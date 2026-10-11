@@ -597,7 +597,8 @@ the server's --jobs limit still bounds work from multiple clients.
 .PP
 On Linux, setting DISTCC_BROKER to an absolute UNIX socket path delegates
 selection and TCP connection establishment to a local distccd --broker
-process. The broker's startup host list is authoritative; the client's host
+process. An empty value disables the broker. The broker's startup host list
+is authoritative; the client's host
 list still supplies --localslots and --localslots_cpp. distcc -j queries the
 broker. Statistics and slot reservations are held in memory, avoiding
 per-client statistics subprocesses and remote slot lock files. Broker

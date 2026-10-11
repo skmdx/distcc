@@ -109,8 +109,9 @@ int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
     struct dcc_hostdef *h;
     int ret;
     int n_hosts;
+    const char *broker_path = getenv("DISTCC_BROKER");
 
-    if (getenv("DISTCC_BROKER"))
+    if (broker_path && *broker_path)
         return dcc_broker_acquire(buildhost, cpu_lock_fd);
 
     if ((ret = dcc_get_hostlist(&hostlist, &n_hosts)) != 0) {

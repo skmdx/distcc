@@ -15,6 +15,12 @@ from test_adaptive import DistccTestCase, free_port, stats_response
 
 
 class BrokerTest(DistccTestCase):
+    def test_empty_setting_uses_direct_path(self):
+        self.env = dict(self.base_env, DISTCC_HOSTS=self.host(0), DISTCC_BROKER="",
+                        DISTCC_DIR=str(self.ddir), DISTCC_FALLBACK="0",
+                        TMPDIR=str(self.work))
+        self.job(0)
+
     def start_broker(self, hosts=None, idle=10):
         path = self.root / "broker.sock"
         env = dict(self.base_env, DISTCC_HOSTS=hosts or self.host(0),

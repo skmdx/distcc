@@ -177,8 +177,9 @@ static void dcc_concurrency_level(void) {
     struct dcc_hostdef *list, *l;
     int nhosts;
     int nslots = 0;
+    const char *broker_path = getenv("DISTCC_BROKER");
 
-    if (getenv("DISTCC_BROKER")) {
+    if (broker_path && *broker_path) {
         nslots = dcc_broker_jobs();
         if (nslots < 0)
             dcc_exit(EXIT_CONNECT_FAILED);
