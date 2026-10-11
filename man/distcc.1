@@ -657,7 +657,8 @@ On Linux, GCC object/archive links can use the local broker and a synchronized
 client sysroot. This is opt-in: set DISTCC_LINK_SYSROOT to a profile produced
 by distcc-link --sync, and DISTCC_BROKER to the broker socket. The distcc-link
 helper requires Python 3.11 or later. Each worker must have a compatible GCC
-cross toolchain and DISTCCD_LINK_ROOT pointing at its sysroot cache.
+cross toolchain and DISTCCD_LINK_ROOT pointing at its sysroot cache. The client's
+GCC specs are cached and applied as well, preserving its default linker flags.
 .PP
 Synchronize a stable, preferably read-only snapshot of the client's root:
 .nf

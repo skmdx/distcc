@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import tarfile
 import unittest
@@ -103,6 +104,29 @@ class LinkTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('distcc-link: linked on ', result.stderr)
 
+    def test_client_linker_defaults_are_preserved(self):
+        # Model a client GCC build with different default linker specs while
+        # executing the real compiler and the ordinary synchronization path.
+        compiler = self.work / 'gcc'
+        real = shutil.which('gcc')
+        compiler.write_text('#!' + sys.executable + '\nimport os, subprocess, sys\n'
+                            'real = ' + repr(real) + '\n'
+                            'if sys.argv[1:] == ["-dumpspecs"]:\n'
+                            '    specs = subprocess.check_output([real, "-dumpspecs"], text=True)\n'
+                            '    sys.stdout.write(specs.replace("*link:\\n", "*link:\\n--defsym=distcc_specs_marker=42 "))\n'
+                            'else:\n    os.execv(real, [real, *sys.argv[1:]])\n')
+        compiler.chmod(0o755)
+        profile = self.work / 'specs.json'
+        subprocess.run([str(self.helper), '--sync', str(self.snapshot), str(compiler),
+                        str(profile), str(self.cache)], env=self.link_env,
+                       check=True, capture_output=True, timeout=30)
+        self.env['DISTCC_LINK_SYSROOT'] = str(profile)
+        output, result = self.link()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-link: linked on ', result.stderr)
+        symbols = subprocess.check_output(['nm', str(output)], text=True)
+        self.assertRegex(symbols, r'0*2a A distcc_specs_marker')
+
     def test_build_library_directory_is_transferred(self):
         directory = self.work / 'build libraries'
         directory.mkdir()
@@ -142,11 +166,12 @@ class LinkTest(BrokerTestCase):
         old = self.cache / self.profile['key']
         obj = old / self.profile['gccdir'] / 'crtbegin.o'
         inode = obj.stat().st_ino
+        current = os.readlink(self.cache / 'current')
         subprocess.run([str(self.helper), '--sync', str(self.snapshot), 'gcc', str(self.profile_file), str(self.cache)],
                                 env=self.link_env, check=True, capture_output=True, text=True, timeout=30)
         self.assertEqual(json.loads(self.profile_file.read_text()), self.profile)
         self.assertEqual(obj.stat().st_ino, inode)
-        self.assertEqual(os.readlink(self.cache / 'current'), self.profile['key'])
+        self.assertEqual(os.readlink(self.cache / 'current'), current)
         self.assertEqual(list(self.cache.glob('.incoming-*')), [])
 
     def test_stale_profile_uses_local_libraries(self):

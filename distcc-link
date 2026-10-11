@@ -366,8 +366,11 @@ def worker(archive, output):
         verify_profile = dict(profile, key=key)
         validation_args = [a for a in args if not a.startswith('-L')]
         prepare_job([compiler, *validation_args, '-o', output], verify_profile, identity)
+        # Native client specs can have an empty sysroot_spec; pass the cache
+        # to ld explicitly as well as to the GCC driver's library search.
         command = [compiler, '--sysroot=' + str(sysroot), '-B' + str(sysroot / gccdir) + '/',
-                   *args, '-o', output]
+                   '-specs=' + str(sysroot / '.distcc-link.specs'),
+                   *args, '-Wl,--sysroot=' + str(sysroot), '-o', output]
         result = subprocess.call(command)
         return result if result >= 0 else 128 - result
 
@@ -405,7 +408,8 @@ def library_files(root, profile):
         pending.extend(links)
         if name is not None and (root / name).is_dir():
             for child in (root / name).iterdir():
-                if re.search(r'(?:\.so(?:\..*)?|\.a|\.o|\.ld|\.lds|\.x[a-z]*)$', child.name):
+                if child.name == 'specs' or re.search(
+                        r'(?:\.so(?:\..*)?|\.a|\.o|\.ld|\.lds|\.spec|\.x[a-z]*)$', child.name):
                     pending.append(str(child.relative_to(root)))
     files, visited = set(), set()
     while pending:
@@ -447,7 +451,8 @@ def sysroot_identity(root, compiler):
         gccdir = f"usr/lib/gcc/{profile['target']}/{profile['version'].split('.')[0]}"
     if not (root / gccdir / 'crtbegin.o').is_file():
         raise ValueError('GCC startup objects are missing from the source sysroot')
-    profile.update(gccdir=gccdir, format=1)
+    specs = subprocess.check_output([compiler, '-dumpspecs'], text=True)
+    profile.update(gccdir=gccdir, format=1, specs=specs)
     return profile
 
 
@@ -491,6 +496,7 @@ def publish(stage, key):
     identity = {k: v for k, v in profile.items() if k != 'key'}
     if sysroot_digest(identity, stage, library_files(stage, profile)) != key:
         raise ValueError('sysroot changed during transfer; use a stable snapshot')
+    (stage / '.distcc-link.specs').write_text(profile['specs'])
     # Absolute links in the source root must not escape into the worker's root.
     for directory, dirs, files in os.walk(stage, followlinks=False):
         for name in dirs + files:

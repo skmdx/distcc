@@ -30,7 +30,9 @@ job.json contains:
 Only /lib, /lib64, /usr/lib and /usr/lib64 are accepted as library_dir values.
 The worker applies the option allowlist independently, checks input formats,
 and verifies the compiler target/version against the cached profile. It adds
---sysroot, the GCC runtime -B directory, and its own temporary output path.
+--sysroot, the GCC runtime -B directory, the cached client GCC specs, and its
+own temporary output path. Specs are part of the administrator-published
+profile and its content hash; jobs cannot supply arbitrary specs.
 The request cannot select an output path on the worker.
 
 Response:
