@@ -480,7 +480,10 @@ int dcc_broker_serve(const char *path)
         if (!clients)
             wake_at = last_request + idle;
         if (clients && now >= broker->refresh_at) {
-            if (!broker->refresh_at)
+            int fresh = 0;
+            for (i = 0; i < broker->count; i++)
+                fresh |= broker->peers[i].valid_until > now;
+            if (!fresh)
                 broker->first_probe_until = now + .25;
             broker->refresh_at = now + 1;
             for (i = 0; i < broker->count; i++) {

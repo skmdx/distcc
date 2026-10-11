@@ -115,6 +115,11 @@ class BrokerTest(DistccTestCase):
                                 check=True, capture_output=True, text=True, timeout=5)
         self.assertEqual(result.stdout.strip(), "6")
         self.assertLess(time.monotonic() - start, .2)
+        # After an idle period, -j must refresh expired metrics before replying.
+        time.sleep(5.2)
+        result = subprocess.run([str(self.build / "distcc"), "-j"], env=self.env,
+                                check=True, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.stdout.strip(), "6")
 
     def test_dead_host_is_skipped(self):
         self.start_broker(f"127.0.0.1:{free_port()}/8 " + self.host(1))
