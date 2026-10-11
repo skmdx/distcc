@@ -39,6 +39,8 @@ SAFE_FLAGS = {
     '-nodefaultlibs', '-nostartfiles', '-ffat-lto-objects', '-fno-fat-lto-objects',
     '-pipe', '-w', '-ffunction-sections', '-fdata-sections', '-fno-plt',
     '-fno-semantic-interposition', '-fomit-frame-pointer', '-fno-omit-frame-pointer',
+    '-fasynchronous-unwind-tables', '-fno-asynchronous-unwind-tables',
+    '-funwind-tables', '-fno-unwind-tables', '-fcommon', '-fno-common',
 }
 SAFE_LINKER_FLAGS = {
     '--as-needed', '--no-as-needed', '--gc-sections', '--no-gc-sections',
@@ -388,13 +390,23 @@ def resolve_inside(root, name):
     return None, links  # Preserve dangling/cyclic links without traversing them.
 
 
-def library_files(root):
+def library_files(root, profile):
     """Project a sysroot to linker inputs, without copying executables or homes.
 
     Resolve symlinks relative to the supplied root, including absolute links.
     The source must be a stable snapshot for hashing and rsync to agree.
     """
-    pending = ['lib', 'lib64', 'usr/lib', 'usr/lib64']
+    directories = ['lib', 'lib64', 'usr/lib', 'usr/lib64',
+                   'lib/' + profile['target'], 'usr/lib/' + profile['target'],
+                   profile['gccdir']]
+    pending = []
+    for directory in directories:
+        name, links = resolve_inside(root, directory)
+        pending.extend(links)
+        if name is not None and (root / name).is_dir():
+            for child in (root / name).iterdir():
+                if re.search(r'(?:\.so(?:\..*)?|\.a|\.o|\.ld|\.lds|\.x[a-z]*)$', child.name):
+                    pending.append(str(child.relative_to(root)))
     files, visited = set(), set()
     while pending:
         name, links = resolve_inside(root, pending.pop())
@@ -405,16 +417,7 @@ def library_files(root):
             continue
         visited.add(name)
         path = root / name
-        if path.is_dir():
-            for child in path.iterdir():
-                # Traversal does not follow directory symlinks through the host /.
-                relative = str(child.relative_to(root))
-                resolved, _ = resolve_inside(root, relative)
-                is_dir = resolved is not None and (root / resolved).is_dir()
-                if is_dir or re.search(
-                        r'(?:\.so(?:\..*)?|\.a|\.o|\.ld|\.lds|\.x[a-z]*)$', child.name):
-                    pending.append(relative)
-        elif path.is_file():
+        if path.is_file():
             files.add(name)
     return sorted(files)
 
@@ -435,7 +438,7 @@ def sysroot_digest(profile, root, files):
     return digest.hexdigest()
 
 
-def sysroot_profile(root, compiler, files):
+def sysroot_identity(root, compiler):
     profile = compiler_identity(compiler)
     runtime = subprocess.check_output([compiler, '-print-file-name=crtbegin.o'], text=True).strip()
     gccdir = Path(runtime).parent.as_posix().lstrip('/')
@@ -445,10 +448,14 @@ def sysroot_profile(root, compiler, files):
     if not (root / gccdir / 'crtbegin.o').is_file():
         raise ValueError('GCC startup objects are missing from the source sysroot')
     profile.update(gccdir=gccdir, format=1)
+    return profile
+
+
+def sysroot_profile(root, profile, files):
     watched = set(files)
     for name in files:
         parent = Path(name).parent
-        while len(parent.parts) >= 2:
+        while len(parent.parts) >= 1:
             watched.add(str(parent))
             parent = parent.parent
     profile['state'] = {name: file_state(root / name) for name in sorted(watched)}
@@ -482,7 +489,7 @@ def publish(stage, key):
     if profile['key'] != key:
         raise ValueError('cache profile does not match its generation')
     identity = {k: v for k, v in profile.items() if k != 'key'}
-    if sysroot_digest(identity, stage, library_files(stage)) != key:
+    if sysroot_digest(identity, stage, library_files(stage, profile)) != key:
         raise ValueError('sysroot changed during transfer; use a stable snapshot')
     # Absolute links in the source root must not escape into the worker's root.
     for directory, dirs, files in os.walk(stage, followlinks=False):
@@ -532,8 +539,9 @@ def transfer_generation(source, listing, metadata, key, host, base):
 
 def describe_sysroot(root, compiler):
     root = Path(root).absolute()
-    files = library_files(root)
-    return {'profile': sysroot_profile(root, compiler, files), 'files': files}
+    profile = sysroot_identity(root, compiler)
+    files = library_files(root, profile)
+    return {'profile': sysroot_profile(root, profile, files), 'files': files}
 
 
 def sync_sysroot(root, compiler, profile_path, destinations):

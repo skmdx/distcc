@@ -83,7 +83,9 @@ class LinkTest(BrokerTestCase):
         return output, result
 
     def test_cpp_remote_link_matches_local(self):
-        output, result = self.link()
+        output, result = self.link(['-O3', '-pipe', '-fomit-frame-pointer', '-fno-plt',
+                                   '-fno-asynchronous-unwind-tables', '-fno-common',
+                                   '-fdata-sections', '-ffunction-sections'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('distcc-link: linked on ', result.stderr)
         self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')

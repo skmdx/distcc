@@ -673,8 +673,10 @@ Install the resulting profile.json on the client and point DISTCC_LINK_SYSROOT
 at it. DISTCC_LINK_SOURCE defaults to /; set it to another root when the
 client's intended sysroot is elsewhere.
 .PP
-Only linker inputs under the library trees, including GCC startup objects and
-runtimes, are synchronized. Headers remain on the compilation client. rsync
+Only linker inputs directly in the standard library search directories and
+the selected GCC runtime directory are synchronized, including their symlink
+targets. Plugin trees and other compiler versions are not traversed. Headers
+remain on the compilation client. rsync
 uses compression and differential transfer, and unchanged cached files are
 hard-linked between generations. Content verification precedes atomic
 publication; the profile is replaced only after every destination is ready.
