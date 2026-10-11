@@ -79,6 +79,11 @@ static int dcc_remote_connect(struct dcc_hostdef *host,
 
     if (host->mode == DCC_MODE_TCP) {
         *ssh_pid = 0;
+        if (host->broker_managed) {
+            *from_net_fd = *to_net_fd = host->broker_fd;
+            host->broker_fd = -1;
+            return *to_net_fd < 0 ? EXIT_CONNECT_FAILED : 0;
+        }
         if ((ret = dcc_connect_by_name(host->hostname, host->port,
                                        to_net_fd)) != 0)
             return ret;

@@ -19,20 +19,13 @@
 #include "exitcode.h"
 #include "adaptive.h"
 
-struct capacity {
-    int cpus, jobs;
-    double load;
-};
-
 /* Parse complete stats responses only. Missing, nonfinite or out-of-range
  * metrics cannot silently turn into a high-capacity host. */
-static int read_capacity(int fd, struct capacity *cap)
+static int read_capacity(int fd, struct dcc_capacity *cap)
 {
-    char buf[4096], *line, extra;
+    char buf[4096];
     size_t used = 0;
     ssize_t n;
-    int fields = 0;
-    double value;
 
     while (used < sizeof(buf) - 1) {
         n = read(fd, buf + used, sizeof(buf) - 1 - used);
@@ -45,8 +38,15 @@ static int read_capacity(int fd, struct capacity *cap)
         used += n;
     }
     buf[used] = '\0';
-    if (used == sizeof(buf) - 1 ||
-        (strncmp(buf, "HTTP/1.0 200 ", 13) &&
+    return used == sizeof(buf) - 1 ? -1 : dcc_parse_capacity(buf, cap);
+}
+
+int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
+{
+    char *line, extra;
+    int fields = 0;
+    double value;
+    if ((strncmp(buf, "HTTP/1.0 200 ", 13) &&
          strncmp(buf, "HTTP/1.1 200 ", 13)) ||
         !(line = strstr(buf, "\n<distccstats>\n")) ||
         !strstr(line, "\n</distccstats>"))
@@ -78,7 +78,7 @@ static int read_capacity(int fd, struct capacity *cap)
 
 /* Isolate the existing resolver and socket code so the entire probe, including
  * DNS and a stalled HTTP peer, has a 250ms deadline. Always reap the worker. */
-static int query_capacity(const struct dcc_hostdef *host, struct capacity *cap)
+static int query_capacity(const struct dcc_hostdef *host, struct dcc_capacity *cap)
 {
     int channel[2], fd, ret = -1, status;
     pid_t pid;
@@ -120,7 +120,7 @@ static int query_capacity(const struct dcc_hostdef *host, struct capacity *cap)
 
 /* Reuse the per-user lock namespace for a one-second, cross-process cache.
  * Failed probes are cached too, but stale successful metrics are never used. */
-static int cached_capacity(const struct dcc_hostdef *host, struct capacity *cap)
+static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *cap)
 {
     struct dcc_hostdef endpoint = *host;
     char buf[160];
@@ -164,18 +164,26 @@ static int cached_capacity(const struct dcc_hostdef *host, struct capacity *cap)
  * Without an explicit limit, stats-enabled hosts use their advertised CPUs. */
 double dcc_host_capacity(const struct dcc_hostdef *host, int *slots)
 {
-    struct capacity cap;
+    struct dcc_capacity cap;
+    return dcc_capacity_value(host,
+        host->is_up && host->n_slots > 0 && host->stats_port &&
+        !cached_capacity(host, &cap) ? &cap : NULL, slots);
+}
+
+double dcc_capacity_value(const struct dcc_hostdef *host,
+                          const struct dcc_capacity *cap, int *slots)
+{
     double pressure = 1;
 
     *slots = host->is_up ? host->n_slots : 0;
     if (*slots > 10000)
         *slots = 10000;
-    if (*slots > 0 && host->stats_port && !cached_capacity(host, &cap)) {
-        if (!host->slots_specified || *slots > cap.cpus)
-            *slots = cap.cpus;
-        if (*slots > cap.jobs)
-            *slots = cap.jobs;
-        pressure += cap.load / cap.cpus;
+    if (*slots > 0 && cap) {
+        if (!host->slots_specified || *slots > cap->cpus)
+            *slots = cap->cpus;
+        if (*slots > cap->jobs)
+            *slots = cap->jobs;
+        pressure += cap->load / cap->cpus;
     }
     return *slots * (host->speed ? host->speed : 1) / pressure;
 }

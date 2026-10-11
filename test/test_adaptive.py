@@ -68,7 +68,7 @@ class StatsPeer:
         self.sock.close()
 
 
-class AdaptiveTest(unittest.TestCase):
+class DistccTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.build = Path.cwd()
@@ -192,6 +192,7 @@ class AdaptiveTest(unittest.TestCase):
         self.addCleanup(stream.close)
         return stream
 
+class AdaptiveTest(DistccTestCase):
     def test_real_stats_and_speed_distribution(self):
         for port in self.stats_ports:
             stats = self.get_stats(port)

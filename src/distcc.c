@@ -47,6 +47,7 @@
 #include "util.h"
 #include "hosts.h"
 #include "adaptive.h"
+#include "broker.h"
 #include "bulk.h"
 #include "implicit.h"
 #include "compile.h"
@@ -97,6 +98,7 @@ static void dcc_show_usage(void)
 "Environment variables:\n"
 "   See the manual page for a complete list.\n"
 "   DISTCC_VERBOSE=1           Give debug messages.\n"
+"   DISTCC_BROKER              Use a local distccd broker's UNIX socket.\n"
 "   DISTCC_LOG                 Send messages to file, not stderr.\n"
 "   DISTCC_SSH                 Command to run to open SSH connections.\n"
 "   DISTCC_DIR                 Directory for host list and locks.\n"
@@ -175,6 +177,14 @@ static void dcc_concurrency_level(void) {
     struct dcc_hostdef *list, *l;
     int nhosts;
     int nslots = 0;
+
+    if (getenv("DISTCC_BROKER")) {
+        nslots = dcc_broker_jobs();
+        if (nslots < 0)
+            dcc_exit(EXIT_CONNECT_FAILED);
+        printf("%i\n", nslots);
+        return;
+    }
 
     if (dcc_get_hostlist(&list, &nhosts) != 0) {
         rs_log_crit("Failed to get host list");

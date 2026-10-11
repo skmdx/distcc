@@ -77,6 +77,7 @@
 #include "srvnet.h"
 #include "daemon.h"
 #include "types.h"
+#include "broker.h"
 #ifdef HAVE_GSSAPI
 #include "auth.h"
 #endif
@@ -187,6 +188,9 @@ int main(int argc, char *argv[])
     int ret;
 
     dcc_setup_startup_log();
+
+    if (argc == 3 && !strcmp(argv[1], "--broker"))
+        return dcc_broker_serve(argv[2]);
 
     if (distccd_parse_options(argc, (const char **) argv))
         dcc_exit(EXIT_DISTCC_FAILED);

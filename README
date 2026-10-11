@@ -25,6 +25,16 @@ the network for each job, so all it requires of the volunteer machines
 is that they be running the distccd daemon, and that they have an
 appropriate compiler installed.
 
+On Linux, a local `distccd --broker /absolute/socket/path` can share adaptive
+host selection and statistics across clients. Set DISTCC_BROKER to that
+socket path in the build environment. The broker passes connected sockets to
+clients, so compiler data does not need an additional relay. It exits when
+idle; systemd socket activation can restart it on demand, including for
+clients in a network sandbox. See distccd(1) for configuration and limits.
+Example systemd units are in packaging/systemd. For a Portage client, enable
+distcc-broker@portage.socket and set
+DISTCC_BROKER=/run/distcc-broker-portage.socket in its build environment.
+
 The distcc "pump" functionality, added in distcc 3.0, improves on
 distcc by distributing not only compilation but also preprocessing to
 distcc servers. This requires that the server and client have the same

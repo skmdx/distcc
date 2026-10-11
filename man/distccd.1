@@ -75,6 +75,33 @@ sysvinit, add this line to
 .PP
 dscc:2345:respawn:/usr/local/bin/distccd --verbose --no-detach --daemon
 .RE
+.SH "LOCAL CLIENT BROKER (LINUX)"
+.B distccd --broker /absolute/socket/path
+runs a foreground scheduling broker for local distcc clients of the same
+user. This mode does not run compilers or accept remote compilation requests.
+The broker reads DISTCC_HOSTS or the usual hosts file at startup; all hosts
+must use TCP. Restart it after changing the host list or DNS addresses.
+.PP
+The broker maintains slot reservations and polls HTTP statistics in parallel
+once per second while clients are present. Each probe has a 250ms deadline.
+Successful metrics expire after five seconds; unavailable statistics use
+configured slots and speed. Selection uses the same adaptive capacity formula
+as the client. It passes connected TCP sockets to clients without relaying
+source files or object data. Each compilation still uses a new TCP connection.
+.PP
+Set DISTCC_BROKER in clients to the absolute socket path. The broker exits
+after DISTCC_BROKER_IDLE seconds without a request and with no connected
+clients (default 60, range 1 to 86400). Active leases prevent idle exit even
+when the compiler is silent. Client disconnects release their reservations.
+.PP
+The socket is private to the broker's user. Its parent directory must also
+be owned and writable only by that user or an administrator. Manual startup
+uses a sibling .lock file to prevent duplicate brokers; leave that file in
+place. Linux systemd socket activation is supported with one
+ListenSequentialPacket socket, SocketMode=0600 and SocketUser matching the
+service User. Run the service outside the build's network namespace to allow
+sandboxed clients to receive connected sockets. In this mode systemd retains
+the listening socket and starts a new broker after an idle exit.
 .SH "RUNNING FROM INETD"
 distccd may be started from a network super-server such as inetd or
 xinetd.  In this case inetd listens for network connections and

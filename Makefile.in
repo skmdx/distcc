@@ -191,6 +191,8 @@ dist_extra =							\
 	packaging/RedHat/init.d/distcc \
 	packaging/RedHat/xinetd.d/distcc \
 	packaging/deb.sh \
+	packaging/systemd/distcc-broker@.socket \
+	packaging/systemd/distcc-broker@.service \
 	packaging/rpm.sh \
 	packaging/googlecode_upload.py
 
@@ -203,6 +205,7 @@ test_SOURCE = test/comfychair.py \
 	test/onetest.py \
 	test/testdistcc.py \
 	test/test_adaptive.py \
+	test/test_broker.py \
 	find_c_extension.sh
 
 dist_common = Makefile.in install-sh configure configure.ac \
@@ -256,7 +259,7 @@ distcc_obj = src/backoff.o						\
 	src/ssh.o src/state.o src/strip.o				\
 	src/timefile.o src/traceenv.o					\
 	src/include_server_if.o						\
-	src/where.o src/adaptive.o					\
+	src/where.o src/adaptive.o src/broker.o			\
 	@ZEROCONF_DISTCC_OBJS@						\
 	@AUTH_DISTCC_OBJS@						\
 	src/emaillog.o							\
@@ -268,7 +271,7 @@ distccd_obj = src/access.o						\
 	src/prefork.o							\
 	src/stringmap.o							\
 	src/serve.o src/setuid.o src/srvnet.o src/srvrpc.o src/state.o	\
-	src/stats.o							\
+	src/stats.o src/adaptive.o src/broker.o src/clinet.o	\
 	src/fix_debug_info.o						\
 	@ZEROCONF_DISTCCD_OBJS@						\
 	@AUTH_DISTCCD_OBJS@						\
@@ -308,12 +311,12 @@ h_dotd_obj = src/h_dotd.o $(common_obj)
 h_fix_debug_info = src/h_fix_debug_info.o $(common_obj)
 h_compile_obj = src/h_compile.o $(common_obj) src/compile.o src/timefile.o \
                 src/backoff.o src/emaillog.o src/remote.o src/clinet.o \
-	        src/clirpc.o src/include_server_if.o src/state.o src/where.o src/adaptive.o \
+	        src/clirpc.o src/include_server_if.o src/state.o src/where.o src/adaptive.o src/broker.o \
 		src/ssh.o src/strip.o src/cpp.o @AUTH_DISTCC_OBJS@
 h_getline_obj = src/h_getline.o $(common_obj)
 
 # All source files, for the purposes of building the distribution
-SRC =	src/stats.c src/adaptive.c					\
+SRC =	src/stats.c src/adaptive.c src/broker.c			\
 	src/access.c src/arg.c src/argutil.c				\
 	src/auth_common.c src/auth_distcc.c src/auth_distccd.c		\
 	src/backoff.c src/bulk.c					\
@@ -348,7 +351,7 @@ SRC =	src/stats.c src/adaptive.c					\
 	src/zeroconf.c src/zeroconf-reg.c src/gcc-id.c
 
 
-HEADERS = src/stats.h src/adaptive.h					\
+HEADERS = src/stats.h src/adaptive.h src/broker.h		\
 	src/access.h							\
 	src/auth.h							\
 	src/bulk.h							\
@@ -765,6 +768,7 @@ maintainer-check: distcc-maintainer-check include-server-maintainer-check \
 
 adaptive-check: distcc distccd h_hosts
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v
+	$(PYTHON) "$(srcdir)/test/test_broker.py" -v
 
 check: adaptive-check
 	@if test -n "$(PYTHON)"; then \

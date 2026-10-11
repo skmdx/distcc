@@ -195,6 +195,7 @@ static void distccd_show_usage(void)
     dcc_show_version("distccd");
     printf (
 "Usage:\n"
+"    distccd --broker /absolute/socket/path\n"
 "   distccd [OPTIONS]\n"
 "\n"
 "Options:\n"

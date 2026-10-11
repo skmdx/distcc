@@ -74,6 +74,10 @@ static const char *const discrepancy_suffix = "/discrepancy_counter";
 
 static void bad_host(struct dcc_hostdef *host, int *cpu_lock_fd , int *local_cpu_lock_fd)
 {
+   if (host && host->broker_managed && host->broker_fd >= 0) {
+       close(host->broker_fd);
+       host->broker_fd = -1;
+   }
    if (host)
        dcc_disliked_host(host);
 

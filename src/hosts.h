@@ -71,6 +71,9 @@ struct dcc_hostdef {
     int stats_port;
     double speed;
     int slots_specified;
+    /* A broker-provided TCP socket, consumed by dcc_remote_connect. */
+    int broker_managed;
+    int broker_fd;
 };
 
 /** Static definition of localhost **/

@@ -106,7 +106,8 @@ struct dcc_hostdef _dcc_local = {
     NULL,                       /* Authentication name */
 #endif
     NULL,
-    0, 0, 0                     /* adaptive statistics, speed, explicit limit */
+    0, 0, 0,                    /* adaptive statistics, speed, explicit limit */
+    0, -1                       /* broker lease */
 };
 
 struct dcc_hostdef *dcc_hostdef_local = &_dcc_local;
@@ -128,7 +129,8 @@ struct dcc_hostdef _dcc_local_cpp = {
     NULL,                       /* Authentication name */
 #endif
     NULL,
-    0, 0, 0                     /* adaptive statistics, speed, explicit limit */
+    0, 0, 0,                    /* adaptive statistics, speed, explicit limit */
+    0, -1                       /* broker lease */
 };
 
 struct dcc_hostdef *dcc_hostdef_local_cpp = &_dcc_local_cpp;
@@ -204,6 +206,10 @@ static int sys_lock(int fd, int block)
 
 int dcc_unlock(int lock_fd)
 {
+    struct stat st;
+    /* Closing a broker control socket releases its remote job lease. */
+    if (!fstat(lock_fd, &st) && S_ISSOCK(st.st_mode))
+        return close(lock_fd) ? EXIT_IO_ERROR : 0;
 #if defined(F_SETLK)
     struct flock lockparam;
 

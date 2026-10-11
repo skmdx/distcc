@@ -1,0 +1,11 @@
+[Unit]
+Description=Local distcc broker socket for %i
+
+[Socket]
+ListenSequentialPacket=/run/distcc-broker-%i.socket
+SocketUser=%i
+SocketMode=0600
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

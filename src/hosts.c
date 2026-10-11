@@ -734,6 +734,8 @@ int dcc_randomize_host_list(struct dcc_hostdef **host_list, int length)
 
 int dcc_free_hostdef(struct dcc_hostdef *host)
 {
+    if (host->broker_managed && host->broker_fd >= 0)
+        close(host->broker_fd);
     /* ANSI C requires free() to accept NULL */
 
     free(host->user);
