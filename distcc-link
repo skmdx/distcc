@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""Link through the local broker using an immutable, rsync-populated sysroot.
+
+The compile fast path stays in C. This helper is started only for object links
+when DISTCC_LINK_SYSROOT names a sysroot profile. Unsupported commands retain
+the existing local compiler behavior.
+"""
+import array
+import hashlib
+import io
+import json
+import os
+import posixpath
+from pathlib import Path
+import re
+import shlex
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import uuid
+
+
+class LocalOnly(Exception):
+    pass
+
+
+COMPILER = re.compile(r"(?:[A-Za-z0-9_.+-]+-)?(?:gcc|g\+\+)(?:-\d+(?:\.\d+)*)?\Z")
+KEY = re.compile(r"[0-9a-f]{64}\Z")
+SAFE_FLAGS = {
+    '-shared', '-static', '-pie', '-no-pie', '-pthread', '-rdynamic', '-s',
+    '-static-libgcc', '-static-libstdc++', '-shared-libgcc', '-fuse-ld=bfd',
+    '-fuse-ld=gold', '-fuse-ld=lld', '-fopenmp', '-fopenacc', '-fPIC', '-fpic',
+    '-fPIE', '-fpie', '-fno-PIE', '-fno-pie', '-fno-lto', '-nostdlib',
+    '-nodefaultlibs', '-nostartfiles', '-ffat-lto-objects', '-fno-fat-lto-objects',
+    '-pipe', '-w', '-ffunction-sections', '-fdata-sections', '-fno-plt',
+    '-fno-semantic-interposition', '-fomit-frame-pointer', '-fno-omit-frame-pointer',
+}
+SAFE_LINKER_FLAGS = {
+    '--as-needed', '--no-as-needed', '--gc-sections', '--no-gc-sections',
+    '--start-group', '--end-group', '-(', '-)', '--whole-archive',
+    '--no-whole-archive', '-Bstatic', '-Bdynamic', '--enable-new-dtags',
+    '--disable-new-dtags', '--eh-frame-hdr', '--export-dynamic', '--no-undefined',
+    '--fatal-warnings', '--no-fatal-warnings', '--strip-all', '--strip-debug',
+    '--no-add-needed', '--copy-dt-needed-entries', '--no-copy-dt-needed-entries',
+}
+
+
+def compiler_identity(compiler):
+    if not COMPILER.fullmatch(Path(compiler).name):
+        raise LocalOnly('unsupported compiler')
+    return {
+        'target': subprocess.check_output([compiler, '-dumpmachine'], text=True).strip(),
+        'version': subprocess.check_output([compiler, '-dumpfullversion'], text=True).strip(),
+    }
+
+
+def response_args(args, depth=0):
+    if depth > 8:
+        raise LocalOnly('response file nesting limit')
+    expanded = []
+    for arg in args:
+        if arg.startswith('@'):
+            text = Path(arg[1:]).read_text()
+            if len(text) > 1024 * 1024:
+                raise LocalOnly('response file too large')
+            expanded.extend(response_args(shlex.split(text, comments=False), depth + 1))
+        else:
+            expanded.append(arg)
+    return expanded
+
+
+def linker_flags(arg):
+    """Keep runtime paths verbatim; unhandled link-time paths stay local."""
+    words = iter(arg[4:].split(','))
+    for word in words:
+        if word in SAFE_LINKER_FLAGS or re.fullmatch(
+                r'(?:-O[0-3]|--hash-style=(?:gnu|sysv|both)|--build-id(?:=[A-Za-z0-9]+)?)', word):
+            continue
+        if word == '-z':
+            if next(words, '') in ('now', 'lazy', 'relro', 'norelro', 'defs', 'nodefs',
+                                    'noexecstack', 'execstack', 'origin'):
+                continue
+        elif word in ('-rpath', '--rpath', '-soname', '--soname', '-h'):
+            if next(words, ''):
+                continue
+        elif word.startswith(('--rpath=', '--soname=')):
+            continue
+        raise LocalOnly('unsupported linker option: ' + word)
+    return arg
+
+
+def validate_input(path):
+    with path.open('rb') as stream:
+        magic = stream.read(8)
+    if magic == b'!<thin>\n':
+        raise LocalOnly('thin archives require their referenced files')
+    if magic[:4] != b'\x7fELF' and magic != b'!<arch>\n':
+        raise LocalOnly('linker scripts require their referenced files')
+
+
+def prepare_job(command, profile, identity=None):
+    compiler, *args = command
+    identity = identity or compiler_identity(compiler)
+    if any(identity[k] != profile[k] for k in identity):
+        raise LocalOnly('compiler and sysroot profile differ')
+    if not KEY.fullmatch(profile['key']):
+        raise LocalOnly('invalid sysroot key')
+    args = response_args(args)
+    mapped, inputs, file_names, library_dirs = [], {}, {}, {}
+    output = 'a.out'
+    index = 0
+
+    def input_file(value, archive_name=None):
+        path = Path(value).absolute()
+        if not path.is_file() or not re.search(r'\.(?:o|a|lo|so(?:\.[A-Za-z0-9_.-]+)?)$', path.name):
+            raise LocalOnly('unsupported link input: ' + value)
+        validate_input(path)
+        key = str(path)
+        if archive_name is None:
+            if '.so' in path.suffixes:
+                raise LocalOnly('explicit shared-library paths may be recorded in DT_NEEDED')
+            if key not in file_names:
+                file_names[key] = f'input-{len(file_names)}{path.suffix}'
+            archive_name = file_names[key]
+        inputs[archive_name] = key
+        return {'input': archive_name}
+
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg in ('-m32', '-mabi=ilp32'):
+            raise LocalOnly('non-default multilib links are not supported')
+        if arg == '-o':
+            if index == len(args):
+                raise LocalOnly('missing output')
+            output = args[index]
+            index += 1
+        elif arg.startswith('-o') and len(arg) > 2:
+            output = arg[2:]
+        elif arg == '-L' or arg.startswith('-L'):
+            value = arg[2:]
+            if not value:
+                if index == len(args):
+                    raise LocalOnly('missing library directory')
+                value = args[index]
+                index += 1
+            if value in ('/lib', '/lib64', '/usr/lib', '/usr/lib64'):
+                mapped.append({'library_dir': value})
+            else:
+                directory = Path(value).absolute()
+                key = str(directory)
+                if not directory.is_dir():
+                    raise LocalOnly('library search directory does not exist')
+                if key not in library_dirs:
+                    library_dirs[key] = 'library-' + str(len(library_dirs))
+                    for file in sorted(directory.iterdir()):
+                        if re.fullmatch(r'lib[A-Za-z0-9_+.-]+\.(?:a|so(?:\.[A-Za-z0-9_.-]+)?)', file.name):
+                            input_file(str(file), library_dirs[key] + '/' + file.name)
+                mapped.append({'library_tree': library_dirs[key]})
+        elif not arg.startswith('-'):
+            mapped.append(input_file(arg))
+        elif arg in SAFE_FLAGS or re.fullmatch(
+                r'(?:-O[0-3sgz]|-g(?:[0-3]|gdb[0-3]?)?|-flto(?:=(?:auto|jobserver|\d+))?'
+                r'|-l[A-Za-z0-9_+.:-]+|-m(?:arch|cpu|tune|abi)=[A-Za-z0-9_.+-]+'
+                r'|-m(?:32|64)|-f(?:no-)?(?:exceptions|rtti|stack-protector(?:-strong|-all)?))', arg):
+            mapped.append(arg)
+        elif arg.startswith('-Wl,'):
+            mapped.append(linker_flags(arg))
+        elif arg == '-I' or arg == '-isystem' or arg == '-include' or arg == '-D' or arg == '-U':
+            if index == len(args):
+                raise LocalOnly('missing preprocessing argument')
+            index += 1
+        elif arg.startswith(('-I', '-D', '-U')):
+            pass  # Pure object links do not preprocess source files.
+        elif arg.startswith('-W') and not arg.startswith('-Wp,'):
+            pass  # Driver diagnostics have no effect on an object-only link.
+        else:
+            raise LocalOnly('unsupported link option: ' + arg)
+    if not inputs or output == '-' or len(mapped) > 10000:
+        raise LocalOnly('not a supported file-producing object link')
+    job = dict(identity, key=profile['key'], compiler=Path(compiler).name, args=mapped)
+    return job, inputs, Path(output)
+
+
+def file_state(path):
+    info = path.lstat()
+    kind = stat.S_IFMT(info.st_mode)
+    return [kind, info.st_mtime_ns, info.st_ctime_ns,
+            None if stat.S_ISDIR(info.st_mode) else info.st_size]
+
+
+def check_source(profile):
+    root = Path(os.environ.get('DISTCC_LINK_SOURCE', '/'))
+    for name, expected in profile['state'].items():
+        if Path(name).is_absolute() or '..' in Path(name).parts:
+            raise ValueError('invalid sysroot state path')
+        try:
+            current = file_state(root / name)
+        except FileNotFoundError:
+            current = None
+        if current != expected:
+            raise LocalOnly('sysroot changed; synchronize a new snapshot before remote linking')
+
+
+def receive_exact(sock, size):
+    data = bytearray()
+    while len(data) < size:
+        part = sock.recv(min(size - len(data), 65536))
+        if not part:
+            raise OSError('link server disconnected')
+        data.extend(part)
+    return bytes(data)
+
+
+def token(sock, name):
+    header = receive_exact(sock, 12)
+    if header[:4] != name.encode('ascii'):
+        raise OSError('unexpected link protocol token')
+    return int(header[4:], 16)
+
+
+def copy_response(sock, name, stream):
+    size = token(sock, name)
+    while size:
+        data = receive_exact(sock, min(size, 65536))
+        stream.write(data)
+        size -= len(data)
+
+
+def remote_link(job, inputs, output):
+    with tempfile.TemporaryFile() as archive:
+        with tarfile.open(fileobj=archive, mode='w') as tar:
+            data = json.dumps(job).encode()
+            member = tarfile.TarInfo('job.json')
+            member.size = len(data)
+            tar.addfile(member, io.BytesIO(data))
+            for name, path in inputs.items():
+                with open(path, 'rb') as stream:
+                    member = tarfile.TarInfo(name)
+                    member.size = os.fstat(stream.fileno()).st_size
+                    tar.addfile(member, stream)
+        size = archive.tell()
+        if size > 0xffffffff:
+            raise LocalOnly('link inputs exceed the protocol size limit')
+        archive.seek(0)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as lease:
+            lease.connect(os.environ['DISTCC_BROKER'])
+            lease.sendall(struct.pack('=II', 2, 1))
+            reply, ancillary, flags, _ = lease.recvmsg(1032, socket.CMSG_SPACE(4),
+                                                       socket.MSG_CMSG_CLOEXEC)
+            descriptors = []
+            for level, kind, data in ancillary:
+                if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
+                    descriptors.extend(array.array('i', data))
+            try:
+                if (len(reply) != 1032 or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+                        or len(descriptors) != 1):
+                    raise OSError('invalid broker reply')
+                status, _ = struct.unpack('=ii', reply[:8])
+                if status:
+                    raise OSError('broker has no available link host')
+                host = reply[8:].split(b'\0', 1)[0].decode()
+                if ',auth' in host:
+                    raise LocalOnly('authenticated link protocol is not supported')
+                lease.sendall(struct.pack('=II', 2, 3))
+                net = socket.socket(fileno=descriptors.pop())
+                with net:
+                    net.settimeout(float(os.environ.get('DISTCC_IO_TIMEOUT', '300')))
+                    net.sendall(b'DIST00000004' + f'LINK{size:08x}'.encode())
+                    while data := archive.read(65536):
+                        net.sendall(data)
+                    if token(net, 'DONE') != 4:
+                        raise OSError('unsupported link protocol version')
+                    status = token(net, 'STAT')
+                    copy_response(net, 'SERR', sys.stderr.buffer)
+                    copy_response(net, 'SOUT', sys.stdout.buffer)
+                    mode = token(net, 'MODE')
+                    with tempfile.NamedTemporaryFile(dir=output.absolute().parent,
+                                                     prefix='.distcc-link-', delete=False) as result:
+                        temporary = Path(result.name)
+                        try:
+                            copy_response(net, 'DOTO', result)
+                            if not status:
+                                mask = os.umask(0)
+                                os.umask(mask)
+                                os.fchmod(result.fileno(), mode & 0o777 & ~mask)
+                                result.flush()
+                                os.replace(temporary, output)
+                        finally:
+                            temporary.unlink(missing_ok=True)
+                    if os.environ.get('DISTCC_VERBOSE') == '1':
+                        print('distcc-link: linked on ' + host, file=sys.stderr)
+                    code = os.waitstatus_to_exitcode(status)
+                    if code == 100:
+                        raise OSError('remote link worker could not execute the job')
+                    return code if code >= 0 else 128 - code
+            finally:
+                for fd in descriptors:
+                    os.close(fd)
+
+
+def worker(archive, output):
+    root = Path(os.environ['DISTCCD_LINK_ROOT'])
+    with tempfile.TemporaryDirectory(prefix='distcc-link-') as name:
+        work = Path(name)
+        with tarfile.open(archive, mode='r:') as tar:
+            names = set()
+            for member in tar:
+                if (not member.isfile() or member.name in names or len(names) >= 100000 or
+                    not re.fullmatch(r'(?:job\.json|input-\d+\.(?:o|a|so|lo)|'
+                                     r'library-\d+/lib[A-Za-z0-9_+.-]+\.(?:a|so(?:\.[A-Za-z0-9_.-]+)?))',
+                                     member.name)):
+                    raise ValueError('invalid link archive member')
+                names.add(member.name)
+                if member.name == 'job.json' and member.size > 1024 * 1024:
+                    raise ValueError('link request metadata too large')
+                path = work / member.name
+                path.parent.mkdir(exist_ok=True)
+                with tar.extractfile(member) as source, path.open('wb') as target:
+                    shutil.copyfileobj(source, target, 65536)
+                if member.name != 'job.json':
+                    validate_input(path)
+        job = json.loads((work / 'job.json').read_text())
+        key = job['key']
+        if not isinstance(key, str) or not KEY.fullmatch(key):
+            raise ValueError('invalid sysroot key')
+        sysroot = root / key
+        profile = json.loads((sysroot / '.distcc-link.json').read_text())
+        if profile.get('format') != 1 or profile.get('key') != key:
+            raise ValueError('invalid cached sysroot profile')
+        compiler = job['compiler']
+        if not isinstance(compiler, str) or Path(compiler).name != compiler:
+            raise ValueError('invalid compiler name')
+        identity = compiler_identity(compiler)
+        if any(identity[k] != job[k] or identity[k] != profile[k] for k in identity):
+            raise ValueError('link compiler does not match the sysroot')
+        gccdir = profile['gccdir']
+        if not re.fullmatch(r'usr/lib(?:64)?/gcc/[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+', gccdir):
+            raise ValueError('invalid GCC runtime directory')
+        args = []
+        for arg in job['args']:
+            if isinstance(arg, dict) and set(arg) == {'input'} and arg['input'] in names:
+                args.append(str(work / arg['input']))
+            elif isinstance(arg, dict) and set(arg) == {'library_dir'} and arg['library_dir'] in (
+                    '/lib', '/lib64', '/usr/lib', '/usr/lib64'):
+                args.append('-L' + str(sysroot / arg['library_dir'].lstrip('/')))
+            elif (isinstance(arg, dict) and set(arg) == {'library_tree'} and
+                  isinstance(arg['library_tree'], str) and re.fullmatch(r'library-\d+', arg['library_tree'])):
+                directory = work / arg['library_tree']
+                directory.mkdir(exist_ok=True)
+                args.append('-L' + str(directory))
+            elif isinstance(arg, str):
+                if not arg.startswith('-') or arg.startswith(('-L', '-o')):
+                    raise ValueError('unmapped path in link request')
+                args.append(arg)
+            else:
+                raise ValueError('invalid link argument')
+        # Reapply the same allowlist on the server, independent of client trust.
+        verify_profile = dict(profile, key=key)
+        validation_args = [a for a in args if not a.startswith('-L')]
+        prepare_job([compiler, *validation_args, '-o', output], verify_profile, identity)
+        command = [compiler, '--sysroot=' + str(sysroot), '-B' + str(sysroot / gccdir) + '/',
+                   *args, '-o', output]
+        result = subprocess.call(command)
+        return result if result >= 0 else 128 - result
+
+
+def resolve_inside(root, name):
+    links = []
+    for _ in range(40):
+        parts = name.split('/')
+        for index in range(len(parts)):
+            prefix = '/'.join(parts[:index + 1])
+            path = root / prefix
+            if path.is_symlink():
+                links.append(prefix)
+                name = posixpath.normpath(posixpath.join(
+                    '/' + posixpath.dirname(prefix), os.readlink(path),
+                    *parts[index + 1:])).lstrip('/')
+                break
+        else:
+            return name, links
+    return None, links  # Preserve dangling/cyclic links without traversing them.
+
+
+def library_files(root):
+    """Project a sysroot to linker inputs, without copying executables or homes.
+
+    Resolve symlinks relative to the supplied root, including absolute links.
+    The source must be a stable snapshot for hashing and rsync to agree.
+    """
+    pending = ['lib', 'lib64', 'usr/lib', 'usr/lib64']
+    files, visited = set(), set()
+    while pending:
+        name, links = resolve_inside(root, pending.pop())
+        files.update(links)
+        if name is None:
+            continue
+        if name in visited:
+            continue
+        visited.add(name)
+        path = root / name
+        if path.is_dir():
+            for child in path.iterdir():
+                # Traversal does not follow directory symlinks through the host /.
+                relative = str(child.relative_to(root))
+                resolved, _ = resolve_inside(root, relative)
+                is_dir = resolved is not None and (root / resolved).is_dir()
+                if is_dir or re.search(
+                        r'(?:\.so(?:\..*)?|\.a|\.o|\.ld|\.lds|\.x[a-z]*)$', child.name):
+                    pending.append(relative)
+        elif path.is_file():
+            files.add(name)
+    return sorted(files)
+
+
+def sysroot_digest(profile, root, files):
+    digest = hashlib.sha256(json.dumps(profile, sort_keys=True).encode())
+    for name in files:
+        digest.update(os.fsencode(name) + b'\0')
+        path = root / name
+        if path.is_symlink():
+            target = posixpath.normpath(posixpath.join(
+                '/' + posixpath.dirname(name), os.readlink(path)))
+            digest.update(b'L' + os.fsencode(target) + b'\0')
+        else:
+            digest.update(b'F')
+            with path.open('rb') as stream:
+                digest.update(hashlib.file_digest(stream, 'sha256').digest())
+    return digest.hexdigest()
+
+
+def sysroot_profile(root, compiler, files):
+    profile = compiler_identity(compiler)
+    runtime = subprocess.check_output([compiler, '-print-file-name=crtbegin.o'], text=True).strip()
+    gccdir = Path(runtime).parent.as_posix().lstrip('/')
+    if not (root / gccdir / 'crtbegin.o').is_file():
+        # A cross compiler may report paths inside its configured sysroot.
+        gccdir = f"usr/lib/gcc/{profile['target']}/{profile['version'].split('.')[0]}"
+    if not (root / gccdir / 'crtbegin.o').is_file():
+        raise ValueError('GCC startup objects are missing from the source sysroot')
+    profile.update(gccdir=gccdir, format=1)
+    watched = set(files)
+    for name in files:
+        parent = Path(name).parent
+        while len(parent.parts) >= 2:
+            watched.add(str(parent))
+            parent = parent.parent
+    profile['state'] = {name: file_state(root / name) for name in sorted(watched)}
+    profile['key'] = sysroot_digest(profile, root, files)
+    return profile
+
+
+def destination(value):
+    if ':' in value:
+        host, path = value.split(':', 1)
+        if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', host):
+            raise ValueError('use a hostname or SSH configuration alias for the cache destination')
+    else:
+        host, path = None, value
+    if not path.startswith('/') or '..' in Path(path).parts:
+        raise ValueError('cache destination must be an absolute path without ..')
+    return host, path.rstrip('/') or '/'
+
+
+def remote_command(host, args):
+    if host:
+        return ['ssh', '-oBatchMode=yes', host, shlex.join(args)]
+    return args
+
+
+def publish(stage, key):
+    stage = Path(stage)
+    if not KEY.fullmatch(key) or not stage.name.startswith('.incoming-' + key + '-'):
+        raise ValueError('invalid staged cache path')
+    profile = json.loads((stage / '.distcc-link.json').read_text())
+    if profile['key'] != key:
+        raise ValueError('cache profile does not match its generation')
+    identity = {k: v for k, v in profile.items() if k != 'key'}
+    if sysroot_digest(identity, stage, library_files(stage)) != key:
+        raise ValueError('sysroot changed during transfer; use a stable snapshot')
+    # Absolute links in the source root must not escape into the worker's root.
+    for directory, dirs, files in os.walk(stage, followlinks=False):
+        for name in dirs + files:
+            path = Path(directory) / name
+            if path.is_symlink():
+                link = os.readlink(path)
+                logical = '/' + str(path.relative_to(stage).parent)
+                target = posixpath.normpath(posixpath.join(logical, link)).lstrip('/')
+                replacement = os.path.relpath(stage / target, path.parent)
+                path.unlink()
+                path.symlink_to(replacement)
+    final = stage.parent / key
+    try:
+        stage.rename(final)
+    except OSError:
+        if not final.is_dir() or json.loads((final / '.distcc-link.json').read_text()) != profile:
+            raise
+        shutil.rmtree(stage)
+    current = final.parent / ('.current-' + uuid.uuid4().hex)
+    current.symlink_to(key)
+    os.replace(current, final.parent / 'current')
+
+
+def transfer_generation(source, listing, metadata, key, host, base):
+    final = base + '/' + key
+    if not subprocess.run(remote_command(host, ['test', '-d', final])).returncode:
+        return final
+    stage = base + '/.incoming-' + key + '-' + uuid.uuid4().hex
+    subprocess.run(remote_command(host, ['mkdir', '-p', stage]), check=True)
+    remote_stage = f'{host}:{stage}' if host else stage
+    try:
+        previous = subprocess.run(remote_command(host, ['test', '-d', base + '/current']))
+        link_dest = ['--link-dest=' + base + '/current'] if not previous.returncode else []
+        subprocess.run(['rsync', '-az', '--checksum', '--secluded-args', '--from0',
+            '--files-from=' + str(listing), *link_dest,
+            source.rstrip('/') + '/', remote_stage + '/'], check=True, stdout=sys.stderr)
+        subprocess.run(['rsync', '-az', '--secluded-args', str(metadata),
+            remote_stage + '/'], check=True, stdout=sys.stderr)
+        subprocess.run(remote_command(host, ['distcc-link', '--publish', stage, key]), check=True)
+    except BaseException:
+        # Only this invocation's unique staging directory is removed.
+        subprocess.run(remote_command(host, ['rm', '-rf', '--', stage]), check=False)
+        raise
+    return final
+
+
+def describe_sysroot(root, compiler):
+    root = Path(root).absolute()
+    files = library_files(root)
+    return {'profile': sysroot_profile(root, compiler, files), 'files': files}
+
+
+def sync_sysroot(root, compiler, profile_path, destinations):
+    source_host, source_path = destination(root)
+    targets = [destination(dest) for dest in destinations]
+    if source_host:
+        local = next((dest for dest in targets if dest[0] is None), None)
+        if local is None:
+            raise ValueError('a remote source requires a local cache destination for rsync staging')
+        description = json.loads(subprocess.check_output(remote_command(source_host,
+            ['distcc-link', '--describe', source_path, compiler]), text=True))
+    else:
+        description = describe_sysroot(source_path, compiler)
+    profile, files = description['profile'], description['files']
+    key = profile['key']
+    if not KEY.fullmatch(key) or any(Path(f).is_absolute() or '..' in Path(f).parts for f in files):
+        raise ValueError('invalid remote sysroot description')
+    with tempfile.TemporaryDirectory(prefix='distcc-sysroot-') as name:
+        scratch = Path(name)
+        listing = scratch / 'files'
+        listing.write_bytes(b'\0'.join(os.fsencode(f) for f in files) + b'\0')
+        metadata = scratch / '.distcc-link.json'
+        metadata.write_text(json.dumps(profile, sort_keys=True) + '\n')
+        if source_host:
+            # Pull once into this controller's cache, then synchronize workers.
+            # No credentials need to be forwarded or installed on the source.
+            source_path = transfer_generation(root, listing, metadata, key, *local)
+            targets.remove(local)
+        for host, base in targets:
+            transfer_generation(source_path, listing, metadata, key, host, base)
+    profile_path = Path(profile_path).absolute()
+    with tempfile.NamedTemporaryFile(mode='w', dir=profile_path.parent,
+                                     prefix='.distcc-sysroot-', delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            json.dump(profile, stream, sort_keys=True)
+            stream.write('\n')
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o644)
+            os.replace(temporary, profile_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    print('sysroot ' + key + ' ready')
+
+
+def main():
+    if len(sys.argv) == 4 and sys.argv[1] == '--describe':
+        print(json.dumps(describe_sysroot(sys.argv[2], sys.argv[3]), sort_keys=True))
+        return 0
+    if len(sys.argv) >= 6 and sys.argv[1] == '--sync':
+        try:
+            sync_sysroot(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:])
+            return 0
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print('distcc-link: ' + str(error), file=sys.stderr)
+            return 1
+    if len(sys.argv) == 4 and sys.argv[1] == '--publish':
+        publish(sys.argv[2], sys.argv[3])
+        return 0
+    if len(sys.argv) == 4 and sys.argv[1] == '--worker':
+        try:
+            return worker(sys.argv[2], sys.argv[3])
+        except (OSError, ValueError, KeyError, TypeError, LocalOnly, subprocess.SubprocessError) as error:
+            print('distcc-link: ' + str(error), file=sys.stderr)
+            return 100
+    command = sys.argv[1:]
+    if not command:
+        print('usage: distcc-link COMPILER [link options]\n'
+              '       distcc-link --sync SNAPSHOT COMPILER PROFILE CACHE_DIRECTORY...', file=sys.stderr)
+        return 1
+    try:
+        profile = json.loads(Path(os.environ['DISTCC_LINK_SYSROOT']).read_text())
+        check_source(profile)
+        job, inputs, output = prepare_job(command, profile)
+        result = remote_link(job, inputs, output)
+        if not result or os.environ.get('DISTCC_FALLBACK') == '0':
+            return result
+        print('distcc-link: remote linker failed; retrying locally', file=sys.stderr)
+    except LocalOnly as error:
+        if os.environ.get('DISTCC_VERBOSE') == '1':
+            print('distcc-link: local: ' + str(error), file=sys.stderr)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        print('distcc-link: ' + str(error), file=sys.stderr)
+        if os.environ.get('DISTCC_FALLBACK') == '0':
+            return 1
+    os.environ['DISTCC_LINK_SYSROOT'] = ''
+    os.execvp(command[0], command)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError, TypeError, LocalOnly, tarfile.TarError,
+            subprocess.SubprocessError) as error:
+        print('distcc-link: ' + str(error), file=sys.stderr)
+        sys.exit(1)

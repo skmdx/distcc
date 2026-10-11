@@ -150,6 +150,7 @@ pkgdoc_DOCS = AUTHORS COPYING NEWS \
 	doc/protocol-1.txt doc/status-1.txt \
 	doc/protocol-2.txt \
 	doc/protocol-3.txt doc/protocol-3-impl.txt \
+	doc/protocol-4.txt \
 	doc/protocol-gssapi.txt \
 	doc/reporting-bugs.txt
 
@@ -185,6 +186,7 @@ update_distcc_symlinks_PY = update-distcc-symlinks.py
 
 # These are included in the distribution but not installed anywhere.
 dist_extra =							\
+	distcc-link \
 	README.packaging ChangeLog \
 	packaging/RedHat/rpm.spec \
 	packaging/RedHat/logrotate.d/distcc \
@@ -206,6 +208,7 @@ test_SOURCE = test/comfychair.py \
 	test/testdistcc.py \
 	test/test_adaptive.py \
 	test/test_broker.py \
+	test/test_link.py \
 	find_c_extension.sh
 
 dist_common = Makefile.in install-sh configure configure.ac \
@@ -769,6 +772,7 @@ maintainer-check: distcc-maintainer-check include-server-maintainer-check \
 adaptive-check: distcc distccd h_hosts
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v
 	$(PYTHON) "$(srcdir)/test/test_broker.py" -v
+	$(PYTHON) "$(srcdir)/test/test_link.py" -v
 
 check: adaptive-check
 	@if test -n "$(PYTHON)"; then \
@@ -1039,6 +1043,7 @@ install: showpaths install-doc install-man install-programs \
 install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS)
 	$(mkinstalldirs) "$(DESTDIR)$(bindir)"
 	$(mkinstalldirs) "$(DESTDIR)$(sbindir)"
+	$(INSTALL_SCRIPT) "$(srcdir)/distcc-link" "$(DESTDIR)$(bindir)/distcc-link"
 	for p in $(bin_PROGRAMS); do \
 	  $(INSTALL_PROGRAM) "$$p" "$(DESTDIR)$(bindir)" || exit 1; \
 	done
@@ -1165,6 +1170,7 @@ uninstall: uninstall-man uninstall-programs @UNINSTALL_GNOME@ \
 	uninstall-include-server uninstall-example uninstall-doc uninstall-conf
 
 uninstall-programs:
+	rm -f "$(DESTDIR)$(bindir)/distcc-link"
 	for p in $(bin_PROGRAMS) pump; do			\
 	  file="$(DESTDIR)$(bindir)/`basename $$p`";            \
 	  if [ -e "$$file" ]; then rm -fv "$$file"; fi          \

@@ -35,6 +35,12 @@ Example systemd units are in packaging/systemd. For a Portage client, enable
 distcc-broker@portage.socket and set
 DISTCC_BROKER=/run/distcc-broker-portage.socket in its build environment.
 
+GCC object links can also run on a broker-selected worker. `distcc-link --sync`
+populates immutable sysroot caches using compressed rsync transfers; set
+DISTCC_LINK_SYSROOT to the resulting client profile and DISTCCD_LINK_ROOT on
+workers to enable this optional path. Changed libraries and unsupported link
+options stay local. See the remote object linking section of distcc(1).
+
 The distcc "pump" functionality, added in distcc 3.0, improves on
 distcc by distributing not only compilation but also preprocessing to
 distcc servers. This requires that the server and client have the same

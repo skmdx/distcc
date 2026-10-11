@@ -101,7 +101,8 @@ enum dcc_cpp_where {
 enum dcc_protover {
     DCC_VER_1   = 1,            /**< vanilla */
     DCC_VER_2   = 2,            /**< LZO sprinkles */
-    DCC_VER_3   = 3             /**< server-side cpp */
+    DCC_VER_3   = 3,            /**< server-side cpp */
+    DCC_VER_LINK = 4            /**< cached-sysroot link job */
 };
 
 

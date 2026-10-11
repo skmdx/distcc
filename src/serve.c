@@ -641,9 +641,52 @@ static int make_temp_dir_and_chdir_for_cpp(int in_fd,
 }
 
 
-/**
- * Read a request, run the compiler, and send a response.
- **/
+/* Protocol 4 delegates only object linking to the sysroot-aware helper. */
+static int dcc_run_link_job(int in_fd, int out_fd,
+                            const char *out_fname, const char *err_fname, int *status)
+{
+    char *archive = NULL, *output = NULL;
+    char *argv[5];
+    struct stat st;
+    pid_t pid;
+    int ret;
+    if (!getenv("DISTCCD_LINK_ROOT")) {
+        rs_log_error("remote linking requires DISTCCD_LINK_ROOT");
+        return EXIT_PROTOCOL_ERROR;
+    }
+    if ((ret = dcc_make_tmpnam("distcc-link", ".tar", &archive)) ||
+        (ret = dcc_make_tmpnam("distcc-link", ".out", &output)) ||
+        (ret = dcc_r_token_file(in_fd, "LINK", archive, DCC_COMPRESS_NONE)))
+        goto done;
+    argv[0] = (char *)"distcc-link";
+    argv[1] = (char *)"--worker";
+    argv[2] = archive;
+    argv[3] = output;
+    argv[4] = NULL;
+    if ((ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname)) ||
+        (ret = dcc_collect_child("link", pid, status, in_fd)))
+        *status = W_EXITCODE(ret, 0);
+    if (!*status && stat(output, &st))
+        *status = W_EXITCODE(EXIT_IO_ERROR, 0);
+    if ((ret = dcc_x_result_header(out_fd, DCC_VER_LINK)) ||
+        (ret = dcc_x_cc_status(out_fd, *status)) ||
+        (ret = dcc_x_file(out_fd, err_fname, "SERR", DCC_COMPRESS_NONE, NULL)) ||
+        (ret = dcc_x_file(out_fd, out_fname, "SOUT", DCC_COMPRESS_NONE, NULL)))
+        goto done;
+    if (!*status) {
+        if (!(ret = dcc_x_token_int(out_fd, "MODE", st.st_mode & 0777)))
+            ret = dcc_x_file(out_fd, output, "DOTO", DCC_COMPRESS_NONE, NULL);
+    } else {
+        if (!(ret = dcc_x_token_int(out_fd, "MODE", 0)))
+            ret = dcc_x_token_int(out_fd, "DOTO", 0);
+    }
+done:
+    free(archive);
+    free(output);
+    return ret;
+}
+
+/** Read a request, run the compiler, and send a response. */
 static int dcc_run_job(int in_fd,
                        int out_fd)
 {
@@ -697,6 +740,19 @@ static int dcc_run_job(int in_fd,
 
     if ((ret = dcc_r_request_header(in_fd, &protover)))
         goto out_cleanup;
+
+    if (protover == DCC_VER_LINK) {
+        argv = calloc(2, sizeof(*argv));
+        orig_input = strdup("link");
+        if (!argv || !(argv[0] = strdup("distcc-link")) || !orig_input) {
+            ret = EXIT_OUT_OF_MEMORY;
+            goto out_cleanup;
+        }
+        ret = dcc_run_link_job(in_fd, out_fd, out_fname, err_fname, &status);
+        job_result = ret || status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
+        tcp_cork_sock(out_fd, 0);
+        goto out_cleanup;
+    }
 
     dcc_get_features_from_protover(protover, &compr, &cpp_where);
 

@@ -99,6 +99,7 @@ class DistccTestCase(unittest.TestCase):
             cls.logs.append(log)
             env = dict(cls.base_env, TMPDIR=str(cls.root),
                        DISTCCD_PATH=str(wrappers) + os.pathsep + os.defpath)
+            env.update(getattr(cls, "daemon_env", {}))
             proc = subprocess.Popen([
                 str(cls.build / "distccd"), "--daemon", "--no-detach",
                 "--log-stderr", "--verbose", "--enable-tcp-insecure",

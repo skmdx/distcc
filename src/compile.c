@@ -648,6 +648,25 @@ static int dcc_get_max_retries(void)
     }
 }
 
+/* Only pure object/archive links are candidates. The helper validates options
+ * and runs unsupported commands locally under the existing local slot lock. */
+static int dcc_link_candidate(char **argv)
+{
+    int i, input = 0;
+    const char *profile = getenv("DISTCC_LINK_SYSROOT");
+    const char *broker = getenv("DISTCC_BROKER");
+    if (!profile || !*profile || !broker || !*broker)
+        return 0;
+    for (i = 1; argv[i]; i++) {
+        if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "-S") ||
+            !strcmp(argv[i], "-E") || dcc_is_source(argv[i]))
+            return 0;
+        if (str_endswith(".o", argv[i]) || str_endswith(".a", argv[i]) || argv[i][0] == '@')
+            input = 1;
+    }
+    return input;
+}
+
 /**
  * Execute the commands in argv remotely or locally as appropriate.
  *
@@ -736,6 +755,18 @@ dcc_build_somewhere(char *argv[],
         dcc_gcc_rewrite_fqn(new_argv);
     }
     if (ret != 0) {
+        if (dcc_link_candidate(argv)) {
+            int argc = dcc_argv_len(argv);
+            char **link_argv = calloc(argc + 2, sizeof(*link_argv));
+            if (!link_argv || !(link_argv[0] = strdup("distcc-link"))) {
+                free(link_argv);
+                ret = EXIT_OUT_OF_MEMORY;
+                goto clean_up;
+            }
+            memcpy(link_argv + 1, argv, (argc + 1) * sizeof(*argv));
+            free(argv);
+            argv = link_argv;
+        }
         /* we need to scan the arguments even if we already know it's
          * local, so that we can pick up distcc client options. */
         goto lock_local;

@@ -106,6 +106,14 @@ ListenSequentialPacket socket, SocketMode=0600 and SocketUser matching the
 service User. Run the service outside the build's network namespace to allow
 sandboxed clients to receive connected sockets. In this mode systemd retains
 the listening socket and starts a new broker after an idle exit.
+.SH "CACHED-SYSROOT LINK WORKERS"
+Setting DISTCCD_LINK_ROOT to a sysroot cache directory enables protocol 4
+object linking. distcc-link must be on DISTCCD_PATH and requires Python 3.11
+or later. Link jobs use the existing distccd worker pool, access rules and
+resource limits. Only administrator-managed, immutable cache generations
+should be exposed here. The helper verifies the requested GCC target/version,
+validates link inputs and options, and uses its own output path.
+See distcc(1) for synchronization and client configuration.
 .SH "RUNNING FROM INETD"
 distccd may be started from a network super-server such as inetd or
 xinetd.  In this case inetd listens for network connections and

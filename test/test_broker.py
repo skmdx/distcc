@@ -15,13 +15,7 @@ import unittest
 from test_adaptive import DistccTestCase, free_port, stats_response
 
 
-class BrokerTest(DistccTestCase):
-    def test_empty_setting_uses_direct_path(self):
-        self.env = dict(self.base_env, DISTCC_HOSTS=self.host(0), DISTCC_BROKER="",
-                        DISTCC_DIR=str(self.ddir), DISTCC_FALLBACK="0",
-                        TMPDIR=str(self.work))
-        self.job(0)
-
+class BrokerTestCase(DistccTestCase):
     def start_broker(self, hosts=None, idle=10):
         path = self.root / "broker.sock"
         env = dict(self.base_env, DISTCC_HOSTS=hosts or self.host(0),
@@ -78,6 +72,13 @@ class BrokerTest(DistccTestCase):
                        capture_output=True, timeout=10)
         subprocess.run([str(exe)], check=True, timeout=5)
         return obj.read_bytes()
+
+class BrokerTest(BrokerTestCase):
+    def test_empty_setting_uses_direct_path(self):
+        self.env = dict(self.base_env, DISTCC_HOSTS=self.host(0), DISTCC_BROKER="",
+                        DISTCC_DIR=str(self.ddir), DISTCC_FALLBACK="0",
+                        TMPDIR=str(self.work))
+        self.job(0)
 
     def test_parallel_real_compiles_and_no_children(self):
         proc = self.start_broker(self.host(0) + " " + self.host(1))

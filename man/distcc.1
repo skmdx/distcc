@@ -652,6 +652,52 @@ hash/pound sign (\fB#\fP) and run to the end of the line.
 .PP
 If a host in the list is not reachable distcc will emit a warning and
 ignore that host for about one minute.
+.SH "REMOTE OBJECT LINKING"
+On Linux, GCC object/archive links can use the local broker and a synchronized
+client sysroot. This is opt-in: set DISTCC_LINK_SYSROOT to a profile produced
+by distcc-link --sync, and DISTCC_BROKER to the broker socket. The distcc-link
+helper requires Python 3.11 or later. Each worker must have a compatible GCC
+cross toolchain and DISTCCD_LINK_ROOT pointing at its sysroot cache.
+.PP
+Synchronize a stable, preferably read-only snapshot of the client's root:
+.nf
+  distcc-link --sync /srv/sysroot-snapshot gcc profile.json \\
+      /var/cache/distcc-link worker:/var/cache/distcc-link
+.fi
+The cache directories must be writable by the synchronization account and
+readable by distccd. Remote paths use SSH and require rsync and distcc-link
+on both ends. A source such as client:/srv/sysroot-snapshot is also accepted;
+include a local cache destination so the controller can pull once and then
+distribute the generation without forwarding credentials to the client.
+Install the resulting profile.json on the client and point DISTCC_LINK_SYSROOT
+at it. DISTCC_LINK_SOURCE defaults to /; set it to another root when the
+client's intended sysroot is elsewhere.
+.PP
+Only linker inputs under the library trees, including GCC startup objects and
+runtimes, are synchronized. Headers remain on the compilation client. rsync
+uses compression and differential transfer, and unchanged cached files are
+hard-linked between generations. Content verification precedes atomic
+publication; the profile is replaced only after every destination is ready.
+Published generations remain available to active jobs. Remove unused generations
+only when no link jobs or client profiles refer to them.
+.PP
+Before linking, the client checks file type, size, modification/change times
+and library directory metadata against the profile. A changed sysroot stays
+local until a new snapshot is synchronized; synchronization is an explicit
+operation, not a per-link transfer. Use a stable snapshot when preparing the
+profile so it represents one coherent library set.
+.PP
+Objects, ordinary archives and ELF libraries in build-specific -L
+directories are transferred per job. Linking runs inside an ordinary distccd
+worker slot, using the same capacity-based host choice as compilation. Output
+is replaced only after a complete successful response. Network/setup failures
+and linker errors retry locally unless DISTCC_FALLBACK=0.
+.PP
+Source-and-link commands, Clang, GSSAPI, non-default multilibs, thin archives,
+explicit shared-library paths, custom linker scripts, additional output files such as link maps, and options
+outside the helper's allowlist stay local. LTO requires compatible compiler
+builds in addition to matching target and full version. Small links may be
+faster locally because packing and transfer have a fixed cost.
 .SH "COMPRESSION"
 The
 .B lzo

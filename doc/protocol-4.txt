@@ -1,0 +1,53 @@
+distcc protocol version 4: cached-sysroot object linking
+
+This opt-in protocol runs a linker within an ordinary distccd worker slot.
+DISTCCD_LINK_ROOT must name an administrator-managed sysroot cache. Compiler
+protocols 1 through 3 are unchanged. GSSAPI is not supported by the link client.
+
+Integers use the existing four-byte token plus eight hexadecimal digits.
+File lengths are byte counts; files are uncompressed in this protocol.
+
+Request:
+    DIST 4
+    LINK <length> <tar archive>
+
+The archive contains job.json and regular files named input-N.o, input-N.a,
+input-N.lo, input-N.so, or library-N/libNAME.a and library-N/libNAME.so[.VERSION].
+Directory entries, symlinks, duplicate names and other member names are rejected.
+Directories for library files are created by the worker. Job metadata is limited
+to 1 MiB and archives to 100,000 members and the existing 32-bit file length.
+
+job.json contains:
+    compiler: a GCC driver basename, including an optional target/version
+    target: the compiler's -dumpmachine result
+    version: the compiler's -dumpfullversion result
+    key: the SHA-256 sysroot generation identifier
+    args: a sequence of strings or one-key objects:
+        {"input": "input-N.o"} selects an extracted file
+        {"library_tree": "library-N"} supplies a transferred -L directory
+        {"library_dir": "/usr/lib64"} supplies a directory inside the sysroot
+
+Only /lib, /lib64, /usr/lib and /usr/lib64 are accepted as library_dir values.
+The worker applies the option allowlist independently, checks input formats,
+and verifies the compiler target/version against the cached profile. It adds
+--sysroot, the GCC runtime -B directory, and its own temporary output path.
+The request cannot select an output path on the worker.
+
+Response:
+    DONE 4
+    STAT <POSIX wait status>
+    SERR <length> <linker stderr>
+    SOUT <length> <linker stdout>
+    MODE <output permission bits, excluding special bits>
+    DOTO <length> <linked file>
+
+Failed jobs send MODE 0 and DOTO 0. Worker setup failures use exit code 100;
+linker failures retain the linker exit code. The client writes to a temporary
+file beside the requested output and replaces it only after a successful,
+complete response. It applies its umask to MODE.
+
+Sysroot transfer is separate from link jobs. distcc-link --sync uses rsync -az --checksum
+and --link-dest to create a new generation, verifies its content hash, normalizes
+symlinks to stay within the cached root, then publishes it by rename. The client
+profile is replaced only after all destinations are ready. Existing generations
+are not modified or garbage-collected, so active links retain their inputs.
