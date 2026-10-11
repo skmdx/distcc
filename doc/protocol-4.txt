@@ -18,22 +18,32 @@ Directories for library files are created by the worker. Job metadata is limited
 to 1 MiB and archives to 100,000 members and the existing 32-bit file length.
 
 job.json contains:
-    compiler: a GCC driver basename, including an optional target/version
+    compiler: a GCC or Clang driver basename, including an optional target/version
     target: the compiler's -dumpmachine result
-    version: the compiler's -dumpfullversion result
+    version: GCC -dumpfullversion or Clang -dumpversion
     key: the SHA-256 sysroot generation identifier
     args: a sequence of strings or one-key objects:
         {"input": "input-N.o"} selects an extracted file
         {"library_tree": "library-N"} supplies a transferred -L directory
         {"library_dir": "/usr/lib64"} supplies a directory inside the sysroot
+        {"sysroot_input": "usr/lib64/crti.o"} selects a cached linker input
 
-Only /lib, /lib64, /usr/lib and /usr/lib64 are accepted as library_dir values.
+Cached paths must be present in the published profile and cannot contain '..'.
+The standard /lib, /lib64, /usr/lib and /usr/lib64 directories are also accepted.
 The worker applies the option allowlist independently, checks input formats,
 and verifies the compiler target/version against the cached profile. It adds
 --sysroot, the GCC runtime -B directory, the cached client GCC specs, and its
 own temporary output path. Specs are part of the administrator-published
 profile and its content hash; jobs cannot supply arbitrary specs.
 The request cannot select an output path on the worker.
+
+Clang profiles have family="clang". Their args contain the client's single
+LLD invocation from clang -###, with input/search paths mapped as above.
+The worker validates the LLD option allowlist separately from GCC options and
+selects LLD through its matching Clang driver. Clang and LLD full versions must
+match. LLVM bitcode objects and ordinary archives are accepted, including
+full LTO and ThinLTO inputs. The cached sysroot is passed explicitly to LLD.
+Non-LLD links and multi-command driver pipelines remain local.
 
 Response:
     DONE 4

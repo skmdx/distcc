@@ -29,7 +29,7 @@ class LocalOnly(Exception):
     pass
 
 
-COMPILER = re.compile(r"(?:[A-Za-z0-9_.+-]+-)?(?:gcc|g\+\+)(?:-\d+(?:\.\d+)*)?\Z")
+COMPILER = re.compile(r"(?:[A-Za-z0-9_.+-]+-)?(?P<driver>gcc|g\+\+|clang|clang\+\+)(?:-\d+(?:\.\d+)*)?\Z")
 KEY = re.compile(r"[0-9a-f]{64}\Z")
 SAFE_FLAGS = {
     '-shared', '-static', '-pie', '-no-pie', '-pthread', '-rdynamic', '-s',
@@ -52,13 +52,49 @@ SAFE_LINKER_FLAGS = {
 }
 
 
-def compiler_identity(compiler):
-    if not COMPILER.fullmatch(Path(compiler).name):
+def compiler_family(compiler):
+    match = COMPILER.fullmatch(Path(compiler).name)
+    if not match:
         raise LocalOnly('unsupported compiler')
+    return 'clang' if match['driver'].startswith('clang') else 'gcc'
+
+
+def compiler_identity(compiler, target=None):
+    clang = compiler_family(compiler) == 'clang'
+    command = [compiler, *(['--target=' + target] if clang and target else [])]
     return {
-        'target': subprocess.check_output([compiler, '-dumpmachine'], text=True).strip(),
-        'version': subprocess.check_output([compiler, '-dumpfullversion'], text=True).strip(),
+        'target': subprocess.check_output([*command, '-dumpmachine'], text=True).strip(),
+        'version': subprocess.check_output([compiler, '-dumpversion' if clang else '-dumpfullversion'],
+                                           text=True).strip(),
     }
+
+
+def clang_link_args(command, version):
+    """Let the client's driver resolve configuration, runtimes and LTO flags.
+
+    Only a single LLD invocation is distributable. Source compilation and
+    offload pipelines still run locally with the original command.
+    """
+    result = subprocess.run([command[0], '-###', *command[1:]], capture_output=True, text=True)
+    commands = [shlex.split(line) for line in result.stderr.splitlines()
+                if line.lstrip().startswith('"')]
+    if (result.returncode or len(commands) != 1 or not commands[0] or
+            not re.fullmatch(r'ld\.lld(?:-\d+)?', Path(commands[0][0]).name)):
+        raise LocalOnly('Clang remote links require a single LLD invocation')
+    check_lld_version(commands[0][0], version)
+    return commands[0][1:]
+
+
+def check_lld_version(linker, version):
+    description = subprocess.check_output([str(linker), '--version'], text=True)
+    if not re.search(r'\bLLD\s+' + re.escape(version) + r'(?:\s|$)', description):
+        raise LocalOnly('Clang and LLD versions differ')
+
+
+def lld_for(compiler, version):
+    linker = subprocess.check_output([compiler, '-print-prog-name=ld.lld'], text=True).strip()
+    check_lld_version(linker, version)
+    return str(linker)
 
 
 def response_args(args, depth=0):
@@ -101,24 +137,53 @@ def validate_input(path):
         magic = stream.read(8)
     if magic == b'!<thin>\n':
         raise LocalOnly('thin archives require their referenced files')
-    if magic[:4] != b'\x7fELF' and magic != b'!<arch>\n':
+    if magic[:4] not in (b'\x7fELF', b'BC\xc0\xde', b'\xde\xc0\x17\x0b') and magic != b'!<arch>\n':
         raise LocalOnly('linker scripts require their referenced files')
 
 
 def prepare_job(command, profile, identity=None):
     compiler, *args = command
-    identity = identity or compiler_identity(compiler)
+    args = response_args(args)
+    if any(arg in ('-m16', '-m32', '-mx32', '-mabi=ilp32') for arg in args):
+        raise LocalOnly('non-default multilib links are not supported')
+    target = None
+    for index, arg in enumerate(args):
+        if arg in ('-target', '--target'):
+            if index + 1 == len(args):
+                raise LocalOnly('missing target')
+            target = args[index + 1]
+        elif arg.startswith(('--target=', '-target=')):
+            target = arg.split('=', 1)[1]
+    identity = identity or compiler_identity(compiler, target)
     if any(identity[k] != profile[k] for k in identity):
         raise LocalOnly('compiler and sysroot profile differ')
+    if compiler_family(compiler) != profile.get('family', 'gcc'):
+        raise LocalOnly('compiler family and sysroot profile differ')
     if not KEY.fullmatch(profile['key']):
         raise LocalOnly('invalid sysroot key')
-    args = response_args(args)
+    if compiler_family(compiler) == 'clang':
+        args = clang_link_args([compiler, *args], identity['version'])
+    return map_link_job(compiler, args, profile, identity)
+
+
+def map_link_job(compiler, args, profile, identity, source_root=None):
+    clang = compiler_family(compiler) == 'clang'
     mapped, inputs, file_names, library_dirs = [], {}, {}, {}
     output = 'a.out'
     index = 0
 
+    def cached_path(value):
+        root = Path(source_root or os.environ.get('DISTCC_LINK_SOURCE', '/')).absolute()
+        path = Path(os.path.normpath(value)).absolute()
+        name = str(path.relative_to(root)) if path.is_relative_to(root) else str(path).lstrip('/')
+        resolved, _ = resolve_inside(root, name)
+        return resolved if resolved in profile['state'] else None
+
     def input_file(value, archive_name=None):
         path = Path(value).absolute()
+        cached = cached_path(value) if clang and archive_name is None else None
+        if cached:
+            return {'sysroot_input': cached}
         if not path.is_file() or not re.search(r'\.(?:o|a|lo|so(?:\.[A-Za-z0-9_.-]+)?)$', path.name):
             raise LocalOnly('unsupported link input: ' + value)
         validate_input(path)
@@ -151,12 +216,15 @@ def prepare_job(command, profile, identity=None):
                     raise LocalOnly('missing library directory')
                 value = args[index]
                 index += 1
-            if value in ('/lib', '/lib64', '/usr/lib', '/usr/lib64'):
-                mapped.append({'library_dir': value})
+            cached = cached_path(value) if clang else None
+            if cached or value in ('/lib', '/lib64', '/usr/lib', '/usr/lib64'):
+                mapped.append({'library_dir': '/' + cached if cached else value})
             else:
                 directory = Path(value).absolute()
                 key = str(directory)
                 if not directory.is_dir():
+                    if clang:
+                        continue  # Driver search paths can include absent directories.
                     raise LocalOnly('library search directory does not exist')
                 if key not in library_dirs:
                     library_dirs[key] = 'library-' + str(len(library_dirs))
@@ -166,6 +234,26 @@ def prepare_job(command, profile, identity=None):
                 mapped.append({'library_tree': library_dirs[key]})
         elif not arg.startswith('-'):
             mapped.append(input_file(arg))
+        elif clang:
+            if arg in ('-m', '-dynamic-linker', '--dynamic-linker', '-z',
+                       '-rpath', '--rpath', '-soname', '--soname', '-h'):
+                if index == len(args) or not args[index] or args[index].startswith('-'):
+                    raise LocalOnly('missing linker option value')
+                value = args[index]
+                index += 1
+                if arg == '-m':
+                    if value not in ('aarch64linux', 'aarch64linuxb', 'elf_x86_64', 'elf_i386',
+                                     'armelf_linux_eabi', 'elf64lriscv', 'elf64lppc', 'elf64ppc'):
+                        raise LocalOnly('unsupported linker emulation')
+                elif arg == '-z':
+                    linker_flags('-Wl,-z,' + value)
+                mapped.extend((arg, value))
+            elif arg in SAFE_LINKER_FLAGS or arg in ('-pie', '-shared', '-static', '-s', '-EL', '-EB') or re.fullmatch(
+                    r'(?:-l[A-Za-z0-9_+.:-]+|-O[0-3]|--hash-style=(?:gnu|sysv|both)'
+                    r'|--build-id(?:=[A-Za-z0-9]+)?|-plugin-opt=(?:O[0-3]|thinlto|-enable-tlsdesc|mcpu=[A-Za-z0-9_.+-]+))', arg):
+                mapped.append(arg)
+            else:
+                raise LocalOnly('unsupported LLD option: ' + arg)
         elif arg in SAFE_FLAGS or re.fullmatch(
                 r'(?:-O[0-3sgz]|-g(?:[0-3]|gdb[0-3]?)?|-flto(?:=(?:auto|jobserver|\d+))?'
                 r'|-l[A-Za-z0-9_+.:-]+|-m(?:arch|cpu|tune|abi)=[A-Za-z0-9_.+-]+'
@@ -338,26 +426,38 @@ def worker(archive, output):
         compiler = job['compiler']
         if not isinstance(compiler, str) or Path(compiler).name != compiler:
             raise ValueError('invalid compiler name')
-        identity = compiler_identity(compiler)
+        clang = compiler_family(compiler) == 'clang'
+        if compiler_family(compiler) != profile.get('family', 'gcc'):
+            raise ValueError('compiler family does not match the sysroot')
+        identity = compiler_identity(compiler, profile['target'])
         if any(identity[k] != job[k] or identity[k] != profile[k] for k in identity):
             raise ValueError('link compiler does not match the sysroot')
-        gccdir = profile['gccdir']
-        if not re.fullmatch(r'usr/lib(?:64)?/gcc/[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+', gccdir):
+        gccdir = profile.get('gccdir', '')
+        if not clang and not re.fullmatch(r'usr/lib(?:64)?/gcc/[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+', gccdir):
             raise ValueError('invalid GCC runtime directory')
         args = []
         for arg in job['args']:
             if isinstance(arg, dict) and set(arg) == {'input'} and arg['input'] in names:
                 args.append(str(work / arg['input']))
-            elif isinstance(arg, dict) and set(arg) == {'library_dir'} and arg['library_dir'] in (
-                    '/lib', '/lib64', '/usr/lib', '/usr/lib64'):
-                args.append('-L' + str(sysroot / arg['library_dir'].lstrip('/')))
+            elif isinstance(arg, dict) and set(arg) in ({'library_dir'}, {'sysroot_input'}):
+                option, value = next(iter(arg.items()))
+                if not isinstance(value, str):
+                    raise ValueError('invalid cached input path')
+                relative = value.lstrip('/') if option == 'library_dir' else value
+                if (Path(relative).is_absolute() or '..' in Path(relative).parts or
+                    (relative not in profile['state'] and value not in ('/lib', '/lib64', '/usr/lib', '/usr/lib64'))):
+                    raise ValueError('input is not in the cached sysroot')
+                args.append(('-L' if option == 'library_dir' else '') + str(sysroot / relative))
             elif (isinstance(arg, dict) and set(arg) == {'library_tree'} and
                   isinstance(arg['library_tree'], str) and re.fullmatch(r'library-\d+', arg['library_tree'])):
                 directory = work / arg['library_tree']
                 directory.mkdir(exist_ok=True)
                 args.append('-L' + str(directory))
             elif isinstance(arg, str):
-                if not arg.startswith('-') or arg.startswith(('-L', '-o')):
+                operand = clang and args and args[-1] in (
+                    '-m', '-dynamic-linker', '--dynamic-linker', '-z',
+                    '-rpath', '--rpath', '-soname', '--soname', '-h')
+                if (not arg.startswith('-') and not operand) or arg.startswith(('-L', '-o')):
                     raise ValueError('unmapped path in link request')
                 args.append(arg)
             else:
@@ -365,12 +465,16 @@ def worker(archive, output):
         # Reapply the same allowlist on the server, independent of client trust.
         verify_profile = dict(profile, key=key)
         validation_args = [a for a in args if not a.startswith('-L')]
-        prepare_job([compiler, *validation_args, '-o', output], verify_profile, identity)
+        map_link_job(compiler, [*validation_args, '-o', output], verify_profile, identity, sysroot)
         # Native client specs can have an empty sysroot_spec; pass the cache
         # to ld explicitly as well as to the GCC driver's library search.
-        command = [compiler, '--sysroot=' + str(sysroot), '-B' + str(sysroot / gccdir) + '/',
-                   '-specs=' + str(sysroot / '.distcc-link.specs'),
-                   *args, '-Wl,--sysroot=' + str(sysroot), '-o', output]
+        if clang:
+            command = [lld_for(compiler, identity['version']), *args,
+                       '--sysroot=' + str(sysroot), '-o', output]
+        else:
+            command = [compiler, '--sysroot=' + str(sysroot), '-B' + str(sysroot / gccdir) + '/',
+                       '-specs=' + str(sysroot / '.distcc-link.specs'),
+                       *args, '-Wl,--sysroot=' + str(sysroot), '-o', output]
         result = subprocess.call(command)
         return result if result >= 0 else 128 - result
 
@@ -400,14 +504,20 @@ def library_files(root, profile):
     The source must be a stable snapshot for hashing and rsync to agree.
     """
     directories = ['lib', 'lib64', 'usr/lib', 'usr/lib64',
-                   'lib/' + profile['target'], 'usr/lib/' + profile['target'],
-                   profile['gccdir']]
+                   'lib/' + profile['target'], 'usr/lib/' + profile['target']]
+    if profile.get('gccdir'):
+        directories.append(profile['gccdir'])
+    directories.extend(profile.get('runtime_dirs', []))
+    directories.extend(profile.get('cxx_dirs', []))
     pending = []
     for directory in directories:
         name, links = resolve_inside(root, directory)
         pending.extend(links)
         if name is not None and (root / name).is_dir():
             for child in (root / name).iterdir():
+                if directory in profile.get('cxx_dirs', []) and not child.name.startswith(
+                        ('libc++', 'libunwind', 'libomp.')):
+                    continue
                 if child.name == 'specs' or re.search(
                         r'(?:\.so(?:\..*)?|\.a|\.o|\.ld|\.lds|\.spec|\.x[a-z]*)$', child.name):
                     pending.append(str(child.relative_to(root)))
@@ -444,15 +554,26 @@ def sysroot_digest(profile, root, files):
 
 def sysroot_identity(root, compiler):
     profile = compiler_identity(compiler)
+    clang = compiler_family(compiler) == 'clang'
     runtime = subprocess.check_output([compiler, '-print-file-name=crtbegin.o'], text=True).strip()
-    gccdir = Path(runtime).parent.as_posix().lstrip('/')
-    if not (root / gccdir / 'crtbegin.o').is_file():
+    gccdir = Path(os.path.normpath(runtime)).parent.as_posix().lstrip('/')
+    if not clang and not (root / gccdir / 'crtbegin.o').is_file():
         # A cross compiler may report paths inside its configured sysroot.
         gccdir = f"usr/lib/gcc/{profile['target']}/{profile['version'].split('.')[0]}"
-    if not (root / gccdir / 'crtbegin.o').is_file():
+    if not clang and not (root / gccdir / 'crtbegin.o').is_file():
         raise ValueError('GCC startup objects are missing from the source sysroot')
-    specs = subprocess.check_output([compiler, '-dumpspecs'], text=True)
-    profile.update(gccdir=gccdir, format=1, specs=specs)
+    profile['format'] = 1
+    if (root / gccdir / 'crtbegin.o').is_file():
+        profile['gccdir'] = gccdir
+    if clang:
+        executable = subprocess.check_output([compiler, '-print-prog-name=clang'], text=True).strip()
+        prefix = Path(executable).resolve().parent.parent
+        runtime = subprocess.check_output([compiler, '-print-runtime-dir'], text=True).strip()
+        profile.update(family='clang', runtime_dirs=[os.path.normpath(runtime).lstrip('/')],
+                       cxx_dirs=[str(prefix / lib).lstrip('/') for lib in ('lib', 'lib64')])
+        lld_for(compiler, profile['version'])
+    else:
+        profile['specs'] = subprocess.check_output([compiler, '-dumpspecs'], text=True)
     return profile
 
 
@@ -496,7 +617,8 @@ def publish(stage, key):
     identity = {k: v for k, v in profile.items() if k != 'key'}
     if sysroot_digest(identity, stage, library_files(stage, profile)) != key:
         raise ValueError('sysroot changed during transfer; use a stable snapshot')
-    (stage / '.distcc-link.specs').write_text(profile['specs'])
+    if profile.get('family', 'gcc') == 'gcc':
+        (stage / '.distcc-link.specs').write_text(profile['specs'])
     # Absolute links in the source root must not escape into the worker's root.
     for directory, dirs, files in os.walk(stage, followlinks=False):
         for name in dirs + files:
@@ -619,7 +741,10 @@ def main():
               '       distcc-link --sync SNAPSHOT COMPILER PROFILE CACHE_DIRECTORY...', file=sys.stderr)
         return 1
     try:
-        profile = json.loads(Path(os.environ['DISTCC_LINK_SYSROOT']).read_text())
+        path = Path(os.environ['DISTCC_LINK_SYSROOT'])
+        if path.is_dir():
+            path /= compiler_family(command[0]) + '.json'
+        profile = json.loads(path.read_text())
         check_source(profile)
         job, inputs, output = prepare_job(command, profile)
         result = remote_link(job, inputs, output)

@@ -15,11 +15,23 @@ import unittest
 from test_broker import BrokerTestCase
 
 
-class LinkTest(BrokerTestCase):
+class LinkTestCase(BrokerTestCase):
+    compiler = 'g++'
+    sync_compiler = 'gcc'
+
     @classmethod
     def setUpClass(cls):
         if not shutil.which('rsync') or not shutil.which('g++'):
             raise unittest.SkipTest('rsync and GCC C++ are required')
+        if not shutil.which(cls.compiler):
+            raise unittest.SkipTest(cls.compiler + ' is required')
+        if cls.sync_compiler == 'clang':
+            linker = subprocess.check_output(['clang', '-print-prog-name=ld.lld'], text=True).strip()
+            if not shutil.which(linker):
+                raise unittest.SkipTest('LLD is required for Clang remote links')
+            version = subprocess.check_output(['clang', '-dumpversion'], text=True).strip()
+            if ('LLD ' + version + ' ') not in subprocess.check_output([linker, '--version'], text=True):
+                raise unittest.SkipTest('matching Clang and LLD versions are required')
         cls.link_storage = tempfile.TemporaryDirectory(prefix='distcc-link-tests-')
         cls.addClassCleanup(cls.link_storage.cleanup)
         cls.link_root = Path(cls.link_storage.name)
@@ -54,14 +66,24 @@ class LinkTest(BrokerTestCase):
             target = cls.snapshot / str(file).lstrip('/')
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(file, target)
-        cls.link_env = dict(os.environ, PATH=str(Path.cwd()) + os.pathsep + os.defpath)
+        if cls.sync_compiler == 'clang':
+            runtime = Path(subprocess.check_output(['clang', '-print-runtime-dir'], text=True).strip())
+            for file in runtime.glob('libclang_rt.builtins*.a'):
+                target = cls.snapshot / os.path.normpath(str(file)).lstrip('/')
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(file, target)
+        cls.link_path = os.pathsep.join((str(Path.cwd()), str(Path(shutil.which(cls.compiler)).parent), os.defpath))
+        cls.link_env = dict(os.environ, PATH=cls.link_path)
         cls.helper = Path.cwd() / 'distcc-link'
         cls.profile_file = cls.link_root / 'profile.json'
-        subprocess.run([str(cls.helper), '--sync', str(cls.snapshot), 'gcc', str(cls.profile_file), str(cls.cache)],
-                                env=cls.link_env, check=True, capture_output=True, text=True, timeout=30)
+        sync = subprocess.run([str(cls.helper), '--sync', str(cls.snapshot), cls.sync_compiler,
+                               str(cls.profile_file), str(cls.cache)],
+                              env=cls.link_env, capture_output=True, text=True, timeout=30)
+        if sync.returncode:
+            raise RuntimeError(sync.stderr)
         cls.profile = json.loads(cls.profile_file.read_text())
         cls.daemon_env = {'DISTCCD_LINK_ROOT': str(cls.cache),
-                          'DISTCCD_PATH': str(Path.cwd()) + os.pathsep + os.defpath}
+                          'DISTCCD_PATH': cls.link_path}
         super().setUpClass()
 
     def setUp(self):
@@ -69,20 +91,21 @@ class LinkTest(BrokerTestCase):
         self.start_broker()
         self.env.update(DISTCC_LINK_SYSROOT=str(self.profile_file), DISTCC_VERBOSE='1',
                         DISTCC_LINK_SOURCE=str(self.snapshot),
-                        PATH=str(self.build) + os.pathsep + os.defpath)
+                        PATH=self.link_path)
         self.cpp = self.work / 'hello.cc'
         self.cpp.write_text('#include <iostream>\nint main() { std::cout << "linked\\n"; }\n')
         self.obj = self.work / 'hello.o'
-        subprocess.run([str(self.build / 'distcc'), 'g++', '-c', str(self.cpp), '-o', str(self.obj)],
+        subprocess.run([str(self.build / 'distcc'), self.compiler, '-c', str(self.cpp), '-o', str(self.obj)],
                        env=self.env, check=True, capture_output=True, timeout=15)
 
     def link(self, args=()):
         output = self.work / 'hello'
-        result = subprocess.run([str(self.build / 'distcc'), 'g++', str(self.obj),
+        result = subprocess.run([str(self.build / 'distcc'), self.compiler, str(self.obj),
                                  *args, '-o', str(output)], env=self.env, capture_output=True,
                                 text=True, timeout=15)
         return output, result
 
+class LinkTest(LinkTestCase):
     def test_cpp_remote_link_matches_local(self):
         output, result = self.link(['-O3', '-pipe', '-fomit-frame-pointer', '-fno-plt',
                                    '-fno-asynchronous-unwind-tables', '-fno-common',
@@ -221,6 +244,80 @@ class LinkTest(BrokerTestCase):
         self.assertEqual(int(reply[16:24], 16) >> 8, 100)
         self.assertIn(b'invalid link archive member', reply)
         self.assertFalse((self.root / 'escaped').exists())
+
+
+class ClangLinkTest(LinkTestCase):
+    compiler = 'clang++'
+    sync_compiler = 'clang'
+
+    def link(self, args=()):
+        return super().link(['-fuse-ld=lld', *args])
+
+    def test_cpp_remote_link_matches_local(self):
+        output, result = self.link()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-link: linked on ', result.stderr)
+        local = self.work / 'local'
+        subprocess.run([self.compiler, '-fuse-ld=lld', str(self.obj), '-o', str(local)],
+                       check=True, capture_output=True)
+        self.assertEqual(local.read_bytes(), output.read_bytes())
+        self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
+
+    def test_lto(self):
+        for mode in ('thin', 'full'):
+            with self.subTest(mode=mode):
+                flag = '-flto=' + mode
+                subprocess.run([self.compiler, flag, '-c', str(self.cpp), '-o', str(self.obj)],
+                               check=True, capture_output=True)
+                output, result = self.link([flag])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-link: linked on ', result.stderr)
+                self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
+
+    def test_compiler_rt_from_cache(self):
+        self.assertTrue(any('libclang_rt.builtins' in name for name in self.profile['state']))
+        output, result = self.link(['--rtlib=compiler-rt', '--unwindlib=libgcc'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-link: linked on ', result.stderr)
+        self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
+
+    def test_profile_directory_selects_clang(self):
+        profiles = self.work / 'profiles'
+        profiles.mkdir()
+        shutil.copyfile(self.profile_file, profiles / 'clang.json')
+        self.env['DISTCC_LINK_SYSROOT'] = str(profiles)
+        _, result = self.link()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-link: linked on ', result.stderr)
+
+    def test_other_linker_stays_local(self):
+        _, result = self.link(['-fuse-ld=bfd'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('single LLD invocation', result.stderr)
+        self.assertNotIn('distcc-link: linked on ', result.stderr)
+
+    def test_worker_rejects_linker_side_output(self):
+        outside = self.work / 'unauthorized.map'
+        job = dict(compiler=self.compiler, target=self.profile['target'],
+                   version=self.profile['version'], key=self.profile['key'],
+                   args=[{'input': 'input-0.o'}, '--Map=' + str(outside)])
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w') as tar:
+            for name, data in [('job.json', json.dumps(job).encode()),
+                               ('input-0.o', self.obj.read_bytes())]:
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                tar.addfile(member, io.BytesIO(data))
+        data = archive.getvalue()
+        with socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5) as net:
+            net.sendall(b'DIST00000004' + f'LINK{len(data):08x}'.encode() + data)
+            reply = b''
+            while chunk := net.recv(65536):
+                reply += chunk
+        self.assertEqual(reply[:16], b'DONE00000004STAT')
+        self.assertEqual(int(reply[16:24], 16) >> 8, 100)
+        self.assertIn(b'unsupported LLD option', reply)
+        self.assertFalse(outside.exists())
 
 
 if __name__ == '__main__':
