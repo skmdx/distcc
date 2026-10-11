@@ -29,10 +29,10 @@
 /* This is local IPC between matching versions, never a network protocol.
  * The control connection is a lease: EOF releases the reserved slot. Bulk
  * compiler traffic goes directly over the descriptor sent with the reply. */
-#define BROKER_VERSION 1
+#define BROKER_VERSION 2
 #define MAX_HOSTS 128
 #define MAX_CLIENTS 256
-enum { ACQUIRE = 1, JOBS = 2 };
+enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3 };
 struct request { uint32_t version, command; };
 struct reply { int32_t status, slots; char host[1024]; };
 
@@ -48,7 +48,7 @@ struct peer {
 };
 enum client_state { REQUEST, WAITING, CONNECTING, ACTIVE };
 struct client {
-    int fd, net, peer;
+    int fd, net, peer, cpp_reserved;
     enum client_state state;
     uint32_t command;
     double deadline;
@@ -56,7 +56,7 @@ struct client {
 struct broker {
     struct peer peers[MAX_HOSTS];
     struct client clients[MAX_CLIENTS];
-    int count;
+    int count, cpp_busy, cpp_limit;
     double refresh_at, first_probe_until;
 };
 
@@ -180,6 +180,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease)
     }
     (*host)->broker_managed = 1;
     (*host)->broker_fd = net;
+    (*host)->broker_lease = fd;
     *lease = fd;
     return 0;
 }
@@ -192,6 +193,14 @@ int dcc_broker_jobs(void)
         return -1;
     close(fd);
     return reply.slots;
+}
+
+void dcc_broker_cpp_done(const struct dcc_hostdef *host)
+{
+    struct request request = { BROKER_VERSION, CPP_DONE };
+    if (host->broker_managed &&
+        send(host->broker_lease, &request, sizeof(request), MSG_NOSIGNAL) != sizeof(request))
+        rs_log_warning("could not release broker preprocessing reservation");
 }
 
 static int connect_peer(const struct peer *peer, int port)
@@ -255,6 +264,8 @@ static void probe_event(struct peer *peer, double now)
 
 static void release_client(struct broker *broker, struct client *client)
 {
+    broker->cpp_busy -= client->cpp_reserved;
+    client->cpp_reserved = 0;
     if (client->peer >= 0)
         broker->peers[client->peer].busy--;
     if (client->net >= 0)
@@ -288,7 +299,7 @@ static int dispatch(struct broker *broker, struct client *client, double now)
         reply.status = available ? 0 : EXIT_CONNECT_FAILED;
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
-    } else if (best >= 0) {
+    } else if (best >= 0 && broker->cpp_busy < broker->cpp_limit) {
         struct peer *p = &broker->peers[best];
         client->net = connect_peer(p, p->host->port);
         if (client->net < 0) {
@@ -299,6 +310,8 @@ static int dispatch(struct broker *broker, struct client *client, double now)
         client->state = CONNECTING;
         client->deadline = now + 3;
         p->busy++;
+        broker->cpp_busy++;
+        client->cpp_reserved = 1;
     }
     return 0;
 }
@@ -311,15 +324,16 @@ static void connection_event(struct broker *broker, struct client *client,
     if (timed_out || connected(client->net)) {
         peer->retry_at = now + 5;
         peer->busy--;
+        broker->cpp_busy--;
+        client->cpp_reserved = 0;
         close(client->net);
         client->net = client->peer = -1;
         client->state = WAITING;
         return;
     }
     strcpy(reply.host, peer->host->hostdef_string);
-    /* SCM_RIGHTS shares the open file description, including O_NONBLOCK. */
-    if (fcntl(client->net, F_SETFL, 0) ||
-        send_reply(client->fd, &reply, client->net)) {
+    /* Preserve O_NONBLOCK: the client's IO helpers implement deadlines. */
+    if (send_reply(client->fd, &reply, client->net)) {
         release_client(broker, client);
         return;
     }
@@ -391,6 +405,7 @@ static int initialize(struct broker *broker, struct dcc_hostdef *hosts)
 {
     struct dcc_hostdef *host;
     int i;
+    broker->cpp_limit = dcc_hostdef_local_cpp->n_slots;
     for (i = 0; i < MAX_CLIENTS; i++)
         broker->clients[i].fd = broker->clients[i].net = broker->clients[i].peer = -1;
     for (host = hosts; host; host = host->next) {
@@ -554,6 +569,13 @@ int dcc_broker_serve(const char *path)
             if (polls[control_index[i]].revents) {
                 struct request request;
                 ssize_t length = recv(c->fd, &request, sizeof(request), MSG_TRUNC);
+                if (c->state == ACTIVE && length == sizeof(request) &&
+                    request.version == BROKER_VERSION && request.command == CPP_DONE &&
+                    c->cpp_reserved) {
+                    broker->cpp_busy--;
+                    c->cpp_reserved = 0;
+                    continue;
+                }
                 if (c->state != REQUEST || length != sizeof(request) ||
                     request.version != BROKER_VERSION ||
                     (request.command != ACQUIRE && request.command != JOBS)) {
@@ -605,5 +627,9 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease)
 int dcc_broker_jobs(void)
 {
     return -1;
+}
+void dcc_broker_cpp_done(const struct dcc_hostdef *host)
+{
+    (void)host;
 }
 #endif

@@ -88,6 +88,10 @@ Successful metrics expire after five seconds; unavailable statistics use
 configured slots and speed. Selection uses the same adaptive capacity formula
 as the client. It passes connected TCP sockets to clients without relaying
 source files or object data. Each compilation still uses a new TCP connection.
+It also reserves a local preprocessing slot before dispatch and releases it
+as soon as preprocessing finishes, allowing the next request to start without
+polling lock files. The broker's --localslots_cpp setting is the shared ceiling;
+clients retain their local file locks to coexist with direct clients.
 .PP
 Set DISTCC_BROKER in clients to the absolute socket path. The broker exits
 after DISTCC_BROKER_IDLE seconds without a request and with no connected

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Broker IPC, lifetime and scheduling with real distccd/GCC workers."""
 import array
+import fcntl
 import concurrent.futures
 import os
 from pathlib import Path
@@ -48,7 +49,7 @@ class BrokerTest(DistccTestCase):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
-        sock.sendall(struct.pack("=II", 1, command))
+        sock.sendall(struct.pack("=II", 2, command))
         self.addCleanup(sock.close)
         return sock
 
@@ -108,6 +109,25 @@ class BrokerTest(DistccTestCase):
         second.close()
         self.assertEqual(proc.wait(timeout=3), 0)
         self.assertFalse(Path(self.env["DISTCC_BROKER"]).exists())
+
+    def test_preprocessing_reservation_released_before_compile_finishes(self):
+        self.start_broker(self.host(0) + " --localslots_cpp=1")
+        first = self.request()
+        status, _, fds = self.receive(first)
+        self.assertEqual(status, 0)
+        for fd in fds:
+            self.assertTrue(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_NONBLOCK)
+            os.close(fd)
+        second = self.request()
+        second.settimeout(.15)
+        with self.assertRaises(socket.timeout):
+            second.recv(1032)
+        first.sendall(struct.pack("=II", 2, 3))
+        second.settimeout(2)
+        status, _, fds = self.receive(second)
+        self.assertEqual(status, 0)
+        for fd in fds:
+            os.close(fd)
 
     def test_stats_refresh_does_not_block_warm_requests(self):
         slow = self.peer(stats_response(), delay=.8)

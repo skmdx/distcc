@@ -45,6 +45,7 @@
 #include "util.h"
 #include "clinet.h"
 #include "hosts.h"
+#include "broker.h"
 #include "exec.h"
 #include "lock.h"
 #include "compile.h"
@@ -322,6 +323,7 @@ int dcc_compile_remote(char **argv,
             dcc_unlock(local_cpu_lock_fd);
             local_cpu_lock_fd = -1;
         }
+        dcc_broker_cpp_done(host);
 
         if (*status != 0)
             goto out;
@@ -332,6 +334,8 @@ int dcc_compile_remote(char **argv,
     }
 
     rs_trace("client finished sending request to server");
+    if (host->cpp_where == DCC_CPP_ON_SERVER)
+        dcc_broker_cpp_done(host);
     tcp_cork_sock(to_net_fd, 0);
     /* but it might not have been read in by the server yet; there's
      * 100kB or more of buffers in the two kernels. */
