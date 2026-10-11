@@ -46,6 +46,7 @@
 #include "exitcode.h"
 #include "util.h"
 #include "hosts.h"
+#include "adaptive.h"
 #include "bulk.h"
 #include "implicit.h"
 #include "compile.h"
@@ -180,8 +181,12 @@ static void dcc_concurrency_level(void) {
         return;
     }
 
-    for (l = list; l; l = l->next)
-        nslots += l->n_slots;
+    for (l = list; l; l = l->next) {
+        int slots = l->n_slots;
+        if (l->stats_port)
+            dcc_host_capacity(l, &slots);
+        nslots += slots;
+    }
 
     dcc_free_hostlist(list);
 

@@ -453,7 +453,7 @@ be listed in descending order of speed.  In particular, when only a
 single compilation can be run (such as from a configure script), the
 first machine listed is used (but see
 .I --randomize
-below).
+and adaptive scheduling below).
 .PP
 Placing
 .I localhost
@@ -516,7 +516,7 @@ The syntax is
   OLDSTYLE_TCP_HOST = HOSTID[/LIMIT][:PORT][OPTIONS]
   HOSTID = HOSTNAME | IPV4 | IPV6
   OPTIONS = ,OPTION[OPTIONS]
-  OPTION = lzo | cpp | auth[=AUTH_NAME]
+  OPTION = lzo | cpp | auth[=AUTH_NAME] | stats=PORT | speed=FACTOR
   GLOBAL_OPTION = --randomize
   ZEROCONF = +zeroconf
 .fi
@@ -565,7 +565,35 @@ A decimal limit can be added to any host specification to restrict the
 number of jobs that this client will send to the machine.  The limit
 defaults to four per host (two for localhost), but may be further
 restricted by the server.  You should only need to increase this for
-servers with more than two processors.
+servers with more than two processors. With stats=PORT and valid server
+metrics, the default is the smaller of the online CPU count and server job
+limit; an explicit /LIMIT is an additional ceiling. The -j option reports
+these discovered limits.
+.TP
+.B ,stats=PORT
+Enable adaptive scheduling using the TCP host's distccd HTTP statistics port
+(normally 3633). The server must run with --stats and report dcc_cpus,
+dcc_max_kids and dcc_load1. Requires this fork's server for dcc_cpus.
+The client chooses the smallest (busy_slots + 1) * (1 + load1 / cpus) /
+(slots * speed) among hosts with free slots. Load is the one-minute average;
+it reduces preference without preventing progress on an overloaded cluster.
+Statistics are shared by clients using the same DISTCC_DIR within each
+wall-clock second. A failed or invalid probe falls back to configured slots
+and speed, with a warning. Each uncached probe, including DNS, is limited
+to 250ms; hosts are probed sequentially. HTTP statistics use the daemon's
+access rules but are not authenticated by GSSAPI. CPU quotas and memory
+pressure are not accounted for.
+.TP
+.B ,speed=FACTOR
+Relative per-core compilation throughput (0.01 to 1000, default 1).
+Use reference compile time divided by this host's compile time for a
+representative single-job workload on idle machines with the same compiler.
+This option also enables adaptive scheduling without statistics, using the
+configured slot count. It works with TCP or SSH. Mixed lists use configured
+slots and speed 1 for hosts without metrics. Ties follow host-list order;
+duplicate lock endpoints use the first entry. Without stats or speed options,
+host selection is unchanged. Per-client slot locks are held until job completion;
+the server's --jobs limit still bounds work from multiple clients.
 .TP
 .B ,lzo
 Enables LZO compression for this TCP or SSH host.

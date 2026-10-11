@@ -94,7 +94,7 @@ const char * dcc_find_extension_const(const char *sfile) {
  **/
 const char * dcc_find_basename(const char *sfile)
 {
-    char *slash;
+    const char *slash;
 
     if (!sfile)
         return sfile;
@@ -324,7 +324,7 @@ int dcc_output_from_source(const char *sfile,
                            const char *out_extn,
                            char **ofile)
 {
-    char *slash;
+    const char *slash;
 
     if ((slash = strrchr(sfile, '/')))
         sfile = slash+1;

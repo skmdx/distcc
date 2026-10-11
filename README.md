@@ -52,6 +52,56 @@ kernel, rsync, KDE, GNOME (via GARNOME), Samba and Ethereal.  distcc
 is nearly linearly scalable for small numbers of machines: for a
 typical case, three machines are 2.6 times faster than one.
 
+## Adaptive scheduling (this fork)
+
+This fork adds opt-in allocation by online CPU count, one-minute load average,
+and relative per-core compilation speed. Start each server with `distccd --stats`
+in addition to its usual listen/access options, then configure the client:
+
+```sh
+export DISTCC_HOSTS='builder-a,stats=3633,speed=1 builder-b,stats=3633,speed=2'
+make -j"$(distcc -j)" CC='distcc gcc' CXX='distcc g++'
+```
+
+`speed=2` means twice the per-core compile throughput of `speed=1`. Measure a
+representative single-job compile with the same compiler/options on idle hosts
+and use `reference_time / host_time`. The default is 1; CPU clock frequency is
+not used as a performance estimate. Valid factors range from 0.01 to 1000.
+
+With `stats=PORT`, the slot limit defaults to the smaller of the server's online
+CPU count and `--jobs` limit. An explicit `/LIMIT`, for example
+`builder-a/8,stats=3633`, adds a client-side ceiling. `distcc -j` reports these
+limits. Servers without statistics retain their configured slot count (default
+4). An old server without the new `dcc_cpus` metric also uses this fallback.
+
+For each host with a free slot, the client minimizes
+`(busy_slots + 1) * (1 + load1 / cpus) / (slots * speed)`. This favors faster,
+larger, less loaded hosts while keeping slot reservations until compilation
+finishes. Load is a weighting signal, not a stop threshold: an entirely busy
+cluster still makes progress. The slot counts coordinate processes sharing
+`DISTCC_DIR`; the daemon's `--jobs` limit remains the cluster-wide safeguard.
+Online CPUs and system-wide load do not model container CPU quotas or memory
+pressure.
+
+Statistics successes and failures are shared within each wall-clock second in
+`DISTCC_DIR/lock`. Each uncached probe has a 250ms deadline including DNS; probes
+are sequential across hosts. Unavailable or invalid statistics produce a warning
+and use configured slots/speed until the next refresh. The stats endpoint must
+be reachable from the client and uses the daemon's existing access rules; it is
+plain HTTP, including when compilation uses GSSAPI. `stats` requires a TCP host.
+`speed` alone also enables weighted selection and can be used with SSH hosts.
+In mixed lists, entries without metrics use their configured slots and speed 1.
+Ties follow list order (`--randomize` can change that order). Repeated entries for
+the same lock endpoint use the first entry. Lists without either new option
+retain the original selection algorithm. Compression and pump options can be
+combined with adaptive options.
+
+Build using the usual `./autogen.sh`, `./configure`, and `make` steps.
+`make adaptive-check` runs real GCC compiles through two local daemons, checks
+the linked executables, and exercises controlled load/error responses and slot
+locking. Set `TMPDIR` to a suitable temporary directory. `make check` includes
+these tests and the existing regression suites.
+
 ## Licence
 
 distcc is distributed under the GNU General Public Licence v2.

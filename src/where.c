@@ -76,11 +76,13 @@
 #include "lock.h"
 #include "where.h"
 #include "exitcode.h"
+#include "adaptive.h"
 
 
 static int dcc_lock_one(struct dcc_hostdef *hostlist,
                         struct dcc_hostdef **buildhost,
                         int *cpu_lock_fd);
+static void dcc_lock_pause(void);
 
 
 void dcc_read_localslots_configuration(void)
@@ -103,6 +105,7 @@ int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
                             int *cpu_lock_fd)
 {
     struct dcc_hostdef *hostlist;
+    struct dcc_hostdef *h;
     int ret;
     int n_hosts;
 
@@ -117,6 +120,14 @@ int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
         return EXIT_NO_HOSTS;
     }
 
+    for (h = hostlist; h; h = h->next) {
+        if (h->stats_port || h->speed) {
+            while ((ret = dcc_lock_adaptive(hostlist, buildhost, cpu_lock_fd))
+                   == EXIT_BUSY)
+                dcc_lock_pause();
+            return ret;
+        }
+    }
     return dcc_lock_one(hostlist, buildhost, cpu_lock_fd);
 
     /* FIXME: Host list is leaked? */

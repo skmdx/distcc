@@ -105,7 +105,8 @@ struct dcc_hostdef _dcc_local = {
     0,                          /* Authentication? */
     NULL,                       /* Authentication name */
 #endif
-    NULL
+    NULL,
+    0, 0, 0                     /* adaptive statistics, speed, explicit limit */
 };
 
 struct dcc_hostdef *dcc_hostdef_local = &_dcc_local;
@@ -126,7 +127,8 @@ struct dcc_hostdef _dcc_local_cpp = {
     0,                          /* Authentication? */
     NULL,                       /* Authentication name */
 #endif
-    NULL
+    NULL,
+    0, 0, 0                     /* adaptive statistics, speed, explicit limit */
 };
 
 struct dcc_hostdef *dcc_hostdef_local_cpp = &_dcc_local_cpp;
@@ -241,8 +243,8 @@ int dcc_unlock(int lock_fd)
  **/
 int dcc_open_lockfile(const char *fname, int *plockfd)
 {
-    /* Create if it doesn't exist.  We don't actually do anything with
-     * the file except lock it.
+    /* Create if it doesn't exist. Adaptive statistics locks also contain
+     * the shared cache, read and written while the lock is held.
      *
      * The file is created with the loosest permissions allowed by the user's
      * umask, to give the best chance of avoiding problems if they should
@@ -250,7 +252,7 @@ int dcc_open_lockfile(const char *fname, int *plockfd)
     /* FIXME: If we fail to open with EPERM or something similar, try deleting
      * the file and try again.  That might fix problems with root-owned files
      * in user home directories. */
-    *plockfd = open(fname, O_WRONLY|O_CREAT, 0666);
+    *plockfd = open(fname, O_RDWR|O_CREAT, 0666);
     if (*plockfd == -1 && errno != EEXIST) {
         rs_log_error("failed to create %s: %s", fname, strerror(errno));
         return EXIT_IO_ERROR;
@@ -283,7 +285,7 @@ int dcc_lock_host(const char *lockname,
 
     /* if host is down, return EXIT_BUSY */
     if (!host->is_up)
-    return EXIT_BUSY;
+        return EXIT_BUSY;
 
     if ((ret = dcc_make_lock_filename(lockname, host, slot, &fname)))
         return ret;

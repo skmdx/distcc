@@ -364,6 +364,7 @@ static void dcc_service_stats_request(int http_fd) {
     double loadavg[3];
     int free_space_mb;
     int free_mem_mb;
+    int ncpus;
     ssize_t ret;
 
     const char replytemplate[] = "\
@@ -384,6 +385,7 @@ dcc_longest_job %s\n\
 dcc_longest_job_compiler %s\n\
 dcc_longest_job_time_msecs %d\n\
 dcc_max_kids %d\n\
+dcc_cpus %d\n\
 dcc_avg_kids1 %d\n\
 dcc_avg_kids2 %d\n\
 dcc_avg_kids3 %d\n\
@@ -405,6 +407,7 @@ dcc_free_mem %d MB\n\
     dcc_stats_minutely_update(); /* force update to get fresh disk io data */
     ct = dcc_stats_get_compile_totals();
     dcc_getloadavg(loadavg);
+    dcc_ncpus(&ncpus);
 
     free_space_mb = dcc_get_tmpdirinfo();
     dcc_get_proc_stats(&num_D, &free_mem_mb, &max_RSS, &max_RSS_name);
@@ -418,7 +421,7 @@ dcc_free_mem %d MB\n\
     if (dcc_check_client((struct sockaddr *)&cli_addr,
                          (int) cli_len,
                          opt_allowed) == 0) {
-        reply_len = snprintf(reply, 2048, replytemplate,
+        reply_len = snprintf(reply, sizeof(reply), replytemplate,
                                dcc_stats.counters[STATS_TCP_ACCEPT],
                                dcc_stats.counters[STATS_REJ_BAD_REQ],
                                dcc_stats.counters[STATS_REJ_OVERLOAD],
@@ -431,6 +434,7 @@ dcc_free_mem %d MB\n\
                                dcc_stats.longest_job_compiler,
                                dcc_stats.longest_job_time,
                                dcc_max_kids,
+                               ncpus,
                                dcc_stats.kids_avg[0],
                                dcc_stats.kids_avg[1],
                                dcc_stats.kids_avg[2],
@@ -442,6 +446,10 @@ dcc_free_mem %d MB\n\
                                free_space_mb,
                                free_mem_mb
                                );
+        if (reply_len >= sizeof(reply)) {
+            rs_log_warning("statistics response truncated");
+            reply_len = sizeof(reply) - 1;
+        }
         dcc_set_nonblocking(acc_fd);
         ret = read(acc_fd, challenge, 1024); /* empty the receive queue */
         if (ret < 0) rs_log_info("read on acc_fd failed");

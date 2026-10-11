@@ -48,7 +48,7 @@
   OLDSTYLE_TCP_HOST = HOSTID[/LIMIT][:PORT][OPTIONS]
   HOSTID = HOSTNAME | IPV4
   OPTIONS = ,OPTION[OPTIONS]
-  OPTION = lzo | cpp
+  OPTION = lzo | cpp | stats=PORT | speed=FACTOR
   GLOBAL_OPTION = --randomize
  *
  * Any amount of whitespace may be present between hosts.
@@ -225,6 +225,7 @@ static int dcc_parse_multiplier(const char **psrc, struct dcc_hostdef *hostdef)
         while (isdigit((uint8_t)**psrc))
             (*psrc)++;
         hostdef->n_slots = val;
+        hostdef->slots_specified = 1;
     }
     return 0;
 }
@@ -262,6 +263,27 @@ static int dcc_parse_options(const char **psrc,
             rs_trace("got CPP option");
             host->cpp_where = DCC_CPP_ON_SERVER;
             p += 3;
+        } else if (str_startswith("stats=", p)) {
+            char *end;
+            long port;
+            p += 6;
+            errno = 0;
+            port = strtol(p, &end, 10);
+            if (end == p || errno || port < 1 || port > 65535 ||
+                (*end && *end != ',' && !isspace((unsigned char)*end)))
+                return EXIT_BAD_HOSTSPEC;
+            host->stats_port = port;
+            p = end;
+        } else if (str_startswith("speed=", p)) {
+            char *end;
+            p += 6;
+            errno = 0;
+            host->speed = strtod(p, &end);
+            if (end == p || errno ||
+                !(host->speed >= 0.01 && host->speed <= 1000) ||
+                (*end && *end != ',' && !isspace((unsigned char)*end)))
+                return EXIT_BAD_HOSTSPEC;
+            p = end;
 #ifdef HAVE_GSSAPI
         } else if (str_startswith("auth", p)) {
             rs_trace("got GSSAPI option");
@@ -608,6 +630,11 @@ int dcc_parse_hosts(const char *where, const char *source_name,
             rs_trace("found tcp token \"%.*s\"", token_len, token_start);
             if ((ret = dcc_parse_tcp_host(curr, token_start)) != 0)
                 return ret;
+        }
+
+        if (curr->stats_port && curr->mode != DCC_MODE_TCP) {
+            rs_log_error("stats requires a TCP host");
+            return EXIT_BAD_HOSTSPEC;
         }
 
         if (!curr->is_up) {

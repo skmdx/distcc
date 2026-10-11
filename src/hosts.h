@@ -66,6 +66,11 @@ struct dcc_hostdef {
 #endif
 
     struct dcc_hostdef *next;
+
+    /** Optional HTTP statistics port and relative per-core compile speed. */
+    int stats_port;
+    double speed;
+    int slots_specified;
 };
 
 /** Static definition of localhost **/

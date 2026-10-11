@@ -204,6 +204,8 @@ wizards only.
 .B --stats
 Turn on the statistics HTTP server. By default it is off.
 (Daemon mode only.)
+This fork also reports dcc_cpus (online logical CPU count), alongside
+dcc_max_kids and dcc_load1, for clients using the stats=PORT host option.
 .TP
 .B --stats-port PORT
 Set the TCP port to listen on for HTTP requests, rather than the default of 3633.
