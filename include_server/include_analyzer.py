@@ -242,6 +242,8 @@ class IncludeAnalyzer(object):
     # directory.
     os.chdir(self.include_server_cwd)
     self.DoStatResetTriggers()
+    if self.build_stat_cache.file_stamps.Changed():
+      self.ClearStatCaches()
 
     # Now change to the distcc client's working directory.
     # That'll let us use os.path.join etc without including currdir explicitly.
@@ -272,7 +274,7 @@ class IncludeAnalyzer(object):
     # few of them.
     links = self.compiler_defaults.system_links + self.mirror_path.Links()
     files = self.compress_files.Compress(include_closure, client_root_keeper,
-                                         self.currdir_idx)
+                                         self.currdir_idx, '-E' in cmd)
 
     files_and_links = files + links
 
@@ -280,6 +282,12 @@ class IncludeAnalyzer(object):
     # to forced include directories, unless disabled with --no_force_dirs
     if basics.opt_no_force_dirs == False:
       files_and_links += self._ForceDirectoriesToExist()
+
+    # Never publish a manifest assembled from changing inputs. Previous
+    # manifests keep their immutable generation until the build finishes.
+    if self.build_stat_cache.file_stamps.Changed():
+      self.ClearStatCaches()
+      raise NotCoveredError("Input changed while collecting includes")
 
     realpath_map = self.realpath_map
 

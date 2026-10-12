@@ -76,9 +76,9 @@ Description:
       make -j80
       pump --shutdown
 
-  Note that distcc-pump assumes that sources files will not be modified during
-  the lifetime of the include server, so modifying source files during a build
-  may cause inconsistent results.
+  Changes to previously analyzed sources, headers and failed include lookups
+  invalidate the cached include graph automatically. Build dependencies must
+  still prevent changing an input while its compilation is running.
 
 Environment variables (all optional):
 
@@ -470,7 +470,7 @@ StartIncludeServerAndDetermineHosts() {
       if [ $num_hosts -eq 0 ]; then
         echo "$program_name: error: distcc hosts list is empty!" 1>&2
         exit 1
-      elif [ $num_pump_hosts -eq 0 ]; then
+      elif [ $num_pump_hosts -eq 0 ] && [ -z "$DISTCC_BROKER" ]; then
         echo "$program_name: error: pump mode requested, but distcc" \
           "hosts list does not contain any hosts with ',cpp' option" 1>&2
         exit 1
@@ -501,6 +501,9 @@ DumpEnvironmentVariables() {
   echo export INCLUDE_SERVER_DIR=\'$socket_dir\'
   # Variables used by the distcc client
   echo export INCLUDE_SERVER_PORT=\'$INCLUDE_SERVER_PORT\'
+  if [ -n "$DISTCC_CLIENT_TMP" ]; then
+    echo export DISTCC_CLIENT_TMP=\'$DISTCC_CLIENT_TMP\'
+  fi
   if [ -n "$DISTCC_HOSTS" ]; then
     echo export DISTCC_HOSTS=\'$DISTCC_HOSTS\'
   fi

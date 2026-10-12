@@ -42,7 +42,8 @@ class CompressFiles(object):
     # The realpath_map indices of files that have been compressed already.
     self.files_compressed = set([])
 
-  def Compress(self, include_closure, client_root_keeper, currdir_idx):
+  def Compress(self, include_closure, client_root_keeper, currdir_idx,
+               preprocess_only=False):
     """Copy files in include_closure to the client_root directory, compressing
     them as we go, and also inserting #line directives.
 
@@ -64,7 +65,7 @@ class CompressFiles(object):
       # the very same canonical path (as calculated by realpath). The
       # first such one to be discovered is the one used.
       realpath = realpath_string[realpath_idx]
-      if len(include_closure[realpath_idx]) > 0:
+      if not preprocess_only and len(include_closure[realpath_idx]) > 0:
         # Designate by suffix '.abs' that this file is to become known by an
         # absolute filepath through a #line directive.
         new_filepath = "%s%s.lzo.abs" % (client_root_keeper.client_root,

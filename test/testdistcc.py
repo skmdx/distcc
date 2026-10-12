@@ -246,6 +246,10 @@ class SimpleDistCC_Case(comfychair.TestCase):
         the test is not affected by the development environment."""
         for key in list(os.environ.keys()):
             if key[:7] == 'DISTCC_':
+                # The include server was started by the outer pump process.
+                # Its temporary-root layout is part of that shared session.
+                if key == 'DISTCC_CLIENT_TMP' and ',cpp' in _server_options:
+                    continue
                 # NOTE: This only works properly on Python 2.2: on
                 # earlier versions, it does not call unsetenv() and so
                 # subprocesses may get confused.

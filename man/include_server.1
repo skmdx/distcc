@@ -81,8 +81,9 @@ Flush stat caches when the timestamp of any filepath in LIST changes or the
 filepath comes in or out of existence.  LIST is a colon separated string of
 filepaths, possibly containing simple globs (as allowed by Python's glob
 module). Print a warning whenever such a change happens (if warnings are
-enabled). This option allows limited exceptions to distcc_pump's normal
-assumption that source files are not modified during the build.
+enabled). Analyzed source files and include lookups are also checked
+automatically between requests; this option provides additional explicit
+invalidation triggers.
 .TP
 .B -t, --time
 Print elapsed, user, and system time to stderr.

@@ -213,6 +213,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_native.py \
 	test/test_protocol.py \
 	test/test_pool.py \
+	test/test_preprocess.py \
 	find_c_extension.sh
 
 dist_common = Makefile.in install-sh configure configure.ac \
@@ -770,7 +771,7 @@ pump-maintainer-check: pump include-server check_programs
 # server exists, then carry out distcc-maintainer-check in pump-mode.
 # These suites share daemon ports and _testtmp; do not overlap them under -j.
 .NOTPARALLEL: maintainer-check
-maintainer-check: distcc-maintainer-check include-server-maintainer-check \
+maintainer-check: distcc-maintainer-check include-server-maintainer-check preprocess-check \
 	pump-maintainer-check
 
 adaptive-check: distcc distccd h_hosts
@@ -780,6 +781,9 @@ adaptive-check: distcc distccd h_hosts
 	$(PYTHON) "$(srcdir)/test/test_native.py" -v
 	$(PYTHON) "$(srcdir)/test/test_protocol.py" -v
 	$(PYTHON) "$(srcdir)/test/test_pool.py" -v
+
+preprocess-check: distcc distccd pump include-server
+	$(PYTHON) "$(srcdir)/test/test_preprocess.py" -v
 
 check: adaptive-check
 	@if test -n "$(PYTHON)"; then \

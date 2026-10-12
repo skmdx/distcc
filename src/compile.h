@@ -23,6 +23,10 @@
 
 /* remote.c */
 
+#include <sys/types.h>
+#include <time.h>
+struct dcc_hostdef;
+
 int dcc_compile_remote(char **argv,
                        char *input_fname,
                        char *cpp_fname,
@@ -30,6 +34,7 @@ int dcc_compile_remote(char **argv,
                        char *output_fname,
                        char *deps_fname,
                        char *server_stderr_fname,
+                       char *server_stdout_fname,
                        pid_t cpp_pid,
                        int local_cpu_lock_fd,
                        struct dcc_hostdef *host,

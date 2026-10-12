@@ -40,7 +40,7 @@ class BasicsTest(unittest.TestCase):
     os.environ['DISTCC_CLIENT_TMP'] = 'to/be'
     self.assertRaises(SystemExit, basics.ClientRootKeeper)
     os.environ['DISTCC_CLIENT_TMP'] = '/to/be/or'
-    self.assertRaises(SystemExit, basics.ClientRootKeeper)
+    self.assertEqual(basics.ClientRootKeeper().number_missing_levels, 0)
     try:
       tempfile_mkdtemp = tempfile.mkdtemp
       os_makedirs = os.makedirs
@@ -88,12 +88,12 @@ class BasicsTest(unittest.TestCase):
     """Test whether directories emerge and go away appropriately."""
 
     # Test with a one-level value of DISTCC_CLIENT_TMP.
-    os.environ['DISTCC_CLIENT_TMP'] = '/tmp'
+    os.environ['DISTCC_CLIENT_TMP'] = tempfile.gettempdir()
     client_root_keeper = basics.ClientRootKeeper()
     client_root_keeper.ClientRootMakedir(117)
     self.assertTrue(os.path.isdir(client_root_keeper._client_root_before_padding))
     self.assertTrue(os.path.isdir(client_root_keeper.client_root))
-    self.assertTrue(client_root_keeper.client_root.endswith('/padding'))
+    self.assertTrue(client_root_keeper.client_root.startswith(tempfile.gettempdir()))
     client_root_keeper.ClientRootMakedir(118)
     client_root_keeper.CleanOutClientRoots()
     # Directories must be gone now!
@@ -102,7 +102,7 @@ class BasicsTest(unittest.TestCase):
     # Test with a two-level value of DISTCC_CLIENT_TMP.
     try:
       os.environ['DISTCC_CLIENT_TMP'] = tempfile.mkdtemp('basics_test',
-                                                         dir='/tmp')
+                                                         dir=tempfile.gettempdir())
       client_root_keeper = basics.ClientRootKeeper()
       client_root_keeper.ClientRootMakedir(117)
       self.assertTrue(os.path.isdir(

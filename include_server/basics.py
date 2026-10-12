@@ -39,8 +39,8 @@ class ClientRootKeeper(object):
 
   Use the RAM disk-like /dev/shm as default place to store compressed files if
   available.  The protocol between the include server and distcc client
-  stipulates that the top three directories constitute the prefix prepended to
-  absolute file paths.
+  uses at least three directory components as the prefix prepended to absolute
+  file paths. Deeper DISTCC_CLIENT_TMP paths are shared with the client.
 
   Instance vars:
     client_tmp: a path, the place for creation of temporary directories.
@@ -52,9 +52,8 @@ class ClientRootKeeper(object):
   -  /tmp/tmpBDoZQV.include_server-6642-13/padding, or
   -  /dev/shm/tmpBDoZQV.include_server-6642-19
 
-  Note that each path has exactly three directory components to it.  This is an
-  invariant.  Some client roots are padded with '/padding' to satisfy the
-  invariant.
+  Shallow client roots are padded with '/padding' to preserve compatibility
+  with the original three-component layout.
   """
 
   # This constant is embedded in names of client root directories.
@@ -72,11 +71,8 @@ class ClientRootKeeper(object):
     if not self.client_tmp or self.client_tmp[0] != '/':
       sys.exit("""DISTCC_CLIENT_TMP must start with '/'.""")
     self.client_tmp = self.client_tmp.rstrip('/')
-    # To have room to make a temp directory, we'll need to have less than two
-    # levels at this point.  Note: '/a/b'.split('/') == ['', 'a', 'b'].
-    if len(self.client_tmp.split('/')) > 3:
-      sys.exit('DISTCC_CLIENT_TMP must have at most two directory levels.')
-    self.number_missing_levels = 3 - len(self.client_tmp.split('/'))
+    # Preserve the old minimum prefix depth; deeper temporary roots need no padding.
+    self.number_missing_levels = max(0, 3 - len(self.client_tmp.split('/')))
     self.client_root = None
 
   def Glob(self, pid_expr):

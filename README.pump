@@ -1,52 +1,58 @@
-See README for basic information on distcc.
+Distributed preprocessing
+=========================
 
-Distcc's "pump" mode improves on plain distcc by distributing not only
-compilation but also preprocessing to distcc servers.
+Run a build under `pump` to distribute preprocessing as well as compilation:
 
-The pump mode uses an "include server" process that runs during
-the build. The include server parses and analyzes source (including
-header) files. It runs on the workstation that initiates the build.
-The include server analyzes each header file only a few times during a build,
-sometimes just once. In contrast, during ordinary distcc operation,
-the preprocessor examines each header file multiple times, even hundreds of 
-times for a large build.
+    pump make -j"$(distcc -j)"
 
-In pump mode, a static analysis algorithm inspects each #include directive
-and computes a superset of the possible values of its argument.
-The resulting dependency graph among header files persists during
-the lifetime of the include server, which then acts as a cache for include
-analysis.
+The build must invoke distcc as its compiler, as with ordinary distcc. Pump
+starts one include-analysis process for the build and stops it when the command
+exits. It does not require build-system hooks or special handling of generated
+headers. Without pump, ordinary client-side preprocessing remains the default.
 
-The include server compresses source files into a temporary directory
-as they are encountered. In this way, a given source file is
-compressed only once during the build.
+With DISTCC_BROKER set, clients request remote preprocessing through the existing
+broker. Adaptive scheduling and the TCP connection pool are reused. These jobs
+do not reserve a local preprocessing slot. Without a broker, configure remote
+hosts with the `,cpp,lzo` options.
 
-It may happen that a header file is included via an absolutely
-specified include directory such as -I/absolute/path. But on the
-compilation server the path -I/absolute/path does not exist; instead
-the server places foo.h under /server_temporary_path/absolute/path for
-some /server_temporary_path root directory. This directory has no
-meaning on the workstation. Before compressing foo.h, the include
-server therefore inserts a #line directive in foo.h, to inform the
-preprocessor that the real location is /absolute/path.
+The include server conservatively analyzes include directives and caches both
+the dependency graph and compressed source/header files. Before reusing the
+graph it checks metadata for positive and negative include lookups, including
+ancestor identities. Header creation, modification, removal and symlink
+replacement invalidate the graph. A new generation holds new compressed files;
+previously issued manifests keep their old files until pump exits. A change
+detected while gathering inputs causes local preprocessing instead. Build
+dependencies must still prevent writes to an input during its compilation.
 
-The distcc client asks the include server for the list of
-compressed files that constitute the transitive closure of the source
-file to be compiled. It then spools these files to a distcc
-server. The distcc server unpacks these files in the
-/server_temporary_path directory before preprocessing and compiling.
-The server also rewrites include options, such as -I's, to reflect the
-new locations of the files on the server. The .d and the .o files are
-both rewritten as necessary to refer to client-side filenames and 
-returned to the pump-mode client.
+The worker receives the raw source and needed application headers, runs the
+compiler's preprocessor and compiles the result. System headers in the compiler's
+default search paths are not transferred: compiler versions, target, search paths
+and default system headers must match between client and workers. A cross compiler
+must provide the same target headers. Pump does not synchronize a sysroot.
 
-Pump mode is able to distribute compilations up to 10X faster than
-plain distcc. But because building also involves linking and perhaps
-generation of source files, the overall speed-up of the build time is
-variable.
+Standalone GCC and Clang `-E` calls with a source file are also distributed.
+Standard output, `-o` output files, explicit `-MF` dependencies, exit status and
+partial standard output on preprocessing errors are returned to the client.
+The worker's temporary path is removed from preprocessor output. Standard output
+is staged until the response finishes, so a dropped connection followed by a
+local retry does not duplicate output. Upgrade clients and workers together to
+use remote `-E`.
 
-The pump mode was developed to be used with large clusters of distcc
-servers, providing hundreds of CPUs. With versions of gcc >= 4.1.1,
-pump mode will probably not show major performance gains using
-clusters of less than ten CPUs. The preprocessor running on the
-workstation is fast enough to keep that many machines busy.
+Stdin input, dependency-only `-M`/`-MM`, `-E -MD` without explicit `-MF`, absolute
+include directives, computed `__has_include` operands and `#embed` remain local.
+Literal `__has_include` probes participate in include lookup invalidation even
+when no include directive follows. Other include-analysis failures fall back to
+ordinary distcc; standalone preprocessing falls back to a local compiler when
+DISTCC_FALLBACK permits it. DISTCC_TESTING_INCLUDE_SERVER=1 turns analysis fallback
+into an error for validation.
+
+DISTCC_CLIENT_TMP selects the compressed-input storage directory. Deep absolute
+paths are supported when the variable is shared by pump and its distcc clients.
+Storage for old generations is reclaimed at pump shutdown. Files are compressed
+once per generation but still transferred per job; worker file caching is not
+part of this protocol. Speedups depend on preprocessing cost, include-analysis
+cost, network throughput and the number of independent build jobs.
+
+`make preprocess-check` exercises real GCC/Clang preprocessing through distccd,
+mutable and generated headers, dependency output, compiler errors, interrupted
+responses, broker admission and pooled connections.

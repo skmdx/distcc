@@ -214,12 +214,11 @@ compared to plain distcc mode.
 Using pump mode requires both client and servers to use release 3.0 or
 later of distcc and distccd (respectively).
 .PP
-The incremental include analysis of distc-pump mode rests on
-the fundamental assumption that source and header files do not change
-during the build process.  A few complex build systems, such as that
-for Linux kernel 2.6, do not quite satisfy this requirement.  To
-overcome such issues, and other corner cases such as absolute
-filepaths in includes, see the
+The include server checks cached file metadata and failed include lookups
+between requests. Changes invalidate the analysis and start a new generation
+of compressed inputs. Build dependencies must still prevent writes to an
+input while its compilation is running. For other restrictions, such as
+absolute filepaths in includes, see the
 .BR include_server(1)
 man page.
 .PP

@@ -34,7 +34,7 @@
 #define MAX_HOSTS 128
 #define MAX_CLIENTS 256
 enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3, MEMO_GET = 4, MEMO_PUT = 5,
-       ACQUIRE_POOL = 6, RETURN = 7, ACQUIRE_LINK = 8 };
+       ACQUIRE_POOL = 6, RETURN = 7, ACQUIRE_LINK = 8, ACQUIRE_CPP = 9 };
 #define MAX_MEMOS 32
 struct request { uint32_t version, command; };
 struct reply { int32_t status, slots; char host[1024]; };
@@ -190,7 +190,7 @@ static int broker_request(uint32_t command, struct reply *reply, int *net)
     }
     if (n != sizeof(*reply) || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
         reply->status || !memchr(reply->host, '\0', sizeof(reply->host)) ||
-        ((command == ACQUIRE || command == ACQUIRE_POOL) && *net < 0) || (command == JOBS && *net >= 0))
+        ((command == ACQUIRE || command == ACQUIRE_POOL || command == ACQUIRE_CPP) && *net < 0) || (command == JOBS && *net >= 0))
         goto failed;
     return fd;
 failed:
@@ -212,7 +212,9 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease)
     if (dcc_get_hostlist(&local, &count))
         return EXIT_BAD_HOSTSPEC;
     free_hosts(local);
-    fd = broker_request(ACQUIRE_POOL, &reply, &net);
+    int remote_cpp = getenv("INCLUDE_SERVER_PORT") != NULL;
+    fd = broker_request(remote_cpp ? ACQUIRE_CPP : ACQUIRE_POOL, &reply, &net);
+    if (fd < 0 && remote_cpp) fd = broker_request(ACQUIRE_POOL, &reply, &net);
     if (fd < 0) fd = broker_request(ACQUIRE, &reply, &net);
     if (fd < 0)
         return EXIT_CONNECT_FAILED;
@@ -227,6 +229,12 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease)
         return EXIT_BAD_HOSTSPEC;
     }
     (*host)->broker_managed = 1;
+    if (remote_cpp) {
+        (*host)->cpp_where = DCC_CPP_ON_SERVER;
+        (*host)->compr = DCC_COMPRESS_LZO1X;
+        dcc_get_protover_from_features((*host)->compr, (*host)->cpp_where,
+                                       &(*host)->protover);
+    }
     (*host)->broker_fd = net;
     (*host)->broker_lease = fd;
     (*host)->broker_pooled = !!(reply.slots & DCC_BROKER_POOLED);
@@ -468,6 +476,7 @@ static int dispatch(struct broker *broker, struct client *client, double now)
     int i, slots, best = -1, available = 0;
     double best_score = 0, best_fill = 0;
     int link = client->command == ACQUIRE_LINK;
+    int local_cpp = !link && client->command != ACQUIRE_CPP;
     for (i = 0; i < broker->count; i++) {
         struct peer *p = &broker->peers[i];
         const struct dcc_capacity *cap = p->valid_until > now ? &p->metrics : NULL;
@@ -492,7 +501,7 @@ static int dispatch(struct broker *broker, struct client *client, double now)
         reply.status = available ? 0 : EXIT_CONNECT_FAILED;
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
-    } else if (best >= 0 && (link || broker->cpp_busy < broker->cpp_limit)) {
+    } else if (best >= 0 && (!local_cpp || broker->cpp_busy < broker->cpp_limit)) {
         struct peer *p = &broker->peers[best];
         client->admission = client->command != ACQUIRE &&
                             p->admission_supported && p->pool_supported >= 0;
@@ -507,8 +516,8 @@ static int dispatch(struct broker *broker, struct client *client, double now)
         client->state = CONNECTING;
         client->deadline = now + 3;
         p->busy++;
-        broker->cpp_busy += !link;
-        client->cpp_reserved = !link;
+        broker->cpp_busy += local_cpp;
+        client->cpp_reserved = local_cpp;
         client->used = 0;
         if (client->pooled) {
             if (client->admission) client->state = RESERVE_SEND;
@@ -891,7 +900,7 @@ int dcc_broker_serve(const char *path)
                 }
                 if (c->state == ACTIVE && length == sizeof(request) &&
                     request.version == BROKER_VERSION && request.command == CPP_DONE &&
-                    (c->cpp_reserved || c->command == ACQUIRE_LINK)) {
+                    (c->cpp_reserved || c->command == ACQUIRE_LINK || c->command == ACQUIRE_CPP)) {
                     broker->cpp_busy -= c->cpp_reserved;
                     c->cpp_reserved = 0;
                     continue;
@@ -899,7 +908,8 @@ int dcc_broker_serve(const char *path)
                 if (c->state != REQUEST || length != sizeof(request) ||
                     request.version != BROKER_VERSION ||
                     (request.command != ACQUIRE && request.command != ACQUIRE_POOL &&
-                     request.command != ACQUIRE_LINK && request.command != JOBS)) {
+                     request.command != ACQUIRE_LINK && request.command != ACQUIRE_CPP &&
+                     request.command != JOBS)) {
                     release_client(broker, c);
                     continue;
                 }

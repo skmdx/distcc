@@ -127,7 +127,19 @@ int dcc_talk_to_include_server(char **argv, char ***files)
 int dcc_get_original_fname(const char *fname, char **original_fname)
 {
     int i;
+    int depth = INCLUDE_SERVER_DIR_DEPTH;
+    const char *client_tmp = getenv("DISTCC_CLIENT_TMP");
     char *work, *alloced_work, *extension;
+
+    if (client_tmp && client_tmp[0] == '/') {
+        int components = dcc_count_slashes(client_tmp) + 1;
+        const char *end = client_tmp + strlen(client_tmp);
+        while (end > client_tmp && end[-1] == '/') {
+            components--;
+            end--;
+        }
+        if (components > depth) depth = components;
+    }
 
     alloced_work = work = strdup(fname);
     if (work == NULL)
@@ -139,9 +151,10 @@ int dcc_get_original_fname(const char *fname, char **original_fname)
      * for a slash, and then we skip that slash and look for a slash, etc.
      */
 
-    for (i = 0; i < INCLUDE_SERVER_DIR_DEPTH; ++i) {
+    for (i = 0; i < depth; ++i) {
         work = strchr(work + 1, '/');
         if (work == NULL) {
+            free(alloced_work);
             return 1;
         }
     }

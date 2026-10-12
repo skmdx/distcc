@@ -182,6 +182,8 @@ int dcc_retrieve_results(int net_fd,
                          const char *output_fname,
                          const char *deps_fname,
                          const char *server_stderr_fname,
+                         const char *server_stdout_fname,
+                         int preprocess_only,
                          struct dcc_hostdef *);
 
 /* climasq.c */

@@ -592,6 +592,50 @@ def RetrieveDirectoriesExceptSys(directory_map, realpath_map,
 #### THE STAT CACHES
 ####
 
+class FileStampCache(object):
+  """Validate lookup results before reusing an include graph.
+
+  Record failed lookups too: a newly generated header can shadow an existing
+  header. Ancestor identities detect symlink replacement without invalidating
+  the graph whenever an unrelated object file is written in the same directory.
+  """
+
+  def __init__(self):
+    self.paths = {}
+
+  @staticmethod
+  def Stamp(path, ancestor=False):
+    try:
+      st = os.lstat(path) if ancestor else os.stat(path)
+    except FileNotFoundError:
+      return None
+    except NotADirectoryError:
+      return None
+    identity = (st.st_dev, st.st_ino, st.st_mode)
+    if ancestor:
+      return identity
+    return identity + (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+  def Observe(self, path):
+    # Keep '..' components: resolving them before following symlinks can refer
+    # to a different file from the compiler's lookup.
+    if not os.path.isabs(path):
+      path = os.path.join(os.getcwd(), path)
+    key = (path, False)
+    if key not in self.paths:
+      self.paths[key] = self.Stamp(path)
+    while path != '/':
+      key = (path, True)
+      if key in self.paths:
+        break
+      self.paths[key] = self.Stamp(path, True)
+      path = os.path.dirname(path)
+
+  def Changed(self):
+    return any(self.Stamp(path, ancestor) != stamp
+               for (path, ancestor), stamp in self.paths.items())
+
+
 class SimpleBuildStat(object):
   """Stat cache that works with strings, not indices."""
 
@@ -640,6 +684,7 @@ class BuildStatCache(object):
     self.directory_map = directory_map
     self.realpath_map = realpath_map
     self.path_observations = []
+    self.file_stamps = FileStampCache()
 
   def _Verify(self, currdir_idx, searchdir_idx, includepath_idx):
     """Verify that the cached result is the same as obtained by stat call.
@@ -776,6 +821,7 @@ class BuildStatCache(object):
         # We do not explicitly take into account currdir_idx, because
         # of the check above that os.getcwd is set to current_dir.
         relpath = dir_map_string[sl_idx] + includepath
+        self.file_stamps.Observe(relpath)
         if _OsPathIsFile(relpath):
           searchdir_stats[sl_idx] = True
           rpath = os.path.join(dir_map_string[currdir_idx], relpath)

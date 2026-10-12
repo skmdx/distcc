@@ -289,8 +289,22 @@ class ParseFile(object):
     file_contents = fd.read()
     fd.close()
 
+    if re.search(r'^\s*#\s*embed\b', file_contents, re.M):
+      raise NotCoveredError("#embed requires local preprocessing")
+
     quote_includes, angle_includes, expr_includes, next_includes = (
       [], [], [], [])
+
+    # An existence predicate is also an input even if no #include follows it.
+    # Track literal probes through the same positive/negative lookup cache.
+    probe_text = PAIRED_COMMENT_RE.sub('', BACKSLASH_RE.sub('', file_contents))
+    for probe in re.finditer(r'\b__has_include(_next)?\s*\(([^)]*)\)', probe_text):
+      operand = probe.group(2).strip()
+      if len(operand) < 2 or (operand[0], operand[-1]) not in [('"', '"'), ('<', '>')]:
+        raise NotCoveredError("Computed __has_include requires local preprocessing")
+      includes = (next_includes if probe.group(1) else
+                  quote_includes if operand[0] == '"' else angle_includes)
+      includes.append(includepath_map_index(operand[1:-1]))
 
     i = 0
     line_start_last = None

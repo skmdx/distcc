@@ -78,10 +78,10 @@ make -j80
 pump --shutdown
 .RE
 .PP
-Note that distcc's pump-mode assumes that sources files will not be
- modified during
-the lifetime of the include server, so modifying source files during a build
-may cause inconsistent results.
+Changes to previously analyzed sources, headers and failed include lookups
+invalidate cached analysis automatically. Earlier manifests retain their
+compressed files until pump exits. Build dependencies must still prevent
+changing an input while its compilation is running.
 .SH "INVOKING LSDISTCC"
 When invoked in either the simple "
 .B pump

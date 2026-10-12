@@ -601,11 +601,38 @@ static int tweak_arguments_for_server(char **argv,
                                       char ***tweaked_argv)
 {
     int ret;
+    char *debug_map;
+    int argc = dcc_argv_len(argv), i;
     *dotd_target = 0;
-    if ((ret = dcc_copy_argv(argv, tweaked_argv, 3)))
+    if ((ret = dcc_copy_argv(argv, tweaked_argv, 4)))
       return 1;
 
-    if ((ret = dcc_convert_mt_to_dotd_target(*tweaked_argv, dotd_target)))
+    /* Let the compiler remap paths before emitting compressed DWARF. The ELF
+     * string fixup cannot edit compressed sections or LLVM bitcode. */
+    checked_asprintf(&debug_map, "-fdebug-prefix-map=%s=", root_dir);
+    if (!debug_map) return EXIT_OUT_OF_MEMORY;
+    memmove(*tweaked_argv + 2, *tweaked_argv + 1, argc * sizeof(char *));
+    (*tweaked_argv)[1] = debug_map;
+
+    /* Preserve user mappings after relocating absolute input paths. Keep the
+     * user's order and let their mappings take precedence over our default. */
+    for (i = 2; (*tweaked_argv)[i]; ++i) {
+        char *arg = (*tweaked_argv)[i];
+        if (str_startswith("-fdebug-prefix-map=/", arg) ||
+            str_startswith("-fmacro-prefix-map=/", arg) ||
+            str_startswith("-ffile-prefix-map=/", arg)) {
+            char *value = strchr(arg, '=') + 1;
+            char *mapped;
+            if (!strchr(value, '=')) continue;
+            checked_asprintf(&mapped, "%.*s%s%s", (int)(value - arg), arg, root_dir, value);
+            if (!mapped) return EXIT_OUT_OF_MEMORY;
+            free(arg);
+            (*tweaked_argv)[i] = mapped;
+        }
+    }
+
+    if (!dcc_argv_search(argv, "-E") &&
+        (ret = dcc_convert_mt_to_dotd_target(*tweaked_argv, dotd_target)))
       return 1;
 
     if (!dcc_argv_search(*tweaked_argv, "-MD") && !dcc_argv_search(*tweaked_argv, "-MMD")) {
@@ -640,6 +667,12 @@ static int make_temp_dir_and_chdir_for_cpp(int in_fd,
 
         if ((ret = dcc_get_new_tmpdir(temp_dir)))
             return ret;
+        /* Compilers canonicalize their working directory in DWARF. Keep the
+         * remapping prefix in the same form when TMPDIR contains symlinks. */
+        char *canonical = realpath(*temp_dir, NULL);
+        if (!canonical) return EXIT_IO_ERROR;
+        free(*temp_dir);
+        *temp_dir = canonical;
         if ((ret = dcc_r_cwd(in_fd, client_side_cwd)))
             return ret;
 
@@ -702,6 +735,38 @@ done:
     return ret;
 }
 
+/* Preprocessor line markers and expanded __FILE__ strings must name client
+ * paths, not the private directory used to assemble the remote input tree. */
+static int remap_preprocessed(const char *file, const char *root)
+{
+    char *replacement = NULL, *line = NULL;
+    size_t capacity = 0, root_len = strlen(root);
+    FILE *input = NULL, *output = NULL;
+    int ret = EXIT_IO_ERROR;
+    if (dcc_make_tmpnam("distccd", ".i", &replacement))
+        goto done;
+    if (!(input = fopen(file, "r")) || !(output = fopen(replacement, "w")))
+        goto done;
+    while (getline(&line, &capacity, input) >= 0) {
+        char *from = line, *match;
+        while ((match = strstr(from, root))) {
+            if (fwrite(from, 1, match - from, output) != (size_t)(match - from))
+                goto done;
+            from = match + root_len;
+        }
+        if (fputs(from, output) == EOF) goto done;
+    }
+    if (ferror(input) || fflush(output)) goto done;
+    if (rename(replacement, file)) goto done;
+    ret = 0;
+done:
+    if (input) fclose(input);
+    if (output && fclose(output)) ret = EXIT_IO_ERROR;
+    free(line);
+    free(replacement);
+    return ret;
+}
+
 /** Read a request, run the compiler, and send a response. */
 static int dcc_run_job(int in_fd,
                        int out_fd, enum dcc_protover protover)
@@ -726,6 +791,8 @@ static int dcc_run_job(int in_fd,
     char *server_cwd = NULL;
     char *client_cwd = NULL;
     int changed_directory = 0;
+    int preprocess_only = 0;
+    int stdout_output = 0;
 
     gettimeofday(&start, NULL);
 
@@ -785,6 +852,8 @@ static int dcc_run_job(int in_fd,
      * free those elements. */
     orig_input = strdup(orig_input_tmp);
     orig_output = strdup(orig_output_tmp);
+    preprocess_only = dcc_argv_search(argv, "-E");
+    stdout_output = preprocess_only && !strcmp(orig_output_tmp, "-");
     if (orig_input == NULL || orig_output == NULL) {
       ret = EXIT_OUT_OF_MEMORY;
       goto out_cleanup;
@@ -805,7 +874,7 @@ static int dcc_run_job(int in_fd,
      */
     if (cpp_where == DCC_CPP_ON_SERVER) {
         if (dcc_r_many_files(in_fd, temp_dir, compr)
-            || dcc_set_output(argv, temp_o)
+            || (!stdout_output && dcc_set_output(argv, temp_o))
             || tweak_arguments_for_server(argv, temp_dir, deps_fname,
                                           &dotd_target, &tweaked_argv))
             goto out_cleanup;
@@ -868,6 +937,13 @@ static int dcc_run_job(int in_fd,
         status = W_EXITCODE(compile_ret, 0);
     }
 
+    if (preprocess_only && cpp_where == DCC_CPP_ON_SERVER) {
+        if (((stdout_output || !status) &&
+             (ret = remap_preprocessed(stdout_output ? out_fname : temp_o, temp_dir))) ||
+            (ret = remap_preprocessed(err_fname, temp_dir)))
+            goto out_cleanup;
+    }
+
     if ((ret = dcc_x_result_header(out_fd, protover))
         || (ret = dcc_x_cc_status(out_fd, status))
         || (ret = dcc_x_file(out_fd, err_fname, "SERR", compr, NULL))
@@ -878,12 +954,12 @@ static int dcc_run_job(int in_fd,
             job_result = STATS_COMPILE_ERROR;
     } else if (WIFSIGNALED(status) || WEXITSTATUS(status)) {
         /* Something went wrong, so send DOTO 0 */
-        dcc_x_token_int(out_fd, "DOTO", 0);
+        ret = dcc_x_token_int(out_fd, "DOTO", 0);
 
         if (job_result == -1)
             job_result = STATS_COMPILE_ERROR;
     } else {
-        if (cpp_where == DCC_CPP_ON_SERVER) {
+        if (cpp_where == DCC_CPP_ON_SERVER && !preprocess_only) {
           rs_trace("fixing up debug info");
           /*
            * We update the debugging information, replacing all occurrences

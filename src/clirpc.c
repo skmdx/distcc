@@ -168,6 +168,8 @@ int dcc_retrieve_results(int net_fd,
                          const char *output_fname,
                          const char *deps_fname,
                          const char *server_stderr_fname,
+                         const char *server_stdout_fname,
+                         int preprocess_only,
                          struct dcc_hostdef *host)
 {
     unsigned len;
@@ -203,7 +205,7 @@ int dcc_retrieve_results(int net_fd,
         return ret;
 
     if ((ret = dcc_r_token_int(net_fd, "SOUT", &len))
-        || (ret = dcc_r_bulk(STDOUT_FILENO, net_fd, len, host->compr))
+        || (ret = dcc_r_file(net_fd, server_stdout_fname, len, host->compr))
         || (ret = dcc_r_token_int(net_fd, "DOTO", &o_len)))
         return ret;
 
@@ -211,15 +213,20 @@ int dcc_retrieve_results(int net_fd,
     /* If the compiler succeeded, then we always retrieve the result,
      * even if it's 0 bytes.  */
     if (*status == 0) {
-        if ((ret = dcc_r_file_timed(net_fd, output_fname, o_len, host->compr)))
+        if ((ret = dcc_r_file_timed(net_fd,
+                    !strcmp(output_fname, "-") ? "/dev/null" : output_fname,
+                    o_len, host->compr)))
             return ret;
         if (host->cpp_where == DCC_CPP_ON_SERVER) {
-            if ((ret = dcc_r_token_int(net_fd, "DOTD", &len) == 0)
-                && deps_fname != NULL) {
-                ret = dcc_r_file_timed(net_fd, deps_fname, len, host->compr);
+            if ((ret = dcc_r_token_int(net_fd, "DOTD", &len)))
                 return ret;
-            }
+            return dcc_r_file_timed(net_fd, deps_fname ? deps_fname : "/dev/null",
+                                    len, host->compr);
         }
+    } else if (preprocess_only && strcmp(output_fname, "-")) {
+        struct stat st;
+        if (!stat(output_fname, &st) && S_ISREG(st.st_mode))
+            dcc_remove_if_exists(output_fname);
     } else if (o_len != 0) {
         rs_log_error("remote compiler failed but also returned output: "
                      "I don't know what to do");

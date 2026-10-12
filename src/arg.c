@@ -121,7 +121,8 @@ static void dcc_note_compiled(const char *input_file, const char *output_file)
  * results differently.
  *
  * This function makes a copy of the arguments, modified to ensure that
- * the arguments include '-o <filename>'.  This is returned in *ret_newargv.
+ * the arguments include '-o <filename>', except for -E output to stdout.
+ * This is returned in *ret_newargv.
  * The copy is dynamically allocated and the caller is responsible for
  * deallocating it.
  *
@@ -130,7 +131,8 @@ static void dcc_note_compiled(const char *input_file, const char *output_file)
 int dcc_scan_args(char *argv[], char **input_file, char **output_file,
                   char ***ret_newargv, int allow_native)
 {
-    int seen_opt_c = 0, seen_opt_s = 0;
+    int seen_opt_c = 0, seen_opt_s = 0, seen_opt_e = 0;
+    int seen_md = 0, seen_mf = 0;
     int i;
     char *a;
     int ret;
@@ -157,9 +159,9 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
     for (i = 0; (a = argv[i]); i++) {
         if (a[0] == '-') {
             if (!strcmp(a, "-E")) {
-                rs_trace("-E call for cpp must be local");
-                return EXIT_LOCAL_CPP;
+                seen_opt_e = 1;
             } else if (!strcmp(a, "-MD") || !strcmp(a, "-MMD")) {
+                seen_md = 1;
                 /* These two generate dependencies as a side effect.  They
                  * should work with the way we call cpp. */
             } else if (!strcmp(a, "-MG") || !strcmp(a, "-MP")) {
@@ -167,10 +169,19 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
                  * nothing by themselves. */
             } else if (!strcmp(a, "-MF") || !strcmp(a, "-MT") ||
                        !strcmp(a, "-MQ")) {
+                if (!strcmp(a, "-MF")) {
+                    seen_mf = 1;
+                    if (argv[i+1] && !strcmp(argv[i+1], "-"))
+                        return EXIT_LOCAL_CPP;
+                }
                 /* As above but with extra argument. */
                 i++;
             } else if (!strncmp(a, "-MF", 3) || !strncmp(a, "-MT", 3) ||
                        !strncmp(a, "-MQ", 3)) {
+                if (!strncmp(a, "-MF", 3)) {
+                    seen_mf = 1;
+                    if (!strcmp(a + 3, "-")) return EXIT_LOCAL_CPP;
+                }
                 /* As above, without extra argument. */
             } else if (a[1] == 'M') {
                 /* -M(anything else) causes the preprocessor to
@@ -267,7 +278,11 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
      * extant files when looking for the input file; that's possibly
      * worthwhile.  Of course we can't do that on the server. */
 
-    if (!seen_opt_c && !seen_opt_s) {
+    /* With -E -MD, -o names the dependency file unless -MF is explicit. */
+    if (seen_opt_e && seen_md && !seen_mf)
+        return EXIT_LOCAL_CPP;
+
+    if (!seen_opt_c && !seen_opt_s && !seen_opt_e) {
         rs_log_info("compiler apparently called not for compile");
         return EXIT_DISTCC_FAILED;
     }
@@ -279,6 +294,13 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
 
     if (dcc_source_needs_local(*input_file))
         return EXIT_DISTCC_FAILED;
+
+    if (seen_opt_e && !*output_file) {
+        static char stdout_name[] = "-";
+        *output_file = stdout_name;
+        dcc_note_compiled(*input_file, *output_file);
+        return 0;
+    }
 
     if (!*output_file) {
         /* This is a commandline like "gcc -c hello.c".  They want
@@ -312,7 +334,7 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
 
     dcc_note_compiled(*input_file, *output_file);
 
-    if (strcmp(*output_file, "-") == 0) {
+    if (!seen_opt_e && strcmp(*output_file, "-") == 0) {
         /* Different compilers may treat "-o -" as either "write to
          * stdout", or "write to a file called '-'".  We can't know,
          * so we just always run it locally.  Hopefully this is a

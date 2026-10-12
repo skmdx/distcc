@@ -290,7 +290,7 @@ int dcc_r_file(int ifd, const char *filename,
     }
 
     rs_trace("failed to receive %s, removing it", filename);
-    if (unlink(filename)) {
+    if (stat(filename, &s) == 0 && S_ISREG(s.st_mode) && unlink(filename)) {
         rs_log_error("failed to unlink %s after failed transfer: %s",
                      filename, strerror(errno));
     }

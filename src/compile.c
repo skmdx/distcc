@@ -718,12 +718,15 @@ dcc_build_somewhere(char *argv[],
     char **localcpp_server_argv = NULL;
     char **remotecpp_server_argv = NULL;
     char *server_stderr_fname = NULL;
+    char *server_stdout_fname = NULL;
+    int preprocess_only;
     int needs_dotd = 0;
     int sets_dotd_target = 0;
     pid_t cpp_pid = 0;
     int cpu_lock_fd = -1, local_cpu_lock_fd = -1;
     int ret;
     int remote_ret = 0;
+    int remote_completed = 0;
     int retry_count = 0, max_retries, remote_unsupported = 0;
     struct dcc_hostdef *host = NULL;
     char *discrepancy_filename = NULL;
@@ -749,6 +752,9 @@ dcc_build_somewhere(char *argv[],
     ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 1);
     dcc_free_argv(argv);
     argv = new_argv;
+    preprocess_only = dcc_argv_search(argv, "-E");
+    if (preprocess_only && (ret || !getenv("INCLUDE_SERVER_PORT")))
+        ret = EXIT_LOCAL_CPP;
     if (!ret && dcc_native_requested(argv)) {
         if (dcc_expand_native(&argv, input_fname, output_fname)) {
             ret = EXIT_DISTCC_FAILED;
@@ -788,7 +794,9 @@ dcc_build_somewhere(char *argv[],
     dcc_note_state(DCC_PHASE_STARTUP, input_fname, NULL);
 #endif
     if ((ret = dcc_make_tmpnam("distcc_server_stderr", ".txt",
-                               &server_stderr_fname))) {
+                               &server_stderr_fname)) ||
+        (ret = dcc_make_tmpnam("distcc_server_stdout", ".txt",
+                               &server_stdout_fname))) {
         /* So we are failing locally to make a temp file to store the
          * server-side errors in; it's unlikely anything else will
          * work, but let's try the compilation locally.
@@ -806,6 +814,7 @@ dcc_build_somewhere(char *argv[],
     /* Choose the distcc server host (which could be either a remote
      * host or localhost) and acquire the lock for it.  */
   choose_host:
+    remote_completed = 0;
     if ((ret = dcc_pick_host_from_list_and_lock_it(&host, &cpu_lock_fd)) != 0) {
         /* Doesn't happen at the moment: all failures are masked by
            returning localhost. */
@@ -817,7 +826,7 @@ dcc_build_somewhere(char *argv[],
         goto run_local;
     }
 
-    if (!dcc_is_preprocessed(input_fname)) {
+    if (host->cpp_where == DCC_CPP_ON_CLIENT && !dcc_is_preprocessed(input_fname)) {
         /* Lock the local CPU, since we're going to be doing preprocessing
          * or include scanning. */
         if ((ret = dcc_lock_local_cpp(&local_cpu_lock_fd)) != 0) {
@@ -864,7 +873,16 @@ dcc_build_somewhere(char *argv[],
     }
 
     if (host->cpp_where == DCC_CPP_ON_CLIENT) {
+        if (preprocess_only) {
+            ret = EXIT_LOCAL_CPP;
+            goto fallback;
+        }
         files = NULL;
+
+        /* Include analysis may have fallen back after host selection. */
+        if (local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
+            (ret = dcc_lock_local_cpp(&local_cpu_lock_fd)))
+            goto fallback;
 
         if ((ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid) != 0))
             goto fallback;
@@ -885,7 +903,7 @@ dcc_build_somewhere(char *argv[],
                               &sets_dotd_target, &dotd_target);
             if ((ret = dcc_copy_argv(argv, &remotecpp_server_argv, 2)))
                 goto fallback;
-            if (needs_dotd && !sets_dotd_target) {
+            if (needs_dotd && !sets_dotd_target && (!preprocess_only || dotd_target)) {
                dcc_argv_append(remotecpp_server_argv, strdup("-MT"));
                if (dotd_target == NULL)
                    dcc_argv_append(remotecpp_server_argv, strdup(output_fname));
@@ -902,6 +920,7 @@ dcc_build_somewhere(char *argv[],
                                   output_fname,
                                   needs_dotd ? deps_fname : NULL,
                                   server_stderr_fname,
+                                  server_stdout_fname,
                                   cpp_pid, local_cpu_lock_fd,
                   host, status, &remote_unsupported)) != 0) {
         /* Returns zero if we successfully ran the compiler, even if
@@ -927,6 +946,7 @@ dcc_build_somewhere(char *argv[],
     }
     /* dcc_compile_remote() already unlocked local_cpu_lock_fd. */
     local_cpu_lock_fd = -1;
+    remote_completed = 1;
 
     dcc_enjoyed_host(host);
 
@@ -949,6 +969,7 @@ dcc_build_somewhere(char *argv[],
             goto fallback;
         }
         /* SUCCESS! */
+        ret = dcc_copy_file_to_fd(server_stdout_fname, STDOUT_FILENO);
         goto clean_up;
     }
     if (ret < 128) {
@@ -976,6 +997,8 @@ dcc_build_somewhere(char *argv[],
                 goto fallback;
             }
             /* Not retrying */
+            if (dcc_copy_file_to_fd(server_stdout_fname, STDOUT_FILENO))
+                ret = EXIT_IO_ERROR;
             goto clean_up;
         } else {
             rs_log_warning("remote compilation of '%s' failed, retrying locally",
@@ -999,6 +1022,8 @@ dcc_build_somewhere(char *argv[],
             rs_log_error("Could not print error messages from '%s'",
                          server_stderr_fname);
         }
+        if (remote_completed && dcc_copy_file_to_fd(server_stdout_fname, STDOUT_FILENO))
+            ret = EXIT_IO_ERROR;
         goto clean_up;
     }
 
@@ -1071,6 +1096,8 @@ dcc_build_somewhere(char *argv[],
         free(localcpp_server_argv);
     }
     free(discrepancy_filename);
+    free(server_stdout_fname);
+    free(server_stderr_fname);
     return ret;
 }
 
