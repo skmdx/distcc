@@ -4,6 +4,8 @@ import json
 import io
 import os
 from pathlib import Path
+import re
+import runpy
 import shutil
 import socket
 import subprocess
@@ -15,6 +17,29 @@ import unittest
 from test_broker import BrokerTestCase
 
 
+class LinkArchiveTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.helper = runpy.run_path(str(Path.cwd() / 'distcc-link'))
+
+    def test_changed_input_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'input.o'
+            path.write_bytes(b'original')
+            archive = self.helper['LinkArchive']({}, {'input-0.o': path})
+            path.write_bytes(b'changed size')
+            sender, receiver = socket.socketpair()
+            with sender, receiver:
+                with self.assertRaisesRegex(OSError, 'input changed'):
+                    archive.send(sender)
+
+    def test_protocol_limit_is_checked_without_reading_inputs(self):
+        with tempfile.TemporaryFile() as source:
+            source.truncate(0xffffffff)
+            with self.assertRaises(self.helper['LocalOnly']):
+                self.helper['LinkArchive']({}, {'input-0.o': source.fileno()})
+
+
 class LinkTestCase(BrokerTestCase):
     compiler = 'g++'
     sync_compiler = 'gcc'
@@ -23,7 +48,8 @@ class LinkTestCase(BrokerTestCase):
     def setUpClass(cls):
         if not shutil.which('rsync') or not shutil.which('g++'):
             raise unittest.SkipTest('rsync and GCC C++ are required')
-        if not shutil.which(cls.compiler):
+        compiler_path = shutil.which(cls.compiler)
+        if not compiler_path:
             raise unittest.SkipTest(cls.compiler + ' is required')
         if cls.sync_compiler == 'clang':
             linker = subprocess.check_output(['clang', '-print-prog-name=ld.lld'], text=True).strip()
@@ -72,7 +98,7 @@ class LinkTestCase(BrokerTestCase):
                 target = cls.snapshot / os.path.normpath(str(file)).lstrip('/')
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(file, target)
-        cls.link_path = os.pathsep.join((str(Path.cwd()), str(Path(shutil.which(cls.compiler)).parent), os.defpath))
+        cls.link_path = os.pathsep.join((str(Path.cwd()), str(Path(compiler_path).parent), os.defpath))
         cls.link_env = dict(os.environ, PATH=cls.link_path)
         cls.helper = Path.cwd() / 'distcc-link'
         cls.profile_file = cls.link_root / 'profile.json'
@@ -98,14 +124,29 @@ class LinkTestCase(BrokerTestCase):
         subprocess.run([str(self.build / 'distcc'), self.compiler, '-c', str(self.cpp), '-o', str(self.obj)],
                        env=self.env, check=True, capture_output=True, timeout=15)
 
-    def link(self, args=()):
+    def link(self, args=(), prefix=()):
         output = self.work / 'hello'
-        result = subprocess.run([str(self.build / 'distcc'), self.compiler, str(self.obj),
+        result = subprocess.run([*prefix, str(self.build / 'distcc'), self.compiler, str(self.obj),
                                  *args, '-o', str(output)], env=self.env, capture_output=True,
                                 text=True, timeout=15)
         return output, result
 
 class LinkTest(LinkTestCase):
+    @unittest.skipUnless(shutil.which('strace'), 'strace is required')
+    def test_link_without_archive_spool(self):
+        spool = self.work / 'spool'
+        spool.mkdir()
+        self.env['TMPDIR'] = str(spool)
+        trace = self.work / 'files.trace'
+        output, result = self.link(prefix=['strace', '-f', '-e', 'trace=openat', '-o', str(trace)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-link: linked on ', result.stderr)
+        self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
+        calls = trace.read_text()
+        self.assertNotIn('O_TMPFILE', calls)
+        # tempfile's directory probe and the compiler-query cache remain valid.
+        self.assertNotRegex(calls, re.escape(str(spool)) + r'/tmp[\w-]{8}"')
+
     def test_native_gcc_link_stays_local(self):
         output, result = self.link(['-march=native'])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -164,10 +205,12 @@ class LinkTest(LinkTestCase):
         source.write_text('int answer() { return 42; }\n')
         obj = directory / 'answer.o'
         subprocess.run(['g++', '-c', str(source), '-o', str(obj)], check=True)
-        subprocess.run(['ar', 'rcs', str(directory / 'libanswer.a'), str(obj)], check=True)
+        # Requires a PAX extended header, which must be included in LINK's size.
+        library = 'answer' + 'x' * 120
+        subprocess.run(['ar', 'rcs', str(directory / ('lib' + library + '.a')), str(obj)], check=True)
         self.cpp.write_text('extern int answer(); int main() { return answer() != 42; }\n')
         subprocess.run(['g++', '-c', str(self.cpp), '-o', str(self.obj)], check=True)
-        output, result = self.link(['-L' + str(directory), '-lanswer'])
+        output, result = self.link(['-L' + str(directory), '-l' + library])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('distcc-link: linked on ', result.stderr)
         subprocess.run([str(output)], check=True)
@@ -257,8 +300,8 @@ class ClangLinkTest(LinkTestCase):
     compiler = 'clang++'
     sync_compiler = 'clang'
 
-    def link(self, args=()):
-        return super().link(['-fuse-ld=lld', *args])
+    def link(self, args=(), prefix=()):
+        return super().link(['-fuse-ld=lld', *args], prefix)
 
     def test_cpp_remote_link_matches_local(self):
         output, result = self.link()

@@ -167,8 +167,8 @@ int dcc_retrieve_results(int net_fd,
                          int *status,
                          const char *output_fname,
                          const char *deps_fname,
-                         const char *server_stderr_fname,
-                         const char *server_stdout_fname,
+                         struct dcc_buffer *server_stderr,
+                         struct dcc_buffer *server_stdout,
                          int preprocess_only,
                          struct dcc_hostdef *host)
 {
@@ -189,7 +189,7 @@ int dcc_retrieve_results(int net_fd,
     if ((ret = dcc_r_token_int(net_fd, "SERR", &len)))
         return ret;
 
-    /* Save the server-side errors into a file. This way, we can
+    /* Keep the decoded server-side errors in memory. This way, we can
        decide later whether we want to report them to the user
        or not. We don't want to report them to the user if
        we are going to redo the compilation locally, because then
@@ -198,14 +198,14 @@ int dcc_retrieve_results(int net_fd,
        send to the maintainers, though.
     */
 
-    if ((ret = dcc_r_file(net_fd, server_stderr_fname, len, host->compr)))
+    if ((ret = dcc_r_buffer(server_stderr, net_fd, len, host->compr)))
         return ret;
 
-    if (dcc_add_file_to_log_email("server-side stderr", server_stderr_fname))
+    if ((ret = dcc_add_buffer_to_log_email("server-side stderr", server_stderr)))
         return ret;
 
     if ((ret = dcc_r_token_int(net_fd, "SOUT", &len))
-        || (ret = dcc_r_file(net_fd, server_stdout_fname, len, host->compr))
+        || (ret = dcc_r_buffer(server_stdout, net_fd, len, host->compr))
         || (ret = dcc_r_token_int(net_fd, "DOTO", &o_len)))
         return ret;
 

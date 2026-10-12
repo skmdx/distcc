@@ -715,8 +715,7 @@ dcc_build_somewhere(char *argv[],
     char **server_side_argv = NULL;
     char **localcpp_server_argv = NULL;
     char **remotecpp_server_argv = NULL;
-    char *server_stderr_fname = NULL;
-    char *server_stdout_fname = NULL;
+    struct dcc_buffer server_stderr = {0}, server_stdout = {0};
     int preprocess_only;
     int needs_dotd = 0;
     int sets_dotd_target = 0;
@@ -791,21 +790,6 @@ dcc_build_somewhere(char *argv[],
     /* turned off because we never spend long in this state. */
     dcc_note_state(DCC_PHASE_STARTUP, input_fname, NULL);
 #endif
-    if ((ret = dcc_make_tmpnam("distcc_server_stderr", ".txt",
-                               &server_stderr_fname)) ||
-        (ret = dcc_make_tmpnam("distcc_server_stdout", ".txt",
-                               &server_stdout_fname))) {
-        /* So we are failing locally to make a temp file to store the
-         * server-side errors in; it's unlikely anything else will
-         * work, but let's try the compilation locally.
-         * FIXME: this will blame the server for a failure that is
-         * local. However, we don't make any distrinction between
-         * all the reasons dcc_compile_remote can fail either;
-         * and some of those reasons are local.
-         */
-        goto fallback;
-    }
-
     /* With a broker, finish local preprocessing before reserving a worker.
      * Release the local lock before requesting the remote lease; never wait
      * for a remote slot while holding a local slot. Reuse this input on retry. */
@@ -829,6 +813,8 @@ dcc_build_somewhere(char *argv[],
     /* Choose the distcc server host (which could be either a remote
      * host or localhost) and acquire the lock for it.  */
   choose_host:
+    dcc_free_buffer(&server_stderr);
+    dcc_free_buffer(&server_stdout);
     remote_completed = 0;
     if ((ret = dcc_pick_host_from_list_and_lock_it(&host, &cpu_lock_fd, cpp_ready)) != 0) {
         /* Doesn't happen at the moment: all failures are masked by
@@ -934,8 +920,8 @@ dcc_build_somewhere(char *argv[],
                                   files,
                                   output_fname,
                                   needs_dotd ? deps_fname : NULL,
-                                  server_stderr_fname,
-                                  server_stdout_fname,
+                                  &server_stderr,
+                                  &server_stdout,
                                   cpp_pid, local_cpu_lock_fd,
                   host, status, &remote_unsupported)) != 0) {
         /* Returns zero if we successfully ran the compiler, even if
@@ -970,21 +956,20 @@ dcc_build_somewhere(char *argv[],
 
     ret = dcc_critique_status(*status, "compile", input_fname, host, 1);
     if (ret == 0) {
-        /* Try to copy the server-side errors on stderr.
+        /* Try to write the server-side errors to stderr.
          * If that fails, even though the compilation succeeded,
          * we haven't managed to give these errors to the user,
          * so we have to try again.
-         * FIXME: Just like in the attempt to make a temporary file, this
-         * is unlikely to fail, if it does it's unlikely any other
+         * FIXME: This is unlikely to fail, if it does it's unlikely any other
          * operation will work, and this makes the mistake of
          * blaming the server for what is (clearly?) a local failure.
          */
-        if ((dcc_copy_file_to_fd(server_stderr_fname, STDERR_FILENO))) {
+        if (dcc_writex(STDERR_FILENO, server_stderr.data, server_stderr.size)) {
             rs_log_warning("Could not show server-side errors");
             goto fallback;
         }
         /* SUCCESS! */
-        ret = dcc_copy_file_to_fd(server_stdout_fname, STDOUT_FILENO);
+        ret = dcc_writex(STDOUT_FILENO, server_stdout.data, server_stdout.size);
         goto clean_up;
     }
     if (ret < 128) {
@@ -1005,14 +990,14 @@ dcc_build_somewhere(char *argv[],
                if it was a local one. But if we can't get the failures
                then we need to retry regardless.
             */
-            if ((dcc_copy_file_to_fd(server_stderr_fname, STDERR_FILENO))) {
+            if (dcc_writex(STDERR_FILENO, server_stderr.data, server_stderr.size)) {
                 rs_log_warning("remote compilation of '%s' failed",\
                                input_fname);
                 rs_log_warning("Could not show server-side errors, retrying locally");
                 goto fallback;
             }
             /* Not retrying */
-            if (dcc_copy_file_to_fd(server_stdout_fname, STDOUT_FILENO))
+            if (dcc_writex(STDOUT_FILENO, server_stdout.data, server_stdout.size))
                 ret = EXIT_IO_ERROR;
             goto clean_up;
         } else {
@@ -1033,16 +1018,18 @@ dcc_build_somewhere(char *argv[],
          * If we fail the user will miss all the messages from the server; so
          * we pretend we failed remotely.
          */
-        if ((dcc_copy_file_to_fd(server_stderr_fname, STDERR_FILENO))) {
-            rs_log_error("Could not print error messages from '%s'",
-                         server_stderr_fname);
+        if (dcc_writex(STDERR_FILENO, server_stderr.data, server_stderr.size)) {
+            rs_log_error("Could not print server-side error messages");
         }
-        if (remote_completed && dcc_copy_file_to_fd(server_stdout_fname, STDOUT_FILENO))
+        if (remote_completed &&
+            dcc_writex(STDOUT_FILENO, server_stdout.data, server_stdout.size))
             ret = EXIT_IO_ERROR;
         goto clean_up;
     }
 
     /* At this point, we can abandon the remote errors. */
+    dcc_free_buffer(&server_stderr);
+    dcc_free_buffer(&server_stdout);
 
     /* "You guys are so lazy!  Do I have to do all the work myself??" */
     if (host) {
@@ -1111,8 +1098,8 @@ dcc_build_somewhere(char *argv[],
         free(localcpp_server_argv);
     }
     free(discrepancy_filename);
-    free(server_stdout_fname);
-    free(server_stderr_fname);
+    dcc_free_buffer(&server_stdout);
+    dcc_free_buffer(&server_stderr);
     return ret;
 }
 

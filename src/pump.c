@@ -56,24 +56,53 @@
 /*
  * Receive either compressed or uncompressed bulk data.
  */
+void dcc_free_buffer(struct dcc_buffer *buffer)
+{
+    free(buffer->data);
+    buffer->data = NULL;
+    buffer->size = 0;
+}
+
+/* Publish only complete payloads; leave an empty buffer on receive failure. */
+int dcc_r_buffer(struct dcc_buffer *buffer, int ifd, unsigned f_size,
+                 enum dcc_compress compression)
+{
+    int ret;
+    dcc_free_buffer(buffer);
+    if (!f_size)
+        return 0;
+    if (compression == DCC_COMPRESS_LZO1X)
+        return dcc_r_bulk_lzo1x(buffer, ifd, f_size);
+    if (compression == DCC_COMPRESS_LZ4)
+        return dcc_r_bulk_lz4(buffer, ifd, f_size);
+    if (compression != DCC_COMPRESS_NONE) {
+        rs_log_error("impossible compression %d", compression);
+        return EXIT_PROTOCOL_ERROR;
+    }
+    if (!(buffer->data = malloc(f_size)))
+        return EXIT_OUT_OF_MEMORY;
+    if ((ret = dcc_readx(ifd, buffer->data, f_size))) {
+        dcc_free_buffer(buffer);
+        return ret;
+    }
+    buffer->size = f_size;
+    return 0;
+}
+
 int dcc_r_bulk(int ofd,
                int ifd,
                unsigned f_size,
                enum dcc_compress compression)
 {
-    if (f_size == 0)
-        return 0;               /* don't decompress nothing */
-
-    if (compression == DCC_COMPRESS_NONE) {
+    struct dcc_buffer buffer = {0};
+    int ret;
+    if (compression == DCC_COMPRESS_NONE)
         return dcc_pump_readwrite(ofd, ifd, f_size);
-    } else if (compression == DCC_COMPRESS_LZO1X) {
-        return dcc_r_bulk_lzo1x(ofd, ifd, f_size);
-    } else if (compression == DCC_COMPRESS_LZ4) {
-        return dcc_r_bulk_lz4(ofd, ifd, f_size);
-    } else {
-        rs_log_error("impossible compression %d", compression);
-        return EXIT_PROTOCOL_ERROR;
-    }
+    ret = dcc_r_buffer(&buffer, ifd, f_size, compression);
+    if (!ret)
+        ret = dcc_writex(ofd, buffer.data, buffer.size);
+    dcc_free_buffer(&buffer);
+    return ret;
 }
 
 

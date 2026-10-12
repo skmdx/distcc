@@ -180,12 +180,18 @@ int dcc_send_job_corked(int net_fd,
             const char *cpp_fname,
                         struct dcc_hostdef *);
 
+/* Owned receive buffer. Initialize to {0}; free with dcc_free_buffer. */
+struct dcc_buffer {
+    char *data;
+    size_t size;
+};
+
 int dcc_retrieve_results(int net_fd,
                          int *status,
                          const char *output_fname,
                          const char *deps_fname,
-                         const char *server_stderr_fname,
-                         const char *server_stdout_fname,
+                         struct dcc_buffer *server_stderr,
+                         struct dcc_buffer *server_stdout,
                          int preprocess_only,
                          struct dcc_hostdef *);
 
@@ -234,7 +240,7 @@ void dcc_set_trace_from_env(void);
 
 
 /* compress.c */
-int dcc_r_bulk_lzo1x(int outf_fd,
+int dcc_r_bulk_lzo1x(struct dcc_buffer *output,
                       int in_fd,
                       unsigned in_len);
 
@@ -248,7 +254,7 @@ int dcc_compress_file(int in_fd,
 
 int dcc_compress_lz4_alloc(const char *in_buf, size_t in_len,
                            char **out_buf, size_t *out_len);
-int dcc_r_bulk_lz4(int out_fd, int in_fd, unsigned in_len);
+int dcc_r_bulk_lz4(struct dcc_buffer *output, int in_fd, unsigned in_len);
 
 int dcc_compress_lzo1x_alloc(const char *in_buf,
                             size_t in_len,
@@ -358,6 +364,9 @@ extern const int dcc_connect_timeout;
 
 
 /* pump.c */
+void dcc_free_buffer(struct dcc_buffer *buffer);
+int dcc_r_buffer(struct dcc_buffer *buffer, int ifd, unsigned size,
+                 enum dcc_compress compression);
 int dcc_r_bulk(int ofd,
                int ifd,
                unsigned f_size,

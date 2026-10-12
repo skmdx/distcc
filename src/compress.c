@@ -152,7 +152,7 @@ int dcc_compress_lz4_alloc(const char *in_buf, size_t in_len,
     return 0;
 }
 
-int dcc_r_bulk_lz4(int out_fd, int in_fd, unsigned in_len)
+int dcc_r_bulk_lz4(struct dcc_buffer *output, int in_fd, unsigned in_len)
 {
     uint32_t size;
     char *in_buf = NULL, *out_buf = NULL;
@@ -186,7 +186,10 @@ int dcc_r_bulk_lz4(int out_fd, int in_fd, unsigned in_len)
         goto out;
     }
     rs_trace("LZ4 decompressed %u bytes to %u bytes", in_len, size);
-    ret = dcc_writex(out_fd, out_buf, size);
+    output->data = out_buf;
+    output->size = size;
+    out_buf = NULL;
+    ret = 0;
 out:
     free(in_buf);
     free(out_buf);
@@ -244,12 +247,12 @@ int dcc_compress_lzo1x_alloc(const char *in_buf,
 
 
 /**
- * Receive @p in_len compressed bytes from @p in_fd, and write the
- * decompressed form to @p out_fd.
+ * Receive @p in_len compressed bytes from @p in_fd and transfer ownership of
+ * the decoded allocation to @p output. On failure, output is unchanged.
  *
  * There's no way for us to know how big the uncompressed form will be, and
  * there is also no way to grow the decompression buffer if it turns out to
- * initially be too small.  So we assume a ratio of 10x.  If it turns out to
+ * initially be too small.  So we assume a ratio of 8x.  If it turns out to
  * be too small, we increase the buffer and try again.  Typical compression of
  * source or object is about 2x to 4x.  On modern Unix we should be able to
  * allocate (and not touch) many megabytes at little cost, since it will just
@@ -259,7 +262,7 @@ int dcc_compress_lzo1x_alloc(const char *in_buf,
  * get more output space, so our buffer needs to be big enough in the first
  * place or we would waste time repeatedly decompressing it.
  **/
-int dcc_r_bulk_lzo1x(int out_fd, int in_fd,
+int dcc_r_bulk_lzo1x(struct dcc_buffer *output, int in_fd,
                      unsigned in_len)
 {
     int ret, lzo_ret;
@@ -282,14 +285,12 @@ int dcc_r_bulk_lzo1x(int out_fd, int in_fd,
     if ((ret = dcc_readx(in_fd, in_buf, in_len)) != 0)
         goto out;
 
-#if 0
-    /* Initial estimate for output buffer.  This is intentionally quite low to
-     * exercise the resizing code -- if it works OK then we can scale this
-     * up. */
-    out_size = 2 * in_len;
-#else
-    out_size = 8 * in_len;
-#endif
+    out_size = in_len;
+    if (out_size > SIZE_MAX / 8) {
+        ret = EXIT_OUT_OF_MEMORY;
+        goto out;
+    }
+    out_size *= 8;
 
     try_again_with_a_bigger_buffer:
 
@@ -308,14 +309,20 @@ int dcc_r_bulk_lzo1x(int out_fd, int in_fd,
                  (long) in_len, (long) out_len,
                  (int) (out_len ? 100*in_len / out_len : 0));
 
-        ret = dcc_writex(out_fd, out_buf, out_len);
+        output->data = out_buf;
+        output->size = out_len;
+        out_buf = NULL;
+        ret = 0;
 
         goto out;
     } else if (lzo_ret == LZO_E_OUTPUT_OVERRUN) {
         free(out_buf);
         out_buf = 0;
+        if (out_size > SIZE_MAX / 2) {
+            ret = EXIT_OUT_OF_MEMORY;
+            goto out;
+        }
         out_size *= 2;
-        /* FIXME: Make sure this doesn't overflow memory size? */
         rs_trace("LZO_E_OUTPUT_OVERRUN, trying again with %lu byte buffer",
                  (unsigned long) out_size);
         goto try_again_with_a_bigger_buffer;

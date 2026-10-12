@@ -35,7 +35,6 @@
 #include "trace.h"
 #include "bulk.h"
 #include "snprintf.h"
-#include "exitcode.h"
 
 /* if never_send_email is true, we won't send email
    even if should_send_email is true */
@@ -79,11 +78,27 @@ void dcc_setup_log_email(void) {
     }
 }
 
+static int dcc_email_boundary(const char *tag, const char *description) {
+  int ret;
+  if ((ret = dcc_writex(email_fileno, tag, strlen(tag))) ||
+      (ret = dcc_writex(email_fileno, description, strlen(description))) ||
+      (ret = dcc_writex(email_fileno, "\n", 1)))
+    return ret;
+  return 0;
+}
+
+int dcc_add_buffer_to_log_email(const char *description, const struct dcc_buffer *buffer) {
+  int ret;
+  if (never_send_email) return 0;
+  if ((ret = dcc_email_boundary("\nBEGIN ", description)) ||
+      (ret = dcc_writex(email_fileno, buffer->data, buffer->size)))
+    return ret;
+  return dcc_email_boundary("\nEND ", description);
+}
+
 int dcc_add_file_to_log_email(const char *description,
                               const char *fname) {
-  char begin[] = "\nBEGIN ";
-  char end[] = "\nEND ";
-  int in_fd = 0;
+  int in_fd;
   off_t fsize;
   int ret;
 
@@ -92,30 +107,11 @@ int dcc_add_file_to_log_email(const char *description,
   ret = dcc_open_read(fname, &in_fd, &fsize);
   if (ret != 0) return ret;
 
-  ret = write(email_fileno, begin, strlen(begin));
-  if (ret != (ssize_t) strlen(begin)) return EXIT_IO_ERROR;
-
-  ret = write(email_fileno, description, strlen(description));
-  if (ret != (ssize_t) strlen(description)) return EXIT_IO_ERROR;
-
-  ret = write(email_fileno, "\n", 1);
-  if (ret != 1) return EXIT_IO_ERROR;
-
-  ret = dcc_pump_readwrite(email_fileno, in_fd, fsize);
-  if (ret != 0) return ret;
-
-  ret = write(email_fileno, end, strlen(end));
-  if (ret != (ssize_t) strlen(end)) return EXIT_IO_ERROR;
-
-  ret = write(email_fileno, description, strlen(description));
-  if (ret != (ssize_t) strlen(description)) return EXIT_IO_ERROR;
-
-  ret = write(email_fileno, "\n", 1);
-  if (ret != 1) return EXIT_IO_ERROR;
-
+  if (!(ret = dcc_email_boundary("\nBEGIN ", description)) &&
+      !(ret = dcc_pump_readwrite(email_fileno, in_fd, fsize)))
+    ret = dcc_email_boundary("\nEND ", description);
   close(in_fd);
-
-  return 0;
+  return ret;
 }
 
 void dcc_maybe_send_email(void) {

@@ -729,7 +729,8 @@ operation, not a per-link transfer. Use a stable snapshot when preparing the
 profile so it represents one coherent library set.
 .PP
 Objects, ordinary archives and ELF libraries in build-specific -L
-directories are transferred per job. Linking runs inside an ordinary distccd
+directories are streamed per job without staging a client-side tar file. Inputs
+must remain unchanged during transfer. Linking runs inside an ordinary distccd
 worker slot, using the same capacity-based host choice as compilation. Output
 is replaced only after a complete successful response. Network/setup failures
 and linker errors retry locally unless DISTCC_FALLBACK=0.
@@ -880,8 +881,13 @@ or a system-wide configuration file set at compile time.  The file
 locations are shown in the output from
 .B distcc --help
 .PP
-distcc creates a number of temporary and lock files underneath the
-temporary directory.
+distcc creates temporary compiler files underneath the temporary directory.
+Client-side preprocessor output is retained for retries, and pump retains its
+compressed include cache for reuse. These are suitable for tmpfs. Received
+compiler diagnostics and standard output are held in memory until the response
+can be published, without client-side spool files. Worker compiler inputs,
+outputs and diagnostics still use files. Remote link results use a temporary
+file beside the destination so that replacement is atomic.
 .SH "ENVIRONMENT VARIABLES"
 distcc's behaviour is controlled by a number of environment variables.
 For most cases nothing need be set if the host list is stored in a

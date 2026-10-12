@@ -27,5 +27,7 @@ void dcc_please_send_email(void);
 void dcc_setup_log_email(void);
 void dcc_maybe_send_email(void);
 int dcc_add_file_to_log_email(const char *description, const char *fname);
+struct dcc_buffer;
+int dcc_add_buffer_to_log_email(const char *description, const struct dcc_buffer *buffer);
 
 #endif /* EMAILLOG_H */

@@ -461,90 +461,116 @@ def copy_response(sock, name, stream):
         size -= len(data)
 
 
-def remote_link(job, inputs, output):
-    with tempfile.TemporaryFile() as archive:
-        with tarfile.open(fileobj=archive, mode='w') as tar:
-            data = json.dumps(job).encode()
-            member = tarfile.TarInfo('job.json')
-            member.size = len(data)
-            tar.addfile(member, io.BytesIO(data))
-            for name, path in inputs.items():
-                with open(path, 'rb') as stream:
-                    member = tarfile.TarInfo(name)
-                    member.size = os.fstat(stream.fileno()).st_size
-                    tar.addfile(member, stream)
-        size = archive.tell()
-        if size > 0xffffffff:
+class LinkArchive:
+    """Plan the length-prefixed tar from metadata, then stream each input once."""
+
+    def __init__(self, job, inputs):
+        self.data = json.dumps(job).encode()
+        self.members = []
+        self.size = 2 * tarfile.BLOCKSIZE  # End-of-archive records.
+        self.add('job.json', len(self.data), None, None)
+        for name, path in inputs.items():
+            stat = os.stat(path)
+            self.add(name, stat.st_size, path, self.identity(stat))
+        self.size += -self.size % tarfile.RECORDSIZE
+        if self.size > 0xffffffff:
             raise LocalOnly('link inputs exceed the protocol size limit')
-        archive.seek(0)
-        with ExitStack() as stack:
-            for command in (8, 6, 1):
-                lease = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
-                lease.connect(os.environ['DISTCC_BROKER'])
-                lease.sendall(struct.pack('=II', 2, command))
-                reply, ancillary, flags, _ = lease.recvmsg(1032, socket.CMSG_SPACE(4),
-                                                           socket.MSG_CMSG_CLOEXEC)
-                if reply or ancillary or flags:
-                    break
-                lease.close()  # An older broker rejects the optional pool request.
-            descriptors = []
-            for level, kind, data in ancillary:
-                if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
-                    descriptors.extend(array.array('i', data))
-            try:
-                if (len(reply) != 1032 or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
-                        or len(descriptors) != 1):
-                    raise OSError('invalid broker reply')
-                status, capabilities = struct.unpack('=ii', reply[:8])
-                if status:
-                    raise OSError('broker has no available link host')
-                host = reply[8:].split(b'\0', 1)[0].decode()
-                if ',auth' in host:
-                    raise LocalOnly('authenticated link protocol is not supported')
-                lease.sendall(struct.pack('=II', 2, 3))
-                net = socket.socket(fileno=descriptors.pop())
-                with net:
-                    net.settimeout(float(os.environ.get('DISTCC_IO_TIMEOUT', '300')))
-                    net.sendall(b'DIST00000004' + f'LINK{size:08x}'.encode())
-                    while data := archive.read(65536):
-                        net.sendall(data)
-                    if token(net, 'DONE') != 4:
-                        raise OSError('unsupported link protocol version')
-                    status = token(net, 'STAT')
-                    copy_response(net, 'SERR', sys.stderr.buffer)
-                    copy_response(net, 'SOUT', sys.stdout.buffer)
-                    mode = token(net, 'MODE')
-                    with tempfile.NamedTemporaryFile(dir=output.absolute().parent,
-                                                     prefix='.distcc-link-', delete=False) as result:
-                        temporary = Path(result.name)
-                        try:
-                            copy_response(net, 'DOTO', result)
-                            if capabilities & (1 << 30) and token(net, 'JEND') != 0:
-                                raise OSError('invalid end of pooled job')
-                            if not status:
-                                mask = os.umask(0)
-                                os.umask(mask)
-                                os.fchmod(result.fileno(), mode & 0o777 & ~mask)
-                                result.flush()
-                                os.replace(temporary, output)
-                        finally:
-                            temporary.unlink(missing_ok=True)
-                    if capabilities & (1 << 30):
-                        try:
-                            lease.sendmsg([struct.pack('=II', 2, 7)],
-                                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                                            array.array('i', [net.fileno()]))])
-                        except OSError:
-                            pass  # Losing the pool does not invalidate a completed link.
-                    if os.environ.get('DISTCC_VERBOSE') == '1':
-                        print('distcc-link: linked on ' + host, file=sys.stderr)
-                    code = os.waitstatus_to_exitcode(status)
-                    if code == 100:
-                        raise OSError('remote link worker could not execute the job')
-                    return code if code >= 0 else 128 - code
-            finally:
-                for fd in descriptors:
-                    os.close(fd)
+
+    @staticmethod
+    def identity(stat):
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def add(self, name, size, path, identity):
+        member = tarfile.TarInfo(name)
+        member.size = size
+        self.members.append((member, path, identity))
+        self.size += len(member.tobuf(format=tarfile.PAX_FORMAT))
+        self.size += size + (-size % tarfile.BLOCKSIZE)
+
+    def send(self, sock):
+        with sock.makefile('wb') as stream:
+            with tarfile.open(fileobj=stream, mode='w|', format=tarfile.PAX_FORMAT) as tar:
+                for member, path, identity in self.members:
+                    if path is None:
+                        tar.addfile(member, io.BytesIO(self.data))
+                        continue
+                    with open(path, 'rb') as source:
+                        if self.identity(os.fstat(source.fileno())) != identity:
+                            raise OSError('link input changed before transfer')
+                        tar.addfile(member, source)
+                        if self.identity(os.fstat(source.fileno())) != identity:
+                            raise OSError('link input changed during transfer')
+
+
+def remote_link(job, inputs, output):
+    archive = LinkArchive(job, inputs)
+    with ExitStack() as stack:
+        for command in (8, 6, 1):
+            lease = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
+            lease.connect(os.environ['DISTCC_BROKER'])
+            lease.sendall(struct.pack('=II', 2, command))
+            reply, ancillary, flags, _ = lease.recvmsg(1032, socket.CMSG_SPACE(4),
+                                                       socket.MSG_CMSG_CLOEXEC)
+            if reply or ancillary or flags:
+                break
+            lease.close()  # An older broker rejects the optional pool request.
+        descriptors = []
+        for level, kind, data in ancillary:
+            if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
+                descriptors.extend(array.array('i', data))
+        try:
+            if (len(reply) != 1032 or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+                    or len(descriptors) != 1):
+                raise OSError('invalid broker reply')
+            status, capabilities = struct.unpack('=ii', reply[:8])
+            if status:
+                raise OSError('broker has no available link host')
+            host = reply[8:].split(b'\0', 1)[0].decode()
+            if ',auth' in host:
+                raise LocalOnly('authenticated link protocol is not supported')
+            lease.sendall(struct.pack('=II', 2, 3))
+            net = socket.socket(fileno=descriptors.pop())
+            with net:
+                net.settimeout(float(os.environ.get('DISTCC_IO_TIMEOUT', '300')))
+                net.sendall(b'DIST00000004' + f'LINK{archive.size:08x}'.encode())
+                archive.send(net)
+                if token(net, 'DONE') != 4:
+                    raise OSError('unsupported link protocol version')
+                status = token(net, 'STAT')
+                copy_response(net, 'SERR', sys.stderr.buffer)
+                copy_response(net, 'SOUT', sys.stdout.buffer)
+                mode = token(net, 'MODE')
+                with tempfile.NamedTemporaryFile(dir=output.absolute().parent,
+                                                 prefix='.distcc-link-', delete=False) as result:
+                    temporary = Path(result.name)
+                    try:
+                        copy_response(net, 'DOTO', result)
+                        if capabilities & (1 << 30) and token(net, 'JEND') != 0:
+                            raise OSError('invalid end of pooled job')
+                        if not status:
+                            mask = os.umask(0)
+                            os.umask(mask)
+                            os.fchmod(result.fileno(), mode & 0o777 & ~mask)
+                            result.flush()
+                            os.replace(temporary, output)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                if capabilities & (1 << 30):
+                    try:
+                        lease.sendmsg([struct.pack('=II', 2, 7)],
+                                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                        array.array('i', [net.fileno()]))])
+                    except OSError:
+                        pass  # Losing the pool does not invalidate a completed link.
+                if os.environ.get('DISTCC_VERBOSE') == '1':
+                    print('distcc-link: linked on ' + host, file=sys.stderr)
+                code = os.waitstatus_to_exitcode(status)
+                if code == 100:
+                    raise OSError('remote link worker could not execute the job')
+                return code if code >= 0 else 128 - code
+        finally:
+            for fd in descriptors:
+                os.close(fd)
 
 
 def worker(archive, output):

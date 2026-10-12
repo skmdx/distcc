@@ -248,8 +248,8 @@ int dcc_compile_remote(char **argv,
                        char **files,
                        char *output_fname,
                        char *deps_fname,
-                       char *server_stderr_fname,
-                       char *server_stdout_fname,
+                       struct dcc_buffer *server_stderr,
+                       struct dcc_buffer *server_stdout,
                        pid_t cpp_pid,
                        int local_cpu_lock_fd,
                        struct dcc_hostdef *host,
@@ -350,8 +350,8 @@ int dcc_compile_remote(char **argv,
      * receive results. */
     if (ret == 0 && *status == 0) {
         ret = dcc_retrieve_results(from_net_fd, status, output_fname,
-                                   deps_fname, server_stderr_fname,
-                                   server_stdout_fname, dcc_argv_search(argv, "-E"), host);
+                                   deps_fname, server_stderr,
+                                   server_stdout, dcc_argv_search(argv, "-E"), host);
         if (!ret && host->broker_pooled) {
             unsigned end;
             ret = dcc_r_token_int(from_net_fd, "JEND", &end);

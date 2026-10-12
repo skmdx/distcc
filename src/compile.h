@@ -28,14 +28,15 @@
 struct dcc_hostdef;
 int dcc_wait_for_cpp(pid_t cpp_pid, int *status, const char *input_fname);
 
+struct dcc_buffer;
 int dcc_compile_remote(char **argv,
                        char *input_fname,
                        char *cpp_fname,
                        char **file_names,
                        char *output_fname,
                        char *deps_fname,
-                       char *server_stderr_fname,
-                       char *server_stdout_fname,
+                       struct dcc_buffer *server_stderr,
+                       struct dcc_buffer *server_stdout,
                        pid_t cpp_pid,
                        int local_cpu_lock_fd,
                        struct dcc_hostdef *host,

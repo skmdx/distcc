@@ -22,7 +22,7 @@ class ProtocolTest(DistccTestCase):
         self.source = self.work / 'source with spaces.c'
         self.source.write_text('int main(void) { return 0; }\n')
 
-    def compile(self, flags=(), prefix=()):
+    def compile_source(self, flags=(), prefix=()):
         obj = self.work / 'result.o'
         result = subprocess.run([*prefix, str(self.build / 'distcc'), 'gcc',
                                  *flags, '-c', str(self.source), '-o', str(obj)],
@@ -32,20 +32,33 @@ class ProtocolTest(DistccTestCase):
         exe = self.work / 'result'
         subprocess.run(['gcc', str(obj), '-o', str(exe)], check=True, capture_output=True)
         subprocess.run([str(exe)], check=True)
+        return result
 
     def test_large_argument_frame(self):
         # The wire frame exceeds ordinary socket buffers; all flags must arrive.
-        self.compile(['-fno-inline'] * 16000)
+        self.compile_source(['-fno-inline'] * 16000)
 
     def test_compression_round_trip(self):
-        for codec in ('lzo', 'lz4'):
-            self.env['DISTCC_HOSTS'] = self.host(0, ',' + codec)
+        for codec in ('', ',lzo', ',lz4'):
+            self.env['DISTCC_HOSTS'] = self.host(0, codec)
             for body in ('', 'const char repeated[] = "' + '0' * 1000000 + '";\n',
                          'const char data[] = "' + os.urandom(32000).hex() + '";\n'):
                 with self.subTest(codec=codec, size=len(body)):
                     self.source.write_text(body + '#warning compression-test\n'
                                            'int main(void) { return 0; }\n')
-                    self.compile()
+                    result = self.compile_source()
+                    self.assertIn('compression-test', result.stderr)
+
+    @unittest.skipUnless(shutil.which('strace'), 'strace is required')
+    def test_diagnostics_without_client_spool_files(self):
+        self.env.update(DISTCC_HOSTS=self.host(0, ',lz4'), DISTCC_SAVE_TEMPS='1')
+        self.source.write_text('#warning direct-diagnostics\nint main(void) { return 0; }\n')
+        trace = self.work / 'files.trace'
+        result = self.compile_source(prefix=['strace', '-f', '-e', 'trace=openat', '-o', str(trace)])
+        self.assertIn('direct-diagnostics', result.stderr)
+        calls = trace.read_text()
+        self.assertNotIn('distcc_server_stdout', calls)
+        self.assertNotIn('distcc_server_stderr', calls)
 
     def test_lz4_rejects_invalid_blocks(self):
         def token(name, value):
@@ -72,7 +85,7 @@ class ProtocolTest(DistccTestCase):
                         pass
                     self.assertNotIn(b'DOTO', response)
         self.env['DISTCC_HOSTS'] = self.host(0, ',lz4')
-        self.compile()
+        self.compile_source()
 
     def test_lz4_rejects_oversized_input_before_reading(self):
         source = self.work / 'oversized.i'
@@ -92,7 +105,7 @@ class ProtocolTest(DistccTestCase):
         for enabled in ('0', '1'):
             with self.subTest(cork=enabled):
                 self.env['DISTCC_TCP_CORK'] = enabled
-                self.compile(['-fno-inline'] * 100, prefix=(
+                self.compile_source(['-fno-inline'] * 100, prefix=(
                     'strace', '-yy', '-s', '64', '-e', 'trace=write,setsockopt',
                     '-o', str(trace)))
                 lines = trace.read_text().splitlines()
