@@ -37,6 +37,7 @@
 
 #include <sys/types.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 
 #include "distcc.h"
 #include "trace.h"
@@ -83,12 +84,18 @@ static int dcc_remote_connect(struct dcc_hostdef *host,
         if (host->broker_managed) {
             *from_net_fd = *to_net_fd = host->broker_fd;
             host->broker_fd = -1;
+            if (host->compr == DCC_COMPRESS_LZ4_STREAM) dcc_buffer_input(*from_net_fd);
             return *to_net_fd < 0 ? EXIT_CONNECT_FAILED : 0;
+        }
+        if (host->http2) {
+            rs_log_error("HTTP/2 requires a local distcc broker");
+            return EXIT_CONNECT_FAILED;
         }
         if ((ret = dcc_connect_by_name(host->hostname, host->port,
                                        to_net_fd)) != 0)
             return ret;
         *from_net_fd = *to_net_fd;
+        if (host->compr == DCC_COMPRESS_LZ4_STREAM) dcc_buffer_input(*from_net_fd);
         return 0;
     } else if (host->mode == DCC_MODE_SSH) {
         if ((ret = dcc_ssh_connect(NULL, host->user, host->hostname,
@@ -304,7 +311,7 @@ int dcc_compile_remote(char **argv,
         }
 
         n_files = dcc_argv_len(files);
-        if ((ret = dcc_x_many_files(to_net_fd, n_files, files))) {
+        if ((ret = dcc_x_many_files(to_net_fd, n_files, files, host->compr))) {
             goto out;
         }
     } else {
@@ -338,6 +345,10 @@ int dcc_compile_remote(char **argv,
     if (host->cpp_where == DCC_CPP_ON_SERVER)
         dcc_broker_cpp_done(host);
     tcp_cork_sock(to_net_fd, 0);
+    if (host->http2 && shutdown(to_net_fd, SHUT_WR)) {
+        ret = EXIT_IO_ERROR;
+        goto out;
+    }
     /* but it might not have been read in by the server yet; there's
      * 100kB or more of buffers in the two kernels. */
 

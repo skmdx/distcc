@@ -21,6 +21,7 @@
 #include "hosts.h"
 #include "adaptive.h"
 #include "broker.h"
+#include "http2.h"
 #include "exitcode.h"
 #include "trace.h"
 
@@ -50,11 +51,13 @@ struct peer {
     double full_until, link_until;
     int pool_supported;
     int admission_supported;
+    struct dcc_h2 *h2;
+    uint64_t h2_generation;
     size_t used;
     char stats[4096];
 };
 enum client_state { REQUEST, WAITING, CONNECTING, HELLO_SEND, HELLO_READ,
-                    RESERVE_SEND, RESERVE_READ, ACTIVE, MEMO_OWNER, MEMO_WAIT };
+                    RESERVE_SEND, RESERVE_READ, H2_WAIT, ACTIVE, MEMO_OWNER, MEMO_WAIT };
 struct client {
     int fd, net, peer, cpp_reserved;
     enum client_state state;
@@ -63,6 +66,8 @@ struct client {
     int memo;
     int pooled;
     int admission;
+    int h2_stream, h2_status;
+    uint64_t h2_generation;
     size_t used;
     char hello[12];
 };
@@ -344,7 +349,13 @@ static void release_assignment(struct broker *broker, struct client *client)
 {
     broker->cpp_busy -= client->cpp_reserved;
     client->cpp_reserved = 0;
-    if (client->peer >= 0) broker->peers[client->peer].busy--;
+    if (client->peer >= 0) {
+        struct peer *p = &broker->peers[client->peer];
+        if (client->h2_stream && client->h2_generation == p->h2_generation)
+            dcc_h2_cancel(p->h2, client->h2_stream);
+        p->busy--;
+    }
+    client->h2_stream = 0;
     if (client->net >= 0) close(client->net);
     client->net = client->peer = -1;
 }
@@ -514,6 +525,31 @@ static int dispatch(struct broker *broker, struct client *client, double now)
         release_client(broker, client);
     } else if (best >= 0 && (!local_cpp || broker->cpp_busy < broker->cpp_limit)) {
         struct peer *p = &broker->peers[best];
+        if (p->host->http2) {
+            if (!p->h2) {
+                int fd = connect_peer(p, p->host->port);
+                if (fd >= 0) {
+                    p->h2 = dcc_h2_new(fd, NULL, NULL);
+                    if (!p->h2) close(fd);
+                    else p->h2_generation++;
+                }
+            }
+            if (!p->h2 || (client->h2_stream = dcc_h2_open(p->h2, link,
+                    &client->net, &client->h2_status)) < 0) {
+                client->h2_stream = 0;
+                p->retry_at = now + 5;
+                return 1;
+            }
+            client->peer = best;
+            client->h2_generation = p->h2_generation;
+            client->state = H2_WAIT;
+            client->deadline = now + 3;
+            client->pooled = 0;
+            p->busy++;
+            broker->cpp_busy += local_cpp;
+            client->cpp_reserved = local_cpp;
+            return 0;
+        }
         client->admission = client->command != ACQUIRE &&
                             p->admission_supported && p->pool_supported >= 0;
         client->net = client->command != ACQUIRE ? pool_take(broker, best, now) : -1;
@@ -787,8 +823,9 @@ int dcc_broker_serve(const char *path)
     mask_set = 1;
     ret = 0;
     while (!stopping) {
-        struct pollfd polls[1 + MAX_HOSTS + 2 * MAX_CLIENTS];
+        struct pollfd polls[1 + 3 * MAX_HOSTS + 3 * MAX_CLIENTS];
         int stats_index[MAX_HOSTS], control_index[MAX_CLIENTS], net_index[MAX_CLIENTS];
+        int h2_index[MAX_HOSTS];
         int i, n = 1, clients = 0, probes = 0, timeout;
         struct timespec wait_time;
         double now = now_seconds();
@@ -851,6 +888,19 @@ int dcc_broker_serve(const char *path)
             }
             if (c->state == CONNECTING && now >= c->deadline)
                 connection_event(broker, c, now, 1);
+            if (c->state == H2_WAIT) {
+                struct peer *p = &broker->peers[c->peer];
+                if (c->h2_status == 200) deliver_connection(broker, c);
+                else if (c->h2_status || now >= c->deadline) {
+                    if (c->h2_status == 503) {
+                        if (c->command == ACQUIRE_LINK) p->link_until = now + .05;
+                        else p->full_until = now + .05;
+                    } else p->retry_at = now + 5;
+                    release_assignment(broker, c);
+                    c->state = WAITING;
+                    wake_at = now;
+                }
+            }
             if ((c->state == HELLO_SEND || c->state == HELLO_READ) && now >= c->deadline)
                 hello_event(broker, c, 1);
             if ((c->state == RESERVE_SEND || c->state == RESERVE_READ) && now >= c->deadline)
@@ -860,7 +910,7 @@ int dcc_broker_serve(const char *path)
                 wake_at = now;
             if (c->fd < 0)
                 continue;
-            if ((c->state == REQUEST || c->state == CONNECTING || c->state == HELLO_SEND || c->state == HELLO_READ ||
+            if ((c->state == REQUEST || c->state == CONNECTING || c->state == H2_WAIT || c->state == HELLO_SEND || c->state == HELLO_READ ||
                  c->state == RESERVE_SEND || c->state == RESERVE_READ ||
                  c->state == MEMO_OWNER || c->state == MEMO_WAIT) && c->deadline < wake_at)
                 wake_at = c->deadline;
@@ -873,6 +923,16 @@ int dcc_broker_serve(const char *path)
                     c->state == HELLO_READ || c->state == RESERVE_READ ? POLLIN : POLLOUT, 0 };
             }
         }
+        for (i = 0; i < broker->count; ++i) {
+            h2_index[i] = -1;
+            if (broker->peers[i].h2) {
+                int added = dcc_h2_prepare(broker->peers[i].h2, polls + n,
+                                            sizeof(polls) / sizeof(polls[0]) - n);
+                if (added < 0) { ret = EXIT_IO_ERROR; goto release_clients; }
+                h2_index[i] = n;
+                n += added;
+            }
+        }
         timeout = wake_at > now ? (int)((wake_at - now) * 1000) + 1 : 0;
         wait_time = (struct timespec){ timeout / 1000, (timeout % 1000) * 1000000L };
         if (ppoll(polls, n, &wait_time, &previous) < 0) {
@@ -882,6 +942,14 @@ int dcc_broker_serve(const char *path)
             break;
         }
         now = now_seconds();
+        for (i = 0; i < broker->count; ++i) {
+            struct peer *p = &broker->peers[i];
+            if (h2_index[i] >= 0 && dcc_h2_process(p->h2, polls + h2_index[i])) {
+                dcc_h2_free(p->h2);
+                p->h2 = NULL;
+                if (p->busy) p->retry_at = now + 5;
+            }
+        }
         for (i = 0; i < broker->count; i++)
             if (stats_index[i] >= 0 && polls[stats_index[i]].revents)
                 probe_event(&broker->peers[i], now);
@@ -947,6 +1015,7 @@ int dcc_broker_serve(const char *path)
         if (polls[0].revents)
             accept_client(broker, fd);
     }
+release_clients:
     for (count = 0; count < MAX_CLIENTS; count++)
         if (broker->clients[count].fd >= 0)
             release_client(broker, &broker->clients[count]);
@@ -954,6 +1023,8 @@ int dcc_broker_serve(const char *path)
         if (broker->peers[count].stats_fd >= 0)
             close(broker->peers[count].stats_fd);
 done:
+    for (count = 0; count < broker->count; ++count)
+        dcc_h2_free(broker->peers[count].h2);
     if (mask_set) sigprocmask(SIG_SETMASK, &previous, NULL);
     for (count = 0; count < MAX_CLIENTS; ++count)
         if (broker->pool[count].fd >= 0) close(broker->pool[count].fd);

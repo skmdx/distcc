@@ -98,7 +98,7 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
 
     /* TODO? switch include_server to use more appropriate token names */
     if (dcc_x_cwd(fd) ||
-        dcc_x_argv(fd, compr == DCC_COMPRESS_LZ4 ? "LZ4C" : "ARGC", "ARGV", argv) ||
+        dcc_x_argv(fd, compr == DCC_COMPRESS_LZ4_STREAM ? "LZ4S" : compr == DCC_COMPRESS_LZ4 ? "LZ4C" : "ARGC", "ARGV", argv) ||
         dcc_r_argv(fd, "ARGC", "ARGV", files)) {
         rs_log_warning("failed to talk to include server '%s'",
                        include_server_port);
@@ -165,7 +165,7 @@ int dcc_get_original_fname(const char *fname, char **original_fname)
         *extension = '\0';
     }
     extension = dcc_find_extension(work);
-    if (extension && (!strcmp(extension, ".lzo") || !strcmp(extension, ".lz4"))) {
+    if (extension && (!strcmp(extension, ".lzo") || !strcmp(extension, ".lz4") || !strcmp(extension, ".lz4s"))) {
         *extension = '\0';
     }
 

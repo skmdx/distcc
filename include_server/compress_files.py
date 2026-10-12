@@ -21,6 +21,7 @@
 
 import os
 import sys
+import struct
 import os.path
 
 import distcc_pump_c_extensions
@@ -58,7 +59,7 @@ class CompressFiles(object):
     filepaths in a list, which is the return value.
     """
     realpath_string = self.realpath_map.string
-    compress = (distcc_pump_c_extensions.CompressLz4Alloc if compression == 'lz4'
+    compress = (distcc_pump_c_extensions.CompressLz4Alloc if compression in ('lz4', 'lz4s')
                 else distcc_pump_c_extensions.CompressLzo1xAlloc)
     files = [] # where we accumulate files
 
@@ -109,8 +110,20 @@ class CompressFiles(object):
         except (IOError, OSError) as why:
           sys.exit("Could not open '%s' for writing: %s" % (new_filepath, why))
         try:
-          new_filepath_fd.write(
-            compress(prefix.encode() + real_file_fd.read()))
+          if compression == 'lz4s':
+            chunk = prefix.encode()
+            while True:
+              chunk += real_file_fd.read(256 * 1024 - len(chunk))
+              if not chunk:
+                break
+              encoded = compress(chunk)[4:]
+              compressed = len(encoded) < len(chunk)
+              new_filepath_fd.write(struct.pack('!II', len(chunk), len(encoded) if compressed else 0))
+              new_filepath_fd.write(encoded if compressed else chunk)
+              chunk = b''
+            new_filepath_fd.write(bytes(8))
+          else:
+            new_filepath_fd.write(compress(prefix.encode() + real_file_fd.read()))
         except (IOError, OSError) as why:
           sys.exit("Could not write to '%s': %s" % (new_filepath, why))
         new_filepath_fd.close()

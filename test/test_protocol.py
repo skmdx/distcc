@@ -39,7 +39,7 @@ class ProtocolTest(DistccTestCase):
         self.compile_source(['-fno-inline'] * 16000)
 
     def test_compression_round_trip(self):
-        for codec in ('', ',lzo', ',lz4'):
+        for codec in ('', ',lzo', ',lz4', ',lz4s'):
             self.env['DISTCC_HOSTS'] = self.host(0, codec)
             for body in ('', 'const char repeated[] = "' + '0' * 1000000 + '";\n',
                          'const char data[] = "' + os.urandom(32000).hex() + '";\n'):
@@ -99,6 +99,31 @@ class ProtocolTest(DistccTestCase):
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('compiled on ', result.stderr)
         self.assertFalse((self.work / 'oversized.o').exists())
+
+    def test_stream_rejects_invalid_chunks(self):
+        args = [b'gcc', b'-c', b'source.i', b'-o', b'result.o']
+        header = b'DIST00000008' + f'ARGC{len(args):08x}'.encode()
+        header += b''.join(f'ARGV{len(arg):08x}'.encode() + arg for arg in args)
+        # Invalid sentinel, zero plaintext with data, oversized chunk, expanded
+        # "compressed" size, and malformed LZ4 must fail before publication.
+        cases = [(1, b'x'), (0xffffffff, struct.pack('!II', 0, 1)),
+                 (0xffffffff, struct.pack('!II', 262145, 0)),
+                 (0xffffffff, struct.pack('!II', 1, 1)),
+                 (0xffffffff, struct.pack('!II', 4, 1) + b'\xff')]
+        for size, chunk in cases:
+            with self.subTest(size=size, chunk=chunk):
+                with socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5) as conn:
+                    conn.sendall(header + f'DOTI{size:08x}'.encode() + chunk)
+                    conn.shutdown(socket.SHUT_WR)
+                    reply = bytearray()
+                    try:
+                        while data := conn.recv(4096):
+                            reply.extend(data)
+                    except ConnectionResetError:
+                        pass
+                    self.assertNotIn(b'DOTO', reply)
+        self.env['DISTCC_HOSTS'] = self.host(0, ',lz4s')
+        self.compile_source()
 
     @unittest.skipUnless(shutil.which('strace'), 'strace is required')
     def test_batched_arguments_and_cork(self):

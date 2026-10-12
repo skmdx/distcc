@@ -60,6 +60,7 @@
 #include "netutil.h"
 #include "stats.h"
 #include "resource.h"
+#include "http2.h"
 
 void dcc_manage_kids(int listen_fd);
 static void dcc_sigchld_handler(int sig);
@@ -72,6 +73,7 @@ static int dcc_preforked_child(int listen_fd);
 #define MAX_PENDING 256
 #define SESSION_NEW 2
 #define WORKER_RETIRING 4
+#define SESSION_H2 8
 struct worker { pid_t pid; int fd, busy, link; };
 struct pending {
     int fd, session, ready, used;
@@ -82,6 +84,33 @@ static struct worker *workers;
 static struct pollfd *parent_polls;
 static struct pending pending[MAX_PENDING];
 static int worker_channel = -1;
+static struct { struct dcc_h2 *connection; time_t active; int poll_index; } h2[MAX_PENDING];
+
+static int accept_h2_job(void *context, int fd, int link)
+{
+    int busy, queued, links, i, streams = 0;
+    int message = SESSION_H2;
+    (void)context;
+    for (i = 0; i < MAX_PENDING; ++i) streams += dcc_h2_active(h2[i].connection);
+    if (streams > MAX_PENDING) return -1;
+    dcc_prefork_status(&busy, &queued, &links);
+    if (busy >= dcc_resource_slots(dcc_max_kids) || (link && links)) return -1;
+    for (i = 0; i < dcc_max_kids; ++i) {
+        struct worker *w = &workers[i];
+        if (w->fd < 0 || w->busy) continue;
+        if (dcc_send_fd(w->fd, &message, sizeof(message), fd)) {
+            close(w->fd);
+            w->fd = -1;
+            w->busy = 1;
+            continue;
+        }
+        w->busy = 1;
+        w->link = link;
+        close(fd);
+        return 0;
+    }
+    return -1;
+}
 
 int dcc_prefork_status(int *busy, int *queued, int *links)
 {
@@ -128,6 +157,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
 {
     struct pollfd *polls = parent_polls;
     int i, j, result, base = count + 1, sockets = base + dcc_max_kids;
+    int total = sockets + MAX_PENDING;
     time_t now = time(NULL);
     for (i = 0; i < count; ++i) polls[i] = extra[i];
     polls[count] = (struct pollfd){ listen_fd, POLLIN, 0 };
@@ -141,8 +171,22 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
         }
         polls[sockets + i] = (struct pollfd){ p->fd, p->ready ? 0 : POLLIN, 0 };
     }
+    for (i = 0; i < MAX_PENDING; ++i) {
+        h2[i].poll_index = -1;
+        if (!h2[i].connection) continue;
+        if (dcc_h2_idle(h2[i].connection) && now - h2[i].active >= 30) {
+            dcc_h2_free(h2[i].connection);
+            h2[i].connection = NULL;
+            continue;
+        }
+        int added = dcc_h2_prepare(h2[i].connection, polls + total,
+                    dcc_max_kids + 3 * MAX_PENDING + 3 - total);
+        if (added < 0) return -1;
+        h2[i].poll_index = total;
+        total += added;
+    }
     /* Bound idle expiry even without statistics or other activity. */
-    result = poll(polls, sockets + MAX_PENDING, timeout < 1000 ? timeout : 1000);
+    result = poll(polls, total, timeout < 1000 ? timeout : 1000);
     for (i = 0; i < count; ++i) extra[i].revents = polls[i].revents;
     if (result < 0) return result;
     for (i = 0; i < dcc_max_kids; ++i) {
@@ -171,6 +215,18 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
 #ifdef HAVE_GSSAPI
                 admission = !dcc_auth_enabled;
 #endif
+                if (admission && !p->used && byte == 'P') {
+                    for (j = 0; j < MAX_PENDING && h2[j].connection; ++j) {}
+                    if (j < MAX_PENDING) {
+                        h2[j].connection = dcc_h2_new(p->fd, accept_h2_job, NULL);
+                        h2[j].active = now;
+                        h2[j].poll_index = -1;
+                    }
+                    if (j == MAX_PENDING || !h2[j].connection) close(p->fd);
+                    else dcc_stats_event(STATS_TCP_ACCEPT);
+                    p->fd = -1;
+                    continue;
+                }
                 if (admission && (p->used || byte == 'S')) {
                     n = recv(p->fd, p->request + p->used, 12 - p->used, MSG_DONTWAIT);
                     if (n > 0) p->used += n;
@@ -230,6 +286,13 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             break;
         }
     }
+    for (i = 0; i < MAX_PENDING; ++i) {
+        if (!h2[i].connection || h2[i].poll_index < 0) continue;
+        if (dcc_h2_process(h2[i].connection, polls + h2[i].poll_index)) {
+            dcc_h2_free(h2[i].connection);
+            h2[i].connection = NULL;
+        } else if (!dcc_h2_idle(h2[i].connection)) h2[i].active = now;
+    }
     if (polls[count].revents & POLLIN) {
         struct sockaddr_storage address;
         socklen_t length = sizeof(address);
@@ -258,7 +321,7 @@ int dcc_preforking_parent(int listen_fd)
     sigaction(SIGCHLD, &act_child, NULL);
 #ifdef __linux__
     workers = calloc(dcc_max_kids, sizeof(*workers));
-    parent_polls = calloc(dcc_max_kids + MAX_PENDING + 3, sizeof(*parent_polls));
+    parent_polls = calloc(dcc_max_kids + 3 * MAX_PENDING + 3, sizeof(*parent_polls));
     if (!workers || !parent_polls) return EXIT_OUT_OF_MEMORY;
     for (ret = 0; ret < dcc_max_kids; ++ret) workers[ret].fd = -1;
     for (ret = 0; ret < MAX_PENDING; ++ret) pending[ret].fd = -1;
@@ -330,6 +393,10 @@ static void dcc_create_kids(int listen_fd) {
                 if (workers[i].fd >= 0) close(workers[i].fd);
             for (i = 0; i < MAX_PENDING; ++i)
                 if (pending[i].fd >= 0) close(pending[i].fd);
+            for (i = 0; i < MAX_PENDING; ++i) {
+                dcc_h2_free(h2[i].connection);
+                h2[i].connection = NULL;
+            }
 #endif
             dcc_stats_init_kid();
             dcc_exit(dcc_preforked_child(listen_fd));
@@ -418,7 +485,11 @@ static int dcc_preforked_child(int listen_fd)
 
 #ifdef __linux__
         if (message & SESSION_NEW) dcc_stats_event(STATS_TCP_ACCEPT);
-        ret = dcc_service_job(acc_fd, acc_fd, (struct sockaddr *)&cli_addr, cli_len, &session);
+        /* HTTP/2 arrives over a private socketpair after the parent checked
+         * the TCP peer against the ACL. Do not apply an IP ACL to AF_UNIX. */
+        ret = dcc_service_job(acc_fd, acc_fd,
+                message & SESSION_H2 ? NULL : (struct sockaddr *)&cli_addr,
+                cli_len, &session);
         now = time(NULL);
         message = ireq + 1 >= child_requests && now - start >= child_lifetime ? WORKER_RETIRING : 0;
         if (dcc_send_fd(worker_channel, &message, sizeof(message), !ret && session ? acc_fd : -1)) {

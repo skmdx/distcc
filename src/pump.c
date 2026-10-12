@@ -75,6 +75,8 @@ int dcc_r_buffer(struct dcc_buffer *buffer, int ifd, unsigned f_size,
         return dcc_r_bulk_lzo1x(buffer, ifd, f_size);
     if (compression == DCC_COMPRESS_LZ4)
         return dcc_r_bulk_lz4(buffer, ifd, f_size);
+    if (compression == DCC_COMPRESS_LZ4_STREAM)
+        return f_size == 0xffffffffU ? dcc_r_lz4_stream(-1, buffer, ifd) : EXIT_PROTOCOL_ERROR;
     if (compression != DCC_COMPRESS_NONE) {
         rs_log_error("impossible compression %d", compression);
         return EXIT_PROTOCOL_ERROR;
@@ -96,6 +98,8 @@ int dcc_r_bulk(int ofd,
 {
     struct dcc_buffer buffer = {0};
     int ret;
+    if (compression == DCC_COMPRESS_LZ4_STREAM)
+        return !f_size ? 0 : f_size == 0xffffffffU ? dcc_r_lz4_stream(ofd, NULL, ifd) : EXIT_PROTOCOL_ERROR;
     if (compression == DCC_COMPRESS_NONE)
         return dcc_pump_readwrite(ofd, ifd, f_size);
     ret = dcc_r_buffer(&buffer, ifd, f_size, compression);

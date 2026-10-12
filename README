@@ -28,7 +28,7 @@ appropriate compiler installed.
 On Linux, a local `distccd --broker /absolute/socket/path` can share adaptive
 host selection and statistics across clients. Set DISTCC_BROKER to that
 socket path in the build environment. The broker passes connected sockets to
-clients, so compiler data does not need an additional relay. Completed TCP
+clients for the default TCP transport. Completed TCP
 sessions are pooled when the server supports reuse; idle connections do not
 reserve compiler workers. It exits when
 idle; systemd socket activation can restart it on demand, including for
@@ -36,6 +36,20 @@ clients in a network sandbox. See distccd(1) for configuration and limits.
 Example systemd units are in packaging/systemd. For a Portage client, enable
 distcc-broker@portage.socket and set
 DISTCC_BROKER=/run/distcc-broker-portage.socket in its build environment.
+
+The optional `,h2` host option multiplexes jobs over one HTTP/2 TCP connection
+per worker host. It requires the broker, upgraded workers and libnghttp2.
+The broker and daemon relay each stream through bounded local sockets;
+flow control limits queued data, and cancelling one job preserves other jobs.
+This is cleartext HTTP/2 on the existing distccd port, subject to its IP ACL;
+SSH and GSSAPI are not supported with this option. It is opt-in because fewer
+connections do not necessarily mean faster builds or lower client CPU use.
+
+`,h2` enables chunked LZ4 transfers; `,lz4s` selects the same codec over pooled
+TCP without the HTTP/2 relay. Sources, objects and link archives stream in
+256 KiB chunks without allocating a complete compressed payload. Both options
+support pump and distributed links. Existing `,lz4` and `,lzo` hosts remain
+compatible. Restart pump sessions after upgrading their include server.
 
 GCC and Clang/LLD object links can also run on a broker-selected worker. `distcc-link --sync`
 populates immutable sysroot caches using compressed rsync transfers; set

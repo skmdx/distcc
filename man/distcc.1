@@ -515,7 +515,7 @@ The syntax is
   OLDSTYLE_TCP_HOST = HOSTID[/LIMIT][:PORT][OPTIONS]
   HOSTID = HOSTNAME | IPV4 | IPV6
   OPTIONS = ,OPTION[OPTIONS]
-  OPTION = lz4 | lzo | cpp | auth[=AUTH_NAME] | stats=PORT | speed=FACTOR
+  OPTION = h2 | lz4s | lz4 | lzo | cpp | auth[=AUTH_NAME] | stats=PORT | speed=FACTOR
   GLOBAL_OPTION = --randomize
   ZEROCONF = +zeroconf
 .fi
@@ -635,6 +635,20 @@ protocols 6 and 7 from this fork. Upgrade servers before enabling this option.
 .TP
 .B ,lzo
 Enables LZO compression for this TCP or SSH host.
+.TP
+.B ,lz4s
+Enables chunked LZ4 compression (protocols 8 and 9, or 10 for links).
+Bulk data is sent in bounded chunks instead of buffering its complete compressed
+representation. Both endpoints and the pump include server must be upgraded.
+.TP
+.B ,h2
+Multiplexes RPC jobs over a persistent HTTP/2 connection to this TCP host.
+Requires DISTCC_BROKER and implies lz4s regardless of other codec options.
+Uses cleartext HTTP/2 with the server's existing IP access rules; SSH and GSSAPI
+cannot be combined with this option. Each stream consumes a worker only after
+admission. HTTP/2 flow control bounds queued data; closing a client lease cancels
+only its stream. This option reduces connection count but adds local relay CPU
+and memory costs. Benchmark the build before enabling it.
 .TP
 .B ,cpp
 Enables distcc-pump mode for this host.  Note: the build command must be
@@ -756,11 +770,12 @@ less network traffic.  The added CPU time is insignificant for pump mode.  The
 compression ratio is typically 4:1 for source and 2:1 for object code.
 .PP
 LZO requires both client and server to use at least release 2.9 of distcc.
-LZ4 requires both ends to support this fork's protocols 6 and 7.
+Whole-payload LZ4 requires this fork's protocols 6 and 7; chunked LZ4 requires
+protocols 8 through 10.
 No server configuration is required: the
 server always responds with compressed replies to compressed requests.
 .PP
-Pump mode requires either the lz4 or lzo host option. Its include server caches
+Pump mode requires lz4, lz4s, h2 or lzo. Its include server caches
 each codec separately. Restart active pump sessions after upgrading the client.
 .SH "SEARCH PATHS"
 .PP

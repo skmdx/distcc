@@ -43,7 +43,7 @@ int dcc_copy_file_to_fd(const char *in_fname, int out_fd);
 /* clirpc.c */
 int dcc_x_many_files(int ofd,
                      unsigned int n_files,
-                     char **fnames);
+                     char **fnames, enum dcc_compress compr);
 
 /* srvrpc.c */
 int dcc_r_many_files(int in_fd,

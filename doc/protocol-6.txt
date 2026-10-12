@@ -1,5 +1,5 @@
-distcc protocols 6 and 7: LZ4 compression
-=======================================
+distcc protocols 6 through 10: LZ4 compression and HTTP/2
+======================================================
 
 Protocol 6 follows protocol 2 (client preprocessing), and protocol 7 follows
 protocol 3 (server preprocessing). All compressed bulk payloads use LZ4
@@ -26,3 +26,49 @@ Responses retain ARGC/ARGV file lists. Compressed cache files use .lz4 or
 .lzo plus optional .abs, so one include server can serve either codec without
 recompressing cached headers. New clients must restart old include servers;
 unsupported requests fail include analysis rather than mislabeling LZO data.
+
+Chunked payloads (8, 9 and 10)
+-----------------------------
+
+Protocol 8 follows 6, protocol 9 follows 7, and protocol 10 follows the
+protocol 4 link exchange. All bulk payloads use independent LZ4 chunks. The
+host option is ,lz4s (or ,h2); there is no automatic codec downgrade.
+
+An empty payload has token length zero. Otherwise the token length is
+0xffffffff, followed by pairs of uint32 values in network byte order:
+uncompressed length and encoded length. The uncompressed length is between
+1 and 262144. Encoded length zero denotes raw bytes; a nonzero encoded length
+must be smaller than the uncompressed length and denotes a raw LZ4 block.
+Exactly that many encoded (or raw) bytes follow each pair. A pair of zeros
+ends the payload. Invalid lengths, truncated input and decompression sizes
+that differ from the declared size are rejected. No total compressed length
+or complete-payload allocation is required. Result files retain the usual
+temporary-file and publication rules.
+
+The include-server token LZ4S selects .lz4s cache files. These contain the
+chunk pairs, data and terminator, without the outer RPC token. The caches
+remain separate from .lz4 and .lzo files.
+
+HTTP/2 transport
+----------------
+
+The broker opens a prior-knowledge cleartext HTTP/2 connection on the existing
+distccd port. The prefork parent checks the existing IP ACL before accepting
+the session. There is no HTTP/1 upgrade, TLS, SSH or GSSAPI wrapper.
+Each job is POST /v1/compile or POST /v1/link, with one RPC exchange in its
+DATA frames. Response status 200 grants a worker; 503 refuses without starting
+execution, allowing another host to be selected. A connection failure after
+admission retains the existing failed-job policy; it is not a safe refusal.
+
+The broker and prefork parent own HTTP/2 framing. Jobs use private local
+sockets, preserving existing compiler and link-helper I/O. A request's
+END_STREAM does not disconnect the worker's local input while it compiles;
+RST_STREAM or loss of the connection cancels it. Response END_STREAM signals
+local EOF after queued result bytes drain. Lease cancellation is scoped to
+both the connection generation and stream ID.
+
+Receive windows are 256 KiB per stream and 8 MiB per connection. WINDOW_UPDATE
+is issued when the local consumer drains data. The sender stops polling local
+producers when the HTTP/2 window or network output buffer is full. Connections
+advertise at most 256 concurrent streams; worker/resource admission still
+determines executable concurrency. Idle server connections expire after 30 s.

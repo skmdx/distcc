@@ -41,6 +41,7 @@ class LinkArchiveTest(unittest.TestCase):
 
 
 class LinkTestCase(BrokerTestCase):
+    transport = ''
     compiler = 'g++'
     sync_compiler = 'gcc'
 
@@ -114,7 +115,7 @@ class LinkTestCase(BrokerTestCase):
 
     def setUp(self):
         super().setUp()
-        self.start_broker(self.host(0, f',stats={self.stats_ports[0]}'))
+        self.start_broker(self.host(0, f',stats={self.stats_ports[0]}' + self.transport))
         self.env.update(DISTCC_LINK_SYSROOT=str(self.profile_file), DISTCC_VERBOSE='1',
                         DISTCC_LINK_SOURCE=str(self.snapshot),
                         PATH=self.link_path)
@@ -368,6 +369,14 @@ class ClangLinkTest(LinkTestCase):
         self.assertEqual(int(reply[16:24], 16) >> 8, 100)
         self.assertIn(b'unsupported LLD option', reply)
         self.assertFalse(outside.exists())
+
+
+class Http2LinkTest(LinkTest):
+    transport = ',h2'
+
+
+class Http2ClangLinkTest(ClangLinkTest):
+    transport = ',h2'
 
 
 if __name__ == '__main__':

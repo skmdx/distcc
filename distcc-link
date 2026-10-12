@@ -439,7 +439,7 @@ def check_source(profile):
 def receive_exact(sock, size):
     data = bytearray()
     while len(data) < size:
-        part = sock.recv(min(size - len(data), 65536))
+        part = sock.read(min(size - len(data), 65536))
         if not part:
             raise OSError('link server disconnected')
         data.extend(part)
@@ -453,12 +453,76 @@ def token(sock, name):
     return int(header[4:], 16)
 
 
-def copy_response(sock, name, stream):
+def copy_response(sock, name, stream, codec=None):
     size = token(sock, name)
+    if codec and size:
+        if size != 0xffffffff:
+            raise OSError('invalid chunked link payload')
+        while True:
+            plain, encoded = struct.unpack('!II', receive_exact(sock, 8))
+            if not plain and not encoded:
+                return
+            if not 0 < plain <= codec.chunk_size or encoded >= plain:
+                raise OSError('invalid LZ4 chunk size')
+            data = receive_exact(sock, encoded or plain)
+            stream.write(codec.decode(data, plain) if encoded else data)
     while size:
         data = receive_exact(sock, min(size, 65536))
         stream.write(data)
         size -= len(data)
+
+
+class Lz4Chunks:
+    """The same bounded block format as the C RPC bulk transport."""
+    chunk_size = 256 * 1024
+
+    def __init__(self):
+        import ctypes
+        self.ctypes = ctypes
+        self.library = ctypes.CDLL('liblz4.so.1')
+        signature = (ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
+        self.library.LZ4_compress_default.argtypes = signature
+        self.library.LZ4_compress_default.restype = ctypes.c_int
+        self.library.LZ4_decompress_safe.argtypes = signature
+        self.library.LZ4_decompress_safe.restype = ctypes.c_int
+        self.library.LZ4_compressBound.argtypes = (ctypes.c_int,)
+        self.library.LZ4_compressBound.restype = ctypes.c_int
+        self.bound = self.library.LZ4_compressBound(self.chunk_size)
+        self.buffer = ctypes.create_string_buffer(self.bound)
+
+    def encode(self, data):
+        n = self.library.LZ4_compress_default(data, self.buffer, len(data), self.bound)
+        if n <= 0:
+            raise OSError('LZ4 compression failed')
+        if n >= len(data):
+            return struct.pack('!II', len(data), 0) + data
+        return struct.pack('!II', len(data), n) + self.ctypes.string_at(self.buffer, n)
+
+    def decode(self, data, size):
+        n = self.library.LZ4_decompress_safe(data, self.buffer, len(data), size)
+        if n != size:
+            raise OSError('invalid LZ4 chunk')
+        return self.ctypes.string_at(self.buffer, n)
+
+
+class ChunkWriter:
+    def __init__(self, stream, codec):
+        self.stream, self.codec = stream, codec
+        self.pending = bytearray()
+
+    def write(self, data):
+        self.pending.extend(data)
+        while len(self.pending) >= self.codec.chunk_size:
+            chunk = bytes(self.pending[:self.codec.chunk_size])
+            del self.pending[:self.codec.chunk_size]
+            self.stream.write(self.codec.encode(chunk))
+        return len(data)
+
+    def finish(self):
+        if self.pending:
+            self.stream.write(self.codec.encode(bytes(self.pending)))
+            self.pending.clear()
+        self.stream.write(bytes(8))
 
 
 class LinkArchive:
@@ -487,8 +551,9 @@ class LinkArchive:
         self.size += len(member.tobuf(format=tarfile.PAX_FORMAT))
         self.size += size + (-size % tarfile.BLOCKSIZE)
 
-    def send(self, sock):
-        with sock.makefile('wb') as stream:
+    def send(self, sock, codec=None):
+        with sock.makefile('wb', buffering=65536) as raw:
+            stream = ChunkWriter(raw, codec) if codec else raw
             with tarfile.open(fileobj=stream, mode='w|', format=tarfile.PAX_FORMAT) as tar:
                 for member, path, identity in self.members:
                     if path is None:
@@ -500,6 +565,8 @@ class LinkArchive:
                         tar.addfile(member, source)
                         if self.identity(os.fstat(source.fileno())) != identity:
                             raise OSError('link input changed during transfer')
+            if codec:
+                stream.finish()
 
 
 def remote_link(job, inputs, output):
@@ -528,24 +595,29 @@ def remote_link(job, inputs, output):
             host = reply[8:].split(b'\0', 1)[0].decode()
             if ',auth' in host:
                 raise LocalOnly('authenticated link protocol is not supported')
+            options = set(host.split(','))
+            codec = Lz4Chunks() if options & {'h2', 'lz4s'} else None
+            version = 10 if codec else 4
             lease.sendall(struct.pack('=II', 2, 3))
             net = socket.socket(fileno=descriptors.pop())
-            with net:
+            with net, net.makefile('rb', buffering=65536) as response:
                 net.settimeout(float(os.environ.get('DISTCC_IO_TIMEOUT', '300')))
-                net.sendall(b'DIST00000004' + f'LINK{archive.size:08x}'.encode())
-                archive.send(net)
-                if token(net, 'DONE') != 4:
+                net.sendall(f'DIST{version:08x}LINK{0xffffffff if codec else archive.size:08x}'.encode())
+                archive.send(net, codec)
+                if 'h2' in options:
+                    net.shutdown(socket.SHUT_WR)
+                if token(response, 'DONE') != version:
                     raise OSError('unsupported link protocol version')
-                status = token(net, 'STAT')
-                copy_response(net, 'SERR', sys.stderr.buffer)
-                copy_response(net, 'SOUT', sys.stdout.buffer)
-                mode = token(net, 'MODE')
+                status = token(response, 'STAT')
+                copy_response(response, 'SERR', sys.stderr.buffer, codec)
+                copy_response(response, 'SOUT', sys.stdout.buffer, codec)
+                mode = token(response, 'MODE')
                 with tempfile.NamedTemporaryFile(dir=output.absolute().parent,
                                                  prefix='.distcc-link-', delete=False) as result:
                     temporary = Path(result.name)
                     try:
-                        copy_response(net, 'DOTO', result)
-                        if capabilities & (1 << 30) and token(net, 'JEND') != 0:
+                        copy_response(response, 'DOTO', result, codec)
+                        if capabilities & (1 << 30) and token(response, 'JEND') != 0:
                             raise OSError('invalid end of pooled job')
                         if not status:
                             mask = os.umask(0)

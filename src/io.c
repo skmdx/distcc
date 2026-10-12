@@ -244,13 +244,36 @@ int dcc_select_for_write(int fd, int timeout)
 /**
  * Read exactly @p len bytes from a file.
  **/
+static struct {
+    int fd;
+    size_t head, size;
+    char data[65536];
+} read_buffer = { .fd = -1 };
+
+void dcc_buffer_input(int fd)
+{
+    read_buffer.fd = fd;
+    read_buffer.head = read_buffer.size = 0;
+}
+
 int dcc_readx(int fd, void *buf, size_t len)
 {
     ssize_t r;
     int ret;
 
     while (len > 0) {
-        r = read(fd, buf, len);
+        int buffered = fd == read_buffer.fd && len < sizeof(read_buffer.data);
+        if (fd == read_buffer.fd && read_buffer.size) {
+            size_t n = len < read_buffer.size ? len : read_buffer.size;
+            memcpy(buf, read_buffer.data + read_buffer.head, n);
+            read_buffer.head += n;
+            read_buffer.size -= n;
+            buf = (char *)buf + n;
+            len -= n;
+            continue;
+        }
+        r = read(fd, buffered ? read_buffer.data : buf,
+                    buffered ? sizeof(read_buffer.data) : len);
 
         if (r == -1 && errno == EAGAIN) {
             if ((ret = dcc_select_for_read(fd, dcc_get_io_timeout())))
@@ -266,6 +289,11 @@ int dcc_readx(int fd, void *buf, size_t len)
             rs_log_error("unexpected eof on fd%d", fd);
             return EXIT_TRUNCATED;
         } else {
+            if (buffered) {
+                read_buffer.head = 0;
+                read_buffer.size = r;
+                continue;
+            }
             buf = &((char *) buf)[r];
             len -= r;
         }
@@ -339,6 +367,7 @@ int tcp_cork_sock(int POSSIBLY_UNUSED(fd), int POSSIBLY_UNUSED(corked))
 
 int dcc_close(int fd)
 {
+    if (read_buffer.fd == fd) dcc_buffer_input(-1);
     if (close(fd) != 0) {
         rs_log_error("failed to close fd%d: %s", fd, strerror(errno));
         return EXIT_IO_ERROR;

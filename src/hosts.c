@@ -250,7 +250,13 @@ static int dcc_parse_options(const char **psrc,
 
     while (p[0] == ',') {
         p++;
-        if (str_startswith("lz4", p)) {
+        if (str_startswith("h2", p)) {
+            host->http2 = 1;
+            p += 2;
+        } else if (str_startswith("lz4s", p)) {
+            host->compr = DCC_COMPRESS_LZ4_STREAM;
+            p += 4;
+        } else if (str_startswith("lz4", p)) {
             rs_trace("got LZ4 option");
             host->compr = DCC_COMPRESS_LZ4;
             p += 3;
@@ -310,6 +316,15 @@ static int dcc_parse_options(const char **psrc,
             return EXIT_BAD_HOSTSPEC;
         }
     }
+    if (host->http2) {
+#ifdef HAVE_GSSAPI
+        if (host->authenticate) {
+            rs_log_error("HTTP/2 does not support GSSAPI authentication");
+            return EXIT_BAD_HOSTSPEC;
+        }
+#endif
+        host->compr = DCC_COMPRESS_LZ4_STREAM;
+    }
     if (dcc_get_protover_from_features(host->compr, host->cpp_where,
                                        &host->protover) == -1) {
         rs_log_error("invalid host options: %s", started);
@@ -360,6 +375,10 @@ static int dcc_parse_ssh_host(struct dcc_hostdef *hostdef,
         return ret;
 
     hostdef->mode = DCC_MODE_SSH;
+    if (hostdef->http2) {
+        rs_log_error("HTTP/2 requires a TCP broker host");
+        return EXIT_BAD_HOSTSPEC;
+    }
     return 0;
 }
 
@@ -464,10 +483,14 @@ int dcc_get_features_from_protover(enum dcc_protover protover,
     case DCC_VER_LZ4_CPP:
         *compr = DCC_COMPRESS_LZ4;
         break;
+    case DCC_VER_STREAM:
+    case DCC_VER_STREAM_CPP:
+        *compr = DCC_COMPRESS_LZ4_STREAM;
+        break;
     default:
         return 1;
     }
-    *cpp_where = (protover == DCC_VER_3 || protover == DCC_VER_LZ4_CPP)
+    *cpp_where = (protover == DCC_VER_3 || protover == DCC_VER_LZ4_CPP || protover == DCC_VER_STREAM_CPP)
                 ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT;
     return 0;
 }
@@ -501,9 +524,11 @@ int dcc_get_protover_from_features(enum dcc_compress compr,
     if (compr == DCC_COMPRESS_LZ4 && cpp_where == DCC_CPP_ON_CLIENT) {
         *protover = DCC_VER_LZ4;
     }
+    if (compr == DCC_COMPRESS_LZ4_STREAM)
+        *protover = cpp_where == DCC_CPP_ON_SERVER ? DCC_VER_STREAM_CPP : DCC_VER_STREAM;
 
     if (compr == DCC_COMPRESS_NONE && cpp_where == DCC_CPP_ON_SERVER) {
-        rs_log_error("pump mode (',cpp') requires compression (',lz4' or ',lzo')");
+        rs_log_error("pump mode (',cpp') requires compression (',lz4', ',lz4s', ',h2' or ',lzo')");
     }
 
     return *protover;

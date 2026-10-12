@@ -264,14 +264,11 @@ int dcc_is_link(const char *fname, int *is_link)
  * @fnames must be null-terminated.
  * The names can be coming from the include server, so
  * we consult dcc_get_original_fname to get the real names.
- * Always uses lzo compression.
+ * The include server has already compressed each file using @p compr.
  */
-/* TODO: This code is highly specific to DCC_VER_3; it assumes
-   lzo compression is on, and that the include server has
-   actually compressed the files. */
 int dcc_x_many_files(int ofd,
                      unsigned int n_files,
-                     char **fnames)
+                     char **fnames, enum dcc_compress compr)
 {
     int ret;
     char link_points_to[MAXPATHLEN + 1];
@@ -309,11 +306,11 @@ int dcc_x_many_files(int ofd,
                 ret = dcc_x_token_string(ofd, "NAME", original_fname);
                 if (ret) return ret;
 
-                /* File should be compressed already.
-                   If we ever support non-compressed server-side-cpp,
-                   we should have some checks here and then uncompress
-                   the file if it is compressed. */
-                ret = dcc_x_file(ofd, fname, "FILE", DCC_COMPRESS_NONE, NULL);
+                /* Cache bytes carry the selected codec, without an RPC token. */
+                if (compr == DCC_COMPRESS_LZ4_STREAM) {
+                    ret = dcc_x_token_int(ofd, "FILE", 0xffffffffU);
+                    if (!ret) ret = dcc_copy_file_to_fd(fname, ofd);
+                } else ret = dcc_x_file(ofd, fname, "FILE", DCC_COMPRESS_NONE, NULL);
                 if (ret) return ret;
             }
         }

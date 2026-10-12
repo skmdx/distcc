@@ -175,6 +175,8 @@ RArgv(PyObject *dummy, PyObject *args) {
     if (!ret) {
       if (!strcmp(token, "LZ4C"))
         compression = "lz4";
+      else if (!strcmp(token, "LZ4S"))
+        compression = "lz4s";
       else if (strcmp(token, "ARGC"))
         ret = EXIT_PROTOCOL_ERROR;
     }

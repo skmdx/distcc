@@ -76,6 +76,7 @@ struct dcc_hostdef {
     int broker_fd;
     int broker_lease;
     int broker_pooled;
+    int http2;
 };
 
 /** Static definition of localhost **/

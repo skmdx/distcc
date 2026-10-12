@@ -145,6 +145,7 @@ ext = setuptools.Extension(
               'src/bulk.c',
               'src/sendfile.c',
               'src/compress.c',
+              'src/compress_stream.c',
               'src/argutil.c',
               'src/cleanup.c',
               'src/emaillog.c',

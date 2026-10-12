@@ -15,10 +15,11 @@ from test_broker import BrokerTestCase
 
 class PreprocessTest(BrokerTestCase):
     compression = 'lzo'
+    transport = ''
 
     def setUp(self):
         super().setUp()
-        self.start_broker(self.host(0, ',' + self.compression) + ' --localslots_cpp=1', idle=60)
+        self.start_broker(self.host(0, ',' + self.compression + self.transport) + ' --localslots_cpp=1', idle=60)
         self.env.update(TMPDIR=str(self.root), DISTCC_CLIENT_TMP=str(self.work),
                         DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_TESTING_INCLUDE_SERVER='1',
                         DISTCC_VERBOSE='1', DISTCC_LOG=str(self.work / 'client.log'))
@@ -214,6 +215,11 @@ class Lz4PreprocessTest(PreprocessTest):
             self.compare(args=['-P'])
         for codec in ('lz4', 'lzo'):
             self.assertTrue(list(self.work.rglob('empty.h.' + codec)))
+
+
+class Http2PreprocessTest(PreprocessTest):
+    compression = 'lz4s'
+    transport = ',h2'
 
 
 if __name__ == '__main__':

@@ -90,7 +90,8 @@ enum dcc_compress {
     /* weird values to catch errors */
     DCC_COMPRESS_NONE     = 69,
     DCC_COMPRESS_LZO1X,
-    DCC_COMPRESS_LZ4
+    DCC_COMPRESS_LZ4,
+    DCC_COMPRESS_LZ4_STREAM
 };
 
 enum dcc_cpp_where {
@@ -106,7 +107,10 @@ enum dcc_protover {
     DCC_VER_LINK = 4,           /**< cached-sysroot link job */
     DCC_VER_SESSION = 5,        /**< negotiate sequential connection reuse */
     DCC_VER_LZ4 = 6,            /**< LZ4, client-side cpp */
-    DCC_VER_LZ4_CPP = 7         /**< LZ4, server-side cpp */
+    DCC_VER_LZ4_CPP = 7,        /**< LZ4, server-side cpp */
+    DCC_VER_STREAM = 8,         /**< chunked LZ4, client-side cpp */
+    DCC_VER_STREAM_CPP = 9,     /**< chunked LZ4, server-side cpp */
+    DCC_VER_STREAM_LINK = 10    /**< chunked LZ4, cached-sysroot link */
 };
 
 
@@ -255,6 +259,9 @@ int dcc_compress_file(int in_fd,
 int dcc_compress_lz4_alloc(const char *in_buf, size_t in_len,
                            char **out_buf, size_t *out_len);
 int dcc_r_bulk_lz4(struct dcc_buffer *output, int in_fd, unsigned in_len);
+#define DCC_STREAM_CHUNK (256 * 1024)
+int dcc_x_lz4_stream(int out_fd, int in_fd, off_t size);
+int dcc_r_lz4_stream(int out_fd, struct dcc_buffer *output, int in_fd);
 
 int dcc_compress_lzo1x_alloc(const char *in_buf,
                             size_t in_len,
@@ -349,6 +356,8 @@ int dcc_r_str_alloc(int fd, unsigned len, char **buf);
 int tcp_cork_sock(int fd, int corked);
 int dcc_close(int fd);
 int dcc_get_io_timeout(void);
+/* One active RPC per client/worker process; reset at every job boundary. */
+void dcc_buffer_input(int fd);
 int dcc_want_mmap(void);
 
 

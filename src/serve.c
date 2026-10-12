@@ -168,6 +168,7 @@ int dcc_service_job(int in_fd,
     enum dcc_protover protover;
 
     dcc_job_summary_clear();
+    dcc_buffer_input(-1);
 
     /* dcc_readx/dcc_writex enforce their deadlines on EAGAIN. Accepted
      * sockets must not block inside read/write before those waits run. */
@@ -211,6 +212,7 @@ int dcc_service_job(int in_fd,
         if (!ret && supported) *session = 1;
         return ret;
     }
+    if (protover >= DCC_VER_STREAM) dcc_buffer_input(in_fd);
     ret = dcc_run_job(in_fd, out_fd, protover);
     if (!ret && session && *session)
         ret = dcc_x_token_int(out_fd, "JEND", 0);
@@ -219,6 +221,7 @@ int dcc_service_job(int in_fd,
     dcc_job_summary();
 
 out:
+    dcc_buffer_input(-1);
     return ret;
 }
 
@@ -698,20 +701,22 @@ static int make_temp_dir_and_chdir_for_cpp(int in_fd,
 
 /* Protocol 4 delegates only object linking to the sysroot-aware helper. */
 static int dcc_run_link_job(int in_fd, int out_fd,
-                            const char *out_fname, const char *err_fname, int *status)
+                            const char *out_fname, const char *err_fname, int *status,
+                            enum dcc_protover protover)
 {
     char *archive = NULL, *output = NULL;
     char *argv[5];
     struct stat st;
     pid_t pid;
     int ret;
+    enum dcc_compress compr = protover == DCC_VER_STREAM_LINK ? DCC_COMPRESS_LZ4_STREAM : DCC_COMPRESS_NONE;
     if (!getenv("DISTCCD_LINK_ROOT")) {
         rs_log_error("remote linking requires DISTCCD_LINK_ROOT");
         return EXIT_PROTOCOL_ERROR;
     }
     if ((ret = dcc_make_tmpnam("distcc-link", ".tar", &archive)) ||
         (ret = dcc_make_tmpnam("distcc-link", ".out", &output)) ||
-        (ret = dcc_r_token_file(in_fd, "LINK", archive, DCC_COMPRESS_NONE)))
+        (ret = dcc_r_token_file(in_fd, "LINK", archive, compr)))
         goto done;
     argv[0] = (char *)"distcc-link";
     argv[1] = (char *)"--worker";
@@ -723,14 +728,14 @@ static int dcc_run_link_job(int in_fd, int out_fd,
         *status = W_EXITCODE(ret, 0);
     if (!*status && stat(output, &st))
         *status = W_EXITCODE(EXIT_IO_ERROR, 0);
-    if ((ret = dcc_x_result_header(out_fd, DCC_VER_LINK)) ||
+    if ((ret = dcc_x_result_header(out_fd, protover)) ||
         (ret = dcc_x_cc_status(out_fd, *status)) ||
-        (ret = dcc_x_file(out_fd, err_fname, "SERR", DCC_COMPRESS_NONE, NULL)) ||
-        (ret = dcc_x_file(out_fd, out_fname, "SOUT", DCC_COMPRESS_NONE, NULL)))
+        (ret = dcc_x_file(out_fd, err_fname, "SERR", compr, NULL)) ||
+        (ret = dcc_x_file(out_fd, out_fname, "SOUT", compr, NULL)))
         goto done;
     if (!*status) {
         if (!(ret = dcc_x_token_int(out_fd, "MODE", st.st_mode & 0777)))
-            ret = dcc_x_file(out_fd, output, "DOTO", DCC_COMPRESS_NONE, NULL);
+            ret = dcc_x_file(out_fd, output, "DOTO", compr, NULL);
     } else {
         if (!(ret = dcc_x_token_int(out_fd, "MODE", 0)))
             ret = dcc_x_token_int(out_fd, "DOTO", 0);
@@ -826,14 +831,14 @@ static int dcc_run_job(int in_fd,
     /* Allow output to accumulate into big packets. */
     tcp_cork_sock(out_fd, 1);
 
-    if (protover == DCC_VER_LINK) {
+    if (protover == DCC_VER_LINK || protover == DCC_VER_STREAM_LINK) {
         argv = calloc(2, sizeof(*argv));
         orig_input = strdup("link");
         if (!argv || !(argv[0] = strdup("distcc-link")) || !orig_input) {
             ret = EXIT_OUT_OF_MEMORY;
             goto out_cleanup;
         }
-        ret = dcc_run_link_job(in_fd, out_fd, out_fname, err_fname, &status);
+        ret = dcc_run_link_job(in_fd, out_fd, out_fname, err_fname, &status, protover);
         job_result = ret || status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
         goto out_cleanup;
     }

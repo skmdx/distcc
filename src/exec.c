@@ -53,6 +53,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
+#include <time.h>
 
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -450,45 +451,47 @@ static int sys_wait4(pid_t pid, int *status, int options, struct rusage *rusage)
  * parent only waits when it thinks a child has exited; the child
  * waits all the time.
  **/
+static void dcc_child_changed(int sig)
+{
+    (void)sig;
+}
+
 int dcc_collect_child(const char *what, pid_t pid,
                       int *wait_status, int in_fd)
 {
     struct rusage ru;
-    pid_t ret_pid;
+    struct sigaction action = {0}, previous_action;
+    sigset_t blocked, previous_mask, wait_mask;
+    struct timespec deadline;
+    int ret = 0;
 
-    int ret;
-    int wait_timeout_sec;
-    fd_set fds,readfds;
-
-    wait_timeout_sec = dcc_job_lifetime;
-
-    FD_ZERO(&readfds);
-    if (in_fd != timeout_null_fd){
-        FD_SET(in_fd,&readfds);
+    /* Block before wait4, atomically unblock while sleeping. Otherwise a
+     * child exiting between wait4 and select loses its wakeup and adds the
+     * old one-second polling delay to an already completed compile. These
+     * client/worker processes are single threaded and own their children. */
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous_mask)) return EXIT_IO_ERROR;
+    action.sa_handler = dcc_child_changed;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGCHLD, &action, &previous_action)) {
+        sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+        return EXIT_IO_ERROR;
     }
-
-
-    while (!dcc_job_lifetime || wait_timeout_sec-- >= 0) {
-
-        /* If we're called with a socket, break out of the loop if the socket
-         * disconnects. To do that, we need to block in select, not in
-         * sys_wait4.  (Only waitpid uses WNOHANG to mean don't block ever,
-         * so I've modified sys_wait4 above to preferentially call waitpid.)
-         */
-        int flags = (in_fd == timeout_null_fd) ? 0 : WNOHANG;
-        ret_pid = sys_wait4(pid, wait_status, flags, &ru);
-
+    wait_mask = previous_mask;
+    sigdelset(&wait_mask, SIGCHLD);
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += dcc_job_lifetime;
+    for (;;) {
+        fd_set fds;
+        struct timespec timeout, now, *wait_time = NULL;
+        pid_t ret_pid = sys_wait4(pid, wait_status, WNOHANG, &ru);
         if (ret_pid == -1) {
-            if (errno == EINTR) {
-                rs_trace("wait4 was interrupted; retrying");
-            } else {
-                rs_log_error("sys_wait4(pid=%d) borked: %s", (int) pid,
-                             strerror(errno));
-                return EXIT_DISTCC_FAILED;
-            }
+            if (errno == EINTR) continue;
+            rs_log_error("sys_wait4(pid=%d) failed: %s", (int)pid, strerror(errno));
+            ret = EXIT_DISTCC_FAILED;
+            break;
         } else if (ret_pid != 0) {
-            /* This is not the main user-visible message; that comes from
-             * critique_status(). */
             rs_trace("%s child %ld terminated with status %#x",
                      what, (long) ret_pid, *wait_status);
             rs_log_info("%s times: user %lld.%06lds, system %lld.%06lds, "
@@ -498,51 +501,39 @@ int dcc_collect_child(const char *what, pid_t pid,
                         (long long) ru.ru_stime.tv_sec, (long) ru.ru_stime.tv_usec,
                         ru.ru_minflt, ru.ru_majflt);
 
-            return 0;
+            break;
         }
-
-        /* check timeout */
-        if (in_fd != timeout_null_fd) {
-            struct timeval timeout;
-
-            /* If client disconnects, the socket will become readable,
-             * and a read should return -1 and set errno to EPIPE.
-             */
-            fds = readfds;
-            timeout.tv_sec = 1;
-            timeout.tv_usec = 0;
-            ret = select(in_fd+1,&fds,NULL,NULL,&timeout);
-            if (ret == 1) {
-                char buf;
-                int nread = read(in_fd, &buf, 1);
-                if ((nread == -1) && (errno == EWOULDBLOCK)) {
-                    /* spurious wakeup, ignore */
-                    ;
-                } else if (nread == 0) {
-                    rs_log_error("Client fd disconnected, killing job");
-                    /* If killpg fails, it might means the child process is not
-                     * in a new group, so, just kill the child process */
-                    if (killpg(pid,SIGTERM)!=0)
-                        kill(pid, SIGTERM);
-                    return EXIT_IO_ERROR;
-                } else if (nread == 1) {
-                    rs_log_error("Bug!  Read from fd succeeded when checking "
-                                 "whether client disconnected!");
-                } else {
-                    rs_log_error("Bug!  nread %d, errno %d checking whether "
-                                 "client disconnected!", nread, errno);
-                }
+        if (dcc_job_lifetime) {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            timeout.tv_sec = deadline.tv_sec - now.tv_sec;
+            timeout.tv_nsec = deadline.tv_nsec - now.tv_nsec;
+            if (timeout.tv_nsec < 0) { timeout.tv_nsec += 1000000000; timeout.tv_sec--; }
+            if (timeout.tv_sec < 0) {
+                rs_log_error("Compilation takes too long, timeout.");
+                ret = EXIT_TIMEOUT;
+                break;
             }
-        } else {
-            poll(NULL, 0, 1000);
+            wait_time = &timeout;
+        }
+        FD_ZERO(&fds);
+        if (in_fd != timeout_null_fd) FD_SET(in_fd, &fds);
+        int ready = pselect(in_fd == timeout_null_fd ? 0 : in_fd + 1,
+                             &fds, NULL, NULL, wait_time, &wait_mask);
+        if (ready < 0 && errno != EINTR) { ret = EXIT_IO_ERROR; break; }
+        if (ready > 0) {
+            char byte;
+            ssize_t n = read(in_fd, &byte, 1);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
+            rs_log_error(n == 0 ? "Client fd disconnected, killing job" :
+                                 "Unexpected client data while compiling, killing job");
+            ret = EXIT_IO_ERROR;
+            break;
         }
     }
-    /* If timeout, also kill the child process */
-    if (killpg(pid, SIGTERM) != 0)
-        kill(pid, SIGTERM);
-    rs_log_error("Compilation takes too long, timeout.");
-
-    return EXIT_TIMEOUT;
+    if (ret && killpg(pid, SIGTERM) != 0) kill(pid, SIGTERM);
+    sigaction(SIGCHLD, &previous_action, NULL);
+    sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+    return ret;
 }
 
 

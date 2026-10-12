@@ -203,6 +203,9 @@ int dcc_x_file(int ofd,
 #else
         ret = dcc_pump_readwrite(ofd, ifd, (size_t) f_size);
 #endif
+    } else if (compression == DCC_COMPRESS_LZ4_STREAM) {
+        ret = dcc_x_token_int(ofd, token, f_size ? 0xffffffffU : 0);
+        if (!ret && f_size) ret = dcc_x_lz4_stream(ofd, ifd, f_size);
     } else if (compression == DCC_COMPRESS_LZO1X || compression == DCC_COMPRESS_LZ4) {
         ret = dcc_x_file_compressed(ofd, ifd, token, f_size, compression);
     } else {
@@ -365,5 +368,5 @@ int dcc_copy_file_to_fd(const char *in_fname, int out_fd)
         close(ifd);
         return ret;
     }
-    return 0;
+    return dcc_close(ifd);
 }
