@@ -1,0 +1,29 @@
+distcc sequential TCP sessions
+=============================
+
+Before sending any job, a client may send DIST00000005 on a fresh TCP
+connection. A supporting server replies POOL00000001 and retains the
+connection. POOL00000000 or a closed/rejected connection means that the
+client must reconnect and use the original single-job protocol. No job has
+been submitted at this point, so this negotiation fallback cannot duplicate
+compilation or linking. GSSAPI and SSH connections do not negotiate sessions.
+
+After successful negotiation, each request is an unchanged protocol 1, 2, 3
+or 4 request, starting with its own DIST token. The corresponding response
+retains its original DONE version and payload. After all response bytes and
+job cleanup, the server sends JEND00000000. This boundary also follows a
+complete response reporting a compiler/linker error. Protocol errors, partial
+transfers and aborted jobs close the connection without promising reuse.
+
+The client must consume JEND before returning the connection to its broker.
+There is at most one outstanding job per connection; requests are not
+multiplexed or pipelined. Each new job obtains a fresh scheduling reservation.
+The server may close an idle session at any time. Clients discard known stale
+idle sockets before use; a failure after job transmission follows ordinary
+distcc error/fallback handling, not an automatic pool-level resend.
+
+The Linux preforking parent owns idle sessions and assigns sockets to workers
+only when another request becomes readable. An idle session consumes a socket,
+not a compiler worker. Both broker and server bound retained socket counts
+and idle lifetimes. Clients without negotiation receive no JEND and retain
+the original single-job behavior.

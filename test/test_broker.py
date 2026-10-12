@@ -113,13 +113,16 @@ class BrokerTest(BrokerTestCase):
 
     def test_parallel_real_compiles_and_no_children(self):
         proc = self.start_broker(self.host(0) + " " + self.host(1))
+        initial_fds = len(list(Path(f"/proc/{proc.pid}/fd").iterdir()))
         with concurrent.futures.ThreadPoolExecutor(max_workers=28) as pool:
             objects = list(pool.map(self.job, range(28)))
         self.assertEqual(len(objects), 28)
         self.job(29, "cc")
         children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
         self.assertEqual(children.read_text().strip(), "")
-        self.assertLess(len(list(Path(f"/proc/{proc.pid}/fd").iterdir())), 12)
+        # Eight compile slots can now retain eight reusable TCP sockets, plus
+        # at most two transient statistics connections.
+        self.assertLessEqual(len(list(Path(f"/proc/{proc.pid}/fd").iterdir())), initial_fds + 10)
 
     def test_lease_release_and_idle(self):
         proc = self.start_broker(self.host(0, slots=1), idle=1)

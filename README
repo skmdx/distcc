@@ -28,7 +28,9 @@ appropriate compiler installed.
 On Linux, a local `distccd --broker /absolute/socket/path` can share adaptive
 host selection and statistics across clients. Set DISTCC_BROKER to that
 socket path in the build environment. The broker passes connected sockets to
-clients, so compiler data does not need an additional relay. It exits when
+clients, so compiler data does not need an additional relay. Completed TCP
+sessions are pooled when the server supports reuse; idle connections do not
+reserve compiler workers. It exits when
 idle; systemd socket activation can restart it on demand, including for
 clients in a network sandbox. See distccd(1) for configuration and limits.
 Example systemd units are in packaging/systemd. For a Portage client, enable

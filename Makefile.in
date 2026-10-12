@@ -151,6 +151,7 @@ pkgdoc_DOCS = AUTHORS COPYING NEWS \
 	doc/protocol-2.txt \
 	doc/protocol-3.txt doc/protocol-3-impl.txt \
 	doc/protocol-4.txt \
+	doc/protocol-5.txt \
 	doc/protocol-gssapi.txt \
 	doc/reporting-bugs.txt
 
@@ -211,6 +212,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_link.py \
 	test/test_native.py \
 	test/test_protocol.py \
+	test/test_pool.py \
 	find_c_extension.sh
 
 dist_common = Makefile.in install-sh configure configure.ac \
@@ -777,6 +779,7 @@ adaptive-check: distcc distccd h_hosts
 	$(PYTHON) "$(srcdir)/test/test_link.py" -v
 	$(PYTHON) "$(srcdir)/test/test_native.py" -v
 	$(PYTHON) "$(srcdir)/test/test_protocol.py" -v
+	$(PYTHON) "$(srcdir)/test/test_pool.py" -v
 
 check: adaptive-check
 	@if test -n "$(PYTHON)"; then \

@@ -344,7 +344,7 @@ static int dcc_inetd_server(void)
         len = 0;
     }
 
-    ret = dcc_service_job(STDIN_FILENO, STDOUT_FILENO, psa, len);
+    ret = dcc_service_job(STDIN_FILENO, STDOUT_FILENO, psa, len, NULL);
 
     close_ret = dcc_close(STDIN_FILENO);
 

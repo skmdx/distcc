@@ -62,6 +62,62 @@
 
 
 
+#ifdef __linux__
+/* Local SOCK_SEQPACKET control messages carry at most one descriptor. The
+ * sender retains ownership; the receiver owns the returned CLOEXEC fd. */
+int dcc_send_fd(int sock, const void *data, size_t size, int fd)
+{
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control = {0};
+    struct iovec iov = { (void *)data, size };
+    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+    ssize_t n;
+    if (fd >= 0) {
+        struct cmsghdr *cmsg;
+        msg.msg_control = control.bytes;
+        msg.msg_controllen = sizeof(control.bytes);
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(fd));
+        memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
+    }
+    do { n = sendmsg(sock, &msg, MSG_NOSIGNAL); } while (n < 0 && errno == EINTR);
+    return n == (ssize_t)size ? 0 : -1;
+}
+
+ssize_t dcc_recv_fd(int sock, void *data, size_t size, int *fd)
+{
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(2 * sizeof(int))]; } control;
+    struct iovec iov = { data, size };
+    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes) };
+    struct cmsghdr *cmsg;
+    ssize_t n;
+    int bad = 0;
+    *fd = -1;
+    do { n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC | MSG_TRUNC); } while (n < 0 && errno == EINTR);
+    if (n < 0) return n;
+    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+            size_t i, count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            for (i = 0; i < count; ++i) {
+                int received;
+                memcpy(&received, (char *)CMSG_DATA(cmsg) + i * sizeof(int), sizeof(int));
+                if (*fd < 0) *fd = received;
+                else { close(received); bad = 1; }
+            }
+        } else bad = 1;
+    }
+    if (bad || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+        if (*fd >= 0) close(*fd);
+        *fd = -1;
+        errno = EPROTO;
+        return -1;
+    }
+    return n;
+}
+#endif
+
 int dcc_get_io_timeout(void)
 {
     /** Timeout for all IO other than opening connections.  Much longer,

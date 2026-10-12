@@ -43,6 +43,15 @@ The recommended method for running distccd is as a standalone server.
 distccd will listen for network connections and fork several child
 processes to serve them.
 .PP
+On Linux, the preforking parent dispatches ready TCP connections to compiler
+workers. Negotiated sessions return to the parent after each complete job;
+idle sessions do not occupy workers. The parent retains at most 256 pending
+connections, closes idle ones after 30 seconds, and bounds queued ready
+connections by the I/O timeout. Each worker handles one job at a time, so
+--jobs continues to limit compilation concurrency across all clients.
+Connection reuse is not negotiated in SSH/inetd, non-preforking or GSSAPI
+authenticated operation; their existing single-job behavior is preserved.
+.PP
 If you installed distcc using a packaged version you may be able to
 start the server using the standard mechanism for your operating
 system, such as

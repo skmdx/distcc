@@ -350,6 +350,12 @@ int dcc_compile_remote(char **argv,
     if (ret == 0 && *status == 0) {
         ret = dcc_retrieve_results(from_net_fd, status, output_fname,
                                    deps_fname, server_stderr_fname, host);
+        if (!ret && host->broker_pooled) {
+            unsigned end;
+            ret = dcc_r_token_int(from_net_fd, "JEND", &end);
+            if (!ret && end) ret = EXIT_PROTOCOL_ERROR;
+            if (!ret) dcc_broker_return(host, from_net_fd);
+        }
     }
 
     if (gettimeofday(&after, NULL)) {
@@ -370,8 +376,8 @@ int dcc_compile_remote(char **argv,
         local_cpu_lock_fd = -1; /* Not really needed; just for consistency. */
     }
 
-    /* Close socket so that the server can terminate, rather than
-     * making it wait until we've finished our work. */
+    /* Close our socket reference. A successfully returned session is now
+     * owned by the broker; all other connections terminate here. */
     if (to_net_fd != from_net_fd) {
         if (to_net_fd != -1)
             dcc_close(to_net_fd);

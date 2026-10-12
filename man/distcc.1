@@ -605,6 +605,14 @@ per-client statistics subprocesses and remote slot lock files. Broker
 reservations are separate from direct clients' slot locks; the server's
 --jobs limit applies to both. Normal fallback settings also apply when the
 broker is unavailable. See distccd(1) for service setup and idle lifetime.
+.PP
+The broker automatically negotiates TCP session reuse before sending a job.
+Older servers and brokers continue to use one connection per job. Complete
+compilation and distributed-link responses return their connection to the
+broker; abandoned or damaged streams are closed. Host selection still uses
+current capacity, not the availability of a cached connection. The broker
+retains at most 256 idle connections and expires each after 10 seconds.
+Idle connections do not prevent the broker from exiting.
 .TP
 .B ,lzo
 Enables LZO compression for this TCP or SSH host.

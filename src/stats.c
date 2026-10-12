@@ -46,6 +46,7 @@
 #include "netutil.h"
 #include "fcntl.h"
 #include "daemon.h"
+#include <poll.h>
 
 int dcc_statspipe[2];
 
@@ -501,11 +502,14 @@ static void dcc_stats_process(struct statsdata *sd) {
  **/
 int dcc_stats_server(int listen_fd)
 {
-    int http_fd, max_fd;
+    int http_fd;
+#ifndef __linux__
+    int max_fd;
+    struct timeval timeout;
+#endif
     int i, ret;
     fd_set fds, fds_master;
     struct statsdata sd;
-    struct timeval timeout;
 
     /* clear stats data */
     for (i = 0; i < STATS_ENUM_MAX; i++)
@@ -523,8 +527,10 @@ int dcc_stats_server(int listen_fd)
     /* We don't want children to inherit this FD */
     fcntl(http_fd, F_SETFD, FD_CLOEXEC);
 
+#ifndef __linux__
     max_fd = (http_fd > dcc_statspipe[0]) ? (http_fd + 1)
                                            : (dcc_statspipe[0] + 1);
+#endif
 
     FD_ZERO(&fds_master);
     FD_SET(dcc_statspipe[0], &fds_master);
@@ -534,10 +540,22 @@ int dcc_stats_server(int listen_fd)
         dcc_stats_minutely_update();
         dcc_stats_calc_kid_avg();
 
+#ifndef __linux__
         timeout.tv_sec = 60;
         timeout.tv_usec = 0;
+#endif
         fds = fds_master;
+#ifdef __linux__
+        {
+            struct pollfd extra[2] = {{ dcc_statspipe[0], POLLIN, 0 }, { http_fd, POLLIN, 0 }};
+            ret = dcc_prefork_poll(listen_fd, extra, 2, 60000);
+            FD_ZERO(&fds);
+            if (extra[0].revents & POLLIN) FD_SET(dcc_statspipe[0], &fds);
+            if (extra[1].revents & POLLIN) FD_SET(http_fd, &fds);
+        }
+#else
         ret = select(max_fd, &fds, NULL, NULL, &timeout);
+#endif
         if (ret != -1) {
             if (FD_ISSET(dcc_statspipe[0], &fds)) {
                 /* Received stats report from a child */

@@ -102,7 +102,8 @@ enum dcc_protover {
     DCC_VER_1   = 1,            /**< vanilla */
     DCC_VER_2   = 2,            /**< LZO sprinkles */
     DCC_VER_3   = 3,            /**< server-side cpp */
-    DCC_VER_LINK = 4            /**< cached-sysroot link job */
+    DCC_VER_LINK = 4,           /**< cached-sysroot link job */
+    DCC_VER_SESSION = 5         /**< negotiate sequential connection reuse */
 };
 
 
@@ -320,6 +321,8 @@ void dcc_truncate_to_dirname(char *file);
 /* io.c */
 
 int dcc_writex(int fd, const void *buf, size_t len);
+int dcc_send_fd(int sock, const void *data, size_t size, int fd);
+ssize_t dcc_recv_fd(int sock, void *data, size_t size, int *fd);
 
 int dcc_r_token(int ifd, char *token);
 

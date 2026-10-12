@@ -42,11 +42,16 @@ void dcc_reap_kids(int must_reap);
 
 /* prefork.c */
 int dcc_preforking_parent(int listen_fd);
+#ifdef __linux__
+struct pollfd;
+int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout);
+void dcc_prefork_reaped(pid_t pid);
+#endif
 
 
 /* serve.c */
 struct sockaddr;
-int dcc_service_job(int in_fd, int out_fd, struct sockaddr *, int);
+int dcc_service_job(int in_fd, int out_fd, struct sockaddr *, int, int *session);
 
 /* setuid.c */
 int dcc_discard_root(void);

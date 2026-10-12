@@ -213,6 +213,9 @@ void dcc_reap_kids(int must_reap)
         } else if (kid != -1) {
             /* child exited */
             --dcc_nkids;
+#ifdef __linux__
+            dcc_prefork_reaped(kid);
+#endif
             rs_trace("down to %d children", dcc_nkids);
 
             dcc_log_child_exited(kid, status);
@@ -273,7 +276,7 @@ static void dcc_nofork_parent(int listen_fd)
 #endif
             dcc_exit(EXIT_CONNECT_FAILED);
         } else {
-            dcc_service_job(acc_fd, acc_fd, (struct sockaddr *) &cli_addr, cli_len);
+            dcc_service_job(acc_fd, acc_fd, (struct sockaddr *) &cli_addr, cli_len, NULL);
             dcc_close(acc_fd);
         }
     }

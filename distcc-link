@@ -6,6 +6,7 @@ when DISTCC_LINK_SYSROOT names a sysroot profile. Unsupported commands retain
 the existing local compiler behavior.
 """
 import array
+from contextlib import ExitStack
 import fcntl
 import hashlib
 import io
@@ -476,11 +477,16 @@ def remote_link(job, inputs, output):
         if size > 0xffffffff:
             raise LocalOnly('link inputs exceed the protocol size limit')
         archive.seek(0)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as lease:
-            lease.connect(os.environ['DISTCC_BROKER'])
-            lease.sendall(struct.pack('=II', 2, 1))
-            reply, ancillary, flags, _ = lease.recvmsg(1032, socket.CMSG_SPACE(4),
-                                                       socket.MSG_CMSG_CLOEXEC)
+        with ExitStack() as stack:
+            for command in (6, 1):
+                lease = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
+                lease.connect(os.environ['DISTCC_BROKER'])
+                lease.sendall(struct.pack('=II', 2, command))
+                reply, ancillary, flags, _ = lease.recvmsg(1032, socket.CMSG_SPACE(4),
+                                                           socket.MSG_CMSG_CLOEXEC)
+                if reply or ancillary or flags:
+                    break
+                lease.close()  # An older broker rejects the optional pool request.
             descriptors = []
             for level, kind, data in ancillary:
                 if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
@@ -489,7 +495,7 @@ def remote_link(job, inputs, output):
                 if (len(reply) != 1032 or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
                         or len(descriptors) != 1):
                     raise OSError('invalid broker reply')
-                status, _ = struct.unpack('=ii', reply[:8])
+                status, capabilities = struct.unpack('=ii', reply[:8])
                 if status:
                     raise OSError('broker has no available link host')
                 host = reply[8:].split(b'\0', 1)[0].decode()
@@ -513,6 +519,8 @@ def remote_link(job, inputs, output):
                         temporary = Path(result.name)
                         try:
                             copy_response(net, 'DOTO', result)
+                            if capabilities & (1 << 30) and token(net, 'JEND') != 0:
+                                raise OSError('invalid end of pooled job')
                             if not status:
                                 mask = os.umask(0)
                                 os.umask(mask)
@@ -521,6 +529,13 @@ def remote_link(job, inputs, output):
                                 os.replace(temporary, output)
                         finally:
                             temporary.unlink(missing_ok=True)
+                    if capabilities & (1 << 30):
+                        try:
+                            lease.sendmsg([struct.pack('=II', 2, 7)],
+                                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                            array.array('i', [net.fileno()]))])
+                        except OSError:
+                            pass  # Losing the pool does not invalidate a completed link.
                     if os.environ.get('DISTCC_VERBOSE') == '1':
                         print('distcc-link: linked on ' + host, file=sys.stderr)
                     code = os.waitstatus_to_exitcode(status)

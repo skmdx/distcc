@@ -106,7 +106,7 @@ int dcc_auth_enabled = 0;
  **/
 static int dcc_compile_log_fd = -1;
 
-static int dcc_run_job(int in_fd, int out_fd);
+static int dcc_run_job(int in_fd, int out_fd, enum dcc_protover protover);
 
 
 /**
@@ -161,9 +161,10 @@ static int dcc_remove_log_to_file(void)
 int dcc_service_job(int in_fd,
                     int out_fd,
                     struct sockaddr *cli_addr,
-                    int cli_len)
+                    int cli_len, int *session)
 {
     int ret;
+    enum dcc_protover protover;
 
     dcc_job_summary_clear();
 
@@ -192,7 +193,22 @@ int dcc_service_job(int in_fd,
     }
 #endif
 
-    ret = dcc_run_job(in_fd, out_fd);
+    dcc_ignore_sigpipe(1);
+    if ((ret = dcc_r_request_header(in_fd, &protover))) goto out;
+    if (protover == DCC_VER_SESSION) {
+        int supported = session && !*session;
+        if (session && *session) return EXIT_PROTOCOL_ERROR;
+#ifdef HAVE_GSSAPI
+        supported &= !dcc_auth_enabled;
+#endif
+        ret = dcc_x_token_int(out_fd, "POOL", supported);
+        if (!ret && supported) *session = 1;
+        return ret;
+    }
+    ret = dcc_run_job(in_fd, out_fd, protover);
+    if (!ret && session && *session)
+        ret = dcc_x_token_int(out_fd, "JEND", 0);
+    tcp_cork_sock(out_fd, 0);
 
     dcc_job_summary();
 
@@ -688,7 +704,7 @@ done:
 
 /** Read a request, run the compiler, and send a response. */
 static int dcc_run_job(int in_fd,
-                       int out_fd)
+                       int out_fd, enum dcc_protover protover)
 {
     char **argv = NULL;
     char **tweaked_argv = NULL;
@@ -701,7 +717,6 @@ static int dcc_run_job(int in_fd,
     char *orig_input_tmp, *orig_output_tmp;
     char *dotd_target = NULL;
     pid_t cc_pid;
-    enum dcc_protover protover;
     enum dcc_compress compr;
     struct timeval start, end;
     int time_ms;
@@ -738,9 +753,6 @@ static int dcc_run_job(int in_fd,
     /* Allow output to accumulate into big packets. */
     tcp_cork_sock(out_fd, 1);
 
-    if ((ret = dcc_r_request_header(in_fd, &protover)))
-        goto out_cleanup;
-
     if (protover == DCC_VER_LINK) {
         argv = calloc(2, sizeof(*argv));
         orig_input = strdup("link");
@@ -750,7 +762,6 @@ static int dcc_run_job(int in_fd,
         }
         ret = dcc_run_link_job(in_fd, out_fd, out_fname, err_fname, &status);
         job_result = ret || status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
-        tcp_cork_sock(out_fd, 0);
         goto out_cleanup;
     }
 
@@ -913,8 +924,6 @@ static int dcc_run_job(int in_fd,
 
     dcc_critique_status(status, argv[0], orig_input, dcc_hostdef_local,
                         0);
-    tcp_cork_sock(out_fd, 0);
-
     rs_log(RS_LOG_INFO|RS_LOG_NONAME, "job complete");
 
 out_cleanup:
@@ -923,6 +932,7 @@ out_cleanup:
     if (changed_directory) {
       if (chdir(dcc_daemon_wd) != 0) {
         rs_log_warning("chdir(%s) failed: %s", dcc_daemon_wd, strerror(errno));
+        ret = EXIT_IO_ERROR;
       }
     }
 
