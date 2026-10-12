@@ -63,12 +63,11 @@
 
 
 /**
- * Transmit token name (4 characters) and value (32-bit int, as 8 hex
+ * Format token name (4 characters) and value (32-bit int, as 8 hex
  * characters).
  **/
-int dcc_x_token_int(int ofd, const char *token, unsigned param)
+int dcc_format_token_int(char buf[13], const char *token, unsigned param)
 {
-    char buf[13];
     int shift;
     char *p;
     const char *hex = "0123456789abcdef";
@@ -90,6 +89,15 @@ int dcc_x_token_int(int ofd, const char *token, unsigned param)
     buf[12] = '\0';
 
     rs_trace("send %s", buf);
+    return 0;
+}
+
+int dcc_x_token_int(int ofd, const char *token, unsigned param)
+{
+    char buf[13];
+    int ret = dcc_format_token_int(buf, token, param);
+    if (ret)
+        return ret;
     return dcc_writex(ofd, buf, 12);
 }
 

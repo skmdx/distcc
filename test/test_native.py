@@ -71,6 +71,7 @@ int main(void) { float a[128] = {0}, b[128] = {3};
         for flags in options:
             with self.subTest(compiler=compiler, flags=flags):
                 self.compare(compiler, flags)
+                self.assertIn('native expansion cache hit', self.compare(compiler, flags))
 
     def test_gcc(self):
         self.cases('gcc')

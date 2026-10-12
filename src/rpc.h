@@ -34,6 +34,7 @@ int dcc_x_cc_status(int, int);
 int dcc_r_cc_status(int, int *);
 
 int dcc_x_token_int(int ofd, const char *token, unsigned param);
+int dcc_format_token_int(char buf[13], const char *token, unsigned param);
 int dcc_r_token_int(int ifd, const char *expected, unsigned int *val);
 
 int dcc_x_token_string(int fd,

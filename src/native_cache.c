@@ -158,7 +158,7 @@ char *dcc_native_cache_key(char *argv[], const char *input, const char *output)
     key = calloc(1, sizeof(*key));
     if (!key) return NULL;
     key->hash = ((__uint128_t)0x6c62272e07bb0142ULL << 64) | 0x62b821756295c58dULL;
-    append(key, "native-v1");
+    append(key, "native-v2");
     stamp(key, resolved);
     stamp(key, "/proc/self/ns/mnt");
     stamp(key, "/");

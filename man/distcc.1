@@ -967,9 +967,10 @@ If the expansion cannot be recognized, the original command runs locally.
 GCC object-only links with native options and Clang native compiles using an
 external assembler remain local.
 .PP
-On Linux, the local broker keeps up to 32 native driver probe results in
-memory. Concurrent requests for the same expansion share a client-side probe;
-the broker never executes a compiler. Source and output filenames are excluded
+On Linux, the local broker keeps up to 32 resolved native CPU option sets in
+memory, avoiding repeated driver-output parsing and transferring only those
+options on cache hits. Concurrent requests for the same expansion share a
+client-side probe; the broker never executes a compiler. Source and output filenames are excluded
 from the fingerprint, but source language, option order, compiler identity,
 environment, mount namespace, CPU information and affinity are retained.
 Standard system GCC/Clang installations under /usr are eligible. Clang
