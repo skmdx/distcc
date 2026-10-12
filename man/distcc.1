@@ -961,10 +961,31 @@ This preserves the client's detected CPU features, including disabled features,
 GCC cache parameters and explicit option overrides. The same resolved options
 are used for local preprocessing and worker compilation; workers do not detect
 their own CPU. Matching compiler versions and target support are required.
-Commands without native options do not run this extra driver query.
+Commands without native options and invocations classified as local-only do
+not run this extra driver query.
 If the expansion cannot be recognized, the original command runs locally.
 GCC object-only links with native options and Clang native compiles using an
 external assembler remain local.
+.PP
+On Linux, the local broker keeps up to 32 native driver probe results in
+memory. Concurrent requests for the same expansion share a client-side probe;
+the broker never executes a compiler. Source and output filenames are excluded
+from the fingerprint, but source language, option order, compiler identity,
+environment, mount namespace, CPU information and affinity are retained.
+Standard system GCC/Clang installations under /usr are eligible. Clang
+configuration files in /etc/clang, ~/.config/clang and the compiler's bin
+directory (including simple nested response files) are checked for changes.
+GCC installations with external specs, custom configuration/search options,
+compiler wrappers, injected libraries and command-line response files bypass
+the cache. Oversized or unfamiliar configurations also use ordinary probes.
+Cache entries disappear when the broker exits; failed or interrupted probes
+do not prevent subsequent compilation.
+.PP
+The distributed-link helper caches successful compiler identity, linker lookup
+and linker version queries in a private distcc-query-UID directory under TMPDIR.
+It uses 64 locked slots, checks compiler and configuration file identities, and
+retains the per-link Clang driver query and sysroot freshness checks. Both
+client and worker helpers use this cache without additional server processes.
 .PP
 Cross compilation means building programs to run on a
 machine with a different processor, architecture, or

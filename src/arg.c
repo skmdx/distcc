@@ -128,7 +128,7 @@ static void dcc_note_compiled(const char *input_file, const char *output_file)
  * @returns 0 if it's ok to distribute this compilation, or an error code.
  **/
 int dcc_scan_args(char *argv[], char **input_file, char **output_file,
-                  char ***ret_newargv)
+                  char ***ret_newargv, int allow_native)
 {
     int seen_opt_c = 0, seen_opt_s = 0;
     int i;
@@ -186,10 +186,12 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
                  * is a target feature, not the driver's -x language). */
                 if (!argv[++i]) return EXIT_DISTCC_FAILED;
             } else if (!strcmp(a, "-march=native")) {
+                if (allow_native) continue;
                 rs_trace("-march=native generates code for local machine; "
                          "must be local");
                 return EXIT_DISTCC_FAILED;
             } else if (!strcmp(a, "-mtune=native") || !strcmp(a, "-mcpu=native")) {
+                if (allow_native) continue;
                 rs_trace("-mtune=native optimizes for local machine; "
                          "must be local");
                 return EXIT_DISTCC_FAILED;

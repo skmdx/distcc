@@ -11,11 +11,20 @@
 #include "exec.h"
 #include "exitcode.h"
 #include "trace.h"
+#include "broker.h"
 
 static int native_option(const char *arg)
 {
     return !strcmp(arg, "-march=native") || !strcmp(arg, "-mtune=native") ||
            !strcmp(arg, "-mcpu=native");
+}
+
+int dcc_native_requested(char *argv[])
+{
+    int i;
+    for (i = 1; argv[i]; i++)
+        if (native_option(argv[i])) return 1;
+    return 0;
 }
 
 /* Driver -### output is quoted argv, not shell code. Never execute it.
@@ -68,10 +77,11 @@ static int add_arg(char **args, int *count, const char *value)
  * Probe the complete invocation: option ordering, explicit feature overrides,
  * target mode and compiler configuration all affect the expansion.
  */
-int dcc_expand_native(char ***argvp)
+int dcc_expand_native(char ***argvp, const char *input, const char *output)
 {
     char **argv = *argvp, **probe = NULL, **frontend = NULL, **expanded = NULL;
-    char *file = NULL, *text = NULL, *line, *next;
+    char *file = NULL, *text = NULL, *line, *next, *key = NULL, *after = NULL;
+    int lease = -1;
     int argc = dcc_argv_len(argv), ret = EXIT_DISTCC_FAILED, status;
     int i, n = 0, clang = 0, found = 0, cpu = 0, native = 0;
     pid_t pid;
@@ -79,6 +89,12 @@ int dcc_expand_native(char ***argvp)
 
     for (i = 1; argv[i]; i++) native |= native_option(argv[i]);
     if (!native) return 0;
+    key = dcc_native_cache_key(argv, input, output);
+    if (key) lease = dcc_broker_memo_get(key, &text);
+    if (text) {
+        rs_trace("native expansion cache hit");
+        goto parse;
+    }
     if (dcc_copy_argv(argv, &probe, 1)) goto out;
     probe[argc + 1] = NULL;
     if (!(probe[argc] = strdup("-###")) ||
@@ -89,6 +105,15 @@ int dcc_expand_native(char ***argvp)
         dcc_load_file_string(file, &text))
         goto out;
 
+    /* Do not publish a probe spanning a compiler/configuration replacement. */
+    if (lease >= 0) {
+        after = dcc_native_cache_key(argv, input, output);
+        if (after && !strcmp(key, after)) dcc_broker_memo_put(lease, text);
+        else dcc_broker_memo_put(lease, NULL);
+        lease = -1;
+    }
+
+parse:
     for (line = text; line && *line; line = next) {
         char **words;
         const char *base;
@@ -147,6 +172,9 @@ int dcc_expand_native(char ***argvp)
     expanded = NULL;
     ret = 0;
 out:
+    dcc_broker_memo_put(lease, NULL);
+    free(key);
+    free(after);
     if (ret) rs_log_info("native option expansion unavailable; compiling locally");
     if (probe) dcc_free_argv(probe);
     if (expanded) dcc_free_argv(expanded);

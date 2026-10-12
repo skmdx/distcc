@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import unittest
+import concurrent.futures
 
 from test_broker import BrokerTestCase
 
@@ -79,6 +80,57 @@ int main(void) { float a[128] = {0}, b[128] = {3};
         if not compiler:
             self.skipTest('Clang is not installed')
         self.cases(compiler)
+
+    def test_cache_reuse_and_flag_order(self):
+        for compiler in ('gcc', shutil.which('clang')):
+            if not compiler:
+                continue
+            with self.subTest(compiler=compiler):
+                first = self.compare(compiler, ['-march=native'])
+                self.assertNotIn('native expansion cache hit', first)
+                self.assertIn('native expansion cache hit', self.compare(compiler, ['-march=native']))
+                self.assertNotIn('native expansion cache hit', self.compare(compiler, ['-march=native', '-O2']))
+                self.assertIn('native expansion cache hit', self.compare(compiler, ['-march=native', '-O2']))
+
+    def test_cache_invalidates_configuration_and_environment(self):
+        compiler = shutil.which('clang')
+        if not compiler:
+            self.skipTest('Clang is not installed')
+        self.env['HOME'] = str(self.work)
+        directory = self.work / '.config/clang'
+        directory.mkdir(parents=True)
+        self.compare(compiler, ['-march=native'])
+        self.assertIn('native expansion cache hit', self.compare(compiler, ['-march=native']))
+        config = directory / 'probe.cfg'
+        config.write_text('# configuration generation one\n')
+        self.assertNotIn('native expansion cache hit', self.compare(compiler, ['-march=native']))
+        self.assertIn('native expansion cache hit', self.compare(compiler, ['-march=native']))
+        config.write_text('# configuration generation two\n')
+        self.assertNotIn('native expansion cache hit', self.compare(compiler, ['-march=native']))
+        self.env['LANG'] = 'C'
+        self.assertNotIn('native expansion cache hit', self.compare(compiler, ['-march=native']))
+
+    def test_local_calls_do_not_probe(self):
+        for flags in (['-E'], []):
+            result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-march=native',
+                                     *flags, str(self.source), '-o', str(self.work / 'local')],
+                                    env=self.env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('native option expansion', result.stderr)
+            self.assertNotIn('expanded native options', result.stderr)
+
+    def test_cache_shared_across_source_and_output_paths(self):
+        self.compare('gcc', ['-march=native'])
+        self.source = self.work / 'other.c'
+        self.source.write_text('int other(void) { return 7; }\n')
+        args = ['gcc', '-O3', '-march=native', '-c', str(self.source)]
+        def compile_one(index):
+            return subprocess.run([str(self.build / 'distcc'), *args, '-o', str(self.work / f'{index}.o')],
+                                  env=self.env, capture_output=True, text=True, timeout=20)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            for result in pool.map(compile_one, range(4)):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('native expansion cache hit', result.stderr)
 
     def test_unrecognized_probe_keeps_original_command_local(self):
         directory = self.work / 'compiler tools'

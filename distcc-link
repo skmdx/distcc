@@ -6,6 +6,7 @@ when DISTCC_LINK_SYSROOT names a sysroot profile. Unsupported commands retain
 the existing local compiler behavior.
 """
 import array
+import fcntl
 import hashlib
 import io
 import json
@@ -59,13 +60,140 @@ def compiler_family(compiler):
     return 'clang' if match['driver'].startswith('clang') else 'gcc'
 
 
+def query_fingerprint(command):
+    """Bounded metadata dependencies; unknown configurations remain uncached."""
+    executable = shutil.which(str(command[0]))
+    if not executable:
+        return None
+    executable = Path(executable).resolve()
+    if not executable.is_relative_to('/usr'):
+        return None
+    with executable.open('rb') as stream:
+        if stream.read(4) != b'\x7fELF':
+            return None
+    states = {}
+
+    def stamp(path):
+        path = Path(path)
+        if str(path) in states:
+            return
+        if len(states) >= 2048:
+            raise ValueError('too many configuration dependencies')
+        try:
+            info = path.stat()
+            states[str(path)] = (info.st_dev, info.st_ino, info.st_size,
+                                 info.st_mtime_ns, info.st_ctime_ns)
+            if str(path) == '/proc/self/ns/mnt':
+                states[str(path)] = (info.st_dev, info.st_ino)
+        except FileNotFoundError:
+            states[str(path)] = None
+
+    def configuration(path, depth=0):
+        if depth > 8:
+            raise ValueError('configuration nesting limit')
+        path = path.resolve()
+        if str(path) in states:
+            return
+        stamp(path)
+        if not path.exists():
+            return
+        if path.stat().st_size > 65536:
+            raise ValueError('configuration too large')
+        for arg in shlex.split(path.read_text(), comments=True):
+            if arg.startswith('@'):
+                if any(c in arg for c in '<>$'):
+                    raise ValueError('unsupported configuration substitution')
+                configuration(path.parent / arg[1:], depth + 1)
+            elif arg.startswith(('--config', '-specs', '--specs', '-B')):
+                raise ValueError('custom toolchain configuration')
+
+    stamp(executable)
+    stamp('/proc/self/ns/mnt')
+    stamp('/')
+    for directory in os.get_exec_path():
+        stamp(directory or '.')
+    family = executable.name
+    if 'clang' in family:
+        for root in (Path('/etc/clang'), Path.home() / '.config/clang', executable.parent):
+            stamp(root)
+            if root.is_dir():
+                # Standard system configuration plus one version directory.
+                for path in sorted(root.iterdir()):
+                    if path.suffix == '.cfg':
+                        configuration(path)
+                    elif root == Path('/etc/clang') and path.is_dir():
+                        stamp(path)
+                        for config in sorted(path.glob('*.cfg')):
+                            configuration(config)
+    elif 'gcc' in family or 'g++' in family:
+        root = Path('/usr/lib/gcc')
+        stamp(root)
+        for target in sorted(root.glob('*')):
+            if target.is_dir():
+                stamp(target)
+                for version in sorted(target.glob('*')):
+                    if version.is_dir():
+                        stamp(version)
+                        if (version / 'specs').exists():
+                            return None
+    environment = {k: v for k, v in os.environ.items()
+                   if not k.startswith('DISTCC_') and k != '_'}
+    if any(k in environment for k in ('GCC_EXEC_PREFIX', 'COMPILER_PATH', 'CCC_OVERRIDE_OPTIONS',
+                                      'LD_PRELOAD', 'LD_LIBRARY_PATH')):
+        return None
+    return json.dumps([command, os.getcwd(), environment, states], sort_keys=True)
+
+
+def compiler_query(command):
+    """Share successful metadata probes across short-lived link helpers.
+
+    The server has no scheduling broker. A private, bounded on-disk cache with
+    per-slot flock works on both ends without adding a daemon or subprocess.
+    Errors and unfamiliar toolchains take the ordinary query path.
+    """
+    def query():
+        return subprocess.check_output(command, text=True)
+
+    try:
+        fingerprint = query_fingerprint(command)
+        if fingerprint is None:
+            return query()
+        digest = hashlib.sha256(fingerprint.encode()).hexdigest()
+        directory = Path(tempfile.gettempdir()) / ('distcc-query-' + str(os.geteuid()))
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            return query()
+        # Fixed slots bound storage and make locking survive process exits.
+        fd = os.open(directory / str(int(digest[:8], 16) % 64),
+                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(fd, 'r+') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                return query()
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            try:
+                saved = json.loads(stream.read(65536))
+                if saved.get('key') == digest and isinstance(saved.get('value'), str):
+                    return saved['value']
+            except (ValueError, AttributeError):
+                pass
+            value = query()
+            if len(value) < 32768 and query_fingerprint(command) == fingerprint:
+                stream.seek(0)
+                stream.truncate()
+                json.dump({'key': digest, 'value': value}, stream)
+            return value
+    except (OSError, ValueError):
+        return query()
+
+
 def compiler_identity(compiler, target=None):
     clang = compiler_family(compiler) == 'clang'
     command = [compiler, *(['--target=' + target] if clang and target else [])]
     return {
-        'target': subprocess.check_output([*command, '-dumpmachine'], text=True).strip(),
-        'version': subprocess.check_output([compiler, '-dumpversion' if clang else '-dumpfullversion'],
-                                           text=True).strip(),
+        'target': compiler_query([*command, '-dumpmachine']).strip(),
+        'version': compiler_query([compiler, '-dumpversion' if clang else '-dumpfullversion']).strip(),
     }
 
 
@@ -86,13 +214,13 @@ def clang_link_args(command, version):
 
 
 def check_lld_version(linker, version):
-    description = subprocess.check_output([str(linker), '--version'], text=True)
+    description = compiler_query([str(linker), '--version'])
     if not re.search(r'\bLLD\s+' + re.escape(version) + r'(?:\s|$)', description):
         raise LocalOnly('Clang and LLD versions differ')
 
 
 def lld_for(compiler, version):
-    linker = subprocess.check_output([compiler, '-print-prog-name=ld.lld'], text=True).strip()
+    linker = compiler_query([compiler, '-print-prog-name=ld.lld']).strip()
     check_lld_version(linker, version)
     return str(linker)
 

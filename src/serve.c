@@ -765,7 +765,7 @@ static int dcc_run_job(int in_fd,
 
     if ((ret = dcc_r_argv(in_fd, "ARGC", "ARGV", &argv))
         || (ret = dcc_scan_args(argv, &orig_input_tmp, &orig_output_tmp,
-                                &tweaked_argv)))
+                                &tweaked_argv, 0)))
         goto out_cleanup;
 
     /* The orig_input_tmp and orig_output_tmp values returned by dcc_scan_args()

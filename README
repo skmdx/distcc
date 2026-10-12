@@ -48,6 +48,11 @@ For GCC and Clang compilation, `-march=native`, `-mtune=native` and
 The resolved CPU, enabled and disabled features, and GCC cache parameters
 are used for both preprocessing and remote compilation. Explicit overrides
 retain the compiler's normal precedence. Unrecognized expansions stay local.
+Local-only invocations skip this probe. The broker reuses native expansions
+for matching compiler, flags, environment, CPU affinity and configuration;
+concurrent misses share one client-side probe. Wrappers, custom toolchain
+configuration and response files use uncached probes. See distcc(1) for the
+cache scope and invalidation rules.
 
 The distcc "pump" functionality, added in distcc 3.0, improves on
 distcc by distributing not only compilation but also preprocessing to

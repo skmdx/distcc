@@ -257,7 +257,7 @@ common_obj = src/arg.o src/argutil.o					\
 
 distcc_obj = src/backoff.o						\
 	src/climasq.o src/clinet.o src/clirpc.o				\
-	src/compile.o src/native.o src/cpp.o					\
+	src/compile.o src/native.o src/native_cache.o src/cpp.o					\
 	src/distcc.o							\
 	src/remote.o							\
 	src/ssh.o src/state.o src/strip.o				\
@@ -313,7 +313,7 @@ h_sa2str_obj = src/h_sa2str.o $(common_obj) src/srvnet.o src/access.o
 h_ccvers_obj = src/h_ccvers.o $(common_obj)
 h_dotd_obj = src/h_dotd.o $(common_obj)
 h_fix_debug_info = src/h_fix_debug_info.o $(common_obj)
-h_compile_obj = src/h_compile.o $(common_obj) src/compile.o src/native.o src/timefile.o \
+h_compile_obj = src/h_compile.o $(common_obj) src/compile.o src/native.o src/native_cache.o src/timefile.o \
                 src/backoff.o src/emaillog.o src/remote.o src/clinet.o \
 	        src/clirpc.o src/include_server_if.o src/state.o src/where.o src/adaptive.o src/broker.o \
 		src/ssh.o src/strip.o src/cpp.o @AUTH_DISTCC_OBJS@

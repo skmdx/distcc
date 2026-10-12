@@ -74,6 +74,37 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerTest(BrokerTestCase):
+    def memo(self, key):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        sock.settimeout(2)
+        sock.connect(self.env['DISTCC_BROKER'])
+        sock.sendall(struct.pack('=II', 2, 4) + key + b'\0')
+        self.addCleanup(sock.close)
+        return sock
+
+    def test_memo_coalesces_and_recovers_owner_exit(self):
+        self.start_broker()
+        owner = self.memo(b'probe')
+        self.assertEqual(owner.recv(65536), b'\0')
+        waiter = self.memo(b'probe')
+        waiter.settimeout(.1)
+        with self.assertRaises(socket.timeout):
+            waiter.recv(65536)
+        owner.sendall(struct.pack('=II', 2, 5) + b'resolved\0')
+        waiter.settimeout(2)
+        self.assertEqual(waiter.recv(65536), b'resolved\0')
+        self.assertEqual(self.memo(b'probe').recv(65536), b'resolved\0')
+        owner = self.memo(b'aborted')
+        self.assertEqual(owner.recv(65536), b'\0')
+        waiter = self.memo(b'aborted')
+        waiter.settimeout(.1)
+        with self.assertRaises(socket.timeout):
+            waiter.recv(65536)
+        owner.close()
+        waiter.settimeout(2)
+        self.assertEqual(waiter.recv(65536), b'')
+        self.assertEqual(self.memo(b'aborted').recv(65536), b'\0')
+
     def test_empty_setting_uses_direct_path(self):
         self.env = dict(self.base_env, DISTCC_HOSTS=self.host(0), DISTCC_BROKER="",
                         DISTCC_DIR=str(self.ddir), DISTCC_FALLBACK="0",

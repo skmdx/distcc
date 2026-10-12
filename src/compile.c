@@ -744,11 +744,20 @@ dcc_build_somewhere(char *argv[],
 
     /* FIXME: this may leak memory for argv. */
 
-    /* Failure leaves the native options intact for the local-only scanner. */
-    dcc_expand_native(&argv);
-    ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv);
+    /* Classify before probing: preprocessing and local links need no native
+     * expansion. A successful expansion invalidates the scanner's pointers. */
+    ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 1);
     dcc_free_argv(argv);
     argv = new_argv;
+    if (!ret && dcc_native_requested(argv)) {
+        if (dcc_expand_native(&argv, input_fname, output_fname)) {
+            ret = EXIT_DISTCC_FAILED;
+        } else {
+            ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 0);
+            dcc_free_argv(argv);
+            argv = new_argv;
+        }
+    }
     if (!getenv("DISTCC_NO_REWRITE_CROSS")) {
 #ifdef HAVE_FSTATAT
         dcc_rewrite_generic_compiler(new_argv);
