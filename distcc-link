@@ -137,9 +137,15 @@ def query_fingerprint(command):
                         if (version / 'specs').exists():
                             return None
     environment = {k: v for k, v in os.environ.items()
-                   if not k.startswith('DISTCC_') and k != '_'}
+                   if not k.startswith('DISTCC_') and k not in
+                   ('_', 'SANDBOX_LOG', 'SANDBOX_DEBUG_LOG', 'SANDBOX_MESSAGE_P@TH')}
+    if 'LD_PRELOAD' in environment:
+        if environment['LD_PRELOAD'] != 'libsandbox.so':
+            return None
+        for directory in ('/usr/lib64', '/lib64', '/usr/lib', '/lib'):
+            stamp(Path(directory) / 'libsandbox.so')
     if any(k in environment for k in ('GCC_EXEC_PREFIX', 'COMPILER_PATH', 'CCC_OVERRIDE_OPTIONS',
-                                      'LD_PRELOAD', 'LD_LIBRARY_PATH')):
+                                      'LD_LIBRARY_PATH')):
         return None
     return json.dumps([command, os.getcwd(), environment, states], sort_keys=True)
 

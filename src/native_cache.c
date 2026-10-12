@@ -174,10 +174,21 @@ char *dcc_native_cache_key(char *argv[], const char *input, const char *output)
         append(key, arg ? arg : "input");
     }
     for (i = 0; environ[i]; i++) {
-        if (!strncmp(environ[i], "DISTCC_", 7) || !strncmp(environ[i], "_=" , 2)) continue;
+        if (!strncmp(environ[i], "DISTCC_", 7) || !strncmp(environ[i], "_=" , 2) ||
+            !strncmp(environ[i], "SANDBOX_LOG=", 12) ||
+            !strncmp(environ[i], "SANDBOX_MESSAGE_P@TH=", 21) ||
+            !strncmp(environ[i], "SANDBOX_DEBUG_LOG=", 18)) continue;
+        if (!strncmp(environ[i], "LD_PRELOAD=", 11)) {
+            /* Portage's standard sandbox is transparent to driver options.
+             * Track its loader candidates; other injected code is uncached. */
+            if (strcmp(environ[i] + 11, "libsandbox.so")) key->failed = 1;
+            stamp(key, "/usr/lib64/libsandbox.so");
+            stamp(key, "/lib64/libsandbox.so");
+            stamp(key, "/usr/lib/libsandbox.so");
+            stamp(key, "/lib/libsandbox.so");
+        }
         if (!strncmp(environ[i], "GCC_EXEC_PREFIX=", 16) ||
             !strncmp(environ[i], "COMPILER_PATH=", 14) ||
-            !strncmp(environ[i], "LD_PRELOAD=", 11) ||
             !strncmp(environ[i], "LD_LIBRARY_PATH=", 16) ||
             !strncmp(environ[i], "CCC_OVERRIDE_OPTIONS=", 21)) key->failed = 1;
         append(key, environ[i]);

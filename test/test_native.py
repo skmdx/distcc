@@ -36,13 +36,13 @@ int main(void) { float a[128] = {0}, b[128] = {3};
     vector_sum(a, b); return a[0] != 3; }
 ''')
 
-    def compare(self, compiler, flags, remote=True):
+    def compare(self, compiler, flags, remote=True, prefix=()):
         output = self.work / 'native.o'
         args = [compiler, '-O3', *flags, '-c', str(self.source), '-o', str(output)]
         subprocess.run(args, check=True, capture_output=True, env=self.env)
         expected = output.read_bytes()
         output.unlink()
-        result = subprocess.run([str(self.build / 'distcc'), *args], env=self.env,
+        result = subprocess.run([*prefix, str(self.build / 'distcc'), *args], env=self.env,
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output.read_bytes(), expected, result.stderr)
@@ -118,6 +118,14 @@ int main(void) { float a[128] = {0}, b[128] = {3};
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn('native option expansion', result.stderr)
             self.assertNotIn('expanded native options', result.stderr)
+
+    def test_portage_sandbox_cache(self):
+        if not shutil.which('sandbox'):
+            self.skipTest('Gentoo sandbox is not installed')
+        self.env.update(SANDBOX_WRITE=str(self.root), SANDBOX_READ='/', SANDBOX_ON='1')
+        self.compare('gcc', ['-march=native'], prefix=('sandbox',))
+        self.assertIn('native expansion cache hit',
+                      self.compare('gcc', ['-march=native'], prefix=('sandbox',)))
 
     def test_cache_shared_across_source_and_output_paths(self):
         self.compare('gcc', ['-march=native'])
