@@ -27,3 +27,23 @@ only when another request becomes readable. An idle session consumes a socket,
 not a compiler worker. Both broker and server bound retained socket counts
 and idle lifetimes. Clients without negotiation receive no JEND and retain
 the original single-job behavior.
+
+Worker admission
+----------------
+
+A Linux server advertising dcc_admission 1 in its statistics also accepts
+SLOT00000001 (compile) or SLOT00000002 (link) on a fresh or idle pooled TCP
+connection. These requests use the ordinary server access rules and are not
+available with GSSAPI. They carry no compiler arguments or input files.
+
+GRNT00000001 atomically reserves a worker and enables the same sequential
+session framing described above. Send one ordinary DIST request next and
+consume its complete response, including JEND, before reusing the connection.
+Closing an abandoned connection releases the reservation through the worker's
+normal EOF/error path. Existing I/O and job lifetime limits still apply.
+
+BUSY00000000 reserves nothing and leaves the connection idle. The broker may
+try another host; it waits at least 50ms before retrying this host for the same
+job class. A link needs a free worker, no other admitted link on this server,
+and memory PSI below 10% when available. Ordinary compile admission needs a
+free worker. Legacy requests remain supported without a SLOT exchange.

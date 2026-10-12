@@ -15,6 +15,20 @@ from test_broker import BrokerTestCase
 
 
 class PoolTest(BrokerTestCase):
+    def test_fragmented_admission_and_cancel(self):
+        self.start_broker(self.host(0, f',stats={self.stats_ports[0]}'))
+        net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=2)
+        self.addCleanup(net.close)
+        net.sendall(b'SLO')
+        net.settimeout(.05)
+        with self.assertRaises(socket.timeout): net.recv(12)
+        net.sendall(b'T00000001')
+        net.settimeout(2)
+        self.assertEqual(net.recv(12, socket.MSG_WAITALL), b'GRNT00000001')
+        self.assertIn('dcc_busy 1\n', self.get_stats(self.stats_ports[0]))
+        net.close()
+        self.job('after-admission-cancel')
+
     def accepts(self):
         return int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
 
@@ -29,7 +43,7 @@ class PoolTest(BrokerTestCase):
         return lease, net
 
     def test_completed_jobs_reuse_one_connection(self):
-        self.start_broker()
+        self.start_broker(self.host(0, f',stats={self.stats_ports[0]}'))
         before = self.accepts()
         for i in range(5): self.job(i)
         self.assertEqual(self.accepts() - before, 1)
@@ -98,7 +112,7 @@ class PoolTest(BrokerTestCase):
         self.assertFalse(Path(self.env['DISTCC_BROKER']).exists())
 
     def test_worker_replacement_preserves_idle_session(self):
-        self.start_broker()
+        self.start_broker(self.host(0, f',stats={self.stats_ports[0]}'))
         before = self.accepts()
         self.job(0)
         parent = self.daemons[0].pid

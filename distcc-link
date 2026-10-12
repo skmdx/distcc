@@ -478,7 +478,7 @@ def remote_link(job, inputs, output):
             raise LocalOnly('link inputs exceed the protocol size limit')
         archive.seek(0)
         with ExitStack() as stack:
-            for command in (6, 1):
+            for command in (8, 6, 1):
                 lease = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
                 lease.connect(os.environ['DISTCC_BROKER'])
                 lease.sendall(struct.pack('=II', 2, command))

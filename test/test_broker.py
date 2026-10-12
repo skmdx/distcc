@@ -16,11 +16,11 @@ from test_adaptive import DistccTestCase, free_port, stats_response
 
 
 class BrokerTestCase(DistccTestCase):
-    def start_broker(self, hosts=None, idle=10):
-        path = self.root / "broker.sock"
+    def start_broker(self, hosts=None, idle=10, name="broker"):
+        path = self.root / f"{name}.sock"
         env = dict(self.base_env, DISTCC_HOSTS=hosts or self.host(0),
                    DISTCC_DIR=str(self.ddir), DISTCC_BROKER_IDLE=str(idle))
-        log = open(self.work / "broker.log", "w+")
+        log = open(self.work / f"{name}.log", "w+")
         self.addCleanup(log.close)
         proc = subprocess.Popen([str(self.build / "distccd"), "--broker", str(path)],
                                 env=env, stdout=log, stderr=log)
@@ -74,6 +74,78 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerTest(BrokerTestCase):
+    def acquire_reserved(self, command=6):
+        lease = self.request(command)
+        status, capabilities, fds = self.receive(lease)
+        self.assertEqual(status, 0)
+        self.assertTrue(capabilities & (1 << 30))
+        self.assertEqual(len(fds), 1)
+        net = socket.socket(fileno=fds[0])
+        self.addCleanup(net.close)
+        lease.sendall(struct.pack('=II', 2, 3))
+        return lease, net
+
+    def admission_hosts(self):
+        # Intentionally stale, idle metrics: admission must still prevent
+        # separate brokers from queuing behind a full real server.
+        stats = stats_response().replace(b'</distccstats>',
+            b'dcc_running 0\ndcc_busy 0\ndcc_queued 0\ndcc_admission 1\n</distccstats>')
+        peers = [self.peer(stats), self.peer(stats)]
+        return ' '.join(self.host(i, f',stats={p.port},speed={2 if i == 0 else 1}')
+                        for i, p in enumerate(peers)) + ' --localslots_cpp=8'
+
+    def test_idle_fast_cores_before_slow_host(self):
+        self.start_broker(self.admission_hosts())
+        for _ in range(4):
+            _, net = self.acquire_reserved()
+            self.assertEqual(net.getpeername()[1], self.ports[0])
+        _, net = self.acquire_reserved()
+        self.assertEqual(net.getpeername()[1], self.ports[1])
+
+    def test_multiple_brokers_reserve_global_capacity(self):
+        hosts, environments, assigned, leases = self.admission_hosts(), [], [], []
+        for i in range(3):
+            self.start_broker(hosts, name=f'broker-{i}')
+            environments.append(self.env)
+        for i in range(8):
+            self.env = environments[i % 3]
+            lease, net = self.acquire_reserved()
+            leases.append((lease, net))
+            assigned.append(net.getpeername()[1])
+        self.assertEqual([assigned.count(port) for port in self.ports], [4, 4])
+        for port in self.stats_ports:
+            stats = self.get_stats(port)
+            self.assertIn('dcc_busy 4\n', stats)
+            self.assertIn('dcc_queued 0\n', stats)
+        # The lease and network close together on cancellation, freeing the
+        # server reservation; completion must also release it after real GCC.
+        for lease, net in leases:
+            net.close()
+            lease.close()
+        self.job('after-cancel')
+
+    def test_links_have_separate_admission_and_no_cpp_reservation(self):
+        self.start_broker(self.admission_hosts() + ' --localslots_cpp=1')
+        _, first = self.acquire_reserved(8)
+        _, second = self.acquire_reserved(8)
+        self.assertNotEqual(first.getpeername()[1], second.getpeername()[1])
+        # Both links can remain reserved while a compile gets the cpp slot.
+        _, compile_net = self.acquire_reserved()
+        self.assertEqual(compile_net.getpeername()[1], self.ports[0])
+
+    def test_invalid_probe_preserves_last_good_metrics(self):
+        peer = self.peer(stats_response(cpus=8, jobs=8))
+        self.start_broker(f'127.0.0.1:{self.ports[0]},stats={peer.port}')
+        def jobs():
+            request = self.request(2)
+            status, slots, fds = self.receive(request)
+            self.assertEqual((status, fds), (0, []))
+            return slots
+        self.assertEqual(jobs(), 8)
+        peer.response = b'garbage'
+        time.sleep(1.05)
+        self.assertEqual(jobs(), 8)
+
     def memo(self, key):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(2)

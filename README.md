@@ -74,14 +74,30 @@ CPU count and `--jobs` limit. An explicit `/LIMIT`, for example
 limits. Servers without statistics retain their configured slot count (default
 4). An old server without the new `dcc_cpus` metric also uses this fallback.
 
-For each host with a free slot, the client minimizes
-`(busy_slots + 1) * (1 + load1 / cpus) / (slots * speed)`. This favors faster,
-larger, less loaded hosts while keeping slot reservations until compilation
-finishes. Load is a weighting signal, not a stop threshold: an entirely busy
-cluster still makes progress. The slot counts coordinate processes sharing
-`DISTCC_DIR`; the daemon's `--jobs` limit remains the cluster-wide safeguard.
-Online CPUs and system-wide load do not model container CPU quotas or memory
-pressure.
+For each host with a free local slot, the client estimates one job's relative
+completion time: `max(1, (occupied + queued + 1) / parallelism,
+(runnable + 1) / cpus) / speed`. Parallelism is the smaller of CPUs and the
+server's job limit; occupied is the larger of local reservations and reported
+server occupancy, avoiding double counting. Faster cores win while capacity
+is free. Equal estimates favor the lower local slot utilization, then list
+order. Missing live runnable counts fall back to the one-minute load average.
+Reported memory PSI (`some avg10`, percent) multiplies the estimate by
+`1 + pressure / 100`. Estimates do not predict individual translation-unit
+sizes, transfer time, compiler-specific speed or container CPU quotas.
+
+With the Linux broker and a supporting server, each pooled connection reserves
+a server worker before preprocessing or transferring a job. A full server
+refuses immediately so the broker can try another host, even when several
+brokers saw the same idle statistics. Refused connections remain reusable;
+retries to a full host are limited to once per 50ms per broker. Idle pooled
+connections reserve no workers. Direct/older clients retain local slot locks
+and can queue at the server. The server's `--jobs` limit applies to both.
+
+Link requests bypass local preprocessing slots. Admission permits one link
+per server at a time and defers new links while memory PSI is at least 10%.
+The Linux parent samples system and accessible cgroup-ancestor memory pressure
+at most once per second; unsupported PSI is unknown, not a claim of free RAM.
+This controls contention, not a guaranteed per-link memory budget.
 
 Statistics successes and failures are shared within each wall-clock second in
 `DISTCC_DIR/lock`. Each uncached probe has a 250ms deadline including DNS; probes
@@ -91,7 +107,7 @@ be reachable from the client and uses the daemon's existing access rules; it is
 plain HTTP, including when compilation uses GSSAPI. `stats` requires a TCP host.
 `speed` alone also enables weighted selection and can be used with SSH hosts.
 In mixed lists, entries without metrics use their configured slots and speed 1.
-Ties follow list order (`--randomize` can change that order). Repeated entries for
+Final ties follow list order (`--randomize` can change that order). Repeated entries for
 the same lock endpoint use the first entry. Lists without either new option
 retain the original selection algorithm. Compression and pump options can be
 combined with adaptive options.

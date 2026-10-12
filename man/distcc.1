@@ -574,15 +574,18 @@ these discovered limits.
 Enable adaptive scheduling using the TCP host's distccd HTTP statistics port
 (normally 3633). The server must run with --stats and report dcc_cpus,
 dcc_max_kids and dcc_load1. Requires this fork's server for dcc_cpus.
-The client chooses the smallest (busy_slots + 1) * (1 + load1 / cpus) /
-(slots * speed) among hosts with free slots. Load is the one-minute average;
-it reduces preference without preventing progress on an overloaded cluster.
+The client minimizes estimated per-job service time among hosts with free
+local slots. Idle hosts are compared by per-core speed; server occupancy,
+queued jobs and runnable system work increase the estimate on saturated hosts.
+Overlapping local and server counts are not added together. Old servers use
+the one-minute load average when live metrics are unavailable. Memory PSI,
+when reported, penalizes hosts experiencing reclaim stalls.
 Statistics are shared by clients using the same DISTCC_DIR within each
 wall-clock second. A failed or invalid probe falls back to configured slots
 and speed, with a warning. Each uncached probe, including DNS, is limited
 to 250ms; hosts are probed sequentially. HTTP statistics use the daemon's
-access rules but are not authenticated by GSSAPI. CPU quotas and memory
-pressure are not accounted for.
+access rules but are not authenticated by GSSAPI. CPU quotas, transfer costs
+and individual job sizes are not predicted.
 .TP
 .B ,speed=FACTOR
 Relative per-core compilation throughput (0.01 to 1000, default 1).
@@ -590,7 +593,8 @@ Use reference compile time divided by this host's compile time for a
 representative single-job workload on idle machines with the same compiler.
 This option also enables adaptive scheduling without statistics, using the
 configured slot count. It works with TCP or SSH. Mixed lists use configured
-slots and speed 1 for hosts without metrics. Ties follow host-list order;
+slots and speed 1 for hosts without metrics. Equal estimates favor lower local
+slot utilization, then host-list order;
 duplicate lock endpoints use the first entry. Without stats or speed options,
 host selection is unchanged. Per-client slot locks are held until job completion;
 the server's --jobs limit still bounds work from multiple clients.
@@ -605,6 +609,16 @@ per-client statistics subprocesses and remote slot lock files. Broker
 reservations are separate from direct clients' slot locks; the server's
 --jobs limit applies to both. Normal fallback settings also apply when the
 broker is unavailable. See distccd(1) for service setup and idle lifetime.
+.PP
+Supporting Linux servers advertise live worker and queue counts and accept
+an atomic reservation on each reusable TCP connection. A full server refuses
+before input transmission, allowing another host to be selected without
+queuing behind other clients. Refused connections remain pooled; retries to
+the same full host are delayed by 50ms. Link admission permits one link per
+server and waits while system or accessible cgroup memory PSI (some avg10)
+is at least 10 percent. Link requests do not reserve local preprocessing slots.
+Memory pressure is sampled at most once per second; unavailable PSI does not
+block admission. This is contention control, not a per-job memory guarantee.
 .PP
 The broker automatically negotiates TCP session reuse before sending a job.
 Older servers and brokers continue to use one connection per job. Complete

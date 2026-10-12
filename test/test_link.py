@@ -88,7 +88,7 @@ class LinkTestCase(BrokerTestCase):
 
     def setUp(self):
         super().setUp()
-        self.start_broker()
+        self.start_broker(self.host(0, f',stats={self.stats_ports[0]}'))
         self.env.update(DISTCC_LINK_SYSROOT=str(self.profile_file), DISTCC_VERBOSE='1',
                         DISTCC_LINK_SOURCE=str(self.snapshot),
                         PATH=self.link_path)

@@ -27,10 +27,11 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def stats_response(cpus=4, jobs=4, load=0):
+def stats_response(cpus=4, jobs=4, load=0, **metrics):
     return ("HTTP/1.0 200 OK\n\n<distccstats>\n"
             f"dcc_cpus {cpus}\ndcc_max_kids {jobs}\ndcc_load1 {load}\n"
-            "</distccstats>\n").encode()
+            + ''.join(f'dcc_{name} {value}\n' for name, value in metrics.items())
+            + "</distccstats>\n").encode()
 
 
 class StatsPeer:
@@ -244,6 +245,24 @@ class AdaptiveTest(DistccTestCase):
         loaded.response, idle.response = stats_response(), stats_response(load=12)
         time.sleep(1.05)
         self.assertEqual(self.compile(hosts, "changed")[0], self.ports[0])
+
+    def test_live_occupancy_and_memory_pressure(self):
+        current = self.peer(stats_response(load=100, running=0, busy=0, queued=0))
+        other = self.peer(stats_response())
+        hosts = self.host(0, f',stats={current.port}') + ' ' + self.host(1, f',stats={other.port}')
+        # Live runnable work replaces the old average; it is not added to it.
+        self.assertEqual(self.compile(hosts, 'idle')[0], self.ports[0])
+        for name, values in [('queued', dict(busy=4, queued=4)),
+                             ('memory', dict(memory_pressure=50))]:
+            current.response = stats_response(running=0, **values)
+            time.sleep(1.05)
+            self.assertEqual(self.compile(hosts, name)[0], self.ports[1])
+
+    def test_invalid_live_metrics_are_not_idle(self):
+        peer = self.peer(stats_response(busy='nan'))
+        hosts = self.host(0, f',stats={peer.port},speed=4') + ' ' + self.host(1)
+        _, log = self.compile(hosts)
+        self.assertIn('adaptive stats unavailable', log)
 
     def test_core_and_daemon_limits(self):
         for field in ("cpus", "jobs"):

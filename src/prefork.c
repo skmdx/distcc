@@ -71,12 +71,91 @@ static int dcc_preforked_child(int listen_fd);
 #define MAX_PENDING 256
 #define SESSION_NEW 2
 #define WORKER_RETIRING 4
-struct worker { pid_t pid; int fd, busy; };
-struct pending { int fd, session, ready; time_t since; };
+struct worker { pid_t pid; int fd, busy, link; };
+struct pending {
+    int fd, session, ready, used;
+    time_t since;
+    char request[12];
+};
 static struct worker *workers;
 static struct pollfd *parent_polls;
 static struct pending pending[MAX_PENDING];
 static int worker_channel = -1;
+
+/* Read at most once per second, in the existing parent. PSI reports actual
+ * reclaim stalls, avoiding false exhaustion from reclaimable page cache.
+ * The cgroup signal matters when the daemon has a service memory limit. */
+double dcc_memory_pressure(void)
+{
+    static time_t sampled;
+    static double pressure = -1;
+    static char group[PATH_MAX];
+    static int located;
+    FILE *file;
+    char path[PATH_MAX], line[PATH_MAX];
+    double value;
+    time_t now = time(NULL);
+    if (sampled == now) return pressure;
+    sampled = now;
+    pressure = -1;
+    if (!located) {
+        located = 1;
+        file = fopen("/proc/self/cgroup", "r");
+        if (file) {
+            while (fgets(line, sizeof(line), file))
+                if (!strncmp(line, "0::/", 4)) {
+                    line[strcspn(line, "\n")] = 0;
+                    if (strlen(line + 3) + sizeof("/sys/fs/cgroup") <= sizeof(group)) {
+                        strcpy(group, "/sys/fs/cgroup");
+                        strcat(group, line + 3);
+                    }
+                    break;
+                }
+            fclose(file);
+        }
+    }
+    file = fopen("/proc/pressure/memory", "r");
+    if (file) {
+        if (fscanf(file, "some avg10=%lf", &value) == 1 && value >= 0 && value <= 100)
+            pressure = value;
+        fclose(file);
+    }
+    if (group[0]) {
+        snprintf(path, sizeof(path), "%s", group);
+        for (;;) {
+            char name[PATH_MAX], *slash;
+            if (snprintf(name, sizeof(name), "%s/memory.pressure", path) < (int)sizeof(name)) {
+                file = fopen(name, "r");
+                if (file) {
+                    if (fscanf(file, "some avg10=%lf", &value) == 1 && value >= 0 &&
+                        value <= 100 && value > pressure) pressure = value;
+                    fclose(file);
+                }
+            }
+            slash = strrchr(path, '/');
+            if (!slash || slash <= path + strlen("/sys/fs/cgroup")) break;
+            *slash = 0;
+        }
+    }
+    return pressure;
+}
+
+int dcc_prefork_status(int *busy, int *queued, int *links)
+{
+    int i;
+    *busy = *queued = *links = 0;
+    if (!workers) return 0;
+    for (i = 0; i < dcc_max_kids; ++i) {
+        *busy += workers[i].fd >= 0 && workers[i].busy;
+        *links += workers[i].fd >= 0 && workers[i].link;
+    }
+    for (i = 0; i < MAX_PENDING; ++i)
+        *queued += pending[i].fd >= 0 && pending[i].ready;
+#ifdef HAVE_GSSAPI
+    if (dcc_auth_enabled) return 0;
+#endif
+    return 1;
+}
 
 void dcc_prefork_reaped(pid_t pid)
 {
@@ -95,7 +174,7 @@ static void park_connection(int fd, int session)
     int i;
     for (i = 0; i < MAX_PENDING; ++i) {
         if (pending[i].fd < 0) {
-            pending[i] = (struct pending){ fd, session, 0, time(NULL) };
+            pending[i] = (struct pending){ .fd = fd, .session = session, .since = time(NULL) };
             return;
         }
     }
@@ -134,6 +213,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
                 workers[i].busy = 1;
             } else {
                 workers[i].busy = !!(session & WORKER_RETIRING);
+                workers[i].link = 0;
                 if (fd >= 0) park_connection(fd, 1);
             }
         }
@@ -143,13 +223,47 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
         if (p->fd >= 0 && polls[sockets + i].fd == p->fd && polls[sockets + i].revents) {
             char byte;
             ssize_t n = recv(p->fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
-            if (n > 0) p->ready = 1;
+            if (n > 0) {
+                int admission = 1;
+#ifdef HAVE_GSSAPI
+                admission = !dcc_auth_enabled;
+#endif
+                if (admission && (p->used || byte == 'S')) {
+                    n = recv(p->fd, p->request + p->used, 12 - p->used, MSG_DONTWAIT);
+                    if (n > 0) p->used += n;
+                    if (p->used == 12) {
+                        if (memcmp(p->request, "SLOT00000001", 12) &&
+                            memcmp(p->request, "SLOT00000002", 12)) {
+                            close(p->fd);
+                            p->fd = -1;
+                        } else p->ready = 1;
+                    }
+                } else p->ready = 1;
+            }
             else if (!n || (errno != EAGAIN && errno != EINTR)) {
                 close(p->fd);
                 p->fd = -1;
             }
         }
         if (p->fd < 0 || !p->ready) continue;
+        if (p->used) {
+            int busy, queued, links, is_link = p->request[11] == '2';
+            dcc_prefork_status(&busy, &queued, &links);
+            for (j = 0; j < dcc_max_kids; ++j)
+                if (workers[j].fd >= 0 && !workers[j].busy) break;
+            if (j == dcc_max_kids || (is_link && (links || dcc_memory_pressure() >= 10))) {
+                /* Refuse immediately, retaining the TCP session for retry on
+                 * another host. Idle sessions never reserve compiler slots. */
+                if (send(p->fd, "BUSY00000000", 12, MSG_NOSIGNAL | MSG_DONTWAIT) != 12) {
+                    close(p->fd);
+                    p->fd = -1;
+                }
+                p->used = p->ready = 0;
+                p->since = now;
+                continue;
+            }
+            p->session |= 1;
+        }
         for (j = 0; j < dcc_max_kids; ++j) {
             struct worker *w = &workers[j];
             if (w->fd < 0 || w->busy) continue;
@@ -160,14 +274,24 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
                 continue;
             }
             w->busy = 1;
+            w->link = p->used && p->request[11] == '2';
+            /* A dead worker channel must not produce a grant followed by a
+             * second reply. Grant only after a worker owns the connection. */
+            if (p->used && send(p->fd, "GRNT00000001", 12, MSG_NOSIGNAL | MSG_DONTWAIT) != 12)
+                shutdown(p->fd, SHUT_RDWR);
             close(p->fd);
             p->fd = -1;
             break;
         }
     }
     if (polls[count].revents & POLLIN) {
-        int fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
-        if (fd >= 0) park_connection(fd, SESSION_NEW);
+        struct sockaddr_storage address;
+        socklen_t length = sizeof(address);
+        int fd = accept4(listen_fd, (struct sockaddr *)&address, &length, SOCK_CLOEXEC);
+        if (fd >= 0) {
+            if (dcc_check_client((struct sockaddr *)&address, length, opt_allowed)) close(fd);
+            else park_connection(fd, SESSION_NEW);
+        }
     }
     return result;
 }
@@ -266,7 +390,7 @@ static void dcc_create_kids(int listen_fd) {
         } else {
 #ifdef __linux__
             close(pair[1]);
-            workers[slot] = (struct worker){ kid, pair[0], 0 };
+            workers[slot] = (struct worker){ .pid = kid, .fd = pair[0] };
 #endif
             /* in parent */
             ++dcc_nkids;

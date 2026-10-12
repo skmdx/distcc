@@ -195,7 +195,7 @@ static void dcc_concurrency_level(void) {
     for (l = list; l; l = l->next) {
         int slots = l->n_slots;
         if (l->stats_port)
-            dcc_host_capacity(l, &slots);
+            slots = dcc_host_slots(l);
         nslots += slots;
     }
 

@@ -46,6 +46,8 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
     char *line, extra;
     int fields = 0;
     double value;
+    *cap = (struct dcc_capacity){ .running = -1, .busy = -1, .queued = -1,
+                                 .links = -1, .memory_pressure = -1 };
     if ((strncmp(buf, "HTTP/1.0 200 ", 13) &&
          strncmp(buf, "HTTP/1.1 200 ", 13)) ||
         !(line = strstr(buf, "\n<distccstats>\n")) ||
@@ -71,9 +73,29 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
                 return -1;
             cap->load = value;
             fields |= 4;
+        } else if (!strncmp(line, "dcc_memory_pressure ", 20)) {
+            if ((fields & 256) || sscanf(line + 20, "%lf %c", &value, &extra) != 1 ||
+                !(value >= -1 && value <= 100)) return -1;
+            cap->memory_pressure = value;
+            fields |= 256;
+        } else {
+            static const char *names[] = {"dcc_running", "dcc_busy", "dcc_queued",
+                                          "dcc_links", "dcc_admission"};
+            int *values[] = {&cap->running, &cap->busy, &cap->queued,
+                            &cap->links, &cap->admission};
+            unsigned i;
+            for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+                size_t len = strlen(names[i]);
+                if (strncmp(line, names[i], len) || line[len] != ' ') continue;
+                if ((fields & (8 << i)) || sscanf(line + len, "%lf %c", &value, &extra) != 1 ||
+                    !(value >= -1 && value <= 1000000) || value != (int)value)
+                    return -1;
+                *values[i] = value;
+                fields |= 8 << i;
+            }
         }
     }
-    return fields == 7 ? 0 : -1;
+    return (fields & 7) == 7 ? 0 : -1;
 }
 
 /* Isolate the existing resolver and socket code so the entire probe, including
@@ -130,18 +152,23 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
     ssize_t n;
 
     endpoint.port = host->stats_port;
-    if (dcc_lock_host("stats", &endpoint, 0, 1, &fd))
+    if (dcc_lock_host("stats2", &endpoint, 0, 1, &fd))
         return -1;
     now = time(NULL);
     n = read(fd, buf, sizeof(buf) - 1);
     if (n > 0) {
         buf[n] = '\0';
-        if (sscanf(buf, "%ld %d %d %d %lf", &stamp, &valid,
-                   &cap->cpus, &cap->jobs, &cap->load) == 5 &&
+        if (sscanf(buf, "%ld %d %d %d %lf %d %d %d %d %d %lf", &stamp, &valid,
+                   &cap->cpus, &cap->jobs, &cap->load, &cap->running, &cap->busy,
+                   &cap->queued, &cap->links, &cap->admission, &cap->memory_pressure) == 11 &&
             stamp == (long)now &&
             (valid == 0 || (valid == 1 && cap->cpus > 0 &&
              cap->cpus <= 10000 && cap->jobs > 0 && cap->jobs <= 10000 &&
-             cap->load >= 0 && cap->load <= 1e9))) {
+             cap->load >= 0 && cap->load <= 1e9 && cap->running >= -1 &&
+             cap->running <= 1000000 && cap->busy >= -1 && cap->busy <= 1000000 &&
+             cap->queued >= -1 && cap->queued <= 1000000 && cap->links >= -1 &&
+             cap->links <= 1000000 && cap->admission >= -1 && cap->admission <= 1000000 &&
+             cap->memory_pressure >= -1 && cap->memory_pressure <= 100))) {
             dcc_unlock(fd);
             return valid ? 0 : -1;
         }
@@ -151,8 +178,9 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
     if (!valid)
         rs_log_warning("adaptive stats unavailable for %s; using configured slots/speed",
                        host->hostname);
-    len = snprintf(buf, sizeof(buf), "%ld %d %d %d %.17g\n",
-                   (long)time(NULL), valid, cap->cpus, cap->jobs, cap->load);
+    len = snprintf(buf, sizeof(buf), "%ld %d %d %d %.17g %d %d %d %d %d %.2f\n",
+                   (long)time(NULL), valid, cap->cpus, cap->jobs, cap->load,
+                   cap->running, cap->busy, cap->queued, cap->links, cap->admission, cap->memory_pressure);
     if (lseek(fd, 0, SEEK_SET) < 0 || ftruncate(fd, 0) ||
         write(fd, buf, len) != len)
         rs_log_warning("could not cache adaptive stats");
@@ -162,36 +190,51 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
 
 /* The configured limit is a ceiling, not an estimate of CPU performance.
  * Without an explicit limit, stats-enabled hosts use their advertised CPUs. */
-double dcc_host_capacity(const struct dcc_hostdef *host, int *slots)
+int dcc_host_slots(const struct dcc_hostdef *host)
 {
     struct dcc_capacity cap;
-    return dcc_capacity_value(host,
+    return dcc_capacity_slots(host,
         host->is_up && host->n_slots > 0 && host->stats_port &&
-        !cached_capacity(host, &cap) ? &cap : NULL, slots);
+        !cached_capacity(host, &cap) ? &cap : NULL);
 }
 
-double dcc_capacity_value(const struct dcc_hostdef *host,
-                          const struct dcc_capacity *cap, int *slots)
+int dcc_capacity_slots(const struct dcc_hostdef *host, const struct dcc_capacity *cap)
 {
-    double pressure = 1;
-
-    *slots = host->is_up ? host->n_slots : 0;
-    if (*slots > 10000)
-        *slots = 10000;
-    if (*slots > 0 && cap) {
-        if (!host->slots_specified || *slots > cap->cpus)
-            *slots = cap->cpus;
-        if (*slots > cap->jobs)
-            *slots = cap->jobs;
-        pressure += cap->load / cap->cpus;
+    int slots = host->is_up ? host->n_slots : 0;
+    if (slots > 10000) slots = 10000;
+    if (slots > 0 && cap) {
+        if (!host->slots_specified || slots > cap->cpus) slots = cap->cpus;
+        if (slots > cap->jobs) slots = cap->jobs;
     }
-    return *slots * (host->speed ? host->speed : 1) / pressure;
+    return slots;
+}
+
+/* One job takes one core's service time until the host is saturated. Global
+ * occupancy overlaps local leases: take the maximum, never add both counts.
+ * Admission on the server closes the race between independent brokers. */
+double dcc_capacity_score(const struct dcc_hostdef *host,
+                          const struct dcc_capacity *cap, int busy)
+{
+    int slots = dcc_capacity_slots(host, cap), occupied = busy;
+    double service = 1, demand;
+    if (cap && cap->busy > occupied) occupied = cap->busy;
+    if (cap && cap->queued > 0) occupied += cap->queued;
+    /* A client's /LIMIT restricts its own leases, not other clients' CPUs. */
+    demand = (occupied + 1.0) / (cap ? (cap->cpus < cap->jobs ? cap->cpus : cap->jobs) : slots);
+    if (demand > service) service = demand;
+    if (cap) {
+        demand = ((cap->running >= 0 ? cap->running : cap->load) + 1) / cap->cpus;
+        if (demand > service) service = demand;
+        if (cap->memory_pressure > 0) service *= 1 + cap->memory_pressure / 100;
+    }
+    return service / (host->speed ? host->speed : 1);
 }
 
 struct candidate {
     struct dcc_hostdef *host;
     int slots;
-    double capacity;
+    struct dcc_capacity metrics;
+    const struct dcc_capacity *cap;
 };
 
 int dcc_lock_adaptive(struct dcc_hostdef *hosts,
@@ -201,7 +244,7 @@ int dcc_lock_adaptive(struct dcc_hostdef *hosts,
     struct candidate *candidates;
     int count = 0, i, slot, busy, first, fd, candidate_fd, scheduler_fd;
     int best_fd = -1, best_slot = 0, ret = EXIT_BUSY;
-    double score, best_score = 0;
+    double score, best_score = 0, best_fill = 0;
 
     for (h = hosts; h; h = h->next)
         count++;
@@ -212,7 +255,9 @@ int dcc_lock_adaptive(struct dcc_hostdef *hosts,
     for (h = hosts, i = 0; h; h = h->next, i++) {
         struct candidate *c = &candidates[i];
         c->host = h;
-        c->capacity = dcc_host_capacity(h, &c->slots);
+        c->cap = h->is_up && h->n_slots > 0 && h->stats_port &&
+                 !cached_capacity(h, &c->metrics) ? &c->metrics : NULL;
+        c->slots = dcc_capacity_slots(h, c->cap);
     }
 
     /* Serialize only slot inspection/reservation, never network probes.
@@ -257,12 +302,14 @@ int dcc_lock_adaptive(struct dcc_hostdef *hosts,
         }
         if (first < 0)
             continue;
-        score = (busy + 1) / c->capacity;
-        if (best_fd < 0 || score < best_score) {
+        score = dcc_capacity_score(c->host, c->cap, busy);
+        if (best_fd < 0 || score < best_score ||
+            (score == best_score && (busy + 1.0) / c->slots < best_fill)) {
             if (best_fd >= 0)
                 dcc_unlock(best_fd);
             best_fd = candidate_fd;
             best_score = score;
+            best_fill = (busy + 1.0) / c->slots;
             best_slot = first;
             *buildhost = c->host;
         } else {
