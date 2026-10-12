@@ -977,8 +977,9 @@ configuration files in /etc/clang, ~/.config/clang and the compiler's bin
 directory (including simple nested response files) are checked for changes.
 GCC installations with external specs, custom configuration/search options,
 compiler wrappers, injected libraries and command-line response files bypass
-the cache. Portage's standard libsandbox.so preload is supported and its file
-identity is checked. Oversized or unfamiliar configurations use ordinary probes.
+the cache. Standard libsandbox.so and libjemalloc.so preloads are supported and
+their file identities are checked. Oversized or unfamiliar configurations use
+ordinary probes.
 Cache entries disappear when the broker exits; failed or interrupted probes
 do not prevent subsequent compilation.
 .PP

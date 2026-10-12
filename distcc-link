@@ -140,10 +140,11 @@ def query_fingerprint(command):
                    if not k.startswith('DISTCC_') and k not in
                    ('_', 'SANDBOX_LOG', 'SANDBOX_DEBUG_LOG', 'SANDBOX_MESSAGE_P@TH')}
     if 'LD_PRELOAD' in environment:
-        if environment['LD_PRELOAD'] != 'libsandbox.so':
-            return None
-        for directory in ('/usr/lib64', '/lib64', '/usr/lib', '/lib'):
-            stamp(Path(directory) / 'libsandbox.so')
+        for library in filter(None, re.split(r'[ :]+', environment['LD_PRELOAD'])):
+            if library not in ('libsandbox.so', 'libjemalloc.so'):
+                return None
+            for directory in ('/usr/lib64', '/lib64', '/usr/lib', '/lib'):
+                stamp(Path(directory) / library)
     if any(k in environment for k in ('GCC_EXEC_PREFIX', 'COMPILER_PATH', 'CCC_OVERRIDE_OPTIONS',
                                       'LD_LIBRARY_PATH')):
         return None

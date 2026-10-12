@@ -126,6 +126,11 @@ int main(void) { float a[128] = {0}, b[128] = {3};
         self.compare('gcc', ['-march=native'], prefix=('sandbox',))
         self.assertIn('native expansion cache hit',
                       self.compare('gcc', ['-march=native'], prefix=('sandbox',)))
+        if any((Path(p) / 'libjemalloc.so').exists() for p in ('/usr/lib64', '/usr/lib')):
+            self.env['LD_PRELOAD'] = 'libjemalloc.so'
+            self.compare('gcc', ['-march=native'], prefix=('sandbox',))
+            self.assertIn('native expansion cache hit',
+                          self.compare('gcc', ['-march=native'], prefix=('sandbox',)))
 
     def test_cache_shared_across_source_and_output_paths(self):
         self.compare('gcc', ['-march=native'])

@@ -40,7 +40,10 @@ static int stamp(struct fingerprint *key, const char *path)
     char value[256];
     append(key, path);
     if (stat(path, &st)) {
-        if (errno != ENOENT && errno != ENOTDIR) key->failed = 1;
+        if (errno != ENOENT && errno != ENOTDIR) {
+            rs_trace("native cache cannot stat %s: %s", path, strerror(errno));
+            key->failed = 1;
+        }
         append(key, "absent");
         return 0;
     }
@@ -69,7 +72,7 @@ static void config_file(struct fingerprint *key, const char *path, int depth)
     if (depth > 8 || ++key->files > 4096) { key->failed = 1; return; }
     if (!stamp(key, path)) return;
     file = fopen(path, "r");
-    if (!file) { key->failed = 1; return; }
+    if (!file) { rs_trace("native cache cannot read %s: %s", path, strerror(errno)); key->failed = 1; return; }
     while (fgets(line, sizeof(line), file)) {
         if (!strchr(line, '\n') && !feof(file)) { key->failed = 1; break; }
         word = line + strspn(line, " \t");
@@ -105,7 +108,7 @@ static void config_directory(struct fingerprint *key, const char *path, int dept
     int count, i;
     if (key->failed || !stamp(key, path)) return;
     count = scandir(path, &entries, NULL, alphasort);
-    if (count < 0) { key->failed = 1; return; }
+    if (count < 0) { rs_trace("native cache cannot list %s: %s", path, strerror(errno)); key->failed = 1; return; }
     if (count > 512) key->failed = 1;
     for (i = 0; i < count; i++) {
         const char *name = entries[i]->d_name;
@@ -179,18 +182,32 @@ char *dcc_native_cache_key(char *argv[], const char *input, const char *output)
             !strncmp(environ[i], "SANDBOX_MESSAGE_P@TH=", 21) ||
             !strncmp(environ[i], "SANDBOX_DEBUG_LOG=", 18)) continue;
         if (!strncmp(environ[i], "LD_PRELOAD=", 11)) {
-            /* Portage's standard sandbox is transparent to driver options.
-             * Track its loader candidates; other injected code is uncached. */
-            if (strcmp(environ[i] + 11, "libsandbox.so")) key->failed = 1;
-            stamp(key, "/usr/lib64/libsandbox.so");
-            stamp(key, "/lib64/libsandbox.so");
-            stamp(key, "/usr/lib/libsandbox.so");
-            stamp(key, "/lib/libsandbox.so");
+            /* Standard sandbox/allocator preloads do not change driver
+             * options. Track their files; other injected code is uncached. */
+            static const char *dirs[] = { "/usr/lib64", "/lib64", "/usr/lib", "/lib" };
+            char *libraries = strdup(environ[i] + 11), *library, *next_library;
+            unsigned directory;
+            if (!libraries) { key->failed = 1; continue; }
+            for (library = strtok_r(libraries, " :", &next_library); library;
+                 library = strtok_r(NULL, " :", &next_library)) {
+                if (strcmp(library, "libsandbox.so") && strcmp(library, "libjemalloc.so")) {
+                    key->failed = 1;
+                    break;
+                }
+                for (directory = 0; directory < sizeof(dirs) / sizeof(dirs[0]); directory++) {
+                    snprintf(path, sizeof(path), "%s/%s", dirs[directory], library);
+                    stamp(key, path);
+                }
+            }
+            free(libraries);
         }
         if (!strncmp(environ[i], "GCC_EXEC_PREFIX=", 16) ||
             !strncmp(environ[i], "COMPILER_PATH=", 14) ||
             !strncmp(environ[i], "LD_LIBRARY_PATH=", 16) ||
-            !strncmp(environ[i], "CCC_OVERRIDE_OPTIONS=", 21)) key->failed = 1;
+            !strncmp(environ[i], "CCC_OVERRIDE_OPTIONS=", 21)) {
+            rs_trace("native cache bypass: environment %.*s", (int)strcspn(environ[i], "="), environ[i]);
+            key->failed = 1;
+        }
         append(key, environ[i]);
     }
     if (sched_getaffinity(0, sizeof(affinity), &affinity)) key->failed = 1;
