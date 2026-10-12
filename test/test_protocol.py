@@ -52,10 +52,11 @@ class ProtocolTest(DistccTestCase):
     @unittest.skipUnless(shutil.which('strace'), 'strace is required')
     def test_diagnostics_without_client_spool_files(self):
         self.env.update(DISTCC_HOSTS=self.host(0, ',lz4'), DISTCC_SAVE_TEMPS='1')
-        self.source.write_text('#warning direct-diagnostics\nint main(void) { return 0; }\n')
+        self.source.write_text('int main(void) { int direct_diagnostics; return 0; }\n')
         trace = self.work / 'files.trace'
-        result = self.compile_source(prefix=['strace', '-f', '-e', 'trace=openat', '-o', str(trace)])
-        self.assertIn('direct-diagnostics', result.stderr)
+        result = self.compile_source(['-Wunused-variable'],
+                                     prefix=['strace', '-f', '-e', 'trace=openat', '-o', str(trace)])
+        self.assertIn('direct_diagnostics', result.stderr)
         calls = trace.read_text()
         self.assertNotIn('distcc_server_stdout', calls)
         self.assertNotIn('distcc_server_stderr', calls)
