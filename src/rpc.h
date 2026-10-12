@@ -53,6 +53,7 @@ int dcc_r_argv(int ifd,
                const char *argc_token,
                const char *argv_token,
                /*@out@*/ char ***argv);
+int dcc_r_argv_body(int ifd, const char *argv_token, unsigned argc, char ***argv);
 
 
 #endif

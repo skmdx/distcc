@@ -107,7 +107,7 @@ class IncludeServerTest(unittest.TestCase):
 
     # Exercise 1: non-existent translation unit.
 
-    distcc_pump_c_extensions.RArgv = lambda self: [ "gcc", "parse.c" ]
+    distcc_pump_c_extensions.RArgv = lambda self, codec: (["gcc", "parse.c"], 'lzo')
     distcc_pump_c_extensions.RCwd = lambda self: os.getcwd()
 
     def Expect1(txt, force, never):
@@ -128,7 +128,7 @@ class IncludeServerTest(unittest.TestCase):
     # Exercise 2: provoke assertion error in cache_basics by providing an
     # entirely false value of current directory as provided in RCwd.
 
-    distcc_pump_c_extensions.RArgv = lambda self: [ "gcc", "parse.c" ]
+    distcc_pump_c_extensions.RArgv = lambda self, codec: (["gcc", "parse.c"], 'lzo')
     distcc_pump_c_extensions.RCwd = lambda self: "/"
     # The cwd will be changed because of false value.
     oldcwd = os.getcwd()
@@ -161,8 +161,8 @@ class IncludeServerTest(unittest.TestCase):
 
     # Exercise 3: provoke a NotCoveredError due to an absolute #include.
 
-    distcc_pump_c_extensions.RArgv = lambda self: [ "gcc",
-      "test_data/contains_abs_include.c" ]
+    distcc_pump_c_extensions.RArgv = lambda self, codec: (
+      ["gcc", "test_data/contains_abs_include.c"], 'lzo')
     distcc_pump_c_extensions.RCwd = lambda self: os.getcwd()
 
     def Expect3(txt, force, never):

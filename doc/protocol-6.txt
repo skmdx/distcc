@@ -1,0 +1,28 @@
+distcc protocols 6 and 7: LZ4 compression
+=======================================
+
+Protocol 6 follows protocol 2 (client preprocessing), and protocol 7 follows
+protocol 3 (server preprocessing). All compressed bulk payloads use LZ4
+instead of LZO. Metadata, arguments, file names and symlinks are unchanged.
+DONE echoes the request's version. Both versions work inside protocol 5
+sessions and worker admission; protocol 4 link jobs remain unchanged.
+
+The host option is ,lz4, combined with ,cpp for protocol 7. There is no
+automatic codec negotiation: upgrade the server before enabling this option.
+Protocols 1 through 5 and the ,lzo option retain their existing wire format.
+
+Each nonempty bulk payload consists of a four-byte unsigned uncompressed
+length in network byte order followed by one raw LZ4 block. The enclosing
+token's length includes this prefix. Compression uses LZ4_compress_default;
+decoding uses LZ4_decompress_safe and must produce exactly the declared length.
+Lengths above LZ4_MAX_INPUT_SIZE, compressed lengths above compressBound for
+the declared size, malformed blocks and truncated input are rejected.
+Empty files may use a zero token length or a valid block with declared size 0.
+
+The local include-server request retains CDIR followed by the argument vector.
+LZ4 requests replace its ARGC token with LZ4C; argument strings still use ARGV.
+An ARGC request selects LZO, preserving existing include-server clients.
+Responses retain ARGC/ARGV file lists. Compressed cache files use .lz4 or
+.lzo plus optional .abs, so one include server can serve either codec without
+recompressing cached headers. New clients must restart old include servers;
+unsupported requests fail include analysis rather than mislabeling LZO data.

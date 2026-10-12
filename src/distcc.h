@@ -89,7 +89,8 @@ struct dcc_hostdef;
 enum dcc_compress {
     /* weird values to catch errors */
     DCC_COMPRESS_NONE     = 69,
-    DCC_COMPRESS_LZO1X
+    DCC_COMPRESS_LZO1X,
+    DCC_COMPRESS_LZ4
 };
 
 enum dcc_cpp_where {
@@ -103,7 +104,9 @@ enum dcc_protover {
     DCC_VER_2   = 2,            /**< LZO sprinkles */
     DCC_VER_3   = 3,            /**< server-side cpp */
     DCC_VER_LINK = 4,           /**< cached-sysroot link job */
-    DCC_VER_SESSION = 5         /**< negotiate sequential connection reuse */
+    DCC_VER_SESSION = 5,        /**< negotiate sequential connection reuse */
+    DCC_VER_LZ4 = 6,            /**< LZ4, client-side cpp */
+    DCC_VER_LZ4_CPP = 7         /**< LZ4, server-side cpp */
 };
 
 
@@ -237,10 +240,15 @@ int dcc_r_bulk_lzo1x(int outf_fd,
 
 
 
-int dcc_compress_file_lzo1x(int in_fd,
+int dcc_compress_file(int in_fd,
                             size_t in_len,
+                            enum dcc_compress compr,
                             char **out_buf,
                             size_t *out_len);
+
+int dcc_compress_lz4_alloc(const char *in_buf, size_t in_len,
+                           char **out_buf, size_t *out_len);
+int dcc_r_bulk_lz4(int out_fd, int in_fd, unsigned in_len);
 
 int dcc_compress_lzo1x_alloc(const char *in_buf,
                             size_t in_len,

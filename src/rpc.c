@@ -321,15 +321,21 @@ int dcc_r_argv(int ifd,
                const char *argv_token,
                /*@out@*/ char ***argv)
 {
-    unsigned i;
     unsigned argc;
-    char **a;
-    int ret;
 
     *argv = NULL;
 
     if (dcc_r_token_int(ifd, argc_token, &argc))
         return EXIT_PROTOCOL_ERROR;
+
+    return dcc_r_argv_body(ifd, argv_token, argc, argv);
+}
+
+int dcc_r_argv_body(int ifd, const char *argv_token, unsigned argc, char ***argv)
+{
+    unsigned i;
+    char **a;
+    int ret;
 
     rs_trace("reading %d arguments from job submission", argc);
 

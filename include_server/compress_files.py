@@ -43,7 +43,7 @@ class CompressFiles(object):
     self.files_compressed = set([])
 
   def Compress(self, include_closure, client_root_keeper, currdir_idx,
-               preprocess_only=False):
+               preprocess_only=False, compression='lzo'):
     """Copy files in include_closure to the client_root directory, compressing
     them as we go, and also inserting #line directives.
 
@@ -53,11 +53,13 @@ class CompressFiles(object):
     Returns: a list of filepaths under client_root
 
     Walk through the files in the include closure. Make sure their compressed
-    images (with either .lzo or lzo.abs extension) exist under client_root as
-    handled by client_root_keeper. Also collect all the .lzo or .lzo.abs
+    images (with a codec suffix and optional .abs extension) exist under
+    client_root as handled by client_root_keeper. Also collect all compressed
     filepaths in a list, which is the return value.
     """
     realpath_string = self.realpath_map.string
+    compress = (distcc_pump_c_extensions.CompressLz4Alloc if compression == 'lz4'
+                else distcc_pump_c_extensions.CompressLzo1xAlloc)
     files = [] # where we accumulate files
 
     for realpath_idx in include_closure:
@@ -68,11 +70,11 @@ class CompressFiles(object):
       if not preprocess_only and len(include_closure[realpath_idx]) > 0:
         # Designate by suffix '.abs' that this file is to become known by an
         # absolute filepath through a #line directive.
-        new_filepath = "%s%s.lzo.abs" % (client_root_keeper.client_root,
-                                         realpath)
+        new_filepath = "%s%s.%s.abs" % (client_root_keeper.client_root,
+                                         realpath, compression)
       else:
-        new_filepath = "%s%s.lzo" % (client_root_keeper.client_root,
-                                     realpath)
+        new_filepath = "%s%s.%s" % (client_root_keeper.client_root,
+                                     realpath, compression)
       files.append(new_filepath)
       if not new_filepath in self.files_compressed:
         self.files_compressed.add(new_filepath)
@@ -108,8 +110,7 @@ class CompressFiles(object):
           sys.exit("Could not open '%s' for writing: %s" % (new_filepath, why))
         try:
           new_filepath_fd.write(
-            distcc_pump_c_extensions.CompressLzo1xAlloc(
-              prefix.encode() + real_file_fd.read()))
+            compress(prefix.encode() + real_file_fd.read()))
         except (IOError, OSError) as why:
           sys.exit("Could not write to '%s': %s" % (new_filepath, why))
         new_filepath_fd.close()

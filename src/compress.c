@@ -50,6 +50,8 @@
 #include "util.h"
 #include "exitcode.h"
 #include "minilzo.h"
+#include <lz4.h>
+#include <stdint.h>
 
 
 static char work_mem[LZO1X_1_MEM_COMPRESS];
@@ -59,16 +61,13 @@ static char work_mem[LZO1X_1_MEM_COMPRESS];
  *
  * Compressed bulk data transfer for distcc.
  *
- * lzo doesn't have any detectable magic at the start in the raw form.  (lzop
- * the command-line tool adds some.)  Therefore we indicate in the request
- * header (the protocol version) whether compression is on or off.  If it is
- * on, all bulk data in both directions is compressed.  metadata whether the
- * transfer is compressed or not.
+ * The request's protocol version selects no compression, LZO or LZ4 for all
+ * bulk data in both directions. Metadata is never compressed.
  *
  * It might be nice to unify this code with that in pump.c, which deals with
  * uncompressed files.  There are some parallels between the routines.
- * However the details are rather different, because with compressed files we
- * do not know ahead of time how big the expanded form will be.  This affects
+ * However the details are rather different, because with LZO files we
+ * do not know ahead of time how big the expanded form will be. This affects
  * sending, where we need to make a large-enough temporary buffer to compress
  * into.  It also affects receipt, where we need to allow extra space for data
  * coming in.  So for the moment they remain separate.
@@ -77,22 +76,25 @@ static char work_mem[LZO1X_1_MEM_COMPRESS];
  * 2.14) without being clearly any faster.  So it's out again.
  *
  * The chunk header gives the number of compressed bytes.  The number of
- * plaintext bytes isn't transmitted, and so for decompression we might need
- * to scale up the buffer.
+ * plaintext bytes isn't transmitted for LZO, so decompression might need
+ * to scale up the buffer. LZ4 prefixes each block with its plaintext length.
  */
 
 
 /*
  * Compress from a file to a newly malloc'd block.
  */
-int dcc_compress_file_lzo1x(int in_fd,
+int dcc_compress_file(int in_fd,
                             size_t in_len,
+                            enum dcc_compress compr,
                             char **out_buf,
                             size_t *out_len)
 {
     char *in_buf = NULL;
     int ret;
 
+    if (compr == DCC_COMPRESS_LZ4 && in_len > LZ4_MAX_INPUT_SIZE)
+        return EXIT_IO_ERROR;
     if ((in_buf = malloc(in_len)) == NULL) {
         rs_log_error("allocation of %ld byte buffer failed",
                      (long) in_len);
@@ -103,14 +105,91 @@ int dcc_compress_file_lzo1x(int in_fd,
     if ((ret = dcc_readx(in_fd, in_buf, in_len)))
         goto out;
 
-    if ((ret = dcc_compress_lzo1x_alloc(in_buf, in_len, out_buf, out_len)))
-        goto out;
+    if (compr == DCC_COMPRESS_LZ4)
+        ret = dcc_compress_lz4_alloc(in_buf, in_len, out_buf, out_len);
+    else
+        ret = dcc_compress_lzo1x_alloc(in_buf, in_len, out_buf, out_len);
 
     out:
     if (in_buf != NULL) {
         free(in_buf);
     }
 
+    return ret;
+}
+
+/* A raw LZ4 block prefixed by its uncompressed size in network byte order.
+ * Knowing the exact size avoids speculative allocations and repeated decoding.
+ * Empty bulk files use the existing zero-length token; cached pump files may
+ * also contain an LZ4 block encoding empty input.
+ */
+int dcc_compress_lz4_alloc(const char *in_buf, size_t in_len,
+                           char **out_buf, size_t *out_len)
+{
+    int bound, len;
+    char *buf;
+    uint32_t size;
+
+    if (in_len > LZ4_MAX_INPUT_SIZE) {
+        rs_log_error("input exceeds LZ4 block size limit");
+        return EXIT_IO_ERROR;
+    }
+    bound = LZ4_compressBound((int) in_len);
+    buf = malloc((size_t) bound + sizeof size);
+    if (!buf)
+        return EXIT_OUT_OF_MEMORY;
+    size = htonl((uint32_t) in_len);
+    memcpy(buf, &size, sizeof size);
+    len = LZ4_compress_default(in_buf, buf + sizeof size, (int) in_len, bound);
+    if (len <= 0) {
+        free(buf);
+        return EXIT_IO_ERROR;
+    }
+    *out_buf = buf;
+    *out_len = (size_t) len + sizeof size;
+    rs_trace("LZ4 compressed %lu bytes to %lu bytes",
+             (unsigned long) in_len, (unsigned long) *out_len);
+    return 0;
+}
+
+int dcc_r_bulk_lz4(int out_fd, int in_fd, unsigned in_len)
+{
+    uint32_t size;
+    char *in_buf = NULL, *out_buf = NULL;
+    int ret, len;
+
+    if (!in_len)
+        return 0;
+    if (in_len <= sizeof size)
+        return EXIT_PROTOCOL_ERROR;
+    if ((ret = dcc_readx(in_fd, &size, sizeof size)))
+        return ret;
+    size = ntohl(size);
+    in_len -= sizeof size;
+    if (size > LZ4_MAX_INPUT_SIZE ||
+        in_len > (unsigned) LZ4_compressBound((int) size)) {
+        rs_log_error("invalid LZ4 block size");
+        return EXIT_PROTOCOL_ERROR;
+    }
+    in_buf = malloc(in_len);
+    out_buf = malloc(size ? size : 1);
+    if (!in_buf || !out_buf) {
+        ret = EXIT_OUT_OF_MEMORY;
+        goto out;
+    }
+    if ((ret = dcc_readx(in_fd, in_buf, in_len)))
+        goto out;
+    len = LZ4_decompress_safe(in_buf, out_buf, (int) in_len, (int) size);
+    if (len < 0 || (uint32_t) len != size) {
+        rs_log_error("invalid LZ4 block or decompressed size");
+        ret = EXIT_PROTOCOL_ERROR;
+        goto out;
+    }
+    rs_trace("LZ4 decompressed %u bytes to %u bytes", in_len, size);
+    ret = dcc_writex(out_fd, out_buf, size);
+out:
+    free(in_buf);
+    free(out_buf);
     return ret;
 }
 

@@ -8,8 +8,8 @@ client must reconnect and use the original single-job protocol. No job has
 been submitted at this point, so this negotiation fallback cannot duplicate
 compilation or linking. GSSAPI and SSH connections do not negotiate sessions.
 
-After successful negotiation, each request is an unchanged protocol 1, 2, 3
-or 4 request, starting with its own DIST token. The corresponding response
+After successful negotiation, each request uses protocol 1, 2, 3, 4, 6 or 7,
+starting with its own DIST token. The corresponding response
 retains its original DONE version and payload. After all response bytes and
 job cleanup, the server sends JEND00000000. This boundary also follows a
 complete response reporting a compiler/linker error. Protocol errors, partial

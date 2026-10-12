@@ -48,7 +48,7 @@
   OLDSTYLE_TCP_HOST = HOSTID[/LIMIT][:PORT][OPTIONS]
   HOSTID = HOSTNAME | IPV4
   OPTIONS = ,OPTION[OPTIONS]
-  OPTION = lzo | cpp | stats=PORT | speed=FACTOR
+  OPTION = lz4 | lzo | cpp | stats=PORT | speed=FACTOR
   GLOBAL_OPTION = --randomize
  *
  * Any amount of whitespace may be present between hosts.
@@ -234,8 +234,7 @@ static int dcc_parse_multiplier(const char **psrc, struct dcc_hostdef *hostdef)
 /**
  * Parse an optionally present option string.
  *
- * At the moment the only two options we have is "lzo" for compression,
- * and "cpp" if the server supports doing the preprocessing there, also.
+ * Compression, preprocessing and scheduling options belong to each host.
  **/
 static int dcc_parse_options(const char **psrc,
                              struct dcc_hostdef *host)
@@ -251,7 +250,11 @@ static int dcc_parse_options(const char **psrc,
 
     while (p[0] == ',') {
         p++;
-        if (str_startswith("lzo", p)) {
+        if (str_startswith("lz4", p)) {
+            rs_trace("got LZ4 option");
+            host->compr = DCC_COMPRESS_LZ4;
+            p += 3;
+        } else if (str_startswith("lzo", p)) {
             rs_trace("got LZO option");
             host->compr = DCC_COMPRESS_LZO1X;
             p += 3;
@@ -449,22 +452,24 @@ int dcc_get_features_from_protover(enum dcc_protover protover,
                                    enum dcc_compress *compr,
                                    enum dcc_cpp_where *cpp_where)
 {
-    if (protover > 1) {
-        *compr = DCC_COMPRESS_LZO1X;
-    } else {
+    switch (protover) {
+    case DCC_VER_1:
         *compr = DCC_COMPRESS_NONE;
-    }
-    if (protover > 2) {
-        *cpp_where = DCC_CPP_ON_SERVER;
-    } else {
-        *cpp_where = DCC_CPP_ON_CLIENT;
-    }
-
-    if (protover == 0 || protover > 3) {
+        break;
+    case DCC_VER_2:
+    case DCC_VER_3:
+        *compr = DCC_COMPRESS_LZO1X;
+        break;
+    case DCC_VER_LZ4:
+    case DCC_VER_LZ4_CPP:
+        *compr = DCC_COMPRESS_LZ4;
+        break;
+    default:
         return 1;
-    } else {
-        return 0;
     }
+    *cpp_where = (protover == DCC_VER_3 || protover == DCC_VER_LZ4_CPP)
+                ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT;
+    return 0;
 }
 
 /** Given a host with its feature fields set, set
@@ -489,8 +494,16 @@ int dcc_get_protover_from_features(enum dcc_compress compr,
         *protover = DCC_VER_2;
     }
 
+    if (compr == DCC_COMPRESS_LZ4 && cpp_where == DCC_CPP_ON_SERVER) {
+        *protover = DCC_VER_LZ4_CPP;
+    }
+
+    if (compr == DCC_COMPRESS_LZ4 && cpp_where == DCC_CPP_ON_CLIENT) {
+        *protover = DCC_VER_LZ4;
+    }
+
     if (compr == DCC_COMPRESS_NONE && cpp_where == DCC_CPP_ON_SERVER) {
-        rs_log_error("pump mode (',cpp') requires compression (',lzo')");
+        rs_log_error("pump mode (',cpp') requires compression (',lz4' or ',lzo')");
     }
 
     return *protover;

@@ -129,10 +129,11 @@ void dcc_calc_rate(off_t size_out,
 }
 
 
-static int dcc_x_file_lzo1x(int out_fd,
+static int dcc_x_file_compressed(int out_fd,
                             int in_fd,
                             const char *token,
-                            unsigned in_len)
+                            size_t in_len,
+                            enum dcc_compress compr)
 {
     int ret;
     char *out_buf = NULL;
@@ -143,7 +144,7 @@ static int dcc_x_file_lzo1x(int out_fd,
         if ((ret = dcc_x_token_int(out_fd, token, 0)))
             goto out;
     } else {
-        if ((ret = dcc_compress_file_lzo1x(in_fd, in_len, &out_buf, &out_len)))
+        if ((ret = dcc_compress_file(in_fd, in_len, compr, &out_buf, &out_len)))
             goto out;
 
         if ((ret = dcc_x_token_int(out_fd, token, out_len)))
@@ -202,16 +203,16 @@ int dcc_x_file(int ofd,
 #else
         ret = dcc_pump_readwrite(ofd, ifd, (size_t) f_size);
 #endif
-    } else if (compression == DCC_COMPRESS_LZO1X) {
-        ret = dcc_x_file_lzo1x(ofd, ifd, token, f_size);
+    } else if (compression == DCC_COMPRESS_LZO1X || compression == DCC_COMPRESS_LZ4) {
+        ret = dcc_x_file_compressed(ofd, ifd, token, f_size, compression);
     } else {
         rs_log_error("invalid compression");
-        return EXIT_PROTOCOL_ERROR;
+        ret = EXIT_PROTOCOL_ERROR;
     }
 
     if (ifd != -1)
         dcc_close(ifd);
-    return 0;
+    return ret;
 
   failed:
     if (ifd != -1)

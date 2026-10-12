@@ -232,7 +232,8 @@ class IncludeAnalyzer(object):
             path)
       self.ClearStatCaches()
 
-  def DoCompilationCommand(self, cmd, currdir, client_root_keeper):
+  def DoCompilationCommand(self, cmd, currdir, client_root_keeper,
+                           compression='lzo'):
     """Parse and and process the command; then gather files and links."""
 
     self.translation_unit = "unknown translation unit"  # don't know yet
@@ -274,7 +275,7 @@ class IncludeAnalyzer(object):
     # few of them.
     links = self.compiler_defaults.system_links + self.mirror_path.Links()
     files = self.compress_files.Compress(include_closure, client_root_keeper,
-                                         self.currdir_idx, '-E' in cmd)
+                                         self.currdir_idx, '-E' in cmd, compression)
 
     files_and_links = files + links
 

@@ -33,6 +33,7 @@ const char *rs_program_name = "distcc_include_server";
 
 #include "distcc.h"
 #include "rpc.h"
+#include "exitcode.h"
 
 static PyObject *distcc_pump_c_extensionsError;
 void initdistcc_pump_c_extensions(void);
@@ -54,18 +55,21 @@ static char CompressLzo1xAlloc_doc__[] =
     " a string, compressed according to distcc protocol\n.";
 
 static PyObject *
-CompressLzo1xAlloc(PyObject *dummy, PyObject *args) {
+CompressAlloc(PyObject *args, enum dcc_compress compr) {
   PyObject *string_object;
   const char *in_buf;
   Py_ssize_t in_len;
   char *out_buf;
   size_t out_len;
-  UNUSED(dummy);
+  int ret;
   if (!PyArg_ParseTuple(args, "s#", &in_buf, &in_len))
     return NULL;
   if (in_len < 0)
     return NULL;
-  if (dcc_compress_lzo1x_alloc(in_buf, in_len, &out_buf, &out_len)) {
+  ret = compr == DCC_COMPRESS_LZ4
+        ? dcc_compress_lz4_alloc(in_buf, in_len, &out_buf, &out_len)
+        : dcc_compress_lzo1x_alloc(in_buf, in_len, &out_buf, &out_len);
+  if (ret) {
     PyErr_SetString(distcc_pump_c_extensionsError,
                     "Couldn't compress that.");
     return NULL;
@@ -73,6 +77,16 @@ CompressLzo1xAlloc(PyObject *dummy, PyObject *args) {
   string_object = PyBytes_FromStringAndSize(out_buf, out_len);
   free(out_buf);
   return string_object;
+}
+
+static PyObject *CompressLzo1xAlloc(PyObject *dummy, PyObject *args) {
+  UNUSED(dummy);
+  return CompressAlloc(args, DCC_COMPRESS_LZO1X);
+}
+
+static PyObject *CompressLz4Alloc(PyObject *dummy, PyObject *args) {
+  UNUSED(dummy);
+  return CompressAlloc(args, DCC_COMPRESS_LZ4);
 }
 
 
@@ -135,8 +149,8 @@ RTokenString(PyObject *dummy, PyObject *args) {
 
 
 static char RArgv_doc__[] =
-"Rargv(ifd):\n"
-"   Read argv values.\n"
+"RArgv(ifd, with_compression=False):\n"
+"   Read argv values, optionally returning (argv, compression).\n"
 "\n"
 "   Arguments:\n"
 "     ifd: an integer file descriptor\n"
@@ -146,37 +160,48 @@ static char RArgv_doc__[] =
 ;
 static PyObject *
 RArgv(PyObject *dummy, PyObject *args) {
-  int i = 0;
+  int i, ret, with_compression = 0;
   PyObject *list_object = NULL;
   int ifd;
-  PyObject *string_object = NULL;
-  char **argv;
+  char **argv = NULL;
+  const char *compression = "lzo";
   UNUSED(dummy);
-  if (!PyArg_ParseTuple(args, "i", &ifd))
+  if (!PyArg_ParseTuple(args, "i|p", &ifd, &with_compression))
     return NULL;
-  if (dcc_r_argv(ifd, "ARGC", "ARGV", &argv)) {
+  if (with_compression) {
+    char token[5];
+    unsigned argc;
+    ret = dcc_r_sometoken_int(ifd, token, &argc);
+    if (!ret) {
+      if (!strcmp(token, "LZ4C"))
+        compression = "lz4";
+      else if (strcmp(token, "ARGC"))
+        ret = EXIT_PROTOCOL_ERROR;
+    }
+    if (!ret)
+      ret = dcc_r_argv_body(ifd, "ARGV", argc, &argv);
+  } else {
+    ret = dcc_r_argv(ifd, "ARGC", "ARGV", &argv);
+  }
+  if (ret) {
     PyErr_SetString(distcc_pump_c_extensionsError, "Couldn't read that.");
     goto error;
   }
-  if ((list_object = PyList_New(0)) == NULL) goto error;
-  for (; argv[i]; i++) {
-    string_object = PyUnicode_FromString(argv[i]);
-    free(argv[i]);
-    if (!string_object) {
+  if ((list_object = PyList_New(dcc_argv_len(argv))) == NULL) goto error;
+  for (i = 0; argv[i]; i++) {
+    PyObject *string_object = PyUnicode_FromString(argv[i]);
+    if (!string_object)
       goto error;
-    }
-    if (PyList_Append(list_object, string_object) < 0)
-      goto error;
-    Py_XDECREF(string_object);
+    PyList_SET_ITEM(list_object, i, string_object);
   }
-  free(argv);
+  dcc_free_argv(argv);
+  if (with_compression)
+    return Py_BuildValue("Ns", list_object, compression);
   return list_object;
  error:
   Py_XDECREF(list_object);
-  Py_XDECREF(string_object);
-  for (i = i + 1; argv[i]; i++)
-    free(argv[i]);
-  free(argv);
+  if (argv)
+    dcc_free_argv(argv);
   return NULL;
 }
 
@@ -397,6 +422,8 @@ static PyMethodDef module_methods[] = {
   {"XArgv",       (PyCFunction)XArgv,   METH_VARARGS, XArgv_doc__},
   {"CompressLzo1xAlloc", (PyCFunction)CompressLzo1xAlloc, METH_VARARGS,
    CompressLzo1xAlloc_doc__},
+  {"CompressLz4Alloc", (PyCFunction)CompressLz4Alloc, METH_VARARGS,
+   "Compress an LZ4 block with a network-order uncompressed-size prefix."},
   {NULL, NULL, 0, NULL}
 };
 

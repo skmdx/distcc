@@ -152,6 +152,7 @@ pkgdoc_DOCS = AUTHORS COPYING NEWS \
 	doc/protocol-3.txt doc/protocol-3-impl.txt \
 	doc/protocol-4.txt \
 	doc/protocol-5.txt \
+	doc/protocol-6.txt \
 	doc/protocol-gssapi.txt \
 	doc/reporting-bugs.txt
 

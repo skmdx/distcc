@@ -3,6 +3,8 @@
 import os
 import re
 import shutil
+import socket
+import struct
 import subprocess
 import unittest
 
@@ -34,6 +36,55 @@ class ProtocolTest(DistccTestCase):
     def test_large_argument_frame(self):
         # The wire frame exceeds ordinary socket buffers; all flags must arrive.
         self.compile(['-fno-inline'] * 16000)
+
+    def test_compression_round_trip(self):
+        for codec in ('lzo', 'lz4'):
+            self.env['DISTCC_HOSTS'] = self.host(0, ',' + codec)
+            for body in ('', 'const char repeated[] = "' + '0' * 1000000 + '";\n',
+                         'const char data[] = "' + os.urandom(32000).hex() + '";\n'):
+                with self.subTest(codec=codec, size=len(body)):
+                    self.source.write_text(body + '#warning compression-test\n'
+                                           'int main(void) { return 0; }\n')
+                    self.compile()
+
+    def test_lz4_rejects_invalid_blocks(self):
+        def token(name, value):
+            return f'{name}{value:08x}'.encode()
+
+        args = [b'gcc', b'-c', b'source.i', b'-o', b'result.o']
+        header = token('DIST', 6) + token('ARGC', len(args))
+        header += b''.join(token('ARGV', len(arg)) + arg for arg in args)
+        # Missing size, impossible output size, malformed block, size mismatch,
+        # and an advertised block cut short by EOF must all fail closed.
+        for data, extra in ((b'bad', 0), (struct.pack('!I', 0xffffffff) + b'\x00', 0),
+                            (struct.pack('!I', 1) + b'\xff', 0),
+                            (struct.pack('!I', 2) + b'\x10x', 0),
+                            (struct.pack('!I', 1), 2)):
+            with self.subTest(data=data, extra=extra):
+                with socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5) as conn:
+                    conn.sendall(header + token('DOTI', len(data) + extra) + data)
+                    conn.shutdown(socket.SHUT_WR)
+                    response = b''
+                    try:
+                        while chunk := conn.recv(4096):
+                            response += chunk
+                    except ConnectionResetError:
+                        pass
+                    self.assertNotIn(b'DOTO', response)
+        self.env['DISTCC_HOSTS'] = self.host(0, ',lz4')
+        self.compile()
+
+    def test_lz4_rejects_oversized_input_before_reading(self):
+        source = self.work / 'oversized.i'
+        with source.open('wb') as stream:
+            stream.truncate(0x7e000001)  # sparse; one byte above LZ4_MAX_INPUT_SIZE
+        self.env.update(DISTCC_HOSTS=self.host(0, ',lz4'), DISTCC_MAX_RETRIES='1')
+        result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(source),
+                                 '-o', str(self.work / 'oversized.o')],
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('compiled on ', result.stderr)
+        self.assertFalse((self.work / 'oversized.o').exists())
 
     @unittest.skipUnless(shutil.which('strace'), 'strace is required')
     def test_batched_arguments_and_cork(self):

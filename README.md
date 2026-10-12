@@ -121,9 +121,15 @@ In mixed lists, entries without metrics use their configured slots and speed 1.
 Final ties follow list order (`--randomize` can change that order). Repeated entries for
 the same lock endpoint use the first entry. Lists without either new option
 retain the original selection algorithm. Compression and pump options can be
-combined with adaptive options.
+combined with adaptive options. Use `builder-a,lz4` for LZ4 compression, or
+`builder-a,cpp,lz4` under `pump` for remote preprocessing. Both ends must run
+this fork with LZ4 support. `,lzo` retains upstream-compatible LZO compression;
+the two codecs can coexist in a host list, including with the broker and pump.
+Upgrade servers before changing client host entries to `,lz4`. Restart brokers
+and active pump sessions after upgrading the client.
 
-Build using the usual `./autogen.sh`, `./configure`, and `make` steps.
+Build using the usual `./autogen.sh`, `./configure`, and `make` steps, with the
+LZ4 library and development headers installed.
 `make adaptive-check` runs real GCC compiles through two local daemons, checks
 the linked executables, and exercises controlled load/error responses and slot
 locking. Set `TMPDIR` to a suitable temporary directory. `make check` includes

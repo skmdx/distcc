@@ -362,7 +362,7 @@ def DistccIncludeHandlerGenerator(include_analyzer):
       """
       statistics.StartTiming()
       currdir = distcc_pump_c_extensions.RCwd(self.rfile.fileno())
-      cmd = distcc_pump_c_extensions.RArgv(self.rfile.fileno())
+      cmd, compression = distcc_pump_c_extensions.RArgv(self.rfile.fileno(), True)
 
       try:
         try:
@@ -389,7 +389,8 @@ def DistccIncludeHandlerGenerator(include_analyzer):
           files_and_links = (
               include_analyzer.
                   DoCompilationCommand(cmd, currdir,
-                                       include_analyzer.client_root_keeper))
+                                       include_analyzer.client_root_keeper,
+                                       compression))
         finally:
           # The timer should normally be cancelled during normal execution
           # flow. Still, we want to make sure that this is indeed the case in

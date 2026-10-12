@@ -233,7 +233,8 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready)
     (*host)->broker_managed = 1;
     if (remote_cpp || cpp_ready) {
         (*host)->cpp_where = remote_cpp ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT;
-        (*host)->compr = DCC_COMPRESS_LZO1X;
+        if ((*host)->compr == DCC_COMPRESS_NONE)
+            (*host)->compr = DCC_COMPRESS_LZO1X;
         dcc_get_protover_from_features((*host)->compr, (*host)->cpp_where,
                                        &(*host)->protover);
     }

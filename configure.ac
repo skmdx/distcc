@@ -223,6 +223,9 @@ fi
 AC_SUBST(WERROR_CFLAGS)
 AC_SUBST(PYTHON_CFLAGS)
 AC_SEARCH_LIBS([strerror],[cposix])
+AC_CHECK_HEADER([lz4.h], [], [AC_MSG_ERROR([LZ4 headers are required])])
+AC_CHECK_LIB([lz4], [LZ4_compress_default], [],
+             [AC_MSG_ERROR([liblz4 is required])])
 
 
 # Apple's OS X gcc has a cpp-precomp "feature" that breaks standard

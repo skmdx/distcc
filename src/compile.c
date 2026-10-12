@@ -859,7 +859,7 @@ dcc_build_somewhere(char *argv[],
         goto unlock_and_clean_up;
     }
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        if ((ret = dcc_talk_to_include_server(argv, &files))) {
+        if ((ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
             /* Fallback to doing cpp locally */
             /* It's unfortunate that the variable that controls that is in the
              * "host" datastructure, even though in this case it's the client

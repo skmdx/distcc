@@ -57,7 +57,7 @@ static int dcc_categorize_file(const char *include_server_filename);
  * if anything goes wrong, it returns a non-zero value.
  */
 
-int dcc_talk_to_include_server(char **argv, char ***files)
+int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr)
 {
     char *include_server_port;
     int fd;
@@ -98,7 +98,7 @@ int dcc_talk_to_include_server(char **argv, char ***files)
 
     /* TODO? switch include_server to use more appropriate token names */
     if (dcc_x_cwd(fd) ||
-        dcc_x_argv(fd, "ARGC", "ARGV", argv) ||
+        dcc_x_argv(fd, compr == DCC_COMPRESS_LZ4 ? "LZ4C" : "ARGC", "ARGV", argv) ||
         dcc_r_argv(fd, "ARGC", "ARGV", files)) {
         rs_log_warning("failed to talk to include server '%s'",
                        include_server_port);
@@ -122,7 +122,7 @@ int dcc_talk_to_include_server(char **argv, char ***files)
 /* The include server puts all files in its own special directory,
  * which is n path components long, where n = INCLUDE_SERVER_DIR_DEPTH
  * The original file should drop those components.
- * Also, we need to strip the .lzo and .lzo.abs suffixes.
+ * Also strip the compression suffix and optional .abs suffix.
  */
 int dcc_get_original_fname(const char *fname, char **original_fname)
 {
@@ -159,17 +159,13 @@ int dcc_get_original_fname(const char *fname, char **original_fname)
         }
     }
 
-    /* This code removes an abs extension if it's there, and
-       then a .lzo extension if it's there. As a result
-       a .lzo.abs extension is removed, but not a .abs.lzo
-       extension.
-     */
+    /* Remove the optional .abs suffix before the compression suffix. */
     extension = dcc_find_extension(work);
     if (extension && (strcmp(extension, ".abs") == 0)) {
         *extension = '\0';
     }
     extension = dcc_find_extension(work);
-    if (extension && (strcmp(extension, ".lzo") == 0)) {
+    if (extension && (!strcmp(extension, ".lzo") || !strcmp(extension, ".lz4"))) {
         *extension = '\0';
     }
 
@@ -201,7 +197,7 @@ dcc_approximate_includes(struct dcc_hostdef *host, char **argv)
         //return 0;
     }
 
-    if ((ret = dcc_talk_to_include_server(argv, &files))) {
+    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
         rs_log_error("failed to get includes from include server");
         return ret;
     }

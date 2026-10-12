@@ -14,9 +14,11 @@ from test_broker import BrokerTestCase
 
 
 class PreprocessTest(BrokerTestCase):
+    compression = 'lzo'
+
     def setUp(self):
         super().setUp()
-        self.start_broker(self.host(0) + ' --localslots_cpp=1', idle=60)
+        self.start_broker(self.host(0, ',' + self.compression) + ' --localslots_cpp=1', idle=60)
         self.env.update(TMPDIR=str(self.root), DISTCC_CLIENT_TMP=str(self.work),
                         DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_TESTING_INCLUDE_SERVER='1',
                         DISTCC_VERBOSE='1', DISTCC_LOG=str(self.work / 'client.log'))
@@ -191,13 +193,27 @@ class PreprocessTest(BrokerTestCase):
         worker = threading.Thread(target=proxy)
         worker.start()
         self.env.pop('DISTCC_BROKER')
-        self.env.update(DISTCC_HOSTS=f'127.0.0.1:{listener.getsockname()[1]},cpp,lzo',
+        self.env.update(DISTCC_HOSTS=f'127.0.0.1:{listener.getsockname()[1]},cpp,{self.compression}',
                         DISTCC_FALLBACK='1', DISTCC_MAX_RETRIES='1')
         self.compare(args=['-P'])
         worker.join(timeout=12)
         self.assertFalse(worker.is_alive())
         self.assertEqual(failures, [])
         self.assertIn('running locally instead', (self.work / 'client.log').read_text())
+
+
+class Lz4PreprocessTest(PreprocessTest):
+    compression = 'lz4'
+
+    def test_mixed_codec_cache(self):
+        self.env.pop('DISTCC_BROKER')
+        (self.work / 'empty.h').write_bytes(b'')
+        self.source.write_text('#include "empty.h"\nint n;\n')
+        for codec in ('lz4', 'lzo', 'lz4'):
+            self.env['DISTCC_HOSTS'] = self.host(0, ',cpp,' + codec)
+            self.compare(args=['-P'])
+        for codec in ('lz4', 'lzo'):
+            self.assertTrue(list(self.work.rglob('empty.h.' + codec)))
 
 
 if __name__ == '__main__':
