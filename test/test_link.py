@@ -106,6 +106,13 @@ class LinkTestCase(BrokerTestCase):
         return output, result
 
 class LinkTest(LinkTestCase):
+    def test_native_gcc_link_stays_local(self):
+        output, result = self.link(['-march=native'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('native object links require client-side CPU expansion', result.stderr)
+        self.assertNotIn('distcc-link: linked on ', result.stderr)
+        self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
+
     def test_cpp_remote_link_matches_local(self):
         output, result = self.link(['-O3', '-pipe', '-fomit-frame-pointer', '-fno-plt',
                                    '-fno-asynchronous-unwind-tables', '-fno-common',

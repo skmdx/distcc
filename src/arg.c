@@ -181,11 +181,15 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
                     to distribute it even if we could. */
                 rs_trace("%s implies -E (maybe) and must be local", a);
                 return EXIT_DISTCC_FAILED;
+            } else if (!strcmp(a, "-Xclang")) {
+                /* A frontend argument is not a driver option (e.g. -xop
+                 * is a target feature, not the driver's -x language). */
+                if (!argv[++i]) return EXIT_DISTCC_FAILED;
             } else if (!strcmp(a, "-march=native")) {
                 rs_trace("-march=native generates code for local machine; "
                          "must be local");
                 return EXIT_DISTCC_FAILED;
-            } else if (!strcmp(a, "-mtune=native")) {
+            } else if (!strcmp(a, "-mtune=native") || !strcmp(a, "-mcpu=native")) {
                 rs_trace("-mtune=native optimizes for local machine; "
                          "must be local");
                 return EXIT_DISTCC_FAILED;

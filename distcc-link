@@ -159,6 +159,9 @@ def prepare_job(command, profile, identity=None):
         raise LocalOnly('compiler and sysroot profile differ')
     if compiler_family(compiler) != profile.get('family', 'gcc'):
         raise LocalOnly('compiler family and sysroot profile differ')
+    if compiler_family(compiler) == 'gcc' and any(
+            arg in ('-march=native', '-mtune=native', '-mcpu=native') for arg in args):
+        raise LocalOnly('GCC native object links require client-side CPU expansion')
     if not KEY.fullmatch(profile['key']):
         raise LocalOnly('invalid sysroot key')
     if compiler_family(compiler) == 'clang':

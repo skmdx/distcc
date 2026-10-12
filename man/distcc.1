@@ -955,6 +955,17 @@ to authenticate the server to the client.
 .B This environment variable is only used if distcc was compiled with
 .B the --with-auth configure option and the ",auth" per host option is specified.
 .SH "CROSS COMPILING"
+For GCC and Clang compilation, distcc resolves -march=native, -mtune=native
+and -mcpu=native using the client compiler's -### output before distribution.
+This preserves the client's detected CPU features, including disabled features,
+GCC cache parameters and explicit option overrides. The same resolved options
+are used for local preprocessing and worker compilation; workers do not detect
+their own CPU. Matching compiler versions and target support are required.
+Commands without native options do not run this extra driver query.
+If the expansion cannot be recognized, the original command runs locally.
+GCC object-only links with native options and Clang native compiles using an
+external assembler remain local.
+.PP
 Cross compilation means building programs to run on a
 machine with a different processor, architecture, or
 operating system to where they were compiled.  distcc

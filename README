@@ -43,6 +43,12 @@ and clang.json selects the compiler family automatically. Clang links use
 `-fuse-ld=lld` and support LLVM LTO, including ThinLTO. Changed libraries and
 unsupported link options stay local. See distcc(1) for toolchain requirements.
 
+For GCC and Clang compilation, `-march=native`, `-mtune=native` and
+`-mcpu=native` are resolved by the client compiler before distribution.
+The resolved CPU, enabled and disabled features, and GCC cache parameters
+are used for both preprocessing and remote compilation. Explicit overrides
+retain the compiler's normal precedence. Unrecognized expansions stay local.
+
 The distcc "pump" functionality, added in distcc 3.0, improves on
 distcc by distributing not only compilation but also preprocessing to
 distcc servers. This requires that the server and client have the same

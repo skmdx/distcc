@@ -744,6 +744,8 @@ dcc_build_somewhere(char *argv[],
 
     /* FIXME: this may leak memory for argv. */
 
+    /* Failure leaves the native options intact for the local-only scanner. */
+    dcc_expand_native(&argv);
     ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv);
     dcc_free_argv(argv);
     argv = new_argv;
