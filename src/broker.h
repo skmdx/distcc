@@ -1,7 +1,8 @@
 /* Local distccd scheduling and connected-socket leases. */
 struct dcc_hostdef;
 int dcc_broker_serve(const char *path);
-int dcc_broker_acquire(struct dcc_hostdef **host, int *lease);
+int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready);
+void dcc_broker_failed(const struct dcc_hostdef *host);
 void dcc_broker_return(const struct dcc_hostdef *host, int fd);
 #define DCC_BROKER_POOLED (1 << 30)
 int dcc_broker_jobs(void);

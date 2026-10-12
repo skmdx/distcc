@@ -104,7 +104,7 @@ static int dcc_remote_connect(struct dcc_hostdef *host,
 }
 
 
-static int dcc_wait_for_cpp(pid_t cpp_pid,
+int dcc_wait_for_cpp(pid_t cpp_pid,
                             int *status,
                             const char *input_fname)
 {

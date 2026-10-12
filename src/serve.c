@@ -83,6 +83,7 @@
 #include "bulk.h"
 #include "exec.h"
 #include "srvnet.h"
+#include "netutil.h"
 #include "hosts.h"
 #include "daemon.h"
 #include "stringmap.h"
@@ -167,6 +168,11 @@ int dcc_service_job(int in_fd,
     enum dcc_protover protover;
 
     dcc_job_summary_clear();
+
+    /* dcc_readx/dcc_writex enforce their deadlines on EAGAIN. Accepted
+     * sockets must not block inside read/write before those waits run. */
+    dcc_set_nonblocking(in_fd);
+    if (out_fd != in_fd) dcc_set_nonblocking(out_fd);
 
     /* Log client name and check access if appropriate.  For ssh connections
      * the client comes from a unix-domain socket and that's always

@@ -86,7 +86,9 @@ Reported memory PSI (`some avg10`, percent) multiplies the estimate by
 sizes, transfer time, compiler-specific speed or container CPU quotas.
 
 With the Linux broker and a supporting server, each pooled connection reserves
-a server worker before preprocessing or transferring a job. A full server
+a server worker before transferring a job. Ordinary broker clients finish
+local preprocessing before reserving that worker and reuse the preprocessed
+input on retries. A full server
 refuses immediately so the broker can try another host, even when several
 brokers saw the same idle statistics. Refused connections remain reusable;
 retries to a full host are limited to once per 50ms per broker. Idle pooled
@@ -94,10 +96,19 @@ connections reserve no workers. Direct/older clients retain local slot locks
 and can queue at the server. The server's `--jobs` limit applies to both.
 
 Link requests bypass local preprocessing slots. Admission permits one link
-per server at a time and defers new links while memory PSI is at least 10%.
-The Linux parent samples system and accessible cgroup-ancestor memory pressure
-at most once per second; unsupported PSI is unknown, not a claim of free RAM.
-This controls contention, not a guaranteed per-link memory budget.
+per server at a time. Linux admission for both compiles and links checks host
+available memory, accessible cgroup memory limits and memory PSI once per second.
+`DISTCC_JOB_MEMORY` sets the estimated memory per job in MiB (default 1024),
+with an additional quarter-job margin. New work waits when PSI is at least 10%
+or available headroom is too small. The same check limits local compile and
+preprocessing slots. Existing work finishes normally; these estimates are not
+hard per-job limits or a common scheduler for unrelated build processes.
+
+Failed remote transfers mark the broker's worker unavailable for
+`DISTCC_BACKOFF_PERIOD` seconds (default 60, set on the broker). A compile tries
+at most three remote jobs even when backoff is disabled, then follows
+`DISTCC_FALLBACK`. Server protocol reads and writes use `DISTCC_IO_TIMEOUT`
+(default 300 seconds), so a silent partial request cannot retain a worker forever.
 
 Statistics successes and failures are shared within each wall-clock second in
 `DISTCC_DIR/lock`. Each uncached probe has a 250ms deadline including DNS; probes

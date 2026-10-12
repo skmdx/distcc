@@ -78,6 +78,7 @@
 #include "exitcode.h"
 #include "adaptive.h"
 #include "broker.h"
+#include "resource.h"
 
 
 static int dcc_lock_one(struct dcc_hostdef *hostlist,
@@ -103,7 +104,7 @@ void dcc_read_localslots_configuration(void)
 
 
 int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
-                            int *cpu_lock_fd)
+                            int *cpu_lock_fd, int cpp_ready)
 {
     struct dcc_hostdef *hostlist;
     struct dcc_hostdef *h;
@@ -112,7 +113,7 @@ int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
     const char *broker_path = getenv("DISTCC_BROKER");
 
     if (broker_path && *broker_path)
-        return dcc_broker_acquire(buildhost, cpu_lock_fd);
+        return dcc_broker_acquire(buildhost, cpu_lock_fd, cpp_ready);
 
     if ((ret = dcc_get_hostlist(&hostlist, &n_hosts)) != 0) {
         return EXIT_NO_HOSTS;
@@ -197,6 +198,8 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
                     continue;
 
                 i_cpu_is_usable = 1;
+                if (h->mode == DCC_MODE_LOCAL && i_cpu >= dcc_resource_slots(h->n_slots))
+                    continue;
 
                 ret = dcc_lock_host("cpu", h, i_cpu, 0, cpu_lock_fd);
 

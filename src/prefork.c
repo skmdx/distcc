@@ -59,6 +59,7 @@
 #include "daemon.h"
 #include "netutil.h"
 #include "stats.h"
+#include "resource.h"
 
 void dcc_manage_kids(int listen_fd);
 static void dcc_sigchld_handler(int sig);
@@ -81,64 +82,6 @@ static struct worker *workers;
 static struct pollfd *parent_polls;
 static struct pending pending[MAX_PENDING];
 static int worker_channel = -1;
-
-/* Read at most once per second, in the existing parent. PSI reports actual
- * reclaim stalls, avoiding false exhaustion from reclaimable page cache.
- * The cgroup signal matters when the daemon has a service memory limit. */
-double dcc_memory_pressure(void)
-{
-    static time_t sampled;
-    static double pressure = -1;
-    static char group[PATH_MAX];
-    static int located;
-    FILE *file;
-    char path[PATH_MAX], line[PATH_MAX];
-    double value;
-    time_t now = time(NULL);
-    if (sampled == now) return pressure;
-    sampled = now;
-    pressure = -1;
-    if (!located) {
-        located = 1;
-        file = fopen("/proc/self/cgroup", "r");
-        if (file) {
-            while (fgets(line, sizeof(line), file))
-                if (!strncmp(line, "0::/", 4)) {
-                    line[strcspn(line, "\n")] = 0;
-                    if (strlen(line + 3) + sizeof("/sys/fs/cgroup") <= sizeof(group)) {
-                        strcpy(group, "/sys/fs/cgroup");
-                        strcat(group, line + 3);
-                    }
-                    break;
-                }
-            fclose(file);
-        }
-    }
-    file = fopen("/proc/pressure/memory", "r");
-    if (file) {
-        if (fscanf(file, "some avg10=%lf", &value) == 1 && value >= 0 && value <= 100)
-            pressure = value;
-        fclose(file);
-    }
-    if (group[0]) {
-        snprintf(path, sizeof(path), "%s", group);
-        for (;;) {
-            char name[PATH_MAX], *slash;
-            if (snprintf(name, sizeof(name), "%s/memory.pressure", path) < (int)sizeof(name)) {
-                file = fopen(name, "r");
-                if (file) {
-                    if (fscanf(file, "some avg10=%lf", &value) == 1 && value >= 0 &&
-                        value <= 100 && value > pressure) pressure = value;
-                    fclose(file);
-                }
-            }
-            slash = strrchr(path, '/');
-            if (!slash || slash <= path + strlen("/sys/fs/cgroup")) break;
-            *slash = 0;
-        }
-    }
-    return pressure;
-}
 
 int dcc_prefork_status(int *busy, int *queued, int *links)
 {
@@ -246,12 +189,14 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             }
         }
         if (p->fd < 0 || !p->ready) continue;
+        int busy, queued, links;
+        dcc_prefork_status(&busy, &queued, &links);
+        int limit = dcc_resource_slots(dcc_max_kids);
         if (p->used) {
-            int busy, queued, links, is_link = p->request[11] == '2';
-            dcc_prefork_status(&busy, &queued, &links);
+            int is_link = p->request[11] == '2';
             for (j = 0; j < dcc_max_kids; ++j)
                 if (workers[j].fd >= 0 && !workers[j].busy) break;
-            if (j == dcc_max_kids || (is_link && (links || dcc_memory_pressure() >= 10))) {
+            if (j == dcc_max_kids || busy >= limit || (is_link && links)) {
                 /* Refuse immediately, retaining the TCP session for retry on
                  * another host. Idle sessions never reserve compiler slots. */
                 if (send(p->fd, "BUSY00000000", 12, MSG_NOSIGNAL | MSG_DONTWAIT) != 12) {
@@ -264,6 +209,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             }
             p->session |= 1;
         }
+        if (busy >= limit) continue;
         for (j = 0; j < dcc_max_kids; ++j) {
             struct worker *w = &workers[j];
             if (w->fd < 0 || w->busy) continue;

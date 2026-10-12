@@ -80,6 +80,9 @@ class DistccTestCase(unittest.TestCase):
         cls.root = Path(cls.storage.name)
         cls.base_env = {k: v for k, v in os.environ.items()
                         if not k.startswith("DISTCC")}
+        # These fixtures compile tiny C units; do not reserve the production
+        # C++ budget for every test worker sharing the runner's cgroup.
+        cls.base_env['DISTCC_JOB_MEMORY'] = '64'
         cls.daemons = []
         cls.ports = []
         cls.stats_ports = []

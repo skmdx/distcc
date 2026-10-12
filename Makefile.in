@@ -213,6 +213,8 @@ test_SOURCE = test/comfychair.py \
 	test/test_native.py \
 	test/test_protocol.py \
 	test/test_pool.py \
+	test/test_retry.py \
+	test/test_admission.py \
 	test/test_preprocess.py \
 	find_c_extension.sh
 
@@ -247,7 +249,7 @@ common_obj = src/arg.o src/argutil.o					\
 	src/cleanup.o src/compress.o					\
 	src/trace.o src/util.o src/io.o src/exec.o			\
 	src/rpc.o src/tempfile.o src/bulk.o src/help.o src/filename.o	\
-	src/lock.o							\
+	src/lock.o src/resource.o					\
 	src/netutil.o							\
 	src/pump.o							\
 	src/sendfile.o							\
@@ -344,7 +346,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c			\
 	src/mon-gnome.c							\
 	src/ncpus.c src/netutil.c					\
 	src/prefork.c src/pump.c					\
-	src/remote.c src/renderer.c src/rpc.c				\
+	src/remote.c src/renderer.c src/resource.c src/rpc.c		\
 	src/safeguard.c src/sendfile.c src/setuid.c src/serve.c		\
 	src/snprintf.c src/state.c					\
 	src/srvnet.c src/srvrpc.c src/ssh.c 				\
@@ -370,7 +372,7 @@ HEADERS = src/stats.h src/adaptive.h src/broker.h		\
 	src/hosts.h src/implicit.h					\
 	src/mon.h							\
 	src/netutil.h							\
-	src/renderer.h src/rpc.h					\
+	src/renderer.h src/resource.h src/rpc.h			\
 	src/snprintf.h src/state.h		 			\
 	src/stringmap.h							\
 	src/timefile.h src/timeval.h src/trace.h			\
@@ -781,6 +783,8 @@ adaptive-check: distcc distccd h_hosts
 	$(PYTHON) "$(srcdir)/test/test_native.py" -v
 	$(PYTHON) "$(srcdir)/test/test_protocol.py" -v
 	$(PYTHON) "$(srcdir)/test/test_pool.py" -v
+	$(PYTHON) "$(srcdir)/test/test_retry.py" -v
+	$(PYTHON) "$(srcdir)/test/test_admission.py" -v
 
 preprocess-check: distcc distccd pump include-server
 	$(PYTHON) "$(srcdir)/test/test_preprocess.py" -v

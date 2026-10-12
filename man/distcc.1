@@ -614,10 +614,12 @@ an atomic reservation on each reusable TCP connection. A full server refuses
 before input transmission, allowing another host to be selected without
 queuing behind other clients. Refused connections remain pooled; retries to
 the same full host are delayed by 50ms. Link admission permits one link per
-server and waits while system or accessible cgroup memory PSI (some avg10)
-is at least 10 percent. Link requests do not reserve local preprocessing slots.
-Memory pressure is sampled at most once per second; unavailable PSI does not
-block admission. This is contention control, not a per-job memory guarantee.
+server. Both compiles and links wait while system or accessible cgroup memory
+PSI (some avg10) is at least 10 percent, or memory headroom is insufficient.
+See DISTCC_JOB_MEMORY for the memory estimate. Existing jobs finish normally.
+Link requests do not reserve local preprocessing slots. Ordinary broker clients
+finish local preprocessing before requesting a worker and reuse that input
+on retries. Pump clients still distribute preprocessing to the worker.
 .PP
 The broker automatically negotiates TCP session reuse before sending a job.
 Older servers and brokers continue to use one connection per job. Complete
@@ -906,13 +908,29 @@ Specifies how long (in seconds) distcc will avoid trying to use a
 particular compilation server after that server yields a compile
 failure.  By default set to 60 seconds.  To disable the backoff
 behavior altogether, set this to 0.
+For broker clients, set this variable on the broker process. A compile makes
+at most three remote attempts, including when backoff is disabled, then follows
+DISTCC_FALLBACK. A failed transfer is reported to the broker before releasing
+the lease, preventing immediate reassignment to that worker during backoff.
+.TP
+.B "DISTCC_JOB_MEMORY"
+Estimated memory per job in MiB on Linux (default 1024). Set it on distccd for
+worker admission and on clients for local compilation and preprocessing.
+The admission limit uses available host memory and accessible cgroup v2
+memory.max limits, accounting for memory used outside the current cgroup.
+A quarter-job margin is retained, and admission pauses when current headroom
+cannot accommodate another job or memory PSI reaches 10 percent.
+Measurements are cached for at most one second. Other platforms retain their
+configured slot limits. This is a contention estimate, not a hard per-job
+memory guarantee or a common budget for unrelated processes and users.
 .TP
 .B "DISTCC_IO_TIMEOUT"
 Specifies how long (in seconds) distcc will wait before deciding a
 distributed job has timed out.  If a distributed job is expected to
 takes a long time, consider increasing this value so the job does
 not time out and fallback to a local compile.  By default set to
-300 seconds.
+300 seconds. The server also uses this timeout for protocol reads and writes,
+including a partially transmitted request whose connection remains open.
 .TP
 .B "DISTCC_PAUSE_TIME_MSEC"
 Specifies how long (in milliseconds) distcc will pause when all

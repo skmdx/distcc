@@ -46,7 +46,6 @@ int dcc_preforking_parent(int listen_fd);
 struct pollfd;
 int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout);
 int dcc_prefork_status(int *busy, int *queued, int *links);
-double dcc_memory_pressure(void);
 void dcc_prefork_reaped(pid_t pid);
 #endif
 

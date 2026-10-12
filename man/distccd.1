@@ -96,11 +96,18 @@ once per second while clients are present. Each probe has a 250ms deadline.
 Successful metrics expire after five seconds; unavailable statistics use
 configured slots and speed. Selection uses the same adaptive capacity formula
 as the client. It passes connected TCP sockets to clients without relaying
-source files or object data. Each compilation still uses a new TCP connection.
-It also reserves a local preprocessing slot before dispatch and releases it
-as soon as preprocessing finishes, allowing the next request to start without
-polling lock files. The broker's --localslots_cpp setting is the shared ceiling;
-clients retain their local file locks to coexist with direct clients.
+source files or object data. Completed exchanges return reusable TCP connections
+to the broker. Ordinary clients finish local preprocessing under their local
+slot locks before requesting a worker. Older clients can still reserve a
+preprocessing slot through the broker's --localslots_cpp setting.
+Failed transfers exclude the worker for DISTCC_BACKOFF_PERIOD seconds
+(default 60, set on the broker).
+.PP
+On Linux, DISTCC_JOB_MEMORY (default 1024 MiB) estimates each compile or link's
+memory budget. The parent checks host and accessible cgroup memory headroom,
+retains a quarter-job margin, and defers admission under memory pressure.
+This estimate does not impose a hard per-job memory limit. DISTCC_IO_TIMEOUT
+(default 300 seconds) also bounds protocol reads from silent clients.
 .PP
 Set DISTCC_BROKER in clients to the absolute socket path. The broker exits
 after DISTCC_BROKER_IDLE seconds without a request and with no connected

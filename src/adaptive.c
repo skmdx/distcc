@@ -47,7 +47,7 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
     int fields = 0;
     double value;
     *cap = (struct dcc_capacity){ .running = -1, .busy = -1, .queued = -1,
-                                 .links = -1, .memory_pressure = -1 };
+                                 .links = -1, .available = -1, .memory_pressure = -1 };
     if ((strncmp(buf, "HTTP/1.0 200 ", 13) &&
          strncmp(buf, "HTTP/1.1 200 ", 13)) ||
         !(line = strstr(buf, "\n<distccstats>\n")) ||
@@ -74,15 +74,15 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
             cap->load = value;
             fields |= 4;
         } else if (!strncmp(line, "dcc_memory_pressure ", 20)) {
-            if ((fields & 256) || sscanf(line + 20, "%lf %c", &value, &extra) != 1 ||
+            if ((fields & 512) || sscanf(line + 20, "%lf %c", &value, &extra) != 1 ||
                 !(value >= -1 && value <= 100)) return -1;
             cap->memory_pressure = value;
-            fields |= 256;
+            fields |= 512;
         } else {
             static const char *names[] = {"dcc_running", "dcc_busy", "dcc_queued",
-                                          "dcc_links", "dcc_admission"};
+                                          "dcc_links", "dcc_admission", "dcc_available"};
             int *values[] = {&cap->running, &cap->busy, &cap->queued,
-                            &cap->links, &cap->admission};
+                            &cap->links, &cap->admission, &cap->available};
             unsigned i;
             for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
                 size_t len = strlen(names[i]);
@@ -158,9 +158,9 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
     n = read(fd, buf, sizeof(buf) - 1);
     if (n > 0) {
         buf[n] = '\0';
-        if (sscanf(buf, "%ld %d %d %d %lf %d %d %d %d %d %lf", &stamp, &valid,
+        if (sscanf(buf, "%ld %d %d %d %lf %d %d %d %d %d %lf %d", &stamp, &valid,
                    &cap->cpus, &cap->jobs, &cap->load, &cap->running, &cap->busy,
-                   &cap->queued, &cap->links, &cap->admission, &cap->memory_pressure) == 11 &&
+                   &cap->queued, &cap->links, &cap->admission, &cap->memory_pressure, &cap->available) == 12 &&
             stamp == (long)now &&
             (valid == 0 || (valid == 1 && cap->cpus > 0 &&
              cap->cpus <= 10000 && cap->jobs > 0 && cap->jobs <= 10000 &&
@@ -168,7 +168,8 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
              cap->running <= 1000000 && cap->busy >= -1 && cap->busy <= 1000000 &&
              cap->queued >= -1 && cap->queued <= 1000000 && cap->links >= -1 &&
              cap->links <= 1000000 && cap->admission >= -1 && cap->admission <= 1000000 &&
-             cap->memory_pressure >= -1 && cap->memory_pressure <= 100))) {
+             cap->memory_pressure >= -1 && cap->memory_pressure <= 100 &&
+             cap->available >= -1 && cap->available <= 1000000))) {
             dcc_unlock(fd);
             return valid ? 0 : -1;
         }
@@ -178,9 +179,10 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
     if (!valid)
         rs_log_warning("adaptive stats unavailable for %s; using configured slots/speed",
                        host->hostname);
-    len = snprintf(buf, sizeof(buf), "%ld %d %d %d %.17g %d %d %d %d %d %.2f\n",
+    len = snprintf(buf, sizeof(buf), "%ld %d %d %d %.17g %d %d %d %d %d %.2f %d\n",
                    (long)time(NULL), valid, cap->cpus, cap->jobs, cap->load,
-                   cap->running, cap->busy, cap->queued, cap->links, cap->admission, cap->memory_pressure);
+                   cap->running, cap->busy, cap->queued, cap->links, cap->admission,
+                   cap->memory_pressure, cap->available);
     if (lseek(fd, 0, SEEK_SET) < 0 || ftruncate(fd, 0) ||
         write(fd, buf, len) != len)
         rs_log_warning("could not cache adaptive stats");
@@ -281,6 +283,7 @@ int dcc_lock_adaptive(struct dcc_hostdef *hosts,
         }
         if (previous < i)
             continue;
+        if (c->cap && c->cap->available == 0) continue;
         busy = 0;
         first = -1;
         candidate_fd = -1;

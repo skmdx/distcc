@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <time.h>
 struct dcc_hostdef;
+int dcc_wait_for_cpp(pid_t cpp_pid, int *status, const char *input_fname);
 
 int dcc_compile_remote(char **argv,
                        char *input_fname,

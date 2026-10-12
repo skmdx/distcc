@@ -57,6 +57,7 @@
 #include "lock.h"
 #include "timeval.h"
 #include "compile.h"
+#include "broker.h"
 #include "include_server_if.h"
 #include "emaillog.h"
 #include "dotd.h"
@@ -74,6 +75,8 @@ static const char *const discrepancy_suffix = "/discrepancy_counter";
 
 static void bad_host(struct dcc_hostdef *host, int *cpu_lock_fd , int *local_cpu_lock_fd)
 {
+   if (host && host->broker_managed && *cpu_lock_fd >= 0)
+       dcc_broker_failed(host);
    if (host && host->broker_managed && host->broker_fd >= 0) {
        close(host->broker_fd);
        host->broker_fd = -1;
@@ -638,14 +641,9 @@ static int dcc_gcc_rewrite_fqn(char **argv)
 
 static int dcc_get_max_retries(void)
 {
-    if (dcc_backoff_is_enabled()) {
-        /* eventually distcc will either find a suitable host or mark
-	 * all hosts as faulty (and fallback to a local compilation)
-	 */
-	return 0; /* no limit */
-    } else {
-	return 3; /* somewhat arbitrary */
-    }
+    /* Backoff is advisory and may be managed by another process. Never
+     * depend on it to make a failed compile terminate. */
+    return 3;
 }
 
 /* Only pure object/archive links are candidates. The helper validates options
@@ -726,7 +724,7 @@ dcc_build_somewhere(char *argv[],
     int cpu_lock_fd = -1, local_cpu_lock_fd = -1;
     int ret;
     int remote_ret = 0;
-    int remote_completed = 0;
+    int remote_completed = 0, cpp_ready = 0;
     int retry_count = 0, max_retries, remote_unsupported = 0;
     struct dcc_hostdef *host = NULL;
     char *discrepancy_filename = NULL;
@@ -808,6 +806,23 @@ dcc_build_somewhere(char *argv[],
         goto fallback;
     }
 
+    /* With a broker, finish local preprocessing before reserving a worker.
+     * Release the local lock before requesting the remote lease; never wait
+     * for a remote slot while holding a local slot. Reuse this input on retry. */
+    if (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER") &&
+        !getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes) {
+        dcc_read_localslots_configuration();
+        if (!dcc_is_preprocessed(input_fname) &&
+            (ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
+        ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid);
+        if (!ret) ret = dcc_wait_for_cpp(cpp_pid, status, input_fname);
+        if (local_cpu_lock_fd != -1) dcc_unlock(local_cpu_lock_fd);
+        local_cpu_lock_fd = -1;
+        cpp_pid = 0;
+        if (ret || *status) goto unlock_and_clean_up;
+        cpp_ready = 1;
+    }
+
     /* Lock ordering invariant: always acquire the lock for the
      * remote host (if any) first. */
 
@@ -815,7 +830,7 @@ dcc_build_somewhere(char *argv[],
      * host or localhost) and acquire the lock for it.  */
   choose_host:
     remote_completed = 0;
-    if ((ret = dcc_pick_host_from_list_and_lock_it(&host, &cpu_lock_fd)) != 0) {
+    if ((ret = dcc_pick_host_from_list_and_lock_it(&host, &cpu_lock_fd, cpp_ready)) != 0) {
         /* Doesn't happen at the moment: all failures are masked by
            returning localhost. */
         goto fallback;
@@ -826,7 +841,7 @@ dcc_build_somewhere(char *argv[],
         goto run_local;
     }
 
-    if (host->cpp_where == DCC_CPP_ON_CLIENT && !dcc_is_preprocessed(input_fname)) {
+    if (!cpp_ready && host->cpp_where == DCC_CPP_ON_CLIENT && !dcc_is_preprocessed(input_fname)) {
         /* Lock the local CPU, since we're going to be doing preprocessing
          * or include scanning. */
         if ((ret = dcc_lock_local_cpp(&local_cpu_lock_fd)) != 0) {
@@ -880,11 +895,11 @@ dcc_build_somewhere(char *argv[],
         files = NULL;
 
         /* Include analysis may have fallen back after host selection. */
-        if (local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
+        if (!cpp_ready && local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
             (ret = dcc_lock_local_cpp(&local_cpu_lock_fd)))
             goto fallback;
 
-        if ((ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid) != 0))
+        if (!cpp_ready && (ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid)))
             goto fallback;
 
         /* localcpp_server_argv may already be processed from a previous bad host */
@@ -936,7 +951,7 @@ dcc_build_somewhere(char *argv[],
         local_cpu_lock_fd = -1;
         bad_host(host, &cpu_lock_fd, &local_cpu_lock_fd);
         retry_count++;
-        if (max_retries == 0 || retry_count < max_retries)
+        if (retry_count < max_retries)
             goto choose_host;
         else {
             rs_log_warning("Couldn't find a host in %d attempts, retrying locally",

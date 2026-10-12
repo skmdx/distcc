@@ -4,7 +4,7 @@ struct dcc_capacity {
     int cpus, jobs;
     double load, memory_pressure;
     /* Optional live metrics; -1 means unavailable, never idle. */
-    int running, busy, queued, links, admission;
+    int running, busy, queued, links, admission, available;
 };
 int dcc_parse_capacity(char *buf, struct dcc_capacity *cap);
 int dcc_capacity_slots(const struct dcc_hostdef *host, const struct dcc_capacity *cap);

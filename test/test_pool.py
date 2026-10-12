@@ -68,7 +68,6 @@ class PoolTest(BrokerTestCase):
         self.job(0)
         self.job(1)
         self.assertEqual(self.accepts() - before, 1)
-
     def test_shutdown_return_is_discarded(self):
         self.start_broker()
         lease, net = self.pooled_lease()
@@ -158,6 +157,26 @@ class PoolTest(BrokerTestCase):
         self.job(0)
         self.job(1)
         self.assertEqual(self.accepts() - before, 2)
+
+
+class SilentPeerTest(BrokerTestCase):
+    daemon_env = {'DISTCC_IO_TIMEOUT': '1'}
+
+    def test_silent_partial_request_releases_worker(self):
+        net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=4)
+        self.addCleanup(net.close)
+        net.sendall(b'SLOT00000001')
+        self.assertEqual(net.recv(12, socket.MSG_WAITALL), b'GRNT00000001')
+        net.sendall(b'DIST00000001ARGC00000002ARGV00000003gcc')
+        self.assertIn('dcc_busy 1\n', self.get_stats(self.stats_ports[0]))
+        # Keep both directions open: this must be a timeout, not EOF detection.
+        self.assertEqual(net.recv(1), b'')
+        deadline = time.monotonic() + 3
+        while 'dcc_busy 0\n' not in self.get_stats(self.stats_ports[0]):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+        self.start_broker()
+        self.job('after-timeout')
 
 
 if __name__ == '__main__':
