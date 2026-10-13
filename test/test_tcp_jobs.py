@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prepared-input TCP jobs through real broker, daemon and compilers."""
 import concurrent.futures
+import array
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,76 @@ from test_broker import BrokerTestCase
 class TcpJobsTest(BrokerTestCase):
     def start_tcp(self):
         return self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
+
+    def test_local_input_descriptor_and_pool_reuse(self):
+        prefix = str(self.root / 'local-jobs')
+        self.restart_server(self.build / 'distccd', DISTCC_LOCAL_SOCKET=prefix)
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.base_env = dict(self.base_env, DISTCC_LOCAL_SOCKET=prefix)
+        self.start_tcp()
+        before = self.get_stats(self.stats_ports[0])
+        for i in range(4):
+            self.job(f'local-{i}', 'cc' if i % 2 else 'c')
+        lease = self.request(6)
+        status, _, descriptors = self.receive(lease)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(descriptors), 1)
+        with socket.socket(fileno=descriptors[0]) as connection:
+            self.assertEqual(connection.family, socket.AF_UNIX)
+            self.assertEqual(connection.getpeername(), f'{prefix}-{self.ports[0]}.sock')
+        lease.close()
+        after = self.get_stats(self.stats_ports[0])
+        self.assertEqual(re.search(r'dcc_tcp_accept (\d+)', before)[1],
+                         re.search(r'dcc_tcp_accept (\d+)', after)[1])
+        self.assertEqual(int(re.search(r'dcc_compile_ok (\d+)', after)[1]) -
+                         int(re.search(r'dcc_compile_ok (\d+)', before)[1]), 4)
+        self.assertIn('dcc_local_input_jobs 4\n', after)
+        self.assertGreater(int(re.search(r'dcc_local_input_bytes (\d+)', after)[1]), 0)
+
+    def test_local_input_matches_native_and_rejects_writable_fd(self):
+        prefix = str(self.root / 'local-validation')
+        self.restart_server(self.build / 'distccd', DISTCC_LOCAL_SOCKET=prefix)
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.base_env = dict(self.base_env, DISTCC_LOCAL_SOCKET=prefix)
+        self.start_tcp()
+        source = self.work / 'large.c'
+        source.write_text('const char payload[] = "' + 'abcdefgh' * 262144 + '";\n')
+        expected, actual = self.work / 'native.o', self.work / 'remote.o'
+        subprocess.run([self.cc, '-c', str(source), '-o', str(expected)], check=True, capture_output=True)
+        subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(source), '-o', str(actual)],
+                       env=self.env, check=True, capture_output=True, timeout=15)
+        self.assertEqual(actual.read_bytes(), expected.read_bytes())
+        self.assertGreater(int(re.search(r'dcc_local_input_bytes (\d+)',
+                                        self.get_stats(self.stats_ports[0]))[1]), 2 * 1024 * 1024)
+        # A writable handle must not be inherited into a compiler. Include a
+        # valid manifest so rejection tests FD validation, not framing.
+        def string(s): return struct.pack('!Q', len(s)) + s
+        args = [b'gcc', b'-c', b'/input.i', b'-o', b'/out.o']
+        body = b'int input;\n'
+        manifest = struct.pack('!4Q', 7, 0, len(args), 1) + string(b'/')
+        manifest += b''.join(map(string, args))
+        manifest += struct.pack('!5Q', 0, 0, 0, len(body), len(body)) + bytes(8) + string(b'/input.i') + string(b'')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as net, (self.work/'bad.i').open('w+b') as f:
+            f.write(body); f.flush()
+            net.settimeout(3); net.connect(f'{prefix}-{self.ports[0]}.sock')
+            net.sendmsg([struct.pack('!II', 0x54000200, len(manifest)) + manifest],
+                        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [f.fileno()]))])
+            self.assertEqual(net.recv(1), b'')
+        self.job('after-invalid-local-fd')
+
+    def test_memory_estimate_uses_completed_compiler_rss(self):
+        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='512', DISTCC_MEMORY_LEARNING='1')
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.start_tcp()
+        before = self.get_stats(self.stats_ports[0])
+        self.assertIn('dcc_job_memory_bytes 536870912\n', before)
+        for i in range(8):
+            self.job(f'memory-{i}')
+        after = self.get_stats(self.stats_ports[0])
+        estimate = int(re.search(r'dcc_job_memory_bytes (\d+)', after)[1])
+        self.assertGreaterEqual(estimate, 256 * 1024 * 1024)
+        self.assertLess(estimate, 512 * 1024 * 1024)
+        self.assertIn('dcc_job_memory_samples 8\n', after)
 
     def test_compile_and_pool_reuse(self):
         self.start_tcp()

@@ -429,14 +429,14 @@ void dcc_reset_signal(int whichsig)
 static int sys_wait4(pid_t pid, int *status, int options, struct rusage *rusage)
 {
 
-    /* Prefer use waitpid to wait4 for non-blocking wait with WNOHANG option */
-#ifdef HAVE_WAITPID
+    /* wait4 also supports WNOHANG and attributes RSS to this exact child. */
+#ifdef HAVE_WAIT4
+    return wait4(pid, status, options, rusage);
+#elif HAVE_WAITPID
     /* Just doing getrusage(children) is not sufficient, because other
      * children may have exited previously. */
     memset(rusage, 0, sizeof *rusage);
     return waitpid(pid, status, options);
-#elif HAVE_WAIT4
-    return wait4(pid, status, options, rusage);
 #else
 #error Please port this
 #endif
@@ -458,13 +458,14 @@ static void dcc_child_changed(int sig)
 }
 
 int dcc_collect_child(const char *what, pid_t pid,
-                      int *wait_status, int in_fd)
+                      int *wait_status, int in_fd, unsigned long long *peak_bytes)
 {
     struct rusage ru;
     struct sigaction action = {0}, previous_action;
     sigset_t blocked, previous_mask, wait_mask;
     struct timespec deadline;
     int ret = 0;
+    if (peak_bytes) *peak_bytes = 0;
 
     /* Block before wait4, atomically unblock while sleeping. Otherwise a
      * child exiting between wait4 and select loses its wakeup and adds the
@@ -493,6 +494,9 @@ int dcc_collect_child(const char *what, pid_t pid,
             ret = EXIT_DISTCC_FAILED;
             break;
         } else if (ret_pid != 0) {
+#ifdef __linux__
+            if (peak_bytes && ru.ru_maxrss > 0) *peak_bytes = (unsigned long long)ru.ru_maxrss * 1024;
+#endif
             rs_trace("%s child %ld terminated with status %#x",
                      what, (long) ret_pid, *wait_status);
             rs_log_info("%s times: user %lld.%06lds, system %lld.%06lds, "

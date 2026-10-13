@@ -762,7 +762,7 @@ static int dcc_run_link_job(int in_fd, int out_fd,
     argv[3] = output;
     argv[4] = NULL;
     if ((ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname)) ||
-        (ret = dcc_collect_child("link", pid, status, in_fd)))
+        (ret = dcc_collect_child("link", pid, status, in_fd, NULL)))
         *status = W_EXITCODE(ret, 0);
     if (!*status && stat(output, &st))
         *status = W_EXITCODE(EXIT_IO_ERROR, 0);
@@ -1027,7 +1027,8 @@ static int dcc_run_job(int in_fd,
 
     if ((compile_ret = dcc_spawn_child(argv, &cc_pid,
                                        "/dev/null", out_fname, err_fname))
-        || (compile_ret = dcc_collect_child("cc", cc_pid, &status, in_fd))) {
+        || (compile_ret = dcc_collect_child("cc", cc_pid, &status, in_fd,
+                                          result ? &result->peak_bytes : NULL))) {
         /* We didn't get around to finding a wait status from the actual
          * compiler */
         status = W_EXITCODE(compile_ret, 0);

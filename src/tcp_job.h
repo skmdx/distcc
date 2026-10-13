@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <limits.h>
 #include <poll.h>
+#include <sys/un.h>
 #include "job.h"
 
 /* 'T' distinguishes this protocol on the existing ACL-protected listener.
@@ -24,7 +25,10 @@ struct dcc_tcp_frame {
     unsigned char header[8], *data;
     size_t used, size;
     uint32_t type;
+    int fd_plus_one; /* Zero-initializable ownership of an optional local FD. */
 };
+int dcc_tcp_local_address(int port, struct sockaddr_un *);
+int dcc_tcp_local_listener(int port);
 uint32_t dcc_tcp_get32(const void *);
 uint64_t dcc_tcp_get64(const void *);
 void dcc_tcp_put32(void *, uint32_t);
@@ -44,14 +48,15 @@ size_t dcc_tcp_encode(uint32_t, unsigned, const void *, size_t, int, void *);
 struct dcc_tcp_run { uint32_t operation; uint64_t id; char root[PATH_MAX]; };
 struct dcc_tcp_finished {
     uint64_t id;
+    uint64_t peak_bytes;
     uint32_t error, retiring, status, mode, present;
     uint64_t size[DCC_JOB_RESULT_COUNT];
 };
-int dcc_tcp_worker(int, const struct dcc_tcp_run *, int, int);
+int dcc_tcp_worker(int, const struct dcc_tcp_run *, int, int, int);
 
 struct dcc_tcp_server;
 struct dcc_tcp_dispatch {
-    int (*start)(struct dcc_tcp_server *, const struct dcc_tcp_run *, int, int);
+    int (*start)(struct dcc_tcp_server *, const struct dcc_tcp_run *, int, int, int);
     void (*cancel)(struct dcc_tcp_server *);
 };
 struct dcc_tcp_server *dcc_tcp_server_new(int, const struct dcc_tcp_dispatch *);
@@ -67,6 +72,8 @@ void dcc_tcp_server_load(struct dcc_tcp_server *, struct dcc_server_load *);
 void dcc_tcp_dispatch_ready(void);
 /* Cumulative unused admissible slot time while an eligible job is ready. */
 uint64_t dcc_tcp_ready_idle_ns(void);
+uint64_t dcc_tcp_local_input_jobs(void);
+uint64_t dcc_tcp_local_input_bytes(void);
 void dcc_tcp_server_finished(struct dcc_tcp_server *, const struct dcc_tcp_finished *, int *, unsigned);
 void dcc_tcp_server_lost(struct dcc_tcp_server *);
 struct dcc_hostdef;

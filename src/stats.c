@@ -413,6 +413,11 @@ dcc_queued %d\n\
 dcc_preparing %d\n\
 dcc_returning %d\n\
 dcc_capacity %d\n\
+dcc_job_memory_bytes %llu\n\
+dcc_job_memory_samples %u\n\
+dcc_job_peak_bytes %llu\n\
+dcc_local_input_jobs %llu\n\
+dcc_local_input_bytes %llu\n\
 dcc_tcp_ready_idle_ns %llu\n\
 dcc_tcp_parallel_tasks %lu\n\
 dcc_tcp_parallel_peak %u\n\
@@ -479,7 +484,11 @@ dcc_free_mem %d MB\n\
                                dcc_getcurrentload(),
                                loadavg[0], loadavg[1], loadavg[2],
                                running, load.busy, load.queued, load.preparing, load.returning,
-                               capacity, ready_idle_ns, parallel_tasks, parallel_peak,
+                               capacity, dcc_resource_job_bytes(), dcc_resource_samples(),
+                               dcc_resource_peak_bytes(),
+                               (unsigned long long)dcc_tcp_local_input_jobs(),
+                               (unsigned long long)dcc_tcp_local_input_bytes(),
+                               ready_idle_ns, parallel_tasks, parallel_peak,
                                load.links, admission, available, memory_pressure,
                                ct[0], ct[1], ct[2],
                                num_D, max_RSS, max_RSS_name,

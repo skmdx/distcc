@@ -30,6 +30,7 @@ struct dcc_job {
 };
 struct dcc_job_result {
     int status, mode;
+    unsigned long long peak_bytes; /* Local execution telemetry, not wire data. */
     uint64_t size[DCC_JOB_RESULT_COUNT];
     int fd[DCC_JOB_RESULT_COUNT];
     /* Local unpublished destinations, never part of wire metadata. */

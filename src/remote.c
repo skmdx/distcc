@@ -119,7 +119,7 @@ int dcc_wait_for_cpp(pid_t cpp_pid,
         /* Wait for cpp to finish (if not already done), check the
          * result, then send the .i file */
 
-        if ((ret = dcc_collect_child("cpp", cpp_pid, status, timeout_null_fd)))
+        if ((ret = dcc_collect_child("cpp", cpp_pid, status, timeout_null_fd, NULL)))
             return ret;
 
         /* Although cpp failed, there is no need to try running the command
@@ -411,7 +411,7 @@ int dcc_compile_remote(char **argv,
      * when something possibly went wrong, and it allows us to account for the
      * cost of the ssh child. */
     if (ssh_pid) {
-        dcc_collect_child("ssh", ssh_pid, &ssh_status, timeout_null_fd); /* ignore failure */
+        dcc_collect_child("ssh", ssh_pid, &ssh_status, timeout_null_fd, NULL); /* ignore failure */
     }
 
     /* The compilation failed remotely: let's see if that was due to unsupported 

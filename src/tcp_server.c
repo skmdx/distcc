@@ -268,9 +268,14 @@ struct dcc_tcp_server *dcc_tcp_server_new(int fd, const struct dcc_tcp_dispatch 
     struct dcc_tcp_server *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     int one = 1;
+    int domain;
+    socklen_t domain_size = sizeof(domain);
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) ||
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one))) { free(s); return NULL; }
+        getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &domain_size) ||
+        (domain != AF_UNIX && setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)))) {
+        free(s); return NULL;
+    }
     s->socket = fd; s->metadata = s->input_fd = -1;
     atomic_init(&s->work.done, 1);
     s->dispatch = dispatch; s->tail = &s->head; s->active = time(NULL);
@@ -390,6 +395,7 @@ static int prepare_inputs(struct dcc_tcp_server *s)
             if (ret && errno != EEXIST) return -1;
         }
         if (description->kind != DCC_JOB_FILE) continue;
+        if (description->fd >= 0) { in->done = 1; continue; }
         if (description->cached && dcc_file_cache_get(description->digest, in->path)) {
             struct stat st;
             if (stat(in->path, &st) || (uint64_t)st.st_size != description->plain_size) return -1;
@@ -423,12 +429,28 @@ static int prepare_inputs(struct dcc_tcp_server *s)
     if (ret) return ret;
     return 0;
 }
-static int begin(struct dcc_tcp_server *s, const struct dcc_tcp_frame *f)
+static uint64_t local_input_jobs, local_input_bytes;
+uint64_t dcc_tcp_local_input_jobs(void) { return local_input_jobs; }
+uint64_t dcc_tcp_local_input_bytes(void) { return local_input_bytes; }
+
+static int begin(struct dcc_tcp_server *s, struct dcc_tcp_frame *f)
 {
     if (s->job || s->phase != PREPARING || f->size <= 8 || !(s->run.id = dcc_tcp_get64(f->data))) return -1;
     s->metadata = dcc_job_memfd("distcc-tcp-manifest");
     if (s->metadata < 0 || dcc_writex(s->metadata, f->data + 8, f->size - 8) ||
         dcc_job_decode_buffer(f->data + 8, f->size - 8, &s->job)) return -1;
+    if (f->fd_plus_one) {
+        struct stat st;
+        int fd = f->fd_plus_one - 1;
+        if (s->job->kind != DCC_JOB_COMPILE || s->job->count != 1 ||
+            s->job->inputs[0].kind != DCC_JOB_FILE || s->job->inputs[0].cached ||
+            s->job->inputs[0].encoding != DCC_JOB_RAW || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+            (uint64_t)st.st_size != s->job->inputs[0].plain_size ||
+            (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY) return -1;
+        s->job->inputs[0].fd = fd; f->fd_plus_one = 0;
+        ++local_input_jobs;
+        local_input_bytes += st.st_size;
+    }
     /* Include the encoded manifest, decoded strings and input bookkeeping,
      * in addition to the incoming frame already charged by the parser. */
     uint64_t amount = 3 * f->size + s->job->count * sizeof(struct input);
@@ -675,6 +697,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         if (s->frame.used != before) s->active = now;
         if (ret <= 0) { if (ret < 0) return -1; break; }
         uint32_t type = s->frame.type & ~DCC_TCP_FLAGS;
+        if (s->frame.fd_plus_one && type != DCC_TCP_BEGIN) return -1;
         if (type == DCC_TCP_BEGIN) {
             if (s->complete_queued && s->head) return -1;
             s->complete_queued = 0;
@@ -733,7 +756,8 @@ void dcc_tcp_dispatch_ready(void)
         int link = s->job->kind == DCC_JOB_LINK;
         if (!link || !link_waiting) {
             s->run.operation = DCC_TCP_RUN;
-            int ret = s->dispatch->start(s, &s->run, s->metadata, link);
+            int input = s->job->kind == DCC_JOB_COMPILE && s->job->count == 1 ? s->job->inputs[0].fd : -1;
+            int ret = s->dispatch->start(s, &s->run, s->metadata, input, link);
             if (ret < 0) { s->failed = 1; dequeue(s); }
             else if (ret) { dequeue(s); s->phase = RUNNING; }
             else if (!link) break;

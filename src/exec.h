@@ -38,7 +38,7 @@ int dcc_spawn_child(char **argv, pid_t *pidptr,
 
 /* if in_fd is timeout_null_fd, means this parameter is not used */
 int dcc_collect_child(const char *what, pid_t pid,
-                      int *wait_status, int in_fd);
+                      int *wait_status, int in_fd, unsigned long long *peak_bytes);
 int dcc_critique_status(int s,
                         const char *,
                         const char *,

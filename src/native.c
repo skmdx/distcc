@@ -177,7 +177,7 @@ int dcc_expand_native(char ***argvp, const char *input, const char *output)
     if (!(probe[argc] = strdup("-###")) ||
         dcc_make_tmpnam("distcc_native", ".txt", &file)) goto out;
     if (dcc_spawn_child(probe, &pid, "/dev/null", "/dev/null", file) ||
-        dcc_collect_child("native option expansion", pid, &status, timeout_null_fd) || status ||
+        dcc_collect_child("native option expansion", pid, &status, timeout_null_fd, NULL) || status ||
         stat(file, &st) || st.st_size > 1024 * 1024 ||
         dcc_load_file_string(file, &text))
         goto out;

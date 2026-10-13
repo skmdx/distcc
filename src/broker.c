@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <ifaddrs.h>
 
 #include "distcc.h"
 #include "hosts.h"
@@ -24,6 +25,7 @@
 #include <netinet/tcp.h>
 #include "exitcode.h"
 #include "trace.h"
+#include "tcp_job.h"
 
 #ifdef __linux__
 
@@ -53,6 +55,7 @@ struct peer {
     double full_until, link_until;
     int pool_supported;
     int admission_supported;
+    int local;
     size_t used;
     char stats[4096];
 };
@@ -286,6 +289,15 @@ static int connect_peer(const struct peer *peer, int port)
 {
     struct sockaddr_storage address = peer->address;
     int fd;
+    struct sockaddr_un local;
+    if (peer->local && peer->host->tcp_jobs && port == peer->host->port &&
+        !dcc_tcp_local_address(port, &local)) {
+        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd >= 0) {
+            if (!connect(fd, (struct sockaddr *)&local, sizeof(local))) return fd;
+            close(fd);
+        }
+    }
     if (!peer->address_len)
         return -1;
     if (address.ss_family == AF_INET)
@@ -466,11 +478,16 @@ static void pool_store(struct broker *broker, struct client *client, int fd, dou
     int i, type, valid = 0;
     socklen_t type_length = sizeof(type);
     if (!getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_length) && type == SOCK_STREAM &&
-        !getpeername(fd, (struct sockaddr *)&address, &length) && address.ss_family == peer->address.ss_family) {
-        if (address.ss_family == AF_INET) {
+        !getpeername(fd, (struct sockaddr *)&address, &length)) {
+        if (address.ss_family == AF_UNIX && peer->local && peer->host->tcp_jobs) {
+            struct sockaddr_un local;
+            valid = !dcc_tcp_local_address(peer->host->port, &local) &&
+                length <= sizeof(local) && length > offsetof(struct sockaddr_un, sun_path) &&
+                !memcmp(&address, &local, length);
+        } else if (address.ss_family == peer->address.ss_family && address.ss_family == AF_INET) {
             struct sockaddr_in *a = (void *)&address, *b = (void *)&peer->address;
             valid = a->sin_port == htons(peer->host->port) && a->sin_addr.s_addr == b->sin_addr.s_addr;
-        } else if (address.ss_family == AF_INET6) {
+        } else if (address.ss_family == peer->address.ss_family && address.ss_family == AF_INET6) {
             struct sockaddr_in6 *a = (void *)&address, *b = (void *)&peer->address;
             valid = a->sin6_port == htons(peer->host->port) && a->sin6_scope_id == b->sin6_scope_id &&
                     !memcmp(&a->sin6_addr, &b->sin6_addr, sizeof(a->sin6_addr));
@@ -802,6 +819,19 @@ static int initialize(struct broker *broker, struct dcc_hostdef *hosts)
             if (addresses->ai_addrlen <= sizeof(peer->address)) {
                 memcpy(&peer->address, addresses->ai_addr, addresses->ai_addrlen);
                 peer->address_len = addresses->ai_addrlen;
+                struct ifaddrs *interfaces;
+                if (!getifaddrs(&interfaces)) {
+                    for (struct ifaddrs *a = interfaces; a; a = a->ifa_next) {
+                        if (!a->ifa_addr || a->ifa_addr->sa_family != peer->address.ss_family) continue;
+                        if (peer->address.ss_family == AF_INET)
+                            peer->local |= ((struct sockaddr_in *)a->ifa_addr)->sin_addr.s_addr ==
+                                           ((struct sockaddr_in *)&peer->address)->sin_addr.s_addr;
+                        else if (peer->address.ss_family == AF_INET6)
+                            peer->local |= !memcmp(&((struct sockaddr_in6 *)a->ifa_addr)->sin6_addr,
+                                &((struct sockaddr_in6 *)&peer->address)->sin6_addr, sizeof(struct in6_addr));
+                    }
+                    freeifaddrs(interfaces);
+                }
             }
             freeaddrinfo(addresses);
         }

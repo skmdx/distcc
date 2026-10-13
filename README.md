@@ -129,6 +129,34 @@ or available headroom is too small. After a PSI stop, admission resumes below
 preprocessing slots. Existing work finishes normally; these estimates are not
 hard per-job limits or a common scheduler for unrelated build processes.
 
+On Linux, `DISTCC_MEMORY_LEARNING=1` on the daemon uses compiler peak RSS
+reported by `wait4` for prepared jobs. `DISTCC_JOB_MEMORY` is the cold-start
+estimate. After eight successful observations, the estimate becomes twice the
+largest observed RSS plus 64 MiB, with a 256 MiB minimum. A larger observation
+raises the estimate immediately, including during warm-up or a failed compile.
+The high-water mark lasts until daemon restart; small later jobs cannot lower
+it. Cgroup limits, available headroom, PSI and `--jobs` remain in force. RSS
+is an estimate, not a guarantee for an unseen workload or a hard job budget.
+Statistics expose `dcc_job_memory_bytes`, `dcc_job_memory_samples` and
+`dcc_job_peak_bytes`. Leave learning unset to keep a fixed estimate.
+
+To avoid copying ordinary preprocessed input to a server on the same machine,
+set `DISTCC_LOCAL_SOCKET` to the same absolute socket prefix on the daemon and
+broker. The daemon creates `<prefix>-<port>.sock`; its parent directory must
+already exist and be writable only by the daemon or administrator. Enabling
+this listener permits all local users to submit prepared jobs (socket mode
+0666), so it is intended for locally trusted build machines. The broker uses
+it only when the worker address matches a local interface, and otherwise uses
+TCP. A missing local listener also uses TCP.
+
+The client passes its read-only input descriptor over this Unix stream; the
+existing server worker receives it with the metadata in one IPC message and
+inherits it only for that compilation. Input lifetime, cancellation and the
+server's common admission limit are unchanged. Results retain the existing
+atomic publication path. Pump and link inputs still use framed payloads.
+`dcc_local_input_jobs` and `dcc_local_input_bytes` count accepted input
+descriptors and their uncompressed sizes, independently of TCP accept counts.
+
 Failed transfers on reused connections discard that worker's idle pool so the
 next attempt can open a fresh connection. Failure on a fresh connection marks
 the worker unavailable for `DISTCC_BACKOFF_PERIOD` seconds (default 60, set on

@@ -72,6 +72,13 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     size_t file_left = 0;
     off_t file_offset = 0;
     int ret = EXIT_IO_ERROR, have_result = 0;
+    struct sockaddr_storage address;
+    socklen_t address_size = sizeof(address);
+    int local_input = job->kind == DCC_JOB_COMPILE && job->count == 1 &&
+        job->inputs[0].encoding == DCC_JOB_RAW && job->inputs[0].fd >= 0 &&
+        !getsockname(host->broker_fd, (struct sockaddr *)&address, &address_size) &&
+        address.ss_family == AF_UNIX;
+    int send_input_fd = local_input;
     time_t active = time(NULL);
     dcc_job_result_init(result);
     if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested || !buffer ||
@@ -90,7 +97,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     free(manifest);
     if (!outgoing) goto done;
     for (unsigned i = 0; i < job->count; ++i)
-        if (job->inputs[i].kind == DCC_JOB_FILE && !job->inputs[i].cached) {
+        if (!local_input && job->inputs[i].kind == DCC_JOB_FILE && !job->inputs[i].cached) {
             requested[i] = 1; requests[count++] = i;
         }
     for (;;) {
@@ -117,6 +124,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
             int complete = dcc_tcp_frame_read(host->broker_fd, &incoming, DCC_TCP_CHUNK + 8U);
             if (before != incoming.used) active = time(NULL);
             if (complete < 0) goto done;
+            if (incoming.fd_plus_one) goto done;
             if (!complete) break;
             if (complete) {
                 uint32_t type = incoming.type & ~DCC_TCP_FLAGS;
@@ -171,7 +179,17 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         }
         for (unsigned turn = 0; turn < 4 && (p.revents & POLLOUT) && outgoing; ++turn) {
             ssize_t n;
-            if (sent < length)
+            if (send_input_fd) {
+                struct iovec iov = {outgoing + sent, length - sent};
+                union { struct cmsghdr align; char data[CMSG_SPACE(sizeof(int))]; } control = {0};
+                struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1,
+                    .msg_control = control.data, .msg_controllen = sizeof(control)};
+                struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+                c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+                memcpy(CMSG_DATA(c), &job->inputs[0].fd, sizeof(int));
+                n = sendmsg(host->broker_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+                if (n > 0) send_input_fd = 0; /* Rights accompany the first byte, even on a short write. */
+            } else if (sent < length)
                 n = send(host->broker_fd, outgoing + sent, length - sent,
                          MSG_NOSIGNAL | MSG_DONTWAIT | (file_left ? MSG_MORE : 0));
             else {

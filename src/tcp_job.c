@@ -4,9 +4,40 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <lz4.h>
 #include "tcp_job.h"
+
+int dcc_tcp_local_address(int port, struct sockaddr_un *address)
+{
+    const char *prefix = getenv("DISTCC_LOCAL_SOCKET");
+    memset(address, 0, sizeof(*address));
+    address->sun_family = AF_UNIX;
+    return !prefix || prefix[0] != '/' ||
+        snprintf(address->sun_path, sizeof(address->sun_path), "%s-%d.sock", prefix, port) >=
+            (int)sizeof(address->sun_path) ? -1 : 0;
+}
+
+int dcc_tcp_local_listener(int port)
+{
+    struct sockaddr_un address;
+    struct stat st;
+    if (dcc_tcp_local_address(port, &address)) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) return -1;
+    if (!lstat(address.sun_path, &st)) {
+        /* Never replace another owner's path or a live listener. */
+        if (!S_ISSOCK(st.st_mode) || st.st_uid != geteuid() ||
+            !connect(fd, (struct sockaddr *)&address, sizeof(address)) || errno != ECONNREFUSED ||
+            unlink(address.sun_path)) { close(fd); return -1; }
+    }
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) ||
+        chmod(address.sun_path, 0666) || listen(fd, 128)) { close(fd); return -1; }
+    return fd;
+}
 
 uint32_t dcc_tcp_get32(const void *p)
 {
@@ -29,6 +60,7 @@ void dcc_tcp_put64(void *p, uint64_t n)
 }
 void dcc_tcp_frame_clear(struct dcc_tcp_frame *f)
 {
+    if (f->fd_plus_one) close(f->fd_plus_one - 1);
     free(f->data);
     memset(f, 0, sizeof(*f));
 }
@@ -59,7 +91,22 @@ int dcc_tcp_frame_read(int fd, struct dcc_tcp_frame *f, size_t available)
             if (!remaining) return 1;
             where = f->data + f->used - 8;
         }
-        ssize_t n = recv(fd, where, remaining, MSG_DONTWAIT);
+        struct iovec iov = {where, remaining};
+        union { struct cmsghdr align; char data[CMSG_SPACE(sizeof(int) * 4)]; } control;
+        struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1,
+                            .msg_control = control.data, .msg_controllen = sizeof(control)};
+        ssize_t n = recvmsg(fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+        int invalid = msg.msg_flags & MSG_CTRUNC;
+        if (n >= 0) for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+            if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) { invalid = 1; continue; }
+            unsigned count = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            int *fds = (int *)CMSG_DATA(c);
+            for (unsigned i = 0; i < count; ++i) {
+                if (f->fd_plus_one || f->used || invalid) { close(fds[i]); invalid = 1; }
+                else f->fd_plus_one = fds[i] + 1;
+            }
+        }
+        if (n >= 0 && invalid) return -1;
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
         if (n <= 0) return -1;

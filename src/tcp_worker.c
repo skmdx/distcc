@@ -4,11 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <fcntl.h>
 #include "distcc.h"
 #include "exitcode.h"
 #include "tcp_job.h"
 
-int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int retiring)
+int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int input, int retiring)
 {
     struct dcc_job *job = NULL;
     struct dcc_job_result result;
@@ -25,10 +27,22 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
     else if (setenv("TMPDIR", run->root, 1)) finished.error = EXIT_OUT_OF_MEMORY;
     else {
         changed_tmp = 1;
+        if (input >= 0) {
+            char target[64], path[PATH_MAX];
+            snprintf(target, sizeof(target), "/proc/self/fd/%d", input);
+            /* Only this job's compiler inherits the read-only input. The
+             * symlink retains the source basename and avoids materializing
+             * another tmpfs copy. The worker closes it before its next job. */
+            if (job->kind != DCC_JOB_COMPILE || job->count != 1 ||
+                snprintf(path, sizeof(path), "%s%s", run->root, job->inputs[0].path) >= (int)sizeof(path) ||
+                fcntl(input, F_SETFD, 0) || symlink(target, path))
+                finished.error = EXIT_IO_ERROR;
+        }
         /* Includes compiler-created temporaries: parent-owned cleanup must
          * cover even SIGKILL, when this worker cannot run its cleanup list. */
-        finished.error = dcc_execute_job(job, run->root, channel, &result);
+        if (!finished.error) finished.error = dcc_execute_job(job, run->root, channel, &result);
     }
+    if (input >= 0) close(input);
     close(metadata);
     dcc_job_free(job);
     dcc_cleanup_tempfiles();
@@ -36,6 +50,7 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
         finished.error = EXIT_OUT_OF_MEMORY;
     free(saved_tmp);
     finished.status = result.status;
+    finished.peak_bytes = result.peak_bytes;
     finished.mode = result.mode;
     for (unsigned i = 0; i < DCC_JOB_RESULT_COUNT; ++i) {
         finished.size[i] = result.size[i];

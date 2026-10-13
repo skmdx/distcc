@@ -405,7 +405,7 @@ static int dcc_compile_local(char *argv[],
     if ((ret = dcc_spawn_child(argv, &pid, NULL, NULL, NULL)) != 0)
         return ret;
 
-    if ((ret = dcc_collect_child("cc", pid, &status, timeout_null_fd)))
+    if ((ret = dcc_collect_child("cc", pid, &status, timeout_null_fd, NULL)))
         return ret;
 
     return dcc_critique_status(status, "compile", input_name,
