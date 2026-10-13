@@ -18,6 +18,8 @@ import time
 
 
 VARIANTS = {'baseline': 'lz4', 'tcp': 'lz4', 'stream': 'lz4s', 'http2': 'h2'}
+TCP_COUNTERS = ('bytes_sent', 'bytes_received', 'bytes_retrans', 'busy',
+                'rwnd_limited', 'sndbuf_limited')
 
 
 def median(values):
@@ -44,8 +46,11 @@ def network_usage(pid):
             fields = line.split()
             key = tuple(fields[3:5]) if f'pid={pid},' in line else None
         elif key:
-            fields = dict(re.findall(r'(bytes_sent|bytes_received):(\d+)', line))
-            connections[key] = {name: int(fields.get(name, 0)) for name in ('bytes_sent', 'bytes_received')}
+            fields = dict(re.findall(r'(\w+):(\d+)', line))
+            # ss omits zero counters; retain the raw TCP_INFO line as well so
+            # gauges such as RTT/cwnd are not mistaken for interval counters.
+            connections[key] = {name: int(fields.get(name, 0)) for name in TCP_COUNTERS}
+            connections[key]['tcp_info'] = line.strip()
     return connections
 
 
@@ -186,11 +191,13 @@ def main():
                 if network_before.keys() <= network_after.keys():
                     network = {field: sum(stats[field] - network_before.get(key, {}).get(field, 0)
                                           for key, stats in network_after.items())
-                               for field in ('bytes_sent', 'bytes_received')}
+                                          for field in TCP_COUNTERS}
                 result.update(variant=name, repeat=repeat, broker_cpu_seconds=after_cpu-broker_cpu,
                               include_cpu_seconds=include_after-include_cpu, include_peak_bytes=include_peak,
                               total_client_cpu_seconds=result['client_cpu_seconds'] + after_cpu-broker_cpu + include_after-include_cpu,
-                              broker_peak_bytes=peak, tcp_connections=len(network_after), network=network, servers=[
+                              broker_peak_bytes=peak, tcp_connections=len(network_after), network=network,
+                              tcp_info_before=list(network_before.values()),
+                              tcp_info_after=list(network_after.values()), servers=[
                     dict(cpu_seconds=b['cpu_seconds']-a['cpu_seconds'],
                          read_bytes=b['read_bytes']-a['read_bytes'] if None not in (a['read_bytes'], b['read_bytes']) else None,
                          write_bytes=b['write_bytes']-a['write_bytes'] if None not in (a['write_bytes'], b['write_bytes']) else None,
