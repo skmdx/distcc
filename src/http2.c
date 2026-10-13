@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <nghttp2/nghttp2.h>
@@ -18,7 +19,8 @@
 #define STREAM_WINDOW (256 * 1024)
 #define CONNECTION_WINDOW (8 * 1024 * 1024)
 #define MAX_STREAMS 256
-#define OUTPUT_SIZE (64 * 1024)
+#define FRAME_SIZE (64 * 1024)
+#define CONTROL_SIZE 4096
 
 struct stream {
     struct stream *next;
@@ -36,7 +38,7 @@ struct dcc_h2 {
     dcc_h2_accept_fn accept_job;
     void *context;
     size_t out_head, out_size;
-    unsigned char output[OUTPUT_SIZE];
+    unsigned char output[CONTROL_SIZE];
     /* mem_send's slice remains valid until the next mem_send call. */
     const uint8_t *pending;
     size_t pending_size;
@@ -67,8 +69,6 @@ static int attach_socket(struct stream *s, int *other)
 {
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) return -1;
-    s->input = malloc(STREAM_WINDOW);
-    if (!s->input) { close(pair[0]); close(pair[1]); return -1; }
     s->fd = pair[0];
     dcc_set_nonblocking(s->fd);
     *other = pair[1];
@@ -88,6 +88,18 @@ static ssize_t read_data(nghttp2_session *session, int32_t id, uint8_t *buf,
     if (!n) { s->eof = 1; *flags |= NGHTTP2_DATA_FLAG_EOF; return 0; }
     if (errno == EAGAIN || errno == EWOULDBLOCK) return NGHTTP2_ERR_DEFERRED;
     return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+}
+
+static ssize_t read_length(nghttp2_session *session, uint8_t type, int32_t id,
+                          int32_t connection_window, int32_t stream_window,
+                          uint32_t frame_size, void *context)
+{
+    size_t size = FRAME_SIZE;
+    (void)session; (void)type; (void)id; (void)context;
+    if (size > frame_size) size = frame_size;
+    if (size > (size_t)connection_window) size = connection_window;
+    if (size > (size_t)stream_window) size = stream_window;
+    return size;
 }
 
 static int begin_headers(nghttp2_session *session, const nghttp2_frame *frame,
@@ -161,7 +173,24 @@ static int receive_data(nghttp2_session *session, uint8_t flags, int32_t id,
         nghttp2_session_consume_connection(session, length);
         return 0;
     }
+    /* Most consumers keep up. Hand those bytes on while nghttp2 still owns
+     * them, allocating a bounded queue only when the local socket blocks. */
+    if (!s->size) {
+        ssize_t n = send(s->fd, data, length, MSG_NOSIGNAL);
+        if (n > 0) {
+            nghttp2_session_consume(session, id, n);
+            data += n;
+            length -= n;
+        } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
+            dcc_h2_cancel(context, id);
+            nghttp2_session_consume_connection(session, length);
+            return 0;
+        }
+    }
+    if (!length) return 0;
     if (length > STREAM_WINDOW - s->size) return NGHTTP2_ERR_CALLBACK_FAILURE;
+    if (!s->input && !(s->input = malloc(STREAM_WINDOW)))
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
     tail = (s->head + s->size) % STREAM_WINDOW;
     first = length < STREAM_WINDOW - tail ? length : STREAM_WINDOW - tail;
     memcpy(s->input + tail, data, first);
@@ -209,6 +238,7 @@ struct dcc_h2 *dcc_h2_new(int fd, dcc_h2_accept_fn accept_job, void *context)
     nghttp2_settings_entry settings[] = {
         { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, MAX_STREAMS },
         { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, STREAM_WINDOW },
+        { NGHTTP2_SETTINGS_MAX_FRAME_SIZE, FRAME_SIZE },
         { NGHTTP2_SETTINGS_ENABLE_PUSH, 0 }
     };
     int ret, one = 1;
@@ -225,6 +255,7 @@ struct dcc_h2 *dcc_h2_new(int fd, dcc_h2_accept_fn accept_job, void *context)
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, receive_data);
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, close_stream);
     nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, sent_frame);
+    nghttp2_session_callbacks_set_data_source_read_length_callback(callbacks, read_length);
     nghttp2_option_set_no_auto_window_update(option, 1);
     ret = c->server ? nghttp2_session_server_new2(&c->session, callbacks, c, option)
                     : nghttp2_session_client_new2(&c->session, callbacks, c, option);
@@ -293,25 +324,21 @@ void dcc_h2_cancel(struct dcc_h2 *c, int stream)
     s->size = 0;
 }
 
-/* Batch frames into a bounded write buffer. Neither a blocked receiver nor a
- * large result may make nghttp2 retain an unbounded application output queue. */
+/* Coalesce small control frames, but retain large DATA frames in nghttp2's
+ * buffer until sendmsg drains them. Never advance mem_send with a live slice. */
 static int fill_output(struct dcc_h2 *c)
 {
-    if (c->out_size) return 0;
+    if (c->out_size || c->pending_size) return 0;
     c->out_head = 0;
-    while (c->out_size < OUTPUT_SIZE) {
-        size_t n;
-        if (!c->pending_size) {
-            ssize_t size = nghttp2_session_mem_send(c->session, &c->pending);
-            if (size < 0) return -1;
-            if (!size) break;
-            c->pending_size = size;
-        }
-        n = c->pending_size < OUTPUT_SIZE - c->out_size ? c->pending_size : OUTPUT_SIZE - c->out_size;
-        memcpy(c->output + c->out_size, c->pending, n);
-        c->out_size += n;
-        c->pending += n;
-        c->pending_size -= n;
+    while (c->out_size < CONTROL_SIZE) {
+        ssize_t size = nghttp2_session_mem_send(c->session, &c->pending);
+        if (size < 0) return -1;
+        if (!size) break;
+        c->pending_size = size;
+        if (c->pending_size > CONTROL_SIZE - c->out_size) break;
+        memcpy(c->output + c->out_size, c->pending, size);
+        c->out_size += size;
+        c->pending_size = 0;
     }
     return 0;
 }
@@ -337,7 +364,7 @@ int dcc_h2_prepare(struct dcc_h2 *c, struct pollfd *polls, int capacity)
     if (capacity < 1) return -1;
     if (fill_output(c)) c->failed = 1;
     reap_streams(c);
-    polls[0] = (struct pollfd){ c->fd, POLLIN | ((c->connecting || c->out_size) ? POLLOUT : 0), 0 };
+    polls[0] = (struct pollfd){ c->fd, POLLIN | ((c->connecting || c->out_size || c->pending_size) ? POLLOUT : 0), 0 };
     for (s = c->streams; s; s = s->next) {
         s->poll_index = -1;
         if (s->fd < 0) continue;
@@ -358,7 +385,7 @@ int dcc_h2_prepare(struct dcc_h2 *c, struct pollfd *polls, int capacity)
 int dcc_h2_process(struct dcc_h2 *c, struct pollfd *polls)
 {
     struct stream *s;
-    unsigned char buffer[OUTPUT_SIZE];
+    unsigned char buffer[FRAME_SIZE];
     ssize_t n;
     if (c->failed) return -1;
     if (c->connecting && polls[0].revents) {
@@ -395,9 +422,20 @@ int dcc_h2_process(struct dcc_h2 *c, struct pollfd *polls)
             nghttp2_session_resume_data(c->session, s->id);
     }
     if (fill_output(c)) return -1;
-    if (c->out_size && !c->connecting) {
-        n = send(c->fd, c->output + c->out_head, c->out_size, MSG_NOSIGNAL);
-        if (n > 0) { c->out_head += n; c->out_size -= n; }
+    if ((c->out_size || c->pending_size) && !c->connecting) {
+        struct iovec vectors[] = {
+            { c->output + c->out_head, c->out_size },
+            { (void *)c->pending, c->pending_size }
+        };
+        struct msghdr message = { .msg_iov = vectors, .msg_iovlen = 2 };
+        n = sendmsg(c->fd, &message, MSG_NOSIGNAL);
+        if (n > 0) {
+            size_t control = (size_t)n < c->out_size ? (size_t)n : c->out_size;
+            c->out_head += control;
+            c->out_size -= control;
+            n -= control;
+            if (n) { c->pending += n; c->pending_size -= n; }
+        }
         else if (n < 0 && errno != EAGAIN && errno != EINTR) return -1;
     }
     reap_streams(c);

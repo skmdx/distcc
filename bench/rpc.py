@@ -54,11 +54,13 @@ def server_usage(spec):
     script = '''import json, pathlib, sys
 p = pathlib.Path(sys.argv[1])
 cpu = dict(line.split() for line in (p/'cpu.stat').read_text().splitlines())
-io = [dict(field.split('=') for field in line.split()[1:]) for line in (p/'io.stat').read_text().splitlines()]
+io_path = p/'io.stat'
+io = ([dict(field.split('=') for field in line.split()[1:]) for line in io_path.read_text().splitlines()]
+      if io_path.exists() else None)
 print(json.dumps(dict(cpu_seconds=int(cpu['usage_usec'])/1e6,
     peak_bytes=int((p/'memory.peak').read_text()),
-    read_bytes=sum(int(row['rbytes']) for row in io),
-    write_bytes=sum(int(row['wbytes']) for row in io))))'''
+    read_bytes=sum(int(row['rbytes']) for row in io) if io is not None else None,
+    write_bytes=sum(int(row['wbytes']) for row in io) if io is not None else None)))'''
     command = shlex.join(['python3', '-c', script, path])
     return json.loads(subprocess.check_output(['ssh', '-o', 'BatchMode=yes', host, command], text=True))
 
@@ -68,7 +70,7 @@ def servers_usage(specs):
         return list(executor.map(server_usage, specs))
 
 
-def run_command(command, env, work, log):
+def run_command(command, env, work, log) -> dict:
     start = time.monotonic()
     proc = subprocess.Popen(command, cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT)
     _, status, usage = os.wait4(proc.pid, 0)
@@ -84,6 +86,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate', type=Path, required=True)
     parser.add_argument('--baseline', type=Path, required=True)
+    parser.add_argument('--baseline-codec', choices=('lzo', 'lz4', 'lz4s', 'h2'), default='lz4',
+                        help='transport/codec of the baseline (default: lz4)')
     parser.add_argument('--hosts', required=True, help='TCP host entries, with slots/stats/speed but no codec')
     parser.add_argument('--baseline-hosts', help='separate baseline daemon endpoints; defaults to --hosts')
     parser.add_argument('--work', type=Path, required=True)
@@ -103,6 +107,7 @@ def main():
     args.candidate = args.candidate.resolve()
     args.baseline = args.baseline.resolve()
     args.output = args.output.resolve()
+    servers_usage(args.server)  # Validate accounting before running any builds.
     root = args.output.parent / (args.output.stem + '-runtime')
     root.mkdir()
     base_env = dict(os.environ, DISTCC_FALLBACK='0', DISTCC_MAX_RETRIES='1',
@@ -118,8 +123,9 @@ def main():
             binary = args.baseline if name == 'baseline' else args.candidate
             hosts = args.baseline_hosts if name == 'baseline' and args.baseline_hosts else args.hosts
             address = directory / 'broker.sock'
+            codec = args.baseline_codec if name == 'baseline' else VARIANTS[name]
             env = dict(base_env, DISTCC_HOSTS=' '.join(
-                entry if entry.startswith('--') else entry + ',' + VARIANTS[name]
+                entry if entry.startswith('--') else entry + ',' + codec
                 for entry in hosts.split()), DISTCC_DIR=str(directory),
                 DISTCC_BROKER=str(address), DISTCC_BROKER_IDLE='600',
                 PATH=str(binary) + os.pathsep + base_env.get('PATH', os.defpath))
@@ -178,8 +184,8 @@ def main():
                               total_client_cpu_seconds=result['client_cpu_seconds'] + after_cpu-broker_cpu + include_after-include_cpu,
                               broker_peak_bytes=peak, tcp_connections=len(network_after), network=network, servers=[
                     dict(cpu_seconds=b['cpu_seconds']-a['cpu_seconds'],
-                         read_bytes=b['read_bytes']-a['read_bytes'],
-                         write_bytes=b['write_bytes']-a['write_bytes'],
+                         read_bytes=b['read_bytes']-a['read_bytes'] if None not in (a['read_bytes'], b['read_bytes']) else None,
+                         write_bytes=b['write_bytes']-a['write_bytes'] if None not in (a['write_bytes'], b['write_bytes']) else None,
                          lifetime_peak_bytes=b['peak_bytes']) for a, b in zip(before, after)])
                 samples.append(result)
                 args.output.write_text(json.dumps(dict(samples=samples), indent=2) + '\n')
@@ -191,8 +197,6 @@ def main():
         # expires after ten seconds, so interleaving alone is not a warm test.
         for repeat in range(args.repeats):
             order = args.variants[repeat % len(args.variants):] + args.variants[:repeat % len(args.variants)]
-            if repeat % 2:
-                order = list(reversed(order))
             for name in order:
                 execute(name, False, repeat)
                 execute(name, True, repeat)
@@ -202,7 +206,7 @@ def main():
                                        'client_peak_bytes', 'broker_peak_bytes', 'include_peak_bytes')}
                    for name in args.variants}
         args.output.write_text(json.dumps(dict(samples=samples, medians=summary,
-            repeats=args.repeats, pump=args.pump,
+            repeats=args.repeats, pump=args.pump, baseline_codec=args.baseline_codec,
             memory_note='broker and server peaks are lifetime upper bounds; command wait4 peaks can include the inherited launcher peak'), indent=2) + '\n')
         print(json.dumps(dict(medians=summary)), flush=True)
     finally:

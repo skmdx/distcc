@@ -49,6 +49,12 @@ The include-server token LZ4S selects .lz4s cache files. These contain the
 chunk pairs, data and terminator, without the outer RPC token. The caches
 remain separate from .lz4 and .lzo files.
 
+The C sender sizes its buffers to the file or chunk, whichever is smaller,
+and sends raw chunks from the input buffer without copying their contents.
+The receiver allocates buffers as chunks arrive and decodes diagnostics
+directly into the retained result buffer. Diagnostic publication and result
+file cleanup retain their existing semantics.
+
 HTTP/2 transport
 ----------------
 
@@ -68,7 +74,15 @@ local EOF after queued result bytes drain. Lease cancellation is scoped to
 both the connection generation and stream ID.
 
 Receive windows are 256 KiB per stream and 8 MiB per connection. WINDOW_UPDATE
-is issued when the local consumer drains data. The sender stops polling local
-producers when the HTTP/2 window or network output buffer is full. Connections
-advertise at most 256 concurrent streams; worker/resource admission still
-determines executable concurrency. Idle server connections expire after 30 s.
+is issued when the local consumer drains data. A writable local consumer
+receives DATA directly; a 256 KiB queue is allocated only when it falls behind.
+The sender stops polling local producers while HTTP/2 or network output is
+blocked. Large serialized frames remain in nghttp2's buffer through partial
+writes; up to 4 KiB of small frames are coalesced and sent alongside them.
+
+Connections advertise a 64 KiB maximum frame and at most 256 concurrent
+streams. DATA reads respect the peer's frame limit and both flow-control
+windows, including older peers using 16 KiB frames. Worker/resource admission
+still determines executable concurrency. Idle server connections expire after
+30 s. The RPC formats and admission exchange are unchanged; this transport
+does not cache source files or objects between jobs.
