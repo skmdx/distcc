@@ -15,6 +15,7 @@
 #include "bulk.h"
 #include "broker.h"
 #include "job.h"
+#include "tcp_job.h"
 #include "job_worker.h"
 #include "file_cache.h"
 #include "include_server_if.h"
@@ -60,7 +61,7 @@ static int snapshot_size(const char *name, uint64_t wire, uint64_t *plain)
     return ret;
 }
 
-static struct dcc_job *describe(char **argv, const char *cpp, char **files)
+static struct dcc_job *describe(char **argv, const char *cpp, char **files, int tcp)
 {
     struct dcc_job *job = calloc(1, sizeof(*job));
     struct dcc_input_digest *digests = NULL;
@@ -115,7 +116,7 @@ static struct dcc_job *describe(char **argv, const char *cpp, char **files)
         } else {
             int encoding;
             in->fd = open(name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-            if (in->fd < 0 || (encoding = dcc_job_compress(&in->fd, in->plain_size, &in->wire_size)) < 0)
+            if (in->fd < 0 || (encoding = tcp ? DCC_JOB_RAW : dcc_job_compress(&in->fd, in->plain_size, &in->wire_size)) < 0)
                 goto failed;
             in->encoding = encoding;
         }
@@ -190,12 +191,17 @@ int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, c
                        const char *output, const char *deps, struct dcc_buffer *err,
                        struct dcc_buffer *out, int *status)
 {
-    struct dcc_job *job = describe(argv, cpp, files);
+    struct dcc_job *job = describe(argv, cpp, files, host->tcp_jobs);
     struct dcc_job_result result;
     unsigned i, cached = 0, transferred = 0;
     int metadata = -1, ret = EXIT_IO_ERROR, ended = 0;
     int artifacts[DCC_JOB_RESULT_COUNT] = {-1, -1, -1, -1};
     dcc_job_result_init(&result);
+    if (host->tcp_jobs) {
+        if (!job || (ret = dcc_tcp_exchange(host, job, files, cpp, &result))) goto done;
+        for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) artifacts[i] = result.fd[i];
+        goto publish_results;
+    }
     if (!job || (metadata = dcc_job_encode(job)) < 0 || dcc_broker_submit(host, metadata)) goto done;
     for (i = 0; i < job->count; ++i) cached += job->inputs[i].cached;
     while (!ended) {
@@ -238,8 +244,9 @@ int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, c
             (artifacts[i] >= 0 && (fstat(artifacts[i], &st) ||
             (uint64_t)st.st_size != result.wire_size[i]))) goto done;
     }
+publish_results:
     *status = result.status;
-    rs_trace("direct HTTP/2 job completed");
+    rs_trace("%s job completed", host->tcp_jobs ? "pooled TCP" : "direct HTTP/2");
     if (cached) rs_trace("input cache: %u of %u entries transferred", transferred, job->count);
     if ((ret = buffer_result(artifacts[DCC_JOB_STDERR], &result, DCC_JOB_STDERR, err)) ||
         (ret = buffer_result(artifacts[DCC_JOB_STDOUT], &result, DCC_JOB_STDOUT, out))) goto done;
@@ -251,6 +258,7 @@ int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, c
         if (!stat(output, &st) && S_ISREG(st.st_mode)) unlink(output);
     }
 done:
+    if (host->tcp_jobs && !ret) dcc_broker_return(host, host->broker_fd);
     if (metadata >= 0) close(metadata);
     for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) if (artifacts[i] >= 0) close(artifacts[i]);
     dcc_job_free(job);

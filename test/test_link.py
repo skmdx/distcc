@@ -379,5 +379,13 @@ class Http2ClangLinkTest(ClangLinkTest):
     transport = ',h2'
 
 
+class TcpLinkTest(LinkTest):
+    transport = ',tcp'
+
+
+class TcpClangLinkTest(ClangLinkTest):
+    transport = ',tcp'
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -250,7 +250,10 @@ static int dcc_parse_options(const char **psrc,
 
     while (p[0] == ',') {
         p++;
-        if (str_startswith("h2", p)) {
+        if (str_startswith("tcp", p)) {
+            host->tcp_jobs = 1;
+            p += 3;
+        } else if (str_startswith("h2", p)) {
             host->http2 = 1;
             p += 2;
         } else if (str_startswith("lz4s", p)) {
@@ -316,10 +319,11 @@ static int dcc_parse_options(const char **psrc,
             return EXIT_BAD_HOSTSPEC;
         }
     }
-    if (host->http2) {
+    if (host->http2 && host->tcp_jobs) return EXIT_BAD_HOSTSPEC;
+    if (host->http2 || host->tcp_jobs) {
 #ifdef HAVE_GSSAPI
         if (host->authenticate) {
-            rs_log_error("HTTP/2 does not support GSSAPI authentication");
+            rs_log_error("job transports do not support GSSAPI authentication");
             return EXIT_BAD_HOSTSPEC;
         }
 #endif
@@ -375,8 +379,8 @@ static int dcc_parse_ssh_host(struct dcc_hostdef *hostdef,
         return ret;
 
     hostdef->mode = DCC_MODE_SSH;
-    if (hostdef->http2) {
-        rs_log_error("HTTP/2 requires a TCP broker host");
+    if (hostdef->http2 || hostdef->tcp_jobs) {
+        rs_log_error("job transports require a TCP broker host");
         return EXIT_BAD_HOSTSPEC;
     }
     return 0;

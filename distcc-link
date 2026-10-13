@@ -700,6 +700,128 @@ def direct_link(lease, archive, output):
         return status
 
 
+def tcp_link(net, archive, output):
+    """Stream a link archive and receive one bounded pooled TCP transaction."""
+    begin, need, incoming, result_type, outgoing, complete = range(0x54000100, 0x54000106)
+    compressed, final = 0x10000, 0x20000
+    codec = Lz4Chunks()
+    identity = int.from_bytes(os.urandom(8), 'big') or 1
+
+    def string(value):
+        value = value.encode()
+        return struct.pack('!Q', len(value)) + value
+
+    def send(kind, body):
+        net.sendall(struct.pack('!II', kind, len(body)) + body)
+
+    def exact(size):
+        chunks = bytearray()
+        while len(chunks) < size:
+            part = net.recv(size - len(chunks))
+            if not part:
+                raise OSError('truncated TCP link response')
+            chunks.extend(part)
+        return bytes(chunks)
+
+    def receive():
+        kind, size = struct.unpack('!II', exact(8))
+        if size > codec.chunk_size + 8:
+            raise OSError('oversized TCP link response')
+        return kind, exact(size)
+
+    metadata = (struct.pack('!3Q', 2, 1, 1) + string(os.getcwd()) + string('distcc-link') +
+                struct.pack('!5Q', 0, 0, 0, archive.size, archive.size) + bytes(8) +
+                string('/input.tar') + string(''))
+    send(begin, struct.pack('!Q', identity) + metadata)
+    kind, body = receive()
+    if kind != need or body != bytes(4):
+        raise OSError('invalid TCP link input request')
+
+    class Writer:
+        def __init__(self):
+            self.pending = bytearray()
+            self.sent = 0
+
+        def write(self, data):
+            self.pending.extend(data)
+            while len(self.pending) >= codec.chunk_size:
+                self.flush_chunk(codec.chunk_size)
+            return len(data)
+
+        def flush_chunk(self, amount):
+            data = bytes(self.pending[:amount])
+            del self.pending[:amount]
+            encoded = codec.encode(data)
+            plain, packed = struct.unpack('!II', encoded[:8])
+            self.sent += plain
+            if self.sent > archive.size:
+                raise OSError('link input length changed')
+            send(incoming | (compressed if packed else 0) |
+                 (final if self.sent == archive.size else 0),
+                 struct.pack('!II', 0, plain) + encoded[8:])
+
+    writer = Writer()
+    archive.write(writer)
+    if writer.pending:
+        writer.flush_chunk(len(writer.pending))
+    if writer.sent != archive.size:
+        raise OSError('link input length changed')
+    kind, body = receive()
+    if kind != result_type or len(body) != 40:
+        raise OSError('invalid TCP link result')
+    status, mode, *sizes = struct.unpack('!II4Q', body)
+    if status > 65535 or mode > 0o777 or sum(sizes) > 512 * 1024 * 1024:
+        raise OSError('invalid TCP link result sizes')
+    with tempfile.NamedTemporaryFile(dir=output.absolute().parent,
+                                     prefix='.distcc-link-', delete=False) as artifact:
+        temporary = Path(artifact.name)
+        try:
+            received = [0] * 4
+            finished = [size == 0 for size in sizes]
+            while True:
+                kind, body = receive()
+                if kind == complete:
+                    if body != struct.pack('!Q', identity) or not all(finished):
+                        raise OSError('incomplete TCP link result')
+                    break
+                if kind & ~(compressed | final) != outgoing or len(body) < 8:
+                    raise OSError('invalid TCP link artifact')
+                index, plain = struct.unpack('!II', body[:8])
+                data = body[8:]
+                if index >= 4 or finished[index] or not 0 < plain <= codec.chunk_size:
+                    raise OSError('invalid TCP link chunk')
+                if kind & compressed:
+                    if len(data) >= plain:
+                        raise OSError('invalid compressed TCP link chunk')
+                    data = codec.decode(data, plain)
+                elif len(data) != plain:
+                    raise OSError('invalid raw TCP link chunk')
+                received[index] += plain
+                if received[index] > sizes[index]:
+                    raise OSError('oversized TCP link artifact')
+                if index == 0:
+                    sys.stderr.buffer.write(data)
+                elif index == 1:
+                    sys.stdout.buffer.write(data)
+                elif index == 2:
+                    artifact.write(data)
+                else:
+                    raise OSError('unexpected link dependency artifact')
+                if kind & final:
+                    if received[index] != sizes[index]:
+                        raise OSError('truncated TCP link artifact')
+                    finished[index] = True
+            if not status:
+                mask = os.umask(0)
+                os.umask(mask)
+                os.fchmod(artifact.fileno(), mode & ~mask)
+                artifact.flush()
+                os.replace(temporary, output)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return status
+
+
 def remote_link(job, inputs, output):
     archive = LinkArchive(job, inputs)
     with ExitStack() as stack:
@@ -734,6 +856,22 @@ def remote_link(job, inputs, output):
                     raise OSError('remote link worker could not execute the job')
                 return code if code >= 0 else 128 - code
             options = set(host.split(','))
+            if 'tcp' in options:
+                with socket.socket(fileno=descriptors.pop()) as net:
+                    net.settimeout(float(os.environ.get('DISTCC_IO_TIMEOUT', '300')))
+                    status = tcp_link(net, archive, output)
+                    try:
+                        lease.sendmsg([struct.pack('=II', 2, 7)],
+                                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                        array.array('i', [net.fileno()]))])
+                    except OSError:
+                        pass
+                if os.environ.get('DISTCC_VERBOSE') == '1':
+                    print('distcc-link: linked on ' + host, file=sys.stderr)
+                code = os.waitstatus_to_exitcode(status)
+                if code == 100:
+                    raise OSError('remote link worker could not execute the job')
+                return code if code >= 0 else 128 - code
             codec = Lz4Chunks() if 'lz4s' in options else None
             version = 10 if codec else 4
             net = socket.socket(fileno=descriptors.pop())

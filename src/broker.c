@@ -23,6 +23,7 @@
 #include "broker.h"
 #include "http2.h"
 #include "job_client.h"
+#include <netinet/tcp.h>
 #include "exitcode.h"
 #include "trace.h"
 
@@ -298,6 +299,13 @@ static int connect_peer(const struct peer *peer, int port)
     else
         ((struct sockaddr_in6 *)&address)->sin6_port = htons(port);
     fd = socket(address.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd >= 0 && peer->host->tcp_jobs && port == peer->host->port) {
+        int one = 1;
+        if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one))) {
+            close(fd);
+            return -1;
+        }
+    }
     if (fd >= 0 && connect(fd, (struct sockaddr *)&address, peer->address_len) &&
         errno != EINPROGRESS) {
         close(fd);
@@ -512,7 +520,7 @@ static int dispatch(struct broker *broker, struct client *client, double now)
             continue;
         available++;
         reply.slots += slots;
-        int staged = p->host->http2;
+        int staged = p->host->http2 || p->host->tcp_jobs;
         if (cap && cap->available == 0 && !staged) continue;
         if (p->full_until > now || (link && p->link_until > now)) continue;
         int inflight = slots + (staged ? (slots < DCC_H2_PIPELINE ? slots : DCC_H2_PIPELINE) : 0);
@@ -554,10 +562,12 @@ static int dispatch(struct broker *broker, struct client *client, double now)
             deliver_connection(broker, client);
             return 0;
         }
-        client->admission = client->command != ACQUIRE &&
+        client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
                             p->admission_supported && p->pool_supported >= 0;
         client->net = client->command != ACQUIRE ? pool_take(broker, best, now) : -1;
         client->pooled = client->net >= 0;
+        int reused = client->pooled;
+        if (p->host->tcp_jobs) client->pooled = 1;
         if (client->net < 0) client->net = connect_peer(p, p->host->port);
         if (client->net < 0) {
             p->retry_at = now + 5;
@@ -570,7 +580,7 @@ static int dispatch(struct broker *broker, struct client *client, double now)
         broker->cpp_busy += local_cpp;
         client->cpp_reserved = local_cpp;
         client->used = 0;
-        if (client->pooled) {
+        if (reused) {
             if (client->admission) client->state = RESERVE_SEND;
             else deliver_connection(broker, client);
         }
@@ -588,7 +598,7 @@ static void connection_event(struct broker *broker, struct client *client,
         client->state = WAITING;
         return;
     }
-    if (client->command != ACQUIRE && peer->pool_supported >= 0) {
+    if (!peer->host->tcp_jobs && client->command != ACQUIRE && peer->pool_supported >= 0) {
         client->state = client->admission ? RESERVE_SEND : HELLO_SEND;
         client->used = 0;
         client->deadline = now + 3;

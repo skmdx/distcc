@@ -79,6 +79,7 @@
 
 const int timeout_null_fd = -1;
 int dcc_job_lifetime = 0;
+int dcc_worker_group = 0;
 
 static void dcc_inside_child(char **argv,
                              const char *stdin_file,
@@ -399,7 +400,7 @@ int dcc_spawn_child(char **argv, pid_t *pidptr,
          * the compiler has an infinite loop bug, the new group
          * will run forever until you kill it.
          */
-        if (stdout_file != NULL) {
+        if (stdout_file != NULL && !dcc_worker_group) {
             if (dcc_new_pgrp() != 0)
                 rs_trace("Unable to start a new group\n");
         }
@@ -529,6 +530,12 @@ int dcc_collect_child(const char *what, pid_t pid,
             ret = EXIT_IO_ERROR;
             break;
         }
+    }
+    if (ret && dcc_worker_group) {
+        /* The parent reaps this worker before releasing the private input
+         * tree. Killing the whole group also catches compiler grandchildren. */
+        killpg(getpgrp(), SIGKILL);
+        _exit(EXIT_IO_ERROR);
     }
     if (ret && killpg(pid, SIGTERM) != 0) kill(pid, SIGTERM);
     sigaction(SIGCHLD, &previous_action, NULL);

@@ -119,6 +119,9 @@ static void dcc_daemon_terminate(int whichsig)
     signal(whichsig, SIG_DFL);
 
     am_parent = getpid() == dcc_master_pid;
+#ifdef __linux__
+    if (am_parent && dcc_prefork_shutdown(whichsig)) return;
+#endif
 
     if (am_parent) {
         dcc_log_signal_termination(whichsig);

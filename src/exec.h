@@ -22,8 +22,12 @@
  */
 
 /* exec.c */
+#include <sys/types.h>
+struct dcc_hostdef;
 extern const int timeout_null_fd;
 extern int dcc_job_lifetime;
+/* A prepared-job worker owns its compiler descendants as one killable group. */
+extern int dcc_worker_group;
 
 int dcc_redirect_fds(const char *stdin_file,
                      const char *stdout_file,

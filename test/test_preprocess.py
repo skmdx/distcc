@@ -85,7 +85,8 @@ class PreprocessTest(BrokerTestCase):
                 self.assertEqual(remote.stdout, b'')
                 self.assertEqual((self.work / 'result.i').read_bytes(), expected)
         log = (self.work / 'client.log').read_text()
-        self.assertIn('direct HTTP/2 job completed' if self.transport == ',h2' else
+        self.assertIn('pooled TCP job completed' if self.transport == ',tcp' else
+                      'direct HTTP/2 job completed' if self.transport == ',h2' else
                       'client finished sending request to server', log)
 
     def test_changed_generated_deleted_headers_and_symlinks(self):
@@ -229,6 +230,7 @@ class Http2PreprocessTest(PreprocessTest):
     compression = 'lz4s'
     transport = ',h2'
 
+
     def cache_counts(self):
         log = (self.work / 'client.log').read_text()
         counts = re.findall(r'input cache: (\d+) of (\d+) entries transferred', log)
@@ -323,6 +325,10 @@ class Http2PreprocessTest(PreprocessTest):
         for _ in range(2):
             self.compare(args=['-P'])
         self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
+
+
+class TcpPreprocessTest(Http2PreprocessTest):
+    transport = ',tcp'
 
 
 if __name__ == '__main__':

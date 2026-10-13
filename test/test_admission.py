@@ -16,6 +16,7 @@ from test_broker import BrokerTestCase
 
 class MemoryAdmissionTest(BrokerTestCase):
     daemon_env = {'DISTCC_JOB_MEMORY': '128'}
+    transport = 'h2'
 
     def test_budget_and_headroom_recover(self):
         path = next((line[3:] for line in Path('/proc/self/cgroup').read_text().splitlines()
@@ -54,7 +55,7 @@ class MemoryAdmissionTest(BrokerTestCase):
         self.assertEqual(net.recv(12, socket.MSG_WAITALL), b'BUSY00000000')
         for lease in leases: lease.close()
         wait_available(expected)
-        self.start_broker(self.host(0, f',h2,stats={self.stats_ports[0]}'))
+        self.start_broker(self.host(0, f',{self.transport},stats={self.stats_ports[0]}'))
         peak = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = [pool.submit(self.job, f'memory-pipeline-{i}') for i in range(8)]
@@ -79,6 +80,10 @@ class MemoryAdmissionTest(BrokerTestCase):
             del memory
         wait_available(expected)
         self.compile(self.host(0))
+
+
+class TcpMemoryAdmissionTest(MemoryAdmissionTest):
+    transport = 'tcp'
 
 
 if __name__ == '__main__':

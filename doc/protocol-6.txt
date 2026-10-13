@@ -1,5 +1,5 @@
-distcc protocols 6 through 10 and direct HTTP/2 jobs
-======================================================
+distcc protocols 6 through 10 and prepared jobs
+=============================================
 
 Protocol 6 follows protocol 2 (client preprocessing), and protocol 7 follows
 protocol 3 (server preprocessing). All compressed bulk payloads use LZ4
@@ -54,6 +54,85 @@ and sends raw chunks from the input buffer without copying their contents.
 The receiver allocates buffers as chunks arrive and decodes diagnostics
 directly into the retained result buffer. Diagnostic publication and result
 file cleanup retain their existing semantics.
+
+Pooled TCP jobs
+--------------
+
+The new TCP job protocol keeps one outstanding job per reusable connection.
+The client broker loans the connected socket; it never relays file bodies.
+The distccd parent owns sockets, input trees, cache upload owners and the ready
+queue in one nonblocking event loop. Existing persistent compiler workers only
+execute prepared jobs. Receiving and returning results do not occupy execution
+slots. A worker receives RUN with a metadata FD and private root, and returns
+FINISHED with status and all result FDs in one SOCK_SEQPACKET message. Successful
+FD transfer releases the sender's references. No per-file IPC or idle ACK is
+needed. Results and availability are committed together after worker cleanup.
+
+A job has three phases: preparing, running, returning. Readiness follows from
+the remaining input count; completion destroys the job and leaves an idle
+connection. Only the parent changes queue membership and cache ownership.
+Missing cached inputs have one uploader and a list of dependants. Publication
+wakes dependants; disconnect promotes another uploader. Inputs are private
+snapshots, never compiler-writable cache inodes. No inter-job upload locks are
+held while waiting for a compiler or another input.
+
+The network exchange is BEGIN(manifest), NEED(missing input indices), input
+chunks, RESULT(status and artifact sizes), output chunks, COMPLETE(job id).
+Further NEED messages can promote a cache waiter after an uploader disconnects.
+Both endpoints continue to service control traffic during transfers. There is
+no per-file ACK, artifact GET or job DELETE. Every frame has a type/flags word
+and payload length in network byte order. Data chunks use raw bytes or an
+independent LZ4 block; expanded size and final markers are checked. Existing
+pump snapshots are translated chunk by chunk without whole-file expansion.
+Live compression uses bounded buffers, not a fully compressed staging memfd.
+RAW and already encoded immutable file extents can use sendfile.
+
+The host option is ,tcp (or ,cpp,tcp under pump). It requires the Linux broker
+and prefork daemon, uses the existing ACL-protected TCP listener, and does not
+support SSH, GSSAPI or combination with ,h2. BEGIN is type 0x54000100, followed
+by NEED, INPUT, RESULT, OUTPUT and COMPLETE in numeric order. The eight-byte
+frame header contains a uint32 type/flags and uint32 payload length. Flag
+0x10000 means compressed; 0x20000 means final, both valid only on data frames.
+All integers use network byte order. Payloads are:
+
+  BEGIN:    uint64 nonzero job ID, then the binary manifest described below.
+  NEED:     a vector of uint32 input indices (possibly empty).
+  INPUT:    uint32 index, uint32 expanded chunk length, raw/LZ4 bytes.
+  RESULT:   uint32 wait status, uint32 mode, four uint64 expanded sizes.
+  OUTPUT:   the same chunk structure as INPUT, indexed by artifact.
+  COMPLETE: uint64 job ID matching BEGIN.
+
+Data chunks expand to at most 256 KiB. A compressed chunk must be smaller than
+its expanded size. Zero-length inputs have an explicit final chunk; zero-length
+outputs have no chunks. Every nonempty input/output must reach its declared
+size with a final marker. Manifest encoding describes the source snapshot;
+each data frame independently describes its wire encoding.
+
+Admission bounds connections (256) and globally retained input estimates,
+output sizes, frame buffers and queued packets (512 MiB) independently of
+compiler slots. These bounds exclude compiler working memory and the separate
+256 MiB persistent cache. Each connection has one 256 KiB working buffer.
+At most four frames or writes per connection per turn prevent large transfers
+from monopolizing the event loop. Retained output pauses dispatch above three
+quarters of the storage budget. Ready jobs dispatch FIFO; ordinary compiles
+may pass a link blocked by the one-link-per-server limit.
+Cancellation closes the connection; a running worker is cancelled and reaped
+before its input tree is removed. Prepared workers and compiler descendants
+share a process group, so worker death also terminates its compiler. Compiler
+temporaries use the private input root. Normal daemon shutdown cancels and
+reaps workers before deleting roots. Input roots are reclaimed at FINISHED;
+result FDs survive independently until transfer completes. Only validated COMPLETE permits client
+publication and pool return. Partial or malformed transactions are discarded,
+never resynchronized or silently replayed. Idle sockets own no compiler slot.
+Idle connections expire after 30 seconds; jobs use DISTCC_IO_TIMEOUT measured
+from network progress or worker completion. Receiving clients stage decoded
+artifacts until COMPLETE, then use the existing publication rules.
+
+The stats counter dcc_tcp_ready_idle_ns accumulates unused admissible compiler
+slot nanoseconds while eligible prepared work is queued. It is sampled at
+queue/worker transitions, and includes result processing or output backpressure
+that delays dispatch; input waiting and unavailable resource slots are excluded.
+Use bench/rpc.py to compare actual builds with fallback and retries disabled.
 
 Direct HTTP/2 jobs
 ------------------
@@ -158,13 +237,15 @@ missing, the client does not use that manifest for cache lookup; it can recover
 expanded lengths from LZ4 chunk headers without decompression.
 
 The client uses cache keys when expected all-hit savings reach 16 KiB.
-Files larger than 4 MiB are never cached. Every job still uses the same
-manifest/PUT exchange; small inputs do not use a legacy fast-path RPC.
+Files larger than 4 MiB are never cached. Every job still uses its transport's
+manifest/input exchange; small inputs do not use a legacy fast-path RPC.
 Hits are copied or reflinked into private job files and verified. On systems
 without reflink, verification happens during copying. Duplicate contents
-share one upload but have independent snapshots. Concurrent jobs acquire
-sorted byte-range leases on one .uploads inode, recheck the cache, and upload
-only remaining misses. Cancellation, timeout and worker death release leases.
+share one upload but have independent snapshots. HTTP/2 clients acquire sorted
+byte-range leases on one .uploads inode, recheck the cache, and upload only
+remaining misses. Cancellation, timeout and worker death release leases.
+Pooled TCP instead keeps upload owners and waiters in the server event loop;
+it does not require client-side inter-job leases.
 
 XXH3-64 detects accidental changes; it is not collision resistant against
 adversarial input. Upload verification precedes atomic cache publication.

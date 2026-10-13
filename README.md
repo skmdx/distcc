@@ -85,7 +85,7 @@ Reported memory PSI (`some avg10`, percent) multiplies the estimate by
 `1 + pressure / 100`. Estimates do not predict individual translation-unit
 sizes, transfer time, compiler-specific speed or container CPU quotas.
 
-With the Linux broker and a supporting server, each pooled connection reserves
+With the Linux broker and a supporting server, each legacy pooled connection reserves
 a server worker before transferring a job. Ordinary broker clients finish
 local preprocessing before reserving that worker and reuse the preprocessed
 input on retries. A full server
@@ -127,6 +127,36 @@ this fork with LZ4 support. `,lzo` retains upstream-compatible LZO compression;
 the two codecs can coexist in a host list, including with the broker and pump.
 Upgrade servers before changing client host entries to `,lz4`. Restart brokers
 and active pump sessions after upgrading the client.
+
+## Prepared TCP jobs
+
+Use `,tcp` to select the prepared-job protocol and `,cpp,tcp` under `pump`:
+
+```sh
+export DISTCC_HOSTS='builder-a/8,tcp,stats=3633'
+make -j"$(distcc -j)" CC='distcc gcc' CXX='distcc g++'
+```
+
+Both endpoints must run this version. Restart the client broker and active
+pump sessions after upgrading. This path requires the Linux broker and the
+daemon's prefork mode. It uses the existing TCP listener and IP access rules;
+SSH and GSSAPI are unsupported. Do not combine `,tcp` and `,h2`.
+
+The broker lends one reusable TCP connection per outstanding job. The server
+prepares inputs before reserving a compiler worker and releases the worker
+before returning results. LZ4 chunks, verified shared-input caching, remote
+preprocessing and GCC/Clang distributed linking are supported. Link execution
+retains the one-link-per-server limit. Preparing and returning jobs can exceed
+the compiler-slot count, but share a bounded 512 MiB storage budget; compiler
+working memory and the persistent input cache are separate. Set the daemon's
+`TMPDIR` to suitable tmpfs storage when available.
+
+This is the recommended opt-in path for shared-input and transfer-heavy builds.
+Small builds need not beat HTTP/2; compare your workload with `bench/rpc.py`
+before changing an existing setup. The stats counter `dcc_tcp_ready_idle_ns`
+records cumulative unused admissible slot nanoseconds while an eligible
+prepared job is queued. It excludes time waiting for inputs and resource
+admission. Wire details and limits are in [the protocol specification](doc/protocol-6.txt).
 
 Build using the usual `./autogen.sh`, `./configure`, and `make` steps, with the
 LZ4, nghttp2 and xxHash (with XXH3 support) libraries and

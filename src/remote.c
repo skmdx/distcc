@@ -283,7 +283,7 @@ int dcc_compile_remote(char **argv,
      * be over pipes, which are one-way connections. */
 
     *status = 0;
-    if (host->http2) {
+    if (host->http2 || host->tcp_jobs) {
         if (host->cpp_where == DCC_CPP_ON_CLIENT) {
             ret = dcc_wait_for_cpp(cpp_pid, status, input_fname);
             if (local_cpu_lock_fd != -1) {

@@ -17,7 +17,7 @@ import subprocess
 import time
 
 
-VARIANTS = {'baseline': 'lz4', 'tcp': 'lz4', 'stream': 'lz4s', 'http2': 'h2'}
+VARIANTS = {'baseline': 'lz4', 'tcp': 'lz4', 'stream': 'lz4s', 'http2': 'h2', 'jobs': 'tcp'}
 TCP_COUNTERS = ('bytes_sent', 'bytes_received', 'bytes_retrans', 'busy',
                 'rwnd_limited', 'sndbuf_limited')
 
@@ -56,13 +56,25 @@ def network_usage(pid):
 
 def server_usage(spec):
     host, path = spec.split(':', 1)
-    script = '''import json, pathlib, sys
+    script = '''import json, os, pathlib, sys
 p = pathlib.Path(sys.argv[1])
 cpu = dict(line.split() for line in (p/'cpu.stat').read_text().splitlines())
 io_path = p/'io.stat'
 io = ([dict(field.split('=') for field in line.split()[1:]) for line in io_path.read_text().splitlines()]
       if io_path.exists() else None)
+processes = {}
+for pid in (p/'cgroup.procs').read_text().split():
+    try:
+        stat = pathlib.Path('/proc', pid, 'stat').read_text()
+    except FileNotFoundError:
+        continue
+    name, fields = stat.split('(', 1)[1].rsplit(')', 1)
+    fields = fields.split()
+    processes[pid] = (name, fields[1], sum(map(int, fields[11:13])))
+dispatcher = sum(ticks for name, parent, ticks in processes.values()
+                 if name == 'distccd' and processes.get(parent, ('',))[0] != 'distccd')
 print(json.dumps(dict(cpu_seconds=int(cpu['usage_usec'])/1e6,
+    dispatcher_cpu_seconds=dispatcher/os.sysconf('SC_CLK_TCK'),
     peak_bytes=int((p/'memory.peak').read_text()),
     read_bytes=sum(int(row['rbytes']) for row in io) if io is not None else None,
     write_bytes=sum(int(row['wbytes']) for row in io) if io is not None else None)))'''
@@ -95,6 +107,10 @@ def main():
                         help='transport/codec of the baseline (default: lz4)')
     parser.add_argument('--hosts', required=True, help='TCP host entries, with slots/stats/speed but no codec')
     parser.add_argument('--baseline-hosts', help='separate baseline daemon endpoints; defaults to --hosts')
+    parser.add_argument('--variant-binary', action='append', default=[], metavar='NAME=PATH',
+                        help='override the client/broker directory for a comparison variant')
+    parser.add_argument('--variant-hosts', action='append', default=[], metavar='NAME=HOSTS',
+                        help='override daemon endpoints for a comparison variant')
     parser.add_argument('--work', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--repeats', type=int, default=5)
@@ -114,6 +130,16 @@ def main():
     args.candidate = args.candidate.resolve()
     args.baseline = args.baseline.resolve()
     args.output = args.output.resolve()
+    def overrides(values):
+        result = {}
+        for value in values:
+            name, separator, setting = value.partition('=')
+            if not separator or name not in VARIANTS or not setting or name in result:
+                parser.error('variant overrides require a unique known NAME and a nonempty value')
+            result[name] = setting
+        return result
+    binaries = {name: Path(path).resolve() for name, path in overrides(args.variant_binary).items()}
+    endpoints = overrides(args.variant_hosts)
     servers_usage(args.server)  # Validate accounting before running any builds.
     root = args.output.parent / (args.output.stem + '-runtime')
     root.mkdir()
@@ -129,6 +155,8 @@ def main():
             directory.mkdir()
             binary = args.baseline if name == 'baseline' else args.candidate
             hosts = args.baseline_hosts if name == 'baseline' and args.baseline_hosts else args.hosts
+            binary = binaries.get(name, binary)
+            hosts = endpoints.get(name, hosts)
             address = directory / 'broker.sock'
             codec = args.baseline_codec if name == 'baseline' else VARIANTS[name]
             env = dict(base_env, DISTCC_HOSTS=' '.join(
@@ -199,6 +227,7 @@ def main():
                               tcp_info_before=list(network_before.values()),
                               tcp_info_after=list(network_after.values()), servers=[
                     dict(cpu_seconds=b['cpu_seconds']-a['cpu_seconds'],
+                         dispatcher_cpu_seconds=b['dispatcher_cpu_seconds']-a['dispatcher_cpu_seconds'],
                          read_bytes=b['read_bytes']-a['read_bytes'] if None not in (a['read_bytes'], b['read_bytes']) else None,
                          write_bytes=b['write_bytes']-a['write_bytes'] if None not in (a['write_bytes'], b['write_bytes']) else None,
                          lifetime_peak_bytes=b['peak_bytes']) for a, b in zip(before, after)])
@@ -220,6 +249,18 @@ def main():
                                        'include_cpu_seconds', 'total_client_cpu_seconds',
                                        'client_peak_bytes', 'broker_peak_bytes', 'include_peak_bytes')}
                    for name in args.variants}
+        for name, values in summary.items():
+            rows = [s for s in samples if s['variant'] == name]
+            for field in ('cpu_seconds', 'dispatcher_cpu_seconds', 'read_bytes', 'write_bytes'):
+                measurements = [sum(server[field] for server in row['servers'])
+                                if row['servers'] and all(server[field] is not None for server in row['servers'])
+                                else None for row in rows]
+                values['server_' + field] = (median(measurements)
+                                             if all(value is not None for value in measurements) else None)
+            values['tcp_connections'] = median(row['tcp_connections'] for row in rows)
+            for field in ('bytes_sent', 'bytes_received'):
+                values[field] = (median(row['network'][field] for row in rows)
+                                 if all(row['network'] is not None for row in rows) else None)
         args.output.write_text(json.dumps(dict(samples=samples, medians=summary,
             repeats=args.repeats, pump=args.pump, baseline_codec=args.baseline_codec,
             memory_note='broker and server peaks are lifetime upper bounds; command wait4 peaks can include the inherited launcher peak'), indent=2) + '\n')

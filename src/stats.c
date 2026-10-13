@@ -48,6 +48,9 @@
 #include "daemon.h"
 #include "resource.h"
 #include <poll.h>
+#ifdef __linux__
+#include "tcp_job.h"
+#endif
 
 int dcc_statspipe[2];
 
@@ -370,6 +373,7 @@ static void dcc_service_stats_request(int http_fd) {
     int busy = -1, queued = -1, links = -1, admission = 0, available = -1;
     int running = dcc_getcurrentload();
     double memory_pressure = -1;
+    unsigned long long ready_idle_ns = 0;
     ssize_t ret;
 
     const char replytemplate[] = "\
@@ -401,6 +405,7 @@ dcc_load3 %1.2lf\n\
 dcc_running %d\n\
 dcc_busy %d\n\
 dcc_queued %d\n\
+dcc_tcp_ready_idle_ns %llu\n\
 dcc_links %d\n\
 dcc_admission %d\n\
 dcc_available %d\n\
@@ -425,6 +430,7 @@ dcc_free_mem %d MB\n\
     available = dcc_resource_slots(dcc_max_kids) - busy;
     if (available < 0) available = 0;
     memory_pressure = dcc_memory_pressure();
+    ready_idle_ns = dcc_tcp_ready_idle_ns();
     if (running > 0) running--; /* Exclude this statistics request itself. */
 #endif
 
@@ -459,7 +465,7 @@ dcc_free_mem %d MB\n\
                                dcc_stats.kids_avg[2],
                                dcc_getcurrentload(),
                                loadavg[0], loadavg[1], loadavg[2],
-                               running, busy, queued, links, admission, available, memory_pressure,
+                               running, busy, queued, ready_idle_ns, links, admission, available, memory_pressure,
                                ct[0], ct[1], ct[2],
                                num_D, max_RSS, max_RSS_name,
                                dcc_stats.io_rate,
