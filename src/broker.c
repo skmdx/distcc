@@ -48,6 +48,8 @@ struct peer {
     struct dcc_capacity metrics;
     double valid_until, retry_at, deadline;
     int busy, stats_fd, stats_reading;
+    uint64_t serial, probe_serial, observed_serial;
+    int completed;
     double full_until, link_until;
     int pool_supported;
     int admission_supported;
@@ -58,6 +60,7 @@ enum client_state { REQUEST, WAITING, CONNECTING, HELLO_SEND, HELLO_READ,
                     RESERVE_SEND, RESERVE_READ, ACTIVE, MEMO_OWNER, MEMO_WAIT };
 struct client {
     int fd, net, peer, cpp_reserved;
+    uint64_t serial;
     enum client_state state;
     uint32_t command;
     double deadline;
@@ -317,6 +320,8 @@ static void finish_probe(struct peer *peer, double now, int complete)
     peer->stats[peer->used] = '\0';
     if (complete && !dcc_parse_capacity(peer->stats, &metrics)) {
         peer->metrics = metrics;
+        peer->observed_serial = peer->probe_serial;
+        peer->completed = 0;
         peer->valid_until = now + 5;
         peer->admission_supported = peer->metrics.admission == 1;
     }
@@ -498,21 +503,66 @@ static int dispatch(struct broker *broker, struct client *client, double now)
     double best_score = 0, best_fill = 0;
     int link = client->command == ACQUIRE_LINK;
     int local_cpp = !link && client->command != ACQUIRE_CPP && client->command != ACQUIRE_READY;
+    int recent[MAX_HOSTS] = {0}, recent_links[MAX_HOSTS] = {0};
+    for (i = 0; i < MAX_CLIENTS; ++i) {
+        const struct client *c = &broker->clients[i];
+        if (c->fd >= 0 && c->peer >= 0 &&
+            c->serial > broker->peers[c->peer].observed_serial) {
+            recent[c->peer]++;
+            recent_links[c->peer] += c->command == ACQUIRE_LINK;
+        }
+    }
     for (i = 0; i < broker->count; i++) {
         struct peer *p = &broker->peers[i];
         const struct dcc_capacity *cap = p->valid_until > now ? &p->metrics : NULL;
+        struct dcc_capacity projected;
         slots = dcc_capacity_slots(p->host, cap);
         if (!p->address_len || p->retry_at > now || slots <= 0)
             continue;
         available++;
         reply.slots += slots;
         int staged = p->host->tcp_jobs;
+        if (cap && (cap->capacity == 0 || cap->memory_pressure >= 10)) continue;
         if (cap && cap->available == 0 && !staged) continue;
         if (p->full_until > now || (link && p->link_until > now)) continue;
         int inflight = slots + (staged ? (slots < DCC_TCP_PIPELINE ? slots : DCC_TCP_PIPELINE) : 0);
+        int work = p->busy;
+        if (staged && cap && cap->busy >= 0 && cap->queued >= 0 && cap->preparing >= 0) {
+            int limit = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
+            if (cap->capacity >= 0 && cap->capacity < limit) limit = cap->capacity;
+            int pipeline = limit < DCC_TCP_PIPELINE ? limit : DCC_TCP_PIPELINE;
+            /* Project the global snapshot, not local leases plus the same
+             * server queue. Requests dispatched during/after the probe are
+             * conservatively charged until the next successful snapshot.
+             * Returning jobs in that snapshot consume no compiler capacity. */
+            /* A RETURN proves execution has ended without another IPC or
+             * network round trip. First charge completions against jobs that
+             * were already returning in the snapshot, never against CPU work. */
+            int finished = p->completed - (cap->returning > 0 ? cap->returning : 0);
+            if (finished < 0) finished = 0;
+            int cpu = cap->busy + cap->queued;
+            int preparing = cap->preparing;
+            if (finished > cpu) {
+                preparing -= finished - cpu;
+                if (preparing < 0) preparing = 0;
+            }
+            cpu = finished < cpu ? cpu - finished : 0;
+            work = cpu + recent[i];
+            if (work + preparing >= limit + pipeline ||
+                (link && (cap->links > 0 || recent_links[i]))) continue;
+            /* Input preparation overlaps execution; only excess preparation
+             * beyond the bounded pipeline adds CPU queueing delay. */
+            if (preparing > pipeline) work += preparing - pipeline;
+            if (cap->returning > 0)
+                inflight += cap->returning < slots ? cap->returning : slots;
+            projected = *cap;
+            projected.busy = cpu;
+            projected.queued = 0;
+            cap = &projected;
+        }
         if (p->busy < inflight) {
-            double score = dcc_capacity_score(p->host, cap, p->busy);
-            double fill = (p->busy + 1.0) / slots;
+            double score = dcc_capacity_score(p->host, cap, work);
+            double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;
             if (best < 0 || score < best_score || (score == best_score && fill < best_fill)) {
                 best = i;
@@ -539,6 +589,7 @@ static int dispatch(struct broker *broker, struct client *client, double now)
             return 1;
         }
         client->peer = best;
+        client->serial = ++p->serial;
         client->state = CONNECTING;
         client->deadline = now + 3;
         p->busy++;
@@ -831,6 +882,7 @@ int dcc_broker_serve(const char *path)
             for (i = 0; i < broker->count; i++) {
                 struct peer *p = &broker->peers[i];
                 if (p->host->stats_port && p->stats_fd < 0) {
+                    p->probe_serial = p->serial;
                     p->stats_fd = connect_peer(p, p->host->stats_port);
                     p->deadline = now + .25;
                     p->used = p->stats_reading = 0;
@@ -917,9 +969,11 @@ int dcc_broker_serve(const char *path)
                 }
                 if (returned >= 0) {
                     if (length == sizeof(request) && request.version == BROKER_VERSION &&
-                        request.command == RETURN && c->state == ACTIVE && c->pooled)
+                        request.command == RETURN && c->state == ACTIVE && c->pooled) {
+                        struct peer *p = &broker->peers[c->peer];
+                        if (c->serial <= p->observed_serial) p->completed++;
                         pool_store(broker, c, returned, now);
-                    else close(returned);
+                    } else close(returned);
                     release_client(broker, c);
                     continue;
                 }

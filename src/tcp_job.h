@@ -62,7 +62,8 @@ void dcc_tcp_server_quiesce(void);
 int dcc_tcp_server_pending(void);
 void dcc_tcp_server_poll(struct dcc_tcp_server *, struct pollfd *);
 int dcc_tcp_server_process(struct dcc_tcp_server *, short);
-int dcc_tcp_server_waiting(struct dcc_tcp_server *);
+struct dcc_server_load;
+void dcc_tcp_server_load(struct dcc_tcp_server *, struct dcc_server_load *);
 void dcc_tcp_dispatch_ready(void);
 /* Cumulative unused admissible slot time while an eligible job is ready. */
 uint64_t dcc_tcp_ready_idle_ns(void);

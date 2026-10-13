@@ -169,6 +169,73 @@ class BrokerTest(BrokerTestCase):
         time.sleep(1.05)
         self.assertEqual(jobs(), 8)
 
+    def test_tcp_global_pipeline_and_resource_limits(self):
+        for name, metrics in (
+                ('memory', dict(capacity=0)),
+                ('pressure', dict(memory_pressure=10)),
+                ('pipeline', dict(busy=4, preparing=4)),
+                ('reduced_capacity', dict(capacity=1, busy=1, preparing=1))):
+            values = dict(running=0, busy=0, queued=0, preparing=0,
+                          returning=0, capacity=4)
+            values.update(metrics)
+            peer = self.peer(stats_response(**values))
+            hosts = (self.host(0, f',tcp,stats={peer.port},speed=100') + ' ' +
+                     self.host(1, ',tcp'))
+            self.start_broker(hosts, name=name)
+            _, net = self.acquire_reserved(10)
+            self.assertEqual(net.getpeername()[1], self.ports[1], name)
+            self.job(name)
+
+    def test_tcp_snapshot_does_not_recount_local_leases(self):
+        peer = self.peer(stats_response(running=0, busy=0, queued=0,
+                                       preparing=0, returning=0, capacity=4))
+        hosts = (self.host(0, f',tcp,stats={peer.port}') + ' ' +
+                 self.host(1, ',tcp,speed=0.7'))
+        self.start_broker(hosts)
+        for _ in range(4):
+            _, net = self.acquire_reserved(10)
+            self.assertEqual(net.getpeername()[1], self.ports[0])
+        # The same four leases now appear in the server snapshot.
+        peer.response = stats_response(running=0, busy=1, queued=3,
+                                       preparing=0, returning=0, capacity=4)
+        time.sleep(1.1)
+        _, net = self.acquire_reserved(10)
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+
+    def test_tcp_returning_leases_do_not_fill_cpu_pipeline(self):
+        peer = self.peer(stats_response(running=0, busy=0, queued=0,
+                                       preparing=0, returning=0, capacity=4))
+        hosts = (self.host(0, f',tcp,stats={peer.port},speed=100') + ' ' +
+                 self.host(1, ',tcp'))
+        self.start_broker(hosts)
+        for _ in range(8):
+            _, net = self.acquire_reserved(10)
+            self.assertEqual(net.getpeername()[1], self.ports[0])
+        peer.response = stats_response(running=0, busy=0, queued=0,
+                                       preparing=0, returning=8, capacity=4)
+        time.sleep(1.1)
+        _, net = self.acquire_reserved(10)
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+
+    def test_tcp_completed_snapshot_work_releases_pipeline(self):
+        peer = self.peer(stats_response(running=0, busy=0, queued=0,
+                                       preparing=0, returning=0, capacity=4))
+        hosts = (self.host(0, f',tcp,stats={peer.port}') + ' ' +
+                 self.host(1, ',tcp,speed=0.5'))
+        self.start_broker(hosts)
+        held = [self.acquire_reserved(10) for _ in range(4)]
+        peer.response = stats_response(running=0, busy=4, queued=4,
+                                       preparing=0, returning=0, capacity=4)
+        time.sleep(1.1)
+        _, net = self.acquire_reserved(10)
+        self.assertEqual(net.getpeername()[1], self.ports[1])
+        for lease, net in held:
+            lease.sendmsg([struct.pack('=II', 2, 7)],
+                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+            net.close()
+        _, net = self.acquire_reserved(10)
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+
     def memo(self, key):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(2)

@@ -364,14 +364,16 @@ static void dcc_service_stats_request(int http_fd) {
     char *max_RSS_name;
     size_t reply_len;
     char challenge[1024];
-    char reply[2048];
+    char reply[4096];
     struct dcc_sockaddr_storage cli_addr;
     socklen_t cli_len = sizeof(cli_addr);
     double loadavg[3];
     int free_space_mb;
     int free_mem_mb;
     int ncpus;
-    int busy = -1, queued = -1, links = -1, admission = 0, available = -1;
+    struct dcc_server_load load = { .busy = -1, .queued = -1, .links = -1,
+                                    .preparing = -1, .returning = -1 };
+    int admission = 0, available = -1, capacity = -1;
     int running = dcc_getcurrentload();
     double memory_pressure = -1;
     unsigned long long ready_idle_ns = 0;
@@ -408,6 +410,9 @@ dcc_load3 %1.2lf\n\
 dcc_running %d\n\
 dcc_busy %d\n\
 dcc_queued %d\n\
+dcc_preparing %d\n\
+dcc_returning %d\n\
+dcc_capacity %d\n\
 dcc_tcp_ready_idle_ns %llu\n\
 dcc_tcp_parallel_tasks %lu\n\
 dcc_tcp_parallel_peak %u\n\
@@ -431,8 +436,9 @@ dcc_free_mem %d MB\n\
     dcc_getloadavg(loadavg);
     dcc_ncpus(&ncpus);
 #ifdef __linux__
-    admission = dcc_prefork_status(&busy, &queued, &links);
-    available = dcc_resource_slots(dcc_max_kids) - busy;
+    admission = dcc_prefork_status(&load);
+    capacity = dcc_resource_slots(dcc_max_kids);
+    available = capacity - load.busy;
     if (available < 0) available = 0;
     memory_pressure = dcc_memory_pressure();
     ready_idle_ns = dcc_tcp_ready_idle_ns();
@@ -472,8 +478,9 @@ dcc_free_mem %d MB\n\
                                dcc_stats.kids_avg[2],
                                dcc_getcurrentload(),
                                loadavg[0], loadavg[1], loadavg[2],
-                               running, busy, queued, ready_idle_ns, parallel_tasks, parallel_peak,
-                               links, admission, available, memory_pressure,
+                               running, load.busy, load.queued, load.preparing, load.returning,
+                               capacity, ready_idle_ns, parallel_tasks, parallel_peak,
+                               load.links, admission, available, memory_pressure,
                                ct[0], ct[1], ct[2],
                                num_D, max_RSS, max_RSS_name,
                                dcc_stats.io_rate,

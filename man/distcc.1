@@ -578,7 +578,11 @@ local slots. Idle hosts are compared by per-core speed; server occupancy,
 queued jobs and runnable system work increase the estimate on saturated hosts.
 Overlapping local and server counts are not added together. Old servers use
 the one-minute load average when live metrics are unavailable. Memory PSI,
-when reported, penalizes hosts experiencing reclaim stalls.
+when reported, penalizes hosts experiencing reclaim stalls. Reported memory
+admission capacity also limits estimated parallelism. Prepared TCP jobs use
+server phase counts and assignments since the last probe, excluding result
+transfer from CPU occupancy and bounding estimated global pipeline depth.
+See README.md for the projection and its sampling limits.
 Statistics are shared by clients using the same DISTCC_DIR within each
 wall-clock second. A failed or invalid probe falls back to configured slots
 and speed, with a warning. Each uncached probe, including DNS, is limited
@@ -616,6 +620,7 @@ queuing behind other clients. Refused connections remain pooled; retries to
 the same full host are delayed by 50ms. Link admission permits one link per
 server. Both compiles and links wait while system or accessible cgroup memory
 PSI (some avg10) is at least 10 percent, or memory headroom is insufficient.
+After a PSI stop, admission resumes below 5 percent with sufficient headroom.
 See DISTCC_JOB_MEMORY for the memory estimate. Existing jobs finish normally.
 Link requests do not reserve local preprocessing slots. Ordinary broker clients
 finish local preprocessing before requesting a worker and reuse that input

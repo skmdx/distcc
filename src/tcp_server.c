@@ -124,12 +124,13 @@ void dcc_tcp_server_quiesce(void)
 
 uint64_t dcc_tcp_ready_idle_ns(void)
 {
-    int busy, queued, links, eligible = 0, available = 0;
+    struct dcc_server_load load;
+    int eligible = 0, available = 0;
     if (ready_head) {
-        dcc_prefork_status(&busy, &queued, &links);
+        dcc_prefork_status(&load);
         for (struct dcc_tcp_server *s = ready_head; s; s = s->ready_next)
-            if (s->job->kind != DCC_JOB_LINK || !links) { eligible = 1; break; }
-        if (eligible) available = dcc_resource_slots(dcc_max_kids) - busy;
+            if (s->job->kind != DCC_JOB_LINK || !load.links) { eligible = 1; break; }
+        if (eligible) available = dcc_resource_slots(dcc_max_kids) - load.busy;
     }
     unsigned slots = available > 0 ? available : 0;
     if (slots || idle_slots) {
@@ -521,9 +522,14 @@ static int install_links(struct dcc_tcp_server *s)
     }
     return 0;
 }
-int dcc_tcp_server_waiting(struct dcc_tcp_server *s)
+void dcc_tcp_server_load(struct dcc_tcp_server *s, struct dcc_server_load *load)
 {
-    return s && s->job && s->phase == PREPARING;
+    if (!s) return;
+    if (s->job && s->phase == PREPARING) {
+        if (s->enqueued) load->queued++;
+        else load->preparing++;
+    }
+    if (s->phase == RETURNING) load->returning++;
 }
 void dcc_tcp_server_lost(struct dcc_tcp_server *s)
 {

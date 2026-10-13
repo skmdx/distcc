@@ -97,9 +97,9 @@ static void receive_worker_message(struct worker *);
 
 static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *run, int fd, int link)
 {
-    int busy, queued, links;
-    dcc_prefork_status(&busy, &queued, &links);
-    if (busy >= dcc_resource_slots(dcc_max_kids) || (link && links)) return 0;
+    struct dcc_server_load load;
+    dcc_prefork_status(&load);
+    if (load.busy >= dcc_resource_slots(dcc_max_kids) || (link && load.links)) return 0;
     for (int i = 0; i < worker_count; ++i) {
         struct worker *w = &workers[i];
         if (w->fd < 0 || w->busy) continue;
@@ -154,19 +154,19 @@ static void finish_shutdown(void)
 }
 
 
-int dcc_prefork_status(int *busy, int *queued, int *links)
+int dcc_prefork_status(struct dcc_server_load *load)
 {
     int i;
-    *busy = *queued = *links = 0;
+    *load = (struct dcc_server_load){0};
     if (!workers) return 0;
     for (i = 0; i < worker_count; ++i) {
-        *busy += workers[i].fd >= 0 && workers[i].busy == EXECUTING;
-        *links += workers[i].fd >= 0 && workers[i].busy == EXECUTING && workers[i].link;
+        load->busy += workers[i].fd >= 0 && workers[i].busy == EXECUTING;
+        load->links += workers[i].fd >= 0 && workers[i].busy == EXECUTING && workers[i].link;
     }
     for (i = 0; i < MAX_PENDING; ++i)
-        *queued += pending[i].fd >= 0 && pending[i].ready;
+        load->queued += pending[i].fd >= 0 && pending[i].ready;
     for (i = 0; i < MAX_PENDING; ++i)
-        *queued += dcc_tcp_server_waiting(tcp[i]);
+        dcc_tcp_server_load(tcp[i], load);
 #ifdef HAVE_GSSAPI
     if (dcc_auth_enabled) return 0;
 #endif
@@ -320,14 +320,14 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             }
         }
         if (p->fd < 0 || !p->ready) continue;
-        int busy, queued, links;
-        dcc_prefork_status(&busy, &queued, &links);
+        struct dcc_server_load load;
+        dcc_prefork_status(&load);
         int limit = dcc_resource_slots(dcc_max_kids);
         if (p->used) {
             int is_link = p->request[11] == '2';
             for (j = 0; j < worker_count; ++j)
                 if (workers[j].fd >= 0 && !workers[j].busy) break;
-            if (j == worker_count || busy >= limit || (is_link && links)) {
+            if (j == worker_count || load.busy >= limit || (is_link && load.links)) {
                 /* Refuse immediately, retaining the TCP session for retry on
                  * another host. Idle sessions never reserve compiler slots. */
                 if (send(p->fd, "BUSY00000000", 12, MSG_NOSIGNAL | MSG_DONTWAIT) != 12) {
@@ -340,7 +340,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             }
             p->session |= 1;
         }
-        if (busy >= limit) continue;
+        if (load.busy >= limit) continue;
         for (j = 0; j < worker_count; ++j) {
             struct worker *w = &workers[j];
             if (w->fd < 0 || w->busy) continue;

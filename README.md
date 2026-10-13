@@ -74,16 +74,38 @@ CPU count and `--jobs` limit. An explicit `/LIMIT`, for example
 limits. Servers without statistics retain their configured slot count (default
 4). An old server without the new `dcc_cpus` metric also uses this fallback.
 
-For each host with a free local slot, the client estimates one job's relative
-completion time: `max(1, (occupied + queued + 1) / parallelism,
-(runnable + 1) / cpus) / speed`. Parallelism is the smaller of CPUs and the
-server's job limit; occupied is the larger of local reservations and reported
-server occupancy, avoiding double counting. Faster cores win while capacity
-is free. Equal estimates favor the lower local slot utilization, then list
-order. Missing live runnable counts fall back to the one-minute load average.
+For each eligible host, the client estimates relative completion time as
+`max(1, (work + 1) / parallelism, (runnable + 1) / cpus) / speed`.
+Parallelism is the smallest of CPUs, the server's job limit and its reported
+memory admission capacity. Legacy paths use the larger of local reservations
+and the sum of server execution and ready-queue counts; they do not add the
+same queued jobs twice. Faster cores win while capacity is free. Equal
+estimates favor lower estimated work per configured slot, then list order.
+Missing live runnable counts fall back to the one-minute load average.
 Reported memory PSI (`some avg10`, percent) multiplies the estimate by
 `1 + pressure / 100`. Estimates do not predict individual translation-unit
 sizes, transfer time, compiler-specific speed or container CPU quotas.
+
+With `,tcp` and live pipeline statistics, the broker projects the global server
+snapshot instead of counting all local socket leases as CPU work. It adds
+outstanding assignments made since the probe started, and subtracts completed
+snapshot work using the existing connection-return notification. Completions
+first consume the snapshot's returning count, so output-only jobs do not free
+CPU capacity twice. No per-stage IPC or extra network round trip is required.
+Input preparation can overlap execution within a pipeline of up to four jobs
+(also capped by effective parallelism); excess preparation increases the score.
+Execution, ready jobs, preparation and new assignments share this estimated
+global limit of parallelism plus pipeline depth. Returning jobs have a separate
+bounded allowance for socket leases. A zero memory capacity stops new uploads;
+busy compiler slots alone do not. Links avoid hosts with a reported active link
+or a new unsampled link assignment.
+
+These are bounded estimates, not distributed reservations: simultaneous
+brokers and assignments in transit can temporarily exceed the estimated queue
+limit. Server worker and storage admission remain authoritative. Jobs accepted
+during a probe can be counted conservatively until the next update. Configure
+statistics on every TCP worker to use this policy; without them, the broker
+uses configured slots, speed and local leases.
 
 With the Linux broker and a supporting server, each legacy pooled connection reserves
 a server worker before transferring a job. Ordinary broker clients finish
@@ -100,7 +122,8 @@ per server at a time. Linux admission for both compiles and links checks host
 available memory, accessible cgroup memory limits and memory PSI once per second.
 `DISTCC_JOB_MEMORY` sets the estimated memory per job in MiB (default 1024),
 with an additional quarter-job margin. New work waits when PSI is at least 10%
-or available headroom is too small. The same check limits local compile and
+or available headroom is too small. After a PSI stop, admission resumes below
+5% once memory headroom is sufficient. The same check limits local compile and
 preprocessing slots. Existing work finishes normally; these estimates are not
 hard per-job limits or a common scheduler for unrelated build processes.
 
@@ -110,10 +133,12 @@ at most three remote jobs even when backoff is disabled, then follows
 `DISTCC_FALLBACK`. Server protocol reads and writes use `DISTCC_IO_TIMEOUT`
 (default 300 seconds), so a silent partial request cannot retain a worker forever.
 
-Statistics successes and failures are shared within each wall-clock second in
+Without a broker, statistics successes and failures are shared within each wall-clock second in
 `DISTCC_DIR/lock`. Each uncached probe has a 250ms deadline including DNS; probes
 are sequential across hosts. Unavailable or invalid statistics produce a warning
-and use configured slots/speed until the next refresh. The stats endpoint must
+and use configured slots/speed until the next refresh. The broker probes hosts
+in parallel once per second and retains the last valid response for at most
+five seconds after failures. The stats endpoint must
 be reachable from the client and uses the daemon's existing access rules; it is
 plain HTTP, including when compilation uses GSSAPI. `stats` requires a TCP host.
 `speed` alone also enables weighted selection and can be used with SSH hosts.

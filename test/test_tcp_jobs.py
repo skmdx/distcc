@@ -37,6 +37,60 @@ class TcpJobsTest(BrokerTestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(self.job, range(24)))
 
+    def test_preparing_and_ready_are_distinct(self):
+        reservations = []
+        for _ in range(4):
+            net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=2)
+            self.addCleanup(net.close)
+            net.sendall(b'SLOT00000001')
+            self.assertEqual(net.recv(12, socket.MSG_WAITALL), b'GRNT00000001')
+            reservations.append(net)
+        body = b'int phase_accounting;\n'
+        net = self.wire_job(body)
+        self.assertEqual(self.frame(net), (0x54000201, bytes(4)))
+        stats = self.get_stats(self.stats_ports[0])
+        self.assertIn('dcc_preparing 1\n', stats)
+        self.assertIn('dcc_queued 0\n', stats)
+        self.upload(net, body)
+        deadline = time.monotonic() + 3
+        while True:
+            stats = self.get_stats(self.stats_ports[0])
+            if 'dcc_queued 1\n' in stats:
+                break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertIn('dcc_preparing 0\n', stats)
+        self.assertIn('dcc_busy 4\n', stats)
+        for lease in reservations:
+            lease.close()
+        self.result(net)
+
+    def test_multiple_brokers_share_workers(self):
+        hosts = ' '.join(self.host(i, f',tcp,stats={self.stats_ports[i]}') for i in range(2))
+        environments = []
+        for i in range(2):
+            self.start_broker(hosts, name=f'shared-{i}')
+            environments.append(dict(self.env, DISTCC_VERBOSE='1'))
+        before = [int(re.search(r'dcc_compile_ok (\d+)', self.get_stats(port))[1])
+                  for port in self.stats_ports]
+
+        def compile_job(i):
+            obj, exe = self.work / f'shared-{i}.o', self.work / f'shared-{i}'
+            result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(self.source),
+                                     '-o', str(obj)], env=environments[i % 2],
+                                    capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertIn(b'pooled TCP job completed', result.stderr)
+            subprocess.run([self.cc, str(obj), '-o', str(exe)], check=True,
+                           capture_output=True, timeout=5)
+            subprocess.run([str(exe)], check=True, timeout=5)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(compile_job, range(32)))
+        for i, port in enumerate(self.stats_ports):
+            stats = self.get_stats(port)
+            self.assertGreater(int(re.search(r'dcc_compile_ok (\d+)', stats)[1]), before[i])
+
     def test_publication_failure_keeps_completed_connection_reusable(self):
         self.start_tcp()
         self.env.update(DISTCC_MAX_RETRIES='1', DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_VERBOSE='1')
@@ -275,7 +329,9 @@ Path(args[args.index('-o') + 1]).write_bytes(random.Random(543).randbytes(4 * 10
                 self.assertEqual(kind, 0x54000203)
                 self.assertEqual(struct.unpack('!II4Q', description)[4], 4 * 1024 * 1024)
             wrapper.write_text(original)
-            self.assertIn('dcc_busy 0\n', self.get_stats(self.stats_ports[0]))
+            stats = self.get_stats(self.stats_ports[0])
+            self.assertIn('dcc_busy 0\n', stats)
+            self.assertIn('dcc_returning 4\n', stats)
             # Replacement must fork only after joining transfer threads.
             parent = self.daemons[0].pid
             workers = Path(f'/proc/{parent}/task/{parent}/children').read_text().split()

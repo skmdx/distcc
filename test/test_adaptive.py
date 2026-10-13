@@ -268,6 +268,14 @@ class AdaptiveTest(DistccTestCase):
         _, log = self.compile(hosts)
         self.assertIn('adaptive stats unavailable', log)
 
+    def test_local_leases_and_server_queue_are_not_added_twice(self):
+        peer = self.peer(stats_response(running=0, busy=1, queued=2))
+        locks = [self.hold_slot(0, i) for i in range(3)]
+        hosts = self.host(0, f',stats={peer.port}') + ' ' + self.host(1, ',speed=0.8')
+        self.assertEqual(self.compile(hosts)[0], self.ports[0])
+        for lock in locks:
+            lock.close()
+
     def test_core_and_daemon_limits(self):
         for field in ("cpus", "jobs"):
             peer = self.peer(stats_response(**{field: 1}))

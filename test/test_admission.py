@@ -16,7 +16,7 @@ from test_broker import BrokerTestCase
 
 class MemoryAdmissionTest(BrokerTestCase):
     daemon_env = {'DISTCC_JOB_MEMORY': '128'}
-    transport = 'h2'
+    transport = 'lz4'
 
     def test_budget_and_headroom_recover(self):
         path = next((line[3:] for line in Path('/proc/self/cgroup').read_text().splitlines()

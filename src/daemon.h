@@ -21,6 +21,8 @@
  */
 
 
+#include <sys/types.h>
+
 /* daemon.c */
 extern const char *dcc_daemon_wd;
 
@@ -42,10 +44,13 @@ void dcc_reap_kids(int must_reap);
 
 /* prefork.c */
 int dcc_preforking_parent(int listen_fd);
+struct dcc_server_load {
+    int busy, queued, links, preparing, returning;
+};
 #ifdef __linux__
 struct pollfd;
 int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout);
-int dcc_prefork_status(int *busy, int *queued, int *links);
+int dcc_prefork_status(struct dcc_server_load *load);
 void dcc_prefork_reaped(pid_t pid);
 #endif
 

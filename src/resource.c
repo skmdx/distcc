@@ -131,6 +131,7 @@ double dcc_memory_pressure(void)
 
 int dcc_resource_slots(int maximum)
 {
+    static int pressure_blocked;
     const char *setting = getenv("DISTCC_JOB_MEMORY");
     char *end;
     unsigned long long job = 1024, spare, slots;
@@ -141,9 +142,11 @@ int dcc_resource_slots(int maximum)
     job *= 1024 * 1024;
     spare = job / 4;
     sample_resources();
+    if (pressure >= 10) pressure_blocked = 1;
+    else if (pressure < 5) pressure_blocked = 0;
     /* PSI is reactive; keep headroom and reserve a budget before the burst.
      * Existing jobs finish normally when the admissible limit falls. */
-    if (pressure >= 10 || available < job + spare || budget < job + spare)
+    if (pressure_blocked || available < job + spare || budget < job + spare)
         return 0;
     slots = (budget - spare) / job;
     return slots < (unsigned)maximum ? (int)slots : maximum;
