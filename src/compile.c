@@ -803,7 +803,9 @@ dcc_build_somewhere(char *argv[],
         if (local_cpu_lock_fd != -1) dcc_unlock(local_cpu_lock_fd);
         local_cpu_lock_fd = -1;
         cpp_pid = 0;
-        if (ret || *status) goto unlock_and_clean_up;
+        if (!ret && *status)
+            ret = dcc_critique_status(*status, "cpp", input_fname, dcc_hostdef_local, 0);
+        if (ret) goto unlock_and_clean_up;
         cpp_ready = 1;
     }
 

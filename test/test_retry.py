@@ -2,6 +2,7 @@
 """Real-worker argument rejection, retry bounds and preprocessing lifetime."""
 import contextlib
 import os
+import re
 import socket
 import socketserver
 import subprocess
@@ -67,6 +68,23 @@ class RejectionConnection(socketserver.BaseRequestHandler):
 
 
 class RetryTest(BrokerTestCase):
+    def test_preprocessing_failure_is_not_success_or_remote_work(self):
+        self.source.write_text('#include "missing-distcc-test-header.h"\n')
+        for codec in ('lz4', 'tcp'):
+            self.start_broker(self.host(0, ',' + codec), name='cpp-error-' + codec)
+            before = re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1]
+            for fallback in ('0', '1'):
+                obj = self.work / f'failed-{codec}-{fallback}.o'
+                result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c',
+                                         str(self.source), '-o', str(obj)],
+                                        env=dict(self.env, DISTCC_FALLBACK=fallback),
+                                        capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn(b'missing-distcc-test-header.h', result.stderr)
+                self.assertFalse(obj.exists())
+            after = re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1]
+            self.assertEqual(before, after)
+
     def rejecting_host(self):
         proxy = RejectingProxy(self.ports[0])
         self.addCleanup(proxy.close)
