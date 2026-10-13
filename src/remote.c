@@ -40,7 +40,6 @@
 #include <sys/socket.h>
 
 #include "distcc.h"
-#include "file_cache.h"
 #include "trace.h"
 #include "rpc.h"
 #include "exitcode.h"
@@ -48,6 +47,7 @@
 #include "clinet.h"
 #include "hosts.h"
 #include "broker.h"
+#include "job.h"
 #include "exec.h"
 #include "lock.h"
 #include "compile.h"
@@ -271,7 +271,6 @@ int dcc_compile_remote(char **argv,
     off_t doti_size;
     struct timeval before, after;
     unsigned int n_files;
-    struct dcc_input_digest *hashes = NULL;
 
     if (gettimeofday(&before, NULL))
         rs_log_warning("gettimeofday failed");
@@ -284,6 +283,20 @@ int dcc_compile_remote(char **argv,
      * be over pipes, which are one-way connections. */
 
     *status = 0;
+    if (host->http2) {
+        if (host->cpp_where == DCC_CPP_ON_CLIENT) {
+            ret = dcc_wait_for_cpp(cpp_pid, status, input_fname);
+            if (local_cpu_lock_fd != -1) {
+                dcc_unlock(local_cpu_lock_fd);
+                local_cpu_lock_fd = -1;
+            }
+            dcc_broker_cpp_done(host);
+            if (ret || *status) goto out;
+        } else dcc_broker_cpp_done(host);
+        ret = dcc_compile_direct(host, argv, cpp_fname, files, output_fname, deps_fname,
+                                 server_stderr, server_stdout, status);
+        goto out;
+    }
     if ((ret = dcc_remote_connect(host, &to_net_fd, &from_net_fd, &ssh_pid)))
         goto out;
 
@@ -309,13 +322,11 @@ int dcc_compile_remote(char **argv,
 
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
         n_files = dcc_argv_len(files);
-        if (host->file_cache && (hashes = dcc_file_hashes(files, n_files)))
-            host->protover = DCC_VER_CACHED_CPP;
         if ((ret = dcc_send_header(to_net_fd, argv, host))) {
           goto out;
         }
 
-        if ((ret = dcc_x_many_files(to_net_fd, from_net_fd, n_files, files, host->compr, hashes))) {
+        if ((ret = dcc_x_many_files(to_net_fd, n_files, files, host->compr))) {
             goto out;
         }
     } else {
@@ -349,10 +360,6 @@ int dcc_compile_remote(char **argv,
     if (host->cpp_where == DCC_CPP_ON_SERVER)
         dcc_broker_cpp_done(host);
     tcp_cork_sock(to_net_fd, 0);
-    if (host->http2 && shutdown(to_net_fd, SHUT_WR)) {
-        ret = EXIT_IO_ERROR;
-        goto out;
-    }
     /* but it might not have been read in by the server yet; there's
      * 100kB or more of buffers in the two kernels. */
 
@@ -415,12 +422,11 @@ int dcc_compile_remote(char **argv,
      * directives in the source. It may be unobvious that we check this after trying
      * remotely rather than before, but these are very rare, and scanning all the 
      * preprocessed source has a cost. */
-    if (ret == 0 && *status != 0) {
+    if (ret == 0 && *status != 0 && cpp_fname) {
         if ((ret = dcc_check_unsupported_directives(cpp_fname, input_fname))) {
             *unsupported = 1;
         }
     }
 
-    free(hashes);
     return ret;
 }

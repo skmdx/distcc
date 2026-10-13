@@ -325,7 +325,7 @@ failed:
 }
 
 /* fnames is the include server's null-terminated list of compressed snapshots
- * and symlinks. Only a cached manifest requires a response on ifd. */
+ * and symlinks for the sequential TCP protocol. */
 struct manifest_writer { int fd; size_t used; char data[65537]; };
 
 static int flush_manifest(struct manifest_writer *writer)
@@ -349,25 +349,22 @@ static int manifest_token(struct manifest_writer *writer, const char *token,
     return 0;
 }
 
-int dcc_x_many_files(int ofd, int ifd,
+int dcc_x_many_files(int ofd,
                      unsigned int n_files,
-                     char **fnames, enum dcc_compress compr,
-                     const struct dcc_input_digest *hashes)
+                     char **fnames, enum dcc_compress compr)
 {
     int ret;
     char link_points_to[MAXPATHLEN + 1];
     int is_link;
     const char *fname;
     char *original_fname;
-    char **files = fnames;
-    unsigned i = 0;
     struct manifest_writer writer;
     writer.fd = ofd;
     writer.used = 0;
 
     if ((ret = manifest_token(&writer, "NFIL", n_files, NULL))) return ret;
 
-    for (; *fnames != NULL; ++fnames, ++i) {
+    for (; *fnames != NULL; ++fnames) {
         fname = *fnames;
         ret = dcc_get_original_fname(fname, &original_fname);
         if (ret) return ret;
@@ -383,8 +380,7 @@ int dcc_x_many_files(int ofd, int ifd,
             ret = manifest_token(&writer, "FILE", 0, NULL);
             if (ret) return ret;
         } else {
-            if (hashes && hashes[i].kind) is_link = 0;
-            else if ((ret = dcc_is_link(fname, &is_link))) {
+            if ((ret = dcc_is_link(fname, &is_link))) {
                 return ret;
             }
 
@@ -395,41 +391,15 @@ int dcc_x_many_files(int ofd, int ifd,
                 }
             } else {
                 /* Cache bytes carry the selected codec, without an RPC token. */
-                if (hashes && hashes[i].kind == DCC_INPUT_CACHED) {
-                    ret = manifest_token(&writer, "HASH", DCC_FILE_HASH_SIZE, hashes[i].hash);
-                } else {
-                    if ((ret = flush_manifest(&writer))) return ret;
-                    if (compr == DCC_COMPRESS_LZ4_STREAM) {
-                        ret = dcc_x_token_int(ofd, "FILE", 0xffffffffU);
-                        if (!ret) ret = dcc_copy_file_to_fd(fname, ofd);
-                    } else ret = dcc_x_file(ofd, fname, "FILE", DCC_COMPRESS_NONE, NULL);
-                }
+                if ((ret = flush_manifest(&writer))) return ret;
+                if (compr == DCC_COMPRESS_LZ4_STREAM) {
+                    ret = dcc_x_token_int(ofd, "FILE", 0xffffffffU);
+                    if (!ret) ret = dcc_copy_file_to_fd(fname, ofd);
+                } else ret = dcc_x_file(ofd, fname, "FILE", DCC_COMPRESS_NONE, NULL);
                 if (ret) return ret;
             }
         }
     }
     if ((ret = flush_manifest(&writer))) return ret;
-    if (hashes) {
-        unsigned count, missing = 0;
-        unsigned char *wanted = malloc(n_files);
-        if (!wanted) return EXIT_OUT_OF_MEMORY;
-        tcp_cork_sock(ofd, 0);
-        ret = dcc_r_token_int(ifd, "MISS", &count);
-        if (!ret && count != n_files) ret = EXIT_PROTOCOL_ERROR;
-        if (!ret) ret = dcc_readx(ifd, wanted, count);
-        for (i = 0; !ret && i < count; ++i) {
-            if (wanted[i] > 1 || (wanted[i] && hashes[i].kind != DCC_INPUT_CACHED)) {
-                ret = EXIT_PROTOCOL_ERROR;
-                break;
-            }
-            if (!wanted[i]) continue;
-            ++missing;
-            ret = dcc_x_token_int(ofd, "FILE", 0xffffffffU);
-            if (!ret) ret = dcc_copy_file_to_fd(files[i], ofd);
-        }
-        rs_trace("input cache: %u of %u entries transferred", missing, n_files);
-        free(wanted);
-        return ret;
-    }
     return 0;
 }

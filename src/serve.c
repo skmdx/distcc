@@ -89,6 +89,7 @@
 #include "stringmap.h"
 #include "dotd.h"
 #include "fix_debug_info.h"
+#include "job.h"
 #ifdef HAVE_GSSAPI
 #include "auth.h"
 
@@ -107,7 +108,25 @@ int dcc_auth_enabled = 0;
  **/
 static int dcc_compile_log_fd = -1;
 
-static int dcc_run_job(int in_fd, int out_fd, enum dcc_protover protover);
+static int dcc_run_job(int in_fd, int out_fd, enum dcc_protover protover,
+                       const struct dcc_job *job, const char *root,
+                       struct dcc_job_result *result);
+
+int dcc_execute_job(struct dcc_job *job, const char *root, int cancel_fd,
+                     struct dcc_job_result *result)
+{
+    enum dcc_protover version;
+    int ret;
+    dcc_job_result_init(result);
+    if (job->kind == DCC_JOB_LINK) version = DCC_VER_LINK;
+    else dcc_get_protover_from_features(DCC_COMPRESS_LZ4_STREAM,
+            job->kind == DCC_JOB_PUMP ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT, &version);
+    dcc_job_summary_clear();
+    ret = dcc_run_job(cancel_fd, -1, version, job, root, result);
+    dcc_job_summary();
+    if (ret) dcc_job_result_free(result);
+    return ret;
+}
 
 
 /**
@@ -213,7 +232,7 @@ int dcc_service_job(int in_fd,
         return ret;
     }
     if (protover >= DCC_VER_STREAM) dcc_buffer_input(in_fd);
-    ret = dcc_run_job(in_fd, out_fd, protover);
+    ret = dcc_run_job(in_fd, out_fd, protover, NULL, NULL, NULL);
     if (!ret && session && *session)
         ret = dcc_x_token_int(out_fd, "JEND", 0);
     tcp_cork_sock(out_fd, 0);
@@ -699,10 +718,26 @@ static int make_temp_dir_and_chdir_for_cpp(int in_fd,
 }
 
 
+/* Open before cleanup, retaining the inode rather than its temporary name. */
+static int retain_artifact(struct dcc_job_result *result, unsigned index, const char *path)
+{
+    struct stat st;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return EXIT_IO_ERROR;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0) {
+        close(fd);
+        return EXIT_IO_ERROR;
+    }
+    result->fd[index] = fd;
+    result->size[index] = st.st_size;
+    return 0;
+}
+
 /* Protocol 4 delegates only object linking to the sysroot-aware helper. */
 static int dcc_run_link_job(int in_fd, int out_fd,
                             const char *out_fname, const char *err_fname, int *status,
-                            enum dcc_protover protover)
+                            enum dcc_protover protover, const char *input_archive,
+                            struct dcc_job_result *result)
 {
     char *archive = NULL, *output = NULL;
     char *argv[5];
@@ -714,9 +749,12 @@ static int dcc_run_link_job(int in_fd, int out_fd,
         rs_log_error("remote linking requires DISTCCD_LINK_ROOT");
         return EXIT_PROTOCOL_ERROR;
     }
-    if ((ret = dcc_make_tmpnam("distcc-link", ".tar", &archive)) ||
-        (ret = dcc_make_tmpnam("distcc-link", ".out", &output)) ||
-        (ret = dcc_r_token_file(in_fd, "LINK", archive, compr)))
+    if (input_archive) {
+        if (!(archive = strdup(input_archive))) return EXIT_OUT_OF_MEMORY;
+    } else if ((ret = dcc_make_tmpnam("distcc-link", ".tar", &archive)) ||
+               (ret = dcc_r_token_file(in_fd, "LINK", archive, compr)))
+        goto done;
+    if ((ret = dcc_make_tmpnam("distcc-link", ".out", &output)))
         goto done;
     argv[0] = (char *)"distcc-link";
     argv[1] = (char *)"--worker";
@@ -730,6 +768,14 @@ static int dcc_run_link_job(int in_fd, int out_fd,
     dcc_worker_release();
     if (!*status && stat(output, &st))
         *status = W_EXITCODE(EXIT_IO_ERROR, 0);
+    if (result) {
+        result->status = *status;
+        result->mode = *status ? 0 : st.st_mode & 0777;
+        if ((ret = retain_artifact(result, DCC_JOB_STDERR, err_fname)) ||
+            (ret = retain_artifact(result, DCC_JOB_STDOUT, out_fname))) goto done;
+        if (!*status) ret = retain_artifact(result, DCC_JOB_OBJECT, output);
+        goto done;
+    }
     if ((ret = dcc_x_result_header(out_fd, protover)) ||
         (ret = dcc_x_cc_status(out_fd, *status)) ||
         (ret = dcc_x_file(out_fd, err_fname, "SERR", compr, NULL)) ||
@@ -782,7 +828,9 @@ done:
 
 /** Read a request, run the compiler, and send a response. */
 static int dcc_run_job(int in_fd,
-                       int out_fd, enum dcc_protover protover)
+                       int out_fd, enum dcc_protover protover,
+                       const struct dcc_job *job, const char *root,
+                       struct dcc_job_result *result)
 {
     char **argv = NULL;
     char **tweaked_argv = NULL;
@@ -831,7 +879,7 @@ static int dcc_run_job(int in_fd,
     dcc_ignore_sigpipe(1);
 
     /* Allow output to accumulate into big packets. */
-    tcp_cork_sock(out_fd, 1);
+    if (!job) tcp_cork_sock(out_fd, 1);
 
     if (protover == DCC_VER_LINK || protover == DCC_VER_STREAM_LINK) {
         argv = calloc(2, sizeof(*argv));
@@ -840,7 +888,15 @@ static int dcc_run_job(int in_fd,
             ret = EXIT_OUT_OF_MEMORY;
             goto out_cleanup;
         }
-        ret = dcc_run_link_job(in_fd, out_fd, out_fname, err_fname, &status, protover);
+        char *input_archive = NULL;
+        if (job && (job->count != 1 ||
+            asprintf(&input_archive, "%s%s", root, job->inputs[0].path) < 0)) {
+            ret = EXIT_PROTOCOL_ERROR;
+            goto out_cleanup;
+        }
+        ret = dcc_run_link_job(in_fd, out_fd, out_fname, err_fname, &status,
+                              protover, input_archive, result);
+        free(input_archive);
         job_result = ret || status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
         goto out_cleanup;
     }
@@ -848,13 +904,25 @@ static int dcc_run_job(int in_fd,
     dcc_get_features_from_protover(protover, &compr, &cpp_where);
 
     if (cpp_where == DCC_CPP_ON_SERVER) {
-        if ((ret = make_temp_dir_and_chdir_for_cpp(in_fd,
+        if (job) {
+            temp_dir = strdup(root);
+            client_cwd = strdup(job->cwd);
+            if (!temp_dir || !client_cwd ||
+                asprintf(&server_cwd, "%s%s", root, job->cwd) < 0) {
+                ret = EXIT_OUT_OF_MEMORY;
+                goto out_cleanup;
+            }
+            if ((ret = dcc_mk_tmp_ancestor_dirs(server_cwd)) ||
+                (ret = dcc_mk_tmpdir(server_cwd))) goto out_cleanup;
+            if (chdir(server_cwd)) { ret = EXIT_IO_ERROR; goto out_cleanup; }
+        } else if ((ret = make_temp_dir_and_chdir_for_cpp(in_fd,
                           &temp_dir, &client_cwd, &server_cwd)))
             goto out_cleanup;
         changed_directory = 1;
     }
 
-    if ((ret = dcc_r_argv(in_fd, "ARGC", "ARGV", &argv))
+    if ((ret = job ? dcc_copy_argv(job->argv, &argv, 0) :
+                    dcc_r_argv(in_fd, "ARGC", "ARGV", &argv))
         || (ret = dcc_scan_args(argv, &orig_input_tmp, &orig_output_tmp,
                                 &tweaked_argv, 0)))
         goto out_cleanup;
@@ -886,8 +954,7 @@ static int dcc_run_job(int in_fd,
      * in a loop.
      */
     if (cpp_where == DCC_CPP_ON_SERVER) {
-        if ((ret = dcc_r_many_files(in_fd, out_fd, temp_dir, compr,
-                                  protover == DCC_VER_CACHED_CPP))
+        if ((!job && (ret = dcc_r_many_files(in_fd, temp_dir, compr)))
             || (!stdout_output && dcc_set_output(argv, temp_o))
             || tweak_arguments_for_server(argv, temp_dir, deps_fname,
                                           &dotd_target, &tweaked_argv))
@@ -897,23 +964,29 @@ static int dcc_run_job(int in_fd,
         argv = tweaked_argv;
         tweaked_argv = NULL;
     } else {
-        if ((ret = dcc_input_tmpnam(orig_input, &temp_i)))
-            goto out_cleanup;
-        if ((ret = dcc_r_token_file(in_fd, "DOTI", temp_i, compr))
+        if (job) {
+            if (job->count != 1 || asprintf(&temp_i, "%s%s", root, job->inputs[0].path) < 0) {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out_cleanup;
+            }
+        } else if ((ret = dcc_input_tmpnam(orig_input, &temp_i))) goto out_cleanup;
+        if ((!job && (ret = dcc_r_token_file(in_fd, "DOTI", temp_i, compr)))
             || (ret = dcc_set_input(argv, temp_i))
             || (ret = dcc_set_output(argv, temp_o)))
             goto out_cleanup;
     }
 
-    if (!dcc_remap_compiler(&argv[0]))
+    if (!dcc_remap_compiler(&argv[0])) {
+        ret = EXIT_BAD_ARGUMENTS;
         goto out_cleanup;
+    }
 
     if ((ret = dcc_check_compiler_masq(argv[0])))
         goto out_cleanup;
 
     if (!opt_enable_tcp_insecure &&
         !getenv("DISTCC_CMDLIST") &&
-        dcc_check_compiler_whitelist(argv[0]))
+        (ret = dcc_check_compiler_whitelist(argv[0])))
         goto out_cleanup;
 
     /* unsafe compiler options. See  https://youtu.be/bSkpMdDe4g4?t=53m12s
@@ -923,6 +996,7 @@ static int dcc_run_job(int in_fd,
     for (i = 0; (a = argv[i]); i++) {
         if (strncmp(a, "-fplugin=", strlen("-fplugin=")) == 0) {
             rs_log_warning("-fplugin= passed, which are insecure and not supported.");
+            ret = EXIT_BAD_ARGUMENTS;
             goto out_cleanup;
         }
         if (strncmp(a, "-specs=", strlen("-specs=")) == 0) {
@@ -938,6 +1012,7 @@ static int dcc_run_job(int in_fd,
             }
             if (fail) {
               rs_log_warning("-specs= passed, but we cannot find the specs.");
+              ret = EXIT_BAD_ARGUMENTS;
               goto out_cleanup;
             }
        }
@@ -960,7 +1035,25 @@ static int dcc_run_job(int in_fd,
             goto out_cleanup;
     }
 
-    if ((ret = dcc_x_result_header(out_fd, protover))
+    if (result) {
+        result->status = status;
+        if ((ret = retain_artifact(result, DCC_JOB_STDERR, err_fname)) ||
+            (ret = retain_artifact(result, DCC_JOB_STDOUT, out_fname))) goto out_cleanup;
+        if (!status) {
+            if (cpp_where == DCC_CPP_ON_SERVER && !preprocess_only &&
+                (ret = dcc_fix_debug_info(temp_o, "/", temp_dir))) goto out_cleanup;
+            if ((ret = retain_artifact(result, DCC_JOB_OBJECT, temp_o))) goto out_cleanup;
+            if (cpp_where == DCC_CPP_ON_SERVER) {
+                char *cleaned = NULL;
+                ret = dcc_cleanup_dotd(deps_fname, &cleaned, temp_dir,
+                                      dotd_target ? dotd_target : orig_output, temp_o);
+                if (!ret) ret = retain_artifact(result, DCC_JOB_DEPS, cleaned);
+                free(cleaned);
+                if (ret) goto out_cleanup;
+            }
+        }
+        job_result = status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
+    } else if ((ret = dcc_x_result_header(out_fd, protover))
         || (ret = dcc_x_cc_status(out_fd, status))
         || (ret = dcc_x_file(out_fd, err_fname, "SERR", compr, NULL))
         || (ret = dcc_x_file(out_fd, out_fname, "SOUT", compr, NULL))) {

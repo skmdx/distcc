@@ -41,13 +41,11 @@ int dcc_open_read(const char *fname, int *ifd, off_t *fsize);
 int dcc_copy_file_to_fd(const char *in_fname, int out_fd);
 
 /* clirpc.c */
-struct dcc_input_digest;
-int dcc_x_many_files(int ofd, int ifd,
+int dcc_x_many_files(int ofd,
                      unsigned int n_files,
-                     char **fnames, enum dcc_compress compr,
-                     const struct dcc_input_digest *hashes);
+                     char **fnames, enum dcc_compress compr);
 
 /* srvrpc.c */
-int dcc_r_many_files(int in_fd, int out_fd,
+int dcc_r_many_files(int in_fd,
                      const char *dirname,
-                     enum dcc_compress compr, int cached);
+                     enum dcc_compress compr);

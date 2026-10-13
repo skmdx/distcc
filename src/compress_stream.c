@@ -62,7 +62,7 @@ static int reserve_buffer(char **buffer, size_t *capacity, size_t needed)
 
 /* out_fd >= 0 writes directly to the caller's output file. Diagnostics use
  * output instead, preserving the existing delayed-publication contract. */
-int dcc_r_lz4_stream(int out_fd, struct dcc_buffer *output, int in_fd)
+int dcc_r_lz4_stream_bounded(int out_fd, struct dcc_buffer *output, int in_fd, uint64_t limit)
 {
     int ret = 0;
     char *plain = NULL, *encoded = NULL;
@@ -74,7 +74,7 @@ int dcc_r_lz4_stream(int out_fd, struct dcc_buffer *output, int in_fd)
         size = ntohl(header[0]);
         compressed = ntohl(header[1]);
         if (!size && !compressed) break;
-        if (!size || size > DCC_STREAM_CHUNK || compressed >= size) {
+        if (!size || size > DCC_STREAM_CHUNK || compressed >= size || size > limit) {
             ret = EXIT_PROTOCOL_ERROR;
             break;
         }
@@ -96,9 +96,15 @@ int dcc_r_lz4_stream(int out_fd, struct dcc_buffer *output, int in_fd)
         if (out_fd >= 0) {
             if ((ret = dcc_writex(out_fd, destination, size))) break;
         } else output->size += size;
+        limit -= size;
     }
     free(plain);
     free(encoded);
     if (ret && output) dcc_free_buffer(output);
     return ret;
+}
+
+int dcc_r_lz4_stream(int out_fd, struct dcc_buffer *output, int in_fd)
+{
+    return dcc_r_lz4_stream_bounded(out_fd, output, in_fd, UINT64_MAX);
 }

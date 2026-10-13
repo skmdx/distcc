@@ -37,23 +37,31 @@ Example systemd units are in packaging/systemd. For a Portage client, enable
 distcc-broker@portage.socket and set
 DISTCC_BROKER=/run/distcc-broker-portage.socket in its build environment.
 
-The optional `,h2` host option multiplexes jobs over one HTTP/2 TCP connection
+The experimental `,h2` host option multiplexes jobs over one HTTP/2 TCP connection
 per worker host. It requires the broker, upgraded workers and libnghttp2.
-The broker and daemon relay each stream through bounded local sockets;
-flow control limits queued data, and cancelling one job preserves other jobs.
+The broker and daemon own HTTP messages and pass immutable file descriptors
+to clients and workers. File bodies use sendfile; no per-job socketpair relays
+the payload. Receive storage and flow control are bounded. Closing a client
+lease cancels its job; a broken connection can fail all jobs using it.
 This is cleartext HTTP/2 on the existing distccd port, subject to its IP ACL;
 SSH and GSSAPI are not supported with this option. It is opt-in because fewer
 connections do not necessarily mean faster builds or lower client CPU use.
+The native resource exchange reduces relay CPU for large inputs, but its
+additional HTTP requests can increase latency for small jobs.
 
-`,h2` enables chunked LZ4 transfers; `,lz4s` selects the same codec over pooled
-TCP without the HTTP/2 relay. Sources, objects and link archives stream in
-256 KiB chunks without allocating a complete compressed payload. Both options
-support pump and distributed links. Existing `,lz4` and `,lzo` hosts remain
-compatible. Restart pump sessions after upgrading their include server.
+`,h2` sends pump's immutable LZ4 snapshots directly. Clients compress
+preprocessed inputs and link archives; workers compress results. LZ4 bodies
+use sealed memfds and `Content-Encoding: x-distcc-lz4-stream`; compression
+is skipped when it does not reduce the size. The broker relays these FDs
+without compression or decompression. `,lz4s` uses chunked LZ4 over
+pooled TCP. Both options support pump and distributed links. HTTP/2 is not
+wire compatible with the previous RPC tunnel: update clients, brokers and
+workers together and restart pump sessions. Existing `,lz4` and `,lzo` hosts
+retain their TCP protocols.
 
-With `,h2` and pump, supporting peers exchange an XXH3-64 input manifest and
-upload only files missing from the worker's bounded cache. Small inputs and
-disabled caches keep the full-file exchange. Cache hits are verified and copied or
+With `,h2` and pump, an XXH3-64 input manifest identifies cacheable snapshots;
+only missing files are uploaded. Small inputs and disabled caches transfer all
+required files through the same HTTP resources. Cache hits are verified and copied or
 reflinked into private job files; a compiler never shares writable cache
 inodes. See doc/protocol-6.txt for the exchange, storage limits and
 DISTCCD_FILE_CACHE setting. XXH3-64 detects accidental changes but is not

@@ -1,4 +1,4 @@
-distcc protocols 6 through 12: LZ4 compression and HTTP/2
+distcc protocols 6 through 10 and direct HTTP/2 jobs
 ======================================================
 
 Protocol 6 follows protocol 2 (client preprocessing), and protocol 7 follows
@@ -32,7 +32,7 @@ Chunked payloads (8, 9 and 10)
 
 Protocol 8 follows 6, protocol 9 follows 7, and protocol 10 follows the
 protocol 4 link exchange. All bulk payloads use independent LZ4 chunks. The
-host option is ,lz4s (or ,h2); there is no automatic codec downgrade.
+host option is ,lz4s; there is no automatic codec downgrade.
 
 An empty payload has token length zero. Otherwise the token length is
 0xffffffff, followed by pairs of uint32 values in network byte order:
@@ -55,111 +55,132 @@ The receiver allocates buffers as chunks arrive and decodes diagnostics
 directly into the retained result buffer. Diagnostic publication and result
 file cleanup retain their existing semantics.
 
-HTTP/2 transport
-----------------
+Direct HTTP/2 jobs
+------------------
 
 The broker opens a prior-knowledge cleartext HTTP/2 connection on the existing
 distccd port. The prefork parent checks the existing IP ACL before accepting
-the session. There is no HTTP/1 upgrade, TLS, SSH or GSSAPI wrapper.
-Each job is POST /v1/compile or POST /v1/link, with one RPC exchange in its
-DATA frames. Response status 200 admits an input; 503 refuses without starting
-execution, allowing another host to be selected. A connection failure after
-admission retains the existing failed-job policy; it is not a safe refusal.
+the session. There is no HTTP/1 upgrade, TLS, SSH or GSSAPI wrapper. This
+protocol replaces the RPC-over-HTTP/2 tunnel; clients, brokers and workers
+must be updated together. Legacy cached-RPC protocol 13 is no longer accepted.
 
-The broker and prefork parent own HTTP/2 framing. Jobs use private local
-sockets, preserving existing compiler and link-helper I/O. A request's
-END_STREAM does not disconnect the worker's local input while it compiles;
-RST_STREAM or loss of the connection cancels it. Response END_STREAM signals
-local EOF after queued result bytes drain. Lease cancellation is scoped to
-both the connection generation and stream ID.
+The broker and prefork parent own HTTP messages, not compiler byte streams.
+Clients and persistent workers exchange metadata and SCM_RIGHTS descriptors
+over their existing SOCK_SEQPACKET control channels. No per-job socketpair
+carries payload bytes. The compiler engine accepts an already materialized
+input tree, opens result descriptors before unlinking temporary names, then
+publishes the result and worker availability in one control message.
 
-HTTP/2 servers separate input reception and result
-draining from compiler admission. The first HTTP/2 session activates up to
-min(jobs, 4) additional persistent workers. Total in-flight jobs are bounded
-by that pool; compilers still obey --jobs and resource admission, with at most
-one active link. Ready inputs receive execution grants in arrival order, with
-links awaiting their own limit. Finished compilers release the grant before
-result transfer. Brokers pipeline up to the same bounded allowance.
-TCP-only servers retain their original worker count. Cancelling
-a worker waiting for a grant retires its channel, so a racing grant cannot be
-mistaken for the next job.
+POST /jobs creates a job from a bounded binary manifest. Its stream ID is the
+job ID. After materializing verified cache hits, the server responds 201 with
+x-distcc-job and one byte per input: 1 requests an upload, 0 means no upload.
+If the bounded worker pool is occupied or replacing retired workers, the
+manifest waits within the connection's job/storage limits before dispatch.
+Cancellation and the normal job timeout also apply during this wait.
+PUT /jobs/{id}/inputs/{index} transfers one immutable snapshot. Its HTTP
+Content-Length is the wire length; the manifest supplies encoding and expanded
+length. The 204 response acknowledges successful materialization and digest
+verification. Clients keep at most four uploads or pending input FD requests
+per job. A file is one HTTP representation, with no DIST/FILE/LINK RPC tokens
+or file-length framing around its DATA. Pump snapshots retain their LZ4 chunk
+encoding described above. Preprocessor inputs, link archives and results
+also use this encoding when it reduces their size. Encoded bodies carry
+Content-Encoding: x-distcc-lz4-stream; unencoded bodies omit it. PUT encoding
+must agree with the manifest. Compression happens in the client or compiler
+worker, never in the connection event loop; sealed encoded memfds remain
+eligible for sendfile. Pump snapshots are already encoded and are not repacked.
 
-Receive windows are 256 KiB per stream and 8 MiB per connection. WINDOW_UPDATE
-is issued when the local consumer drains data. A writable local consumer
-receives DATA directly; a 256 KiB queue is allocated only when it falls behind.
-The sender stops polling local producers while HTTP/2 or network output is
-blocked. Large serialized frames remain in nghttp2's buffer through partial
-writes; up to 4 KiB of small frames are coalesced and sent alongside them.
-Each event-loop turn drains at most 1 MiB in either network direction before
-yielding, avoiding one poll cycle per frame while bounding work per connection.
+GET /jobs/{id}/result waits for compilation. Its 200 response body is the
+object (or linked/preprocessed output). Decimal HTTP headers x-distcc-status,
+x-distcc-mode, x-distcc-stderr-size, x-distcc-stdout-size, x-distcc-object-size
+and x-distcc-deps-size carry the wait status, permissions and expanded sizes.
+GET /jobs/{id}/outputs/{index} retrieves a retained artifact (0 stderr,
+1 stdout, 2 object, 3 dependencies). Only nonempty ancillary artifacts need
+another request. Content-Length describes encoded bytes. The receiver checks
+both this length and the exact expanded size, rejecting trailing data,
+truncation and expansion beyond the declared size. HTTP END_STREAM plus the declared
+length, not a legacy DONE/JEND token, determines transfer completion.
+Compilation failure remains a successful HTTP exchange with nonzero compiler
+status. Protocol, worker and resource failures return non-2xx status or reset
+the request; incomplete outputs are never published as successful files.
 
-Connections advertise a 64 KiB maximum frame and at most 256 concurrent
-streams. DATA reads respect the peer's frame limit and both flow-control
-windows, including older peers using 16 KiB frames. Worker/resource admission
-still determines executable concurrency. Idle server connections expire after
-30 s. Objects and link inputs are not cached between jobs; source inputs can
-use protocol 13 as described below.
+DELETE /jobs/{id} cancels execution and releases retained artifacts. A client
+queues it after verifying all results, without waiting for its 204 response
+before delivering local result FDs. Abandoned local leases reset outstanding
+streams and queue DELETE even between uploads. Connection loss cancels every
+owned job. Cancelling a partially written DATA frame first finishes that
+frame; source truncation or a peer reset that invalidates a partial frame
+fails the connection rather than inserting a control frame into its body.
 
-Cached input manifests (13)
---------------------------
+Manifest scalars are unsigned 64-bit integers in network byte order. Strings
+are a length scalar followed by bytes, without NUL. Fields are: job kind
+(0 compile, 1 pump, 2 link), argc, input count, cwd, argv strings, then inputs.
+Each input carries kind (0 file, 1 symlink, 2 empty placeholder), encoding
+(0 raw, 1 LZ4 chunks), cached flag, wire size, expanded size, eight raw XXH3-64
+digest bytes, absolute path and link target strings. Count and argc are at
+most 65536; metadata is at most 16 MiB. Paths have no empty/dot components.
+The local result FD contains eleven scalars: status, mode, compressed-artifact
+bitmask (bit 0 through 3), four expanded sizes, then four wire sizes.
+The HTTP result uses headers instead of this local binary representation.
 
-An HTTP/2 response advertises x-distcc-cache: xxh3-64 when the daemon enables
-cached inputs. The broker conveys this capability with its job descriptor.
-For server preprocessing, clients with include-server XXH3-64 sidecars use
-cached manifests when an all-hit manifest would save at least 16 KiB,
-estimated from compressed file sizes minus digest and missing-bitmap costs.
-Smaller jobs, missing digest metadata and disabled caches use protocol 9.
-This avoids the missing-set exchange for small inputs. Protocol 13 has the
-same command, working-directory and result exchange as protocol 9.
-Obsolete cache protocols 11/12 are rejected. Upgrade clients, brokers, servers
-and pump sessions together and clear old input caches; no digest migration
-or old-version negotiation is provided.
+Each connection reserves at most 512 MiB for uploads, materialized input
+sizes and retained artifacts, including compressed expansion. Limits can
+reject a large job even when the host has free RAM. Jobs expire after
+DISTCC_IO_TIMEOUT without request/response progress or worker messages.
+Finished result descriptors stay pinned until DELETE or expiry. Idle
+connections with no jobs expire after 30 seconds. These limits exclude
+compiler working memory and the separate persistent input cache.
 
-NFIL is followed by a complete input manifest. Each entry has NAME and
-either HASH (length 8, canonical big-endian XXH3-64 with the default seed), LINK, or FILE with
-length zero for a directory
-placeholder. Hashes cover uncompressed contents including any inserted #line
-directive. Names are unique absolute paths without dot or empty components;
-the manifest is limited to 65536 entries and paths shorter than MAXPATHLEN.
-The server materializes verified cache hits into private job files, then
-sends MISS with length NFIL and one byte per entry (1 = upload, 0 = present).
-Only HASH entries can require upload. The client sends FILE payloads for the
-missing entries in manifest order, using the existing chunked LZ4 encoding.
-An actual miss requires a round trip before its upload, not one per file.
-With all inputs present the server proceeds after sending MISS without waiting
-for a client acknowledgement. A digest mismatch aborts the job before execution.
-XXH3-64 is a non-cryptographic identifier: accidental collisions remain possible,
-and it provides no protection against deliberately colliding inputs. Verification
-cannot distinguish such a collision. Cache keys have 16 hex characters.
-Request END_STREAM follows uploads. Manifest metadata is sent in bounded
-64 KiB batches, flushing before any inline file data.
+HTTP/2 receive windows are 256 KiB per stream and 8 MiB per connection.
+WINDOW_UPDATE follows a successful bounded pwrite to the prepared memfd.
+Outgoing file bodies use nghttp2's no-copy provider and sendfile; small memory
+bodies are copied at submission. The sender owns a duplicate immutable FD
+until stream close, so caller close/unlink cannot truncate a transfer.
+Short writes retain the exact frame header/body offsets. Frames are capped at
+64 KiB and each event-loop turn processes at most 1 MiB in either direction.
+At most 256 streams are active per connection. This removes userspace payload
+copies on send; receive, decompression and compiler input materialization
+still copy or write data.
 
-Protocol 13 permits
-nonempty FILE entries directly in the manifest; these entries never require
-an upload in MISS. Clients send inputs larger than the 4 MiB retention limit
-inline and exclude them from the savings estimate. A job without sufficient
-cacheable content uses protocol 9 without any lookup.
+Compiler admission remains separate from upload/download. HTTP/2 activates
+up to min(jobs, 4) additional persistent workers; ready jobs obey --jobs,
+memory admission and the single active-link limit. Closing a worker control
+channel retires that worker, so a racing grant cannot serve a subsequent job.
+TCP-only servers keep their original pool size.
 
-The include server hashes contents while producing its immutable compressed
-snapshot and stores the raw digest followed by its uint64 uncompressed length
-in network byte order in a .xxh3 sidecar (16 bytes total). Existing mutation
-checks invalidate the compressed snapshot and digest together. Cache hits
-are copied or reflinked, verified, and owned by the job; eviction cannot
-invalidate an active input. On filesystems without reflink, hashing occurs
-during the copy, without rereading the destination. Uploads are verified before
-atomic publication. Duplicate contents within a manifest use one upload and
-independent snapshots. Concurrent jobs share uploads using sorted byte-range
-leases on one persistent .uploads inode. Sorting prevents overlapping manifests
-from deadlocking; cancellation, timeout or worker death releases the leases.
-Waiters recheck the cache before sending MISS. Eviction or a skipped insertion
-can still cause a later reupload. Directory insertion locks remain nonblocking;
-an already valid entry is not copied or counted a second time during eviction.
+Input cache
+-----------
 
-DISTCCD_FILE_CACHE chooses a private daemon-owned directory. By default it is
-distcc-cache-<uid> under the daemon's TMPDIR. An explicitly empty value disables
-the capability. The cache is sharded into 64 directories, each limited to
-64 files and 4 MiB, for at most 4096 files and 256 MiB of payload. Shards evict
-oldest entries on insertion; files larger than 4 MiB are transferred but not
-retained. Cache storage failures become misses or skipped insertions and do
-not invalidate verified job inputs. Keep this directory on tmpfs when memory
-permits, or on storage with reflink support to reduce snapshot writes.
+Pump snapshots include a .xxh3 sidecar containing the default-seed XXH3-64
+digest followed by the expanded uint64 length (16 bytes, network byte order).
+Mutation checks invalidate the snapshot and sidecar together. If a sidecar is
+missing, the client does not use that manifest for cache lookup; it can recover
+expanded lengths from LZ4 chunk headers without decompression.
+
+The client uses cache keys when expected all-hit savings reach 16 KiB.
+Files larger than 4 MiB are never cached. Every job still uses the same
+manifest/PUT exchange; small inputs do not use a legacy fast-path RPC.
+Hits are copied or reflinked into private job files and verified. On systems
+without reflink, verification happens during copying. Duplicate contents
+share one upload but have independent snapshots. Concurrent jobs acquire
+sorted byte-range leases on one .uploads inode, recheck the cache, and upload
+only remaining misses. Cancellation, timeout and worker death release leases.
+
+XXH3-64 detects accidental changes; it is not collision resistant against
+adversarial input. Upload verification precedes atomic cache publication.
+DISTCCD_FILE_CACHE selects a private daemon-owned directory, defaulting to
+distcc-cache-<uid> under TMPDIR. An empty value disables retention; jobs then
+upload every required file. The cache has 64 shards, each limited to 64 files
+and 4 MiB, for at most 4096 files and 256 MiB. Insertion locks are nonblocking;
+eviction or storage failure can cause later reuploads without invalidating
+private inputs. Prefer tmpfs when memory permits or reflink-capable storage.
+
+Performance tradeoffs
+--------------------
+
+FD transfer reduces copying and removes the local stream relay, but requires
+separate HTTP resources, input materialization and bounded memfd storage.
+Small jobs can cost more client CPU. Uncompressed results can consume more
+bandwidth than TCP's LZ4 encoding, especially for debug objects and large
+preprocessor output. Use bench/rpc.py with actual builds and fallback disabled
+to compare both routes on the intended network before changing host options.

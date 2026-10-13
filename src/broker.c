@@ -22,6 +22,7 @@
 #include "adaptive.h"
 #include "broker.h"
 #include "http2.h"
+#include "job_client.h"
 #include "exitcode.h"
 #include "trace.h"
 
@@ -36,7 +37,7 @@
 #define MAX_CLIENTS 256
 enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3, MEMO_GET = 4, MEMO_PUT = 5,
        ACQUIRE_POOL = 6, RETURN = 7, ACQUIRE_LINK = 8, ACQUIRE_CPP = 9,
-       ACQUIRE_READY = 10, FAILED = 11 };
+       ACQUIRE_READY = 10, FAILED = 11, SUBMIT = 12 };
 #define MAX_MEMOS 32
 struct request { uint32_t version, command; };
 struct reply { int32_t status, slots; char host[1024]; };
@@ -52,12 +53,11 @@ struct peer {
     int pool_supported;
     int admission_supported;
     struct dcc_h2 *h2;
-    uint64_t h2_generation;
     size_t used;
     char stats[4096];
 };
 enum client_state { REQUEST, WAITING, CONNECTING, HELLO_SEND, HELLO_READ,
-                    RESERVE_SEND, RESERVE_READ, H2_WAIT, ACTIVE, MEMO_OWNER, MEMO_WAIT };
+                    RESERVE_SEND, RESERVE_READ, ACTIVE, MEMO_OWNER, MEMO_WAIT };
 struct client {
     int fd, net, peer, cpp_reserved;
     enum client_state state;
@@ -66,8 +66,7 @@ struct client {
     int memo;
     int pooled;
     int admission;
-    int h2_stream, h2_status, h2_file_cache;
-    uint64_t h2_generation;
+    struct dcc_client_job *job;
     size_t used;
     char hello[12];
 };
@@ -171,7 +170,7 @@ static int broker_request(uint32_t command, struct reply *reply, int *net)
     struct msghdr msg = {0};
     struct cmsghdr *cmsg;
     int fd;
-    ssize_t n;
+    ssize_t n = -1;
     *net = -1;
     if (unix_address(getenv("DISTCC_BROKER"), &address))
         return -1;
@@ -197,7 +196,8 @@ static int broker_request(uint32_t command, struct reply *reply, int *net)
     if (n != sizeof(*reply) || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
         reply->status || !memchr(reply->host, '\0', sizeof(reply->host)) ||
         ((command == ACQUIRE || command == ACQUIRE_POOL || command == ACQUIRE_CPP ||
-          command == ACQUIRE_READY) && *net < 0) || (command == JOBS && *net >= 0))
+          command == ACQUIRE_READY) && *net < 0 && !(reply->slots & DCC_BROKER_DIRECT)) ||
+        (command == JOBS && *net >= 0))
         goto failed;
     return fd;
 failed:
@@ -206,7 +206,8 @@ failed:
         *net = -1;
     }
     close(fd);
-    rs_log_error("local broker request failed");
+    rs_log_error("local broker request failed (command=%u, bytes=%zd, status=%d, flags=%d)",
+                 command, n, n == sizeof(*reply) ? reply->status : -1, msg.msg_flags);
     return -1;
 }
 
@@ -221,8 +222,6 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready)
     free_hosts(local);
     int remote_cpp = getenv("INCLUDE_SERVER_PORT") != NULL;
     fd = broker_request(remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL, &reply, &net);
-    if (fd < 0 && (remote_cpp || cpp_ready)) fd = broker_request(ACQUIRE_POOL, &reply, &net);
-    if (fd < 0) fd = broker_request(ACQUIRE, &reply, &net);
     if (fd < 0)
         return EXIT_CONNECT_FAILED;
     *host = NULL;
@@ -246,9 +245,14 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready)
     (*host)->broker_fd = net;
     (*host)->broker_lease = fd;
     (*host)->broker_pooled = !!(reply.slots & DCC_BROKER_POOLED);
-    (*host)->file_cache = !!(reply.slots & DCC_BROKER_FILE_CACHE);
     *lease = fd;
     return 0;
+}
+
+int dcc_broker_submit(const struct dcc_hostdef *host, int metadata)
+{
+    struct request request = { BROKER_VERSION, SUBMIT };
+    return dcc_send_fd(host->broker_lease, &request, sizeof(request), metadata);
 }
 
 void dcc_broker_return(const struct dcc_hostdef *host, int fd)
@@ -352,11 +356,10 @@ static void release_assignment(struct broker *broker, struct client *client)
     client->cpp_reserved = 0;
     if (client->peer >= 0) {
         struct peer *p = &broker->peers[client->peer];
-        if (client->h2_stream && client->h2_generation == p->h2_generation)
-            dcc_h2_cancel(p->h2, client->h2_stream);
         p->busy--;
     }
-    client->h2_stream = 0;
+    dcc_job_client_free(client->job);
+    client->job = NULL;
     if (client->net >= 0) close(client->net);
     client->net = client->peer = -1;
 }
@@ -482,13 +485,14 @@ static void pool_store(struct broker *broker, struct client *client, int fd, dou
 static void deliver_connection(struct broker *broker, struct client *client)
 {
     struct reply reply = { .slots = client->pooled ? DCC_BROKER_POOLED : 0 };
-    if (client->h2_file_cache) reply.slots |= DCC_BROKER_FILE_CACHE;
+    if (broker->peers[client->peer].host->http2)
+        reply.slots |= DCC_BROKER_DIRECT;
     strcpy(reply.host, broker->peers[client->peer].host->hostdef_string);
     if (send_reply(client->fd, &reply, client->net)) {
         release_client(broker, client);
         return;
     }
-    close(client->net);
+    if (client->net >= 0) close(client->net);
     client->net = -1;
     client->state = ACTIVE;
 }
@@ -533,25 +537,21 @@ static int dispatch(struct broker *broker, struct client *client, double now)
             if (!p->h2) {
                 int fd = connect_peer(p, p->host->port);
                 if (fd >= 0) {
-                    p->h2 = dcc_h2_new(fd, NULL, NULL);
+                    p->h2 = dcc_h2_new(fd, 0, &dcc_job_client_events, NULL);
                     if (!p->h2) close(fd);
-                    else p->h2_generation++;
                 }
             }
-            if (!p->h2 || (client->h2_stream = dcc_h2_open(p->h2, link,
-                    &client->net, &client->h2_status, &client->h2_file_cache)) < 0) {
-                client->h2_stream = 0;
+            if (!p->h2) {
                 p->retry_at = now + 5;
                 return 1;
             }
             client->peer = best;
-            client->h2_generation = p->h2_generation;
-            client->state = H2_WAIT;
-            client->deadline = now + 3;
+            client->net = -1;
             client->pooled = 0;
             p->busy++;
             broker->cpp_busy += local_cpp;
             client->cpp_reserved = local_cpp;
+            deliver_connection(broker, client);
             return 0;
         }
         client->admission = client->command != ACQUIRE &&
@@ -892,19 +892,6 @@ int dcc_broker_serve(const char *path)
             }
             if (c->state == CONNECTING && now >= c->deadline)
                 connection_event(broker, c, now, 1);
-            if (c->state == H2_WAIT) {
-                struct peer *p = &broker->peers[c->peer];
-                if (c->h2_status == 200) deliver_connection(broker, c);
-                else if (c->h2_status || now >= c->deadline) {
-                    if (c->h2_status == 503) {
-                        if (c->command == ACQUIRE_LINK) p->link_until = now + .05;
-                        else p->full_until = now + .05;
-                    } else p->retry_at = now + 5;
-                    release_assignment(broker, c);
-                    c->state = WAITING;
-                    wake_at = now;
-                }
-            }
             if ((c->state == HELLO_SEND || c->state == HELLO_READ) && now >= c->deadline)
                 hello_event(broker, c, 1);
             if ((c->state == RESERVE_SEND || c->state == RESERVE_READ) && now >= c->deadline)
@@ -914,7 +901,7 @@ int dcc_broker_serve(const char *path)
                 wake_at = now;
             if (c->fd < 0)
                 continue;
-            if ((c->state == REQUEST || c->state == CONNECTING || c->state == H2_WAIT || c->state == HELLO_SEND || c->state == HELLO_READ ||
+            if ((c->state == REQUEST || c->state == CONNECTING || c->state == HELLO_SEND || c->state == HELLO_READ ||
                  c->state == RESERVE_SEND || c->state == RESERVE_READ ||
                  c->state == MEMO_OWNER || c->state == MEMO_WAIT) && c->deadline < wake_at)
                 wake_at = c->deadline;
@@ -951,6 +938,9 @@ int dcc_broker_serve(const char *path)
             if (h2_index[i] >= 0 && dcc_h2_process(p->h2, polls + h2_index[i])) {
                 dcc_h2_free(p->h2);
                 p->h2 = NULL;
+                for (int j = 0; j < MAX_CLIENTS; ++j)
+                    if (broker->clients[j].peer == i)
+                        dcc_job_client_disconnected(broker->clients[j].job);
                 if (p->busy) p->retry_at = now + 5;
             }
         }
@@ -966,6 +956,21 @@ int dcc_broker_serve(const char *path)
                 int returned;
                 ssize_t length = dcc_recv_fd(c->fd, &packet, sizeof(packet), &returned);
                 struct request request = packet.header;
+                if (c->state == ACTIVE && c->peer >= 0 && broker->peers[c->peer].host->http2 &&
+                    length == sizeof(request)) {
+                    if (request.version == BROKER_VERSION && request.command == SUBMIT && !c->job &&
+                        returned >= 0 && broker->peers[c->peer].h2) {
+                        c->job = dcc_job_client_start(broker->peers[c->peer].h2, c->fd, returned);
+                        close(returned);
+                        if (!c->job) release_client(broker, c);
+                        continue;
+                    }
+                    if (request.version == DCC_JOB_INPUT && c->job) {
+                        struct dcc_job_message message = { request.version, request.command };
+                        dcc_job_client_input(c->job, &message, returned);
+                        continue;
+                    }
+                }
                 if (returned < 0 && c->state == ACTIVE && length == sizeof(request) &&
                     request.version == BROKER_VERSION && request.command == FAILED) {
                     broker->peers[c->peer].retry_at = now + (backoff > 0 ? backoff : 0);

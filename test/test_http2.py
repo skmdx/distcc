@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """HTTP/2 multiplexing and cancellation through real distccd workers."""
 import concurrent.futures
+import array
+from contextlib import ExitStack
+import fcntl
 import io
 import json
 import xxhash
@@ -104,76 +107,98 @@ sys.exit(result)
             self.restart_server(self.build / 'distccd')
 
     def cached_compile(self, files, *, abort=False, corrupt=False, reject_manifest=False,
-                       ready=None, execute=False, inline=()):
-        helper = runpy.run_path(str(self.build / 'distcc-link'))
-        def string(name, value):
-            return f'{name}{len(value):08x}'.encode() + value
+                       ready=None, execute=False, inline=(), after_upload=None, capture=None,
+                       declared_size=None):
+        def string(value):
+            return struct.pack('!Q', len(value)) + value
         args = [b'gcc', b'-c', b'/src/source.c', b'-o', b'/src/result.o']
-        version = 13
-        header = f'DIST{version:08x}'.encode() + string('CDIR', b'/src') + f'ARGC{len(args):08x}'.encode()
-        header += b''.join(string('ARGV', arg) for arg in args)
-        header += f'NFIL{len(files):08x}'.encode()
+        header = struct.pack('!3Q', 1, len(args), len(files)) + string(b'/src')
+        header += b''.join(string(arg) for arg in args)
         for index, (name, body) in enumerate(files):
-            header += string('NAME', name)
-            if index in inline:
-                header += b'FILEffffffff'
-                for offset in range(0, len(body), 262144):
-                    chunk = body[offset:offset + 262144]
-                    header += struct.pack('!II', len(chunk), 0) + chunk
-                header += bytes(8)
-            else:
-                header += string('HASH', xxhash.xxh3_64(body).digest())
-        with self.request(9) as lease:
+            size = len(body) if declared_size is None else declared_size
+            header += struct.pack('!5Q', 0, 0, int(index not in inline), size, size)
+            header += xxhash.xxh3_64(body).digest() + string(name) + string(b'')
+        wanted = bytearray(len(files))
+        with ExitStack() as stack, self.request(9) as lease:
+            lease.settimeout(15)
+            def send(operation, index, data):
+                fd = os.memfd_create('test-job', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+                try:
+                    with os.fdopen(os.dup(fd), 'wb') as stream:
+                        stream.write(data)
+                    fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK |
+                                fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
+                    lease.sendmsg([struct.pack('=II', operation, index)],
+                                  [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [fd]))])
+                finally:
+                    os.close(fd)
             status, caps, fds = self.receive(lease)
             self.assertEqual(status, 0)
-            self.assertTrue(caps & (1 << 29), 'server cache capability was not negotiated')
-            with socket.socket(fileno=fds[0]) as net:
-                net.settimeout(10)
-                net.sendall(header)
-                with net.makefile('rb') as response:
-                    if reject_manifest:
-                        self.assertEqual(response.read(), b'')
-                        return None
-                    self.assertEqual(helper['token'](response, 'MISS'), len(files))
-                    wanted = helper['receive_exact'](response, len(files))
+            self.assertTrue(caps & (1 << 28))
+            self.assertEqual(fds, [])
+            send(2, 12, header)
+            outputs = [b''] * 4
+            while True:
+                packet, ancillary, flags, _ = lease.recvmsg(8, socket.CMSG_SPACE(16), socket.MSG_CMSG_CLOEXEC)
+                received = []
+                for level, kind, data in ancillary:
+                    if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
+                        received.extend(array.array('i', data))
+                for fd in received:
+                    stack.callback(os.close, fd)
+                self.assertFalse(flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC))
+                if reject_manifest and not packet:
+                    return None
+                self.assertEqual(len(packet), 8)
+                operation, index = struct.unpack('=II', packet)
+                if operation == 65536:
+                    self.assertFalse(received)
+                    wanted[index] = int(index not in inline)
                     if ready:
                         ready()
-                    for (_, body), missing in zip(files, wanted):
-                        self.assertIn(missing, (0, 1))
-                        if not missing:
-                            continue
-                        net.sendall(b'FILEffffffff')
-                        if abort:
-                            net.sendall(struct.pack('!II', len(body), 0) + body[:1])
-                            return wanted
-                        if corrupt:
-                            body += b'changed'
-                        for offset in range(0, len(body), 262144):
-                            chunk = body[offset:offset + 262144]
-                            net.sendall(struct.pack('!II', len(chunk), 0) + chunk)
-                        net.sendall(bytes(8))
-                    net.shutdown(socket.SHUT_WR)
+                        ready = None
+                    if abort:
+                        return bytes(wanted)
+                    body = files[index][1]
                     if corrupt:
-                        self.assertEqual(response.read(), b'')
-                        return wanted
-                    self.assertEqual(helper['token'](response, 'DONE'), version)
-                    self.assertEqual(helper['token'](response, 'STAT'), 0)
-                    codec = helper['Lz4Chunks']()
-                    outputs = []
-                    for kind in ('SERR', 'SOUT', 'DOTO', 'DOTD'):
-                        output = io.BytesIO()
-                        helper['copy_response'](response, kind, output, codec)
-                        outputs.append(output.getvalue())
-                    self.assertEqual(outputs[:2], [b'', b''])
-                    self.assertTrue(outputs[2].startswith(b'\x7fELF'))
-                    self.assertEqual(response.read(1), b'')
-                    if execute:
-                        assert self.cc is not None
-                        obj, binary = self.work / 'snapshot.o', self.work / 'snapshot'
-                        obj.write_bytes(outputs[2])
-                        subprocess.run([self.cc, str(obj), '-o', str(binary)], check=True)
-                        subprocess.run([str(binary)], check=True)
-                    return wanted
+                        body = bytes([body[0] ^ 1]) + body[1:]
+                    send(65537, index, body)
+                    if after_upload:
+                        after_upload(lease)
+                        after_upload = None
+                elif operation == 65538:
+                    self.assertEqual(len(received), 1)
+                    outputs[index] = os.pread(received[0], os.fstat(received[0]).st_size, 0)
+                else:
+                    self.assertEqual(operation, 65539)
+                    if corrupt or reject_manifest:
+                        self.assertNotEqual(index, 0)
+                        return None if reject_manifest else bytes(wanted)
+                    self.assertEqual(index, 0)
+                    self.assertEqual(len(received), 1)
+                    status, mode, compressed, *lengths = struct.unpack('!11Q', os.pread(received[0], 88, 0))
+                    sizes, wire_sizes = lengths[:4], lengths[4:]
+                    self.assertEqual(status, 0)
+                    self.assertEqual(wire_sizes, list(map(len, outputs)))
+                    link = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'distcc-link'))
+                    for artifact in range(4):
+                        if compressed & (1 << artifact):
+                            source, target = io.BytesIO(outputs[artifact]), io.BytesIO()
+                            link['copy_lz4'](source.read, target, link['Lz4Chunks'](), sizes[artifact])
+                            self.assertEqual(source.tell(), wire_sizes[artifact])
+                            outputs[artifact] = target.getvalue()
+                    self.assertEqual(sizes, list(map(len, outputs)))
+                    break
+            self.assertEqual(outputs[:2], [b'', b''])
+            self.assertTrue(outputs[2].startswith(b'\x7fELF'))
+            if capture is not None:
+                capture.extend(outputs)
+            if execute:
+                obj, binary = self.work / ('snapshot-' + str(threading.get_ident()) + '.o'), self.work / ('snapshot-' + str(threading.get_ident()))
+                obj.write_bytes(outputs[2])
+                subprocess.run([self.cc, str(obj), '-o', str(binary)], check=True)
+                subprocess.run([str(binary)], check=True)
+            return bytes(wanted)
 
     def test_cached_upload_cancel_corruption_and_concurrency(self):
         self.start_h2()
@@ -260,11 +285,17 @@ sys.exit(result)
                             reject_manifest=True)
         self.assertEqual(self.cached_compile([(b'/src/source.c', body)]), b'\1')
 
+    def test_expanded_input_budget_rejects_before_upload(self):
+        self.start_h2()
+        self.cached_compile([(b'/src/source.c', b'')], inline=(0,),
+                            declared_size=512 * 1024 * 1024, reject_manifest=True)
+        self.job('after-resource-rejection')
+
     def test_active_job_keeps_private_snapshot(self):
         self.start_h2()
         body = b'int main(void) { return 0; }\n'
-        files = [(b'/src/source.c', body)]
-        self.cached_compile(files, execute=True)
+        files = [(b'/src/source.c', body), (b'/src/barrier.h', b'/* barrier */')]
+        self.cached_compile(files, execute=True, inline=(1,))
         key = xxhash.xxh3_64(body).hexdigest()
         entry = self.root / f'distcc-cache-{os.geteuid()}' / f'{int(key[:2], 16) % 64:02x}' / key
         def change_cached_inode():
@@ -272,8 +303,8 @@ sys.exit(result)
             entry.write_bytes(b'int main(void) { return 13; }\n')
         # MISS is emitted only after hits have been materialized. The real
         # compiler fixture sleeps before opening inputs, exposing shared inodes.
-        self.assertEqual(self.cached_compile(files, ready=change_cached_inode, execute=True), b'\0')
-        self.assertEqual(self.cached_compile(files, execute=True), b'\1')
+        self.assertEqual(self.cached_compile(files, ready=change_cached_inode, execute=True, inline=(1,)), b'\0\0')
+        self.assertEqual(self.cached_compile(files, execute=True, inline=(1,)), b'\1\0')
 
     def start_h2(self, name='broker'):
         return self.start_broker(self.host(0, f',h2,lz4,stats={self.stats_ports[0]}') +
@@ -293,23 +324,97 @@ sys.exit(result)
         self.assertEqual(self.accepts() - before, 1)
         self.assertIn('dcc_busy 0\n', self.get_stats(self.stats_ports[0]))
 
+    def test_completed_jobs_immediately_reuse_workers(self):
+        self.start_h2()
+        before = self.accepts()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(self.job, (f'handoff-{i}' for i in range(64))))
+        self.assertEqual(len(results), 64)
+        self.assertEqual(self.accepts() - before, 1)
+
+    def test_retiring_workers_deliver_queued_results(self):
+        clock = self.work / 'retirement.c'
+        library = self.work / 'retirement.so'
+        gate = self.work / 'retire'
+        clock.write_text('''#include <time.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <poll.h>
+#include <dlfcn.h>
+static pid_t parent;
+__attribute__((constructor)) static void remember_parent(void) { parent = getpid(); }
+void exit(int status) {
+    void (*real_exit)(int) = dlsym(RTLD_NEXT, "exit");
+    const char *gate = getenv("DISTCC_TEST_CLOCK_GATE");
+    /* Leave retiring workers visible after FINISHED while clients submit
+     * their next jobs. This must wait for replacement, never return 503. */
+    if (getpid() != parent && gate && access(gate, F_OK) == 0) usleep(1000000);
+    real_exit(status);
+    __builtin_unreachable();
+}
+time_t time(time_t *out) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    const char *gate = getenv("DISTCC_TEST_CLOCK_GATE");
+    time_t value = now.tv_sec + (gate && access(gate, F_OK) == 0 ? 61 : 0);
+    if (out) *out = value;
+    return value;
+}
+int poll(struct pollfd *fds, nfds_t count, int timeout) {
+    int (*real_poll)(struct pollfd *, nfds_t, int) = dlsym(RTLD_NEXT, "poll");
+    int result = real_poll(fds, count, timeout);
+    const char *gate = getenv("DISTCC_TEST_CLOCK_GATE");
+    if (result > 0 && gate && access(gate, F_OK) == 0) usleep(20000);
+    return result;
+}
+''')
+        subprocess.run([self.cc, '-shared', '-fPIC', str(clock), '-o', str(library)],
+                       check=True, capture_output=True, timeout=15)
+        wrapper = self.root / 'bin' / 'gcc'
+        original = wrapper.read_text()
+        wrapper.write_text('#!/bin/sh\nexec ' + self.cc + ' "$@"\n')
+        try:
+            self.restart_server(Path(os.environ.get('DISTCC_RETIRE_TEST_SERVER', self.build / 'distccd')),
+                                LD_PRELOAD=str(library), DISTCC_TEST_CLOCK_GATE=str(gate))
+            self.start_h2()
+            def compile_job(index):
+                return self.cached_compile([(b'/src/source.c', f'int retired_{index};'.encode())], inline=(0,))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(compile_job, range(512)))
+                parent = self.daemons[0].pid
+                children = Path(f'/proc/{parent}/task/{parent}/children')
+                before = set(children.read_text().split())
+                gate.touch()
+                list(pool.map(compile_job, range(512, 576)))
+                self.assertNotEqual(set(children.read_text().split()), before,
+                                    'test did not reach worker retirement')
+        finally:
+            wrapper.write_text(original)
+            self.restart_server(self.build / 'distccd')
+
     def test_stalled_uploads_leave_execution_slots_available(self):
         self.start_h2()
-        leases, sockets = [], []
-        try:
-            for _ in range(4):
-                lease = self.request(9)
-                leases.append(lease)
-                status, _, fds = self.receive(lease)
-                self.assertEqual(status, 0)
-                sockets.append(socket.socket(fileno=fds[0]))
-            stats = self.get_stats(self.stats_ports[0])
-            self.assertIn('dcc_busy 0\n', stats)
-            self.assertIn('dcc_queued 4\n', stats)
-            self.job('ready-behind-stalled-inputs')
-        finally:
-            for lease in leases: lease.close()
-            for net in sockets: net.close()
+        entered = [threading.Event() for _ in range(4)]
+        release = threading.Event()
+        def stalled(index):
+            def ready():
+                entered[index].set()
+                self.assertTrue(release.wait(10))
+            return self.cached_compile([(b'/src/source.c', f'int stalled_{index};'.encode())],
+                                       ready=ready, abort=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(stalled, index) for index in range(4)]
+            try:
+                for event in entered:
+                    self.assertTrue(event.wait(5))
+                stats = self.get_stats(self.stats_ports[0])
+                self.assertIn('dcc_busy 0\n', stats)
+                self.assertIn('dcc_queued 4\n', stats)
+                self.job('ready-behind-stalled-inputs')
+            finally:
+                release.set()
+            for future in futures:
+                future.result(timeout=10)
         self.job('after-stalled-cancel')
 
     def test_pipeline_respects_execution_limit(self):
@@ -364,15 +469,8 @@ sys.exit(result)
     def test_cancel_stream_preserves_other_jobs(self):
         self.start_h2()
         before = self.accepts()
-        lease = self.request(6)
-        status, capabilities, fds = self.receive(lease)
-        self.assertEqual((status, capabilities, len(fds)), (0, 1 << 29, 1))
-        with socket.socket(fileno=fds[0]) as net:
-            net.sendall(b'DIST00000006ARGC00000002ARGV00000003gcc')
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                other = pool.submit(self.job, 'uncancelled')
-                lease.close()
-                other.result(timeout=20)
+        self.cached_compile([(b'/src/source.c', b'int cancelled;')],
+                            ready=lambda: self.job('uncancelled'), abort=True)
         self.job('after-cancel')
         self.assertEqual(self.accepts() - before, 1)
 
@@ -392,39 +490,18 @@ sys.exit(result)
                        capture_output=True, timeout=30)
         self.assertEqual(payload.read_bytes(), data)
 
-    def test_slow_result_consumer_preserves_other_jobs(self):
+    def test_unread_result_descriptors_preserve_other_jobs(self):
         self.start_h2()
         data = random.Random(43).randbytes(2 * 1024 * 1024)
         body = ('const unsigned char blob[] = {' + ','.join(map(str, data)) + '};\n').encode()
-        args = [b'gcc', b'-c', b'source.i', b'-o', b'result.o']
-        header = b'DIST00000008' + f'ARGC{len(args):08x}'.encode()
-        header += b''.join(f'ARGV{len(arg):08x}'.encode() + arg for arg in args)
-        with self.request(6) as lease:
-            status, _, fds = self.receive(lease)
-            self.assertEqual(status, 0)
-            with socket.socket(fileno=fds[0]) as net:
-                net.settimeout(20)
-                net.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-                net.sendall(header + b'DOTIffffffff')
-                for start in range(0, len(body), 262144):
-                    chunk = body[start:start + 262144]
-                    net.sendall(struct.pack('!II', len(chunk), 0) + chunk)
-                net.sendall(bytes(8))
-                net.shutdown(socket.SHUT_WR)
-                self.assertTrue(select.select([net], [], [], 20)[0])
-                # Leave a result larger than every stream/socket buffer unread
-                # while another real compilation completes on the same session.
-                self.job('while-result-blocked')
-                helper = runpy.run_path(str(self.build / 'distcc-link'))
-                codec = helper['Lz4Chunks']()
-                result = self.work / 'slow.o'
-                with net.makefile('rb') as response, result.open('wb') as output:
-                    self.assertEqual(helper['token'](response, 'DONE'), 8)
-                    self.assertEqual(helper['token'](response, 'STAT'), 0)
-                    helper['copy_response'](response, 'SERR', io.BytesIO(), codec)
-                    helper['copy_response'](response, 'SOUT', io.BytesIO(), codec)
-                    helper['copy_response'](response, 'DOTO', output, codec)
-                    self.assertEqual(response.read(1), b'')
+        outputs = []
+        def wait(lease):
+            self.assertTrue(select.select([lease], [], [], 20)[0])
+            self.job('while-result-unread')
+        self.cached_compile([(b'/src/source.c', body)], inline=(0,),
+                            after_upload=wait, capture=outputs)
+        result = self.work / 'slow.o'
+        result.write_bytes(outputs[2])
         payload = self.work / 'slow.payload'
         subprocess.run(['objcopy', '--dump-section', '.rodata=' + str(payload), str(result)],
                        check=True, capture_output=True, timeout=10)
@@ -433,22 +510,14 @@ sys.exit(result)
     def test_old_lease_cannot_cancel_reconnected_stream(self):
         self.start_h2()
         old_lease = self.request(6)
-        status, _, fds = self.receive(old_lease)
+        status, caps, fds = self.receive(old_lease)
         self.assertEqual(status, 0)
-        old_net = socket.socket(fileno=fds[0])
-        self.addCleanup(old_lease.close)
-        self.addCleanup(old_net.close)
+        self.assertEqual(fds, [])
+        self.assertTrue(caps & (1 << 28))
         self.restart_server(self.build / 'distccd')
         time.sleep(5.1)  # The broken connection's peer backoff expires.
-        with self.request(6) as lease:
-            lease.settimeout(10)
-            status, _, fds = self.receive(lease)
-            self.assertEqual(status, 0)
-            with socket.socket(fileno=fds[0]) as net:
-                old_lease.close()
-                net.settimeout(.2)
-                with self.assertRaises(socket.timeout):
-                    net.recv(1)
+        self.job('new-connection')
+        old_lease.close()
         self.job('reconnected')
 
     def test_blocked_worker_does_not_spin_broker(self):

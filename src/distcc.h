@@ -24,6 +24,7 @@
 /* distcc.h -- common internal-use header file */
 
 #include <sys/types.h>
+#include <stdint.h>
 #include <sys/time.h>     /* for struct timeval */
 
 
@@ -110,8 +111,7 @@ enum dcc_protover {
     DCC_VER_LZ4_CPP = 7,        /**< LZ4, server-side cpp */
     DCC_VER_STREAM = 8,         /**< chunked LZ4, client-side cpp */
     DCC_VER_STREAM_CPP = 9,     /**< chunked LZ4, server-side cpp */
-    DCC_VER_STREAM_LINK = 10,   /**< chunked LZ4, cached-sysroot link */
-    DCC_VER_CACHED_CPP = 13    /**< inline manifest with XXH3-64 input digests */
+    DCC_VER_STREAM_LINK = 10    /**< chunked LZ4, cached-sysroot link */
 };
 
 
@@ -263,6 +263,7 @@ int dcc_r_bulk_lz4(struct dcc_buffer *output, int in_fd, unsigned in_len);
 #define DCC_STREAM_CHUNK (256 * 1024)
 int dcc_x_lz4_stream(int out_fd, int in_fd, off_t size);
 int dcc_r_lz4_stream(int out_fd, struct dcc_buffer *output, int in_fd);
+int dcc_r_lz4_stream_bounded(int out_fd, struct dcc_buffer *output, int in_fd, uint64_t limit);
 
 int dcc_compress_lzo1x_alloc(const char *in_buf,
                             size_t in_len,

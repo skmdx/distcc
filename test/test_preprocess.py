@@ -85,7 +85,8 @@ class PreprocessTest(BrokerTestCase):
                 self.assertEqual(remote.stdout, b'')
                 self.assertEqual((self.work / 'result.i').read_bytes(), expected)
         log = (self.work / 'client.log').read_text()
-        self.assertIn('client finished sending request to server', log)
+        self.assertIn('direct HTTP/2 job completed' if self.transport == ',h2' else
+                      'client finished sending request to server', log)
 
     def test_changed_generated_deleted_headers_and_symlinks(self):
         for directory in ('first', 'second'):
@@ -311,7 +312,10 @@ class Http2PreprocessTest(PreprocessTest):
         try:
             self.restart_server(self.build / 'distccd', DISTCCD_FILE_CACHE='')
             self.compare(args=['-P'])
-            self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
+            first = self.cache_counts()[0]
+            self.compare(args=['-P'])
+            self.assertGreater(first, 0)
+            self.assertEqual(self.cache_counts()[0], first)
         finally:
             self.restart_server(self.build / 'distccd')
 

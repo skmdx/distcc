@@ -642,13 +642,19 @@ Bulk data is sent in bounded chunks instead of buffering its complete compressed
 representation. Both endpoints and the pump include server must be upgraded.
 .TP
 .B ,h2
-Multiplexes RPC jobs over a persistent HTTP/2 connection to this TCP host.
-Requires DISTCC_BROKER and implies lz4s regardless of other codec options.
+Multiplexes job resources over a persistent HTTP/2 connection to this TCP host.
+Requires DISTCC_BROKER and uses lz4s snapshots for pump inputs.
 Uses cleartext HTTP/2 with the server's existing IP access rules; SSH and GSSAPI
 cannot be combined with this option. Each stream consumes a worker only after
 admission. HTTP/2 flow control bounds queued data; closing a client lease cancels
-only its stream. This option reduces connection count but adds local relay CPU
-and memory costs. Benchmark the build before enabling it.
+its job. Local control channels pass file descriptors; DATA bodies are sent
+directly from files. Clients and workers compress preprocessed inputs, link
+archives and results with LZ4 when it reduces their size. Encoded bodies use
+sealed memfds and Content-Encoding; the broker does not repack them.
+The connection reserves up to 512 MiB for input expansion,
+uploads and retained results. Small jobs can use more client CPU.
+Benchmark before enabling it.
+Update both endpoints together; the former RPC tunnel is not supported.
 .TP
 .B ,cpp
 Enables distcc-pump mode for this host.  Note: the build command must be
