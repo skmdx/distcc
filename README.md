@@ -129,7 +129,7 @@ Upgrade servers before changing client host entries to `,lz4`. Restart brokers
 and active pump sessions after upgrading the client.
 
 Build using the usual `./autogen.sh`, `./configure`, and `make` steps, with the
-LZ4 library and development headers installed.
+LZ4, nghttp2 and OpenSSL libcrypto libraries and development headers installed.
 `make adaptive-check` runs real GCC compiles through two local daemons, checks
 the linked executables, and exercises controlled load/error responses and slot
 locking. Set `TMPDIR` to a suitable temporary directory. `make check` includes

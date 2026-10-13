@@ -110,7 +110,8 @@ enum dcc_protover {
     DCC_VER_LZ4_CPP = 7,        /**< LZ4, server-side cpp */
     DCC_VER_STREAM = 8,         /**< chunked LZ4, client-side cpp */
     DCC_VER_STREAM_CPP = 9,     /**< chunked LZ4, server-side cpp */
-    DCC_VER_STREAM_LINK = 10    /**< chunked LZ4, cached-sysroot link */
+    DCC_VER_STREAM_LINK = 10,   /**< chunked LZ4, cached-sysroot link */
+    DCC_VER_CACHED_CPP = 11     /**< content-addressed input manifest */
 };
 
 

@@ -51,6 +51,13 @@ TCP without the HTTP/2 relay. Sources, objects and link archives stream in
 support pump and distributed links. Existing `,lz4` and `,lzo` hosts remain
 compatible. Restart pump sessions after upgrading their include server.
 
+With `,h2` and pump, supporting peers exchange a SHA-256 input manifest and
+upload only files missing from the worker's bounded cache. Small inputs and
+old peers keep the existing full-file exchange. Cache hits are verified and copied or
+reflinked into private job files; a compiler never shares writable cache
+inodes. See doc/protocol-6.txt for the exchange, storage limits and
+DISTCCD_FILE_CACHE setting. This requires OpenSSL libcrypto at build time.
+
 GCC and Clang/LLD object links can also run on a broker-selected worker. `distcc-link --sync`
 populates immutable sysroot caches using compressed rsync transfers; set
 DISTCC_LINK_SYSROOT to the resulting client profile and DISTCCD_LINK_ROOT on

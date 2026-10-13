@@ -284,7 +284,7 @@ distccd_obj = src/access.o						\
 	src/prefork.o							\
 	src/stringmap.o							\
 	src/serve.o src/setuid.o src/srvnet.o src/srvrpc.o src/state.o	\
-	src/stats.o src/adaptive.o src/broker.o src/http2.o src/clinet.o	\
+	src/stats.o src/adaptive.o src/broker.o src/http2.o src/clinet.o src/file_cache.o	\
 	src/fix_debug_info.o						\
 	@ZEROCONF_DISTCCD_OBJS@						\
 	@AUTH_DISTCCD_OBJS@						\
@@ -332,7 +332,7 @@ h_getline_obj = src/h_getline.o $(common_obj)
 SRC =	src/stats.c src/adaptive.c src/broker.c src/http2.c			\
 	src/access.c src/arg.c src/argutil.c				\
 	src/auth_common.c src/auth_distcc.c src/auth_distccd.c		\
-	src/backoff.c src/bulk.c src/compress_stream.c					\
+	src/backoff.c src/bulk.c src/compress_stream.c src/file_cache.c	\
 	src/cleanup.c							\
 	src/climasq.c src/clinet.c src/clirpc.c src/compile.c src/native.c \
 	src/compress.c src/cpp.c					\
@@ -364,7 +364,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c src/http2.c			\
 	src/zeroconf.c src/zeroconf-reg.c src/gcc-id.c
 
 
-HEADERS = src/stats.h src/adaptive.h src/broker.h src/http2.h		\
+HEADERS = src/stats.h src/adaptive.h src/broker.h src/http2.h src/file_cache.h	\
 	src/access.h							\
 	src/auth.h							\
 	src/bulk.h							\
@@ -505,7 +505,7 @@ distcc@EXEEXT@: $(distcc_obj)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(distcc_obj) $(LIBS)
 
 distccd@EXEEXT@: $(distccd_obj)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(distccd_obj) $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(distccd_obj) $(LIBS) @CRYPTO_LIBS@
 
 distccmon-text@EXEEXT@: $(mon_obj) src/mon-text.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(mon_obj) src/mon-text.o $(LIBS)

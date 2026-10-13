@@ -485,12 +485,14 @@ int dcc_get_features_from_protover(enum dcc_protover protover,
         break;
     case DCC_VER_STREAM:
     case DCC_VER_STREAM_CPP:
+    case DCC_VER_CACHED_CPP:
         *compr = DCC_COMPRESS_LZ4_STREAM;
         break;
     default:
         return 1;
     }
-    *cpp_where = (protover == DCC_VER_3 || protover == DCC_VER_LZ4_CPP || protover == DCC_VER_STREAM_CPP)
+    *cpp_where = (protover == DCC_VER_3 || protover == DCC_VER_LZ4_CPP ||
+                  protover == DCC_VER_STREAM_CPP || protover == DCC_VER_CACHED_CPP)
                 ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT;
     return 0;
 }

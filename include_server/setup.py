@@ -33,6 +33,7 @@ __author__ = 'Manos Renieris and Nils Klarlund'
 
 import setuptools
 import doctest
+import glob
 import os
 import shlex
 import sys
@@ -109,7 +110,8 @@ if not cpp_flags_env:
 cpp_flags_includes = GetIncludes(cpp_flags_env)
 
 # SRCDIR checking.
-if not os.getenv('SRCDIR'):
+srcdir_env = os.getenv('SRCDIR')
+if not srcdir_env:
   # Don't quit; perhaps the user is asking for help using '--help'.
   print('setup.py: SRCDIR must be defined.', sys.stderr)
   srcdir = 'UNDEFINED'
@@ -119,7 +121,7 @@ else:
   # location, and so to avoid that relative source paths with '..' make built
   # files end up outside the build location, the location is changed to an
   # absolute path.
-  srcdir = os.path.abspath(os.getenv('SRCDIR'))
+  srcdir = os.path.abspath(srcdir_env)
   if not os.path.isdir(srcdir):
     sys.exit("""Could not cd to SRCDIR '%s'.""" % srcdir)
   srcdir_include_server = os.path.join(srcdir, 'include_server')
@@ -146,6 +148,7 @@ ext = setuptools.Extension(
               'src/sendfile.c',
               'src/compress.c',
               'src/compress_stream.c',
+              'src/file_cache.c',
               'src/argutil.c',
               'src/cleanup.c',
               'src/emaillog.c',
@@ -155,9 +158,10 @@ ext = setuptools.Extension(
               'include_server/c_extensions/distcc_pump_c_extensions_module.c',
              ]],
     include_dirs=cpp_flags_includes,
-    define_macros=[('_GNU_SOURCE', 1)],
+    depends=[__file__, *glob.glob(os.path.join(srcdir, 'src', '*.h'))],
+    define_macros=[('_GNU_SOURCE', '1')],
     library_dirs=[],
-    libraries=['lz4'],
+    libraries=['lz4', 'crypto'],
     runtime_library_dirs=[],
     extra_objects=[],
     extra_compile_args=[]

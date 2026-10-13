@@ -26,7 +26,7 @@ struct stream {
     struct stream *next;
     int32_t id;
     int fd, poll_index, ended, closed, eof, headers, link;
-    int *status;
+    int *status, *file_cache;
     size_t head, size;
     unsigned char *input;
 };
@@ -134,6 +134,8 @@ static int header(nghttp2_session *session, const nghttp2_frame *frame,
         if (valuelen == 3 && !memcmp(value, "200", 3)) *s->status = 200;
         else if (valuelen == 3 && !memcmp(value, "503", 3)) *s->status = 503;
         else *s->status = -1;
+    } else if (s->file_cache && namelen == 14 && !memcmp(name, "x-distcc-cache", 14)) {
+        *s->file_cache = valuelen == 1 && value[0] == '1';
     }
     return 0;
 }
@@ -148,14 +150,17 @@ static int receive_frame(nghttp2_session *session, const nghttp2_frame *frame,
         frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
         int fd = -1, accepted = s->headers == 3 && !attach_socket(s, &fd) &&
                                   !c->accept_job(c->context, fd, s->link);
-        nghttp2_nv ok[] = { NV(":status", "200"), NV("content-type", "application/x-distcc") };
+        nghttp2_nv ok[] = { NV(":status", "200"), NV("content-type", "application/x-distcc"),
+                           NV("x-distcc-cache", "1") };
         nghttp2_nv busy[] = { NV(":status", "503") };
+        const char *cache = getenv("DISTCCD_FILE_CACHE");
         nghttp2_data_provider provider = { .source.ptr = s, .read_callback = read_data };
         if (!accepted && fd >= 0) close(fd);
         if (!accepted && s->fd >= 0) { close(s->fd); s->fd = -1; }
         if (!accepted) { free(s->input); s->input = NULL; }
         if (nghttp2_submit_response(session, s->id, accepted ? ok : busy,
-                                    accepted ? 2 : 1, accepted ? &provider : NULL))
+                                    accepted ? ((!cache || *cache) ? 3 : 2) : 1,
+                                    accepted ? &provider : NULL))
             return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     if ((frame->hd.type == NGHTTP2_DATA || frame->hd.type == NGHTTP2_HEADERS) &&
@@ -292,7 +297,7 @@ void dcc_h2_free(struct dcc_h2 *c)
     free(c);
 }
 
-int dcc_h2_open(struct dcc_h2 *c, int link, int *fd, int *status)
+int dcc_h2_open(struct dcc_h2 *c, int link, int *fd, int *status, int *file_cache)
 {
     struct stream *s;
     nghttp2_nv headers[] = { NV(":method", "POST"), NV(":scheme", "http"),
@@ -306,9 +311,11 @@ int dcc_h2_open(struct dcc_h2 *c, int link, int *fd, int *status)
     if (link) { headers[3].value = (uint8_t *)"/v1/link"; headers[3].valuelen = 8; }
     provider.source.ptr = s;
     s->status = status;
+    s->file_cache = file_cache;
     *status = 0;
+    *file_cache = 0;
     s->id = nghttp2_submit_request(c->session, NULL, headers, 5, &provider, s);
-    if (s->id < 0) { close(*fd); *fd = -1; s->closed = 1; s->status = NULL; return -1; }
+    if (s->id < 0) { close(*fd); *fd = -1; s->closed = 1; s->status = s->file_cache = NULL; return -1; }
     return s->id;
 }
 
@@ -317,6 +324,7 @@ void dcc_h2_cancel(struct dcc_h2 *c, int stream)
     struct stream *s = c ? find_stream(c, stream) : NULL;
     if (!s) return;
     s->status = NULL;
+    s->file_cache = NULL;
     if (!s->closed) nghttp2_submit_rst_stream(c->session, NGHTTP2_FLAG_NONE, stream, NGHTTP2_CANCEL);
     if (s->fd >= 0) close(s->fd);
     s->fd = -1;

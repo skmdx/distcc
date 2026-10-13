@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import socket
 import shutil
+import signal
 import struct
 import subprocess
 import time
@@ -16,6 +17,28 @@ from test_adaptive import DistccTestCase, free_port, stats_response
 
 
 class BrokerTestCase(DistccTestCase):
+    def restart_server(self, binary, **settings):
+        old = self.daemons[0]
+        os.killpg(old.pid, signal.SIGTERM)
+        old.wait(timeout=5)
+        env = dict(self.base_env, TMPDIR=str(self.root),
+                   DISTCCD_PATH=str(self.root / 'bin') + os.pathsep + os.defpath)
+        env.update(getattr(self, 'daemon_env', {}))
+        env.update(settings)
+        replacement = subprocess.Popen([str(binary), *old.args[1:]], env=env, stdout=self.logs[0],
+                                       stderr=self.logs[0], start_new_session=True)
+        self.daemons[0] = replacement
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                self.get_stats(self.stats_ports[0])
+                break
+            except OSError:
+                self.assertIsNone(replacement.poll())
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.02)
+
     def start_broker(self, hosts=None, idle=10, name="broker"):
         path = self.root / f"{name}.sock"
         env = dict(self.base_env, DISTCC_HOSTS=hosts or self.host(0),

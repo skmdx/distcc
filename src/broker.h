@@ -5,6 +5,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready);
 void dcc_broker_failed(const struct dcc_hostdef *host);
 void dcc_broker_return(const struct dcc_hostdef *host, int fd);
 #define DCC_BROKER_POOLED (1 << 30)
+#define DCC_BROKER_FILE_CACHE (1 << 29)
 int dcc_broker_jobs(void);
 void dcc_broker_cpp_done(const struct dcc_hostdef *host);
 

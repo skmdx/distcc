@@ -11,7 +11,7 @@ void dcc_h2_free(struct dcc_h2 *connection);
 /* The returned socket carries one RPC. status is updated until completion:
  * 0 pending, 200 admitted, 503 refused without execution, -1 transport error.
  * Its storage must remain alive until cancel() or session destruction. */
-int dcc_h2_open(struct dcc_h2 *connection, int link, int *fd, int *status);
+int dcc_h2_open(struct dcc_h2 *connection, int link, int *fd, int *status, int *file_cache);
 void dcc_h2_cancel(struct dcc_h2 *connection, int stream);
 int dcc_h2_prepare(struct dcc_h2 *connection, struct pollfd *polls, int capacity);
 int dcc_h2_process(struct dcc_h2 *connection, struct pollfd *polls);

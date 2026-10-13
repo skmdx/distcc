@@ -1,4 +1,4 @@
-distcc protocols 6 through 10: LZ4 compression and HTTP/2
+distcc protocols 6 through 11: LZ4 compression and HTTP/2
 ======================================================
 
 Protocol 6 follows protocol 2 (client preprocessing), and protocol 7 follows
@@ -84,5 +84,46 @@ Connections advertise a 64 KiB maximum frame and at most 256 concurrent
 streams. DATA reads respect the peer's frame limit and both flow-control
 windows, including older peers using 16 KiB frames. Worker/resource admission
 still determines executable concurrency. Idle server connections expire after
-30 s. The RPC formats and admission exchange are unchanged; this transport
-does not cache source files or objects between jobs.
+30 s. The admission exchange is unchanged. Objects and link inputs are not
+cached between jobs; source inputs can use protocol 11 as described below.
+
+Cached input manifests (11)
+--------------------------
+
+An HTTP/2 response advertises x-distcc-cache: 1 when the daemon supports
+cached inputs. The broker conveys this capability with its job descriptor.
+For server preprocessing, clients with include-server SHA-256 sidecars use
+protocol 11 when an all-hit manifest would save at least 16 KiB, estimated
+from compressed file sizes minus digest sizes. Smaller jobs, clients without
+digests and peers without this header retain protocol 9. This avoids the
+missing-set round trip for small inputs. Old clients ignore the additional
+HTTP header. Protocol 11 has
+the same command, working-directory and result exchange as protocol 9.
+
+NFIL is followed by a complete input manifest. Each entry has NAME and
+either HASH (length 32, raw SHA-256 of the uncompressed contents including
+any inserted #line directive), LINK, or FILE with length zero for a directory
+placeholder. Names are unique absolute paths without dot or empty components;
+the manifest is limited to 65536 entries and paths shorter than MAXPATHLEN.
+The server materializes verified cache hits into private job files, then
+sends MISS with length NFIL and one byte per entry (1 = upload, 0 = present).
+Only HASH entries can require upload. The client sends FILE payloads for the
+missing entries in manifest order, using the existing chunked LZ4 encoding.
+There is one missing-set round trip per job, not one per file. A digest
+mismatch aborts the job before execution. Request END_STREAM follows uploads.
+
+The include server hashes contents while producing its immutable compressed
+snapshot and stores the raw digest in a .sha256 sidecar. Existing mutation
+checks invalidate the compressed snapshot and digest together. Cache hits
+are copied or reflinked, verified, and owned by the job; eviction cannot
+invalidate an active input. Uploads are verified before atomic publication,
+and cache insertion never waits for another uploader's lock.
+
+DISTCCD_FILE_CACHE chooses a private daemon-owned directory. By default it is
+distcc-cache-<uid> under the daemon's TMPDIR. An explicitly empty value disables
+the capability. The cache is sharded into 64 directories, each limited to
+64 files and 4 MiB, for at most 4096 files and 256 MiB of payload. Shards evict
+oldest entries on insertion; files larger than 4 MiB are transferred but not
+retained. Cache storage failures become misses or skipped insertions and do
+not invalidate verified job inputs. Keep this directory on tmpfs when memory
+permits, or on storage with reflink support to reduce snapshot writes.

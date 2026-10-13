@@ -884,7 +884,7 @@ static int dcc_run_job(int in_fd,
      * in a loop.
      */
     if (cpp_where == DCC_CPP_ON_SERVER) {
-        if (dcc_r_many_files(in_fd, temp_dir, compr)
+        if ((ret = dcc_r_many_files(in_fd, out_fd, temp_dir, compr, protover == DCC_VER_CACHED_CPP))
             || (!stdout_output && dcc_set_output(argv, temp_o))
             || tweak_arguments_for_server(argv, temp_dir, deps_fname,
                                           &dotd_target, &tweaked_argv))

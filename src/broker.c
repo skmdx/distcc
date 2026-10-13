@@ -66,7 +66,7 @@ struct client {
     int memo;
     int pooled;
     int admission;
-    int h2_stream, h2_status;
+    int h2_stream, h2_status, h2_file_cache;
     uint64_t h2_generation;
     size_t used;
     char hello[12];
@@ -246,6 +246,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready)
     (*host)->broker_fd = net;
     (*host)->broker_lease = fd;
     (*host)->broker_pooled = !!(reply.slots & DCC_BROKER_POOLED);
+    (*host)->file_cache = !!(reply.slots & DCC_BROKER_FILE_CACHE);
     *lease = fd;
     return 0;
 }
@@ -481,6 +482,7 @@ static void pool_store(struct broker *broker, struct client *client, int fd, dou
 static void deliver_connection(struct broker *broker, struct client *client)
 {
     struct reply reply = { .slots = client->pooled ? DCC_BROKER_POOLED : 0 };
+    if (client->h2_file_cache) reply.slots |= DCC_BROKER_FILE_CACHE;
     strcpy(reply.host, broker->peers[client->peer].host->hostdef_string);
     if (send_reply(client->fd, &reply, client->net)) {
         release_client(broker, client);
@@ -535,7 +537,7 @@ static int dispatch(struct broker *broker, struct client *client, double now)
                 }
             }
             if (!p->h2 || (client->h2_stream = dcc_h2_open(p->h2, link,
-                    &client->net, &client->h2_status)) < 0) {
+                    &client->net, &client->h2_status, &client->h2_file_cache)) < 0) {
                 client->h2_stream = 0;
                 p->retry_at = now + 5;
                 return 1;

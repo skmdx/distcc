@@ -47,6 +47,7 @@
 #include "dopt.h"
 #include "hosts.h"
 #include "bulk.h"
+#include "file_cache.h"
 #include "snprintf.h"
 
 int dcc_r_request_header(int ifd,
@@ -60,7 +61,7 @@ int dcc_r_request_header(int ifd,
         return ret;
     }
 
-    if (vers < DCC_VER_1 || vers > DCC_VER_STREAM_LINK) {
+    if (vers < DCC_VER_1 || vers > DCC_VER_CACHED_CPP) {
         rs_log_error("can't handle requested protocol version is %d", vers);
         return EXIT_PROTOCOL_ERROR;
     }
@@ -96,9 +97,14 @@ static int prepend_dir_to_name(const char *dirname, char **path)
         return 0;
 }
 
-int dcc_r_many_files(int in_fd,
+static int compare_names(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+int dcc_r_many_files(int in_fd, int out_fd,
                      const char *dirname,
-                     enum dcc_compress compr)
+                     enum dcc_compress compr, int cached)
 {
     int ret = 0;
     unsigned int n_files;
@@ -106,16 +112,39 @@ int dcc_r_many_files(int in_fd,
     char *name = 0;
     char *link_target = 0;
     char token[5];
+    struct cached_file { char *name; unsigned char hash[DCC_FILE_HASH_SIZE]; } *files = NULL;
+    unsigned char *wanted = NULL;
+    char **names = NULL;
 
     if ((ret = dcc_r_token_int(in_fd, "NFIL", &n_files)))
         return ret;
+    if (cached) {
+        if (!n_files || n_files > DCC_FILE_MANIFEST_LIMIT) return EXIT_PROTOCOL_ERROR;
+        files = calloc(n_files, sizeof(*files));
+        wanted = calloc(n_files, 1);
+        names = calloc(n_files, sizeof(*names));
+        if (!files || !wanted || !names) { ret = EXIT_OUT_OF_MEMORY; goto done; }
+    }
 
     for (i = 0; i < n_files; ++i) {
         /* like dcc_r_argv */
         unsigned int link_or_file_len;
 
-        if ((ret = dcc_r_token_string(in_fd, "NAME", &name)))
+        if (cached) {
+            unsigned length;
+            if ((ret = dcc_r_token_int(in_fd, "NAME", &length))) goto out_cleanup;
+            if (!length || length >= MAXPATHLEN) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
+            if ((ret = dcc_r_str_alloc(in_fd, length, &name))) goto out_cleanup;
+            if (strlen(name) != length) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
+        } else if ((ret = dcc_r_token_string(in_fd, "NAME", &name))) goto out_cleanup;
+
+        if (cached && (name[0] != '/' || strstr(name, "/../") ||
+                       strstr(name, "//") || strstr(name, "/./") ||
+                       str_endswith("/", name) || str_endswith("/.", name) ||
+                       str_endswith("/..", name))) {
+            ret = EXIT_PROTOCOL_ERROR;
             goto out_cleanup;
+        }
 
         /* FIXME: verify that name starts with '/' and doesn't contain '..'. */
         if ((ret = prepend_dir_to_name(dirname, &name)))
@@ -126,6 +155,11 @@ int dcc_r_many_files(int in_fd,
 
         /* Must prepend the dirname for the file name, a link's target name. */
         if (strncmp(token, "LINK", 4) == 0) {
+
+            if (cached && (!link_or_file_len || link_or_file_len >= MAXPATHLEN)) {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out_cleanup;
+            }
 
             if ((ret = dcc_r_str_alloc(in_fd, link_or_file_len, &link_target))){
                 goto out_cleanup;
@@ -154,7 +188,19 @@ int dcc_r_many_files(int in_fd,
                 unlink(name);
                 goto out_cleanup;
             }
+        } else if (cached && !strcmp(token, "HASH")) {
+            if (link_or_file_len != DCC_FILE_HASH_SIZE) {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out_cleanup;
+            }
+            if ((ret = dcc_readx(in_fd, files[i].hash, DCC_FILE_HASH_SIZE)) ||
+                (ret = dcc_add_cleanup(name))) goto out_cleanup;
+            wanted[i] = !dcc_file_cache_get(files[i].hash, name);
         } else if (strncmp(token, "FILE", 4) == 0) {
+            if (cached && link_or_file_len) {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out_cleanup;
+            }
             if ((ret = dcc_r_file(in_fd, name, link_or_file_len, compr))) {
                 goto out_cleanup;
             }
@@ -179,6 +225,10 @@ int dcc_r_many_files(int in_fd,
         }
 
 out_cleanup:
+        if (cached && !ret) {
+            files[i].name = names[i] = name;
+            name = NULL;
+        }
         free(name);
         name = NULL;
         free(link_target);
@@ -186,5 +236,28 @@ out_cleanup:
         if (ret)
             break;
     }
+    if (!ret && cached) {
+        qsort(names, n_files, sizeof(*names), compare_names);
+        for (i = 1; i < n_files; ++i) {
+            if (!strcmp(names[i - 1], names[i])) { ret = EXIT_PROTOCOL_ERROR; goto done; }
+        }
+        ret = dcc_x_token_int(out_fd, "MISS", n_files);
+        if (!ret) ret = dcc_writex(out_fd, wanted, n_files);
+        tcp_cork_sock(out_fd, 0);
+        for (i = 0; !ret && i < n_files; ++i) {
+            if (!wanted[i]) continue;
+            ret = dcc_r_token_file(in_fd, "FILE", files[i].name, compr);
+            if (!ret && !dcc_file_cache_verify(files[i].hash, files[i].name)) {
+                rs_log_error("input content does not match its SHA-256 manifest");
+                ret = EXIT_PROTOCOL_ERROR;
+            }
+            if (!ret) dcc_file_cache_put(files[i].hash, files[i].name);
+        }
+    }
+done:
+    if (files) for (i = 0; i < n_files; ++i) free(files[i].name);
+    free(names);
+    free(files);
+    free(wanted);
     return ret;
 }

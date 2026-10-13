@@ -40,6 +40,7 @@
 #include <sys/socket.h>
 
 #include "distcc.h"
+#include "file_cache.h"
 #include "trace.h"
 #include "rpc.h"
 #include "exitcode.h"
@@ -270,6 +271,7 @@ int dcc_compile_remote(char **argv,
     off_t doti_size;
     struct timeval before, after;
     unsigned int n_files;
+    struct dcc_input_digest *hashes = NULL;
 
     if (gettimeofday(&before, NULL))
         rs_log_warning("gettimeofday failed");
@@ -306,12 +308,14 @@ int dcc_compile_remote(char **argv,
     dcc_note_state(DCC_PHASE_SEND, NULL, NULL, DCC_REMOTE);
 
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
+        n_files = dcc_argv_len(files);
+        if (host->file_cache && (hashes = dcc_file_hashes(files, n_files)))
+            host->protover = DCC_VER_CACHED_CPP;
         if ((ret = dcc_send_header(to_net_fd, argv, host))) {
           goto out;
         }
 
-        n_files = dcc_argv_len(files);
-        if ((ret = dcc_x_many_files(to_net_fd, n_files, files, host->compr))) {
+        if ((ret = dcc_x_many_files(to_net_fd, from_net_fd, n_files, files, host->compr, hashes))) {
             goto out;
         }
     } else {
@@ -417,5 +421,6 @@ int dcc_compile_remote(char **argv,
         }
     }
 
+    free(hashes);
     return ret;
 }

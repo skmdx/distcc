@@ -27,7 +27,7 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def stats_response(cpus=4, jobs=4, load=0, **metrics):
+def stats_response(cpus=4, jobs=4, load: float | str = 0, **metrics):
     return ("HTTP/1.0 200 OK\n\n<distccstats>\n"
             f"dcc_cpus {cpus}\ndcc_max_kids {jobs}\ndcc_load1 {load}\n"
             + ''.join(f'dcc_{name} {value}\n' for name, value in metrics.items())
@@ -35,7 +35,7 @@ def stats_response(cpus=4, jobs=4, load=0, **metrics):
 
 
 class StatsPeer:
-    def __init__(self, response, delay=0):
+    def __init__(self, response, delay: float = 0):
         self.response, self.delay = response, delay
         self.requests = 0
         self.stop = threading.Event()
@@ -73,9 +73,10 @@ class DistccTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.build = Path.cwd()
-        cls.cc = shutil.which("gcc")
-        if not cls.cc:
+        compiler = shutil.which("gcc")
+        if not compiler:
             raise unittest.SkipTest("GCC is required")
+        cls.cc = compiler
         cls.storage = tempfile.TemporaryDirectory(prefix="distcc-adaptive-")
         cls.root = Path(cls.storage.name)
         cls.base_env = {k: v for k, v in os.environ.items()
@@ -163,7 +164,7 @@ class DistccTestCase(unittest.TestCase):
     def host(self, index, options="", slots=4):
         return f"127.0.0.1:{self.ports[index]}/{slots}{options}"
 
-    def peer(self, response, delay=0):
+    def peer(self, response, delay: float = 0):
         peer = StatsPeer(response, delay)
         self.addCleanup(peer.close)
         return peer

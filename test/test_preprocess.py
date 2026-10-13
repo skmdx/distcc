@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Remote preprocessing with mutable inputs, real compilers and pooled TCP."""
 import os
+import hashlib
+import random
+from pathlib import Path
 import re
 import select
 import shlex
@@ -111,11 +114,15 @@ class PreprocessTest(BrokerTestCase):
     def test_compile_execute_and_pool_reuse(self):
         self.source.write_text('#include "value.h"\nint main(void) { return VALUE - 19; }\n')
         (self.work / 'value.h').write_text('#define VALUE 19\n')
-        before = int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
+        match = re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))
+        assert match is not None, 'daemon did not report its accept counter'
+        before = int(match[1])
         for _ in range(3):
             result = self.run_cc('gcc', ['-c', self.source, '-o', 'hello.o'])
             self.assertEqual(result.returncode, 0, result.stderr.decode())
-        after = int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
+        match = re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))
+        assert match is not None, 'daemon did not report its accept counter'
+        after = int(match[1])
         self.assertEqual(after - before, 1)
         subprocess.run([self.cc, 'hello.o', '-o', 'hello'], cwd=self.work, check=True)
         subprocess.run([str(self.work / 'hello')], check=True)
@@ -220,6 +227,93 @@ class Lz4PreprocessTest(PreprocessTest):
 class Http2PreprocessTest(PreprocessTest):
     compression = 'lz4s'
     transport = ',h2'
+
+    def cache_counts(self):
+        log = (self.work / 'client.log').read_text()
+        counts = re.findall(r'input cache: (\d+) of (\d+) entries transferred', log)
+        self.assertTrue(counts, 'cached RPC was not reached: ' + log)
+        return tuple(map(int, counts[-1]))
+
+    def test_cache_reuses_and_repairs_input_snapshots(self):
+        header = ('/*' + random.Random(31).randbytes(16384).hex() + '*/\n#define VALUE 731\n').encode()
+        (self.work / 'value.h').write_bytes(header)
+        (self.work / 'empty.h').write_bytes(b'')
+        self.source.write_text('#include "value.h"\n#include "empty.h"\nint n = VALUE;\n')
+        self.compare(args=['-P'])
+        self.assertGreater(self.cache_counts()[0], 0)
+        self.compare(args=['-P'])
+        self.assertEqual(self.cache_counts()[0], 0)
+
+        key = hashlib.sha256(header).hexdigest()
+        entry = self.root / f'distcc-cache-{os.geteuid()}' / f'{int(key[:2], 16) % 64:02x}' / key
+        self.assertEqual(entry.read_bytes(), header)
+        entry.chmod(0o600)
+        entry.write_bytes(b'corrupt cached input')
+        self.compare(args=['-P'])
+        self.assertEqual(self.cache_counts()[0], 1)
+        self.assertEqual(entry.read_bytes(), header)
+        entry.unlink()
+        self.compare(args=['-P'])
+        self.assertEqual(self.cache_counts()[0], 1)
+        self.compare(args=['-P'])
+        self.assertEqual(self.cache_counts()[0], 0)
+
+        (self.work / 'value.h').write_bytes(header.replace(b'VALUE 731', b'VALUE 732'))
+        self.assertIn(b'732', self.compare(args=['-P']).stdout)
+        self.assertEqual(self.cache_counts()[0], 1)
+
+    def test_cached_symlink_retarget(self):
+        padding = '/*' + random.Random(39).randbytes(16384).hex() + '*/\n'
+        for name, value in (('first', 71), ('second', 72)):
+            directory = self.work / name
+            directory.mkdir()
+            (directory / 'value.h').write_text(padding + f'#define VALUE {value}\n')
+        alias = self.work / 'alias'
+        alias.symlink_to('first')
+        self.source.write_text('#include "alias/value.h"\nint n = VALUE;\n')
+        self.assertIn(b'71', self.compare(args=['-P']).stdout)
+        self.cache_counts()
+        alias.unlink()
+        alias.symlink_to('second')
+        self.assertIn(b'72', self.compare(args=['-P']).stdout)
+        self.cache_counts()
+        self.compare(args=['-P'])
+        self.assertEqual(self.cache_counts()[0], 0)
+
+    def test_previous_include_server_without_digests(self):
+        self.source.write_text('/*' + random.Random(32).randbytes(16384).hex() + '*/\nint n;\n')
+        self.compare(args=['-P'])
+        self.cache_counts()
+        for digest in self.work.rglob('*.sha256'):
+            digest.unlink()
+        (self.work / 'client.log').write_text('')
+        self.compare(args=['-P'])
+        self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
+
+    def test_disabled_server_cache(self):
+        self.source.write_text('/*' + random.Random(33).randbytes(16384).hex() + '*/\nint n;\n')
+        try:
+            self.restart_server(self.build / 'distccd', DISTCCD_FILE_CACHE='')
+            self.compare(args=['-P'])
+            self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
+        finally:
+            self.restart_server(self.build / 'distccd')
+
+    @unittest.skipUnless(os.environ.get('DISTCC_TEST_BASELINE'), 'previous HTTP/2 build is required')
+    def test_previous_server_cache_negotiation(self):
+        previous = Path(os.environ['DISTCC_TEST_BASELINE']).resolve()
+        self.source.write_text('/*' + random.Random(34).randbytes(16384).hex() + '*/\nint n;\n')
+        try:
+            self.restart_server(previous / 'distccd')
+            self.compare(args=['-P'])
+            self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
+        finally:
+            self.restart_server(self.build / 'distccd')
+
+    def test_small_inputs_skip_manifest_round_trip(self):
+        for _ in range(2):
+            self.compare(args=['-P'])
+        self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
 
 
 if __name__ == '__main__':

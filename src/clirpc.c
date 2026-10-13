@@ -44,6 +44,7 @@
 #include "util.h"
 #include "clinet.h"
 #include "bulk.h"
+#include "file_cache.h"
 #include "hosts.h"
 #include "state.h"
 #include "include_server_if.h"
@@ -260,35 +261,86 @@ int dcc_is_link(const char *fname, int *is_link)
     return 0;
 }
 
-/* Send to @p ofd @p n_files whose names are in @p fnames.
- * @fnames must be null-terminated.
- * The names can be coming from the include server, so
- * we consult dcc_get_original_fname to get the real names.
- * The include server has already compressed each file using @p compr.
- */
-int dcc_x_many_files(int ofd,
+/* Read digests of the include server's immutable compressed snapshots only
+ * when the missing-set exchange can save a useful amount of traffic. */
+struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count)
+{
+    struct dcc_input_digest *hashes;
+    unsigned i;
+    int64_t savings = -12 - (int64_t)count; /* MISS token and bitmap. */
+    if (!count || count > DCC_FILE_MANIFEST_LIMIT) return NULL;
+    hashes = calloc(count, sizeof(*hashes));
+    if (!hashes) return NULL;
+    for (i = 0; i < count; ++i) {
+        struct stat st;
+        if (lstat(files[i], &st)) {
+            char *name = NULL;
+            int placeholder;
+            if (errno != ENOENT || dcc_get_original_fname(files[i], &name)) goto failed;
+            placeholder = str_endswith("/forcing_technique_271828", name);
+            free(name);
+            if (!placeholder) goto failed;
+            continue;
+        }
+        if (S_ISLNK(st.st_mode)) continue;
+        if (!S_ISREG(st.st_mode)) goto failed;
+        hashes[i].regular = 1;
+        savings += st.st_size > INT_MAX ? INT_MAX : st.st_size - DCC_FILE_HASH_SIZE;
+    }
+    /* Avoid a missing-set round trip and sidecar reads when even an all-hit
+     * manifest would save little traffic. Compressed sizes are already known. */
+    if (savings < 16384) goto failed;
+    for (i = 0; i < count; ++i) {
+        char *sidecar = NULL;
+        FILE *file;
+        int valid;
+        if (!hashes[i].regular) continue;
+        if (asprintf(&sidecar, "%s.sha256", files[i]) < 0) goto failed;
+        file = fopen(sidecar, "rb");
+        free(sidecar);
+        if (!file) goto failed;
+        valid = fread(hashes[i].sha256, 1, DCC_FILE_HASH_SIZE, file) == DCC_FILE_HASH_SIZE &&
+                fgetc(file) == EOF && !ferror(file);
+        fclose(file);
+        if (!valid) goto failed;
+    }
+    return hashes;
+failed:
+    /* An older include server has no digests: retain its existing exchange. */
+    free(hashes);
+    return NULL;
+}
+
+/* fnames is the include server's null-terminated list of compressed snapshots
+ * and symlinks. Only a cached manifest requires a response on ifd. */
+int dcc_x_many_files(int ofd, int ifd,
                      unsigned int n_files,
-                     char **fnames, enum dcc_compress compr)
+                     char **fnames, enum dcc_compress compr,
+                     const struct dcc_input_digest *hashes)
 {
     int ret;
     char link_points_to[MAXPATHLEN + 1];
     int is_link;
     const char *fname;
     char *original_fname;
+    char **files = fnames;
+    unsigned i = 0;
 
-    dcc_x_token_int(ofd, "NFIL", n_files);
+    if ((ret = dcc_x_token_int(ofd, "NFIL", n_files))) return ret;
 
-    for (; *fnames != NULL; ++fnames) {
+    for (; *fnames != NULL; ++fnames, ++i) {
         fname = *fnames;
         ret = dcc_get_original_fname(fname, &original_fname);
         if (ret) return ret;
 
-        if (str_endswith("/forcing_technique_271828", original_fname)) {
+        ret = dcc_x_token_string(ofd, "NAME", original_fname);
+        int placeholder = str_endswith("/forcing_technique_271828", original_fname);
+        free(original_fname);
+        if (ret) return ret;
+
+        if (placeholder) {
             /* Directory placeholder files don't exist on disk.  Send
                an empty file to ensure the directory is created */
-            ret = dcc_x_token_string(ofd, "NAME", original_fname);
-            if (ret) return ret;
-
             ret = dcc_x_token_int(ofd, "FILE", 0);
             if (ret) return ret;
         } else {
@@ -298,22 +350,43 @@ int dcc_x_many_files(int ofd,
 
             if (is_link) {
                 if ((ret = dcc_read_link(fname, link_points_to)) ||
-                    (ret = dcc_x_token_string(ofd, "NAME", original_fname)) ||
                     (ret = dcc_x_token_string(ofd, "LINK", link_points_to))) {
                     return ret;
                 }
             } else {
-                ret = dcc_x_token_string(ofd, "NAME", original_fname);
-                if (ret) return ret;
-
                 /* Cache bytes carry the selected codec, without an RPC token. */
-                if (compr == DCC_COMPRESS_LZ4_STREAM) {
+                if (hashes) {
+                    ret = dcc_x_token_int(ofd, "HASH", DCC_FILE_HASH_SIZE);
+                    if (!ret) ret = dcc_writex(ofd, hashes[i].sha256, DCC_FILE_HASH_SIZE);
+                } else if (compr == DCC_COMPRESS_LZ4_STREAM) {
                     ret = dcc_x_token_int(ofd, "FILE", 0xffffffffU);
                     if (!ret) ret = dcc_copy_file_to_fd(fname, ofd);
                 } else ret = dcc_x_file(ofd, fname, "FILE", DCC_COMPRESS_NONE, NULL);
                 if (ret) return ret;
             }
         }
+    }
+    if (hashes) {
+        unsigned count, missing = 0;
+        unsigned char *wanted = malloc(n_files);
+        if (!wanted) return EXIT_OUT_OF_MEMORY;
+        tcp_cork_sock(ofd, 0);
+        ret = dcc_r_token_int(ifd, "MISS", &count);
+        if (!ret && count != n_files) ret = EXIT_PROTOCOL_ERROR;
+        if (!ret) ret = dcc_readx(ifd, wanted, count);
+        for (i = 0; !ret && i < count; ++i) {
+            if (wanted[i] > 1 || (wanted[i] && !hashes[i].regular)) {
+                ret = EXIT_PROTOCOL_ERROR;
+                break;
+            }
+            if (!wanted[i]) continue;
+            ++missing;
+            ret = dcc_x_token_int(ofd, "FILE", 0xffffffffU);
+            if (!ret) ret = dcc_copy_file_to_fd(files[i], ofd);
+        }
+        rs_trace("input cache: %u of %u entries transferred", missing, n_files);
+        free(wanted);
+        return ret;
     }
     return 0;
 }
