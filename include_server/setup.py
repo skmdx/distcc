@@ -161,7 +161,7 @@ ext = setuptools.Extension(
     depends=[__file__, *glob.glob(os.path.join(srcdir, 'src', '*.h'))],
     define_macros=[('_GNU_SOURCE', '1')],
     library_dirs=[],
-    libraries=['lz4', 'crypto'],
+    libraries=['lz4', 'xxhash'],
     runtime_library_dirs=[],
     extra_objects=[],
     extra_compile_args=[]
@@ -179,6 +179,7 @@ args = {
     'long_description': 'The include server is part of distcc.',
     'packages': ['include_server'],
     'ext_modules': [ext],
+    'install_requires': ['xxhash>=3.0.0'],
 }
 
 # First, do a little self-testing.

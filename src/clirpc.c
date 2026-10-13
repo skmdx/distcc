@@ -263,7 +263,7 @@ int dcc_is_link(const char *fname, int *is_link)
 
 /* Read digests of the include server's immutable compressed snapshots only
  * when the missing-set exchange can save a useful amount of traffic. */
-struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count, int capabilities)
+struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count)
 {
     struct dcc_input_digest *hashes;
     unsigned i;
@@ -298,32 +298,28 @@ struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count, int capab
         size_t length;
         uint64_t plain_size = 0;
         if (!hashes[i].kind) continue;
-        if (asprintf(&sidecar, "%s.sha256", files[i]) < 0) goto failed;
+        if (asprintf(&sidecar, "%s.xxh3", files[i]) < 0) goto failed;
         file = fopen(sidecar, "rb");
         free(sidecar);
         if (!file) goto failed;
-        valid = fread(hashes[i].sha256, 1, DCC_FILE_HASH_SIZE, file) == DCC_FILE_HASH_SIZE;
+        valid = fread(hashes[i].hash, 1, DCC_FILE_HASH_SIZE, file) == DCC_FILE_HASH_SIZE;
         length = fread(size, 1, sizeof(size), file);
-        valid &= (length == sizeof(size) || !length) && fgetc(file) == EOF && !ferror(file);
+        valid &= length == sizeof(size) && fgetc(file) == EOF && !ferror(file);
         fclose(file);
         if (!valid) goto failed;
-        /* Old include servers have no size: their protocol 11 exchange is
-         * still safe. New snapshots can exclude inputs the cache cannot keep. */
-        if (length) {
-            unsigned j;
-            for (j = 0; j < sizeof(size); ++j) plain_size = (plain_size << 8) | size[j];
-            if (plain_size > DCC_FILE_CACHE_MAX) {
-                struct stat st;
-                if (!(capabilities & 2) || lstat(files[i], &st)) goto failed;
-                savings -= st.st_size > INT_MAX ? INT_MAX : st.st_size - DCC_FILE_HASH_SIZE;
-                hashes[i].kind = DCC_INPUT_INLINE;
-            }
+        /* Exclude inputs the cache cannot keep. */
+        for (unsigned j = 0; j < sizeof(size); ++j) plain_size = (plain_size << 8) | size[j];
+        if (plain_size > DCC_FILE_CACHE_MAX) {
+            struct stat st;
+            if (lstat(files[i], &st)) goto failed;
+            savings -= st.st_size > INT_MAX ? INT_MAX : st.st_size - DCC_FILE_HASH_SIZE;
+            hashes[i].kind = DCC_INPUT_INLINE;
         }
     }
     if (savings < 16384) goto failed;
     return hashes;
 failed:
-    /* An older include server has no digests: retain its existing exchange. */
+    /* Missing or invalid metadata must never select a cached input. */
     free(hashes);
     return NULL;
 }
@@ -400,7 +396,7 @@ int dcc_x_many_files(int ofd, int ifd,
             } else {
                 /* Cache bytes carry the selected codec, without an RPC token. */
                 if (hashes && hashes[i].kind == DCC_INPUT_CACHED) {
-                    ret = manifest_token(&writer, "HASH", DCC_FILE_HASH_SIZE, hashes[i].sha256);
+                    ret = manifest_token(&writer, "HASH", DCC_FILE_HASH_SIZE, hashes[i].hash);
                 } else {
                     if ((ret = flush_manifest(&writer))) return ret;
                     if (compr == DCC_COMPRESS_LZ4_STREAM) {

@@ -309,8 +309,8 @@ int dcc_compile_remote(char **argv,
 
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
         n_files = dcc_argv_len(files);
-        if (host->file_cache && (hashes = dcc_file_hashes(files, n_files, host->file_cache)))
-            host->protover = host->file_cache & 2 ? DCC_VER_INLINE_CPP : DCC_VER_CACHED_CPP;
+        if (host->file_cache && (hashes = dcc_file_hashes(files, n_files)))
+            host->protover = DCC_VER_CACHED_CPP;
         if ((ret = dcc_send_header(to_net_fd, argv, host))) {
           goto out;
         }

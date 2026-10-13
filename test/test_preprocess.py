@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Remote preprocessing with mutable inputs, real compilers and pooled TCP."""
 import os
-import hashlib
+import xxhash
 import random
 from pathlib import Path
 import re
@@ -244,7 +244,7 @@ class Http2PreprocessTest(PreprocessTest):
         self.compare(args=['-P'])
         self.assertEqual(self.cache_counts()[0], 0)
 
-        key = hashlib.sha256(header).hexdigest()
+        key = xxhash.xxh3_64(header).hexdigest()
         entry = self.root / f'distcc-cache-{os.geteuid()}' / f'{int(key[:2], 16) % 64:02x}' / key
         self.assertEqual(entry.read_bytes(), header)
         entry.chmod(0o600)
@@ -296,11 +296,11 @@ class Http2PreprocessTest(PreprocessTest):
         self.compare(args=['-P'])
         self.assertEqual(self.cache_counts()[0], 0)
 
-    def test_previous_include_server_without_digests(self):
+    def test_missing_sidecar_does_not_reuse_cache(self):
         self.source.write_text('/*' + random.Random(32).randbytes(16384).hex() + '*/\nint n;\n')
         self.compare(args=['-P'])
         self.cache_counts()
-        for digest in self.work.rglob('*.sha256'):
+        for digest in self.work.rglob('*.xxh3'):
             digest.unlink()
         (self.work / 'client.log').write_text('')
         self.compare(args=['-P'])
@@ -312,30 +312,6 @@ class Http2PreprocessTest(PreprocessTest):
             self.restart_server(self.build / 'distccd', DISTCCD_FILE_CACHE='')
             self.compare(args=['-P'])
             self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
-        finally:
-            self.restart_server(self.build / 'distccd')
-
-    @unittest.skipUnless(os.environ.get('DISTCC_TEST_BASELINE'), 'previous HTTP/2 build is required')
-    def test_previous_server_cache_negotiation(self):
-        previous = Path(os.environ['DISTCC_TEST_BASELINE']).resolve()
-        self.source.write_text('/*' + random.Random(34).randbytes(16384).hex() + '*/\nint n;\n')
-        try:
-            self.restart_server(previous / 'distccd', DISTCCD_FILE_CACHE='')
-            self.compare(args=['-P'])
-            self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
-        finally:
-            self.restart_server(self.build / 'distccd')
-
-    @unittest.skipUnless(os.environ.get('DISTCC_TEST_CACHE_BASELINE'), 'protocol 11 build is required')
-    def test_previous_cached_server(self):
-        previous = Path(os.environ['DISTCC_TEST_CACHE_BASELINE']).resolve()
-        self.source.write_text('/*' + random.Random(64).randbytes(16384).hex() + '*/\nint n;\n')
-        try:
-            self.restart_server(previous / 'distccd')
-            self.compare(args=['-P'])
-            self.assertGreater(self.cache_counts()[0], 0)
-            self.compare(args=['-P'])
-            self.assertEqual(self.cache_counts()[0], 0)
         finally:
             self.restart_server(self.build / 'distccd')
 

@@ -51,12 +51,15 @@ TCP without the HTTP/2 relay. Sources, objects and link archives stream in
 support pump and distributed links. Existing `,lz4` and `,lzo` hosts remain
 compatible. Restart pump sessions after upgrading their include server.
 
-With `,h2` and pump, supporting peers exchange a SHA-256 input manifest and
+With `,h2` and pump, supporting peers exchange an XXH3-64 input manifest and
 upload only files missing from the worker's bounded cache. Small inputs and
-old peers keep the existing full-file exchange. Cache hits are verified and copied or
+disabled caches keep the full-file exchange. Cache hits are verified and copied or
 reflinked into private job files; a compiler never shares writable cache
 inodes. See doc/protocol-6.txt for the exchange, storage limits and
-DISTCCD_FILE_CACHE setting. This requires OpenSSL libcrypto at build time.
+DISTCCD_FILE_CACHE setting. XXH3-64 detects accidental changes but is not
+collision-resistant against adversarial inputs. Build dependencies include
+xxHash; pump needs Python xxhash. Update clients and servers together, restart
+brokers and pump sessions, and clear old input caches when upgrading this protocol.
 
 GCC and Clang/LLD object links can also run on a broker-selected worker. `distcc-link --sync`
 populates immutable sysroot caches using compressed rsync transfers; set

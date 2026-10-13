@@ -73,16 +73,16 @@ RST_STREAM or loss of the connection cancels it. Response END_STREAM signals
 local EOF after queued result bytes drain. Lease cancellation is scoped to
 both the connection generation and stream ID.
 
-Servers advertising x-distcc-queue: 1 separate input reception and result
+HTTP/2 servers separate input reception and result
 draining from compiler admission. The first HTTP/2 session activates up to
 min(jobs, 4) additional persistent workers. Total in-flight jobs are bounded
 by that pool; compilers still obey --jobs and resource admission, with at most
 one active link. Ready inputs receive execution grants in arrival order, with
 links awaiting their own limit. Finished compilers release the grant before
-result transfer. Brokers may pipeline up to the same bounded allowance after
-negotiation. TCP-only servers retain their original worker count. Cancelling
+result transfer. Brokers pipeline up to the same bounded allowance.
+TCP-only servers retain their original worker count. Cancelling
 a worker waiting for a grant retires its channel, so a racing grant cannot be
-mistaken for the next job. Older HTTP/2 peers retain their original admission.
+mistaken for the next job.
 
 Receive windows are 256 KiB per stream and 8 MiB per connection. WINDOW_UPDATE
 is issued when the local consumer drains data. A writable local consumer
@@ -98,26 +98,28 @@ streams. DATA reads respect the peer's frame limit and both flow-control
 windows, including older peers using 16 KiB frames. Worker/resource admission
 still determines executable concurrency. Idle server connections expire after
 30 s. Objects and link inputs are not cached between jobs; source inputs can
-use protocols 11 and 12 as described below.
+use protocol 13 as described below.
 
-Cached input manifests (11 and 12)
----------------------------------
+Cached input manifests (13)
+--------------------------
 
-An HTTP/2 response advertises x-distcc-cache: 1 when the daemon supports
+An HTTP/2 response advertises x-distcc-cache: xxh3-64 when the daemon enables
 cached inputs. The broker conveys this capability with its job descriptor.
-For server preprocessing, clients with include-server SHA-256 sidecars use
+For server preprocessing, clients with include-server XXH3-64 sidecars use
 cached manifests when an all-hit manifest would save at least 16 KiB,
 estimated from compressed file sizes minus digest and missing-bitmap costs.
-Smaller jobs, clients without
-digests and peers without this header retain protocol 9. This avoids the
-missing-set exchange for small inputs. Old clients ignore additional
-HTTP headers. Both versions have
-the same command, working-directory and result exchange as protocol 9.
+Smaller jobs, missing digest metadata and disabled caches use protocol 9.
+This avoids the missing-set exchange for small inputs. Protocol 13 has the
+same command, working-directory and result exchange as protocol 9.
+Obsolete cache protocols 11/12 are rejected. Upgrade clients, brokers, servers
+and pump sessions together and clear old input caches; no digest migration
+or old-version negotiation is provided.
 
 NFIL is followed by a complete input manifest. Each entry has NAME and
-either HASH (length 32, raw SHA-256 of the uncompressed contents including
-any inserted #line directive), LINK, or FILE with length zero for a directory
-placeholder. Names are unique absolute paths without dot or empty components;
+either HASH (length 8, canonical big-endian XXH3-64 with the default seed), LINK, or FILE with
+length zero for a directory
+placeholder. Hashes cover uncompressed contents including any inserted #line
+directive. Names are unique absolute paths without dot or empty components;
 the manifest is limited to 65536 entries and paths shorter than MAXPATHLEN.
 The server materializes verified cache hits into private job files, then
 sends MISS with length NFIL and one byte per entry (1 = upload, 0 = present).
@@ -126,22 +128,21 @@ missing entries in manifest order, using the existing chunked LZ4 encoding.
 An actual miss requires a round trip before its upload, not one per file.
 With all inputs present the server proceeds after sending MISS without waiting
 for a client acknowledgement. A digest mismatch aborts the job before execution.
+XXH3-64 is a non-cryptographic identifier: accidental collisions remain possible,
+and it provides no protection against deliberately colliding inputs. Verification
+cannot distinguish such a collision. Cache keys have 16 hex characters.
 Request END_STREAM follows uploads. Manifest metadata is sent in bounded
 64 KiB batches, flushing before any inline file data.
 
-Servers also advertising x-distcc-input: 12 accept protocol 12. It permits
+Protocol 13 permits
 nonempty FILE entries directly in the manifest; these entries never require
 an upload in MISS. Clients send inputs larger than the 4 MiB retention limit
 inline and exclude them from the savings estimate. A job without sufficient
-cacheable content uses protocol 9 without any lookup. Against a protocol 11
-peer, a job containing a known oversized input also uses protocol 9.
+cacheable content uses protocol 9 without any lookup.
 
 The include server hashes contents while producing its immutable compressed
 snapshot and stores the raw digest followed by its uint64 uncompressed length
-in network byte order in a .sha256 sidecar. Digest-only sidecars from older
-include servers remain readable; their retention eligibility is unknown.
-Old clients that require a digest-only sidecar use protocol 9 with a new
-include server. Existing mutation
+in network byte order in a .xxh3 sidecar (16 bytes total). Existing mutation
 checks invalidate the compressed snapshot and digest together. Cache hits
 are copied or reflinked, verified, and owned by the job; eviction cannot
 invalidate an active input. On filesystems without reflink, hashing occurs

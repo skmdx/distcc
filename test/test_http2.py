@@ -2,7 +2,7 @@
 """HTTP/2 multiplexing and cancellation through real distccd workers."""
 import concurrent.futures
 import io
-import hashlib
+import xxhash
 import re
 import random
 import os
@@ -27,7 +27,7 @@ class Http2Test(BrokerTestCase):
         def string(name, value):
             return f'{name}{len(value):08x}'.encode() + value
         args = [b'gcc', b'-c', b'/src/source.c', b'-o', b'/src/result.o']
-        version = 12 if inline else 11
+        version = 13
         header = f'DIST{version:08x}'.encode() + string('CDIR', b'/src') + f'ARGC{len(args):08x}'.encode()
         header += b''.join(string('ARGV', arg) for arg in args)
         header += f'NFIL{len(files):08x}'.encode()
@@ -40,7 +40,7 @@ class Http2Test(BrokerTestCase):
                     header += struct.pack('!II', len(chunk), 0) + chunk
                 header += bytes(8)
             else:
-                header += string('HASH', hashlib.sha256(body).digest())
+                header += string('HASH', xxhash.xxh3_64(body).digest())
         with self.request(9) as lease:
             status, caps, fds = self.receive(lease)
             self.assertEqual(status, 0)
@@ -152,7 +152,7 @@ class Http2Test(BrokerTestCase):
         index = 0
         while len(files) < 70:
             body = f'/* unused header {index} */\n'.encode()
-            if hashlib.sha256(body).digest()[0] % 64 == 0:
+            if xxhash.xxh3_64(body).digest()[0] % 64 == 0:
                 files.append((f'/src/header{index}.h'.encode(), body))
             index += 1
         self.cached_compile(files)
@@ -161,7 +161,7 @@ class Http2Test(BrokerTestCase):
         large = []
         while len(large) < 6:
             body = f'/* large header {index} */\n'.encode() + b' ' * (900 * 1024)
-            if hashlib.sha256(body).digest()[0] % 64 == 0:
+            if xxhash.xxh3_64(body).digest()[0] % 64 == 0:
                 large.append((f'/src/large{index}.h'.encode(), body))
             index += 1
         self.cached_compile(files[:1] + large)
@@ -183,7 +183,7 @@ class Http2Test(BrokerTestCase):
         body = b'int main(void) { return 0; }\n'
         files = [(b'/src/source.c', body)]
         self.cached_compile(files, execute=True)
-        key = hashlib.sha256(body).hexdigest()
+        key = xxhash.xxh3_64(body).hexdigest()
         entry = self.root / f'distcc-cache-{os.geteuid()}' / f'{int(key[:2], 16) % 64:02x}' / key
         def change_cached_inode():
             entry.chmod(0o600)
@@ -284,7 +284,7 @@ class Http2Test(BrokerTestCase):
         before = self.accepts()
         lease = self.request(6)
         status, capabilities, fds = self.receive(lease)
-        self.assertEqual((status, capabilities, len(fds)), (0, (1 << 29) | (1 << 28), 1))
+        self.assertEqual((status, capabilities, len(fds)), (0, 1 << 29, 1))
         with socket.socket(fileno=fds[0]) as net:
             net.sendall(b'DIST00000006ARGC00000002ARGV00000003gcc')
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -368,23 +368,6 @@ class Http2Test(BrokerTestCase):
                 with self.assertRaises(socket.timeout):
                     net.recv(1)
         self.job('reconnected')
-
-    @unittest.skipUnless(os.environ.get('DISTCC_TEST_BASELINE'), 'previous HTTP/2 build is required')
-    def test_previous_http2_peers(self):
-        previous = Path(os.environ['DISTCC_TEST_BASELINE']).resolve()
-        candidate = self.build
-        try:
-            self.build = previous
-            self.start_h2('previous')
-            self.check_large_transfer()
-        finally:
-            self.build = candidate
-        try:
-            self.restart_server(previous / 'distccd')
-            self.start_h2('candidate')
-            self.check_large_transfer()
-        finally:
-            self.restart_server(candidate / 'distccd')
 
     def test_blocked_worker_does_not_spin_broker(self):
         broker = self.start_h2()

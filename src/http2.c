@@ -33,7 +33,7 @@ struct stream {
 };
 
 struct dcc_h2 {
-    int fd, server, failed, connecting, staged;
+    int fd, server, failed, connecting;
     nghttp2_session *session;
     struct stream *streams;
     dcc_h2_accept_fn accept_job;
@@ -135,12 +135,8 @@ static int header(nghttp2_session *session, const nghttp2_frame *frame,
         if (valuelen == 3 && !memcmp(value, "200", 3)) *s->status = 200;
         else if (valuelen == 3 && !memcmp(value, "503", 3)) *s->status = 503;
         else *s->status = -1;
-    } else if (namelen == 14 && !memcmp(name, "x-distcc-queue", 14)) {
-        c->staged = valuelen == 1 && value[0] == '1';
     } else if (s->file_cache && namelen == 14 && !memcmp(name, "x-distcc-cache", 14)) {
-        if (valuelen == 1 && value[0] == '1') *s->file_cache |= 1;
-    } else if (s->file_cache && namelen == 14 && !memcmp(name, "x-distcc-input", 14)) {
-        if (valuelen == 2 && !memcmp(value, "12", 2)) *s->file_cache |= 2;
+        *s->file_cache = valuelen == 7 && !memcmp(value, "xxh3-64", 7);
     }
     return 0;
 }
@@ -156,8 +152,7 @@ static int receive_frame(nghttp2_session *session, const nghttp2_frame *frame,
         int fd = -1, accepted = s->headers == 3 && !attach_socket(s, &fd) &&
                                   !c->accept_job(c->context, fd, s->link);
         nghttp2_nv ok[] = { NV(":status", "200"), NV("content-type", "application/x-distcc"),
-                           NV("x-distcc-queue", "1"),
-                           NV("x-distcc-cache", "1"), NV("x-distcc-input", "12") };
+                           NV("x-distcc-cache", "xxh3-64") };
         nghttp2_nv busy[] = { NV(":status", "503") };
         const char *cache = getenv("DISTCCD_FILE_CACHE");
         nghttp2_data_provider provider = { .source.ptr = s, .read_callback = read_data };
@@ -165,7 +160,7 @@ static int receive_frame(nghttp2_session *session, const nghttp2_frame *frame,
         if (!accepted && s->fd >= 0) { close(s->fd); s->fd = -1; }
         if (!accepted) { free(s->input); s->input = NULL; }
         if (nghttp2_submit_response(session, s->id, accepted ? ok : busy,
-                                    accepted ? ((!cache || *cache) ? 5 : 3) : 1,
+                                    accepted ? ((!cache || *cache) ? 3 : 2) : 1,
                                     accepted ? &provider : NULL))
             return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
@@ -478,9 +473,4 @@ int dcc_h2_active(struct dcc_h2 *c)
     int count = 0;
     if (c) for (s = c->streams; s; s = s->next) count += s->fd >= 0;
     return count;
-}
-
-int dcc_h2_staged(struct dcc_h2 *c)
-{
-    return c && c->staged;
 }

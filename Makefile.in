@@ -505,7 +505,7 @@ distcc@EXEEXT@: $(distcc_obj)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(distcc_obj) $(LIBS)
 
 distccd@EXEEXT@: $(distccd_obj)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(distccd_obj) $(LIBS) @CRYPTO_LIBS@
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(distccd_obj) $(LIBS)
 
 distccmon-text@EXEEXT@: $(mon_obj) src/mon-text.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(mon_obj) src/mon-text.o $(LIBS)

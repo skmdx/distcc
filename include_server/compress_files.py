@@ -20,7 +20,7 @@
 """Compress files in an include closure."""
 
 import os
-import hashlib
+import xxhash
 import sys
 import struct
 import os.path
@@ -112,7 +112,7 @@ class CompressFiles(object):
           sys.exit("Could not open '%s' for writing: %s" % (new_filepath, why))
         try:
           if compression == 'lz4s':
-            digest = hashlib.sha256()
+            digest = xxhash.xxh3_64()
             plain_size = 0
             chunk = prefix.encode()
             while True:
@@ -127,7 +127,7 @@ class CompressFiles(object):
               new_filepath_fd.write(encoded if compressed else chunk)
               chunk = b''
             new_filepath_fd.write(bytes(8))
-            with open(new_filepath + '.sha256', 'wb') as hash_file:
+            with open(new_filepath + '.xxh3', 'wb') as hash_file:
               hash_file.write(digest.digest())
               hash_file.write(struct.pack('!Q', plain_size))
           else:

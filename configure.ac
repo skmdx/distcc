@@ -223,10 +223,9 @@ fi
 AC_SUBST(WERROR_CFLAGS)
 AC_SUBST(PYTHON_CFLAGS)
 AC_SEARCH_LIBS([strerror],[cposix])
-AC_CHECK_HEADER([openssl/evp.h], [], [AC_MSG_ERROR([OpenSSL headers are required])])
-AC_CHECK_LIB([crypto], [EVP_sha256], [CRYPTO_LIBS="-lcrypto"],
-             [AC_MSG_ERROR([libcrypto is required])])
-AC_SUBST(CRYPTO_LIBS)
+AC_CHECK_HEADER([xxhash.h], [], [AC_MSG_ERROR([xxHash headers are required])])
+AC_CHECK_LIB([xxhash], [XXH3_64bits_reset], [],
+             [AC_MSG_ERROR([libxxhash with XXH3 support is required])])
 AC_CHECK_HEADER([lz4.h], [], [AC_MSG_ERROR([LZ4 headers are required])])
 AC_CHECK_LIB([lz4], [LZ4_compress_default], [],
              [AC_MSG_ERROR([liblz4 is required])])

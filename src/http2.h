@@ -18,5 +18,4 @@ int dcc_h2_prepare(struct dcc_h2 *connection, struct pollfd *polls, int capacity
 int dcc_h2_process(struct dcc_h2 *connection, struct pollfd *polls);
 int dcc_h2_idle(struct dcc_h2 *connection);
 int dcc_h2_active(struct dcc_h2 *connection);
-int dcc_h2_staged(struct dcc_h2 *connection);
 #endif

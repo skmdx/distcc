@@ -61,7 +61,7 @@ int dcc_r_request_header(int ifd,
         return ret;
     }
 
-    if (vers < DCC_VER_1 || vers > DCC_VER_INLINE_CPP) {
+    if (vers < DCC_VER_1 || (vers > DCC_VER_STREAM_LINK && vers != DCC_VER_CACHED_CPP)) {
         rs_log_error("can't handle requested protocol version is %d", vers);
         return EXIT_PROTOCOL_ERROR;
     }
@@ -113,7 +113,7 @@ static int compare_hashes(const void *a, const void *b)
 {
     const struct cached_file *x = *(const struct cached_file *const *)a;
     const struct cached_file *y = *(const struct cached_file *const *)b;
-    return memcmp(x->hash, y->hash, DCC_FILE_HASH_SIZE);
+    return memcmp(x->hash, y->hash, sizeof(x->hash));
 }
 
 static int receive_cached_files(int in_fd, int out_fd, struct cached_file *files,
@@ -154,7 +154,7 @@ static int receive_cached_files(int in_fd, int out_fd, struct cached_file *files
         if (!wanted[i]) continue;
         ret = dcc_r_token_file(in_fd, "FILE", files[i].name, compr);
         if (!ret && !dcc_file_cache_verify(files[i].hash, files[i].name)) {
-            rs_log_error("input content does not match its SHA-256 manifest");
+            rs_log_error("input content does not match its manifest digest");
             ret = EXIT_PROTOCOL_ERROR;
         }
         if (!ret) dcc_file_cache_put(files[i].hash, files[i].name);
@@ -264,10 +264,6 @@ int dcc_r_many_files(int in_fd, int out_fd,
                 (ret = dcc_add_cleanup(name))) goto out_cleanup;
             files[i].hashed = 1;
         } else if (strncmp(token, "FILE", 4) == 0) {
-            if (cached == 1 && link_or_file_len) {
-                ret = EXIT_PROTOCOL_ERROR;
-                goto out_cleanup;
-            }
             if ((ret = dcc_r_file(in_fd, name, link_or_file_len, compr))) {
                 goto out_cleanup;
             }

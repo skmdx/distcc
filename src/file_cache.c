@@ -7,7 +7,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <time.h>
-#include <openssl/evp.h>
+#include <xxhash.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,7 +58,7 @@ static int cache_root(void)
     return root;
 }
 
-static int cache_shard(const unsigned char *hash, char key[65])
+static int cache_shard(const unsigned char *hash, char key[17])
 {
     char shard[3];
     int root = cache_root(), fd, i;
@@ -129,60 +129,46 @@ done:
     return ret;
 }
 
-static int digest(int fd, const unsigned char *expected)
+/* A negative destination verifies an existing file without copying it.
+ * Verify the same bytes that enter the private snapshot. */
+static int copy_snapshot(int from, int to, const unsigned char *expected)
 {
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    unsigned char buffer[65536], hash[EVP_MAX_MD_SIZE];
-    unsigned length;
+    char buffer[65536];
+    XXH3_state_t *xxh = NULL;
+    int ret = -1;
     ssize_t n;
-    int ok = 0;
-    if (!ctx || lseek(fd, 0, SEEK_SET) < 0 || !EVP_DigestInit_ex(ctx, EVP_sha256(), NULL))
-        goto done;
-    while ((n = read(fd, buffer, sizeof(buffer))) != 0) {
-        if (n < 0) { if (errno == EINTR) continue; goto done; }
-        if (!EVP_DigestUpdate(ctx, buffer, n)) goto done;
+#ifdef __linux__
+    if (to >= 0 && !ioctl(to, FICLONE, from))
+        return expected ? copy_snapshot(to, -1, expected) : 0;
+#endif
+    if (lseek(from, 0, SEEK_SET) < 0) goto done;
+    if (expected) {
+        xxh = XXH3_createState();
+        if (!xxh || XXH3_64bits_reset(xxh) != XXH_OK) goto done;
     }
-    ok = EVP_DigestFinal_ex(ctx, hash, &length) && length == DCC_FILE_HASH_SIZE &&
-         !memcmp(hash, expected, length);
+    while ((n = read(from, buffer, sizeof(buffer))) != 0) {
+        if (n < 0) { if (errno == EINTR) continue; goto done; }
+        if ((xxh && XXH3_64bits_update(xxh, buffer, n) != XXH_OK) ||
+            (to >= 0 && dcc_writex(to, buffer, n))) goto done;
+    }
+    if (xxh) {
+        XXH64_canonical_t canonical;
+        XXH64_canonicalFromHash(&canonical, XXH3_64bits_digest(xxh));
+        if (memcmp(canonical.digest, expected, DCC_FILE_HASH_SIZE)) goto done;
+    }
+    ret = 0;
 done:
-    EVP_MD_CTX_free(ctx);
-    return ok;
+    XXH3_freeState(xxh);
+    return ret;
 }
 
 int dcc_file_cache_verify(const unsigned char *hash, const char *path)
 {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC), ok;
     if (fd < 0) return 0;
-    ok = digest(fd, hash);
+    ok = !copy_snapshot(fd, -1, hash);
     close(fd);
     return ok;
-}
-
-static int copy_snapshot(int from, int to, const unsigned char *expected)
-{
-    char buffer[65536];
-    EVP_MD_CTX *ctx = NULL;
-    unsigned char hash[EVP_MAX_MD_SIZE];
-    unsigned length;
-    int ret = -1;
-    ssize_t n;
-#ifdef __linux__
-    if (!ioctl(to, FICLONE, from)) return !expected || digest(to, expected) ? 0 : -1;
-#endif
-    if (expected) {
-        ctx = EVP_MD_CTX_new();
-        if (!ctx || !EVP_DigestInit_ex(ctx, EVP_sha256(), NULL)) goto done;
-    }
-    while ((n = read(from, buffer, sizeof(buffer))) != 0) {
-        if (n < 0) { if (errno == EINTR) continue; goto done; }
-        if ((ctx && !EVP_DigestUpdate(ctx, buffer, n)) || dcc_writex(to, buffer, n)) goto done;
-    }
-    if (ctx && (!EVP_DigestFinal_ex(ctx, hash, &length) || length != DCC_FILE_HASH_SIZE ||
-                memcmp(hash, expected, length))) goto done;
-    ret = 0;
-done:
-    EVP_MD_CTX_free(ctx);
-    return ret;
 }
 
 static int snapshot(int from, const char *destination, const unsigned char *hash)
@@ -208,7 +194,7 @@ int dcc_file_cache_copy(const unsigned char *hash, const char *source, const cha
 
 int dcc_file_cache_get(const unsigned char *hash, const char *destination)
 {
-    char key[65];
+    char key[17];
     struct stat st;
     int shard = cache_shard(hash, key), from = -1, ok = 0;
     if (shard < 0) return 0;
@@ -224,7 +210,7 @@ done:
     return ok;
 }
 
-struct entry { char key[65]; off_t size; time_t age; };
+struct entry { char key[17]; off_t size; time_t age; };
 
 static int make_room(int shard, off_t size, const char *replaced)
 {
@@ -240,7 +226,7 @@ static int make_room(int shard, off_t size, const char *replaced)
             if (unlinkat(shard, de->d_name, 0)) { closedir(dir); return -1; }
             continue;
         }
-        if (strlen(de->d_name) != 64 || strspn(de->d_name, "0123456789abcdef") != 64)
+        if (strlen(de->d_name) != 16 || strspn(de->d_name, "0123456789abcdef") != 16)
             continue;
         if (!strcmp(de->d_name, replaced)) continue;
         if (fstatat(shard, de->d_name, &st, AT_SYMLINK_NOFOLLOW)) continue;
@@ -267,7 +253,7 @@ static int make_room(int shard, off_t size, const char *replaced)
 
 void dcc_file_cache_put(const unsigned char *hash, const char *path)
 {
-    char key[65], temporary[40];
+    char key[17], temporary[40];
     struct stat st;
     int shard = -1, lock = -1, from = -1, to = -1;
     from = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -282,7 +268,7 @@ void dcc_file_cache_put(const unsigned char *hash, const char *path)
     if (to >= 0) {
         struct stat existing;
         int present = !fstat(to, &existing) && S_ISREG(existing.st_mode) &&
-                      existing.st_size == st.st_size && digest(to, hash);
+                      existing.st_size == st.st_size && !copy_snapshot(to, -1, hash);
         close(to);
         to = -1;
         if (present) goto done;
