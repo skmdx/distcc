@@ -21,6 +21,7 @@
 #define MAX_STREAMS 256
 #define FRAME_SIZE (64 * 1024)
 #define CONTROL_SIZE 4096
+#define IO_BUDGET (16 * FRAME_SIZE)
 
 struct stream {
     struct stream *next;
@@ -32,7 +33,7 @@ struct stream {
 };
 
 struct dcc_h2 {
-    int fd, server, failed, connecting;
+    int fd, server, failed, connecting, staged;
     nghttp2_session *session;
     struct stream *streams;
     dcc_h2_accept_fn accept_job;
@@ -134,8 +135,12 @@ static int header(nghttp2_session *session, const nghttp2_frame *frame,
         if (valuelen == 3 && !memcmp(value, "200", 3)) *s->status = 200;
         else if (valuelen == 3 && !memcmp(value, "503", 3)) *s->status = 503;
         else *s->status = -1;
+    } else if (namelen == 14 && !memcmp(name, "x-distcc-queue", 14)) {
+        c->staged = valuelen == 1 && value[0] == '1';
     } else if (s->file_cache && namelen == 14 && !memcmp(name, "x-distcc-cache", 14)) {
-        *s->file_cache = valuelen == 1 && value[0] == '1';
+        if (valuelen == 1 && value[0] == '1') *s->file_cache |= 1;
+    } else if (s->file_cache && namelen == 14 && !memcmp(name, "x-distcc-input", 14)) {
+        if (valuelen == 2 && !memcmp(value, "12", 2)) *s->file_cache |= 2;
     }
     return 0;
 }
@@ -151,7 +156,8 @@ static int receive_frame(nghttp2_session *session, const nghttp2_frame *frame,
         int fd = -1, accepted = s->headers == 3 && !attach_socket(s, &fd) &&
                                   !c->accept_job(c->context, fd, s->link);
         nghttp2_nv ok[] = { NV(":status", "200"), NV("content-type", "application/x-distcc"),
-                           NV("x-distcc-cache", "1") };
+                           NV("x-distcc-queue", "1"),
+                           NV("x-distcc-cache", "1"), NV("x-distcc-input", "12") };
         nghttp2_nv busy[] = { NV(":status", "503") };
         const char *cache = getenv("DISTCCD_FILE_CACHE");
         nghttp2_data_provider provider = { .source.ptr = s, .read_callback = read_data };
@@ -159,7 +165,7 @@ static int receive_frame(nghttp2_session *session, const nghttp2_frame *frame,
         if (!accepted && s->fd >= 0) { close(s->fd); s->fd = -1; }
         if (!accepted) { free(s->input); s->input = NULL; }
         if (nghttp2_submit_response(session, s->id, accepted ? ok : busy,
-                                    accepted ? ((!cache || *cache) ? 3 : 2) : 1,
+                                    accepted ? ((!cache || *cache) ? 5 : 3) : 1,
                                     accepted ? &provider : NULL))
             return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
@@ -403,9 +409,14 @@ int dcc_h2_process(struct dcc_h2 *c, struct pollfd *polls)
         c->connecting = 0;
     }
     if (polls[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-        n = recv(c->fd, buffer, sizeof(buffer), 0);
-        if (!n || (n < 0 && errno != EAGAIN && errno != EINTR)) return -1;
-        if (n > 0 && nghttp2_session_mem_recv(c->session, buffer, n) != n) return -1;
+        size_t received = 0;
+        do {
+            n = recv(c->fd, buffer, sizeof(buffer), 0);
+            if (!n || (n < 0 && errno != EAGAIN && errno != EINTR)) return -1;
+            if (n < 0) break;
+            if (nghttp2_session_mem_recv(c->session, buffer, n) != n) return -1;
+            received += n;
+        } while (received < IO_BUDGET);
     }
     for (s = c->streams; s; s = s->next) {
         short events = s->poll_index < 0 ? 0 : polls[s->poll_index].revents;
@@ -429,8 +440,10 @@ int dcc_h2_process(struct dcc_h2 *c, struct pollfd *polls)
         if (events & (POLLIN | POLLHUP | POLLERR))
             nghttp2_session_resume_data(c->session, s->id);
     }
-    if (fill_output(c)) return -1;
-    if ((c->out_size || c->pending_size) && !c->connecting) {
+    size_t sent = 0;
+    while (!c->connecting && sent < IO_BUDGET) {
+        if (fill_output(c)) return -1;
+        if (!c->out_size && !c->pending_size) break;
         struct iovec vectors[] = {
             { c->output + c->out_head, c->out_size },
             { (void *)c->pending, c->pending_size }
@@ -438,13 +451,17 @@ int dcc_h2_process(struct dcc_h2 *c, struct pollfd *polls)
         struct msghdr message = { .msg_iov = vectors, .msg_iovlen = 2 };
         n = sendmsg(c->fd, &message, MSG_NOSIGNAL);
         if (n > 0) {
+            sent += n;
             size_t control = (size_t)n < c->out_size ? (size_t)n : c->out_size;
             c->out_head += control;
             c->out_size -= control;
             n -= control;
             if (n) { c->pending += n; c->pending_size -= n; }
         }
-        else if (n < 0 && errno != EAGAIN && errno != EINTR) return -1;
+        else {
+            if (n < 0 && errno != EAGAIN && errno != EINTR) return -1;
+            break;
+        }
     }
     reap_streams(c);
     return 0;
@@ -461,4 +478,9 @@ int dcc_h2_active(struct dcc_h2 *c)
     int count = 0;
     if (c) for (s = c->streams; s; s = s->next) count += s->fd >= 0;
     return count;
+}
+
+int dcc_h2_staged(struct dcc_h2 *c)
+{
+    return c && c->staged;
 }

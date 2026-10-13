@@ -97,6 +97,8 @@ def main():
     parser.add_argument('--remove-glob', action='append', default=[])
     parser.add_argument('--verify', type=shlex.split, help='quoted argv command to verify each build')
     parser.add_argument('--pump', action='store_true')
+    parser.add_argument('--before-measure', type=shlex.split,
+                        help='quoted argv hook after warmup; {variant} selects the instance')
     parser.add_argument('--server', action='append', default=[], metavar='SSH_HOST:CGROUP_PATH')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -139,7 +141,7 @@ def main():
                     raise RuntimeError('broker failed to start')
                 time.sleep(.01)
             if args.pump:
-                startup = subprocess.run([str(args.candidate/'pump'), '--startup'], env=env,
+                startup = subprocess.run([str(binary/'pump'), '--startup'], env=env,
                                          cwd=args.work, check=True, capture_output=True, text=True)
                 for line in startup.stdout.splitlines():
                     words = shlex.split(line)
@@ -159,12 +161,18 @@ def main():
                         raise RuntimeError('remove globs must select regular files inside --work')
                     file.unlink()
             command = [part.replace('{distcc}', str(instance['binary']/'distcc')) for part in args.command]
+            if measured and args.before_measure:
+                subprocess.run([part.replace('{variant}', name) for part in args.before_measure],
+                               cwd=args.work, env=env, stdout=log, stderr=log, check=True)
             before = servers_usage(args.server) if measured else []
             network_before = network_usage(broker.pid) if measured else {}
             broker_cpu, _ = process_usage(broker.pid)
             include_pid = int(env.get('INCLUDE_SERVER_PID', '0'))
             include_cpu = process_usage(include_pid)[0] if include_pid else 0
-            result = run_command(command, env, args.work, log)
+            try:
+                result = run_command(command, env, args.work, log)
+            except RuntimeError as error:
+                raise RuntimeError(f'{error}; broker exit status: {broker.poll()}') from error
             after_cpu, peak = process_usage(broker.pid)
             include_after, include_peak = process_usage(include_pid) if include_pid else (0, 0)
             if measured:
@@ -212,7 +220,7 @@ def main():
     finally:
         for instance in instances.values():
             if instance['pump']:
-                subprocess.run([str(args.candidate/'pump'), '--shutdown'], env=instance['env'],
+                subprocess.run([str(instance['binary']/'pump'), '--shutdown'], env=instance['env'],
                                cwd=args.work, stdout=instance['log'], stderr=instance['log'])
             broker = instance['broker']
             if broker.poll() is None:

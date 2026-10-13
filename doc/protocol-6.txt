@@ -1,4 +1,4 @@
-distcc protocols 6 through 11: LZ4 compression and HTTP/2
+distcc protocols 6 through 12: LZ4 compression and HTTP/2
 ======================================================
 
 Protocol 6 follows protocol 2 (client preprocessing), and protocol 7 follows
@@ -62,7 +62,7 @@ The broker opens a prior-knowledge cleartext HTTP/2 connection on the existing
 distccd port. The prefork parent checks the existing IP ACL before accepting
 the session. There is no HTTP/1 upgrade, TLS, SSH or GSSAPI wrapper.
 Each job is POST /v1/compile or POST /v1/link, with one RPC exchange in its
-DATA frames. Response status 200 grants a worker; 503 refuses without starting
+DATA frames. Response status 200 admits an input; 503 refuses without starting
 execution, allowing another host to be selected. A connection failure after
 admission retains the existing failed-job policy; it is not a safe refusal.
 
@@ -73,31 +73,45 @@ RST_STREAM or loss of the connection cancels it. Response END_STREAM signals
 local EOF after queued result bytes drain. Lease cancellation is scoped to
 both the connection generation and stream ID.
 
+Servers advertising x-distcc-queue: 1 separate input reception and result
+draining from compiler admission. The first HTTP/2 session activates up to
+min(jobs, 4) additional persistent workers. Total in-flight jobs are bounded
+by that pool; compilers still obey --jobs and resource admission, with at most
+one active link. Ready inputs receive execution grants in arrival order, with
+links awaiting their own limit. Finished compilers release the grant before
+result transfer. Brokers may pipeline up to the same bounded allowance after
+negotiation. TCP-only servers retain their original worker count. Cancelling
+a worker waiting for a grant retires its channel, so a racing grant cannot be
+mistaken for the next job. Older HTTP/2 peers retain their original admission.
+
 Receive windows are 256 KiB per stream and 8 MiB per connection. WINDOW_UPDATE
 is issued when the local consumer drains data. A writable local consumer
 receives DATA directly; a 256 KiB queue is allocated only when it falls behind.
 The sender stops polling local producers while HTTP/2 or network output is
 blocked. Large serialized frames remain in nghttp2's buffer through partial
 writes; up to 4 KiB of small frames are coalesced and sent alongside them.
+Each event-loop turn drains at most 1 MiB in either network direction before
+yielding, avoiding one poll cycle per frame while bounding work per connection.
 
 Connections advertise a 64 KiB maximum frame and at most 256 concurrent
 streams. DATA reads respect the peer's frame limit and both flow-control
 windows, including older peers using 16 KiB frames. Worker/resource admission
 still determines executable concurrency. Idle server connections expire after
-30 s. The admission exchange is unchanged. Objects and link inputs are not
-cached between jobs; source inputs can use protocol 11 as described below.
+30 s. Objects and link inputs are not cached between jobs; source inputs can
+use protocols 11 and 12 as described below.
 
-Cached input manifests (11)
---------------------------
+Cached input manifests (11 and 12)
+---------------------------------
 
 An HTTP/2 response advertises x-distcc-cache: 1 when the daemon supports
 cached inputs. The broker conveys this capability with its job descriptor.
 For server preprocessing, clients with include-server SHA-256 sidecars use
-protocol 11 when an all-hit manifest would save at least 16 KiB, estimated
-from compressed file sizes minus digest sizes. Smaller jobs, clients without
+cached manifests when an all-hit manifest would save at least 16 KiB,
+estimated from compressed file sizes minus digest and missing-bitmap costs.
+Smaller jobs, clients without
 digests and peers without this header retain protocol 9. This avoids the
-missing-set round trip for small inputs. Old clients ignore the additional
-HTTP header. Protocol 11 has
+missing-set exchange for small inputs. Old clients ignore additional
+HTTP headers. Both versions have
 the same command, working-directory and result exchange as protocol 9.
 
 NFIL is followed by a complete input manifest. Each entry has NAME and
@@ -109,15 +123,36 @@ The server materializes verified cache hits into private job files, then
 sends MISS with length NFIL and one byte per entry (1 = upload, 0 = present).
 Only HASH entries can require upload. The client sends FILE payloads for the
 missing entries in manifest order, using the existing chunked LZ4 encoding.
-There is one missing-set round trip per job, not one per file. A digest
-mismatch aborts the job before execution. Request END_STREAM follows uploads.
+An actual miss requires a round trip before its upload, not one per file.
+With all inputs present the server proceeds after sending MISS without waiting
+for a client acknowledgement. A digest mismatch aborts the job before execution.
+Request END_STREAM follows uploads. Manifest metadata is sent in bounded
+64 KiB batches, flushing before any inline file data.
+
+Servers also advertising x-distcc-input: 12 accept protocol 12. It permits
+nonempty FILE entries directly in the manifest; these entries never require
+an upload in MISS. Clients send inputs larger than the 4 MiB retention limit
+inline and exclude them from the savings estimate. A job without sufficient
+cacheable content uses protocol 9 without any lookup. Against a protocol 11
+peer, a job containing a known oversized input also uses protocol 9.
 
 The include server hashes contents while producing its immutable compressed
-snapshot and stores the raw digest in a .sha256 sidecar. Existing mutation
+snapshot and stores the raw digest followed by its uint64 uncompressed length
+in network byte order in a .sha256 sidecar. Digest-only sidecars from older
+include servers remain readable; their retention eligibility is unknown.
+Old clients that require a digest-only sidecar use protocol 9 with a new
+include server. Existing mutation
 checks invalidate the compressed snapshot and digest together. Cache hits
 are copied or reflinked, verified, and owned by the job; eviction cannot
-invalidate an active input. Uploads are verified before atomic publication,
-and cache insertion never waits for another uploader's lock.
+invalidate an active input. On filesystems without reflink, hashing occurs
+during the copy, without rereading the destination. Uploads are verified before
+atomic publication. Duplicate contents within a manifest use one upload and
+independent snapshots. Concurrent jobs share uploads using sorted byte-range
+leases on one persistent .uploads inode. Sorting prevents overlapping manifests
+from deadlocking; cancellation, timeout or worker death releases the leases.
+Waiters recheck the cache before sending MISS. Eviction or a skipped insertion
+can still cause a later reupload. Directory insertion locks remain nonblocking;
+an already valid entry is not copied or counted a second time during eviction.
 
 DISTCCD_FILE_CACHE chooses a private daemon-owned directory. By default it is
 distcc-cache-<uid> under the daemon's TMPDIR. An explicitly empty value disables

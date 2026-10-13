@@ -61,7 +61,7 @@ int dcc_r_request_header(int ifd,
         return ret;
     }
 
-    if (vers < DCC_VER_1 || vers > DCC_VER_CACHED_CPP) {
+    if (vers < DCC_VER_1 || vers > DCC_VER_INLINE_CPP) {
         rs_log_error("can't handle requested protocol version is %d", vers);
         return EXIT_PROTOCOL_ERROR;
     }
@@ -102,6 +102,75 @@ static int compare_names(const void *a, const void *b)
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
+struct cached_file {
+    char *name;
+    unsigned char hash[DCC_FILE_HASH_SIZE];
+    int hashed;
+    struct cached_file *alias;
+};
+
+static int compare_hashes(const void *a, const void *b)
+{
+    const struct cached_file *x = *(const struct cached_file *const *)a;
+    const struct cached_file *y = *(const struct cached_file *const *)b;
+    return memcmp(x->hash, y->hash, DCC_FILE_HASH_SIZE);
+}
+
+static int receive_cached_files(int in_fd, int out_fd, struct cached_file *files,
+                               unsigned count, enum dcc_compress compr)
+{
+    struct cached_file **ordered = calloc(count, sizeof(*ordered)), *previous = NULL;
+    const unsigned char **hashes = calloc(count, sizeof(*hashes));
+    unsigned char *wanted = calloc(count, 1);
+    unsigned i, used = 0, missing = 0;
+    int ret = EXIT_OUT_OF_MEMORY, lock = -1;
+    if (!ordered || !hashes || !wanted) goto done;
+    for (i = 0; i < count; ++i)
+        if (files[i].hashed) ordered[used++] = &files[i];
+    qsort(ordered, used, sizeof(*ordered), compare_hashes);
+    for (i = 0; i < used; ++i) {
+        struct cached_file *file = ordered[i];
+        if (previous && !memcmp(previous->hash, file->hash, DCC_FILE_HASH_SIZE)) {
+            file->alias = previous;
+            continue;
+        }
+        previous = file;
+        if (!dcc_file_cache_get(file->hash, file->name)) {
+            wanted[file - files] = 1;
+            hashes[missing++] = file->hash;
+        }
+    }
+    ret = dcc_file_cache_lock(hashes, missing, in_fd, &lock);
+    if (ret) goto done;
+    /* An overlapping upload may have populated the cache while we waited.
+     * Hits already have private snapshots and never need to wait on a lease. */
+    if (lock >= 0)
+        for (i = 0; i < count; ++i)
+            if (wanted[i]) wanted[i] = !dcc_file_cache_get(files[i].hash, files[i].name);
+    ret = dcc_x_token_int(out_fd, "MISS", count);
+    if (!ret) ret = dcc_writex(out_fd, wanted, count);
+    tcp_cork_sock(out_fd, 0);
+    for (i = 0; !ret && i < count; ++i) {
+        if (!wanted[i]) continue;
+        ret = dcc_r_token_file(in_fd, "FILE", files[i].name, compr);
+        if (!ret && !dcc_file_cache_verify(files[i].hash, files[i].name)) {
+            rs_log_error("input content does not match its SHA-256 manifest");
+            ret = EXIT_PROTOCOL_ERROR;
+        }
+        if (!ret) dcc_file_cache_put(files[i].hash, files[i].name);
+    }
+    if (lock >= 0) { close(lock); lock = -1; }
+    for (i = 0; !ret && i < count; ++i)
+        if (files[i].alias && !dcc_file_cache_copy(files[i].hash, files[i].alias->name, files[i].name))
+            ret = EXIT_IO_ERROR;
+done:
+    if (lock >= 0) close(lock);
+    free(ordered);
+    free(hashes);
+    free(wanted);
+    return ret;
+}
+
 int dcc_r_many_files(int in_fd, int out_fd,
                      const char *dirname,
                      enum dcc_compress compr, int cached)
@@ -112,8 +181,7 @@ int dcc_r_many_files(int in_fd, int out_fd,
     char *name = 0;
     char *link_target = 0;
     char token[5];
-    struct cached_file { char *name; unsigned char hash[DCC_FILE_HASH_SIZE]; } *files = NULL;
-    unsigned char *wanted = NULL;
+    struct cached_file *files = NULL;
     char **names = NULL;
 
     if ((ret = dcc_r_token_int(in_fd, "NFIL", &n_files)))
@@ -121,9 +189,8 @@ int dcc_r_many_files(int in_fd, int out_fd,
     if (cached) {
         if (!n_files || n_files > DCC_FILE_MANIFEST_LIMIT) return EXIT_PROTOCOL_ERROR;
         files = calloc(n_files, sizeof(*files));
-        wanted = calloc(n_files, 1);
         names = calloc(n_files, sizeof(*names));
-        if (!files || !wanted || !names) { ret = EXIT_OUT_OF_MEMORY; goto done; }
+        if (!files || !names) { ret = EXIT_OUT_OF_MEMORY; goto done; }
     }
 
     for (i = 0; i < n_files; ++i) {
@@ -195,9 +262,9 @@ int dcc_r_many_files(int in_fd, int out_fd,
             }
             if ((ret = dcc_readx(in_fd, files[i].hash, DCC_FILE_HASH_SIZE)) ||
                 (ret = dcc_add_cleanup(name))) goto out_cleanup;
-            wanted[i] = !dcc_file_cache_get(files[i].hash, name);
+            files[i].hashed = 1;
         } else if (strncmp(token, "FILE", 4) == 0) {
-            if (cached && link_or_file_len) {
+            if (cached == 1 && link_or_file_len) {
                 ret = EXIT_PROTOCOL_ERROR;
                 goto out_cleanup;
             }
@@ -241,23 +308,11 @@ out_cleanup:
         for (i = 1; i < n_files; ++i) {
             if (!strcmp(names[i - 1], names[i])) { ret = EXIT_PROTOCOL_ERROR; goto done; }
         }
-        ret = dcc_x_token_int(out_fd, "MISS", n_files);
-        if (!ret) ret = dcc_writex(out_fd, wanted, n_files);
-        tcp_cork_sock(out_fd, 0);
-        for (i = 0; !ret && i < n_files; ++i) {
-            if (!wanted[i]) continue;
-            ret = dcc_r_token_file(in_fd, "FILE", files[i].name, compr);
-            if (!ret && !dcc_file_cache_verify(files[i].hash, files[i].name)) {
-                rs_log_error("input content does not match its SHA-256 manifest");
-                ret = EXIT_PROTOCOL_ERROR;
-            }
-            if (!ret) dcc_file_cache_put(files[i].hash, files[i].name);
-        }
+        ret = receive_cached_files(in_fd, out_fd, files, n_files, compr);
     }
 done:
     if (files) for (i = 0; i < n_files; ++i) free(files[i].name);
     free(names);
     free(files);
-    free(wanted);
     return ret;
 }

@@ -5,15 +5,16 @@ Run in a dedicated 384 MiB cgroup with swap disabled. Larger/unlimited test
 runners skip this test rather than allocating host-sized amounts of memory.
 """
 from pathlib import Path
+import concurrent.futures
 import re
 import socket
 import time
 import unittest
 
-from test_adaptive import DistccTestCase
+from test_broker import BrokerTestCase
 
 
-class MemoryAdmissionTest(DistccTestCase):
+class MemoryAdmissionTest(BrokerTestCase):
     daemon_env = {'DISTCC_JOB_MEMORY': '128'}
 
     def test_budget_and_headroom_recover(self):
@@ -29,7 +30,9 @@ class MemoryAdmissionTest(DistccTestCase):
         expected = min(4, (maximum - 32*1024**2) // (128*1024**2))
 
         def available():
-            return int(re.search(r'dcc_available (\d+)', self.get_stats(self.stats_ports[0]))[1])
+            match = re.search(r'dcc_available (\d+)', self.get_stats(self.stats_ports[0]))
+            assert match is not None
+            return int(match[1])
 
         def wait_available(value):
             deadline = time.monotonic() + 4
@@ -51,6 +54,18 @@ class MemoryAdmissionTest(DistccTestCase):
         self.assertEqual(net.recv(12, socket.MSG_WAITALL), b'BUSY00000000')
         for lease in leases: lease.close()
         wait_available(expected)
+        self.start_broker(self.host(0, f',h2,stats={self.stats_ports[0]}'))
+        peak = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(self.job, f'memory-pipeline-{i}') for i in range(8)]
+            while any(not future.done() for future in futures):
+                match = re.search(r'dcc_busy (\d+)', self.get_stats(self.stats_ports[0]))
+                assert match is not None
+                peak = max(peak, int(match[1]))
+                self.assertLessEqual(peak, expected)
+                time.sleep(.02)
+            for future in futures: future.result()
+        self.assertGreater(peak, 0)
         used = int((group/'memory.current').read_text())
         allocation = maximum - used - 96*1024**2
         self.assertGreater(allocation, 0)

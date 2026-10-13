@@ -247,6 +247,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready)
     (*host)->broker_lease = fd;
     (*host)->broker_pooled = !!(reply.slots & DCC_BROKER_POOLED);
     (*host)->file_cache = !!(reply.slots & DCC_BROKER_FILE_CACHE);
+    if (reply.slots & DCC_BROKER_INLINE_INPUT) (*host)->file_cache |= 2;
     *lease = fd;
     return 0;
 }
@@ -483,6 +484,7 @@ static void deliver_connection(struct broker *broker, struct client *client)
 {
     struct reply reply = { .slots = client->pooled ? DCC_BROKER_POOLED : 0 };
     if (client->h2_file_cache) reply.slots |= DCC_BROKER_FILE_CACHE;
+    if (client->h2_file_cache & 2) reply.slots |= DCC_BROKER_INLINE_INPUT;
     strcpy(reply.host, broker->peers[client->peer].host->hostdef_string);
     if (send_reply(client->fd, &reply, client->net)) {
         release_client(broker, client);
@@ -508,9 +510,11 @@ static int dispatch(struct broker *broker, struct client *client, double now)
             continue;
         available++;
         reply.slots += slots;
-        if (cap && cap->available == 0) continue;
+        int staged = p->host->http2 && dcc_h2_staged(p->h2);
+        if (cap && cap->available == 0 && !staged) continue;
         if (p->full_until > now || (link && p->link_until > now)) continue;
-        if (p->busy < slots) {
+        int inflight = slots + (staged ? (slots < DCC_H2_PIPELINE ? slots : DCC_H2_PIPELINE) : 0);
+        if (p->busy < inflight) {
             double score = dcc_capacity_score(p->host, cap, p->busy);
             double fill = (p->busy + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;

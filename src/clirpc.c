@@ -263,7 +263,7 @@ int dcc_is_link(const char *fname, int *is_link)
 
 /* Read digests of the include server's immutable compressed snapshots only
  * when the missing-set exchange can save a useful amount of traffic. */
-struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count)
+struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count, int capabilities)
 {
     struct dcc_input_digest *hashes;
     unsigned i;
@@ -284,7 +284,7 @@ struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count)
         }
         if (S_ISLNK(st.st_mode)) continue;
         if (!S_ISREG(st.st_mode)) goto failed;
-        hashes[i].regular = 1;
+        hashes[i].kind = DCC_INPUT_CACHED;
         savings += st.st_size > INT_MAX ? INT_MAX : st.st_size - DCC_FILE_HASH_SIZE;
     }
     /* Avoid a missing-set round trip and sidecar reads when even an all-hit
@@ -294,16 +294,33 @@ struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count)
         char *sidecar = NULL;
         FILE *file;
         int valid;
-        if (!hashes[i].regular) continue;
+        unsigned char size[8];
+        size_t length;
+        uint64_t plain_size = 0;
+        if (!hashes[i].kind) continue;
         if (asprintf(&sidecar, "%s.sha256", files[i]) < 0) goto failed;
         file = fopen(sidecar, "rb");
         free(sidecar);
         if (!file) goto failed;
-        valid = fread(hashes[i].sha256, 1, DCC_FILE_HASH_SIZE, file) == DCC_FILE_HASH_SIZE &&
-                fgetc(file) == EOF && !ferror(file);
+        valid = fread(hashes[i].sha256, 1, DCC_FILE_HASH_SIZE, file) == DCC_FILE_HASH_SIZE;
+        length = fread(size, 1, sizeof(size), file);
+        valid &= (length == sizeof(size) || !length) && fgetc(file) == EOF && !ferror(file);
         fclose(file);
         if (!valid) goto failed;
+        /* Old include servers have no size: their protocol 11 exchange is
+         * still safe. New snapshots can exclude inputs the cache cannot keep. */
+        if (length) {
+            unsigned j;
+            for (j = 0; j < sizeof(size); ++j) plain_size = (plain_size << 8) | size[j];
+            if (plain_size > DCC_FILE_CACHE_MAX) {
+                struct stat st;
+                if (!(capabilities & 2) || lstat(files[i], &st)) goto failed;
+                savings -= st.st_size > INT_MAX ? INT_MAX : st.st_size - DCC_FILE_HASH_SIZE;
+                hashes[i].kind = DCC_INPUT_INLINE;
+            }
+        }
     }
+    if (savings < 16384) goto failed;
     return hashes;
 failed:
     /* An older include server has no digests: retain its existing exchange. */
@@ -313,6 +330,29 @@ failed:
 
 /* fnames is the include server's null-terminated list of compressed snapshots
  * and symlinks. Only a cached manifest requires a response on ifd. */
+struct manifest_writer { int fd; size_t used; char data[65537]; };
+
+static int flush_manifest(struct manifest_writer *writer)
+{
+    int ret = writer->used ? dcc_writex(writer->fd, writer->data, writer->used) : 0;
+    writer->used = 0;
+    return ret;
+}
+
+static int manifest_token(struct manifest_writer *writer, const char *token,
+                          unsigned value, const void *data)
+{
+    size_t size = 12 + (data ? value : 0);
+    int ret;
+    if (size >= sizeof(writer->data)) return EXIT_PROTOCOL_ERROR;
+    if (writer->used + size >= sizeof(writer->data) && (ret = flush_manifest(writer))) return ret;
+    ret = dcc_format_token_int(writer->data + writer->used, token, value);
+    if (ret) return ret;
+    if (data) memcpy(writer->data + writer->used + 12, data, value);
+    writer->used += size;
+    return 0;
+}
+
 int dcc_x_many_files(int ofd, int ifd,
                      unsigned int n_files,
                      char **fnames, enum dcc_compress compr,
@@ -325,15 +365,18 @@ int dcc_x_many_files(int ofd, int ifd,
     char *original_fname;
     char **files = fnames;
     unsigned i = 0;
+    struct manifest_writer writer;
+    writer.fd = ofd;
+    writer.used = 0;
 
-    if ((ret = dcc_x_token_int(ofd, "NFIL", n_files))) return ret;
+    if ((ret = manifest_token(&writer, "NFIL", n_files, NULL))) return ret;
 
     for (; *fnames != NULL; ++fnames, ++i) {
         fname = *fnames;
         ret = dcc_get_original_fname(fname, &original_fname);
         if (ret) return ret;
 
-        ret = dcc_x_token_string(ofd, "NAME", original_fname);
+        ret = manifest_token(&writer, "NAME", strlen(original_fname), original_fname);
         int placeholder = str_endswith("/forcing_technique_271828", original_fname);
         free(original_fname);
         if (ret) return ret;
@@ -341,31 +384,35 @@ int dcc_x_many_files(int ofd, int ifd,
         if (placeholder) {
             /* Directory placeholder files don't exist on disk.  Send
                an empty file to ensure the directory is created */
-            ret = dcc_x_token_int(ofd, "FILE", 0);
+            ret = manifest_token(&writer, "FILE", 0, NULL);
             if (ret) return ret;
         } else {
-            if ((ret = dcc_is_link(fname, &is_link))) {
+            if (hashes && hashes[i].kind) is_link = 0;
+            else if ((ret = dcc_is_link(fname, &is_link))) {
                 return ret;
             }
 
             if (is_link) {
                 if ((ret = dcc_read_link(fname, link_points_to)) ||
-                    (ret = dcc_x_token_string(ofd, "LINK", link_points_to))) {
+                    (ret = manifest_token(&writer, "LINK", strlen(link_points_to), link_points_to))) {
                     return ret;
                 }
             } else {
                 /* Cache bytes carry the selected codec, without an RPC token. */
-                if (hashes) {
-                    ret = dcc_x_token_int(ofd, "HASH", DCC_FILE_HASH_SIZE);
-                    if (!ret) ret = dcc_writex(ofd, hashes[i].sha256, DCC_FILE_HASH_SIZE);
-                } else if (compr == DCC_COMPRESS_LZ4_STREAM) {
-                    ret = dcc_x_token_int(ofd, "FILE", 0xffffffffU);
-                    if (!ret) ret = dcc_copy_file_to_fd(fname, ofd);
-                } else ret = dcc_x_file(ofd, fname, "FILE", DCC_COMPRESS_NONE, NULL);
+                if (hashes && hashes[i].kind == DCC_INPUT_CACHED) {
+                    ret = manifest_token(&writer, "HASH", DCC_FILE_HASH_SIZE, hashes[i].sha256);
+                } else {
+                    if ((ret = flush_manifest(&writer))) return ret;
+                    if (compr == DCC_COMPRESS_LZ4_STREAM) {
+                        ret = dcc_x_token_int(ofd, "FILE", 0xffffffffU);
+                        if (!ret) ret = dcc_copy_file_to_fd(fname, ofd);
+                    } else ret = dcc_x_file(ofd, fname, "FILE", DCC_COMPRESS_NONE, NULL);
+                }
                 if (ret) return ret;
             }
         }
     }
+    if ((ret = flush_manifest(&writer))) return ret;
     if (hashes) {
         unsigned count, missing = 0;
         unsigned char *wanted = malloc(n_files);
@@ -375,7 +422,7 @@ int dcc_x_many_files(int ofd, int ifd,
         if (!ret && count != n_files) ret = EXIT_PROTOCOL_ERROR;
         if (!ret) ret = dcc_readx(ifd, wanted, count);
         for (i = 0; !ret && i < count; ++i) {
-            if (wanted[i] > 1 || (wanted[i] && !hashes[i].regular)) {
+            if (wanted[i] > 1 || (wanted[i] && hashes[i].kind != DCC_INPUT_CACHED)) {
                 ret = EXIT_PROTOCOL_ERROR;
                 break;
             }

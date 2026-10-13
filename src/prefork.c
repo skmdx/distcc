@@ -74,7 +74,11 @@ static int dcc_preforked_child(int listen_fd);
 #define SESSION_NEW 2
 #define WORKER_RETIRING 4
 #define SESSION_H2 8
-struct worker { pid_t pid; int fd, busy, link; };
+#define WORKER_READY 16
+#define WORKER_GRANT 32
+#define WORKER_DRAIN 64
+enum worker_phase { IDLE, EXECUTING, RECEIVING, WAITING, RETIRING, DRAINING };
+struct worker { pid_t pid; int fd, busy, link; unsigned long ticket; };
 struct pending {
     int fd, session, ready, used;
     time_t since;
@@ -84,18 +88,19 @@ static struct worker *workers;
 static struct pollfd *parent_polls;
 static struct pending pending[MAX_PENDING];
 static int worker_channel = -1;
+static int worker_count, worker_capacity, worker_staged, worker_running;
+static unsigned long next_ticket;
 static struct { struct dcc_h2 *connection; time_t active; int poll_index; } h2[MAX_PENDING];
 
 static int accept_h2_job(void *context, int fd, int link)
 {
-    int busy, queued, links, i, streams = 0;
+    int i, streams = 0;
     int message = SESSION_H2;
     (void)context;
     for (i = 0; i < MAX_PENDING; ++i) streams += dcc_h2_active(h2[i].connection);
     if (streams > MAX_PENDING) return -1;
-    dcc_prefork_status(&busy, &queued, &links);
-    if (busy >= dcc_resource_slots(dcc_max_kids) || (link && links)) return -1;
-    for (i = 0; i < dcc_max_kids; ++i) {
+    if (!dcc_resource_slots(dcc_max_kids)) return -1;
+    for (i = 0; i < worker_count; ++i) {
         struct worker *w = &workers[i];
         if (w->fd < 0 || w->busy) continue;
         if (dcc_send_fd(w->fd, &message, sizeof(message), fd)) {
@@ -104,7 +109,7 @@ static int accept_h2_job(void *context, int fd, int link)
             w->busy = 1;
             continue;
         }
-        w->busy = 1;
+        w->busy = RECEIVING;
         w->link = link;
         close(fd);
         return 0;
@@ -117,9 +122,10 @@ int dcc_prefork_status(int *busy, int *queued, int *links)
     int i;
     *busy = *queued = *links = 0;
     if (!workers) return 0;
-    for (i = 0; i < dcc_max_kids; ++i) {
-        *busy += workers[i].fd >= 0 && workers[i].busy;
-        *links += workers[i].fd >= 0 && workers[i].link;
+    for (i = 0; i < worker_count; ++i) {
+        *busy += workers[i].fd >= 0 && workers[i].busy == EXECUTING;
+        *links += workers[i].fd >= 0 && workers[i].busy == EXECUTING && workers[i].link;
+        *queued += workers[i].fd >= 0 && (workers[i].busy == RECEIVING || workers[i].busy == WAITING);
     }
     for (i = 0; i < MAX_PENDING; ++i)
         *queued += pending[i].fd >= 0 && pending[i].ready;
@@ -133,7 +139,7 @@ void dcc_prefork_reaped(pid_t pid)
 {
     int i;
     if (!workers) return;
-    for (i = 0; i < dcc_max_kids; ++i)
+    for (i = 0; i < worker_count; ++i)
         if (workers[i].pid == pid) {
             if (workers[i].fd >= 0) close(workers[i].fd);
             workers[i] = (struct worker){ .fd = -1 };
@@ -156,12 +162,12 @@ static void park_connection(int fd, int session)
 int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout)
 {
     struct pollfd *polls = parent_polls;
-    int i, j, result, base = count + 1, sockets = base + dcc_max_kids;
+    int i, j, result, base = count + 1, sockets = base + worker_count;
     int total = sockets + MAX_PENDING;
     time_t now = time(NULL);
     for (i = 0; i < count; ++i) polls[i] = extra[i];
     polls[count] = (struct pollfd){ listen_fd, POLLIN, 0 };
-    for (i = 0; i < dcc_max_kids; ++i)
+    for (i = 0; i < worker_count; ++i)
         polls[base + i] = (struct pollfd){ workers[i].fd, POLLIN, 0 };
     for (i = 0; i < MAX_PENDING; ++i) {
         struct pending *p = &pending[i];
@@ -180,7 +186,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             continue;
         }
         int added = dcc_h2_prepare(h2[i].connection, polls + total,
-                    dcc_max_kids + 3 * MAX_PENDING + 3 - total);
+                    worker_count + 3 * MAX_PENDING + 3 - total);
         if (added < 0) return -1;
         h2[i].poll_index = total;
         total += added;
@@ -189,7 +195,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
     result = poll(polls, total, timeout < 1000 ? timeout : 1000);
     for (i = 0; i < count; ++i) extra[i].revents = polls[i].revents;
     if (result < 0) return result;
-    for (i = 0; i < dcc_max_kids; ++i) {
+    for (i = 0; i < worker_count; ++i) {
         if (polls[base + i].revents) {
             int fd, session;
             ssize_t n = dcc_recv_fd(workers[i].fd, &session, sizeof(session), &fd);
@@ -198,12 +204,38 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
                 close(workers[i].fd);
                 workers[i].fd = -1;
                 workers[i].busy = 1;
+            } else if (session == WORKER_READY && workers[i].busy == RECEIVING) {
+                if (fd >= 0) close(fd);
+                workers[i].busy = WAITING;
+                workers[i].ticket = ++next_ticket;
+            } else if (session == WORKER_DRAIN && workers[i].busy == EXECUTING) {
+                if (fd >= 0) close(fd);
+                workers[i].busy = DRAINING;
             } else {
-                workers[i].busy = !!(session & WORKER_RETIRING);
+                workers[i].busy = session & WORKER_RETIRING ? RETIRING : IDLE;
                 workers[i].link = 0;
                 if (fd >= 0) park_connection(fd, 1);
             }
         }
+    }
+    /* Ready inputs enter the compiler pool in arrival order. Receiving and
+     * draining need no CPU grant; their total is bounded by the worker pool
+     * and its fixed pipeline allowance. TCP reservations keep their existing
+     * execution-slot contract. */
+    for (;;) {
+        int busy, queued, links, selected = -1, message = WORKER_GRANT;
+        dcc_prefork_status(&busy, &queued, &links);
+        if (busy >= dcc_resource_slots(dcc_max_kids)) break;
+        for (i = 0; i < worker_count; ++i)
+            if (workers[i].fd >= 0 && workers[i].busy == WAITING && !(workers[i].link && links) &&
+                (selected < 0 || workers[i].ticket < workers[selected].ticket)) selected = i;
+        if (selected < 0) break;
+        struct worker *w = &workers[selected];
+        if (dcc_send_fd(w->fd, &message, sizeof(message), -1)) {
+            close(w->fd);
+            w->fd = -1;
+        }
+        w->busy = EXECUTING;
     }
     for (i = 0; i < MAX_PENDING; ++i) {
         struct pending *p = &pending[i];
@@ -223,7 +255,10 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
                         h2[j].poll_index = -1;
                     }
                     if (j == MAX_PENDING || !h2[j].connection) close(p->fd);
-                    else dcc_stats_event(STATS_TCP_ACCEPT);
+                    else {
+                        worker_count = worker_capacity;
+                        dcc_stats_event(STATS_TCP_ACCEPT);
+                    }
                     p->fd = -1;
                     continue;
                 }
@@ -250,9 +285,9 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
         int limit = dcc_resource_slots(dcc_max_kids);
         if (p->used) {
             int is_link = p->request[11] == '2';
-            for (j = 0; j < dcc_max_kids; ++j)
+            for (j = 0; j < worker_count; ++j)
                 if (workers[j].fd >= 0 && !workers[j].busy) break;
-            if (j == dcc_max_kids || busy >= limit || (is_link && links)) {
+            if (j == worker_count || busy >= limit || (is_link && links)) {
                 /* Refuse immediately, retaining the TCP session for retry on
                  * another host. Idle sessions never reserve compiler slots. */
                 if (send(p->fd, "BUSY00000000", 12, MSG_NOSIGNAL | MSG_DONTWAIT) != 12) {
@@ -266,7 +301,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             p->session |= 1;
         }
         if (busy >= limit) continue;
-        for (j = 0; j < dcc_max_kids; ++j) {
+        for (j = 0; j < worker_count; ++j) {
             struct worker *w = &workers[j];
             if (w->fd < 0 || w->busy) continue;
             if (dcc_send_fd(w->fd, &p->session, sizeof(p->session), p->fd)) {
@@ -306,6 +341,50 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
 }
 #endif
 
+int dcc_worker_acquire(int input)
+{
+#ifdef __linux__
+    int message = WORKER_READY, fd = -1, ret;
+    struct pollfd polls[2] = { { worker_channel, POLLIN, 0 }, { input, POLLIN, 0 } };
+    if (!worker_staged) return 0;
+    if (dcc_send_fd(worker_channel, &message, sizeof(message), -1)) return EXIT_IO_ERROR;
+    do { ret = poll(polls, 2, dcc_get_io_timeout() * 1000); } while (ret < 0 && errno == EINTR);
+    if (!ret) { ret = EXIT_TIMEOUT; goto cancelled; }
+    if (ret < 0 || polls[1].revents || !(polls[0].revents & POLLIN)) {
+        ret = EXIT_IO_ERROR;
+        goto cancelled;
+    }
+    ret = dcc_recv_fd(worker_channel, &message, sizeof(message), &fd);
+    if (fd >= 0) close(fd);
+    if (ret != sizeof(message) || message != WORKER_GRANT) {
+        ret = EXIT_PROTOCOL_ERROR;
+        goto cancelled;
+    }
+    worker_running = 1;
+    return 0;
+cancelled:
+    /* A grant may already be queued while input cancellation wakes us. Retire
+     * this worker channel so that a stale grant cannot become the next job's
+     * descriptor or release a slot belonging to that job. */
+    shutdown(worker_channel, SHUT_RDWR);
+    return ret;
+#else
+    (void)input;
+#endif
+    return 0;
+}
+
+void dcc_worker_release(void)
+{
+#ifdef __linux__
+    int message = WORKER_DRAIN;
+    if (worker_running) {
+        dcc_send_fd(worker_channel, &message, sizeof(message), -1);
+        worker_running = 0;
+    }
+#endif
+}
+
 /**
  * Main loop for the parent process with the new preforked implementation.
  * The parent maintains compiler workers. On Linux it also dispatches ready
@@ -320,10 +399,12 @@ int dcc_preforking_parent(int listen_fd)
     act_child.sa_handler = dcc_sigchld_handler;
     sigaction(SIGCHLD, &act_child, NULL);
 #ifdef __linux__
-    workers = calloc(dcc_max_kids, sizeof(*workers));
-    parent_polls = calloc(dcc_max_kids + 3 * MAX_PENDING + 3, sizeof(*parent_polls));
+    worker_count = dcc_max_kids;
+    worker_capacity = dcc_max_kids + (dcc_max_kids < DCC_H2_PIPELINE ? dcc_max_kids : DCC_H2_PIPELINE);
+    workers = calloc(worker_capacity, sizeof(*workers));
+    parent_polls = calloc(worker_capacity + 3 * MAX_PENDING + 3, sizeof(*parent_polls));
     if (!workers || !parent_polls) return EXIT_OUT_OF_MEMORY;
-    for (ret = 0; ret < dcc_max_kids; ++ret) workers[ret].fd = -1;
+    for (ret = 0; ret < worker_capacity; ++ret) workers[ret].fd = -1;
     for (ret = 0; ret < MAX_PENDING; ++ret) pending[ret].fd = -1;
 #endif
 
@@ -369,16 +450,20 @@ void dcc_manage_kids(int listen_fd) {
 }
 
 /**
- * Fork children until we have dcc_max_kids of them
+ * Maintain execution workers plus the fixed HTTP/2 pipeline allowance.
  **/
 static void dcc_create_kids(int listen_fd) {
     pid_t kid;
+    int maximum = dcc_max_kids;
+#ifdef __linux__
+    maximum = worker_count;
+#endif
 
-    while (dcc_nkids < dcc_max_kids) {
+    while (dcc_nkids < maximum) {
 #ifdef __linux__
         int pair[2], slot, i;
-        for (slot = 0; slot < dcc_max_kids && workers[slot].pid; ++slot) {}
-        if (slot == dcc_max_kids || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair))
+        for (slot = 0; slot < worker_count && workers[slot].pid; ++slot) {}
+        if (slot == worker_count || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair))
             dcc_exit(EXIT_OUT_OF_MEMORY);
 #endif
         if ((kid = fork()) == -1) {
@@ -389,7 +474,7 @@ static void dcc_create_kids(int listen_fd) {
             close(pair[0]);
             worker_channel = pair[1];
             close(listen_fd);
-            for (i = 0; i < dcc_max_kids; ++i)
+            for (i = 0; i < worker_count; ++i)
                 if (workers[i].fd >= 0) close(workers[i].fd);
             for (i = 0; i < MAX_PENDING; ++i)
                 if (pending[i].fd >= 0) close(pending[i].fd);
@@ -459,6 +544,8 @@ static int dcc_preforked_child(int listen_fd)
         if (dcc_recv_fd(worker_channel, &message, sizeof(message), &acc_fd) != sizeof(message) || acc_fd < 0)
             return 0;
         session = message & 1;
+        worker_staged = !!(message & SESSION_H2);
+        worker_running = 0;
         if (getpeername(acc_fd, (struct sockaddr *)&cli_addr, &cli_len)) {
             close(acc_fd);
             return EXIT_CONNECT_FAILED;
@@ -490,6 +577,7 @@ static int dcc_preforked_child(int listen_fd)
         ret = dcc_service_job(acc_fd, acc_fd,
                 message & SESSION_H2 ? NULL : (struct sockaddr *)&cli_addr,
                 cli_len, &session);
+        dcc_worker_release();
         now = time(NULL);
         message = ireq + 1 >= child_requests && now - start >= child_lifetime ? WORKER_RETIRING : 0;
         if (dcc_send_fd(worker_channel, &message, sizeof(message), !ret && session ? acc_fd : -1)) {

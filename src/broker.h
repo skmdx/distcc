@@ -6,6 +6,7 @@ void dcc_broker_failed(const struct dcc_hostdef *host);
 void dcc_broker_return(const struct dcc_hostdef *host, int fd);
 #define DCC_BROKER_POOLED (1 << 30)
 #define DCC_BROKER_FILE_CACHE (1 << 29)
+#define DCC_BROKER_INLINE_INPUT (1 << 28)
 int dcc_broker_jobs(void);
 void dcc_broker_cpp_done(const struct dcc_hostdef *host);
 

@@ -21,7 +21,9 @@
 /* distcc_pump_c_extensions_module.c -- Python bindings for distcc-pump
  * extensions */
 
+#ifndef PY_SSIZE_T_CLEAN
 #define PY_SSIZE_T_CLEAN
+#endif
 #include "Python.h"
 
 static const char *version = ".01";

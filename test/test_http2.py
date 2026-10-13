@@ -14,6 +14,7 @@ import socket
 import struct
 import subprocess
 import time
+import threading
 import unittest
 
 from test_broker import BrokerTestCase
@@ -21,16 +22,25 @@ from test_broker import BrokerTestCase
 
 class Http2Test(BrokerTestCase):
     def cached_compile(self, files, *, abort=False, corrupt=False, reject_manifest=False,
-                       ready=None, execute=False):
+                       ready=None, execute=False, inline=()):
         helper = runpy.run_path(str(self.build / 'distcc-link'))
         def string(name, value):
             return f'{name}{len(value):08x}'.encode() + value
         args = [b'gcc', b'-c', b'/src/source.c', b'-o', b'/src/result.o']
-        header = b'DIST0000000b' + string('CDIR', b'/src') + f'ARGC{len(args):08x}'.encode()
+        version = 12 if inline else 11
+        header = f'DIST{version:08x}'.encode() + string('CDIR', b'/src') + f'ARGC{len(args):08x}'.encode()
         header += b''.join(string('ARGV', arg) for arg in args)
         header += f'NFIL{len(files):08x}'.encode()
-        for name, body in files:
-            header += string('NAME', name) + string('HASH', hashlib.sha256(body).digest())
+        for index, (name, body) in enumerate(files):
+            header += string('NAME', name)
+            if index in inline:
+                header += b'FILEffffffff'
+                for offset in range(0, len(body), 262144):
+                    chunk = body[offset:offset + 262144]
+                    header += struct.pack('!II', len(chunk), 0) + chunk
+                header += bytes(8)
+            else:
+                header += string('HASH', hashlib.sha256(body).digest())
         with self.request(9) as lease:
             status, caps, fds = self.receive(lease)
             self.assertEqual(status, 0)
@@ -64,7 +74,7 @@ class Http2Test(BrokerTestCase):
                     if corrupt:
                         self.assertEqual(response.read(), b'')
                         return wanted
-                    self.assertEqual(helper['token'](response, 'DONE'), 11)
+                    self.assertEqual(helper['token'](response, 'DONE'), version)
                     self.assertEqual(helper['token'](response, 'STAT'), 0)
                     codec = helper['Lz4Chunks']()
                     outputs = []
@@ -90,9 +100,49 @@ class Http2Test(BrokerTestCase):
         self.assertEqual(self.cached_compile(files, corrupt=True), b'\1')
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda _: self.cached_compile(files), range(4)))
-        self.assertIn(b'\1', results)
+        self.assertCountEqual(results, [b'\1', b'\0', b'\0', b'\0'])
         self.assertEqual(self.cached_compile(files), b'\0')
         self.job('after-cache-cancel')
+
+    def test_duplicate_contents_and_reversed_manifests(self):
+        self.start_h2()
+        files = [(b'/src/source.c', b'#include "a.h"\n#include "b.h"\nint n = VALUE;\n'),
+                 (b'/src/a.h', b'#define VALUE 631\n'),
+                 (b'/src/b.h', b'#define VALUE 631\n')]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda i: self.cached_compile(files if i % 2 else files[::-1]), range(4)))
+        transferred = 0
+        for result in results:
+            assert result is not None
+            transferred += result.count(b'\1')
+        self.assertEqual(transferred, 2)
+
+    def test_abandoned_uploader_releases_waiting_job(self):
+        self.start_h2()
+        files = [(b'/src/source.c', b'int abandoned_uploader(void) { return 634; }\n')]
+        entered, release = threading.Event(), threading.Event()
+        def hold_upload():
+            entered.set()
+            self.assertTrue(release.wait(5))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            owner = pool.submit(self.cached_compile, files, ready=hold_upload, abort=True)
+            try:
+                self.assertTrue(entered.wait(5))
+                waiter = pool.submit(self.cached_compile, files)
+                self.assertFalse(waiter.done())
+            finally:
+                release.set()
+            self.assertEqual(owner.result(timeout=10), b'\1')
+            self.assertEqual(waiter.result(timeout=10), b'\1')
+        self.assertEqual(self.cached_compile(files), b'\0')
+
+    def test_inline_uncached_input_with_cached_headers(self):
+        self.start_h2()
+        files = [(b'/src/source.c', b'#include "large.h"\n#include "small.h"\nint n = VALUE;\n'),
+                 (b'/src/large.h', b'/*' + b' ' * (5 * 1024 * 1024) + b'*/\n'),
+                 (b'/src/small.h', b'#define VALUE 633\n')]
+        self.assertEqual(self.cached_compile(files, inline=(1,)), b'\1\0\1')
+        self.assertEqual(self.cached_compile(files, inline=(1,)), b'\0\0\0')
 
     def test_cache_shards_bound_files_and_bytes(self):
         self.start_h2()
@@ -161,12 +211,80 @@ class Http2Test(BrokerTestCase):
         self.assertEqual(self.accepts() - before, 1)
         self.assertIn('dcc_busy 0\n', self.get_stats(self.stats_ports[0]))
 
+    def test_stalled_uploads_leave_execution_slots_available(self):
+        self.start_h2()
+        leases, sockets = [], []
+        try:
+            for _ in range(4):
+                lease = self.request(9)
+                leases.append(lease)
+                status, _, fds = self.receive(lease)
+                self.assertEqual(status, 0)
+                sockets.append(socket.socket(fileno=fds[0]))
+            stats = self.get_stats(self.stats_ports[0])
+            self.assertIn('dcc_busy 0\n', stats)
+            self.assertIn('dcc_queued 4\n', stats)
+            self.job('ready-behind-stalled-inputs')
+        finally:
+            for lease in leases: lease.close()
+            for net in sockets: net.close()
+        self.job('after-stalled-cancel')
+
+    def test_pipeline_respects_execution_limit(self):
+        self.start_h2()
+        peak = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(self.job, f'pipeline-{i}') for i in range(16)]
+            while any(not future.done() for future in futures):
+                stats = self.get_stats(self.stats_ports[0])
+                match = re.search(r'dcc_busy (\d+)', stats)
+                assert match is not None
+                peak = max(peak, int(match[1]))
+                self.assertLessEqual(peak, 4)
+                time.sleep(.02)
+            for future in futures: future.result()
+        self.assertGreaterEqual(peak, 2)
+
+    def test_cancel_job_waiting_for_execution(self):
+        self.start_h2()
+        self.job('negotiate-pipeline')
+        reservations = []
+        proc = None
+        try:
+            for _ in range(4):
+                net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
+                reservations.append(net)
+                net.sendall(b'SLOT00000001')
+                self.assertEqual(net.recv(12), b'GRNT00000001')
+            source = self.work / 'waiting.i'
+            source.write_text('int waiting;\n')
+            proc = subprocess.Popen([str(self.build / 'distcc'), 'gcc', '-c', str(source),
+                                     '-o', str(self.work / 'waiting.o')], env=self.env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + 5
+            while 'dcc_queued 1\n' not in self.get_stats(self.stats_ports[0]):
+                self.assertIsNone(proc.poll())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+            self.assertIn('dcc_busy 4\n', self.get_stats(self.stats_ports[0]))
+            proc.terminate()
+            proc.wait(timeout=5)
+            while 'dcc_queued 0\n' not in self.get_stats(self.stats_ports[0]):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            for net in reservations: net.close()
+        self.job('after-waiter-cancel')
+
     def test_cancel_stream_preserves_other_jobs(self):
         self.start_h2()
         before = self.accepts()
         lease = self.request(6)
         status, capabilities, fds = self.receive(lease)
-        self.assertEqual((status, capabilities, len(fds)), (0, 1 << 29, 1))
+        self.assertEqual((status, capabilities, len(fds)), (0, (1 << 29) | (1 << 28), 1))
         with socket.socket(fileno=fds[0]) as net:
             net.sendall(b'DIST00000006ARGC00000002ARGV00000003gcc')
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:

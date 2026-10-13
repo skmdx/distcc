@@ -113,12 +113,14 @@ class CompressFiles(object):
         try:
           if compression == 'lz4s':
             digest = hashlib.sha256()
+            plain_size = 0
             chunk = prefix.encode()
             while True:
               chunk += real_file_fd.read(256 * 1024 - len(chunk))
               if not chunk:
                 break
               digest.update(chunk)
+              plain_size += len(chunk)
               encoded = compress(chunk)[4:]
               compressed = len(encoded) < len(chunk)
               new_filepath_fd.write(struct.pack('!II', len(chunk), len(encoded) if compressed else 0))
@@ -127,6 +129,7 @@ class CompressFiles(object):
             new_filepath_fd.write(bytes(8))
             with open(new_filepath + '.sha256', 'wb') as hash_file:
               hash_file.write(digest.digest())
+              hash_file.write(struct.pack('!Q', plain_size))
           else:
             new_filepath_fd.write(compress(prefix.encode() + real_file_fd.read()))
         except (IOError, OSError) as why:

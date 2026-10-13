@@ -4,13 +4,17 @@
 
 #define DCC_FILE_HASH_SIZE 32
 #define DCC_FILE_MANIFEST_LIMIT 65536
+#define DCC_FILE_CACHE_MAX (4 * 1024 * 1024)
 
+enum dcc_input_kind { DCC_INPUT_OTHER, DCC_INPUT_CACHED, DCC_INPUT_INLINE };
 struct dcc_input_digest {
     unsigned char sha256[DCC_FILE_HASH_SIZE];
-    int regular;
+    enum dcc_input_kind kind;
 };
 
-struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count);
+struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count, int capabilities);
+int dcc_file_cache_lock(const unsigned char **hashes, unsigned count, int input, int *lock);
+int dcc_file_cache_copy(const unsigned char *hash, const char *source, const char *destination);
 int dcc_file_cache_get(const unsigned char *hash, const char *destination);
 int dcc_file_cache_verify(const unsigned char *hash, const char *path);
 void dcc_file_cache_put(const unsigned char *hash, const char *path);

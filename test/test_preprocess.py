@@ -280,6 +280,22 @@ class Http2PreprocessTest(PreprocessTest):
         self.compare(args=['-P'])
         self.assertEqual(self.cache_counts()[0], 0)
 
+    def test_uncacheable_input_skips_lookup(self):
+        self.source.write_text('/*' + random.Random(61).randbytes(3 * 1024 * 1024).hex() + '*/\nint n;\n')
+        for _ in range(2):
+            self.compare(args=['-P'])
+        self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
+
+    def test_mixed_uncacheable_and_cached_inputs(self):
+        (self.work / 'large.h').write_bytes(b'/*' + b' ' * (5 * 1024 * 1024) + b'*/\n')
+        header = '/*' + random.Random(62).randbytes(16384).hex() + '*/\n#define VALUE 733\n'
+        (self.work / 'value.h').write_text(header)
+        self.source.write_text('#include "large.h"\n#include "value.h"\nint n = VALUE;\n')
+        self.compare(args=['-P'])
+        self.assertGreater(self.cache_counts()[0], 0)
+        self.compare(args=['-P'])
+        self.assertEqual(self.cache_counts()[0], 0)
+
     def test_previous_include_server_without_digests(self):
         self.source.write_text('/*' + random.Random(32).randbytes(16384).hex() + '*/\nint n;\n')
         self.compare(args=['-P'])
@@ -304,9 +320,22 @@ class Http2PreprocessTest(PreprocessTest):
         previous = Path(os.environ['DISTCC_TEST_BASELINE']).resolve()
         self.source.write_text('/*' + random.Random(34).randbytes(16384).hex() + '*/\nint n;\n')
         try:
-            self.restart_server(previous / 'distccd')
+            self.restart_server(previous / 'distccd', DISTCCD_FILE_CACHE='')
             self.compare(args=['-P'])
             self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
+        finally:
+            self.restart_server(self.build / 'distccd')
+
+    @unittest.skipUnless(os.environ.get('DISTCC_TEST_CACHE_BASELINE'), 'protocol 11 build is required')
+    def test_previous_cached_server(self):
+        previous = Path(os.environ['DISTCC_TEST_CACHE_BASELINE']).resolve()
+        self.source.write_text('/*' + random.Random(64).randbytes(16384).hex() + '*/\nint n;\n')
+        try:
+            self.restart_server(previous / 'distccd')
+            self.compare(args=['-P'])
+            self.assertGreater(self.cache_counts()[0], 0)
+            self.compare(args=['-P'])
+            self.assertEqual(self.cache_counts()[0], 0)
         finally:
             self.restart_server(self.build / 'distccd')
 

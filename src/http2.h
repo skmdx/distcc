@@ -2,6 +2,7 @@
 #ifndef DCC_HTTP2_H
 #define DCC_HTTP2_H
 #include <poll.h>
+#define DCC_H2_PIPELINE 4
 
 struct dcc_h2;
 /* Takes fd on success. A refusal must not start a job or retain fd. */
@@ -17,4 +18,5 @@ int dcc_h2_prepare(struct dcc_h2 *connection, struct pollfd *polls, int capacity
 int dcc_h2_process(struct dcc_h2 *connection, struct pollfd *polls);
 int dcc_h2_idle(struct dcc_h2 *connection);
 int dcc_h2_active(struct dcc_h2 *connection);
+int dcc_h2_staged(struct dcc_h2 *connection);
 #endif

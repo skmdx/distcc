@@ -723,9 +723,11 @@ static int dcc_run_link_job(int in_fd, int out_fd,
     argv[2] = archive;
     argv[3] = output;
     argv[4] = NULL;
+    if ((ret = dcc_worker_acquire(in_fd))) goto done;
     if ((ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname)) ||
         (ret = dcc_collect_child("link", pid, status, in_fd)))
         *status = W_EXITCODE(ret, 0);
+    dcc_worker_release();
     if (!*status && stat(output, &st))
         *status = W_EXITCODE(EXIT_IO_ERROR, 0);
     if ((ret = dcc_x_result_header(out_fd, protover)) ||
@@ -884,7 +886,8 @@ static int dcc_run_job(int in_fd,
      * in a loop.
      */
     if (cpp_where == DCC_CPP_ON_SERVER) {
-        if ((ret = dcc_r_many_files(in_fd, out_fd, temp_dir, compr, protover == DCC_VER_CACHED_CPP))
+        if ((ret = dcc_r_many_files(in_fd, out_fd, temp_dir, compr,
+                                  protover == DCC_VER_INLINE_CPP ? 2 : protover == DCC_VER_CACHED_CPP))
             || (!stdout_output && dcc_set_output(argv, temp_o))
             || tweak_arguments_for_server(argv, temp_dir, deps_fname,
                                           &dotd_target, &tweaked_argv))
@@ -940,6 +943,7 @@ static int dcc_run_job(int in_fd,
        }
     }
 
+    if ((ret = dcc_worker_acquire(in_fd))) goto out_cleanup;
     if ((compile_ret = dcc_spawn_child(argv, &cc_pid,
                                        "/dev/null", out_fname, err_fname))
         || (compile_ret = dcc_collect_child("cc", cc_pid, &status, in_fd))) {
@@ -947,6 +951,7 @@ static int dcc_run_job(int in_fd,
          * compiler */
         status = W_EXITCODE(compile_ret, 0);
     }
+    dcc_worker_release();
 
     if (preprocess_only && cpp_where == DCC_CPP_ON_SERVER) {
         if (((stdout_output || !status) &&
