@@ -107,7 +107,7 @@ struct dcc_hostdef _dcc_local = {
 #endif
     NULL,
     0, 0, 0,                    /* adaptive statistics, speed, explicit limit */
-    0, -1, -1, 0, 0             /* broker descriptors, pooled session, HTTP/2 */
+    0, -1, -1, 0, 0             /* broker descriptors, pooled session, TCP jobs */
 };
 
 struct dcc_hostdef *dcc_hostdef_local = &_dcc_local;
@@ -130,7 +130,7 @@ struct dcc_hostdef _dcc_local_cpp = {
 #endif
     NULL,
     0, 0, 0,                    /* adaptive statistics, speed, explicit limit */
-    0, -1, -1, 0, 0             /* broker descriptors, pooled session, HTTP/2 */
+    0, -1, -1, 0, 0             /* broker descriptors, pooled session, TCP jobs */
 };
 
 struct dcc_hostdef *dcc_hostdef_local_cpp = &_dcc_local_cpp;

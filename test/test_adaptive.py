@@ -343,7 +343,7 @@ class AdaptiveTest(DistccTestCase):
     def test_invalid_options(self):
         for option in ("stats=0", "stats=65536", "stats=", "stats=12x",
                        "speed=0", "speed=-1", "speed=nan", "speed=inf",
-                       "speed=1001", "speed=2x", "speed="):
+                       "speed=1001", "speed=2x", "speed=", "h2", "tcp,h2"):
             result = subprocess.run([str(self.build / "h_hosts")],
                                     env=dict(self.base_env, DISTCC_HOSTS=self.host(0, "," + option)),
                                     capture_output=True, timeout=5)

@@ -229,9 +229,6 @@ AC_CHECK_LIB([xxhash], [XXH3_64bits_reset], [],
 AC_CHECK_HEADER([lz4.h], [], [AC_MSG_ERROR([LZ4 headers are required])])
 AC_CHECK_LIB([lz4], [LZ4_compress_default], [],
              [AC_MSG_ERROR([liblz4 is required])])
-AC_CHECK_HEADER([nghttp2/nghttp2.h], [], [AC_MSG_ERROR([nghttp2 headers are required])])
-AC_CHECK_LIB([nghttp2], [nghttp2_session_client_new2], [],
-             [AC_MSG_ERROR([libnghttp2 is required])])
 
 
 # Apple's OS X gcc has a cpp-precomp "feature" that breaks standard

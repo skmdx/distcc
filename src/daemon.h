@@ -42,8 +42,6 @@ void dcc_reap_kids(int must_reap);
 
 /* prefork.c */
 int dcc_preforking_parent(int listen_fd);
-int dcc_worker_acquire(int input);
-void dcc_worker_release(void);
 #ifdef __linux__
 struct pollfd;
 int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout);

@@ -17,7 +17,7 @@ import subprocess
 import time
 
 
-VARIANTS = {'baseline': 'lz4', 'tcp': 'lz4', 'stream': 'lz4s', 'http2': 'h2', 'jobs': 'tcp'}
+VARIANTS = {'baseline': 'lz4', 'tcp': 'lz4', 'stream': 'lz4s', 'jobs': 'tcp'}
 TCP_COUNTERS = ('bytes_sent', 'bytes_received', 'bytes_retrans', 'busy',
                 'rwnd_limited', 'sndbuf_limited')
 
@@ -104,7 +104,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate', type=Path, required=True)
     parser.add_argument('--baseline', type=Path, required=True)
-    parser.add_argument('--baseline-codec', choices=('lzo', 'lz4', 'lz4s', 'h2', 'tcp'), default='lz4',
+    parser.add_argument('--baseline-codec', choices=('lzo', 'lz4', 'lz4s', 'tcp'), default='lz4',
                         help='transport/codec of the baseline (default: lz4)')
     parser.add_argument('--hosts', required=True, help='TCP host entries, with slots/stats/speed but no codec')
     parser.add_argument('--baseline-hosts', help='separate baseline daemon endpoints; defaults to --hosts')

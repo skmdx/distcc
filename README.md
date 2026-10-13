@@ -140,7 +140,7 @@ make -j"$(distcc -j)" CC='distcc gcc' CXX='distcc g++'
 Both endpoints must run this version. Restart the client broker and active
 pump sessions after upgrading. This path requires the Linux broker and the
 daemon's prefork mode. It uses the existing TCP listener and IP access rules;
-SSH and GSSAPI are unsupported. Do not combine `,tcp` and `,h2`.
+SSH and GSSAPI are unsupported with `,tcp`.
 
 The broker lends one reusable TCP connection per outstanding job. The server
 prepares inputs before reserving a compiler worker and releases the worker
@@ -156,14 +156,14 @@ objects go directly into unpublished destination files. Update clients and
 daemons together: this wire version does not accept earlier `,tcp` clients.
 
 This is the recommended opt-in path for shared-input and transfer-heavy builds.
-Small builds need not beat HTTP/2; compare your workload with `bench/rpc.py`
+Compare your workload with the legacy TCP paths using `bench/rpc.py`
 before changing an existing setup. The stats counter `dcc_tcp_ready_idle_ns`
 records cumulative unused admissible slot nanoseconds while an eligible
 prepared job is queued. It excludes time waiting for inputs and resource
 admission. Wire details and limits are in [the protocol specification](doc/protocol-6.txt).
 
 Build using the usual `./autogen.sh`, `./configure`, and `make` steps, with the
-LZ4, nghttp2 and xxHash (with XXH3 support) libraries and
+LZ4 and xxHash (with XXH3 support) libraries and
 development headers installed. Pump also requires Python `xxhash>=3.0.0`.
 `make adaptive-check` runs real GCC compiles through two local daemons, checks
 the linked executables, and exercises controlled load/error responses and slot

@@ -137,7 +137,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                         uint64_t size = dcc_tcp_get64(incoming.data + 8 + i * 8);
                         if (size > DCC_TCP_BYTES - total) goto done;
                         total += size;
-                        result->size[i] = result->wire_size[i] = size;
+                        result->size[i] = size;
                         if (!size) finals |= 1U << i;
                         const char *path = i == DCC_JOB_OBJECT ? output : i == DCC_JOB_DEPS ? deps : NULL;
                         if (!result->status && path && strcmp(path, "-") && strcmp(path, "/dev/null")) {

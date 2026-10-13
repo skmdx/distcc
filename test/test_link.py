@@ -371,14 +371,6 @@ class ClangLinkTest(LinkTestCase):
         self.assertFalse(outside.exists())
 
 
-class Http2LinkTest(LinkTest):
-    transport = ',h2'
-
-
-class Http2ClangLinkTest(ClangLinkTest):
-    transport = ',h2'
-
-
 class TcpLinkTest(LinkTest):
     transport = ',tcp'
 

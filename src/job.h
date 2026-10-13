@@ -1,4 +1,4 @@
-/* Job metadata shared by the local FD IPC and HTTP representations.
+/* Job metadata shared by the local FD IPC and prepared TCP transport.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef DCC_JOB_H
 #define DCC_JOB_H
@@ -7,7 +7,6 @@
 #define DCC_JOB_METADATA_MAX (16 * 1024 * 1024)
 #define DCC_JOB_INPUT_MAX 65536
 #define DCC_JOB_RESULT_COUNT 4
-#define DCC_JOB_CONTENT_ENCODING "x-distcc-lz4-stream"
 enum dcc_job_kind { DCC_JOB_COMPILE, DCC_JOB_PUMP, DCC_JOB_LINK };
 enum dcc_job_input_kind { DCC_JOB_FILE, DCC_JOB_SYMLINK, DCC_JOB_EMPTY };
 enum dcc_job_encoding { DCC_JOB_RAW, DCC_JOB_LZ4 };
@@ -32,8 +31,6 @@ struct dcc_job {
 struct dcc_job_result {
     int status, mode;
     uint64_t size[DCC_JOB_RESULT_COUNT];
-    uint64_t wire_size[DCC_JOB_RESULT_COUNT];
-    unsigned compressed;
     int fd[DCC_JOB_RESULT_COUNT];
     /* Local unpublished destinations, never part of wire metadata. */
     char *temporary[DCC_JOB_RESULT_COUNT];
@@ -41,22 +38,13 @@ struct dcc_job_result {
 void dcc_job_free(struct dcc_job *);
 void dcc_job_result_init(struct dcc_job_result *);
 void dcc_job_result_free(struct dcc_job_result *);
-/* These return an owned sealed metadata memfd, or -1. No file payload is copied
- * into metadata; HTTP file bodies and SCM_RIGHTS carry it independently. */
-int dcc_job_encode(const struct dcc_job *);
+/* No file payload is copied into metadata. */
 int dcc_job_decode(int fd, struct dcc_job **);
 unsigned char *dcc_job_encode_buffer(const struct dcc_job *, size_t *);
 int dcc_job_decode_buffer(const void *, size_t, struct dcc_job **);
-int dcc_job_result_encode(const struct dcc_job_result *);
-int dcc_job_result_decode(int fd, struct dcc_job_result *);
 /* Anonymous storage for data which must outlive its producing process. */
 int dcc_job_memfd(const char *name);
 struct dcc_buffer;
-/* Replace an owned raw FD only when compression shrinks it. Returns encoding,
- * or -1 on failure. Payload work stays outside the connection event loop. */
-int dcc_job_compress(int *fd, uint64_t plain, uint64_t *wire);
-int dcc_job_expand(int fd, uint64_t wire, uint64_t plain, int output,
-                   struct dcc_buffer *buffer);
 /* Server compiler execution consumes an already materialized private tree.
  * Results own open FDs before the worker removes temporary pathnames. */
 int dcc_execute_job(struct dcc_job *, const char *root, int cancel_fd, struct dcc_job_result *);

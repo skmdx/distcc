@@ -4,9 +4,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <stdint.h>
-#include <time.h>
 #include <xxhash.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +18,6 @@
 #endif
 #include "distcc.h"
 #include "file_cache.h"
-#include "exitcode.h"
 
 /* Separate shard locks bound both directory scans and concurrent storage.
  * FIFO eviction avoids a metadata write on every cache hit. */
@@ -70,67 +67,6 @@ static int cache_shard(const unsigned char *hash, char key[17])
     return fd;
 }
 
-static int compare_slots(const void *a, const void *b)
-{
-    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
-    return (x > y) - (x < y);
-}
-
-int dcc_file_cache_lock(const unsigned char **hashes, unsigned count, int input, int *lock)
-{
-    uint32_t *slots;
-    unsigned i;
-    struct stat st;
-    struct timespec start, now;
-    int root, ret = 0;
-    *lock = -1;
-    if (!count || (root = cache_root()) < 0) return 0;
-    *lock = openat(root, ".uploads", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
-    close(root);
-    if (*lock < 0) return 0;
-    if (fstat(*lock, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077)) {
-        close(*lock);
-        *lock = -1;
-        return 0;
-    }
-    slots = malloc(count * sizeof(*slots));
-    if (!slots) return EXIT_OUT_OF_MEMORY;
-    for (i = 0; i < count; ++i)
-        slots[i] = ((uint32_t)(hashes[i][0] & 127) << 24) |
-                   ((uint32_t)hashes[i][1] << 16) | ((uint32_t)hashes[i][2] << 8) | hashes[i][3];
-    qsort(slots, count, sizeof(*slots), compare_slots);
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    /* One persistent lock inode, no payload storage or per-content lock files.
-     * Every job takes byte-range locks in the same order: overlapping manifests
-     * cannot deadlock. Closing the descriptor (including worker death) releases
-     * the whole set. Cache insertion itself remains nonblocking. */
-    for (i = 0; i < count && !ret; ++i) {
-        struct flock range = { .l_type = F_WRLCK, .l_whence = SEEK_SET,
-                               .l_start = slots[i], .l_len = 1 };
-        if (i && slots[i] == slots[i-1]) continue;
-        while (fcntl(*lock, F_SETLK, &range)) {
-            struct pollfd p = { .fd = input, .events = POLLIN };
-            if (errno != EACCES && errno != EAGAIN && errno != EINTR) {
-                /* A filesystem without record locks can still serve inputs. */
-                close(*lock);
-                *lock = -1;
-                goto done;
-            }
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            if (now.tv_sec - start.tv_sec >= dcc_get_io_timeout()) { ret = EXIT_TIMEOUT; break; }
-            if (poll(&p, 1, 10) < 0 && errno != EINTR) { ret = EXIT_IO_ERROR; break; }
-            /* Clients must await MISS here. Readability is cancellation or an
-             * unsolicited payload; neither may hold another uploader hostage. */
-            if (p.revents) { ret = EXIT_IO_ERROR; break; }
-        }
-    }
-done:
-    free(slots);
-    return ret;
-}
-
-/* A negative destination verifies an existing file without copying it.
- * Verify the same bytes that enter the private snapshot. */
 static int copy_snapshot(int from, int to, const unsigned char *expected)
 {
     char buffer[65536];
@@ -160,15 +96,6 @@ static int copy_snapshot(int from, int to, const unsigned char *expected)
 done:
     XXH3_freeState(xxh);
     return ret;
-}
-
-int dcc_file_cache_verify(const unsigned char *hash, const char *path)
-{
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC), ok;
-    if (fd < 0) return 0;
-    ok = !copy_snapshot(fd, -1, hash);
-    close(fd);
-    return ok;
 }
 
 static int snapshot(int from, const char *destination, const unsigned char *hash)

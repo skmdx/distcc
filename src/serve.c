@@ -761,11 +761,9 @@ static int dcc_run_link_job(int in_fd, int out_fd,
     argv[2] = archive;
     argv[3] = output;
     argv[4] = NULL;
-    if ((ret = dcc_worker_acquire(in_fd))) goto done;
     if ((ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname)) ||
         (ret = dcc_collect_child("link", pid, status, in_fd)))
         *status = W_EXITCODE(ret, 0);
-    dcc_worker_release();
     if (!*status && stat(output, &st))
         *status = W_EXITCODE(EXIT_IO_ERROR, 0);
     if (result) {
@@ -1018,7 +1016,6 @@ static int dcc_run_job(int in_fd,
        }
     }
 
-    if ((ret = dcc_worker_acquire(in_fd))) goto out_cleanup;
     if ((compile_ret = dcc_spawn_child(argv, &cc_pid,
                                        "/dev/null", out_fname, err_fname))
         || (compile_ret = dcc_collect_child("cc", cc_pid, &status, in_fd))) {
@@ -1026,7 +1023,6 @@ static int dcc_run_job(int in_fd,
          * compiler */
         status = W_EXITCODE(compile_ret, 0);
     }
-    dcc_worker_release();
 
     if (preprocess_only && cpp_where == DCC_CPP_ON_SERVER) {
         if (((stdout_output || !status) &&

@@ -1,9 +1,8 @@
-/* Client job description and descriptor-only broker exchange.
+/* Client job description and prepared TCP exchange.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +15,6 @@
 #include "broker.h"
 #include "job.h"
 #include "tcp_job.h"
-#include "job_worker.h"
 #include "file_cache.h"
 #include "include_server_if.h"
 #include "exitcode.h"
@@ -61,7 +59,7 @@ static int snapshot_size(const char *name, uint64_t wire, uint64_t *plain)
     return ret;
 }
 
-static struct dcc_job *describe(char **argv, const char *cpp, char **files, int tcp)
+static struct dcc_job *describe(char **argv, const char *cpp, char **files)
 {
     struct dcc_job *job = calloc(1, sizeof(*job));
     struct dcc_input_digest *digests = NULL;
@@ -114,11 +112,9 @@ static struct dcc_job *describe(char **argv, const char *cpp, char **files, int 
                 memcpy(in->digest, digests[i].hash, sizeof(in->digest));
             }
         } else {
-            int encoding;
             in->fd = open(name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-            if (in->fd < 0 || (encoding = tcp ? DCC_JOB_RAW : dcc_job_compress(&in->fd, in->plain_size, &in->wire_size)) < 0)
-                goto failed;
-            in->encoding = encoding;
+            if (in->fd < 0) goto failed;
+            in->encoding = DCC_JOB_RAW;
         }
     }
     free(digests);
@@ -133,8 +129,6 @@ static int buffer_result(int fd, const struct dcc_job_result *result, unsigned i
 {
     size_t done = 0;
     uint64_t size = result->size[index];
-    if (result->compressed & (1U << index))
-        return dcc_job_expand(fd, result->wire_size[index], size, -1, buffer);
     if (size > SIZE_MAX - 1) return EXIT_OUT_OF_MEMORY;
     buffer->data = malloc(size + 1);
     if (!buffer->data) return EXIT_OUT_OF_MEMORY;
@@ -153,128 +147,39 @@ static int buffer_result(int fd, const struct dcc_job_result *result, unsigned i
  * a previous object with a prefix, and successful empty outputs still exist. */
 static int publish(int *source, const struct dcc_job_result *result, unsigned index, const char *path)
 {
-    int fd = *source;
-    char *temporary = NULL, data[65536];
-    int output = -1, ret = EXIT_IO_ERROR;
-    uint64_t offset = 0;
-    uint64_t size = result->size[index];
-    mode_t mask;
     if (!path || !strcmp(path, "-") || !strcmp(path, "/dev/null")) return 0;
-    if (result->temporary[index]) {
-        mask = umask(0); umask(mask);
-        if (fchmod(fd, 0666 & ~mask)) return EXIT_IO_ERROR;
-        int failed = close(fd);
-        *source = -1;
-        return failed || rename(result->temporary[index], path) ? EXIT_IO_ERROR : 0;
-    }
-    if (asprintf(&temporary, "%s.distcc-XXXXXX", path) < 0) return EXIT_OUT_OF_MEMORY;
-    if ((output = mkstemp(temporary)) < 0) goto done;
-    mask = umask(0);
+    mode_t mask = umask(0);
     umask(mask);
-    if (fchmod(output, 0666 & ~mask)) goto done;
-    if (result->compressed & (1U << index)) {
-        ret = dcc_job_expand(fd, result->wire_size[index], size, output, NULL);
-        if (ret) goto done;
-        ret = EXIT_IO_ERROR;
-        offset = size;
-    }
-    while (offset < size) {
-        size_t amount = size - offset < sizeof(data) ? size - offset : sizeof(data);
-        ssize_t n = pread(fd, data, amount, offset);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0 || dcc_writex(output, data, n)) goto done;
-        offset += n;
-    }
-    if (close(output)) { output = -1; goto done; }
-    output = -1;
-    if (rename(temporary, path)) goto done;
-    ret = 0;
-done:
-    if (output >= 0) close(output);
-    if (temporary) unlink(temporary);
-    free(temporary);
-    return ret;
+    if (fchmod(*source, 0666 & ~mask)) return EXIT_IO_ERROR;
+    int failed = close(*source);
+    *source = -1;
+    return failed || rename(result->temporary[index], path) ? EXIT_IO_ERROR : 0;
 }
 int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, char **files,
                        const char *output, const char *deps, struct dcc_buffer *err,
                        struct dcc_buffer *out, int *status)
 {
-    struct dcc_job *job = describe(argv, cpp, files, host->tcp_jobs);
+    struct dcc_job *job = describe(argv, cpp, files);
     struct dcc_job_result result;
-    unsigned i, cached = 0, transferred = 0;
-    int metadata = -1, ret = EXIT_IO_ERROR, ended = 0, transport_complete = 0;
-    int artifacts[DCC_JOB_RESULT_COUNT] = {-1, -1, -1, -1};
+    int ret = EXIT_IO_ERROR, transport_complete = 0;
     dcc_job_result_init(&result);
-    if (host->tcp_jobs) {
-        if (!job || (ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result))) goto done;
-        /* COMPLETE ends the network transaction; publication is local work. */
-        dcc_broker_return(host, host->broker_fd);
-        transport_complete = 1;
-        for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) artifacts[i] = result.fd[i];
-        goto publish_results;
-    }
-    if (!job || (metadata = dcc_job_encode(job)) < 0 || dcc_broker_submit(host, metadata)) goto done;
-    for (i = 0; i < job->count; ++i) cached += job->inputs[i].cached;
-    while (!ended) {
-        struct pollfd p = {host->broker_lease, POLLIN, 0};
-        struct dcc_job_message message;
-        int fd = -1, ready;
-        do { ready = poll(&p, 1, dcc_get_io_timeout() * 1000); } while (ready < 0 && errno == EINTR);
-        if (ready <= 0) goto done;
-        if (dcc_recv_fd(host->broker_lease, &message, sizeof(message), &fd) != sizeof(message)) {
-            if (fd >= 0) close(fd);
-            goto done;
-        }
-        if (message.operation == DCC_JOB_NEED && fd < 0 && message.index < job->count &&
-            job->inputs[message.index].kind == DCC_JOB_FILE) {
-            int retained = job->inputs[message.index].fd;
-            fd = retained >= 0 ? fcntl(retained, F_DUPFD_CLOEXEC, 0) :
-                open(files ? files[message.index] : cpp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-            if (fd < 0) goto done;
-            transferred += job->inputs[message.index].cached;
-            message.operation = DCC_JOB_INPUT;
-            int sent = dcc_send_fd(host->broker_lease, &message, sizeof(message), fd);
-            close(fd);
-            if (sent) goto done;
-        } else if (message.operation == DCC_JOB_ARTIFACT && fd >= 0 &&
-                   message.index < DCC_JOB_RESULT_COUNT && artifacts[message.index] < 0) {
-            artifacts[message.index] = fd;
-        } else if (message.operation == DCC_JOB_FINISHED && !message.index && fd >= 0) {
-            int invalid = dcc_job_result_decode(fd, &result);
-            close(fd);
-            if (invalid) goto done;
-            ended = 1;
-        } else {
-            if (fd >= 0) close(fd);
-            goto done;
-        }
-    }
-    for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) {
-        struct stat st;
-        if ((artifacts[i] < 0 && result.wire_size[i]) ||
-            (artifacts[i] >= 0 && (fstat(artifacts[i], &st) ||
-            (uint64_t)st.st_size != result.wire_size[i]))) goto done;
-    }
-publish_results:
+    if (!job || (ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result))) goto done;
+    /* COMPLETE ends the network transaction; publication is local work. */
+    dcc_broker_return(host, host->broker_fd);
+    transport_complete = 1;
     *status = result.status;
-    rs_trace("%s job completed", host->tcp_jobs ? "pooled TCP" : "direct HTTP/2");
-    if (cached) rs_trace("input cache: %u of %u entries transferred", transferred, job->count);
-    if ((ret = buffer_result(artifacts[DCC_JOB_STDERR], &result, DCC_JOB_STDERR, err)) ||
-        (ret = buffer_result(artifacts[DCC_JOB_STDOUT], &result, DCC_JOB_STDOUT, out))) goto done;
+    rs_trace("pooled TCP job completed");
+    if ((ret = buffer_result(result.fd[DCC_JOB_STDERR], &result, DCC_JOB_STDERR, err)) ||
+        (ret = buffer_result(result.fd[DCC_JOB_STDOUT], &result, DCC_JOB_STDOUT, out))) goto done;
     if (!*status) {
-        if ((ret = publish(&artifacts[DCC_JOB_OBJECT], &result, DCC_JOB_OBJECT, output))) goto done;
-        if (files) ret = publish(&artifacts[DCC_JOB_DEPS], &result, DCC_JOB_DEPS, deps);
+        if ((ret = publish(&result.fd[DCC_JOB_OBJECT], &result, DCC_JOB_OBJECT, output))) goto done;
+        if (files) ret = publish(&result.fd[DCC_JOB_DEPS], &result, DCC_JOB_DEPS, deps);
     } else if (dcc_argv_search(argv, "-E") && strcmp(output, "-")) {
         struct stat st;
         if (!stat(output, &st) && S_ISREG(st.st_mode)) unlink(output);
     }
 done:
-    if (metadata >= 0) close(metadata);
-    for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) if (artifacts[i] >= 0) close(artifacts[i]);
-    if (host->tcp_jobs) {
-        for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) result.fd[i] = -1;
-        dcc_job_result_free(&result);
-    }
+    dcc_job_result_free(&result);
     dcc_job_free(job);
     return transport_complete && ret ? DCC_REMOTE_LOCAL_ERROR : ret;
 }

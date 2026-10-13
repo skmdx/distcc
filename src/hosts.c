@@ -253,9 +253,6 @@ static int dcc_parse_options(const char **psrc,
         if (str_startswith("tcp", p)) {
             host->tcp_jobs = 1;
             p += 3;
-        } else if (str_startswith("h2", p)) {
-            host->http2 = 1;
-            p += 2;
         } else if (str_startswith("lz4s", p)) {
             host->compr = DCC_COMPRESS_LZ4_STREAM;
             p += 4;
@@ -319,8 +316,7 @@ static int dcc_parse_options(const char **psrc,
             return EXIT_BAD_HOSTSPEC;
         }
     }
-    if (host->http2 && host->tcp_jobs) return EXIT_BAD_HOSTSPEC;
-    if (host->http2 || host->tcp_jobs) {
+    if (host->tcp_jobs) {
 #ifdef HAVE_GSSAPI
         if (host->authenticate) {
             rs_log_error("job transports do not support GSSAPI authentication");
@@ -379,7 +375,7 @@ static int dcc_parse_ssh_host(struct dcc_hostdef *hostdef,
         return ret;
 
     hostdef->mode = DCC_MODE_SSH;
-    if (hostdef->http2 || hostdef->tcp_jobs) {
+    if (hostdef->tcp_jobs) {
         rs_log_error("job transports require a TCP broker host");
         return EXIT_BAD_HOSTSPEC;
     }
@@ -533,7 +529,7 @@ int dcc_get_protover_from_features(enum dcc_compress compr,
         *protover = cpp_where == DCC_CPP_ON_SERVER ? DCC_VER_STREAM_CPP : DCC_VER_STREAM;
 
     if (compr == DCC_COMPRESS_NONE && cpp_where == DCC_CPP_ON_SERVER) {
-        rs_log_error("pump mode (',cpp') requires compression (',lz4', ',lz4s', ',h2' or ',lzo')");
+        rs_log_error("pump mode (',cpp') requires compression (',lz4', ',lz4s', ',tcp' or ',lzo')");
     }
 
     return *protover;

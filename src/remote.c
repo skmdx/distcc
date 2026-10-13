@@ -88,10 +88,6 @@ static int dcc_remote_connect(struct dcc_hostdef *host,
             if (host->compr == DCC_COMPRESS_LZ4_STREAM) dcc_buffer_input(*from_net_fd);
             return *to_net_fd < 0 ? EXIT_CONNECT_FAILED : 0;
         }
-        if (host->http2) {
-            rs_log_error("HTTP/2 requires a local distcc broker");
-            return EXIT_CONNECT_FAILED;
-        }
         if ((ret = dcc_connect_by_name(host->hostname, host->port,
                                        to_net_fd)) != 0)
             return ret;
@@ -283,7 +279,7 @@ int dcc_compile_remote(char **argv,
      * be over pipes, which are one-way connections. */
 
     *status = 0;
-    if (host->http2 || host->tcp_jobs) {
+    if (host->tcp_jobs) {
         if (host->cpp_where == DCC_CPP_ON_CLIENT) {
             ret = dcc_wait_for_cpp(cpp_pid, status, input_fname);
             if (local_cpu_lock_fd != -1) {

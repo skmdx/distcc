@@ -116,7 +116,7 @@ class PoolTest(BrokerTestCase):
         self.job(0)
         parent = self.daemons[0].pid
         children = Path(f'/proc/{parent}/task/{parent}/children').read_text().split()
-        self.assertEqual(len(children), 4)  # HTTP/2 pipeline workers are started on demand.
+        self.assertEqual(len(children), 4)
         for child in children: os.kill(int(child), signal.SIGTERM)
         self.job(1)
         self.assertEqual(self.accepts() - before, 1)

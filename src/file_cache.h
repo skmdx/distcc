@@ -13,12 +13,10 @@ struct dcc_input_digest {
 };
 
 struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count);
-int dcc_file_cache_lock(const unsigned char **hashes, unsigned count, int input, int *lock);
 /* NULL hash is allowed only for a verified source held immutable until copy
  * completion. The destination always gets a private inode. */
 int dcc_file_cache_copy(const unsigned char *hash, const char *source, const char *destination);
 int dcc_file_cache_get(const unsigned char *hash, const char *destination);
-int dcc_file_cache_verify(const unsigned char *hash, const char *path);
 void dcc_file_cache_put(const unsigned char *hash, const char *path);
 
 #endif

@@ -37,37 +37,11 @@ Example systemd units are in packaging/systemd. For a Portage client, enable
 distcc-broker@portage.socket and set
 DISTCC_BROKER=/run/distcc-broker-portage.socket in its build environment.
 
-The experimental `,h2` host option multiplexes jobs over one HTTP/2 TCP connection
-per worker host. It requires the broker, upgraded workers and libnghttp2.
-The broker and daemon own HTTP messages and pass immutable file descriptors
-to clients and workers. File bodies use sendfile; no per-job socketpair relays
-the payload. Receive storage and flow control are bounded. Closing a client
-lease cancels its job; a broken connection can fail all jobs using it.
-This is cleartext HTTP/2 on the existing distccd port, subject to its IP ACL;
-SSH and GSSAPI are not supported with this option. It is opt-in because fewer
-connections do not necessarily mean faster builds or lower client CPU use.
-The native resource exchange reduces relay CPU for large inputs, but its
-additional HTTP requests can increase latency for small jobs.
-
-`,h2` sends pump's immutable LZ4 snapshots directly. Clients compress
-preprocessed inputs and link archives; workers compress results. LZ4 bodies
-use sealed memfds and `Content-Encoding: x-distcc-lz4-stream`; compression
-is skipped when it does not reduce the size. The broker relays these FDs
-without compression or decompression. `,lz4s` uses chunked LZ4 over
-pooled TCP. Both options support pump and distributed links. HTTP/2 is not
-wire compatible with the previous RPC tunnel: update clients, brokers and
-workers together and restart pump sessions. Existing `,lz4` and `,lzo` hosts
-retain their TCP protocols.
-
-With `,h2` and pump, an XXH3-64 input manifest identifies cacheable snapshots;
-only missing files are uploaded. Small inputs and disabled caches transfer all
-required files through the same HTTP resources. Cache hits are verified and copied or
-reflinked into private job files; a compiler never shares writable cache
-inodes. See doc/protocol-6.txt for the exchange, storage limits and
-DISTCCD_FILE_CACHE setting. XXH3-64 detects accidental changes but is not
-collision-resistant against adversarial inputs. Build dependencies include
-xxHash; pump needs Python xxhash. Update clients and servers together, restart
-brokers and pump sessions, and clear old input caches when upgrading this protocol.
+The opt-in `,tcp` host option uses prepared jobs over pooled TCP connections.
+It supports shared input caching, pump and distributed links. The broker
+passes network descriptors to clients; persistent server workers execute
+prepared inputs. See README.md and doc/protocol-6.txt for configuration and
+storage limits. Legacy `,lz4`, `,lz4s` and `,lzo` TCP protocols remain available.
 
 GCC and Clang/LLD object links can also run on a broker-selected worker. `distcc-link --sync`
 populates immutable sysroot caches using compressed rsync transfers; set

@@ -12,7 +12,6 @@
 #include "job.h"
 #include "file_cache.h"
 #include "distcc.h"
-#include "exitcode.h"
 
 struct metadata {
     unsigned char *data;
@@ -22,42 +21,6 @@ struct metadata {
 int dcc_job_memfd(const char *name)
 {
     return memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
-}
-int dcc_job_compress(int *fd, uint64_t plain, uint64_t *wire)
-{
-    int encoded;
-    struct stat st;
-    *wire = plain;
-    if (!plain) return DCC_JOB_RAW;
-    encoded = dcc_job_memfd("distcc-lz4");
-    if (encoded < 0) return -1;
-    if (lseek(*fd, 0, SEEK_SET) < 0 || dcc_x_lz4_stream(encoded, *fd, plain) ||
-        fstat(encoded, &st) ||
-        fcntl(encoded, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)) {
-        close(encoded);
-        return -1;
-    }
-    if ((uint64_t)st.st_size >= plain) {
-        close(encoded);
-        return DCC_JOB_RAW;
-    }
-    close(*fd);
-    *fd = encoded;
-    *wire = st.st_size;
-    return DCC_JOB_LZ4;
-}
-int dcc_job_expand(int fd, uint64_t wire, uint64_t plain, int output,
-                   struct dcc_buffer *buffer)
-{
-    off_t start = output >= 0 ? lseek(output, 0, SEEK_CUR) : 0;
-    int ret;
-    if (start < 0 || lseek(fd, 0, SEEK_SET) < 0) return EXIT_IO_ERROR;
-    ret = dcc_r_lz4_stream_bounded(output, buffer, fd, plain);
-    if (!ret && ((uint64_t)lseek(fd, 0, SEEK_CUR) != wire ||
-        (output >= 0 ? (uint64_t)(lseek(output, 0, SEEK_CUR) - start) : buffer->size) != plain))
-        ret = EXIT_PROTOCOL_ERROR;
-    if (ret && buffer) dcc_free_buffer(buffer);
-    return ret;
 }
 static void put(struct metadata *m, const void *data, size_t size)
 {
@@ -117,25 +80,6 @@ static char *get_string(struct metadata *m)
     memcpy(s, p, size);
     s[size] = 0;
     return s;
-}
-static int publish(struct metadata *m)
-{
-    int fd = -1;
-    size_t done = 0;
-    if (m->error || (fd = dcc_job_memfd("distcc-metadata")) < 0) goto failed;
-    while (done < m->size) {
-        ssize_t n = write(fd, m->data + done, m->size - done);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) goto failed;
-        done += n;
-    }
-    if (fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)) goto failed;
-    free(m->data);
-    return fd;
-failed:
-    if (fd >= 0) close(fd);
-    free(m->data);
-    return -1;
 }
 static int load(int fd, struct metadata *m)
 {
@@ -209,12 +153,6 @@ unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
     *size = m.size;
     return m.data;
 }
-int dcc_job_encode(const struct dcc_job *job)
-{
-    struct metadata m = {0};
-    m.data = dcc_job_encode_buffer(job, &m.size);
-    return m.data ? publish(&m) : -1;
-}
 static int absolute_path(const char *s)
 {
     return s && s[0] == '/' && !strstr(s, "/../") && !strstr(s, "/./") &&
@@ -278,48 +216,6 @@ int dcc_job_decode(int fd, struct dcc_job **out)
     *out = NULL;
     if (load(fd, &m)) return -1;
     int ret = dcc_job_decode_buffer(m.data, m.size, out);
-    free(m.data);
-    return ret;
-}
-int dcc_job_result_encode(const struct dcc_job_result *r)
-{
-    struct metadata m = {0};
-    unsigned i;
-    if (r->status < 0 || r->mode < 0 || r->mode > 0777) return -1;
-    number(&m, r->status);
-    number(&m, r->mode);
-    number(&m, r->compressed);
-    for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) number(&m, r->size[i]);
-    for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) number(&m, r->wire_size[i]);
-    return publish(&m);
-}
-int dcc_job_result_decode(int fd, struct dcc_job_result *r)
-{
-    struct metadata m = {0};
-    uint64_t status, mode, compressed;
-    unsigned i;
-    int ret = -1;
-    dcc_job_result_init(r);
-    if (load(fd, &m)) return -1;
-    status = get_number(&m);
-    mode = get_number(&m);
-    compressed = get_number(&m);
-    if (status > 65535 || mode > 0777 || compressed >= (1U << DCC_JOB_RESULT_COUNT)) goto done;
-    r->status = status;
-    r->mode = mode;
-    r->compressed = compressed;
-    for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) {
-        r->size[i] = get_number(&m);
-        if (r->size[i] > INT64_MAX) goto done;
-    }
-    for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) {
-        r->wire_size[i] = get_number(&m);
-        if (compressed & (1U << i)) {
-            if (r->wire_size[i] < 8 || r->wire_size[i] >= r->size[i]) goto done;
-        } else if (r->wire_size[i] != r->size[i]) goto done;
-    }
-    if (!m.error && m.offset == m.size) ret = 0;
-done:
     free(m.data);
     return ret;
 }
