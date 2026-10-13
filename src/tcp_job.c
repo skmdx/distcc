@@ -76,7 +76,8 @@ unsigned char *dcc_tcp_frame_make(uint32_t type, const void *data, size_t size, 
     *length = size + 8;
     return p;
 }
-int dcc_tcp_unpack(const struct dcc_tcp_frame *f, unsigned *index, void *data, size_t *length)
+int dcc_tcp_unpack(const struct dcc_tcp_frame *f, unsigned *index, void *buffer,
+                   const void **data, size_t *length)
 {
     if (f->size < 8) return -1;
     *index = dcc_tcp_get32(f->data);
@@ -84,28 +85,35 @@ int dcc_tcp_unpack(const struct dcc_tcp_frame *f, unsigned *index, void *data, s
     if (*length > DCC_TCP_CHUNK || (!*length && !(f->type & DCC_TCP_FINAL))) return -1;
     if (f->type & DCC_TCP_COMPRESSED) {
         if (f->size - 8 >= *length || LZ4_decompress_safe((char *)f->data + 8,
-                data, f->size - 8, *length) != (int)*length) return -1;
+                buffer, f->size - 8, *length) != (int)*length) return -1;
+        *data = buffer;
     } else {
         if (f->size - 8 != *length) return -1;
-        memcpy(data, f->data + 8, *length);
+        *data = f->data + 8;
     }
     return 0;
+}
+size_t dcc_tcp_encode(uint32_t type, unsigned index, const void *data,
+                       size_t length, int final, void *storage)
+{
+    unsigned char *p = storage;
+    int compressed = 0;
+    /* A destination shorter than raw makes incompressible blocks cheap. */
+    if (length > 16) compressed = LZ4_compress_default(data, (char *)p + 16, length, length - 1);
+    if (compressed) type |= DCC_TCP_COMPRESSED;
+    if (final) type |= DCC_TCP_FINAL;
+    dcc_tcp_put32(p, type);
+    dcc_tcp_put32(p + 4, 8 + (compressed ? (size_t)compressed : length));
+    dcc_tcp_put32(p + 8, index);
+    dcc_tcp_put32(p + 12, length);
+    return 16 + compressed;
 }
 unsigned char *dcc_tcp_chunk(uint32_t type, unsigned index, const void *data,
                              size_t length, int final, size_t *size)
 {
     unsigned char *p;
-    int compressed = 0;
     if (length > DCC_TCP_CHUNK || !(p = malloc(length + 16))) return NULL;
-    /* A destination shorter than raw makes incompressible blocks cheap. */
-    if (length > 16) compressed = LZ4_compress_default(data, (char *)p + 16, length, length - 1);
-    if (compressed) type |= DCC_TCP_COMPRESSED;
-    else if (length) memcpy(p + 16, data, length);
-    if (final) type |= DCC_TCP_FINAL;
-    *size = 16 + (compressed ? (size_t)compressed : length);
-    dcc_tcp_put32(p, type);
-    dcc_tcp_put32(p + 4, *size - 8);
-    dcc_tcp_put32(p + 8, index);
-    dcc_tcp_put32(p + 12, length);
+    *size = dcc_tcp_encode(type, index, data, length, final, p);
+    if (*size == 16 && length) { memcpy(p + 16, data, length); *size += length; }
     return p;
 }

@@ -65,7 +65,8 @@ io = ([dict(field.split('=') for field in line.split()[1:]) for line in io_path.
 processes = {}
 for pid in (p/'cgroup.procs').read_text().split():
     try:
-        stat = pathlib.Path('/proc', pid, 'stat').read_text()
+        # task/<pid> measures only the event-loop thread, excluding chunk workers.
+        stat = pathlib.Path('/proc', pid, 'task', pid, 'stat').read_text()
     except FileNotFoundError:
         continue
     name, fields = stat.split('(', 1)[1].rsplit(')', 1)
@@ -103,7 +104,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate', type=Path, required=True)
     parser.add_argument('--baseline', type=Path, required=True)
-    parser.add_argument('--baseline-codec', choices=('lzo', 'lz4', 'lz4s', 'h2'), default='lz4',
+    parser.add_argument('--baseline-codec', choices=('lzo', 'lz4', 'lz4s', 'h2', 'tcp'), default='lz4',
                         help='transport/codec of the baseline (default: lz4)')
     parser.add_argument('--hosts', required=True, help='TCP host entries, with slots/stats/speed but no codec')
     parser.add_argument('--baseline-hosts', help='separate baseline daemon endpoints; defaults to --hosts')

@@ -2,6 +2,7 @@
 """Prepared-input TCP jobs through real broker, daemon and compilers."""
 import concurrent.futures
 import os
+from pathlib import Path
 import re
 import random
 import runpy
@@ -36,6 +37,44 @@ class TcpJobsTest(BrokerTestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(self.job, range(24)))
 
+    def test_publication_failure_keeps_completed_connection_reusable(self):
+        self.start_tcp()
+        self.env.update(DISTCC_MAX_RETRIES='1', DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_VERBOSE='1')
+        destination = self.work / 'directory.o'
+        destination.mkdir()
+        before = int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
+        result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(self.source),
+                                 '-o', str(destination)], env=self.env, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'pooled TCP job completed', result.stderr)
+        self.assertTrue(destination.is_dir())
+        self.assertFalse(list(self.work.glob('directory.o.distcc-*')))
+        self.job('after-publication-failure')
+        after = int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
+        self.assertEqual(after - before, 1)
+
+    def test_parallel_compressed_inputs_and_disconnect(self):
+        body = b'/*' + b'bounded expansion ' * 65536 + b'*/\nint parallel_input;\n'
+        codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
+        streams = [self.wire_job(body, cached=False) for _ in range(6)]
+        cancelled = self.wire_job(body, cached=False)
+        first = codec.encode(body[:262144])
+        self.send(cancelled, 0x54010202, struct.pack('!II', 0, 262144) + first[8:])
+        cancelled.close()
+        for offset in range(0, len(body), 262144):
+            chunk = body[offset:offset + 262144]
+            packed = codec.encode(chunk)
+            plain, size = struct.unpack('!II', packed[:8])
+            self.assertGreater(size, 0)
+            kind = 0x54010202 | (0x20000 if offset + plain == len(body) else 0)
+            for net in streams:
+                self.send(net, kind, struct.pack('!II', 0, plain) + packed[8:])
+        for net in streams:
+            self.result(net)
+        stats = self.get_stats(self.stats_ports[0])
+        self.assertGreaterEqual(int(re.search(r'dcc_tcp_parallel_tasks (\d+)', stats)[1]), 24)
+        self.assertIn(int(re.search(r'dcc_tcp_parallel_peak (\d+)', stats)[1]), (1, 2))
+
     def test_partial_manifest_does_not_reserve_worker(self):
         self.start_tcp()
         sockets = []
@@ -43,7 +82,7 @@ class TcpJobsTest(BrokerTestCase):
             for _ in range(8):
                 net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=2)
                 sockets.append(net)
-                net.sendall(struct.pack('!II', 0x54000100, 100) + b'partial')
+                net.sendall(struct.pack('!II', 0x54000200, 100) + b'partial')
             self.job('while-receiving')
         finally:
             for net in sockets:
@@ -63,7 +102,7 @@ class TcpJobsTest(BrokerTestCase):
         if receive_buffer:
             net.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
         self.addCleanup(net.close)
-        self.send(net, 0x54000100, manifest)
+        self.send(net, 0x54000200, manifest)
         return net
 
     @staticmethod
@@ -83,20 +122,20 @@ class TcpJobsTest(BrokerTestCase):
         return kind, read(size)
 
     def upload(self, net, body, index=0):
-        self.send(net, 0x54000102 | 0x20000, struct.pack('!II', index, len(body)) + body)
+        self.send(net, 0x54000202 | 0x20000, struct.pack('!II', index, len(body)) + body)
 
     def result(self, net, identity=1):
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
         kind, description = self.frame(net)
-        self.assertEqual(kind, 0x54000103)
+        self.assertEqual(kind, 0x54000203)
         status, mode, *sizes = struct.unpack('!II4Q', description)
         outputs = [bytearray() for _ in sizes]
         while True:
             kind, body = self.frame(net)
-            if kind == 0x54000105:
+            if kind == 0x54000205:
                 self.assertEqual(body, struct.pack('!Q', identity))
                 break
-            self.assertEqual(kind & ~0x30000, 0x54000104)
+            self.assertEqual(kind & ~0x30000, 0x54000204)
             index, plain = struct.unpack('!II', body[:8])
             data = codec.decode(body[8:], plain) if kind & 0x10000 else body[8:]
             outputs[index].extend(data)
@@ -108,14 +147,14 @@ class TcpJobsTest(BrokerTestCase):
     def test_single_upload_and_owner_disconnect(self):
         body = b'int cache_owner_recovery(void) { return 901; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000101, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
         waiter = self.wire_job(body)
         waiter.settimeout(.15)
         with self.assertRaises(socket.timeout):
             waiter.recv(8)
         owner.close()
         waiter.settimeout(5)
-        self.assertEqual(self.frame(waiter), (0x54000101, bytes(4)))
+        self.assertEqual(self.frame(waiter), (0x54000201, bytes(4)))
         self.upload(waiter, body)
         self.result(waiter)
         hit = self.wire_job(body)
@@ -124,7 +163,7 @@ class TcpJobsTest(BrokerTestCase):
     def test_parallel_cache_waiters_share_upload(self):
         body = b'int single_upload_for_all(void) { return 902; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000101, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
         waiters = [self.wire_job(body) for _ in range(7)]
         self.upload(owner, body)
         self.result(owner)
@@ -139,26 +178,25 @@ class TcpJobsTest(BrokerTestCase):
     def test_bad_digest_discards_connection_and_releases_waiter(self):
         body = b'int verified_upload;\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000101, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
         waiter = self.wire_job(body)
         self.upload(owner, b'x' * len(body))
         self.assertEqual(owner.recv(8), b'')
-        self.assertEqual(self.frame(waiter), (0x54000101, bytes(4)))
+        self.assertEqual(self.frame(waiter), (0x54000201, bytes(4)))
         self.upload(waiter, body)
         self.result(waiter)
 
     def test_invalid_chunks_close_connection_without_dispatch(self):
         body = b'int bounded_input;\n'
         cases = [
-            (0x54020102, struct.pack('!II', 0, 262145)),
-            (0x54020102, struct.pack('!II', 1, len(body)) + body),
-            (0x54030102, struct.pack('!II', 0, len(body)) + b'\xff'),
-            (0x54020102, struct.pack('!II', 0, len(body)) + body[:-1]),
+            (0x54020202, struct.pack('!II', 0, 262145)),
+            (0x54020202, struct.pack('!II', 1, len(body)) + body),
+            (0x54030202, struct.pack('!II', 0, len(body)) + b'\xff'),
+            (0x54020202, struct.pack('!II', 0, len(body)) + body[:-1]),
         ]
         for kind, data in cases:
             with self.subTest(kind=kind, payload=len(data)):
                 net = self.wire_job(body, cached=False)
-                self.assertEqual(self.frame(net), (0x54000101, bytes(4)))
                 self.send(net, kind, data)
                 self.assertEqual(net.recv(8), b'')
                 self.assertIn('dcc_busy 0\n', self.get_stats(self.stats_ports[0]))
@@ -168,7 +206,6 @@ class TcpJobsTest(BrokerTestCase):
     def test_cancel_running_job_reclaims_tree_and_worker(self):
         body = b'int cancel_running_job;\n'
         net = self.wire_job(body, cached=False)
-        self.assertEqual(self.frame(net), (0x54000101, bytes(4)))
         self.upload(net, body)
         deadline = time.monotonic() + 3
         while 'dcc_busy 1\n' not in self.get_stats(self.stats_ports[0]):
@@ -192,7 +229,6 @@ class TcpJobsTest(BrokerTestCase):
                            'echo private-temporary > "$TMPDIR/compiler-owned"\nexec sleep 30\n')
         body = b'int killed_compiler;\n'
         net = self.wire_job(body, cached=False)
-        self.assertEqual(self.frame(net), (0x54000101, bytes(4)))
         self.upload(net, body)
         deadline = time.monotonic() + 5
         while not marker.exists():
@@ -234,13 +270,17 @@ Path(args[args.index('-o') + 1]).write_bytes(random.Random(543).randbytes(4 * 10
                 body = f'int stalled_{i};\n'.encode()
                 net = self.wire_job(body, cached=False, receive_buffer=1024)
                 stalled.append(net)
-                self.assertEqual(self.frame(net), (0x54000101, bytes(4)))
                 self.upload(net, body)
                 kind, description = self.frame(net)
-                self.assertEqual(kind, 0x54000103)
+                self.assertEqual(kind, 0x54000203)
                 self.assertEqual(struct.unpack('!II4Q', description)[4], 4 * 1024 * 1024)
             wrapper.write_text(original)
             self.assertIn('dcc_busy 0\n', self.get_stats(self.stats_ports[0]))
+            # Replacement must fork only after joining transfer threads.
+            parent = self.daemons[0].pid
+            workers = Path(f'/proc/{parent}/task/{parent}/children').read_text().split()
+            self.assertTrue(workers)
+            os.kill(int(workers[0]), signal.SIGKILL)
             self.start_tcp()
             self.job('while-results-stalled')
         finally:
@@ -249,10 +289,8 @@ Path(args[args.index('-o') + 1]).write_bytes(random.Random(543).randbytes(4 * 10
 
     def test_daemon_shutdown_reclaims_preparing_and_running_jobs(self):
         waiting = self.wire_job(b'int waiting_for_upload;\n', cached=False)
-        self.assertEqual(self.frame(waiting), (0x54000101, bytes(4)))
         body = b'int running_at_shutdown;\n'
         running = self.wire_job(body, cached=False)
-        self.assertEqual(self.frame(running), (0x54000101, bytes(4)))
         self.upload(running, body)
         deadline = time.monotonic() + 3
         while 'dcc_busy 1\n' not in self.get_stats(self.stats_ports[0]):
@@ -280,7 +318,6 @@ with open(args[args.index('-o') + 1], 'ab') as output:
 ''')
         body = b'int main(void) { return 0; }\n'
         net = self.wire_job(body, cached=False, receive_buffer=65536)
-        self.assertEqual(self.frame(net), (0x54000101, bytes(4)))
         self.upload(net, body)
         outputs = self.result(net)
         self.assertEqual(outputs[2][-size:], random.Random(764).randbytes(size))
@@ -304,19 +341,18 @@ with open(args[args.index('-o') + 1], 'ab') as output:
                 with listener.accept()[0] as net:
                     net.settimeout(5)
                     kind, manifest = self.frame(net)
-                    self.assertEqual(kind, 0x54000100)
-                    # Deliberately fragment the request header.
-                    request = struct.pack('!III', 0x54000101, 4, 0)
-                    net.sendall(request[:3])
-                    time.sleep(.01)
-                    net.sendall(request[3:])
+                    self.assertEqual(kind, 0x54000200)
                     while True:
                         kind, body = self.frame(net)
-                        self.assertEqual(kind & ~0x30000, 0x54000102)
+                        self.assertEqual(kind & ~0x30000, 0x54000202)
                         if kind & 0x20000:
                             break
-                    self.send(net, 0x54000103, struct.pack('!II4Q', 0, 0, 0, 0, 4, 0))
-                    self.send(net, 0x54020104, struct.pack('!II', 2, 4) + b'FAKE')
+                    # Deliberately fragment the response header.
+                    response = struct.pack('!IIII4Q', 0x54000203, 40, 0, 0, 0, 0, 4, 0)
+                    net.sendall(response[:3])
+                    time.sleep(.01)
+                    net.sendall(response[3:])
+                    self.send(net, 0x54020204, struct.pack('!II', 2, 4) + b'FAKE')
                     reached.set()  # Close after a complete artifact, before COMPLETE.
             except BaseException as error:
                 errors.append(error)
@@ -336,6 +372,7 @@ with open(args[args.index('-o') + 1], 'ab') as output:
         self.assertTrue(reached.is_set())
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(output.read_bytes(), b'original artifact')
+        self.assertFalse(list(self.work.glob('previous.o.distcc-*')))
 
     @unittest.skipUnless(shutil.which('strace'), 'strace is required')
     def test_execution_ipc_is_one_request_and_one_result(self):

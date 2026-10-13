@@ -11,7 +11,7 @@
 /* 'T' distinguishes this protocol on the existing ACL-protected listener.
  * One framing layer; flags never introduce an inner RPC stream. */
 enum dcc_tcp_type {
-    DCC_TCP_BEGIN = 0x54000100, DCC_TCP_NEED, DCC_TCP_INPUT,
+    DCC_TCP_BEGIN = 0x54000200, DCC_TCP_NEED, DCC_TCP_INPUT,
     DCC_TCP_RESULT, DCC_TCP_OUTPUT, DCC_TCP_COMPLETE
 };
 #define DCC_TCP_COMPRESSED 0x10000U
@@ -35,8 +35,10 @@ int dcc_tcp_frame_read(int, struct dcc_tcp_frame *, size_t);
 /* Encode at most one chunk; raw input and precompressed pump blocks share
  * this framing. Returned allocation includes the complete 8-byte header. */
 unsigned char *dcc_tcp_frame_make(uint32_t, const void *, size_t, size_t *);
-int dcc_tcp_unpack(const struct dcc_tcp_frame *, unsigned *, void *, size_t *);
+int dcc_tcp_unpack(const struct dcc_tcp_frame *, unsigned *, void *, const void **, size_t *);
 unsigned char *dcc_tcp_chunk(uint32_t, unsigned, const void *, size_t, int, size_t *);
+/* Caller supplies CHUNK+16 bytes. RAW returns only its 16-byte header. */
+size_t dcc_tcp_encode(uint32_t, unsigned, const void *, size_t, int, void *);
 
 #define DCC_TCP_RUN 128
 struct dcc_tcp_run { uint32_t operation; uint64_t id; char root[PATH_MAX]; };
@@ -55,6 +57,9 @@ struct dcc_tcp_dispatch {
 struct dcc_tcp_server *dcc_tcp_server_new(int, const struct dcc_tcp_dispatch *);
 void dcc_tcp_server_free(struct dcc_tcp_server *);
 void dcc_tcp_server_abandon(struct dcc_tcp_server *);
+void dcc_tcp_server_collect(void);
+void dcc_tcp_server_quiesce(void);
+int dcc_tcp_server_pending(void);
 void dcc_tcp_server_poll(struct dcc_tcp_server *, struct pollfd *);
 int dcc_tcp_server_process(struct dcc_tcp_server *, short);
 int dcc_tcp_server_waiting(struct dcc_tcp_server *);
@@ -64,5 +69,6 @@ uint64_t dcc_tcp_ready_idle_ns(void);
 void dcc_tcp_server_finished(struct dcc_tcp_server *, const struct dcc_tcp_finished *, int *, unsigned);
 void dcc_tcp_server_lost(struct dcc_tcp_server *);
 struct dcc_hostdef;
-int dcc_tcp_exchange(struct dcc_hostdef *, struct dcc_job *, char **, const char *, struct dcc_job_result *);
+int dcc_tcp_exchange(struct dcc_hostdef *, struct dcc_job *, char **, const char *,
+                     const char *, const char *, struct dcc_job_result *);
 #endif

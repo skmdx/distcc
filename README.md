@@ -150,6 +150,10 @@ retains the one-link-per-server limit. Preparing and returning jobs can exceed
 the compiler-slot count, but share a bounded 512 MiB storage budget; compiler
 working memory and the persistent input cache are separate. Set the daemon's
 `TMPDIR` to suitable tmpfs storage when available.
+Large compressed inputs and result compression can use up to two background
+threads. Uncached inputs start without a request round trip, and received
+objects go directly into unpublished destination files. Update clients and
+daemons together: this wire version does not accept earlier `,tcp` clients.
 
 This is the recommended opt-in path for shared-input and transfer-heavy builds.
 Small builds need not beat HTTP/2; compare your workload with `bench/rpc.py`

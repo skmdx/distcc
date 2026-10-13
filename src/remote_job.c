@@ -151,14 +151,22 @@ static int buffer_result(int fd, const struct dcc_job_result *result, unsigned i
 }
 /* Complete output is published atomically. A transport failure never replaces
  * a previous object with a prefix, and successful empty outputs still exist. */
-static int publish(int fd, const struct dcc_job_result *result, unsigned index, const char *path)
+static int publish(int *source, const struct dcc_job_result *result, unsigned index, const char *path)
 {
+    int fd = *source;
     char *temporary = NULL, data[65536];
     int output = -1, ret = EXIT_IO_ERROR;
     uint64_t offset = 0;
     uint64_t size = result->size[index];
     mode_t mask;
     if (!path || !strcmp(path, "-") || !strcmp(path, "/dev/null")) return 0;
+    if (result->temporary[index]) {
+        mask = umask(0); umask(mask);
+        if (fchmod(fd, 0666 & ~mask)) return EXIT_IO_ERROR;
+        int failed = close(fd);
+        *source = -1;
+        return failed || rename(result->temporary[index], path) ? EXIT_IO_ERROR : 0;
+    }
     if (asprintf(&temporary, "%s.distcc-XXXXXX", path) < 0) return EXIT_OUT_OF_MEMORY;
     if ((output = mkstemp(temporary)) < 0) goto done;
     mask = umask(0);
@@ -194,11 +202,14 @@ int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, c
     struct dcc_job *job = describe(argv, cpp, files, host->tcp_jobs);
     struct dcc_job_result result;
     unsigned i, cached = 0, transferred = 0;
-    int metadata = -1, ret = EXIT_IO_ERROR, ended = 0;
+    int metadata = -1, ret = EXIT_IO_ERROR, ended = 0, transport_complete = 0;
     int artifacts[DCC_JOB_RESULT_COUNT] = {-1, -1, -1, -1};
     dcc_job_result_init(&result);
     if (host->tcp_jobs) {
-        if (!job || (ret = dcc_tcp_exchange(host, job, files, cpp, &result))) goto done;
+        if (!job || (ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result))) goto done;
+        /* COMPLETE ends the network transaction; publication is local work. */
+        dcc_broker_return(host, host->broker_fd);
+        transport_complete = 1;
         for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) artifacts[i] = result.fd[i];
         goto publish_results;
     }
@@ -251,16 +262,19 @@ publish_results:
     if ((ret = buffer_result(artifacts[DCC_JOB_STDERR], &result, DCC_JOB_STDERR, err)) ||
         (ret = buffer_result(artifacts[DCC_JOB_STDOUT], &result, DCC_JOB_STDOUT, out))) goto done;
     if (!*status) {
-        if ((ret = publish(artifacts[DCC_JOB_OBJECT], &result, DCC_JOB_OBJECT, output))) goto done;
-        if (files) ret = publish(artifacts[DCC_JOB_DEPS], &result, DCC_JOB_DEPS, deps);
+        if ((ret = publish(&artifacts[DCC_JOB_OBJECT], &result, DCC_JOB_OBJECT, output))) goto done;
+        if (files) ret = publish(&artifacts[DCC_JOB_DEPS], &result, DCC_JOB_DEPS, deps);
     } else if (dcc_argv_search(argv, "-E") && strcmp(output, "-")) {
         struct stat st;
         if (!stat(output, &st) && S_ISREG(st.st_mode)) unlink(output);
     }
 done:
-    if (host->tcp_jobs && !ret) dcc_broker_return(host, host->broker_fd);
     if (metadata >= 0) close(metadata);
     for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) if (artifacts[i] >= 0) close(artifacts[i]);
+    if (host->tcp_jobs) {
+        for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) result.fd[i] = -1;
+        dcc_job_result_free(&result);
+    }
     dcc_job_free(job);
-    return ret;
+    return transport_complete && ret ? DCC_REMOTE_LOCAL_ERROR : ret;
 }

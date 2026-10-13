@@ -35,6 +35,8 @@ struct dcc_job_result {
     uint64_t wire_size[DCC_JOB_RESULT_COUNT];
     unsigned compressed;
     int fd[DCC_JOB_RESULT_COUNT];
+    /* Local unpublished destinations, never part of wire metadata. */
+    char *temporary[DCC_JOB_RESULT_COUNT];
 };
 void dcc_job_free(struct dcc_job *);
 void dcc_job_result_init(struct dcc_job_result *);
@@ -43,6 +45,8 @@ void dcc_job_result_free(struct dcc_job_result *);
  * into metadata; HTTP file bodies and SCM_RIGHTS carry it independently. */
 int dcc_job_encode(const struct dcc_job *);
 int dcc_job_decode(int fd, struct dcc_job **);
+unsigned char *dcc_job_encode_buffer(const struct dcc_job *, size_t *);
+int dcc_job_decode_buffer(const void *, size_t, struct dcc_job **);
 int dcc_job_result_encode(const struct dcc_job_result *);
 int dcc_job_result_decode(int fd, struct dcc_job_result *);
 /* Anonymous storage for data which must outlive its producing process. */

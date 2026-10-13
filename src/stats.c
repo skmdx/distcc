@@ -50,6 +50,7 @@
 #include <poll.h>
 #ifdef __linux__
 #include "tcp_job.h"
+#include "tcp_async.h"
 #endif
 
 int dcc_statspipe[2];
@@ -374,6 +375,8 @@ static void dcc_service_stats_request(int http_fd) {
     int running = dcc_getcurrentload();
     double memory_pressure = -1;
     unsigned long long ready_idle_ns = 0;
+    unsigned long parallel_tasks = 0;
+    unsigned parallel_peak = 0;
     ssize_t ret;
 
     const char replytemplate[] = "\
@@ -406,6 +409,8 @@ dcc_running %d\n\
 dcc_busy %d\n\
 dcc_queued %d\n\
 dcc_tcp_ready_idle_ns %llu\n\
+dcc_tcp_parallel_tasks %lu\n\
+dcc_tcp_parallel_peak %u\n\
 dcc_links %d\n\
 dcc_admission %d\n\
 dcc_available %d\n\
@@ -431,6 +436,8 @@ dcc_free_mem %d MB\n\
     if (available < 0) available = 0;
     memory_pressure = dcc_memory_pressure();
     ready_idle_ns = dcc_tcp_ready_idle_ns();
+    parallel_tasks = dcc_tcp_async_tasks();
+    parallel_peak = dcc_tcp_async_peak();
     if (running > 0) running--; /* Exclude this statistics request itself. */
 #endif
 
@@ -465,7 +472,8 @@ dcc_free_mem %d MB\n\
                                dcc_stats.kids_avg[2],
                                dcc_getcurrentload(),
                                loadavg[0], loadavg[1], loadavg[2],
-                               running, busy, queued, ready_idle_ns, links, admission, available, memory_pressure,
+                               running, busy, queued, ready_idle_ns, parallel_tasks, parallel_peak,
+                               links, admission, available, memory_pressure,
                                ct[0], ct[1], ct[2],
                                num_D, max_RSS, max_RSS_name,
                                dcc_stats.io_rate,

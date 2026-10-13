@@ -25,6 +25,9 @@
 
 #include <sys/types.h>
 #include <stdint.h>
+/* Internal return from remote execution: transport completed, but local
+ * result publication failed. Never blacklist/retry the remote host for it. */
+#define DCC_REMOTE_LOCAL_ERROR (-1)
 #include <sys/time.h>     /* for struct timeval */
 
 

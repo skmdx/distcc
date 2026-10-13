@@ -177,16 +177,18 @@ void dcc_job_result_init(struct dcc_job_result *r)
 void dcc_job_result_free(struct dcc_job_result *r)
 {
     unsigned i;
-    for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i)
+    for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) {
         if (r->fd[i] >= 0) { close(r->fd[i]); r->fd[i] = -1; }
+        if (r->temporary[i]) { unlink(r->temporary[i]); free(r->temporary[i]); r->temporary[i] = NULL; }
+    }
 }
-int dcc_job_encode(const struct dcc_job *job)
+unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
 {
     struct metadata m = {0};
     unsigned argc = 0, i;
     if (!job || job->kind > DCC_JOB_LINK || job->count > DCC_JOB_INPUT_MAX ||
-        (job->count && !job->inputs) || !job->argv || !job->cwd) return -1;
-    while (job->argv[argc]) if (++argc > DCC_JOB_INPUT_MAX) return -1;
+        (job->count && !job->inputs) || !job->argv || !job->cwd) return NULL;
+    while (job->argv[argc]) if (++argc > DCC_JOB_INPUT_MAX) return NULL;
     number(&m, job->kind);
     number(&m, argc);
     number(&m, job->count);
@@ -203,7 +205,15 @@ int dcc_job_encode(const struct dcc_job *job)
         string(&m, in->path);
         string(&m, in->target);
     }
-    return publish(&m);
+    if (m.error) { free(m.data); return NULL; }
+    *size = m.size;
+    return m.data;
+}
+int dcc_job_encode(const struct dcc_job *job)
+{
+    struct metadata m = {0};
+    m.data = dcc_job_encode_buffer(job, &m.size);
+    return m.data ? publish(&m) : -1;
 }
 static int absolute_path(const char *s)
 {
@@ -211,14 +221,14 @@ static int absolute_path(const char *s)
         !strstr(s, "//") && (strlen(s) < 3 || strcmp(s + strlen(s) - 3, "/..")) &&
         (strlen(s) < 2 || strcmp(s + strlen(s) - 2, "/."));
 }
-int dcc_job_decode(int fd, struct dcc_job **out)
+int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
 {
-    struct metadata m = {0};
+    struct metadata m = { .data = (unsigned char *)data, .size = size };
     struct dcc_job *job = NULL;
     uint64_t kind, argc, count;
     unsigned i;
     *out = NULL;
-    if (load(fd, &m)) return -1;
+    if (!data || size < 8 || size > DCC_JOB_METADATA_MAX) return -1;
     kind = get_number(&m);
     argc = get_number(&m);
     count = get_number(&m);
@@ -256,13 +266,20 @@ int dcc_job_decode(int fd, struct dcc_job **out)
             (in->cached && in->plain_size > DCC_FILE_CACHE_MAX)) goto failed;
     }
     if (m.error || m.offset != m.size) goto failed;
-    free(m.data);
     *out = job;
     return 0;
 failed:
-    free(m.data);
     dcc_job_free(job);
     return -1;
+}
+int dcc_job_decode(int fd, struct dcc_job **out)
+{
+    struct metadata m = {0};
+    *out = NULL;
+    if (load(fd, &m)) return -1;
+    int ret = dcc_job_decode_buffer(m.data, m.size, out);
+    free(m.data);
+    return ret;
 }
 int dcc_job_result_encode(const struct dcc_job_result *r)
 {

@@ -3,6 +3,7 @@
 #include <config.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -58,7 +59,7 @@ static unsigned char *next_chunk(struct input_stream *stream, const struct dcc_j
     return p;
 }
 int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files,
-                      const char *cpp, struct dcc_job_result *result)
+                      const char *cpp, const char *output, const char *deps, struct dcc_job_result *result)
 {
     struct dcc_tcp_frame incoming = {0};
     struct input_stream stream = {.fd = -1};
@@ -70,20 +71,28 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     size_t length = 0, sent = 0;
     size_t file_left = 0;
     off_t file_offset = 0;
-    int metadata = -1, ret = EXIT_IO_ERROR, have_result = 0;
+    int ret = EXIT_IO_ERROR, have_result = 0;
     time_t active = time(NULL);
-    struct stat st;
     dcc_job_result_init(result);
     if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested || !buffer ||
-        getrandom(&id, sizeof(id), 0) != sizeof(id) || !id ||
-        (metadata = dcc_job_encode(job)) < 0 || fstat(metadata, &st)) goto done;
-    unsigned char *manifest = malloc(st.st_size + 8);
+        getrandom(&id, sizeof(id), 0) != sizeof(id) || !id) goto done;
+    size_t metadata_size = 0;
+    unsigned char *manifest = dcc_job_encode_buffer(job, &metadata_size);
     if (!manifest) goto done;
-    dcc_tcp_put64(manifest, id);
-    if (pread(metadata, manifest + 8, st.st_size, 0) != st.st_size) { free(manifest); goto done; }
-    outgoing = dcc_tcp_frame_make(DCC_TCP_BEGIN, manifest, st.st_size + 8, &length);
+    length = metadata_size + 16;
+    outgoing = malloc(length);
+    if (outgoing) {
+        dcc_tcp_put32(outgoing, DCC_TCP_BEGIN);
+        dcc_tcp_put32(outgoing + 4, metadata_size + 8);
+        dcc_tcp_put64(outgoing + 8, id);
+        memcpy(outgoing + 16, manifest, metadata_size);
+    }
     free(manifest);
     if (!outgoing) goto done;
+    for (unsigned i = 0; i < job->count; ++i)
+        if (job->inputs[i].kind == DCC_JOB_FILE && !job->inputs[i].cached) {
+            requested[i] = 1; requests[count++] = i;
+        }
     for (;;) {
         if (!outgoing && (stream.fd >= 0 || read_request < count)) {
             if (stream.fd < 0) {
@@ -103,11 +112,12 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         int n = poll(&p, 1, timeout * 1000);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto done;
-        if (p.revents & (POLLIN | POLLHUP | POLLERR)) {
+        for (unsigned turn = 0; turn < 4 && (p.revents & (POLLIN | POLLHUP | POLLERR)); ++turn) {
             size_t before = incoming.used;
             int complete = dcc_tcp_frame_read(host->broker_fd, &incoming, DCC_TCP_CHUNK + 8U);
             if (before != incoming.used) active = time(NULL);
             if (complete < 0) goto done;
+            if (!complete) break;
             if (complete) {
                 uint32_t type = incoming.type & ~DCC_TCP_FLAGS;
                 if (type == DCC_TCP_NEED && !have_result && incoming.size && !(incoming.size % 4)) {
@@ -129,15 +139,23 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                         total += size;
                         result->size[i] = result->wire_size[i] = size;
                         if (!size) finals |= 1U << i;
-                        if ((result->fd[i] = dcc_job_memfd("distcc-tcp-result")) < 0) goto done;
+                        const char *path = i == DCC_JOB_OBJECT ? output : i == DCC_JOB_DEPS ? deps : NULL;
+                        if (!result->status && path && strcmp(path, "-") && strcmp(path, "/dev/null")) {
+                            if (asprintf(&result->temporary[i], "%s.distcc-XXXXXX", path) < 0) {
+                                result->temporary[i] = NULL; goto done;
+                            }
+                            result->fd[i] = mkstemp(result->temporary[i]);
+                        } else result->fd[i] = dcc_job_memfd("distcc-tcp-result");
+                        if (result->fd[i] < 0) goto done;
                     }
                 } else if (type == DCC_TCP_OUTPUT && have_result) {
                     unsigned index;
                     size_t size;
-                    if (dcc_tcp_unpack(&incoming, &index, buffer, &size) ||
+                    const void *data;
+                    if (dcc_tcp_unpack(&incoming, &index, buffer, &data, &size) ||
                         index >= DCC_JOB_RESULT_COUNT || (finals & (1U << index)) ||
                         size > result->size[index] - received[index] ||
-                        dcc_writex(result->fd[index], buffer, size)) goto done;
+                        dcc_writex(result->fd[index], data, size)) goto done;
                     received[index] += size;
                     if (incoming.type & DCC_TCP_FINAL) {
                         if (received[index] != result->size[index]) goto done;
@@ -151,7 +169,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                 dcc_tcp_frame_clear(&incoming);
             }
         }
-        if ((p.revents & POLLOUT) && outgoing) {
+        for (unsigned turn = 0; turn < 4 && (p.revents & POLLOUT) && outgoing; ++turn) {
             ssize_t n;
             if (sent < length)
                 n = send(host->broker_fd, outgoing + sent, length - sent,
@@ -162,6 +180,8 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                 if (n > 0) file_left -= n;
             }
             if (n < 0 && errno != EAGAIN && errno != EINTR) goto done;
+            if (n < 0) break;
+            if (!n) goto done;
             if (n > 0) {
                 active = time(NULL);
                 if (sent < length) sent += n;
@@ -184,7 +204,6 @@ done:
         }
         if (cached) rs_trace("input cache: %u of %u entries transferred", transferred, job->count);
     }
-    if (metadata >= 0) close(metadata);
     if (stream.fd >= 0) close(stream.fd);
     free(requests); free(requested); free(buffer); free(outgoing);
     dcc_tcp_frame_clear(&incoming);

@@ -702,7 +702,7 @@ def direct_link(lease, archive, output):
 
 def tcp_link(net, archive, output):
     """Stream a link archive and receive one bounded pooled TCP transaction."""
-    begin, need, incoming, result_type, outgoing, complete = range(0x54000100, 0x54000106)
+    begin, need, incoming, result_type, outgoing, complete = range(0x54000200, 0x54000206)
     compressed, final = 0x10000, 0x20000
     codec = Lz4Chunks()
     identity = int.from_bytes(os.urandom(8), 'big') or 1
@@ -733,9 +733,6 @@ def tcp_link(net, archive, output):
                 struct.pack('!5Q', 0, 0, 0, archive.size, archive.size) + bytes(8) +
                 string('/input.tar') + string(''))
     send(begin, struct.pack('!Q', identity) + metadata)
-    kind, body = receive()
-    if kind != need or body != bytes(4):
-        raise OSError('invalid TCP link input request')
 
     class Writer:
         def __init__(self):

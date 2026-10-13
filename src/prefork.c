@@ -70,6 +70,7 @@ static int dcc_preforked_child(int listen_fd);
 
 #ifdef __linux__
 #include "tcp_job.h"
+#include "tcp_async.h"
 /* Only the parent owns idle sockets. Legacy workers borrow an active socket;
  * prepared-job workers receive input metadata instead. */
 #define MAX_PENDING 256
@@ -147,6 +148,7 @@ int dcc_prefork_shutdown(int signal_number)
 
 static void finish_shutdown(void)
 {
+    dcc_tcp_server_quiesce();
     /* Run outside the signal handler: tree cleanup uses allocator/directory
      * routines, and must follow worker death rather than race compiler IO. */
     for (int i = 0; i < worker_count; ++i) if (workers[i].pid > 0) {
@@ -334,6 +336,8 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
     struct pollfd *polls = parent_polls;
     int i, j, result, base = count + 1, sockets = base + worker_count;
     int total = sockets + MAX_PENDING;
+    int wake_index = total++;
+    polls[wake_index] = (struct pollfd){dcc_tcp_async_fd(), POLLIN, 0};
     int tcp_base = total;
     total += MAX_PENDING;
     time_t now = time(NULL);
@@ -364,18 +368,21 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             continue;
         }
         int added = dcc_h2_prepare(h2[i].connection, polls + total,
-                    worker_count + 4 * MAX_PENDING + 3 - total);
+                    worker_count + 4 * MAX_PENDING + 4 - total);
         if (added < 0) return -1;
         h2[i].poll_index = total;
         total += added;
     }
     /* Bound idle expiry even without statistics or other activity. */
-    result = poll(polls, total, timeout < 1000 ? timeout : 1000);
+    result = poll(polls, total, dcc_tcp_server_pending() ? 0 : timeout < 1000 ? timeout : 1000);
     if (shutdown_signal) finish_shutdown();
     for (i = 0; i < count; ++i) extra[i].revents = polls[i].revents;
     if (result < 0) return result;
+    if (polls[wake_index].revents) dcc_tcp_async_drain();
+    dcc_tcp_server_collect();
     for (i = 0; i < worker_count; ++i)
         if (polls[base + i].revents) receive_worker(&workers[i]);
+    dcc_tcp_dispatch_ready();
     /* Ready inputs enter the compiler pool in arrival order. Receiving and
      * draining need no CPU grant; their total is bounded by the worker pool
      * and its fixed pipeline allowance. TCP reservations keep their existing
@@ -576,7 +583,7 @@ int dcc_preforking_parent(int listen_fd)
     worker_count = dcc_max_kids;
     worker_capacity = dcc_max_kids + (dcc_max_kids < DCC_H2_PIPELINE ? dcc_max_kids : DCC_H2_PIPELINE);
     workers = calloc(worker_capacity, sizeof(*workers));
-    parent_polls = calloc(worker_capacity + 4 * MAX_PENDING + 3, sizeof(*parent_polls));
+    parent_polls = calloc(worker_capacity + 4 * MAX_PENDING + 4, sizeof(*parent_polls));
     if (!workers || !parent_polls) return EXIT_OUT_OF_MEMORY;
     for (ret = 0; ret < worker_capacity; ++ret) workers[ret].fd = -1;
     for (ret = 0; ret < MAX_PENDING; ++ret) pending[ret].fd = -1;
@@ -639,6 +646,9 @@ static void dcc_create_kids(int listen_fd) {
         for (slot = 0; slot < worker_count && workers[slot].pid; ++slot) {}
         if (slot == worker_count || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair))
             dcc_exit(EXIT_OUT_OF_MEMORY);
+        /* A compiler child runs library code before exec: never fork it with
+         * live threads or library locks inherited from background tasks. */
+        dcc_tcp_server_quiesce();
 #endif
         if ((kid = fork()) == -1) {
             rs_log_error("fork failed: %s", strerror(errno));
@@ -646,6 +656,7 @@ static void dcc_create_kids(int listen_fd) {
         } else if (kid == 0) {
 #ifdef __linux__
             close(pair[0]);
+            dcc_tcp_async_child();
             worker_channel = pair[1];
             close(listen_fd);
             for (i = 0; i < worker_count; ++i)

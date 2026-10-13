@@ -74,10 +74,15 @@ connection. Only the parent changes queue membership and cache ownership.
 Missing cached inputs have one uploader and a list of dependants. Publication
 wakes dependants; disconnect promotes another uploader. Inputs are private
 snapshots, never compiler-writable cache inodes. No inter-job upload locks are
-held while waiting for a compiler or another input.
+held while waiting for a compiler or another input. Preparation advances at
+most eight input entries per turn and stops after each cache hit. Completed
+shared uploads copy one dependant per turn without rehashing the verified
+source; that source cannot enter a compiler until all copies finish. Cache
+hits from persistent storage still undergo verification.
 
-The network exchange is BEGIN(manifest), NEED(missing input indices), input
+The network exchange is BEGIN(manifest), NEED(missing cached input indices), input
 chunks, RESULT(status and artifact sizes), output chunks, COMPLETE(job id).
+Uncached inputs start immediately after BEGIN, without waiting for NEED.
 Further NEED messages can promote a cache waiter after an uploader disconnects.
 Both endpoints continue to service control traffic during transfers. There is
 no per-file ACK, artifact GET or job DELETE. Every frame has a type/flags word
@@ -89,14 +94,14 @@ RAW and already encoded immutable file extents can use sendfile.
 
 The host option is ,tcp (or ,cpp,tcp under pump). It requires the Linux broker
 and prefork daemon, uses the existing ACL-protected TCP listener, and does not
-support SSH, GSSAPI or combination with ,h2. BEGIN is type 0x54000100, followed
+support SSH, GSSAPI or combination with ,h2. BEGIN is type 0x54000200, followed
 by NEED, INPUT, RESULT, OUTPUT and COMPLETE in numeric order. The eight-byte
 frame header contains a uint32 type/flags and uint32 payload length. Flag
 0x10000 means compressed; 0x20000 means final, both valid only on data frames.
 All integers use network byte order. Payloads are:
 
   BEGIN:    uint64 nonzero job ID, then the binary manifest described below.
-  NEED:     a vector of uint32 input indices (possibly empty).
+  NEED:     a nonempty vector of uint32 cached input indices.
   INPUT:    uint32 index, uint32 expanded chunk length, raw/LZ4 bytes.
   RESULT:   uint32 wait status, uint32 mode, four uint64 expanded sizes.
   OUTPUT:   the same chunk structure as INPUT, indexed by artifact.
@@ -112,6 +117,16 @@ Admission bounds connections (256) and globally retained input estimates,
 output sizes, frame buffers and queued packets (512 MiB) independently of
 compiler slots. These bounds exclude compiler working memory and the separate
 256 MiB persistent cache. Each connection has one 256 KiB working buffer.
+Compressed inputs and output chunks of at least 64 KiB use a lazy pool of at
+most two threads (one on a single-CPU host). A connection has at most one task;
+the event loop retains its frame, file descriptors and storage reservation
+until task completion. The threads expand/write/hash input or read/compress
+output; only the event loop changes job/cache/queue ownership. Small chunks
+and raw inputs stay synchronous. Raw receive frames are written directly;
+raw result sendfile extents need no intermediate payload copy. Temporary
+output encoding buffers count against the storage budget.
+All transfer threads are joined before compiler-worker fork or daemon cleanup;
+they restart lazily. Cancelled jobs retain task resources until completion.
 At most four frames or writes per connection per turn prevent large transfers
 from monopolizing the event loop. Retained output pauses dispatch above three
 quarters of the storage budget. Ready jobs dispatch FIFO; ordinary compiles
@@ -126,12 +141,20 @@ publication and pool return. Partial or malformed transactions are discarded,
 never resynchronized or silently replayed. Idle sockets own no compiler slot.
 Idle connections expire after 30 seconds; jobs use DISTCC_IO_TIMEOUT measured
 from network progress or worker completion. Receiving clients stage decoded
-artifacts until COMPLETE, then use the existing publication rules.
+artifacts until COMPLETE. Object/dependency chunks decode directly into a
+private temporary file beside the destination; COMPLETE permits rename, with
+no memfd-to-file copy. Diagnostics retain anonymous storage. The connection
+returns to the pool before local publication; a publication error cannot make
+an incomplete network transaction reusable and does not blacklist or retry a
+healthy server. The version-1 prepared TCP wire
+format is rejected; update clients and daemons together.
 
 The stats counter dcc_tcp_ready_idle_ns accumulates unused admissible compiler
 slot nanoseconds while eligible prepared work is queued. It is sampled at
 queue/worker transitions, and includes result processing or output backpressure
 that delays dispatch; input waiting and unavailable resource slots are excluded.
+The dcc_tcp_parallel_tasks and dcc_tcp_parallel_peak counters report completed
+background chunks and the peak number of concurrently executing chunk tasks.
 Use bench/rpc.py to compare actual builds with fallback and retries disabled.
 
 Direct HTTP/2 jobs

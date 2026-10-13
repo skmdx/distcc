@@ -935,6 +935,11 @@ dcc_build_somewhere(char *argv[],
 
         /* dcc_compile_remote() already unlocked local_cpu_lock_fd. */
         local_cpu_lock_fd = -1;
+        if (ret == DCC_REMOTE_LOCAL_ERROR) {
+            rs_log_error("could not publish the completed remote result locally");
+            ret = EXIT_IO_ERROR;
+            goto unlock_and_clean_up;
+        }
         bad_host(host, &cpu_lock_fd, &local_cpu_lock_fd);
         retry_count++;
         if (retry_count < max_retries)
