@@ -816,9 +816,9 @@ static int dcc_run_job(int in_fd,
     if ((ret = dcc_make_tmpnam("distcc", ".stdout", &out_fname)))
         goto out_cleanup;
 
-    dcc_remove_if_exists(deps_fname);
-    dcc_remove_if_exists(err_fname);
-    dcc_remove_if_exists(out_fname);
+    /* Keep the exclusive name reservations until this job's cleanup. The
+     * compiler and log redirection reopen these files. Unlinking them here
+     * lets another worker claim the same name and later remove our result. */
 
     /* Capture any messages relating to this compilation to the same file as
      * compiler errors so that they can all be sent back to the client. */

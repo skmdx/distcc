@@ -2,6 +2,7 @@
 """HTTP/2 multiplexing and cancellation through real distccd workers."""
 import concurrent.futures
 import io
+import json
 import xxhash
 import re
 import random
@@ -13,6 +14,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import time
 import threading
 import unittest
@@ -21,6 +23,86 @@ from test_broker import BrokerTestCase
 
 
 class Http2Test(BrokerTestCase):
+    def test_concurrent_jobs_keep_reserved_result_files(self):
+        # Force the initial temporary-name candidate to collide across workers.
+        # The actual exclusive creation must keep each job's files separate.
+        clock = self.work / 'clock.c'
+        library = self.work / 'clock.so'
+        clock.write_text('''#include <sys/time.h>
+#include <unistd.h>
+int gettimeofday(struct timeval *tv, void *tz) {
+    (void)tz;
+    tv->tv_sec = COLLISION_SECONDS;
+    tv->tv_usec = (getpid() & 65535) ^ 12345;
+    return 0;
+}
+'''.replace('COLLISION_SECONDS', str(int(time.time()))))
+        subprocess.run([self.cc, '-shared', '-fPIC', str(clock), '-o', str(library)],
+                       check=True, capture_output=True, timeout=15)
+        wrapper = self.root / 'bin' / 'gcc'
+        original = wrapper.read_text()
+        gate = self.work / 'gate'
+        gate.mkdir()
+        wrapper.write_text(f'''#!{sys.executable}
+import json, os, subprocess, sys, time
+from pathlib import Path
+gate = Path({str(gate)!r})
+args = sys.argv[1:]
+source = Path(args[args.index('-c') + 1]).read_text()
+role = 'a' if 'ROLE_A' in source else 'b'
+deps = args[args.index('-MF') + 1]
+ready = gate / (role + '.ready')
+temporary = gate / (role + '.tmp')
+temporary.write_text(json.dumps(deps))
+temporary.rename(ready)
+def wait(name):
+    deadline = time.monotonic() + 10
+    while not (gate / name).exists():
+        if time.monotonic() > deadline: sys.exit(99)
+        time.sleep(.005)
+wait('a.ready')
+wait('b.ready')
+if role == 'a': wait('b.compiled')
+result = subprocess.run([{self.cc!r}, *args]).returncode
+if role == 'b':
+    (gate / 'b.compiled').touch()
+    wait('release')
+sys.exit(result)
+''')
+        try:
+            self.restart_server(self.build / 'distccd', LD_PRELOAD=str(library))
+            self.start_h2()
+            def job(role):
+                body = f'/* ROLE_{role} */\nint main(void) {{ return 0; }}\n'.encode()
+                return self.cached_compile([(b'/src/source.c', body)], execute=True)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                b = pool.submit(job, 'B')
+                try:
+                    deadline = time.monotonic() + 5
+                    while not (gate / 'b.ready').exists() and time.monotonic() < deadline:
+                        if b.done(): b.result()
+                        time.sleep(.005)
+                    self.assertTrue((gate / 'b.ready').exists(), 'second job did not reach compiler')
+                    a = pool.submit(job, 'A')
+                    self.assertEqual(a.result(timeout=15), b'\1')
+                    deps_a = Path(json.loads((gate / 'a.ready').read_text()))
+                    deadline = time.monotonic() + 5
+                    while deps_a.exists() and time.monotonic() < deadline:
+                        time.sleep(.005)
+                    self.assertFalse(deps_a.exists(), 'first job did not finish cleanup')
+                finally:
+                    (gate / 'release').touch()
+                self.assertEqual(b.result(timeout=15), b'\1')
+                self.assertNotEqual((gate / 'a.ready').read_text(), (gate / 'b.ready').read_text())
+        except Exception:
+            self.logs[0].flush()
+            self.logs[0].seek(0)
+            print(self.logs[0].read()[-10000:], file=sys.stderr)
+            raise
+        finally:
+            wrapper.write_text(original)
+            self.restart_server(self.build / 'distccd')
+
     def cached_compile(self, files, *, abort=False, corrupt=False, reject_manifest=False,
                        ready=None, execute=False, inline=()):
         helper = runpy.run_path(str(self.build / 'distcc-link'))
