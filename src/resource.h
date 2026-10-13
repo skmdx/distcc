@@ -5,3 +5,4 @@ void dcc_resource_observe(unsigned long long peak_bytes, int success);
 unsigned long long dcc_resource_job_bytes(void);
 unsigned dcc_resource_samples(void);
 unsigned long long dcc_resource_peak_bytes(void);
+unsigned long long dcc_resource_spare_bytes(void);

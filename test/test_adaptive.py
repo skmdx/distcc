@@ -362,5 +362,43 @@ class AdaptiveTest(DistccTestCase):
         self.assertEqual(result.returncode, 106)
 
 
+class MemoryEstimateTest(unittest.TestCase):
+    def test_outlier_keeps_spare_without_charging_every_job(self):
+        with tempfile.TemporaryDirectory(prefix='distcc-memory-model-') as directory:
+            root = Path(directory)
+            source = root/'memory.c'
+            source.write_text('''#include <assert.h>
+#include <stdlib.h>
+#include "resource.h"
+#define M (1024ULL*1024)
+int main(void) {
+    setenv("DISTCC_JOB_MEMORY", "512", 1);
+    setenv("DISTCC_MEMORY_LEARNING", "1", 1);
+    assert(dcc_resource_job_bytes() == 512*M);
+    for (int i=0; i<8; ++i) dcc_resource_observe(64*M, 1);
+    assert(dcc_resource_job_bytes() == 256*M);
+    dcc_resource_observe(1024*M, 1);
+    assert(dcc_resource_spare_bytes() == 1024*M);
+    for (int i=0; i<8; ++i) dcc_resource_observe(64*M, 1);
+    assert(dcc_resource_job_bytes() == 256*M);
+    assert(dcc_resource_spare_bytes() == 1024*M);
+    assert(dcc_resource_samples() == 17);
+    dcc_resource_observe(1536*M, 0);
+    assert(dcc_resource_spare_bytes() == 1536*M);
+    assert(dcc_resource_samples() == 17);
+    for (int i=0; i<64; ++i) dcc_resource_observe(160*M, 1);
+    assert(dcc_resource_job_bytes() == 384*M);
+    assert(dcc_resource_spare_bytes() == 1536*M);
+    unsetenv("DISTCC_MEMORY_LEARNING");
+    assert(dcc_resource_job_bytes() == 512*M);
+    assert(dcc_resource_spare_bytes() == 128*M);
+    return 0;
+}''')
+            executable=root/'memory'
+            subprocess.run(['gcc','-Isrc',str(source),'src/resource.c','-o',str(executable)],
+                           check=True,capture_output=True)
+            subprocess.run([str(executable)],check=True,capture_output=True)
+
+
 if __name__ == "__main__":
     unittest.main()

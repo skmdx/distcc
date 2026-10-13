@@ -131,13 +131,31 @@ double dcc_memory_pressure(void)
 
 static unsigned long long peak_job;
 static unsigned samples;
+static unsigned long long observations[64], learned_job;
+static unsigned observation_count, next_observation;
+
+static int order_bytes(const void *a, const void *b)
+{
+    unsigned long long x = *(const unsigned long long *)a, y = *(const unsigned long long *)b;
+    return (x > y) - (x < y);
+}
 
 void dcc_resource_observe(unsigned long long peak_bytes, int success)
 {
-    /* Retain the high-water mark until daemon restart. Small later jobs must
-     * not erase evidence of a large compiler working set. */
+    /* Keep the largest working set as spare capacity, not a charge on every
+     * tiny job. A bounded recent distribution follows changes of workload. */
     if (peak_bytes > peak_job) peak_job = peak_bytes;
-    if (peak_bytes && success && samples < UINT_MAX) ++samples;
+    if (!peak_bytes || !success) return;
+    if (samples < UINT_MAX) ++samples;
+    observations[next_observation++ % 64] = peak_bytes;
+    if (observation_count < 64) ++observation_count;
+    unsigned long long sorted[64];
+    memcpy(sorted, observations, observation_count * sizeof(*sorted));
+    qsort(sorted, observation_count, sizeof(*sorted), order_bytes);
+    unsigned long long p90 = sorted[observation_count * 9 / 10];
+    learned_job = p90 <= (ULLONG_MAX - 64ULL * 1024 * 1024) / 2 ?
+        p90 * 2 + 64ULL * 1024 * 1024 : ULLONG_MAX;
+    if (learned_job < 256ULL * 1024 * 1024) learned_job = 256ULL * 1024 * 1024;
 }
 
 unsigned dcc_resource_samples(void) { return samples; }
@@ -154,26 +172,36 @@ unsigned long long dcc_resource_job_bytes(void)
     }
     job *= 1024 * 1024;
     const char *learn = getenv("DISTCC_MEMORY_LEARNING");
-    if (learn && !strcmp(learn, "1")) {
-        /* Child RSS excludes daemon/input storage and simultaneous peaks.
-         * Reserve twice the largest observation plus 64 MiB, never less
-         * than 256 MiB. The cgroup/headroom/PSI checks remain authoritative. */
-        unsigned long long measured = peak_job <= (ULLONG_MAX - 64ULL * 1024 * 1024) / 2 ?
-            peak_job * 2 + 64ULL * 1024 * 1024 : ULLONG_MAX;
-        if (samples >= 8 || measured > job)
-            job = measured > 256ULL * 1024 * 1024 ? measured : 256ULL * 1024 * 1024;
-    }
+    if (learn && !strcmp(learn, "1") && samples >= 8) job = learned_job;
     return job;
+}
+
+unsigned long long dcc_resource_spare_bytes(void)
+{
+    unsigned long long spare = dcc_resource_job_bytes() / 4;
+    const char *learn = getenv("DISTCC_MEMORY_LEARNING");
+    if (learn && !strcmp(learn, "1") && peak_job > spare) spare = peak_job;
+    return spare;
 }
 
 int dcc_resource_slots(int maximum)
 {
     static int pressure_blocked;
     unsigned long long job = dcc_resource_job_bytes(), spare, slots;
-    spare = job / 4;
+    spare = dcc_resource_spare_bytes();
     sample_resources();
     if (pressure >= 10) pressure_blocked = 1;
     else if (pressure < 5) pressure_blocked = 0;
+    const char *learn = getenv("DISTCC_MEMORY_LEARNING");
+    if (!pressure_blocked && learn && !strcmp(learn, "1") && samples >= 8 &&
+        (budget < job || budget - job < spare)) {
+        /* Do not deadlock learning when a short window contains a large
+         * outlier: one measured working set may fit even when the usual
+         * two-times estimate plus the separate reserve does not. */
+        unsigned long long one = peak_job <= (ULLONG_MAX - 64ULL * 1024 * 1024) / 5 * 4 ?
+            peak_job + peak_job / 4 + 64ULL * 1024 * 1024 : ULLONG_MAX;
+        return maximum > 0 && available >= one && budget >= one ? 1 : 0;
+    }
     /* PSI is reactive; keep headroom and reserve a budget before the burst.
      * Existing jobs finish normally when the admissible limit falls. */
     if (pressure_blocked || available < job || available - job < spare ||

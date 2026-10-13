@@ -132,13 +132,19 @@ hard per-job limits or a common scheduler for unrelated build processes.
 On Linux, `DISTCC_MEMORY_LEARNING=1` on the daemon uses compiler peak RSS
 reported by `wait4` for prepared jobs. `DISTCC_JOB_MEMORY` is the cold-start
 estimate. After eight successful observations, the estimate becomes twice the
-largest observed RSS plus 64 MiB, with a 256 MiB minimum. A larger observation
-raises the estimate immediately, including during warm-up or a failed compile.
-The high-water mark lasts until daemon restart; small later jobs cannot lower
-it. Cgroup limits, available headroom, PSI and `--jobs` remain in force. RSS
+90th percentile of the last 64 successful RSS observations plus 64 MiB, with a
+256 MiB minimum. Spare capacity is the greater of a quarter-job margin and the
+largest observed RSS, including failed compiles. This high-water reserve lasts
+until daemon restart; an unusually large job does not inflate the estimate for
+every subsequent small job. Cgroup limits, available headroom, PSI and `--jobs`
+remain in force. Multiple simultaneous unseen large jobs can still exceed the
+estimate; the service's memory limit must remain configured. When the combined
+estimate and reserve exceed the budget, one job may run if the largest measured
+RSS plus 25% and 64 MiB fits both the budget and available memory. This allows
+new observations without opening a parallel burst. RSS
 is an estimate, not a guarantee for an unseen workload or a hard job budget.
 Statistics expose `dcc_job_memory_bytes`, `dcc_job_memory_samples` and
-`dcc_job_peak_bytes`. Leave learning unset to keep a fixed estimate.
+`dcc_job_peak_bytes` and `dcc_memory_spare_bytes`. Leave learning unset to keep a fixed estimate.
 
 To avoid copying ordinary preprocessed input to a server on the same machine,
 set `DISTCC_LOCAL_SOCKET` to the same absolute socket prefix on the daemon and
