@@ -892,7 +892,7 @@ dcc_build_somewhere(char *argv[],
 
         /* localcpp_server_argv may already be processed from a previous bad host */
         if (localcpp_server_argv == NULL) {
-            if ((ret = dcc_strip_local_args(argv, &localcpp_server_argv)))
+            if ((ret = dcc_strip_local_args(argv, &localcpp_server_argv, input_fname)))
                 goto fallback;
         }
         server_side_argv = localcpp_server_argv;

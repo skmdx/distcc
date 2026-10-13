@@ -157,6 +157,20 @@ class PreprocessTest(BrokerTestCase):
         (self.work / 'optional.h').write_text('/* presence is enough */\n')
         self.assertIn(b'present', self.compare(args=['-P']).stdout)
 
+    def test_failed_include_analysis_is_not_cached_as_complete(self):
+        (self.work / 'unsupported.h').write_text(
+            '#define HEADER "value.h"\n#if __has_include(HEADER)\n'
+            '#include HEADER\n#endif\n')
+        (self.work / 'value.h').write_text('#define VALUE 17\n')
+        self.source.write_text('#include "unsupported.h"\nint n = VALUE;\n')
+        for attempt in range(3):
+            with self.subTest(attempt=attempt):
+                (self.work / 'client.log').write_text('')
+                result = self.run_cc('gcc', ['-E', self.source])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b'failed to get includes',
+                              (self.work / 'client.log').read_bytes())
+
     def test_remote_cpp_does_not_wait_for_local_cpp_slot(self):
         lease = self.request(6)
         status, _, descriptors = self.receive(lease)

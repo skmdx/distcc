@@ -967,6 +967,15 @@ static int dcc_run_job(int in_fd,
                 ret = EXIT_PROTOCOL_ERROR;
                 goto out_cleanup;
             }
+        } else if (dcc_argv_search(argv, "-x")) {
+            /* Rewritten Clang input uses an explicit language. Its basename
+             * is observable in the object even without debug information. */
+            if ((ret = dcc_get_new_tmpdir(&temp_dir))) goto out_cleanup;
+            if (asprintf(&temp_i, "%s/%s", temp_dir, dcc_find_basename(orig_input)) < 0) {
+                ret = EXIT_OUT_OF_MEMORY;
+                goto out_cleanup;
+            }
+            if ((ret = dcc_add_cleanup(temp_i))) goto out_cleanup;
         } else if ((ret = dcc_input_tmpnam(orig_input, &temp_i))) goto out_cleanup;
         if ((!job && (ret = dcc_r_token_file(in_fd, "DOTI", temp_i, compr)))
             || (ret = dcc_set_input(argv, temp_i))

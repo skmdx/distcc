@@ -62,14 +62,15 @@
  * to by 'from'.  The caller is responsible for calling free() on
  * '*out_argv'.
  **/
-int dcc_strip_local_args(char **from, char ***out_argv)
+int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname)
 {
     char **to;
     int from_i, to_i;
     int from_len;
+    const char *rewrite_language = input_fname ? dcc_cpp_rewrite_language(from, input_fname) : NULL;
 
     from_len = dcc_argv_len(from);
-    *out_argv = to = malloc((from_len + 1) * sizeof (char *));
+    *out_argv = to = malloc((from_len + 3) * sizeof (char *));
 
     if (!to) {
         rs_log_error("failed to allocate space for arguments");
@@ -78,10 +79,24 @@ int dcc_strip_local_args(char **from, char ***out_argv)
 
     /* skip through argv, copying all arguments but skipping ones that
      * ought to be omitted */
-    for (from_i = to_i = 0; from[from_i]; from_i++) {
+    to_i = 0;
+    to[to_i++] = from[0];
+    if (rewrite_language) {
+        to[to_i++] = (char *)"-x";
+        to[to_i++] = (char *)rewrite_language;
+    }
+    for (from_i = 1; from[from_i]; from_i++) {
         if (str_equal("-Xclang", from[from_i]) && from[from_i + 1]) {
             to[to_i++] = from[from_i++];
             to[to_i++] = from[from_i];
+        }
+        else if (rewrite_language &&
+                 (str_startswith("-D", from[from_i]) ||
+                  str_startswith("-U", from[from_i]) ||
+                  str_equal("-undef", from[from_i]))) {
+            to[to_i++] = from[from_i];
+            if ((!strcmp(from[from_i], "-D") || !strcmp(from[from_i], "-U")) && from[from_i + 1])
+                to[to_i++] = from[++from_i];
         }
         else if (str_equal("-D", from[from_i])
             || str_equal("-I", from[from_i])

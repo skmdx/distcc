@@ -63,11 +63,12 @@ static struct dcc_job *describe(char **argv, const char *cpp, char **files)
 {
     struct dcc_job *job = calloc(1, sizeof(*job));
     struct dcc_input_digest *digests = NULL;
+    char *source, *output;
     unsigned i;
     if (!job) return NULL;
     job->kind = files ? DCC_JOB_PUMP : DCC_JOB_COMPILE;
     job->cwd = getcwd(NULL, 0);
-    if (!job->cwd || dcc_copy_argv(argv, &job->argv, 0)) goto failed;
+    if (!job->cwd || dcc_scan_args(argv, &source, &output, &job->argv, 0)) goto failed;
     job->count = files ? dcc_argv_len(files) : 1;
     if (job->count > DCC_JOB_INPUT_MAX ||
         !(job->inputs = calloc(job->count ? job->count : 1, sizeof(*job->inputs)))) {
@@ -84,7 +85,11 @@ static struct dcc_job *describe(char **argv, const char *cpp, char **files)
             if (dcc_get_original_fname(name, &in->path)) goto failed;
         } else {
             const char *extension = strrchr(cpp, '.');
-            if (asprintf(&in->path, "/input%s", extension ? extension : ".i") < 0) goto failed;
+            /* Explicit-language input may still contain macros. Keep its
+             * source basename for compiler file symbols and diagnostics. */
+            if (dcc_argv_search(argv, "-x")) {
+                if (asprintf(&in->path, "/%s", dcc_find_basename(source)) < 0) goto failed;
+            } else if (asprintf(&in->path, "/input%s", extension ? extension : ".i") < 0) goto failed;
         }
         if (files && str_endswith("/forcing_technique_271828", in->path)) {
             in->kind = DCC_JOB_EMPTY;

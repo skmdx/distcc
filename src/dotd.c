@@ -169,10 +169,10 @@ int dcc_get_dotd_info(char **argv, char **dotd_fname,
 
     char *input_file;
     char *output_file;
-    char **new_args;  /* will throw this away */
+    char **new_args = NULL;  /* will throw this away */
     int has_dash_o = 0;
     char *env_var = 0;
-    int i;
+    int i, ret;
     char *a;
 
     *needs_dotd = 0;
@@ -186,14 +186,14 @@ int dcc_get_dotd_info(char **argv, char **dotd_fname,
     }
 
     for (i = 0; (a = argv[i]); i++) {
-        if (strcmp(a, "-MT") == 0) {
+        if (strncmp(a, "-MT", 3) == 0) {
             *sets_dotd_target = 1;
-            ++i;
+            if (!a[3]) ++i;
             continue;
         }
-        if (strcmp(a, "-MQ") == 0) {
+        if (strncmp(a, "-MQ", 3) == 0) {
             *sets_dotd_target = 1;
-            ++i;
+            if (!a[3]) ++i;
             continue;
         }
         /* Catch-all for all -MD, -MMD, etc, options.
@@ -252,13 +252,18 @@ int dcc_get_dotd_info(char **argv, char **dotd_fname,
 
         char *extension;
         char *tmp_dotd_fname;
-        dcc_scan_args(argv, &input_file, &output_file, &new_args, 0);
+        ret = dcc_scan_args(argv, &input_file, &output_file, &new_args, 0);
+        if (ret) {
+          dcc_free_argv(new_args);
+          return ret;
+        }
         /* if .o is set, just append .d.
          * otherwise, take the basename of the input, and set the suffix to .d */
         if (has_dash_o)
           tmp_dotd_fname = strdup(output_file);
         else
           tmp_dotd_fname = strdup(input_file);
+        dcc_free_argv(new_args);
         if (tmp_dotd_fname == NULL) return EXIT_OUT_OF_MEMORY;
         extension = dcc_find_extension(tmp_dotd_fname);
         /* Whether derived from input or output filename, we peel the extension

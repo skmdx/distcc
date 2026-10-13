@@ -66,6 +66,7 @@ struct client {
     double deadline;
     int memo;
     int pooled;
+    int reused;
     int admission;
     size_t used;
     char hello[12];
@@ -311,7 +312,9 @@ static int connected(int fd)
 {
     int error;
     socklen_t length = sizeof(error);
-    return getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) || error ? -1 : 0;
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length)) return -1;
+    if (error) { errno = error; return -1; }
+    return 0;
 }
 
 static void finish_probe(struct peer *peer, double now, int complete)
@@ -572,6 +575,15 @@ static int dispatch(struct broker *broker, struct client *client, double now)
         }
     }
     if (client->command == JOBS || !available) {
+        if (!available && client->command != JOBS) {
+            for (i = 0; i < broker->count; i++) {
+                struct peer *p = &broker->peers[i];
+                rs_log_warning("unavailable worker %s: address=%u up=%d slots=%d cpus=%d jobs=%d retry=%.3fs",
+                               p->host->hostname, (unsigned)p->address_len, p->host->is_up,
+                               p->host->n_slots, p->metrics.cpus, p->metrics.jobs,
+                               p->retry_at > now ? p->retry_at - now : 0);
+            }
+        }
         reply.status = available ? 0 : EXIT_CONNECT_FAILED;
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
@@ -581,10 +593,11 @@ static int dispatch(struct broker *broker, struct client *client, double now)
                             p->admission_supported && p->pool_supported >= 0;
         client->net = client->command != ACQUIRE ? pool_take(broker, best, now) : -1;
         client->pooled = client->net >= 0;
-        int reused = client->pooled;
+        client->reused = client->pooled;
         if (p->host->tcp_jobs) client->pooled = 1;
         if (client->net < 0) client->net = connect_peer(p, p->host->port);
         if (client->net < 0) {
+            rs_log_warning("cannot connect to %s: %s", p->host->hostname, strerror(errno));
             p->retry_at = now + 5;
             return 1;
         }
@@ -596,7 +609,7 @@ static int dispatch(struct broker *broker, struct client *client, double now)
         broker->cpp_busy += local_cpp;
         client->cpp_reserved = local_cpp;
         client->used = 0;
-        if (reused) {
+        if (client->reused) {
             if (client->admission) client->state = RESERVE_SEND;
             else deliver_connection(broker, client);
         }
@@ -609,6 +622,8 @@ static void connection_event(struct broker *broker, struct client *client,
 {
     struct peer *peer = &broker->peers[client->peer];
     if (timed_out || connected(client->net)) {
+        rs_log_warning("connection to %s failed: %s", peer->host->hostname,
+                       timed_out ? "connection timeout" : strerror(errno));
         peer->retry_at = now + 5;
         release_assignment(broker, client);
         client->state = WAITING;
@@ -963,7 +978,21 @@ int dcc_broker_serve(const char *path)
                 struct request request = packet.header;
                 if (returned < 0 && c->state == ACTIVE && length == sizeof(request) &&
                     request.version == BROKER_VERSION && request.command == FAILED) {
-                    broker->peers[c->peer].retry_at = now + (backoff > 0 ? backoff : 0);
+                    if (c->reused) {
+                        /* An idle socket can die after the pool liveness
+                         * check. Discard the peer's idle pool and try a fresh
+                         * connection before quarantining a healthy worker. */
+                        int j;
+                        for (j = 0; j < MAX_CLIENTS; j++) {
+                            struct idle_connection *entry = &broker->pool[j];
+                            if (entry->fd >= 0 && entry->peer == c->peer) {
+                                close(entry->fd);
+                                entry->fd = -1;
+                            }
+                        }
+                    } else {
+                        broker->peers[c->peer].retry_at = now + (backoff > 0 ? backoff : 0);
+                    }
                     release_client(broker, c);
                     continue;
                 }

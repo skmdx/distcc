@@ -39,7 +39,38 @@
 #include "util.h"
 #include "implicit.h"
 #include "exec.h"
+#include "dotd.h"
 
+/* Expanding macros on the client loses their provenance, changing Clang's
+ * diagnostics (including -Werror) and source locations. Rewrite includes only
+ * and let the remote frontend expand macros in the original language. */
+const char *dcc_cpp_rewrite_language(char **argv, const char *input_fname)
+{
+    const char *name = dcc_find_basename(argv[0]);
+    const char *clang = strstr(name, "clang");
+    const char *ext, *language = NULL;
+    int i;
+    if (!clang || (clang != name && clang[-1] != '-') ||
+        (clang[5] && clang[5] != '-' && strcmp(clang + 5, "++") &&
+         strncmp(clang + 5, "++-", 3)) || dcc_is_preprocessed(input_fname))
+        return NULL;
+    ext = dcc_find_extension_const(input_fname);
+    if (ext) ext = dcc_preproc_exten(ext);
+    if (ext) {
+        if (!strcmp(ext, ".i")) language = !strncmp(clang + 5, "++", 2) ? "c++" : "c";
+        else if (!strcmp(ext, ".ii")) language = "c++";
+        else if (!strcmp(ext, ".mi")) language = "objective-c";
+        else if (!strcmp(ext, ".mii")) language = "objective-c++";
+    }
+    for (i = 1; argv[i]; i++) {
+        if (!strcmp(argv[i], "-Xclang") && argv[i + 1]) { i++; continue; }
+        if (!strcmp(argv[i], "-x") && argv[i + 1]) language = argv[++i];
+        else if (!strncmp(argv[i], "-x", 2) && argv[i][2]) language = argv[i] + 2;
+    }
+    return language && (!strcmp(language, "c") || !strcmp(language, "c++") ||
+                       !strcmp(language, "objective-c") ||
+                       !strcmp(language, "objective-c++")) ? language : NULL;
+}
 
 /**
  * If the input filename is a plain source file rather than a
@@ -58,6 +89,9 @@ int dcc_cpp_maybe(char **argv, char *input_fname, char **cpp_fname,
     int ret;
     char *input_exten;
     const char *output_exten;
+    const char *output = NULL;
+    char *deps = NULL, *target = NULL;
+    int needs_deps = 0, sets_target = 0, i;
 
     *cpp_pid = 0;
 
@@ -79,23 +113,38 @@ int dcc_cpp_maybe(char **argv, char *input_fname, char **cpp_fname,
     if ((ret = dcc_make_tmpnam("distcc", output_exten, cpp_fname)))
         return ret;
 
-    /* We strip the -o option and allow cpp to write to stdout, which is
-     * caught in a file.  Sun cc doesn't understand -E -o, and gcc screws up
-     * -MD -E -o.
-     *
-     * There is still a problem here with -MD -E -o, gcc writes dependencies
-     * to a file determined by the source filename.  We could fix it by
-     * generating a -MF option, but that would break compilation with older
-     * versions of gcc.  This is only a problem for people who have the source
-     * and objects in different directories, and who don't specify -MF.  They
-     * can fix it by specifying -MF.  */
+    /* CPP writes to stdout. Preserve the dependency filename and target that
+     * the original -o would otherwise select. argv has a normalized -o. */
+    for (i = 1; argv[i]; i++) {
+        if (!strcmp(argv[i], "-o") && argv[i + 1]) output = argv[++i];
+        else if (!strcmp(argv[i], "-MD") || !strcmp(argv[i], "-MMD")) needs_deps = 1;
+    }
+    if (needs_deps && (ret = dcc_get_dotd_info(argv, &deps, &needs_deps,
+                                             &sets_target, &target)))
+        return ret;
 
     if ((ret = dcc_strip_dasho(argv, &cpp_argv))
         || (ret = dcc_set_action_opt(cpp_argv, "-E")))
-        return ret;
+        { free(deps); return ret; }
 
-    /* FIXME: cpp_argv is leaked */
-
-    return dcc_spawn_child(cpp_argv, cpp_pid,
-                           "/dev/null", *cpp_fname, NULL);
+    {
+        char **expanded = realloc(cpp_argv, (dcc_argv_len(cpp_argv) + 6) * sizeof(*cpp_argv));
+        if (!expanded) { free(cpp_argv); free(deps); return EXIT_OUT_OF_MEMORY; }
+        cpp_argv = expanded;
+    }
+    if (dcc_cpp_rewrite_language(argv, input_fname))
+        dcc_argv_append(cpp_argv, (char *)"-frewrite-includes");
+    if (needs_deps) {
+        dcc_argv_append(cpp_argv, (char *)"-MF");
+        dcc_argv_append(cpp_argv, deps);
+        if (!sets_target && !target && output) {
+            dcc_argv_append(cpp_argv, (char *)"-MQ");
+            dcc_argv_append(cpp_argv, (char *)output);
+        }
+    }
+    ret = dcc_spawn_child(cpp_argv, cpp_pid,
+                         "/dev/null", *cpp_fname, NULL);
+    free(cpp_argv);
+    free(deps);
+    return ret;
 }

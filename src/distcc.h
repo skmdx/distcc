@@ -323,10 +323,11 @@ void dcc_cleanup_tempfiles_from_signal_handler(void);
 int dcc_add_cleanup(const char *filename) WARN_UNUSED;
 
 /* strip.c */
-int dcc_strip_local_args(char **from, char ***out_argv);
+int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname);
 int dcc_strip_dasho(char **from, char ***out_argv);
 
 /* cpp.c */
+const char *dcc_cpp_rewrite_language(char **argv, const char *input_fname);
 int dcc_cpp_maybe(char **argv, char *input_fname, char **cpp_fname,
           pid_t *cpp_pid);
 

@@ -37,6 +37,37 @@ class TcpJobsTest(BrokerTestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(self.job, range(24)))
 
+    def test_failed_reused_connection_does_not_quarantine_worker(self):
+        self.start_tcp()
+        self.job('warm-pool')
+        lease = self.request(6)
+        status, _, descriptors = self.receive(lease)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(descriptors), 1)
+        # A peer may close after pool_take's liveness check. The client then
+        # reports a failed RPC; only that pooled connection is known bad.
+        with socket.socket(fileno=descriptors[0]) as net:
+            net.shutdown(socket.SHUT_RDWR)
+        lease.sendall(struct.pack('=II', 2, 11))
+        self.assertEqual(lease.recv(1), b'')
+        lease.close()
+        self.job('fresh-connection-after-failure')
+
+    def test_failed_fresh_connection_still_quarantines_worker(self):
+        self.start_tcp()
+        lease = self.request(6)
+        status, _, descriptors = self.receive(lease)
+        self.assertEqual(status, 0)
+        for fd in descriptors:
+            os.close(fd)
+        lease.sendall(struct.pack('=II', 2, 11))
+        self.assertEqual(lease.recv(1), b'')
+        lease.close()
+        retry = self.request(6)
+        status, _, descriptors = self.receive(retry)
+        self.assertEqual(status, 103)
+        self.assertEqual(descriptors, [])
+
     def test_preparing_and_ready_are_distinct(self):
         reservations = []
         for _ in range(4):

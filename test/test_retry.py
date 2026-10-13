@@ -3,6 +3,7 @@
 import contextlib
 import os
 import re
+import shutil
 import socket
 import socketserver
 import subprocess
@@ -68,6 +69,72 @@ class RejectionConnection(socketserver.BaseRequestHandler):
 
 
 class RetryTest(BrokerTestCase):
+    def test_clang_cpp_driver_preserves_language(self):
+        clang = shutil.which('clang++')
+        if not clang:
+            self.skipTest('Clang++ is required')
+        self.start_broker(self.host(0, ',tcp'))
+        for suffix, cpp in (('.c', 1), ('.m', 0)):
+            source = self.work / ('language' + suffix)
+            source.write_text(f'#if defined(__cplusplus) != {cpp}\n#error wrong language\n#endif\n'
+                              'int value() { return 17; }\n')
+            obj = self.work / 'language.o'
+            args = [clang, '-c', str(source), '-o', str(obj)]
+            subprocess.run(args, check=True, capture_output=True)
+            expected = obj.read_bytes()
+            result = subprocess.run([str(self.build / 'distcc'), *args],
+                                    env=self.env, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(obj.read_bytes(), expected)
+
+    def test_clang_local_cpp_preserves_macros_and_diagnostics(self):
+        clang = shutil.which('clang')
+        if not clang:
+            self.skipTest('Clang is required')
+        (self.work / 'loop.h').write_text('#define LOOP for (int i=0; i < 1; i++)\n')
+        self.source.write_text('#include "loop.h"\n#include <string.h>\n'
+                               '#if VALUE != 17 || defined(REMOVED)\n#error bad macros\n#endif\n'
+                               'int main(void) { LOOP { return VALUE - 17 ||\n'
+                               'strcmp(__FILE__, EXPECTED_FILE) ||\n'
+                               'strcmp(__BASE_FILE__, EXPECTED_FILE) || __INCLUDE_LEVEL__; } return 1; }\n')
+        for codec in ('lz4', 'tcp'):
+            self.start_broker(self.host(0, ',' + codec), name='clang-cpp-' + codec)
+            obj, dep = self.work / 'macro.o', self.work / 'macro.d'
+            args = [clang, '-Werror=unreachable-code-loop-increment',
+                    '-DVALUE=17', '-D', 'REMOVED', '-U', 'REMOVED',
+                    '-DEXPECTED_FILE="' + str(self.source) + '"',
+                    '-MMD', '-MF', str(dep), '-c', str(self.source), '-o', str(obj)]
+            local = subprocess.run(args, capture_output=True, timeout=5)
+            self.assertEqual(local.returncode, 0, local.stderr)
+            expected_deps = dep.read_text()
+            result = subprocess.run([str(self.build / 'distcc'), *args],
+                                    env=dict(self.env, DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_VERBOSE='1'),
+                                    capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b'exec on 127.0.0.1', result.stderr)
+            self.assertEqual(dep.read_text(), expected_deps)
+            exe = self.work / 'macro'
+            subprocess.run([clang, str(obj), '-o', str(exe)], check=True, capture_output=True)
+            subprocess.run([str(exe)], check=True, timeout=5)
+
+    def test_local_cpp_preserves_dependency_outputs(self):
+        self.start_broker(self.host(0, ',tcp'))
+        for compiler in ('gcc', shutil.which('clang')):
+            if not compiler:
+                continue
+            for extra in ([], ['-MQcustom target'], ['-MT', 'custom'], ['-MF', 'explicit.d']):
+                with self.subTest(compiler=compiler, extra=extra):
+                    obj = self.work / 'output name.o'
+                    dep = self.work / ('explicit.d' if '-MF' in extra else 'output name.d')
+                    args = [compiler, '-MMD', *extra, '-c', str(self.source), '-o', str(obj)]
+                    subprocess.run(args, cwd=self.work, check=True, capture_output=True)
+                    expected = dep.read_text()
+                    dep.unlink()
+                    result = subprocess.run([str(self.build / 'distcc'), *args],
+                                            cwd=self.work, env=self.env, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(dep.read_text(), expected)
+
     def test_preprocessing_failure_is_not_success_or_remote_work(self):
         self.source.write_text('#include "missing-distcc-test-header.h"\n')
         for codec in ('lz4', 'tcp'):

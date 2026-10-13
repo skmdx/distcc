@@ -55,7 +55,6 @@ DEBUG_WARNING = basics.DEBUG_WARNING
 # Exceptions.
 SignalSIGTERM = basics.SignalSIGTERM
 NotCoveredError = basics.NotCoveredError
-NotCoveredTimeOutError = basics.NotCoveredTimeOutError
 
 
 # USAGE
@@ -412,10 +411,10 @@ def DistccIncludeHandlerGenerator(include_analyzer):
         # information back to the distcc client, so that it can fall
         # back to preprocessing on the client.
         distcc_pump_c_extensions.XArgv(self.wfile.fileno(), [])
-        if isinstance(inst, NotCoveredTimeOutError):
-          Debug(DEBUG_TRACE,
-                "Clearing caches because of include server timeout.")
-          include_analyzer.ClearStatCaches()
+        # FindNode publishes nodes before visiting their children to handle
+        # cycles. Any aborted traversal leaves incomplete nodes, not only a
+        # timeout. Never reuse those nodes for the next translation unit.
+        include_analyzer.ClearStatCaches()
 
       except SignalSIGTERM:
         # Normally, we will get this exception when the include server is no

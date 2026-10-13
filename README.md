@@ -20,10 +20,12 @@ the same libraries or header files installed. Machines can be running
 different operating systems, as long as they have compatible binary
 formats or cross-compilers.
 
-By default, distcc sends the complete preprocessed source code across
+By default, distcc sends source code with its headers expanded across
 the network for each job, so all it requires of the volunteer machines
 is that they be running the distccd daemon, and that they have an
 appropriate compiler installed.
+Clang retains macros until remote compilation to preserve diagnostics;
+see README.pump for preprocessing behavior and toolchain requirements.
 
 The distcc "pump" functionality, added in distcc 3.0, improves on
 distcc by distributing not only compilation but also preprocessing to
@@ -127,8 +129,10 @@ or available headroom is too small. After a PSI stop, admission resumes below
 preprocessing slots. Existing work finishes normally; these estimates are not
 hard per-job limits or a common scheduler for unrelated build processes.
 
-Failed remote transfers mark the broker's worker unavailable for
-`DISTCC_BACKOFF_PERIOD` seconds (default 60, set on the broker). A compile tries
+Failed transfers on reused connections discard that worker's idle pool so the
+next attempt can open a fresh connection. Failure on a fresh connection marks
+the worker unavailable for `DISTCC_BACKOFF_PERIOD` seconds (default 60, set on
+the broker). A compile tries
 at most three remote jobs even when backoff is disabled, then follows
 `DISTCC_FALLBACK`. Server protocol reads and writes use `DISTCC_IO_TIMEOUT`
 (default 300 seconds), so a silent partial request cannot retain a worker forever.

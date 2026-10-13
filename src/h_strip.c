@@ -53,7 +53,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if ((ret = dcc_strip_local_args(argv + 1, &new_args))) {
+    if ((ret = dcc_strip_local_args(argv + 1, &new_args, NULL))) {
         return ret;
     }
 
