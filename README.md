@@ -149,7 +149,11 @@ this listener permits all local users to submit prepared jobs (socket mode
 it only when the worker address matches a local interface, and otherwise uses
 TCP. A missing local listener also uses TCP.
 
-The client passes its read-only input descriptor over this Unix stream; the
+The client copies input once in the kernel into an anonymous sealed memfd and
+passes a read-only descriptor over this Unix stream. The snapshot can be
+opened by a compiler running under a different UID without changing the named
+input's permissions. This removes input compression, socket payload transfer
+and server-side materialization, rather than eliminating every copy. The
 existing server worker receives it with the metadata in one IPC message and
 inherits it only for that compilation. Input lifetime, cancellation and the
 server's common admission limit are unchanged. Results retain the existing

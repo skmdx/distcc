@@ -19,6 +19,30 @@
 #include "tcp_job.h"
 
 struct input_stream { int fd; unsigned index; uint64_t offset, plain; };
+static int local_snapshot(int source, uint64_t size)
+{
+    if (size > DCC_TCP_BYTES) return -1;
+    int fd = dcc_job_memfd("distcc-local-input"), readonly = -1;
+    off_t offset = 0;
+    char path[64];
+    if (fd < 0) return -1;
+    /* Reopening /proc/self/fd in a different UID still checks inode mode.
+     * An anonymous, sealed snapshot grants access only through the passed
+     * descriptor without exposing or chmod'ing the client's named file. */
+    while ((uint64_t)offset < size) {
+        size_t amount = size - offset > DCC_TCP_CHUNK ? DCC_TCP_CHUNK : size - offset;
+        ssize_t n = sendfile(fd, source, &offset, amount);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) goto done;
+    }
+    if (fchmod(fd, 0444) || fcntl(fd, F_ADD_SEALS,
+            F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)) goto done;
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    readonly = open(path, O_RDONLY | O_CLOEXEC);
+done:
+    close(fd);
+    return readonly;
+}
 static unsigned char *next_chunk(struct input_stream *stream, const struct dcc_job_input *in,
                                  unsigned char *buffer, size_t *size, off_t *file_offset, size_t *file_left)
 {
@@ -79,10 +103,13 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         !getsockname(host->broker_fd, (struct sockaddr *)&address, &address_size) &&
         address.ss_family == AF_UNIX;
     int send_input_fd = local_input;
+    int shared_input = -1;
     time_t active = time(NULL);
     dcc_job_result_init(result);
     if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested || !buffer ||
         getrandom(&id, sizeof(id), 0) != sizeof(id) || !id) goto done;
+    if (local_input && (shared_input = local_snapshot(job->inputs[0].fd, job->inputs[0].plain_size)) < 0)
+        goto done;
     size_t metadata_size = 0;
     unsigned char *manifest = dcc_job_encode_buffer(job, &metadata_size);
     if (!manifest) goto done;
@@ -186,7 +213,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     .msg_control = control.data, .msg_controllen = sizeof(control)};
                 struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
                 c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
-                memcpy(CMSG_DATA(c), &job->inputs[0].fd, sizeof(int));
+                memcpy(CMSG_DATA(c), &shared_input, sizeof(int));
                 n = sendmsg(host->broker_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
                 if (n > 0) send_input_fd = 0; /* Rights accompany the first byte, even on a short write. */
             } else if (sent < length)
@@ -214,6 +241,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         }
     }
 done:
+    if (shared_input >= 0) close(shared_input);
     if (!ret) {
         unsigned cached = 0, transferred = 0;
         for (unsigned i = 0; i < job->count; ++i) {

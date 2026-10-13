@@ -13,11 +13,14 @@ import socket
 import struct
 import subprocess
 import threading
+import tempfile
+import pwd
 import time
 import unittest
 import xxhash
 
 from test_broker import BrokerTestCase
+from test_adaptive import free_port
 
 
 class TcpJobsTest(BrokerTestCase):
@@ -550,6 +553,61 @@ with open(args[args.index('-o') + 1], 'ab') as output:
             self.assertEqual(len(messages), 2, '\n'.join(messages))
         finally:
             self.restart_server(self.build / 'distccd')
+
+
+@unittest.skipUnless(os.geteuid() == 0, 'cross-UID integration requires root')
+class LocalCrossUidTest(unittest.TestCase):
+    def test_private_input_can_be_compiled_by_another_uid(self):
+        build = Path.cwd()
+        account = pwd.getpwnam('nobody')
+        with tempfile.TemporaryDirectory(prefix='distcc-cross-uid-') as directory:
+            root = Path(directory)
+            os.chown(root, account.pw_uid, account.pw_gid)
+            client = root / 'client'
+            client.mkdir(mode=0o700)
+            source = client / 'private.c'
+            source.write_text('const char *name = __FILE__; int private_input;\n')
+            source.chmod(0o600)
+            port, stats = free_port(), free_port()
+            env = {k:v for k,v in os.environ.items() if not k.startswith('DISTCC')}
+            env.update(DISTCC_JOB_MEMORY='64', DISTCC_LOCAL_SOCKET=str(root/'jobs'),
+                       DISTCC_HOSTS=f'127.0.0.1:{port}/1,tcp,stats={stats}',
+                       DISTCC_DIR=str(client), DISTCC_BROKER=str(client/'broker.sock'),
+                       DISTCC_FALLBACK='0', DISTCC_SKIP_LOCAL_RETRY='1', TMPDIR=str(client))
+            server_env = dict(env, TMPDIR=str(root), DISTCCD_PATH=os.path.dirname(shutil.which('gcc'))+os.pathsep+os.defpath)
+            processes = []
+            with (root/'server.log').open('w+') as log:
+                try:
+                    processes.append(subprocess.Popen([str(build/'distccd'), '--daemon', '--no-detach',
+                        '--enable-tcp-insecure', '--listen', '127.0.0.1', '--allow', '127.0.0.1',
+                        '--port', str(port), '--stats', '--stats-port', str(stats), '--jobs', '1',
+                        '--log-stderr'], env=server_env, user=account.pw_uid, group=account.pw_gid,
+                        extra_groups=[], start_new_session=True, stdout=log, stderr=log))
+                    deadline = time.monotonic()+5
+                    while True:
+                        try:
+                            BrokerTestCase.get_stats(stats)
+                            break
+                        except OSError:
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(.02)
+                    processes.append(subprocess.Popen([str(build/'distccd'), '--broker', env['DISTCC_BROKER']],
+                        env=env, start_new_session=True, stdout=log, stderr=log))
+                    while not Path(env['DISTCC_BROKER']).exists():
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.01)
+                    result = subprocess.run([str(build/'distcc'), 'gcc', '-c', str(source), '-o', str(client/'remote.o')],
+                        env=env, capture_output=True, timeout=10)
+                    log.flush();log.seek(0)
+                    self.assertEqual(result.returncode, 0, result.stderr.decode()+log.read())
+                    subprocess.run(['gcc', '-c', str(source), '-o', str(client/'native.o')], check=True, capture_output=True)
+                    self.assertEqual((client/'remote.o').read_bytes(), (client/'native.o').read_bytes())
+                    self.assertIn('dcc_local_input_jobs 1\n', BrokerTestCase.get_stats(stats))
+                    self.assertEqual(source.stat().st_mode & 0o777, 0o600)
+                finally:
+                    for process in reversed(processes):
+                        if process.poll() is None:os.killpg(process.pid, signal.SIGTERM)
+                        process.wait(timeout=5)
 
 
 if __name__ == '__main__':
