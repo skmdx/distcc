@@ -189,8 +189,7 @@ class BrokerTest(BrokerTestCase):
     def test_tcp_snapshot_does_not_recount_local_leases(self):
         peer = self.peer(stats_response(running=0, busy=0, queued=0,
                                        preparing=0, returning=0, capacity=4))
-        hosts = (self.host(0, f',tcp,stats={peer.port}') + ' ' +
-                 self.host(1, ',tcp,speed=0.7'))
+        hosts = self.host(0, f',tcp,stats={peer.port}')
         self.start_broker(hosts)
         for _ in range(4):
             _, net = self.acquire_reserved(10)
@@ -202,11 +201,25 @@ class BrokerTest(BrokerTestCase):
         _, net = self.acquire_reserved(10)
         self.assertEqual(net.getpeername()[1], self.ports[0])
 
+    def test_tcp_fills_idle_worker_before_queueing_on_fast_worker(self):
+        peers = [self.peer(stats_response(running=0, busy=0, queued=0,
+                                         preparing=0, returning=0, capacity=4))
+                 for _ in range(2)]
+        hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={4 if i == 0 else 1}')
+                         for i, p in enumerate(peers))
+        self.start_broker(hosts)
+        for _ in range(4):
+            _, net = self.acquire_reserved(10)
+            self.assertEqual(net.getpeername()[1], self.ports[0])
+        # A queued fast compile must not prevent an idle slow core from
+        # contributing to a sustained build. Keep the fast pipeline bounded.
+        _, net = self.acquire_reserved(10)
+        self.assertEqual(net.getpeername()[1], self.ports[1])
+
     def test_tcp_returning_leases_do_not_fill_cpu_pipeline(self):
         peer = self.peer(stats_response(running=0, busy=0, queued=0,
                                        preparing=0, returning=0, capacity=4))
-        hosts = (self.host(0, f',tcp,stats={peer.port},speed=100') + ' ' +
-                 self.host(1, ',tcp'))
+        hosts = self.host(0, f',tcp,stats={peer.port},speed=100')
         self.start_broker(hosts)
         for _ in range(8):
             _, net = self.acquire_reserved(10)
@@ -221,7 +234,7 @@ class BrokerTest(BrokerTestCase):
         peer = self.peer(stats_response(running=0, busy=0, queued=0,
                                        preparing=0, returning=0, capacity=4))
         hosts = (self.host(0, f',tcp,stats={peer.port}') + ' ' +
-                 self.host(1, ',tcp,speed=0.5'))
+                 self.host(1, ',tcp,speed=0.5', slots=1))
         self.start_broker(hosts)
         held = [self.acquire_reserved(10) for _ in range(4)]
         peer.response = stats_response(running=0, busy=4, queued=4,

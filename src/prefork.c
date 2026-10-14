@@ -583,10 +583,13 @@ static int dcc_preforked_child(int listen_fd)
             run.root[request_size - offsetof(struct dcc_tcp_run, root) - 1] == 0) {
             if (dcc_new_pgrp()) { close(acc_fd); if (input >= 0) close(input); return EXIT_IO_ERROR; }
             dcc_worker_group = 1;
-            int retiring = ireq + 1 >= child_requests && time(NULL) - start >= child_lifetime;
+            now = time(NULL);
+            int retiring = ireq + 1 >= child_requests && now - start >= child_lifetime;
             ret = dcc_tcp_worker(worker_channel, &run, acc_fd, input, retiring);
             if (ret || retiring) return ret;
-            now = time(NULL);
+            /* The loop must use the same lifetime snapshot as the result's
+             * retiring flag. Crossing the deadline during this job must not
+             * exit after advertising an idle worker to the parent. */
             continue;
         }
         if (request_size != sizeof(message) || input >= 0) {

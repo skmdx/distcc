@@ -96,6 +96,10 @@ first consume the snapshot's returning count, so output-only jobs do not free
 CPU capacity twice. No per-stage IPC or extra network round trip is required.
 Input preparation can overlap execution within a pipeline of up to four jobs
 (also capped by effective parallelism); excess preparation increases the score.
+Hosts with estimated free execution capacity are preferred to hosts whose
+assignments already fill that capacity. Within either group, load and speed
+determine the score. This keeps idle workers contributing when a faster host's
+memory estimate allows a deeper queue.
 Execution, ready jobs, preparation and new assignments share this estimated
 global limit of parallelism plus pipeline depth. Returning jobs have a separate
 bounded allowance for socket leases. A zero memory capacity stops new uploads;

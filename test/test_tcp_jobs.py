@@ -111,6 +111,51 @@ class TcpJobsTest(BrokerTestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(self.job, range(24)))
 
+    def test_worker_crossing_retirement_deadline_stays_available(self):
+        # Advance daemon wall time during compilation, after its retirement
+        # decision. Avoid a minute-long, timing-dependent deadline test.
+        clock = self.work / 'clock.c'
+        library = self.work / 'clock.so'
+        marker = self.work / 'advance'
+        trigger = self.work / 'trigger'
+        worker = self.work / 'worker'
+        clock.write_text('''#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+time_t time(time_t *out) {
+    time_t (*real_time)(time_t *) = dlsym(RTLD_NEXT, "time");
+    time_t value = real_time(NULL);
+    const char *marker = getenv("TEST_CLOCK_MARKER");
+    if (marker && !access(marker, F_OK)) value += 120;
+    if (out) *out = value;
+    return value;
+}
+''')
+        subprocess.run([self.cc, '-shared', '-fPIC', str(clock), '-ldl', '-o', str(library)],
+                       check=True, capture_output=True)
+        wrapper = self.root / 'bin/gcc'
+        original = wrapper.read_text()
+        self.addCleanup(wrapper.write_text, original)
+        wrapper.write_text(f'#!/bin/sh\necho "$PPID" > "{worker}"\n'
+                           f'if test -e "{trigger}"; then touch "{marker}"; fi\n'
+                           f'exec "{self.cc}" "$@"\n')
+        self.restart_server(self.build / 'distccd', LD_PRELOAD=str(library),
+                            TEST_CLOCK_MARKER=str(marker))
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.start_tcp()
+        for i in range(50):
+            self.job(f'warm-retirement-{i}')
+        trigger.touch()
+        self.job('cross-retirement')
+        pid = int(worker.read_text())
+        time.sleep(.2)
+        self.assertTrue(Path(f'/proc/{pid}').exists(),
+                        'worker exited after reporting itself reusable')
+        self.job('announced-retirement')
+        self.job('replacement-worker')
+
     def test_failed_reused_connection_does_not_quarantine_worker(self):
         self.start_tcp()
         self.job('warm-pool')
