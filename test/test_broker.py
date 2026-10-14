@@ -97,6 +97,27 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerTest(BrokerTestCase):
+    def test_local_cpp_lease_wakes_waiter_without_reserving_worker(self):
+        self.start_broker(self.host(0, ',tcp') + ' --localslots_cpp=1')
+        first = self.request(12)
+        self.assertEqual(self.receive(first), (0, 1, []))
+        waiter = self.request(12)
+        waiter.settimeout(.05)
+        with self.assertRaises(socket.timeout):
+            waiter.recv(1032)
+        # CPP admission does not reserve a remote worker.
+        remote = self.request(10)
+        status, _, descriptors = self.receive(remote)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(descriptors), 1)
+        for fd in descriptors:
+            os.close(fd)
+        first.close()
+        waiter.settimeout(.5)
+        self.assertEqual(self.receive(waiter), (0, 1, []))
+        waiter.close()
+        self.assertEqual(self.receive(self.request(12)), (0, 1, []))
+
     def acquire_reserved(self, command=6):
         lease = self.request(command)
         status, capabilities, fds = self.receive(lease)

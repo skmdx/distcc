@@ -2,6 +2,7 @@
 struct dcc_hostdef;
 int dcc_broker_serve(const char *path);
 int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready);
+int dcc_broker_local_cpp(int *lease, int *occupied);
 void dcc_broker_failed(const struct dcc_hostdef *host);
 void dcc_broker_return(const struct dcc_hostdef *host, int fd);
 #define DCC_BROKER_POOLED (1 << 30)

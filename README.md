@@ -94,6 +94,9 @@ For a distributed Ninja build, bound total jobs with `-j`. A local load limit
 even while other workers are idle. Benchmark with the same explicit job count
 and without that local load limit before tuning memory admission or transport.
 Keep worker memory limits and the local preprocessing slot limit enabled.
+The total job count also includes preprocessing and transfer waits: a CPU-sized
+`-j` limit can leave remote workers idle. Compare a larger bounded job count
+while holding preprocessing slots and worker memory limits constant.
 
 With `,tcp` and live pipeline statistics, the broker projects the global server
 snapshot instead of counting all local socket leases as CPU work. It adds
@@ -123,7 +126,10 @@ uses configured slots, speed and local leases.
 With the Linux broker and a supporting server, each legacy pooled connection reserves
 a server worker before transferring a job. Ordinary broker clients finish
 local preprocessing before reserving that worker and reuse the preprocessed
-input on retries. A full server
+input on retries. The broker grants local preprocessing leases up to its
+`--localslots_cpp` limit and wakes waiters when a lease closes, without polling
+slot files. Clients still check their own memory budget before starting
+preprocessing; the broker may belong to a separate, smaller cgroup. A full server
 refuses immediately so the broker can try another host, even when several
 brokers saw the same idle statistics. Refused connections remain reusable;
 retries to a full host are limited to once per 50ms per broker. Idle pooled
@@ -143,7 +149,7 @@ hard per-job limits or a common scheduler for unrelated build processes.
 On Linux, `DISTCC_MEMORY_LEARNING=1` on the daemon uses compiler peak RSS
 reported by `wait4` for prepared jobs. `DISTCC_JOB_MEMORY` is the cold-start
 estimate. After eight successful observations, the estimate becomes twice the
-90th percentile of the last 64 successful RSS observations plus 64 MiB, with a
+lower 90th-percentile rank of the last 64 successful RSS observations plus 64 MiB, with a
 256 MiB minimum. Spare capacity is the greater of a quarter-job margin and the
 largest observed RSS, including failed compiles. This high-water reserve lasts
 until daemon restart; an unusually large job does not inflate the estimate for

@@ -378,8 +378,11 @@ int main(void) {
     for (int i=0; i<8; ++i) dcc_resource_observe(64*M, 1);
     assert(dcc_resource_job_bytes() == 256*M);
     dcc_resource_observe(1024*M, 1);
+    assert(dcc_resource_job_bytes() == 256*M);
     assert(dcc_resource_spare_bytes() == 1024*M);
-    for (int i=0; i<8; ++i) dcc_resource_observe(64*M, 1);
+    dcc_resource_observe(64*M, 1);
+    assert(dcc_resource_job_bytes() == 256*M);
+    for (int i=0; i<7; ++i) dcc_resource_observe(64*M, 1);
     assert(dcc_resource_job_bytes() == 256*M);
     assert(dcc_resource_spare_bytes() == 1024*M);
     assert(dcc_resource_samples() == 17);

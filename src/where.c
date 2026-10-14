@@ -239,8 +239,23 @@ int dcc_lock_local(int *cpu_lock_fd)
 int dcc_lock_local_cpp(int *cpu_lock_fd)
 {
     int ret;
-    struct dcc_hostdef *chosen;
-    ret = dcc_lock_one(dcc_hostdef_local_cpp, &chosen, cpu_lock_fd);
+    struct dcc_hostdef *chosen = dcc_hostdef_local_cpp;
+    const char *broker = getenv("DISTCC_BROKER");
+    /* A socket lease wakes on release instead of polling all local locks.
+     * It is closed by the same unlock path, including cancellation. */
+    if (broker && *broker) {
+        int occupied;
+        for (;;) {
+            ret = dcc_broker_local_cpp(cpu_lock_fd, &occupied);
+            /* The broker can live in a different cgroup. Keep admission
+             * against this client's budget, not the small broker service. */
+            if (ret || occupied <= dcc_resource_slots(chosen->n_slots)) break;
+            dcc_unlock(*cpu_lock_fd);
+            *cpu_lock_fd = -1;
+            dcc_lock_pause();
+        }
+    } else
+        ret = dcc_lock_one(dcc_hostdef_local_cpp, &chosen, cpu_lock_fd);
     if (ret == 0) {
         dcc_note_state(DCC_PHASE_CPP, NULL, chosen->hostname, DCC_LOCAL);
     }

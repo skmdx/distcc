@@ -152,7 +152,10 @@ void dcc_resource_observe(unsigned long long peak_bytes, int success)
     unsigned long long sorted[64];
     memcpy(sorted, observations, observation_count * sizeof(*sorted));
     qsort(sorted, observation_count, sizeof(*sorted), order_bytes);
-    unsigned long long p90 = sorted[observation_count * 9 / 10];
+    /* Use the lower quantile rank. With ten observations, index nine is
+     * the maximum, not the 90th percentile; charging an isolated peak both
+     * here and as spare can starve a worker of the samples needed to recover. */
+    unsigned long long p90 = sorted[(observation_count - 1) * 9 / 10];
     learned_job = p90 <= (ULLONG_MAX - 64ULL * 1024 * 1024) / 2 ?
         p90 * 2 + 64ULL * 1024 * 1024 : ULLONG_MAX;
     if (learned_job < 256ULL * 1024 * 1024) learned_job = 256ULL * 1024 * 1024;

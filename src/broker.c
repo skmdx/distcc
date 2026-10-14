@@ -38,7 +38,7 @@
 #define MAX_CLIENTS 256
 enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3, MEMO_GET = 4, MEMO_PUT = 5,
        ACQUIRE_POOL = 6, RETURN = 7, ACQUIRE_LINK = 8, ACQUIRE_CPP = 9,
-       ACQUIRE_READY = 10, FAILED = 11 };
+       ACQUIRE_READY = 10, FAILED = 11, LOCAL_CPP = 12 };
 #define MAX_MEMOS 32
 struct request { uint32_t version, command; };
 struct reply { int32_t status, slots; char host[1024]; };
@@ -201,7 +201,7 @@ static int broker_request(uint32_t command, struct reply *reply, int *net)
         reply->status || !memchr(reply->host, '\0', sizeof(reply->host)) ||
         ((command == ACQUIRE || command == ACQUIRE_POOL || command == ACQUIRE_CPP ||
           command == ACQUIRE_READY) && *net < 0) ||
-        (command == JOBS && *net >= 0))
+        ((command == JOBS || command == LOCAL_CPP) && *net >= 0))
         goto failed;
     return fd;
 failed:
@@ -213,6 +213,15 @@ failed:
     rs_log_error("local broker request failed (command=%u, bytes=%zd, status=%d, flags=%d)",
                  command, n, n == sizeof(*reply) ? reply->status : -1, msg.msg_flags);
     return -1;
+}
+
+int dcc_broker_local_cpp(int *lease, int *occupied)
+{
+    struct reply reply;
+    int net;
+    *lease = broker_request(LOCAL_CPP, &reply, &net);
+    if (*lease >= 0) *occupied = reply.slots;
+    return *lease < 0 ? EXIT_CONNECT_FAILED : 0;
 }
 
 int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready)
@@ -519,6 +528,19 @@ static void deliver_connection(struct broker *broker, struct client *client)
 static int dispatch(struct broker *broker, struct client *client, double now)
 {
     struct reply reply = {0};
+    if (client->command == LOCAL_CPP) {
+        if (broker->cpp_busy < broker->cpp_limit) {
+            reply.slots = broker->cpp_busy + 1;
+            if (send_reply(client->fd, &reply, -1)) {
+                release_client(broker, client);
+            } else {
+                broker->cpp_busy++;
+                client->cpp_reserved = 1;
+                client->state = ACTIVE;
+            }
+        }
+        return 0;
+    }
     int i, slots, best = -1, available = 0;
     double best_score = 0, best_fill = 0;
     int link = client->command == ACQUIRE_LINK;
@@ -967,7 +989,7 @@ int dcc_broker_serve(const char *path)
                 hello_event(broker, c, 1);
             if ((c->state == RESERVE_SEND || c->state == RESERVE_READ) && now >= c->deadline)
                 reserve_event(broker, c, now, 1);
-            if (c->state == WAITING && (!probes || now >= broker->first_probe_until) &&
+            if (c->state == WAITING && (c->command == LOCAL_CPP || !probes || now >= broker->first_probe_until) &&
                 dispatch(broker, c, now))
                 wake_at = now;
             if (c->fd < 0)
@@ -1006,7 +1028,7 @@ int dcc_broker_serve(const char *path)
                 int returned;
                 ssize_t length = dcc_recv_fd(c->fd, &packet, sizeof(packet), &returned);
                 struct request request = packet.header;
-                if (returned < 0 && c->state == ACTIVE && length == sizeof(request) &&
+                if (returned < 0 && c->state == ACTIVE && c->peer >= 0 && length == sizeof(request) &&
                     request.version == BROKER_VERSION && request.command == FAILED) {
                     if (c->reused) {
                         /* An idle socket can die after the pool liveness
@@ -1057,7 +1079,7 @@ int dcc_broker_serve(const char *path)
                     request.version != BROKER_VERSION ||
                     (request.command != ACQUIRE && request.command != ACQUIRE_POOL &&
                      request.command != ACQUIRE_LINK && request.command != ACQUIRE_CPP &&
-                     request.command != ACQUIRE_READY &&
+                     request.command != ACQUIRE_READY && request.command != LOCAL_CPP &&
                      request.command != JOBS)) {
                     release_client(broker, c);
                     continue;
@@ -1103,6 +1125,12 @@ done:
 }
 
 #else
+int dcc_broker_local_cpp(int *lease, int *occupied)
+{
+    (void)occupied;
+    *lease = -1;
+    return EXIT_CONNECT_FAILED;
+}
 void dcc_broker_failed(const struct dcc_hostdef *host) { (void)host; }
 void dcc_broker_return(const struct dcc_hostdef *host, int fd)
 {
