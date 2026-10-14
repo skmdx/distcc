@@ -27,7 +27,8 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def stats_response(cpus=4, jobs=4, load: float | str = 0, cores=None, core_scale=1, smt_gain=.25, **metrics):
+def stats_response(cpus=4, jobs=4, load: float | str = 0, cores=None,
+                   core_scale: float | str = 1, smt_gain: float | str = .25, **metrics):
     return ("HTTP/1.0 200 OK\n\n<distccstats>\n"
             f"dcc_cpus {cpus}\ndcc_max_kids {jobs}\ndcc_load1 {load}\n"
             f"dcc_cores {cpus if cores is None else cores}\ndcc_smt_gain {smt_gain}\n"
@@ -352,13 +353,19 @@ class AdaptiveTest(DistccTestCase):
         self.assertLess(time.monotonic() - start, 1.5)
 
     def test_shared_cache(self):
-        peer = self.peer(stats_response())
-        hosts = self.host(0, f",stats={peer.port}")
+        peer = self.peer(stats_response(cpus=8, jobs=8, cores=4,
+                                        core_scale=.8, smt_gain=.25, busy=6))
+        other = self.peer(stats_response())
+        hosts = (self.host(0, f",stats={peer.port}") + " " +
+                 self.host(1, f",stats={other.port},speed=.5"))
         # Stay within a cache second, including the 0.3s compiler delay.
         time.sleep(1 - time.time() % 1 + 0.02)
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            list(pool.map(lambda i: self.compile(hosts, f"cached{i}"), range(3)))
+            results = list(pool.map(lambda i: self.compile(hosts, f"cached{i}"), range(3)))
+        # Fresh and cached topology/coefficients must select the same host.
+        self.assertEqual([port for port, _ in results], [self.ports[0]] * 3)
         self.assertEqual(peer.requests, 1)
+        self.assertEqual(other.requests, 1)
 
     def test_duplicate_host_keeps_slot_locked(self):
         host = self.host(0, ",speed=2", slots=1)

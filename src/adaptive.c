@@ -178,10 +178,11 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
     n = read(fd, buf, sizeof(buf) - 1);
     if (n > 0) {
         buf[n] = '\0';
-        if (sscanf(buf, "%ld %d %d %d %lf %d %d %d %d %d %lf %d %d %d %d", &stamp, &valid,
+        if (sscanf(buf, "%ld %d %d %d %lf %d %d %d %d %d %lf %d %d %d %d %d %lf %lf", &stamp, &valid,
                    &cap->cpus, &cap->jobs, &cap->load, &cap->running, &cap->busy,
                    &cap->queued, &cap->links, &cap->admission, &cap->memory_pressure, &cap->available,
-                   &cap->preparing, &cap->returning, &cap->capacity) == 15 &&
+                   &cap->preparing, &cap->returning, &cap->capacity,
+                   &cap->cores, &cap->core_scale, &cap->smt_gain) == 18 &&
             stamp == (long)now &&
             (valid == 0 || (valid == 1 && cap->cpus > 0 &&
              cap->cpus <= 10000 && cap->jobs > 0 && cap->jobs <= 10000 &&
@@ -193,7 +194,10 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
              cap->available >= -1 && cap->available <= 1000000 &&
              cap->preparing >= -1 && cap->preparing <= 1000000 &&
              cap->returning >= -1 && cap->returning <= 1000000 &&
-             cap->capacity >= -1 && cap->capacity <= 1000000))) {
+             cap->capacity >= -1 && cap->capacity <= 1000000 &&
+             cap->cores >= 1 && cap->cores <= cap->cpus &&
+             cap->core_scale >= 0 && cap->core_scale <= 1 &&
+             cap->smt_gain >= -1 && cap->smt_gain <= 1))) {
             dcc_unlock(fd);
             return valid ? 0 : -1;
         }
@@ -203,11 +207,11 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
     if (!valid)
         rs_log_warning("adaptive stats unavailable for %s; using configured slots/speed",
                        host->hostname);
-    len = snprintf(buf, sizeof(buf), "%ld %d %d %d %.17g %d %d %d %d %d %.2f %d %d %d %d\n",
+    len = snprintf(buf, sizeof(buf), "%ld %d %d %d %.17g %d %d %d %d %d %.2f %d %d %d %d %d %.17g %.17g\n",
                    (long)time(NULL), valid, cap->cpus, cap->jobs, cap->load,
                    cap->running, cap->busy, cap->queued, cap->links, cap->admission,
                    cap->memory_pressure, cap->available, cap->preparing, cap->returning,
-                   cap->capacity);
+                   cap->capacity, cap->cores, cap->core_scale, cap->smt_gain);
     if (lseek(fd, 0, SEEK_SET) < 0 || ftruncate(fd, 0) ||
         write(fd, buf, len) != len)
         rs_log_warning("could not cache adaptive stats");
