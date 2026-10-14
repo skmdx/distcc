@@ -73,6 +73,8 @@ void dcc_tcp_dispatch_ready(void);
 /* Cumulative unused admissible slot time while an eligible job is ready. */
 uint64_t dcc_tcp_ready_idle_ns(void);
 uint64_t dcc_tcp_local_input_jobs(void);
+uint64_t dcc_tcp_input_prefetch_bytes(void);
+uint64_t dcc_tcp_output_overlaps(void);
 uint64_t dcc_tcp_local_input_bytes(void);
 void dcc_tcp_server_finished(struct dcc_tcp_server *, const struct dcc_tcp_finished *, int *, unsigned);
 void dcc_tcp_server_lost(struct dcc_tcp_server *);

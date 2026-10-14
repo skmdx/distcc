@@ -59,7 +59,7 @@ static int snapshot_size(const char *name, uint64_t wire, uint64_t *plain)
     return ret;
 }
 
-static struct dcc_job *describe(char **argv, const char *cpp, char **files)
+static struct dcc_job *describe(char **argv, const char *cpp, int cpp_fd, char **files)
 {
     struct dcc_job *job = calloc(1, sizeof(*job));
     struct dcc_input_digest *digests = NULL;
@@ -84,7 +84,8 @@ static struct dcc_job *describe(char **argv, const char *cpp, char **files)
         if (files) {
             if (dcc_get_original_fname(name, &in->path)) goto failed;
         } else {
-            const char *extension = strrchr(cpp, '.');
+            const char *extension = cpp_fd >= 0 ?
+                dcc_preproc_exten(dcc_find_extension(source)) : strrchr(cpp, '.');
             /* Explicit-language input may still contain macros. Keep its
              * source basename for compiler file symbols and diagnostics. */
             if (dcc_argv_search(argv, "-x")) {
@@ -95,7 +96,7 @@ static struct dcc_job *describe(char **argv, const char *cpp, char **files)
             in->kind = DCC_JOB_EMPTY;
             continue;
         }
-        if (lstat(name, &st)) goto failed;
+        if ((!files && cpp_fd >= 0) ? fstat(cpp_fd, &st) : lstat(name, &st)) goto failed;
         if (S_ISLNK(st.st_mode)) {
             char target[4097];
             ssize_t n = readlink(name, target, sizeof(target) - 1);
@@ -117,7 +118,8 @@ static struct dcc_job *describe(char **argv, const char *cpp, char **files)
                 memcpy(in->digest, digests[i].hash, sizeof(in->digest));
             }
         } else {
-            in->fd = open(name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            in->fd = cpp_fd >= 0 ? fcntl(cpp_fd, F_DUPFD_CLOEXEC, 0) :
+                open(name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
             if (in->fd < 0) goto failed;
             in->encoding = DCC_JOB_RAW;
         }
@@ -160,11 +162,11 @@ static int publish(int *source, const struct dcc_job_result *result, unsigned in
     *source = -1;
     return failed || rename(result->temporary[index], path) ? EXIT_IO_ERROR : 0;
 }
-int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, char **files,
+int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, int cpp_fd, char **files,
                        const char *output, const char *deps, struct dcc_buffer *err,
                        struct dcc_buffer *out, int *status)
 {
-    struct dcc_job *job = describe(argv, cpp, files);
+    struct dcc_job *job = describe(argv, cpp, cpp_fd, files);
     struct dcc_job_result result;
     int ret = EXIT_IO_ERROR, transport_complete = 0;
     dcc_job_result_init(&result);

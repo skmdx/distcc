@@ -65,6 +65,20 @@ class TcpJobsTest(BrokerTestCase):
         subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(source), '-o', str(actual)],
                        env=self.env, check=True, capture_output=True, timeout=15)
         self.assertEqual(actual.read_bytes(), expected.read_bytes())
+        # Observe the real client/CPP boundary: preprocessing owns the shared
+        # memfd, and local transport must not allocate/copy a second snapshot.
+        tracer = shutil.which('strace')
+        if tracer:
+            trace = self.work / 'local-input.trace'
+            subprocess.run([tracer, '-f', '-e', 'trace=memfd_create,sendfile',
+                            '-o', str(trace), str(self.build / 'distcc'), 'gcc',
+                            '-c', str(source), '-o', str(actual)],
+                           env=self.env, check=True, capture_output=True, timeout=15)
+            calls = trace.read_text()
+            self.assertIn('memfd_create("distcc-preprocessed"', calls)
+            self.assertNotIn('memfd_create("distcc-local-input"', calls)
+            self.assertNotIn('sendfile(', calls)
+            self.assertEqual(actual.read_bytes(), expected.read_bytes())
         self.assertGreater(int(re.search(r'dcc_local_input_bytes (\d+)',
                                         self.get_stats(self.stats_ports[0]))[1]), 2 * 1024 * 1024)
         # A writable handle must not be inherited into a compiler. Include a
@@ -258,12 +272,36 @@ time_t time(time_t *out) {
         self.assertEqual(after - before, 1)
 
     def test_parallel_compressed_inputs_and_disconnect(self):
+        # Hold a decoder in a real worker thread so the next frame must be
+        # received while the first one still owns its decompression buffer.
+        shim = self.work / 'slow-decode.c'
+        shim.write_text('''#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+ssize_t write(int fd, const void *data, size_t size) {
+    ssize_t (*real_write)(int, const void *, size_t) = dlsym(RTLD_NEXT, "write");
+    if (size >= 65536 && syscall(SYS_gettid) != getpid()) usleep(100000);
+    return real_write(fd, data, size);
+}
+''')
+        library = self.work / 'slow-decode.so'
+        subprocess.run([self.cc, '-shared', '-fPIC', str(shim), '-ldl', '-o', str(library)],
+                       check=True, capture_output=True)
+        self.restart_server(self.build / 'distccd', LD_PRELOAD=str(library))
+        self.addCleanup(self.restart_server, self.build / 'distccd')
         body = b'/*' + b'bounded expansion ' * 65536 + b'*/\nint parallel_input;\n'
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
         streams = [self.wire_job(body, cached=False) for _ in range(6)]
         cancelled = self.wire_job(body, cached=False)
         first = codec.encode(body[:262144])
         self.send(cancelled, 0x54010202, struct.pack('!II', 0, 262144) + first[8:])
+        self.send(cancelled, 0x54010202, struct.pack('!II', 0, 262144) + first[8:])
+        deadline = time.monotonic() + 3
+        while not int(re.search(r'dcc_tcp_input_prefetch_bytes (\d+)',
+                               self.get_stats(self.stats_ports[0]))[1]):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
         cancelled.close()
         for offset in range(0, len(body), 262144):
             chunk = body[offset:offset + 262144]
@@ -511,6 +549,8 @@ Path(args[args.index('-o') + 1]).write_bytes(random.Random(543).randbytes(4 * 10
         self.job('after-daemon-restart')
 
     def test_large_raw_result_keeps_the_last_partial_chunk(self):
+        before = int(re.search(r'dcc_tcp_output_overlaps (\d+)',
+                               self.get_stats(self.stats_ports[0]))[1])
         wrapper = self.root / 'bin' / 'gcc'
         original = wrapper.read_text()
         self.addCleanup(wrapper.write_text, original)
@@ -527,6 +567,9 @@ with open(args[args.index('-o') + 1], 'ab') as output:
         self.upload(net, body)
         outputs = self.result(net)
         self.assertEqual(outputs[2][-size:], random.Random(764).randbytes(size))
+        after = int(re.search(r'dcc_tcp_output_overlaps (\d+)',
+                              self.get_stats(self.stats_ports[0]))[1])
+        self.assertGreater(after, before)
         obj = self.work / 'large.o'
         obj.write_bytes(outputs[2])
         executable = self.work / 'large'

@@ -22,6 +22,13 @@ struct input_stream { int fd; unsigned index; uint64_t offset, plain; };
 static int local_snapshot(int source, uint64_t size)
 {
     if (size > DCC_TCP_BYTES) return -1;
+    int seals = fcntl(source, F_GET_SEALS);
+    int required = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
+    if (seals >= 0 && (seals & required) == required) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", source);
+        return open(path, O_RDONLY | O_CLOEXEC);
+    }
     int fd = dcc_job_memfd("distcc-local-input"), readonly = -1;
     off_t offset = 0;
     char path[64];

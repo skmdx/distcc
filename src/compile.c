@@ -710,7 +710,8 @@ dcc_build_somewhere(char *argv[],
                     int sg_level,
                     int *status)
 {
-    char *input_fname = NULL, *output_fname, *cpp_fname, *deps_fname = NULL;
+    char *input_fname = NULL, *output_fname, *cpp_fname = NULL, *deps_fname = NULL;
+    int cpp_fd = -1;
     char **files;
     char **server_side_argv = NULL;
     char **localcpp_server_argv = NULL;
@@ -798,8 +799,14 @@ dcc_build_somewhere(char *argv[],
         dcc_read_localslots_configuration();
         if (!dcc_is_preprocessed(input_fname) &&
             (ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
-        ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid);
+        ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid, &cpp_fd);
         if (!ret) ret = dcc_wait_for_cpp(cpp_pid, status, input_fname);
+#ifdef __linux__
+        if (!ret && !*status && cpp_fd >= 0 &&
+            (fchmod(cpp_fd, 0444) || fcntl(cpp_fd, F_ADD_SEALS,
+                F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)))
+            ret = EXIT_IO_ERROR;
+#endif
         if (local_cpu_lock_fd != -1) dcc_unlock(local_cpu_lock_fd);
         local_cpu_lock_fd = -1;
         cpp_pid = 0;
@@ -887,7 +894,7 @@ dcc_build_somewhere(char *argv[],
             (ret = dcc_lock_local_cpp(&local_cpu_lock_fd)))
             goto fallback;
 
-        if (!cpp_ready && (ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid)))
+        if (!cpp_ready && (ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid, NULL)))
             goto fallback;
 
         /* localcpp_server_argv may already be processed from a previous bad host */
@@ -919,6 +926,7 @@ dcc_build_somewhere(char *argv[],
     if ((ret = dcc_compile_remote(server_side_argv,
                                   input_fname,
                                   cpp_fname,
+                                  cpp_fd,
                                   files,
                                   output_fname,
                                   needs_dotd ? deps_fname : NULL,
@@ -1097,6 +1105,7 @@ dcc_build_somewhere(char *argv[],
     }
 
   clean_up:
+    if (cpp_fd >= 0) { close(cpp_fd); free(cpp_fname); }
     dcc_free_argv(argv);
     if (remotecpp_server_argv != NULL) {
         dcc_free_argv(remotecpp_server_argv);

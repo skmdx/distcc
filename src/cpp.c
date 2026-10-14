@@ -32,6 +32,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 #include "distcc.h"
 #include "trace.h"
@@ -83,7 +86,7 @@ const char *dcc_cpp_rewrite_language(char **argv, const char *input_fname)
  * use many cycles, with running the preprocessor.
  **/
 int dcc_cpp_maybe(char **argv, char *input_fname, char **cpp_fname,
-          pid_t *cpp_pid)
+          pid_t *cpp_pid, int *cpp_fd)
 {
     char **cpp_argv;
     int ret;
@@ -110,8 +113,22 @@ int dcc_cpp_maybe(char **argv, char *input_fname, char **cpp_fname,
 
     input_exten = dcc_find_extension(input_fname);
     output_exten = dcc_preproc_exten(input_exten);
-    if ((ret = dcc_make_tmpnam("distcc", output_exten, cpp_fname)))
-        return ret;
+#ifdef __linux__
+    if (cpp_fd && !dcc_getenv_bool("DISTCC_SAVE_TEMPS", 0)) {
+        *cpp_fd = memfd_create("distcc-preprocessed", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (*cpp_fd < 0) return EXIT_IO_ERROR;
+        if (asprintf(cpp_fname, "/proc/self/fd/%d", *cpp_fd) < 0) {
+            *cpp_fname = NULL;
+            return EXIT_OUT_OF_MEMORY;
+        }
+    } else
+#else
+    (void)cpp_fd;
+#endif
+    {
+        if ((ret = dcc_make_tmpnam("distcc", output_exten, cpp_fname)))
+            return ret;
+    }
 
     /* CPP writes to stdout. Preserve the dependency filename and target that
      * the original -o would otherwise select. argv has a normalized -o. */

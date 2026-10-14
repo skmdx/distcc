@@ -51,7 +51,8 @@ struct dcc_tcp_server {
     int socket, failed, metadata, input_fd;
     enum phase phase;
     time_t active;
-    struct dcc_tcp_frame frame;
+    /* The reader owns frame; the decoder exclusively owns decoding. */
+    struct dcc_tcp_frame frame, decoding;
     struct packet *head, **tail;
     size_t queued;
     const struct dcc_tcp_dispatch *dispatch;
@@ -78,6 +79,9 @@ static uint64_t returning_bytes;
 static struct dcc_tcp_server *ready_head, **ready_tail = &ready_head;
 static uint64_t idle_ns, idle_at;
 static unsigned idle_slots;
+static uint64_t input_prefetch_bytes, output_overlaps;
+uint64_t dcc_tcp_input_prefetch_bytes(void) { return input_prefetch_bytes; }
+uint64_t dcc_tcp_output_overlaps(void) { return output_overlaps; }
 static struct dcc_tcp_server *abandoned;
 static void completed_input(struct input *);
 static void unhash(struct upload *);
@@ -301,6 +305,7 @@ void dcc_tcp_server_abandon(struct dcc_tcp_server *s)
     free(s->inputs);
     dcc_job_free(s->job);
     dcc_tcp_frame_clear(&s->frame);
+    dcc_tcp_frame_clear(&s->decoding);
     while (s->head) {
         struct packet *p = s->head;
         s->head = p->next; free(p->data); free(p);
@@ -339,8 +344,10 @@ void dcc_tcp_server_free(struct dcc_tcp_server *s)
         free(p->data); free(p);
     }
     close(s->socket);
-    retained -= DCC_TCP_CHUNK + (s->frame.data ? s->frame.size : 0);
+    retained -= DCC_TCP_CHUNK + (s->frame.data ? s->frame.size : 0) +
+                (s->decoding.data ? s->decoding.size : 0);
     dcc_tcp_frame_clear(&s->frame);
+    dcc_tcp_frame_clear(&s->decoding);
     free(s->buffer); XXH3_freeState(s->hash); free(s);
 }
 static int path_order(const void *a, const void *b)
@@ -476,7 +483,7 @@ static void decode_input(void *argument)
     unsigned index;
     size_t length;
     const void *data;
-    s->input_error = dcc_tcp_unpack(&s->frame, &index, s->buffer, &data, &length);
+    s->input_error = dcc_tcp_unpack(&s->decoding, &index, s->buffer, &data, &length);
     if (s->input_error) return;
     s->input_error = dcc_writex(s->input_fd, data, length);
     if (!s->input_error && s->job->inputs[index].cached)
@@ -484,7 +491,7 @@ static void decode_input(void *argument)
 }
 static int finish_input(struct dcc_tcp_server *s)
 {
-    const struct dcc_tcp_frame *f = &s->frame;
+    const struct dcc_tcp_frame *f = &s->decoding;
     unsigned index = dcc_tcp_get32(f->data);
     size_t length = dcc_tcp_get32(f->data + 4);
     struct input *in = &s->inputs[index];
@@ -506,6 +513,14 @@ static int finish_input(struct dcc_tcp_server *s)
     } else completed_input(in);
     return 0;
 }
+static int complete_input(struct dcc_tcp_server *s)
+{
+    int ret = finish_input(s);
+    retained -= s->decoding.size;
+    dcc_tcp_frame_clear(&s->decoding);
+    return ret;
+}
+
 static int receive_input(struct dcc_tcp_server *s, const struct dcc_tcp_frame *f)
 {
     if (!s->job || s->phase != PREPARING || f->size < 8) return -1;
@@ -517,12 +532,15 @@ static int receive_input(struct dcc_tcp_server *s, const struct dcc_tcp_frame *f
         s->input_index = index; s->input_offset = 0;
     }
     if (index != s->input_index || length > s->job->inputs[index].plain_size - s->input_offset) return -1;
+    int compressed = f->type & DCC_TCP_COMPRESSED;
+    s->decoding = s->frame;
+    memset(&s->frame, 0, sizeof(s->frame));
     /* RAW already points into the receive frame: avoid a thread handoff for
      * a bounded write. Offload expansion, where independent jobs can use CPUs. */
-    if (length >= 65536 && (f->type & DCC_TCP_COMPRESSED))
+    if (length >= 65536 && compressed)
         return dcc_tcp_async_submit(&s->work, decode_input, s) ? -1 : 1;
     decode_input(s);
-    return finish_input(s);
+    return complete_input(s);
 }
 static int install_links(struct dcc_tcp_server *s)
 {
@@ -632,12 +650,14 @@ static int output(struct dcc_tcp_server *s)
         struct packet *p = s->encoded; s->encoded = NULL;
         retained -= s->encoding_bytes; s->encoding_bytes = 0;
         if (!p) return -1;
-        /* One packet at a time: the result FD outlives every queued extent. */
+        /* At most two packets, including the one being encoded. Result FDs
+         * outlive both the sender and the encoder. */
         *s->tail = p; s->tail = &p->next;
         s->queued += p->size; retained += p->size;
         s->output_offset += dcc_tcp_get32(p->data + 12);
         return 0;
     }
+    if (s->head && s->head->next) return 0;
     while (s->output_index < DCC_JOB_RESULT_COUNT) {
         unsigned i = s->output_index;
         uint64_t left = s->result.size[i] - s->output_offset;
@@ -647,13 +667,15 @@ static int output(struct dcc_tcp_server *s)
         s->encoding_bytes = amount + 16; retained += s->encoding_bytes;
         if (amount >= 65536) {
             if (dcc_tcp_async_submit(&s->work, encode_output, s)) return -1;
+            if (s->head && (dcc_tcp_get32(s->head->data) & ~DCC_TCP_FLAGS) == DCC_TCP_OUTPUT)
+                ++output_overlaps;
             return 0;
         }
         encode_output(s);
         s->work.run = encode_output; atomic_store(&s->work.done, 1);
         return output(s);
     }
-    if (!s->complete_queued) {
+    if (!s->head && !s->complete_queued) {
         unsigned char id[8];
         dcc_tcp_put64(id, s->run.id);
         /* Reclaim job resources before exposing the reusable boundary. */
@@ -668,7 +690,10 @@ void dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
     p->fd = s->socket;
     int pending = s->work.run && !atomic_load_explicit(&s->work.done, memory_order_acquire);
     p->events = POLLIN | (s->head || (s->phase == RETURNING && !pending) ? POLLOUT : 0);
-    if (pending && s->work.run == decode_input) p->events = POLLRDHUP;
+    if (pending && s->work.run == decode_input) {
+        int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
+        p->events = POLLRDHUP | (buffered ? 0 : POLLIN);
+    }
     if (s->job && s->phase == PREPARING && s->prepared < s->job->count)
         p->events = POLLOUT;
     p->revents = 0;
@@ -679,10 +704,22 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
     if (s->failed || now - s->active >= (s->job || s->phase == RETURNING ? dcc_get_io_timeout() : 30)) return -1;
     if (s->work.run == decode_input) {
         if (events & (POLLHUP | POLLERR | POLLRDHUP)) return -1;
-        if (!atomic_load_explicit(&s->work.done, memory_order_acquire)) return 0;
+        if (!atomic_load_explicit(&s->work.done, memory_order_acquire)) {
+            if (events & POLLIN) {
+                size_t before = s->frame.used;
+                int allocated = s->frame.data != NULL;
+                size_t available = DCC_TCP_BYTES - retained;
+                if (available > DCC_TCP_CHUNK + 8U) available = DCC_TCP_CHUNK + 8U;
+                int ret = dcc_tcp_frame_read(s->socket, &s->frame, available);
+                if (!allocated && s->frame.data) retained += s->frame.size;
+                input_prefetch_bytes += s->frame.used - before;
+                if (s->frame.used != before) s->active = now;
+                if (ret < 0) return -1;
+            }
+            return 0;
+        }
         s->work.run = NULL;
-        int ret = finish_input(s);
-        retained -= s->frame.size; dcc_tcp_frame_clear(&s->frame);
+        int ret = complete_input(s);
         if (ret) return -1;
         events |= POLLIN;
     } else if (s->work.run && atomic_load_explicit(&s->work.done, memory_order_acquire)) events |= POLLOUT;
@@ -723,7 +760,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         dcc_tcp_dispatch_ready();
     }
     if (events & POLLOUT) for (unsigned turn = 0; turn < 4; ++turn) {
-        if (!s->head && s->phase == RETURNING && output(s)) return -1;
+        if (s->phase == RETURNING && output(s)) return -1;
         struct packet *p = s->head;
         if (!p) break;
         ssize_t n;

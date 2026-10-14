@@ -50,7 +50,7 @@ struct dcc_buffer;
  * Results own open FDs before the worker removes temporary pathnames. */
 int dcc_execute_job(struct dcc_job *, const char *root, int cancel_fd, struct dcc_job_result *);
 struct dcc_hostdef;
-int dcc_compile_direct(struct dcc_hostdef *, char **argv, const char *cpp, char **files,
+int dcc_compile_direct(struct dcc_hostdef *, char **argv, const char *cpp, int cpp_fd, char **files,
                        const char *output, const char *deps, struct dcc_buffer *err,
                        struct dcc_buffer *out, int *status);
 #endif

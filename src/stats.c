@@ -422,6 +422,8 @@ dcc_local_input_bytes %llu\n\
 dcc_tcp_ready_idle_ns %llu\n\
 dcc_tcp_parallel_tasks %lu\n\
 dcc_tcp_parallel_peak %u\n\
+dcc_tcp_input_prefetch_bytes %llu\n\
+dcc_tcp_output_overlaps %llu\n\
 dcc_links %d\n\
 dcc_admission %d\n\
 dcc_available %d\n\
@@ -490,6 +492,8 @@ dcc_free_mem %d MB\n\
                                (unsigned long long)dcc_tcp_local_input_jobs(),
                                (unsigned long long)dcc_tcp_local_input_bytes(),
                                ready_idle_ns, parallel_tasks, parallel_peak,
+                               (unsigned long long)dcc_tcp_input_prefetch_bytes(),
+                               (unsigned long long)dcc_tcp_output_overlaps(),
                                load.links, admission, available, memory_pressure,
                                ct[0], ct[1], ct[2],
                                num_D, max_RSS, max_RSS_name,

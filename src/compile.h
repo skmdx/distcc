@@ -32,6 +32,7 @@ struct dcc_buffer;
 int dcc_compile_remote(char **argv,
                        char *input_fname,
                        char *cpp_fname,
+                       int cpp_fd,
                        char **file_names,
                        char *output_fname,
                        char *deps_fname,

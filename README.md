@@ -175,8 +175,10 @@ this listener permits all local users to submit prepared jobs (socket mode
 it only when the worker address matches a local interface, and otherwise uses
 TCP. A missing local listener also uses TCP.
 
-The client copies input once in the kernel into an anonymous sealed memfd and
-passes a read-only descriptor over this Unix stream. The snapshot can be
+Broker clients preprocess directly into a memfd and seal it after the compiler
+exits. Local transport passes a read-only descriptor without copying that input.
+Already-preprocessed named files and `DISTCC_SAVE_TEMPS` builds still get a
+private sealed snapshot. The snapshot can be
 opened by a compiler running under a different UID without changing the named
 input's permissions. This removes input compression, socket payload transfer
 and server-side materialization, rather than eliminating every copy. The
@@ -238,7 +240,14 @@ the compiler-slot count, but share a bounded 512 MiB storage budget; compiler
 working memory and the persistent input cache are separate. Set the daemon's
 `TMPDIR` to suitable tmpfs storage when available.
 Large compressed inputs and result compression can use up to two background
-threads. Uncached inputs start without a request round trip, and received
+threads. Each connection can receive one chunk while decoding its predecessor,
+or encode one output chunk while sending its predecessor, with at most two
+chunks in flight and one CPU task per connection. Both buffers count against
+the shared storage budget; result completion waits for the last byte.
+`dcc_tcp_input_prefetch_bytes` counts wire bytes read during decoding, and
+`dcc_tcp_output_overlaps` counts encodes started while an output chunk remains
+queued. These demonstrate overlap, not time saved.
+Uncached inputs start without a request round trip, and received
 objects go directly into unpublished destination files. Update clients and
 daemons together: this wire version does not accept earlier `,tcp` clients.
 
