@@ -88,6 +88,22 @@ class PreprocessTest(BrokerTestCase):
         self.assertIn('pooled TCP job completed' if self.transport == ',tcp' else
                       'client finished sending request to server', log)
 
+    def test_utf8_bom_header_and_macro_diagnostic(self):
+        header = self.work / 'bom.h'
+        header.write_bytes(b'\xef\xbb\xbf#define NONNULL(x) ((x) != 0)\n'
+                           b'static int values[2];\n')
+        self.source.write_text('#include "bom.h"\n'
+                               'int f(void) { return NONNULL(values); }\n')
+        for compiler in ('gcc', shutil.which('clang')):
+            if not compiler:
+                continue
+            args = ['-I' + str(self.work), '-O2', '-Werror=address',
+                    '-c', self.source, '-o', 'bom.o']
+            local = self.run_cc(compiler, args, False)
+            self.assertEqual(local.returncode, 0, local.stderr.decode())
+            remote = self.run_cc(compiler, args)
+            self.assertEqual(remote.returncode, 0, remote.stderr.decode())
+
     def test_changed_generated_deleted_headers_and_symlinks(self):
         for directory in ('first', 'second'):
             (self.work / directory).mkdir()

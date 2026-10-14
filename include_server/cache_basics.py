@@ -187,8 +187,13 @@ using this one.
 
 __author__ = "opensource@google.com (Nils Klarlund, Craig Silverstein)"
 
+import ctypes
+import errno
 import os
 import os.path
+import re
+import stat
+import struct
 import sys
 
 import basics
@@ -602,6 +607,52 @@ class FileStampCache(object):
 
   def __init__(self):
     self.paths = {}
+    self.files = {}
+    self.watch_fd = -1
+    self.watched = set()
+    self.watch_dirs = {}
+    if sys.platform.startswith('linux'):
+      # Remote filesystem changes are not necessarily reported by inotify.
+      try:
+        mounts = open('/proc/self/mountinfo')
+      except OSError:
+        return
+      with mounts:
+        self.mounts = sorted(
+          [(re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)),
+                   line.split(' - ', 1)[0].split()[4]),
+            line.split(' - ', 1)[1].split()[0]) for line in mounts],
+          key=lambda item: len(item[0]), reverse=True)
+      self.libc = ctypes.CDLL(None, use_errno=True)
+      self.watch_fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+
+  def __del__(self):
+    if self.watch_fd >= 0:
+      os.close(self.watch_fd)
+
+  def WatchParent(self, path):
+    parent = os.path.dirname(path)
+    if self.watch_fd < 0 or parent in self.watched:
+      return
+    # Modify, attrib, move, create, delete, and changes to the directory itself.
+    wd = self.libc.inotify_add_watch(self.watch_fd, os.fsencode(parent), 0xfce)
+    if wd < 0:
+      if ctypes.get_errno() not in (errno.ENOENT, errno.ENOTDIR):
+        # Resource limits or unsupported filesystems retain stat validation.
+        os.close(self.watch_fd)
+        self.watch_fd = -1
+        self.watch_dirs.clear()
+    else:
+      self.watch_dirs.setdefault(wd, set()).add(parent)
+      real_parent = os.path.realpath(parent)
+      for mount, filesystem in self.mounts:
+        if real_parent == mount or real_parent.startswith(mount.rstrip('/') + '/'):
+          if filesystem not in ('btrfs', 'ext2', 'ext3', 'ext4', 'xfs', 'tmpfs', 'overlay'):
+            os.close(self.watch_fd)
+            self.watch_fd = -1
+            self.watch_dirs.clear()
+          break
+    self.watched.add(parent)
 
   @staticmethod
   def Stamp(path, ancestor=False):
@@ -621,19 +672,59 @@ class FileStampCache(object):
     # to a different file from the compiler's lookup.
     if not os.path.isabs(path):
       path = os.path.join(os.getcwd(), path)
-    key = (path, False)
-    if key not in self.paths:
-      self.paths[key] = self.Stamp(path)
+    original = path
+    ancestors = []
     while path != '/':
       key = (path, True)
       if key in self.paths:
         break
-      self.paths[key] = self.Stamp(path, True)
+      ancestors.append(path)
       path = os.path.dirname(path)
+    # Watch ancestors before taking the lookup snapshot, including nonexistent
+    # ancestors whose creation can make a formerly missing header visible.
+    for path in reversed(ancestors):
+      self.WatchParent(path)
+      key = (path, True)
+      self.paths[key] = self.Stamp(path, True)
+      # A dangling symlink can become usable without changing its own parent.
+      # Watch the missing target's ancestors as well as the link's spelling.
+      if (self.paths[key] is not None and
+          stat.S_ISLNK(self.paths[key][2]) and not os.path.exists(path)):
+        self.Observe(os.path.realpath(path))
+    key = (original, False)
+    if key not in self.paths:
+      self.WatchParent(original)
+      stamp = self.paths[key] = self.Stamp(original)
+      if stamp is not None:
+        self.files[original] = stamp
 
   def Changed(self):
-    return any(self.Stamp(path, ancestor) != stamp
-               for (path, ancestor), stamp in self.paths.items())
+    if self.watch_fd < 0:
+      return any(self.Stamp(path, ancestor) != stamp
+                 for (path, ancestor), stamp in self.paths.items())
+    # Positive files still need stamps: mmap writes and writes via another hard
+    # link need not produce a notification in the directory we watched.
+    if any(self.Stamp(path) != stamp for path, stamp in self.files.items()):
+      return True
+    while True:
+      try:
+        events = os.read(self.watch_fd, 65536)
+      except BlockingIOError:
+        return False
+      offset = 0
+      while offset < len(events):
+        wd, mask, _, length = struct.unpack_from('iIII', events, offset)
+        name = os.fsdecode(events[offset + 16:offset + 16 + length].split(b'\0')[0])
+        offset += 16 + length
+        # Overflow or a lost/moved watch requires a fresh graph and watch set.
+        if mask & (0x4000 | 0x8000 | 0x400 | 0x800):
+          return True
+        for parent in self.watch_dirs.get(wd, ()):
+          path = os.path.join(parent, name)
+          for ancestor in (False, True):
+            key = (path, ancestor)
+            if key in self.paths and self.Stamp(path, ancestor) != self.paths[key]:
+              return True
 
 
 class SimpleBuildStat(object):

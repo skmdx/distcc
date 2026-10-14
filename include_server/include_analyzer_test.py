@@ -28,6 +28,7 @@ import glob
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import basics
 import cache_basics
@@ -549,6 +550,57 @@ class IncludeAnalyzerTest(unittest.TestCase):
     """Run helper_test_IncludeAnalyzer through a link farm to exercise include
     processors ability to handle links."""
     self.helper_test_IncludeAnalyzer('test_data/symlink_farm')
+
+
+class FileStampCacheTest(unittest.TestCase):
+  def test_dangling_symlink_target_created_elsewhere(self):
+    with tempfile.TemporaryDirectory() as root:
+      os.mkdir(os.path.join(root, 'targets'))
+      target = os.path.join(root, 'targets', 'generated')
+      alias = os.path.join(root, 'include')
+      os.symlink(target, alias)
+      cache = cache_basics.FileStampCache()
+      cache.Observe(os.path.join(alias, 'header.h'))
+      self.assertFalse(cache.Changed())
+      os.mkdir(target)
+      self.assertTrue(cache.Changed())
+
+  def test_negative_lookups_use_notifications(self):
+    with tempfile.TemporaryDirectory() as root:
+      cache = cache_basics.FileStampCache()
+      for index in range(256):
+        cache.Observe(os.path.join(root, 'missing%d.h' % index))
+      if cache.watch_fd < 0:
+        self.skipTest('filesystem notifications unavailable')
+      with open(os.path.join(root, 'unrelated.o'), 'w') as output:
+        output.write('output')
+      with mock.patch.object(cache, 'Stamp', wraps=cache.Stamp) as stamp:
+        self.assertFalse(cache.Changed())
+        self.assertLess(stamp.call_count, 8)
+      with open(os.path.join(root, 'missing17.h'), 'w') as header:
+        header.write('generated')
+      self.assertTrue(cache.Changed())
+
+  def test_hardlink_write_and_missing_ancestor(self):
+    with tempfile.TemporaryDirectory() as root:
+      header = os.path.join(root, 'header.h')
+      with open(header, 'w') as output:
+        output.write('one')
+      alias_dir = os.path.join(root, 'other')
+      os.mkdir(alias_dir)
+      alias = os.path.join(alias_dir, 'alias.h')
+      os.link(header, alias)
+      cache = cache_basics.FileStampCache()
+      cache.Observe(header)
+      self.assertFalse(cache.Changed())
+      with open(alias, 'w') as output:
+        output.write('two')
+      self.assertTrue(cache.Changed())
+      cache = cache_basics.FileStampCache()
+      cache.Observe(os.path.join(root, 'generated', 'header.h'))
+      self.assertFalse(cache.Changed())
+      os.mkdir(os.path.join(root, 'generated'))
+      self.assertTrue(cache.Changed())
 
 
 for algorithm in [ basics.MEMOIZING ]:

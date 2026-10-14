@@ -22,8 +22,10 @@ hosts with the `,cpp,lzo` options.
 
 The include server conservatively analyzes include directives and caches both
 the dependency graph and compressed source/header files. Before reusing the
-graph it checks metadata for positive and negative include lookups, including
-ancestor identities. Header creation, modification, removal and symlink
+graph it checks metadata for positive include lookups. On supported local Linux
+filesystems, directory notifications select which negative lookups and ancestor
+identities need rechecking. Other filesystems and unavailable or exhausted
+notification watches retain full metadata checks. Header creation, modification, removal and symlink
 replacement invalidate the graph. A new generation holds new compressed files;
 previously issued manifests keep their old files until pump exits. A change
 detected while gathering inputs causes local preprocessing instead. Build
@@ -36,6 +38,13 @@ compiler's preprocessor and compiles the result. System headers in the compiler'
 default search paths are not transferred: compiler versions, target, search paths
 and default system headers must match between client and workers. A cross compiler
 must provide the same target headers. Pump does not synchronize a sysroot.
+
+For Gentoo, source `packaging/gentoo/pump.bashrc` (installed by the overlay as
+`/usr/share/distcc/portage-pump.bashrc`) from `/etc/portage/bashrc`, and call
+`distcc_pump_start` from `pre_src_compile` and `distcc_pump_stop` from
+`post_src_compile`. Call `register_die_hook distcc_pump_stop` for failure
+cleanup. Enable selected packages with `DISTCC_PUMP=1` in their `package.env`
+environment file. The helper preserves Portage's compiler wrapper search order.
 
 Standalone GCC and Clang `-E` calls with a source file are also distributed.
 Standard output, `-o` output files, explicit `-MF` dependencies, exit status and

@@ -111,6 +111,13 @@ class CompressFiles(object):
         except (IOError, OSError) as why:
           sys.exit("Could not open '%s' for writing: %s" % (new_filepath, why))
         try:
+          # A UTF-8 signature is only recognized at byte zero. Keep it before
+          # our line directive, otherwise GCC sees it as a source token.
+          if prefix:
+            if real_file_fd.read(3) == b'\xef\xbb\xbf':
+              prefix = '\ufeff' + prefix
+            else:
+              real_file_fd.seek(0)
           if compression == 'lz4s':
             digest = xxhash.xxh3_64()
             plain_size = 0
