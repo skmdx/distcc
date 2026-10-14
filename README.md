@@ -113,10 +113,15 @@ To calibrate, measure batch completion time for identical representative
 compiles started together at concurrency 1, P (physical cores), and L (logical
 CPUs). Average repeated batches to obtain T1, TP, TL.
 Use `core_scale = T1 / TP` and `smt_gain = (L * TP / TL - P) / (L - P)`, bounded
-to the accepted ranges. SMT gain is irrelevant when L equals P. Repeat with
-warm inputs and constant compiler/options and memory limits. The default gain
-is an initial estimate; validate calibrated values on a whole build because
-frequency, memory bandwidth and compiler workload change the throughput curve.
+to the accepted ranges. SMT gain is irrelevant when L equals P. Keep inputs,
+compiler/options and memory limits constant, and warm up the CPU until batch
+time, frequency and power have stabilized. Interleave concurrency levels and
+record temperature and throttling: comparing an early turbo burst with a later
+throttled batch can falsely produce a negative SMT gain. A fixed-frequency run
+can isolate SMT sharing, but does not calibrate the host's normal turbo behavior.
+The default gain is an initial estimate; validate calibrated values on a whole
+build. A fixed coefficient cannot predict thermal history or changing power
+limits, and workload changes can also alter memory bandwidth contention.
 
 For a distributed Ninja build, bound total jobs with `-j`. A local load limit
 (`-l`) can stop new remote jobs when the client also executes compiler work,
