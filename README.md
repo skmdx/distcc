@@ -184,19 +184,30 @@ in the existing reply and connection-return message. Only execution time is
 normalized by the dispatch-time CPU service cost and learned as compile work.
 The broker keeps 4096 bounded history entries keyed by working directory,
 compiler arguments and input path, excluding output/dependency filenames.
-Repeated inputs use their measured work, adjusted for size changes. Unseen
-inputs use learned bytes-to-work ratios for C, C++ and assembler, with separate
-classes for raw and preprocessed source. Initial ratios are heuristics;
+Four-way buckets retain colliding keys across repeated builds. Repeated inputs
+use their measured work, adjusted for size changes. Unseen inputs use an online
+nonnegative fit of input size and original source size for C, C++ and assembler,
+with separate classes for raw and preprocessed source. The source-size feature
+is capped at 1 MiB so large generated tables cannot dominate the fit; input
+size still represents parsing work. Initial rates and this cap are heuristics;
 contents and include trees are not read to calculate a hint. History lasts
 for the broker process lifetime. Frequency or contention changes during a job
 and different optimization costs remain sources of prediction error.
 
-Predicted remaining work determines when an execution slot will become free;
-unobserved jobs from other brokers use the host's recent mean work. Preparation
-time uses measured byte rates. Uploads are deferred while predicted CPU wait
+Predicted remaining work determines when an execution slot will become free.
+An overrun does not increase predicted remaining work; the bounded input
+pipeline can overlap that uncertain tail while server admission enforces limits.
+Unobserved jobs from other brokers use the host's recent mean work. Prepared
+network inputs use measured transfer costs. Same-host inputs and raw sources
+use measured preparation latency: FD handoffs do not upload the input, and raw
+source size does not describe its include tree. Fast samples are included and
+sub-chunk inputs do not train bandwidth, preventing a delayed small request
+from dominating later estimates. Uploads are deferred while predicted CPU wait
 exceeds preparation time by more than 20ms, retaining work at the broker so it
 can choose another host. Completion notifications and bounded timed wakes
-reconsider waiting jobs. A dispatch pass accounts for earlier waiting jobs
+reconsider waiting jobs. Each pass prioritizes larger estimated jobs, which pay
+the greatest execution penalty on slower hosts. Jobs waiting at least one second
+take precedence by arrival time. A dispatch pass accounts for earlier waiting jobs
 when forecasting later ones, without reserving server resources. Existing
 recovery probes may bypass this advisory wait. Inputs without a usable hint,
 links and legacy TCP use the aggregate CPU score.
