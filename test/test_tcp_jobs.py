@@ -115,7 +115,18 @@ sys.exit(result.returncode)
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+static pid_t daemon_pid;
+__attribute__((constructor)) static void identify_daemon(void) {
+    char path[4096];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path)-1);
+    if (n > 0) {
+        path[n] = 0;
+        const char *name = strrchr(path, '/');
+        if (name && !strcmp(name + 1, "distccd")) daemon_pid = getpid();
+    }
+}
 static void gate(const char *kind) {
+    if (getpid() != daemon_pid) return;
     const char *mode = getenv("TEST_FILE_KIND"), *arm = getenv("TEST_FILE_ARM");
     if (!mode || strcmp(mode, kind) || !arm || access(arm, F_OK)) return;
     int fd = open(getenv("TEST_FILE_ENTERED"), O_WRONLY|O_CREAT|O_EXCL, 0600);
@@ -229,7 +240,7 @@ int ioctl(int fd, unsigned long request, ...) {
             self.assertIn('SCM_RIGHTS', calls)
             self.assertIn('sendfile(', calls)  # Result publication, not an input snapshot.
             self.assertNotRegex(calls, r'sendfile\([^\n]*distcc-preprocessed')
-            returned = re.search(r'sendmsg\([^\n]*iov_len=8[^\n]*SCM_RIGHTS', calls)
+            returned = re.search(r'sendmsg\([^\n]*iov_len=32[^\n]*SCM_RIGHTS', calls)
             self.assertIsNotNone(returned, 'pooled connection was not returned')
             self.assertLess(returned.start(), calls.index('sendfile('), 'copy held the pooled connection')
             self.assertEqual(actual.read_bytes(), expected.read_bytes())
@@ -524,7 +535,11 @@ ssize_t write(int fd, const void *data, size_t size) {
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
         kind, description = self.frame(net)
         self.assertEqual(kind, 0x54000203)
-        status, mode, *sizes = struct.unpack('!II4Q', description)
+        self.assertEqual(len(description), 64)
+        status, mode, *sizes = struct.unpack('!II4Q', description[:40])
+        prepare, queued, execute = struct.unpack('!3Q', description[40:])
+        self.assertGreater(execute, 0)
+        self.assertLess(prepare + queued + execute, 60 * 1000000000)
         outputs = [bytearray() for _ in sizes]
         while True:
             kind, body = self.frame(net)
@@ -671,7 +686,7 @@ Path(args[args.index('-o') + 1]).write_bytes(random.Random(543).randbytes(4 * 10
                 self.upload(net, body)
                 kind, description = self.frame(net)
                 self.assertEqual(kind, 0x54000203)
-                self.assertEqual(struct.unpack('!II4Q', description)[4], 4 * 1024 * 1024)
+                self.assertEqual(struct.unpack('!II4Q', description[:40])[4], 4 * 1024 * 1024)
             wrapper.write_text(original)
             stats = self.get_stats(self.stats_ports[0])
             self.assertIn('dcc_busy 0\n', stats)
@@ -753,7 +768,7 @@ with open(args[args.index('-o') + 1], 'ab') as output:
                         if kind & 0x20000:
                             break
                     # Deliberately fragment the response header.
-                    response = struct.pack('!IIII4Q', 0x54000203, 40, 0, 0, 0, 0, 4, 0)
+                    response = struct.pack('!IIII7Q', 0x54000203, 64, 0, 0, 0, 0, 4, 0, 0, 0, 0)
                     net.sendall(response[:3])
                     time.sleep(.01)
                     net.sendall(response[3:])

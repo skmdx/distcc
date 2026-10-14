@@ -30,6 +30,7 @@ struct dcc_job {
 };
 struct dcc_job_result {
     int status, mode;
+    uint64_t prepare_ns, queue_ns, execute_ns; /* Server monotonic phase durations. */
     unsigned long long peak_bytes; /* Local execution telemetry, not wire data. */
     uint64_t size[DCC_JOB_RESULT_COUNT];
     int fd[DCC_JOB_RESULT_COUNT];

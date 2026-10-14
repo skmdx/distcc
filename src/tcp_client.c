@@ -175,11 +175,17 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                             job->inputs[index].kind != DCC_JOB_FILE || count == job->count) goto done;
                         requested[index] = 1; requests[count++] = index;
                     }
-                } else if (type == DCC_TCP_RESULT && !have_result && incoming.size == 40) {
+                } else if (type == DCC_TCP_RESULT && !have_result && incoming.size == 64) {
                     have_result = 1;
                     result->status = dcc_tcp_get32(incoming.data);
                     result->mode = dcc_tcp_get32(incoming.data + 4);
                     if (result->status > 65535 || result->mode > 0777) goto done;
+                    result->prepare_ns = dcc_tcp_get64(incoming.data + 40);
+                    result->queue_ns = dcc_tcp_get64(incoming.data + 48);
+                    result->execute_ns = dcc_tcp_get64(incoming.data + 56);
+                    if (result->prepare_ns > 86400ULL * 1000000000 ||
+                        result->queue_ns > 86400ULL * 1000000000 ||
+                        result->execute_ns > 86400ULL * 1000000000) goto done;
                     uint64_t total = 0;
                     for (unsigned i = 0; i < DCC_JOB_RESULT_COUNT; ++i) {
                         uint64_t size = dcc_tcp_get64(incoming.data + 8 + i * 8);

@@ -19,6 +19,7 @@
 #include "distcc.h"
 #include "file_cache.h"
 #include "resource.h"
+#include "cpuperf.h"
 #include "daemon.h"
 #include "tcp_job.h"
 #include "tcp_async.h"
@@ -51,6 +52,7 @@ struct dcc_tcp_server {
     int socket, failed, metadata, input_fd, local;
     enum phase phase;
     time_t active;
+    uint64_t begun_at, ready_at, started_at;
     /* The reader owns frame; the decoder exclusively owns decoding. */
     struct dcc_tcp_frame frame, decoding;
     struct packet *head, **tail;
@@ -91,6 +93,13 @@ static void output_complete(void *);
 static void copy_input(void *);
 static void copy_complete(void *);
 static int prepare_inputs(struct dcc_tcp_server *);
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec time;
+    clock_gettime(CLOCK_MONOTONIC, &time);
+    return (uint64_t)time.tv_sec * 1000000000 + time.tv_nsec;
+}
 
 int dcc_tcp_server_pending(void)
 {
@@ -140,7 +149,7 @@ uint64_t dcc_tcp_ready_idle_ns(void)
         dcc_prefork_status(&load);
         for (struct dcc_tcp_server *s = ready_head; s; s = s->ready_next)
             if (s->job->kind != DCC_JOB_LINK || !load.links) { eligible = 1; break; }
-        if (eligible) available = dcc_resource_slots(dcc_max_kids) - load.busy;
+        if (eligible) available = dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids)) - load.busy;
     }
     unsigned slots = available > 0 ? available : 0;
     if (slots || idle_slots) {
@@ -514,6 +523,7 @@ uint64_t dcc_tcp_local_input_bytes(void) { return local_input_bytes; }
 static int begin(struct dcc_tcp_server *s, struct dcc_tcp_frame *f)
 {
     if (s->job || s->phase != PREPARING || f->size <= 8 || !(s->run.id = dcc_tcp_get64(f->data))) return -1;
+    s->begun_at = monotonic_ns();
     s->metadata = dcc_job_memfd("distcc-tcp-manifest");
     if (s->metadata < 0 || dcc_writex(s->metadata, f->data + 8, f->size - 8) ||
         dcc_job_decode_buffer(f->data + 8, f->size - 8, &s->job)) return -1;
@@ -686,10 +696,13 @@ void dcc_tcp_server_finished(struct dcc_tcp_server *s, const struct dcc_tcp_fini
     retained += bytes; s->reserved += bytes;
     returning_bytes += bytes; s->result_bytes = bytes;
     s->result.status = r->status; s->result.mode = r->mode;
-    unsigned char description[40];
+    unsigned char description[64];
     dcc_tcp_put32(description, r->status); dcc_tcp_put32(description + 4, r->mode);
     for (unsigned i = 0; i < DCC_JOB_RESULT_COUNT; ++i)
         dcc_tcp_put64(description + 8 + i * 8, r->size[i]);
+    dcc_tcp_put64(description + 40, s->ready_at - s->begun_at);
+    dcc_tcp_put64(description + 48, s->started_at - s->ready_at);
+    dcc_tcp_put64(description + 56, monotonic_ns() - s->started_at);
     s->phase = RETURNING;
     s->active = time(NULL);
     queue(s, DCC_TCP_RESULT, description, sizeof(description));
@@ -847,6 +860,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
     if (s->job && s->phase == PREPARING && s->prepared == s->job->count && !s->remaining) {
         if (!s->enqueued) {
             if (install_links(s)) return -1;
+            s->ready_at = monotonic_ns();
             dcc_tcp_ready_idle_ns();
             s->enqueued = 1; *ready_tail = s; ready_tail = &s->ready_next;
             dcc_tcp_ready_idle_ns();
@@ -902,7 +916,7 @@ void dcc_tcp_dispatch_ready(void)
             int input = s->job->kind == DCC_JOB_COMPILE && s->job->count == 1 ? s->job->inputs[0].fd : -1;
             int ret = s->dispatch->start(s, &s->run, s->metadata, input, link);
             if (ret < 0) { s->failed = 1; dequeue(s); }
-            else if (ret) { dequeue(s); s->phase = RUNNING; }
+            else if (ret) { dequeue(s); s->phase = RUNNING; s->started_at = monotonic_ns(); }
             else if (!link) break;
             else link_waiting = 1;
         }

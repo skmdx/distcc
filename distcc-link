@@ -652,9 +652,9 @@ def tcp_link(net, archive, output):
     if writer.sent != archive.size:
         raise OSError('link input length changed')
     kind, body = receive()
-    if kind != result_type or len(body) != 40:
+    if kind != result_type or len(body) != 64:
         raise OSError('invalid TCP link result')
-    status, mode, *sizes = struct.unpack('!II4Q', body)
+    status, mode, *sizes = struct.unpack('!II4Q', body[:40])
     if status > 65535 or mode > 0o777 or sum(sizes) > 512 * 1024 * 1024:
         raise OSError('invalid TCP link result sizes')
     with tempfile.NamedTemporaryFile(dir=output.absolute().parent,
@@ -737,7 +737,7 @@ def remote_link(job, inputs, output):
                     net.settimeout(float(os.environ.get('DISTCC_IO_TIMEOUT', '300')))
                     status = tcp_link(net, archive, output)
                     try:
-                        lease.sendmsg([struct.pack('=II', 2, 7)],
+                        lease.sendmsg([struct.pack('=II3Q', 2, 7, 0, 0, 0)],
                                       [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                         array.array('i', [net.fileno()]))])
                     except OSError:
@@ -778,7 +778,7 @@ def remote_link(job, inputs, output):
                         temporary.unlink(missing_ok=True)
                 if capabilities & (1 << 30):
                     try:
-                        lease.sendmsg([struct.pack('=II', 2, 7)],
+                        lease.sendmsg([struct.pack('=II3Q', 2, 7, 0, 0, 0)],
                                       [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                         array.array('i', [net.fileno()]))])
                     except OSError:

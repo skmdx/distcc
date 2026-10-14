@@ -104,7 +104,7 @@ void dcc_read_localslots_configuration(void)
 
 
 int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
-                            int *cpu_lock_fd, int cpp_ready)
+                            int *cpu_lock_fd, int cpp_ready, const struct dcc_work_hint *work)
 {
     struct dcc_hostdef *hostlist;
     struct dcc_hostdef *h;
@@ -113,7 +113,7 @@ int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
     const char *broker_path = getenv("DISTCC_BROKER");
 
     if (broker_path && *broker_path)
-        return dcc_broker_acquire(buildhost, cpu_lock_fd, cpp_ready);
+        return dcc_broker_acquire(buildhost, cpu_lock_fd, cpp_ready, work);
 
     if ((ret = dcc_get_hostlist(&hostlist, &n_hosts)) != 0) {
         return EXIT_NO_HOSTS;

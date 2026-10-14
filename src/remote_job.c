@@ -189,7 +189,7 @@ int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, i
     dcc_job_result_init(&result);
     if (!job || (ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result))) goto done;
     /* COMPLETE ends the network transaction; publication is local work. */
-    dcc_broker_return(host, host->broker_fd);
+    dcc_broker_return(host, host->broker_fd, &result);
     transport_complete = 1;
     *status = result.status;
     rs_trace("pooled TCP job completed");

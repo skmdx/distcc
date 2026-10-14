@@ -375,7 +375,7 @@ int dcc_compile_remote(char **argv,
             unsigned end;
             ret = dcc_r_token_int(from_net_fd, "JEND", &end);
             if (!ret && end) ret = EXIT_PROTOCOL_ERROR;
-            if (!ret) dcc_broker_return(host, from_net_fd);
+            if (!ret) dcc_broker_return(host, from_net_fd, NULL);
         }
     }
 

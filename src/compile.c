@@ -58,6 +58,7 @@
 #include "timeval.h"
 #include "compile.h"
 #include "broker.h"
+#include "workload.h"
 #include "include_server_if.h"
 #include "emaillog.h"
 #include "dotd.h"
@@ -727,6 +728,7 @@ dcc_build_somewhere(char *argv[],
     int remote_completed = 0, cpp_ready = 0;
     int retry_count = 0, max_retries, remote_unsupported = 0;
     struct dcc_hostdef *host = NULL;
+    struct dcc_work_hint work = {0};
     char *discrepancy_filename = NULL;
     char **new_argv;
 
@@ -816,6 +818,9 @@ dcc_build_somewhere(char *argv[],
         cpp_ready = 1;
     }
 
+    if (getenv("DISTCC_BROKER"))
+        dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready);
+
     /* Lock ordering invariant: always acquire the lock for the
      * remote host (if any) first. */
 
@@ -825,7 +830,7 @@ dcc_build_somewhere(char *argv[],
     dcc_free_buffer(&server_stderr);
     dcc_free_buffer(&server_stdout);
     remote_completed = 0;
-    if ((ret = dcc_pick_host_from_list_and_lock_it(&host, &cpu_lock_fd, cpp_ready)) != 0) {
+    if ((ret = dcc_pick_host_from_list_and_lock_it(&host, &cpu_lock_fd, cpp_ready, &work)) != 0) {
         /* Doesn't happen at the moment: all failures are masked by
            returning localhost. */
         goto fallback;

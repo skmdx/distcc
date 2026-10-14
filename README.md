@@ -81,8 +81,8 @@ limits. Servers without statistics retain their configured slot count (default
 4). Missing or invalid statistics also use this fallback. Clients and servers
 must report the same statistics schema, including CPU topology and coefficients.
 
-For each eligible host, the broker estimates completion cost from aggregate
-CPU throughput, expressed in units of one idle compile. Throughput interpolates
+For each eligible host, CPU service cost is estimated from aggregate
+throughput, expressed in units of one idle compile. Throughput interpolates
 from 1 at one job to `physical_cores * core_scale` at one job per physical core.
 Each additional SMT thread contributes `smt_gain * core_scale`; throughput is
 bounded below by 1. Work beyond the execution limit queues rather than adding
@@ -97,8 +97,8 @@ same queued jobs twice. Lower completion cost wins. Equal
 estimates favor lower estimated work per configured slot, then list order.
 Missing live runnable counts fall back to the one-minute load average.
 Reported memory PSI (`some avg10`, percent) multiplies the estimate by
-`1 + pressure / 100`. Estimates do not predict individual translation-unit
-sizes, transfer time, compiler-specific speed or container CPU quotas.
+`1 + pressure / 100`. The CPU model does not measure compiler-specific host
+speed or container CPU quotas.
 
 Linux statistics count physical cores from the allowed CPUs' sysfs sibling
 lists and cache the topology until CPU affinity changes. If topology cannot
@@ -173,10 +173,33 @@ snapshot work using the existing connection-return notification. Completions
 first consume the snapshot's returning count, so output-only jobs do not free
 CPU capacity twice. No per-stage IPC or extra network round trip is required.
 Input preparation can overlap execution within a pipeline of up to four jobs
-(also capped by effective parallelism); excess preparation increases the score.
-Prepared-job hosts use the same contention curve with projected work, runnable
-CPU load and memory pressure. Memory capacity bounds concurrency but does not
-make SMT threads equivalent to independent cores.
+(also capped by effective parallelism). For compile jobs with an input-size
+hint, the broker selects the smallest predicted completion time:
+`max(input_ready, cpu_slot_ready) + estimated_work * cpu_service_cost`.
+The existing contention curve accounts for SMT, frequency and external CPU
+load; memory capacity continues to bound execution.
+
+Successful TCP results carry input preparation, queue and execution durations
+in the existing reply and connection-return message. Only execution time is
+normalized by the dispatch-time CPU service cost and learned as compile work.
+The broker keeps 4096 bounded history entries keyed by working directory,
+compiler arguments and input path, excluding output/dependency filenames.
+Repeated inputs use their measured work, adjusted for size changes. Unseen
+inputs use learned bytes-to-work ratios for C, C++ and assembler, with separate
+classes for raw and preprocessed source. Initial ratios are heuristics;
+contents and include trees are not read to calculate a hint. History lasts
+for the broker process lifetime. Frequency or contention changes during a job
+and different optimization costs remain sources of prediction error.
+
+Predicted remaining work determines when an execution slot will become free;
+unobserved jobs from other brokers use the host's recent mean work. Preparation
+time uses measured byte rates. Uploads are deferred while predicted CPU wait
+exceeds preparation time by more than 20ms, retaining work at the broker so it
+can choose another host. Completion notifications and bounded timed wakes
+reconsider waiting jobs. A dispatch pass accounts for earlier waiting jobs
+when forecasting later ones, without reserving server resources. Existing
+recovery probes may bypass this advisory wait. Inputs without a usable hint,
+links and legacy TCP use the aggregate CPU score.
 Execution, ready jobs, preparation and new assignments share this estimated
 global limit of parallelism plus pipeline depth. Returning jobs have a separate
 bounded allowance for socket leases. A zero memory capacity stops new uploads;

@@ -62,11 +62,14 @@ class BrokerTestCase(DistccTestCase):
                         TMPDIR=str(self.work))
         return proc
 
-    def request(self, command=1):
+    def request(self, command=1, work=(0, 0, 0)):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
-        sock.sendall(struct.pack("=II", 2, command))
+        payload = struct.pack("=II", 2, command)
+        if command in (6, 9, 10):
+            payload += struct.pack('=QQII', *work, 0)
+        sock.sendall(payload)
         self.addCleanup(sock.close)
         return sock
 
@@ -118,8 +121,8 @@ class BrokerTest(BrokerTestCase):
         waiter.close()
         self.assertEqual(self.receive(self.request(12)), (0, 1, []))
 
-    def acquire_reserved(self, command=6):
-        lease = self.request(command)
+    def acquire_reserved(self, command=6, work=(0, 0, 0)):
+        lease = self.request(command, work)
         status, capabilities, fds = self.receive(lease)
         self.assertEqual(status, 0)
         self.assertTrue(capabilities & (1 << 30))
@@ -189,6 +192,61 @@ class BrokerTest(BrokerTestCase):
         peer.response = b'garbage'
         time.sleep(1.05)
         self.assertEqual(jobs(), 8)
+
+    def test_job_cost_waits_for_fast_cpu_without_holding_back_small_jobs(self):
+        peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
+                    queued=0, preparing=0, returning=0, capacity=1)) for _ in range(2)]
+        hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else 1}')
+                         for i, p in enumerate(peers))
+        self.start_broker(hosts)
+        first, net = self.acquire_reserved(10, (1, 4 * 1024 * 1024, 1))
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+        heavy = self.request(10, (2, 16 * 1024 * 1024, 1))
+        heavy.settimeout(.05)
+        with self.assertRaises(socket.timeout):
+            heavy.recv(1032)
+        # The waiting heavy job owns only a forecast position. A small job
+        # must use the other CPU rather than wait for that same fast slot.
+        _, small = self.acquire_reserved(10, (3, 64 * 1024, 1))
+        self.assertEqual(small.getpeername()[1], self.ports[1])
+        first.close()
+        heavy.settimeout(1)
+        status, _, descriptors = self.receive(heavy)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(descriptors), 1)
+        with socket.socket(fileno=descriptors[0]) as selected:
+            self.assertEqual(selected.getpeername()[1], self.ports[0])
+
+    def test_job_cost_learns_execution_cost(self):
+        peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
+                    queued=0, preparing=0, returning=0, capacity=1)) for _ in range(2)]
+        hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else 1}')
+                         for i, p in enumerate(peers))
+        self.start_broker(hosts)
+        seed, net = self.acquire_reserved(10, (11, 4 * 1024 * 1024, 1))
+        seed.sendmsg([struct.pack('=II3Q', 2, 7, 0, 90_000_000_000, 10_000_000_000)],
+                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+        # An exact repeat learns 20 normalized seconds from ten execution
+        # seconds on speed=2. The unrelated C++ class remains untrained.
+        _, repeated = self.acquire_reserved(10, (11, 4 * 1024 * 1024, 1))
+        self.assertEqual(repeated.getpeername()[1], self.ports[0])
+        _, other = self.acquire_reserved(10, (12, 2 * 1024 * 1024, 2))
+        self.assertEqual(other.getpeername()[1], self.ports[1])
+
+    def test_job_cost_excludes_queue_time(self):
+        peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
+                    queued=0, preparing=0, returning=0, capacity=1)) for _ in range(2)]
+        hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else 1}')
+                         for i, p in enumerate(peers))
+        self.start_broker(hosts)
+        seed, net = self.acquire_reserved(10, (21, 4 * 1024 * 1024, 1))
+        seed.sendmsg([struct.pack('=II3Q', 2, 7, 0, 90_000_000_000, 100_000_000)],
+                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+        self.acquire_reserved(10, (21, 4 * 1024 * 1024, 1))
+        # Ninety seconds of old queueing must not turn this repeat into a
+        # long-running job. Waiting briefly for the fast CPU is still better.
+        _, other = self.acquire_reserved(10, (22, 2 * 1024 * 1024, 2))
+        self.assertEqual(other.getpeername()[1], self.ports[0])
 
     def test_tcp_smt_contention_prefers_spare_physical_cores(self):
         first = self.peer(stats_response(cpus=8, cores=4, jobs=8, running=4, busy=4,
@@ -289,7 +347,7 @@ class BrokerTest(BrokerTestCase):
         _, net = self.acquire_reserved(10)
         self.assertEqual(net.getpeername()[1], self.ports[1])
         for lease, net in held:
-            lease.sendmsg([struct.pack('=II', 2, 7)],
+            lease.sendmsg([struct.pack('=II3Q', 2, 7, 0, 0, 0)],
                           [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
             net.close()
         _, net = self.acquire_reserved(10)
