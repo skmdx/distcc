@@ -76,13 +76,16 @@ CPU count and `--jobs` limit. An explicit `/LIMIT`, for example
 limits. Servers without statistics retain their configured slot count (default
 4). An old server without the new `dcc_cpus` metric also uses this fallback.
 
-For each eligible prepared-job host, the broker scores normalized demand as
-`max((work + 1) / parallelism, (runnable + 1) / cpus) / speed`.
-Legacy paths retain a minimum service cost of 1 before dividing by speed.
+For each eligible host, the broker scores estimated completion cost as
+`max(1, (work + 1) / parallelism, (runnable + 1) / cpus) / speed`.
+Idle cores permit concurrent jobs, but cannot reduce a single compile below
+its own execution time. The lower bound favors faster workers for short
+queues and the build tail; bounded per-host pipelines still spill work to
+other workers when faster workers fill.
 Parallelism is the smallest of CPUs, the server's job limit and its reported
 memory admission capacity. Legacy paths use the larger of local reservations
 and the sum of server execution and ready-queue counts; they do not add the
-same queued jobs twice. Lower normalized demand wins. Equal
+same queued jobs twice. Lower completion cost wins. Equal
 estimates favor lower estimated work per configured slot, then list order.
 Missing live runnable counts fall back to the one-minute load average.
 Reported memory PSI (`some avg10`, percent) multiplies the estimate by

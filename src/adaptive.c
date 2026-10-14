@@ -228,7 +228,9 @@ double dcc_capacity_score(const struct dcc_hostdef *host,
 {
     int slots = dcc_capacity_slots(host, cap), occupied = busy;
     int parallelism = cap ? (cap->cpus < cap->jobs ? cap->cpus : cap->jobs) : slots;
-    double service = host->tcp_jobs ? 0 : 1, demand;
+    /* Spare cores allow concurrency, not a fraction of one compile's runtime.
+     * Below saturation compare single-job speed; above it include queueing. */
+    double service = 1, demand;
     if (cap) {
         int remote = (cap->busy > 0 ? cap->busy : 0) + (cap->queued > 0 ? cap->queued : 0);
         if (remote > occupied) occupied = remote;
