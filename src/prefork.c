@@ -60,6 +60,7 @@
 #include "netutil.h"
 #include "stats.h"
 #include "resource.h"
+#include "cpuperf.h"
 
 void dcc_manage_kids(int listen_fd);
 static void dcc_sigchld_handler(int sig);
@@ -100,7 +101,8 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
 {
     struct dcc_server_load load;
     dcc_prefork_status(&load);
-    if (load.busy >= dcc_resource_slots(dcc_max_kids) || (link && load.links)) return 0;
+    if (load.busy >= dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids)) ||
+        (link && load.links)) return 0;
     for (int i = 0; i < worker_count; ++i) {
         struct worker *w = &workers[i];
         if (w->fd < 0 || w->busy) continue;
@@ -111,6 +113,7 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
             return -1;
         }
         w->tcp = job; w->busy = EXECUTING; w->link = link;
+        dcc_cpu_perf_started();
         return 1;
     }
     return 0;
@@ -274,6 +277,10 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
     polls[count] = (struct pollfd){ listen_fd, POLLIN, 0 };
     for (i = 0; i < worker_count; ++i)
         polls[base + i] = (struct pollfd){ workers[i].fd, POLLIN, 0 };
+    int busy = 0;
+    for (i = 0; i < worker_count; ++i)
+        busy += workers[i].fd >= 0 && workers[i].busy == EXECUTING;
+    timeout = dcc_cpu_perf_poll(busy, timeout);
     for (i = 0; i < MAX_PENDING; ++i) {
         struct pending *p = &pending[i];
         if (p->fd >= 0 && now - p->since >= (p->ready ? dcc_get_io_timeout() : 30)) {
@@ -333,7 +340,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
         if (p->fd < 0 || !p->ready) continue;
         struct dcc_server_load load;
         dcc_prefork_status(&load);
-        int limit = dcc_resource_slots(dcc_max_kids);
+        int limit = dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids));
         if (p->used) {
             int is_link = p->request[11] == '2';
             for (j = 0; j < worker_count; ++j)
@@ -363,6 +370,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             }
             w->busy = 1;
             w->link = p->used && p->request[11] == '2';
+            dcc_cpu_perf_started();
             /* A dead worker channel must not produce a grant followed by a
              * second reply. Grant only after a worker owns the connection. */
             if (p->used && send(p->fd, "GRNT00000001", 12, MSG_NOSIGNAL | MSG_DONTWAIT) != 12)
@@ -537,6 +545,7 @@ static void dcc_create_kids(int listen_fd) {
  **/
 static int dcc_preforked_child(int listen_fd)
 {
+    dcc_cpu_perf_child();
     int ireq;
     time_t start, now;
     const int child_requests = 50;

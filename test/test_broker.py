@@ -200,6 +200,21 @@ class BrokerTest(BrokerTestCase):
         _, net = self.acquire_reserved(10)
         self.assertEqual(net.getpeername()[1], self.ports[1])
 
+    def test_tcp_throttled_host_gets_only_one_recovery_trial(self):
+        first = self.peer(stats_response(cpu_scale=.2, cpu_age=20, cpu_probe=1,
+                                        busy=0, queued=0, preparing=0, returning=0, capacity=1))
+        second = self.peer(stats_response(busy=0, queued=0, preparing=0, returning=0, capacity=4))
+        hosts = self.host(0, f',tcp,stats={first.port}') + ' ' + self.host(1, f',tcp,stats={second.port}')
+        self.start_broker(hosts)
+        lease, net = self.acquire_reserved(10)
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+        net.close()
+        lease.close()
+        # Even a completed/cancelled short trial cannot trigger another probe
+        # from the same stale stats snapshot.
+        _, next_net = self.acquire_reserved(10)
+        self.assertEqual(next_net.getpeername()[1], self.ports[1])
+
     def test_tcp_global_pipeline_and_resource_limits(self):
         for name, metrics in (
                 ('memory', dict(capacity=0)),

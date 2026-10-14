@@ -48,7 +48,8 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
     double value;
     *cap = (struct dcc_capacity){ .running = -1, .busy = -1, .queued = -1,
                                  .links = -1, .available = -1, .memory_pressure = -1,
-                                 .preparing = -1, .returning = -1, .capacity = -1 };
+                                 .preparing = -1, .returning = -1, .capacity = -1,
+                                 .cpu_scale = -1, .cpu_age = -1 };
     if ((strncmp(buf, "HTTP/1.0 200 ", 13) &&
          strncmp(buf, "HTTP/1.1 200 ", 13)) ||
         !(line = strstr(buf, "\n<distccstats>\n")) ||
@@ -78,6 +79,21 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
                 !(value >= -1 && value <= 1)) return -1;
             cap->smt_gain = value;
             fields |= 16384;
+        } else if (!strncmp(line, "dcc_cpu_scale ", 14)) {
+            if ((fields & 65536) || sscanf(line + 14, "%lf %c", &value, &extra) != 1 ||
+                !(value == -1 || (value > 0 && value <= 1))) return -1;
+            cap->cpu_scale = value;
+            fields |= 65536;
+        } else if (!strncmp(line, "dcc_cpu_age ", 12)) {
+            if ((fields & 131072) || sscanf(line + 12, "%lf %c", &value, &extra) != 1 ||
+                !(value == -1 || (value >= 0 && value <= 1e9))) return -1;
+            cap->cpu_age = value;
+            fields |= 131072;
+        } else if (!strncmp(line, "dcc_cpu_probe ", 14)) {
+            if ((fields & 262144) || sscanf(line + 14, "%lf %c", &value, &extra) != 1 ||
+                !(value == 0 || value == 1)) return -1;
+            cap->cpu_probe = value;
+            fields |= 262144;
         } else if (!strncmp(line, "dcc_max_kids ", 13)) {
             if ((fields & 2) || sscanf(line + 13, "%lf %c", &value, &extra) != 1 ||
                 !(value >= 1 && value <= 10000) || value != (int)value)
@@ -114,8 +130,10 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
             }
         }
     }
-    const int required = 7 | 8192 | 16384 | 32768;
-    return (fields & required) == required && cap->cores <= cap->cpus ? 0 : -1;
+    const int required = 7 | 8192 | 16384 | 32768 | 65536 | 131072 | 262144;
+    return (fields & required) == required && cap->cores <= cap->cpus &&
+           ((cap->cpu_scale == -1 && cap->cpu_age == -1 && !cap->cpu_probe) ||
+            (cap->cpu_scale > 0 && cap->cpu_age >= 0)) ? 0 : -1;
 }
 
 /* Isolate the existing resolver and socket code so the entire probe, including
@@ -165,7 +183,7 @@ static int query_capacity(const struct dcc_hostdef *host, struct dcc_capacity *c
 static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *cap)
 {
     struct dcc_hostdef endpoint = *host;
-    char buf[256];
+    char buf[384];
     long stamp;
     time_t now;
     int fd, valid, len;
@@ -178,11 +196,12 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
     n = read(fd, buf, sizeof(buf) - 1);
     if (n > 0) {
         buf[n] = '\0';
-        if (sscanf(buf, "%ld %d %d %d %lf %d %d %d %d %d %lf %d %d %d %d %d %lf %lf", &stamp, &valid,
+        if (sscanf(buf, "%ld %d %d %d %lf %d %d %d %d %d %lf %d %d %d %d %d %lf %lf %lf %lf %d", &stamp, &valid,
                    &cap->cpus, &cap->jobs, &cap->load, &cap->running, &cap->busy,
                    &cap->queued, &cap->links, &cap->admission, &cap->memory_pressure, &cap->available,
                    &cap->preparing, &cap->returning, &cap->capacity,
-                   &cap->cores, &cap->core_scale, &cap->smt_gain) == 18 &&
+                   &cap->cores, &cap->core_scale, &cap->smt_gain,
+                   &cap->cpu_scale, &cap->cpu_age, &cap->cpu_probe) == 21 &&
             stamp == (long)now &&
             (valid == 0 || (valid == 1 && cap->cpus > 0 &&
              cap->cpus <= 10000 && cap->jobs > 0 && cap->jobs <= 10000 &&
@@ -197,7 +216,11 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
              cap->capacity >= -1 && cap->capacity <= 1000000 &&
              cap->cores >= 1 && cap->cores <= cap->cpus &&
              cap->core_scale >= 0 && cap->core_scale <= 1 &&
-             cap->smt_gain >= -1 && cap->smt_gain <= 1))) {
+             cap->smt_gain >= -1 && cap->smt_gain <= 1 &&
+             ((cap->cpu_scale == -1 && cap->cpu_age == -1 && !cap->cpu_probe) ||
+              (cap->cpu_scale > 0 && cap->cpu_scale <= 1 &&
+               cap->cpu_age >= 0 && cap->cpu_age <= 1e9 &&
+               (cap->cpu_probe == 0 || cap->cpu_probe == 1)))))) {
             dcc_unlock(fd);
             return valid ? 0 : -1;
         }
@@ -207,11 +230,12 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
     if (!valid)
         rs_log_warning("adaptive stats unavailable for %s; using configured slots/speed",
                        host->hostname);
-    len = snprintf(buf, sizeof(buf), "%ld %d %d %d %.17g %d %d %d %d %d %.2f %d %d %d %d %d %.17g %.17g\n",
+    len = snprintf(buf, sizeof(buf), "%ld %d %d %d %.17g %d %d %d %d %d %.2f %d %d %d %d %d %.17g %.17g %.17g %.17g %d\n",
                    (long)time(NULL), valid, cap->cpus, cap->jobs, cap->load,
                    cap->running, cap->busy, cap->queued, cap->links, cap->admission,
                    cap->memory_pressure, cap->available, cap->preparing, cap->returning,
-                   cap->capacity, cap->cores, cap->core_scale, cap->smt_gain);
+                   cap->capacity, cap->cores, cap->core_scale, cap->smt_gain,
+                   cap->cpu_scale, cap->cpu_age, cap->cpu_probe);
     if (lseek(fd, 0, SEEK_SET) < 0 || ftruncate(fd, 0) ||
         write(fd, buf, len) != len)
         rs_log_warning("could not cache adaptive stats");
@@ -282,6 +306,9 @@ double dcc_capacity_score(const struct dcc_hostdef *host,
                              cap->cpus, cap);
         if (demand > service) service = demand;
         if (cap->memory_pressure > 0) service *= 1 + cap->memory_pressure / 100;
+        /* Apply after the contention floor so even one job can slow down.
+         * The ratio is relative to the calibrated clock at the observed load. */
+        if (cap->cpu_scale > 0) service /= cap->cpu_scale;
     }
     return service / (host->speed ? host->speed : 1);
 }
@@ -361,6 +388,8 @@ int dcc_lock_adaptive(struct dcc_hostdef *hosts,
         if (first < 0)
             continue;
         score = dcc_capacity_score(c->host, c->cap, busy);
+        if (c->cap && c->cap->cpu_probe && !busy && !c->cap->busy && !c->cap->queued)
+            score = 0;
         if (best_fd < 0 || score < best_score ||
             (score == best_score && (busy + 1.0) / c->slots < best_fill)) {
             if (best_fd >= 0)

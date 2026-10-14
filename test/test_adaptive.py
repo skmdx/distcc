@@ -27,12 +27,16 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def stats_response(cpus=4, jobs=4, load: float | str = 0, cores=None,
-                   core_scale: float | str = 1, smt_gain: float | str = .25, **metrics):
+def stats_response(cpus: float | str = 4, jobs: float | str = 4,
+                   load: float | str = 0, cores=None,
+                   core_scale: float | str = 1, smt_gain: float | str = .25,
+                   cpu_scale: float | str = -1, cpu_age: float | str = -1,
+                   cpu_probe: float | str = 0, **metrics):
     return ("HTTP/1.0 200 OK\n\n<distccstats>\n"
             f"dcc_cpus {cpus}\ndcc_max_kids {jobs}\ndcc_load1 {load}\n"
             f"dcc_cores {cpus if cores is None else cores}\ndcc_smt_gain {smt_gain}\n"
             f"dcc_core_scale {core_scale}\n"
+            f"dcc_cpu_scale {cpu_scale}\ndcc_cpu_age {cpu_age}\ndcc_cpu_probe {cpu_probe}\n"
             + ''.join(f'dcc_{name} {value}\n' for name, value in metrics.items())
             + "</distccstats>\n").encode()
 
@@ -367,6 +371,29 @@ class AdaptiveTest(DistccTestCase):
         self.assertEqual(peer.requests, 1)
         self.assertEqual(other.requests, 1)
 
+    def test_cpu_slowdown_including_single_job(self):
+        slow = self.peer(stats_response(cpu_scale=.25, cpu_age=.5))
+        steady = self.peer(stats_response())
+        hosts = (self.host(0, f",stats={slow.port},speed=2") + " " +
+                 self.host(1, f",stats={steady.port},speed=1"))
+        # A fast but throttled idle core must lose even without contention.
+        time.sleep(1 - time.time() % 1 + .02)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda i: self.compile(hosts, f"throttled{i}"), range(2)))
+        self.assertEqual([port for port, _ in results], [self.ports[1]] * 2)
+        self.assertEqual(slow.requests, 1)
+        self.assertEqual(steady.requests, 1)
+
+    def test_invalid_cpu_capacity_is_unavailable(self):
+        for i, metrics in enumerate((dict(cpu_scale=0, cpu_age=0),
+                                     dict(cpu_scale="nan", cpu_age=0),
+                                     dict(cpu_scale=.5, cpu_age=-1),
+                                     dict(cpu_scale=.5, cpu_age=0, cpu_probe=2))):
+            with self.subTest(metrics=metrics):
+                peer = self.peer(stats_response(**metrics))
+                _, log = self.compile(self.host(0, f",stats={peer.port}"), f"invalid-cpu{i}")
+                self.assertIn("adaptive stats unavailable", log)
+
     def test_duplicate_host_keeps_slot_locked(self):
         host = self.host(0, ",speed=2", slots=1)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -459,6 +486,63 @@ int main(void) {
             subprocess.run(['gcc','-Isrc',str(source),'src/resource.c','-o',str(executable)],
                            check=True,capture_output=True)
             subprocess.run([str(executable)],check=True,capture_output=True)
+
+
+class CpuPerfTest(DistccTestCase):
+    # Deliberately above hardware frequency, making a measurable reduction
+    # without changing the machine's governor or frequency limits.
+    daemon_env = {'DISTCC_CPU_FREQ_REF': '10000000,10000000,10000000'}
+
+    def test_live_sampling_idle_and_global_recovery(self):
+        if not list(Path('/sys/devices/system/cpu/cpufreq').glob('policy*/cpuinfo_avg_freq')):
+            self.skipTest('hardware frequency feedback is unavailable')
+        self.source.write_text('int main(void) { return 0; }\n' + ''.join(
+            f'int f{i}(int x) {{ return (x + {i}) * (x ^ {i}); }}\n' for i in range(10000)))
+        host = self.host(0, f',stats={self.stats_ports[0]}')
+        self.compile(host, 'warm')
+
+        def metrics():
+            return dict(line.split(' ', 1) for line in self.get_stats(self.stats_ports[0]).splitlines()
+                        if line.startswith('dcc_'))
+
+        warm = metrics()
+        self.assertGreater(int(warm['dcc_cpu_samples']), 0, warm)
+        self.assertGreater(float(warm['dcc_cpu_scale']), 0)
+        self.assertLess(float(warm['dcc_cpu_scale']), .9)
+        time.sleep(10.1)
+        idle = metrics()
+        self.assertEqual(idle['dcc_cpu_samples'], warm['dcc_cpu_samples'])
+        self.assertEqual(idle['dcc_cpu_scale'], warm['dcc_cpu_scale'])
+        self.assertEqual(idle['dcc_cpu_probe'], '1')
+        self.assertEqual(idle['dcc_capacity'], '1')
+        # Independent client processes must not start two recovery compilers.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            jobs = [pool.submit(self.compile, host, f'recover{i}') for i in range(2)]
+            end = time.monotonic() + 1.5
+            seen_busy = False
+            while time.monotonic() < end:
+                current = metrics()
+                busy = int(current['dcc_busy'])
+                seen_busy |= busy == 1
+                self.assertLessEqual(busy, 1, current)
+                time.sleep(.1)
+            for job in jobs:
+                job.result()
+        self.assertTrue(seen_busy)
+        self.assertGreater(int(metrics()['dcc_cpu_samples']), int(warm['dcc_cpu_samples']))
+        # A tiny job cannot provide 100ms of busy feedback. Its trial must
+        # still release the global one-worker limit, retaining the old scale.
+        time.sleep(10.1)
+        stale = metrics()
+        self.assertEqual(stale['dcc_cpu_probe'], '1')
+        self.source.write_text('int main(void) { return 0; }\n')
+        self.compile(host, 'tiny-recovery')
+        time.sleep(2.1)
+        expired = metrics()
+        self.assertEqual(expired['dcc_cpu_samples'], stale['dcc_cpu_samples'])
+        self.assertEqual(expired['dcc_cpu_scale'], stale['dcc_cpu_scale'])
+        self.assertEqual(expired['dcc_cpu_probe'], '0')
+        self.assertGreater(int(expired['dcc_capacity']), 1)
 
 
 class CpuCalibrationTest(DistccTestCase):

@@ -3,6 +3,8 @@ struct dcc_hostdef;
 struct dcc_capacity {
     int cpus, cores, jobs;
     double core_scale, smt_gain;
+    double cpu_scale, cpu_age;
+    int cpu_probe;
     double load, memory_pressure;
     /* Optional live metrics; -1 means unavailable, never idle. */
     int running, busy, queued, links, admission, available;

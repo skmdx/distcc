@@ -280,7 +280,7 @@ distcc_obj = src/backoff.o						\
 
 distccd_obj = src/access.o						\
 	src/daemon.o  src/dopt.o src/dparent.o src/dsignal.o		\
-	src/ncpus.o							\
+	src/ncpus.o src/cpuperf.o						\
 	src/prefork.o							\
 	src/stringmap.o							\
 	src/serve.o src/setuid.o src/srvnet.o src/srvrpc.o src/state.o	\
@@ -355,7 +355,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c			\
 	src/loadfile.c src/lock.c 					\
 	src/mon.c src/mon-notify.c src/mon-text.c			\
 	src/mon-gnome.c							\
-	src/ncpus.c src/netutil.c					\
+	src/ncpus.c src/cpuperf.c src/netutil.c				\
 	src/prefork.c src/pump.c					\
 	src/remote.c src/renderer.c src/resource.c src/rpc.c		\
 	src/safeguard.c src/sendfile.c src/setuid.c src/serve.c		\
@@ -372,7 +372,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c			\
 	src/zeroconf.c src/zeroconf-reg.c src/gcc-id.c
 
 
-HEADERS = src/stats.h src/adaptive.h src/broker.h src/file_cache.h	\
+HEADERS = src/stats.h src/adaptive.h src/broker.h src/cpuperf.h src/file_cache.h	\
 	src/access.h							\
 	src/auth.h							\
 	src/bulk.h							\

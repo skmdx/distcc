@@ -109,6 +109,40 @@ these coefficients affect selection, not hard worker or memory limits.
 They are fixed calibration values, while occupancy and runnable load refresh
 with statistics. Restart the daemon after changing them.
 
+To account for changing CPU frequency, also set `DISTCC_CPU_FREQ_REF=F1,FP,FL`
+on the server. These are hardware-observed frequencies in kHz, measured alongside
+the calibration batches at one job, one job per physical core, and one job per
+logical CPU. Use the same batches for the contention coefficients and frequency
+references; using a maximum advertised clock would count normal multicore clock
+reductions twice. Keep the client `speed` consistent with the single-job batch.
+
+On Linux the daemon samples `cpuinfo_avg_freq` and per-CPU `/proc/stat` counters
+at most twice per second while workers execute. Active CPU time weights the
+frequency; idle intervals and samples covering less than 80% of busy CPU time
+are excluded. The reference frequency interpolates at the observed active CPU
+count. The current/reference ratio, capped at 1, scales the CPU service cost
+once, including single-job work. Frequency is an approximation to compilation
+capacity, not a cross-machine speed measurement. The filter uses
+`alpha = dt / (tau + dt)`, with tau 0.5 seconds for decreases and 10 seconds for
+increases. Idle time never advances recovery or changes the reference curve.
+
+Statistics expose `dcc_cpu_scale`, `dcc_cpu_age` (seconds since the last valid
+sample), `dcc_cpu_probe`, frequency/reference in kHz, active CPU count, and sample
+count. A scale and age of -1 mean unavailable, including when calibration is
+disabled or hardware feedback is absent. Temperature and privileged MSR reads
+are not required. The samples share the existing statistics response and add no
+per-job IPC or network round trip.
+
+After ten seconds without a valid sample, an idle degraded host becomes eligible
+for a real recovery job. Brokers offer at most one trial per ten seconds. The
+server admits at most one compiler for a two-second trial, retaining waiting
+jobs in the existing queues. A fresh sample during the trial extends the limit
+for two seconds so clients can refresh. If feedback is still unavailable, the
+trial expires rather than serializing short jobs indefinitely. Worker and memory
+ceilings still apply.
+Already running compilers continue. Missing telemetry retains the last measured
+reduction; it is never treated as proof of recovery.
+
 To calibrate, measure batch completion time for identical representative
 compiles started together at concurrency 1, P (physical cores), and L (logical
 CPUs). Average repeated batches to obtain T1, TP, TL.

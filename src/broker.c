@@ -52,7 +52,7 @@ struct peer {
     int busy, stats_fd, stats_reading;
     uint64_t serial, probe_serial, observed_serial;
     int completed;
-    double full_until, link_until;
+    double full_until, link_until, probe_after;
     int pool_supported;
     int admission_supported;
     int local;
@@ -541,7 +541,7 @@ static int dispatch(struct broker *broker, struct client *client, double now)
         }
         return 0;
     }
-    int i, slots, best = -1, available = 0;
+    int i, slots, best = -1, available = 0, best_probe = 0;
     double best_score = 0, best_fill = 0;
     int link = client->command == ACQUIRE_LINK;
     int local_cpp = !link && client->command != ACQUIRE_CPP && client->command != ACQUIRE_READY;
@@ -604,10 +604,16 @@ static int dispatch(struct broker *broker, struct client *client, double now)
         }
         if (p->busy < inflight) {
             double score = dcc_capacity_score(p->host, cap, work);
+            /* An idle host with stale degraded telemetry gets one real job
+             * to observe recovery. Projection prevents this broker from
+             * flooding it; server admission serializes different clients. */
+            int probe = !link && cap && cap->cpu_probe && work == 0 && now >= p->probe_after;
+            if (probe) score = 0;
             double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;
             if (best < 0 || score < best_score || (score == best_score && fill < best_fill)) {
                 best = i;
+                best_probe = probe;
                 best_score = score;
                 best_fill = fill;
             }
@@ -641,6 +647,7 @@ static int dispatch(struct broker *broker, struct client *client, double now)
             return 1;
         }
         client->peer = best;
+        if (best_probe) p->probe_after = now + 10;
         client->serial = ++p->serial;
         client->state = CONNECTING;
         client->deadline = now + 3;

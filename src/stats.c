@@ -47,6 +47,7 @@
 #include "fcntl.h"
 #include "daemon.h"
 #include "resource.h"
+#include "cpuperf.h"
 #include <poll.h>
 #ifdef __linux__
 #include "tcp_job.h"
@@ -369,6 +370,7 @@ static void dcc_service_stats_request(int http_fd) {
     int free_mem_mb;
     int ncpus, ncores;
     double core_scale, smt_gain;
+    struct dcc_cpu_perf perf;
     struct dcc_server_load load = { .busy = -1, .queued = -1, .links = -1,
                                     .preparing = -1, .returning = -1 };
     int admission = 0, available = -1, capacity = -1;
@@ -401,6 +403,13 @@ dcc_cpus %d\n\
 dcc_cores %d\n\
 dcc_core_scale %.3f\n\
 dcc_smt_gain %.3f\n\
+dcc_cpu_scale %.6f\n\
+dcc_cpu_age %.3f\n\
+dcc_cpu_probe %d\n\
+dcc_cpu_frequency %.0f\n\
+dcc_cpu_reference %.0f\n\
+dcc_cpu_active %.3f\n\
+dcc_cpu_samples %lu\n\
 dcc_avg_kids1 %d\n\
 dcc_avg_kids2 %d\n\
 dcc_avg_kids3 %d\n\
@@ -441,9 +450,10 @@ dcc_free_mem %d MB\n\
     ct = dcc_stats_get_compile_totals();
     dcc_getloadavg(loadavg);
     dcc_cpu_topology(&ncpus, &ncores, &core_scale, &smt_gain);
+    dcc_cpu_perf_get(&perf);
 #ifdef __linux__
     admission = dcc_prefork_status(&load);
-    capacity = dcc_resource_slots(dcc_max_kids);
+    capacity = dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids));
     available = capacity - load.busy;
     if (available < 0) available = 0;
     memory_pressure = dcc_memory_pressure();
@@ -480,6 +490,8 @@ dcc_free_mem %d MB\n\
                                dcc_max_kids,
                                ncpus,
                                ncores, core_scale, smt_gain,
+                               perf.scale, perf.age, perf.probe,
+                               perf.frequency, perf.reference, perf.active, perf.samples,
                                dcc_stats.kids_avg[0],
                                dcc_stats.kids_avg[1],
                                dcc_stats.kids_avg[2],
