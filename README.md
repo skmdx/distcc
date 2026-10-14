@@ -89,6 +89,12 @@ Reported memory PSI (`some avg10`, percent) multiplies the estimate by
 `1 + pressure / 100`. Estimates do not predict individual translation-unit
 sizes, transfer time, compiler-specific speed or container CPU quotas.
 
+For a distributed Ninja build, bound total jobs with `-j`. A local load limit
+(`-l`) can stop new remote jobs when the client also executes compiler work,
+even while other workers are idle. Benchmark with the same explicit job count
+and without that local load limit before tuning memory admission or transport.
+Keep worker memory limits and the local preprocessing slot limit enabled.
+
 With `,tcp` and live pipeline statistics, the broker projects the global server
 snapshot instead of counting all local socket leases as CPU work. It adds
 outstanding assignments made since the probe started, and subtracts completed
