@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/sendfile.h>
 #include <arpa/inet.h>
 #include "distcc.h"
 #include "hosts.h"
@@ -152,9 +153,25 @@ static int buffer_result(int fd, const struct dcc_job_result *result, unsigned i
 }
 /* Complete output is published atomically. A transport failure never replaces
  * a previous object with a prefix, and successful empty outputs still exist. */
-static int publish(int *source, const struct dcc_job_result *result, unsigned index, const char *path)
+static int publish(int *source, struct dcc_job_result *result, unsigned index, const char *path)
 {
     if (!path || !strcmp(path, "-") || !strcmp(path, "/dev/null")) return 0;
+    if (!result->temporary[index]) {
+        if (asprintf(&result->temporary[index], "%s.distcc-XXXXXX", path) < 0) {
+            result->temporary[index] = NULL; return EXIT_OUT_OF_MEMORY;
+        }
+        int destination = mkstemp(result->temporary[index]);
+        if (destination < 0) return EXIT_IO_ERROR;
+        off_t offset = 0;
+        while ((uint64_t)offset < result->size[index]) {
+            uint64_t left = result->size[index] - offset;
+            ssize_t copied = sendfile(destination, *source, &offset,
+                left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK);
+            if (copied < 0 && errno == EINTR) continue;
+            if (copied <= 0) { close(destination); return EXIT_IO_ERROR; }
+        }
+        close(*source); *source = destination;
+    }
     mode_t mask = umask(0);
     umask(mask);
     if (fchmod(*source, 0666 & ~mask)) return EXIT_IO_ERROR;

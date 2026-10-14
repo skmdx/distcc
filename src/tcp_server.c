@@ -70,6 +70,9 @@ struct dcc_tcp_server {
     struct packet *encoded;
     size_t encoding_bytes;
     int input_error;
+    unsigned cache_index, borrowers;
+    int cache_hit;
+    struct input *copy_source;
 };
 /* The parent event loop alone owns these. Children abandon inherited FDs. */
 static struct upload *uploads[256];
@@ -81,36 +84,38 @@ static unsigned idle_slots;
 static uint64_t input_prefetch_bytes, output_overlaps;
 uint64_t dcc_tcp_input_prefetch_bytes(void) { return input_prefetch_bytes; }
 uint64_t dcc_tcp_output_overlaps(void) { return output_overlaps; }
-static struct dcc_tcp_server *abandoned;
 static void completed_input(struct input *);
 static void unhash(struct upload *);
+static void input_complete(void *);
+static void output_complete(void *);
+static void copy_input(void *);
+static void copy_complete(void *);
+static int prepare_inputs(struct dcc_tcp_server *);
 
 int dcc_tcp_server_pending(void)
 {
     for (unsigned i = 0; i < 256; ++i)
-        for (struct upload *u = uploads[i]; u; u = u->next) if (u->ready) return 1;
+        for (struct upload *u = uploads[i]; u; u = u->next)
+            if (u->ready && (!u->waiters || !u->waiters->server->work.run)) return 1;
     return 0;
 }
 
 void dcc_tcp_server_collect(void)
 {
-    struct dcc_tcp_server **p = &abandoned;
-    while (*p) {
-        struct dcc_tcp_server *s = *p;
-        if (!atomic_load_explicit(&s->work.done, memory_order_acquire)) { p = &s->ready_next; continue; }
-        *p = s->ready_next;
-        s->work.run = NULL;
-        dcc_tcp_server_free(s);
-    }
     /* One private snapshot per turn. The verified source remains PREPARING
      * until every dependant has its own inode; no compiler can mutate it. */
     for (unsigned i = 0; i < 256; ++i) for (struct upload *u = uploads[i]; u; u = u->next) {
         if (!u->ready) continue;
         struct input *w = u->waiters;
         if (w) {
-            u->waiters = w->next; w->next = NULL; w->upload = NULL;
-            if (dcc_file_cache_copy(NULL, u->owner->path, w->path)) completed_input(w);
-            else w->server->failed = 1;
+            struct dcc_tcp_server *s = w->server;
+            if (s->work.run) continue;
+            s->cache_index = w->index; s->copy_source = u->owner;
+            ++u->owner->server->borrowers;
+            if (dcc_tcp_async_submit(&s->work, copy_input, copy_complete, s)) {
+                --u->owner->server->borrowers;
+                s->copy_source = NULL; s->failed = 1;
+            }
         }
         if (!u->waiters) {
             struct input *owner = u->owner;
@@ -121,8 +126,10 @@ void dcc_tcp_server_collect(void)
 }
 void dcc_tcp_server_quiesce(void)
 {
-    dcc_tcp_async_stop();
-    dcc_tcp_server_collect();
+    do {
+        dcc_tcp_async_stop();
+        dcc_tcp_async_drain();
+    } while (dcc_tcp_async_pending());
 }
 
 uint64_t dcc_tcp_ready_idle_ns(void)
@@ -231,6 +238,22 @@ static void remove_tree(int parent, const char *name)
         unlinkat(parent, name, AT_REMOVEDIR);
     } else unlinkat(parent, name, 0);
 }
+struct tree_cleanup {
+    struct dcc_tcp_work work;
+    uint64_t bytes;
+    char root[PATH_MAX];
+};
+static void cleanup_tree(void *argument)
+{
+    struct tree_cleanup *tree = argument;
+    remove_tree(AT_FDCWD, tree->root);
+}
+static void cleanup_complete(void *argument)
+{
+    struct tree_cleanup *tree = argument;
+    retained -= tree->bytes;
+    free(tree);
+}
 static void release_inputs(struct dcc_tcp_server *s)
 {
     if (s->job) for (unsigned i = 0; i < s->job->count; ++i) {
@@ -243,11 +266,22 @@ static void release_inputs(struct dcc_tcp_server *s)
     s->input_fd = -1;
     if (s->metadata >= 0) close(s->metadata);
     s->metadata = -1;
-    if (s->run.root[0]) remove_tree(AT_FDCWD, s->run.root);
+    uint64_t bytes = s->input_bytes;
+    if (s->run.root[0]) {
+        struct tree_cleanup *tree = calloc(1, sizeof(*tree));
+        if (tree) {
+            strcpy(tree->root, s->run.root);
+            tree->bytes = bytes;
+            if (!dcc_tcp_async_submit(&tree->work, cleanup_tree, cleanup_complete, tree)) bytes = 0;
+            else { free(tree); tree = NULL; }
+        }
+        /* Allocation/thread creation failure must still reclaim the private tree. */
+        if (!tree) remove_tree(AT_FDCWD, s->run.root);
+    }
     s->run.root[0] = 0;
     free(s->inputs); s->inputs = NULL;
     dcc_job_free(s->job); s->job = NULL;
-    retained -= s->input_bytes;
+    retained -= bytes;
     s->reserved -= s->input_bytes;
     s->input_bytes = 0;
 }
@@ -281,7 +315,6 @@ struct dcc_tcp_server *dcc_tcp_server_new(int fd, const struct dcc_tcp_dispatch 
     }
     s->socket = fd; s->metadata = s->input_fd = -1;
     s->local = domain == AF_UNIX;
-    atomic_init(&s->work.done, 1);
     s->dispatch = dispatch; s->tail = &s->head; s->active = time(NULL);
     s->buffer = malloc(DCC_TCP_CHUNK);
     s->hash = XXH3_createState();
@@ -322,9 +355,8 @@ void dcc_tcp_server_abandon(struct dcc_tcp_server *s)
 void dcc_tcp_server_free(struct dcc_tcp_server *s)
 {
     if (!s) return;
-    if (s->work.run && !atomic_load_explicit(&s->work.done, memory_order_acquire)) {
+    if (s->work.run || s->borrowers) {
         close(s->socket); s->socket = -1;
-        s->ready_next = abandoned; abandoned = s;
         return;
     }
     if (s->encoded) { free(s->encoded->data); free(s->encoded); }
@@ -353,6 +385,24 @@ void dcc_tcp_server_free(struct dcc_tcp_server *s)
 static int path_order(const void *a, const void *b)
 {
     return strcmp(*(char *const *)a, *(char *const *)b);
+}
+static void copy_input(void *argument)
+{
+    struct dcc_tcp_server *s = argument;
+    s->cache_hit = dcc_file_cache_copy(NULL, s->copy_source->path, s->inputs[s->cache_index].path);
+}
+static void copy_complete(void *argument)
+{
+    struct dcc_tcp_server *s = argument;
+    struct dcc_tcp_server *owner = s->copy_source->server;
+    struct input *in = &s->inputs[s->cache_index];
+    s->copy_source = NULL;
+    detach(in);
+    if (s->cache_hit) completed_input(in);
+    else s->failed = 1;
+    --owner->borrowers;
+    if (owner != s && owner->socket < 0) dcc_tcp_server_free(owner);
+    if (s->socket < 0) dcc_tcp_server_free(s);
 }
 static int prepare(struct dcc_tcp_server *s)
 {
@@ -386,6 +436,45 @@ static int prepare(struct dcc_tcp_server *s)
     free(paths);
     return 0;
 }
+static int input_missing(struct dcc_tcp_server *s, unsigned i)
+{
+    struct input *in = &s->inputs[i];
+    const struct dcc_job_input *description = &s->job->inputs[i];
+    ++s->remaining;
+    if (!description->cached) { in->wanted = 1; return 0; }
+    struct upload **bucket = &uploads[description->digest[0]], *u;
+    for (u = *bucket; u; u = u->next)
+        if (u->size == description->plain_size && !memcmp(u->digest, description->digest, 8)) break;
+    if (!u) {
+        u = calloc(1, sizeof(*u));
+        if (!u) return -1;
+        memcpy(u->digest, description->digest, 8);
+        u->size = description->plain_size;
+        u->owner = in; u->next = *bucket; *bucket = u;
+        in->wanted = 1;
+    } else { in->next = u->waiters; u->waiters = in; }
+    in->upload = u;
+    return 0;
+}
+static void lookup_input(void *argument)
+{
+    struct dcc_tcp_server *s = argument;
+    const struct dcc_job_input *in = &s->job->inputs[s->prepared];
+    const char *path = s->inputs[s->prepared].path;
+    s->cache_hit = dcc_file_cache_get(in->digest, path);
+    if (s->cache_hit) {
+        struct stat st;
+        if (stat(path, &st) || (uint64_t)st.st_size != in->plain_size) s->cache_hit = -1;
+    }
+}
+static void lookup_complete(void *argument)
+{
+    struct dcc_tcp_server *s = argument;
+    if (s->cache_hit < 0 || (!s->cache_hit && input_missing(s, s->prepared))) s->failed = 1;
+    ++s->prepared;
+    if (s->prepared == s->job->count && prepare_inputs(s)) s->failed = 1;
+    if (s->socket < 0) dcc_tcp_server_free(s);
+}
 static int prepare_inputs(struct dcc_tcp_server *s)
 {
     unsigned limit = s->prepared + 8;
@@ -403,26 +492,9 @@ static int prepare_inputs(struct dcc_tcp_server *s)
         }
         if (description->kind != DCC_JOB_FILE) continue;
         if (description->fd >= 0) continue;
-        if (description->cached && dcc_file_cache_get(description->digest, in->path)) {
-            struct stat st;
-            if (stat(in->path, &st) || (uint64_t)st.st_size != description->plain_size) return -1;
-            limit = i + 1; /* Bound cache copying/hashing to one file per turn. */
-            continue;
-        }
-        ++s->remaining;
-        if (!description->cached) { in->wanted = 1; continue; }
-        struct upload **bucket = &uploads[description->digest[0]], *u;
-        for (u = *bucket; u; u = u->next)
-            if (u->size == description->plain_size && !memcmp(u->digest, description->digest, 8)) break;
-        if (!u) {
-            u = calloc(1, sizeof(*u));
-            if (!u) return -1;
-            memcpy(u->digest, description->digest, 8);
-            u->size = description->plain_size;
-            u->owner = in; u->next = *bucket; *bucket = u;
-            in->wanted = 1;
-        } else { in->next = u->waiters; u->waiters = in; }
-        in->upload = u;
+        if (description->cached)
+            return dcc_tcp_async_submit(&s->work, lookup_input, lookup_complete, s) ? -1 : 0;
+        if (input_missing(s, i)) return -1;
     }
     if (s->prepared != s->job->count) return 0;
     unsigned char *wanted = malloc(s->job->count * 4U + 1);
@@ -487,6 +559,13 @@ static void decode_input(void *argument)
     s->input_error = dcc_writex(s->input_fd, data, length);
     if (!s->input_error && s->job->inputs[index].cached)
         s->input_error = XXH3_64bits_update(s->hash, data, length) != XXH_OK;
+    if (!s->input_error && s->job->inputs[index].cached && (s->decoding.type & DCC_TCP_FINAL)) {
+        XXH64_canonical_t digest;
+        XXH64_canonicalFromHash(&digest, XXH3_64bits_digest(s->hash));
+        if (s->input_offset + length != s->job->inputs[index].plain_size ||
+            memcmp(digest.digest, s->job->inputs[index].digest, 8)) s->input_error = -1;
+        else dcc_file_cache_put(s->job->inputs[index].digest, s->inputs[index].path);
+    }
 }
 static int finish_input(struct dcc_tcp_server *s)
 {
@@ -500,12 +579,6 @@ static int finish_input(struct dcc_tcp_server *s)
     if (!(f->type & DCC_TCP_FINAL)) return s->input_offset < description->plain_size ? 0 : -1;
     if (s->input_offset != description->plain_size) return -1;
     close(s->input_fd); s->input_fd = -1;
-    if (description->cached) {
-        XXH64_canonical_t digest;
-        XXH64_canonicalFromHash(&digest, XXH3_64bits_digest(s->hash));
-        if (memcmp(digest.digest, description->digest, 8)) return -1;
-        dcc_file_cache_put(description->digest, in->path);
-    }
     if (in->upload) {
         in->wanted = 0;
         in->upload->ready = 1;
@@ -518,6 +591,12 @@ static int complete_input(struct dcc_tcp_server *s)
     retained -= s->decoding.size;
     dcc_tcp_frame_clear(&s->decoding);
     return ret;
+}
+static void input_complete(void *argument)
+{
+    struct dcc_tcp_server *s = argument;
+    if (complete_input(s)) s->failed = 1;
+    if (s->socket < 0) dcc_tcp_server_free(s);
 }
 
 static int receive_input(struct dcc_tcp_server *s, const struct dcc_tcp_frame *f)
@@ -536,8 +615,9 @@ static int receive_input(struct dcc_tcp_server *s, const struct dcc_tcp_frame *f
     memset(&s->frame, 0, sizeof(s->frame));
     /* RAW already points into the receive frame: avoid a thread handoff for
      * a bounded write. Offload expansion, where independent jobs can use CPUs. */
-    if (length >= 65536 && compressed)
-        return dcc_tcp_async_submit(&s->work, decode_input, s) ? -1 : 1;
+    if ((length >= 65536 && compressed) ||
+        (s->job->inputs[index].cached && (f->type & DCC_TCP_FINAL)))
+        return dcc_tcp_async_submit(&s->work, decode_input, input_complete, s) ? -1 : 1;
     decode_input(s);
     return complete_input(s);
 }
@@ -653,13 +733,15 @@ static int accept_output(struct dcc_tcp_server *s)
     s->output_offset += dcc_tcp_get32(p->data + 12);
     return 0;
 }
+static void output_complete(void *argument)
+{
+    struct dcc_tcp_server *s = argument;
+    if (accept_output(s)) s->failed = 1;
+    if (s->socket < 0) dcc_tcp_server_free(s);
+}
 static int output(struct dcc_tcp_server *s)
 {
-    if (s->work.run) {
-        if (!atomic_load_explicit(&s->work.done, memory_order_acquire)) return 0;
-        s->work.run = NULL;
-        return accept_output(s);
-    }
+    if (s->work.run) return 0;
     if (s->head && s->head->next) return 0;
     while (s->output_index < DCC_JOB_RESULT_COUNT) {
         unsigned i = s->output_index;
@@ -679,7 +761,7 @@ static int output(struct dcc_tcp_server *s)
         if (amount + 16 > DCC_TCP_BYTES - retained) return -1;
         s->encoding_bytes = amount + 16; retained += s->encoding_bytes;
         if (amount >= 65536) {
-            if (dcc_tcp_async_submit(&s->work, encode_output, s)) return -1;
+            if (dcc_tcp_async_submit(&s->work, encode_output, output_complete, s)) return -1;
             if (s->head && (dcc_tcp_get32(s->head->data) & ~DCC_TCP_FLAGS) == DCC_TCP_OUTPUT)
                 ++output_overlaps;
             return 0;
@@ -699,8 +781,9 @@ static int output(struct dcc_tcp_server *s)
 int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
 {
     p->fd = s->socket;
-    int pending = s->work.run && !atomic_load_explicit(&s->work.done, memory_order_acquire);
-    p->events = POLLIN | (s->head || (s->phase == RETURNING && !pending) ? POLLOUT : 0);
+    int pending = s->work.run != NULL;
+    p->events = POLLIN | (s->head ? POLLOUT : 0);
+    if (pending && s->work.run != encode_output) p->events = POLLRDHUP;
     if (pending && s->work.run == decode_input) {
         int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
         p->events = POLLRDHUP | (buffered ? 0 : POLLIN);
@@ -708,7 +791,10 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
     int preparing = s->job && s->phase == PREPARING && s->prepared < s->job->count;
     if (preparing) p->events = POLLRDHUP;
     p->revents = 0;
-    return preparing;
+    int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
+    return !pending && (preparing || buffered ||
+        (s->phase == RETURNING && (!s->head ||
+            (s->output_index < DCC_JOB_RESULT_COUNT && !s->head->next))));
 }
 int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
 {
@@ -716,32 +802,29 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
     if (s->failed || now - s->active >= (s->job || s->phase == RETURNING ? dcc_get_io_timeout() : 30)) return -1;
     if (s->work.run == decode_input) {
         if (events & (POLLHUP | POLLERR | POLLRDHUP)) return -1;
-        if (!atomic_load_explicit(&s->work.done, memory_order_acquire)) {
-            if (events & POLLIN) {
-                size_t before = s->frame.used;
-                int allocated = s->frame.data != NULL;
-                size_t available = DCC_TCP_BYTES - retained;
-                if (available > DCC_TCP_CHUNK + 8U) available = DCC_TCP_CHUNK + 8U;
-                int ret = dcc_tcp_frame_read(s->socket, &s->frame, available);
-                if (!allocated && s->frame.data) retained += s->frame.size;
-                input_prefetch_bytes += s->frame.used - before;
-                if (s->frame.used != before) s->active = now;
-                if (ret < 0) return -1;
-            }
-            return 0;
+        if (events & POLLIN) {
+            size_t before = s->frame.used;
+            int allocated = s->frame.data != NULL;
+            size_t available = DCC_TCP_BYTES - retained;
+            if (available > DCC_TCP_CHUNK + 8U) available = DCC_TCP_CHUNK + 8U;
+            int ret = dcc_tcp_frame_read(s->socket, &s->frame, available);
+            if (!allocated && s->frame.data) retained += s->frame.size;
+            input_prefetch_bytes += s->frame.used - before;
+            if (s->frame.used != before) s->active = now;
+            if (ret < 0) return -1;
         }
-        s->work.run = NULL;
-        int ret = complete_input(s);
-        if (ret) return -1;
-        events |= POLLIN;
-    } else if (s->work.run && atomic_load_explicit(&s->work.done, memory_order_acquire)) events |= POLLOUT;
+        return 0;
+    }
+    if (s->work.run && s->work.run != encode_output)
+        return events & (POLLHUP | POLLERR | POLLRDHUP) ? -1 : 0;
     /* Bounded turns interleave other connections and worker completions. */
     if (s->job && s->phase == PREPARING && s->prepared < s->job->count) {
         if (prepare_inputs(s)) return -1;
+        if (s->work.run) return 0;
         if (s->prepared < s->job->count) events &= ~POLLIN;
-        else events |= POLLIN;
     }
-    if (events & (POLLIN | POLLHUP | POLLERR)) for (unsigned turn = 0; turn < 4; ++turn) {
+    int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
+    if (buffered || (events & (POLLIN | POLLHUP | POLLERR))) for (unsigned turn = 0; turn < 4; ++turn) {
         size_t before = s->frame.used;
         int allocated = s->frame.data != NULL;
         int ret = dcc_tcp_frame_read(s->socket, &s->frame, DCC_TCP_BYTES - retained);
@@ -768,10 +851,9 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
             s->enqueued = 1; *ready_tail = s; ready_tail = &s->ready_next;
             dcc_tcp_ready_idle_ns();
         }
-        dcc_tcp_dispatch_ready();
     }
+    if (s->phase == RETURNING && output(s)) return -1;
     if (events & POLLOUT) for (unsigned turn = 0; turn < 4; ++turn) {
-        if (s->phase == RETURNING && output(s)) return -1;
         struct packet *p = s->head;
         if (!p) break;
         ssize_t n;

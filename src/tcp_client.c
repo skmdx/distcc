@@ -188,7 +188,8 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                         result->size[i] = size;
                         if (!size) finals |= 1U << i;
                         const char *path = i == DCC_JOB_OBJECT ? output : i == DCC_JOB_DEPS ? deps : NULL;
-                        if (!result->status && path && strcmp(path, "-") && strcmp(path, "/dev/null")) {
+                        if (local && size) continue; /* The result frame supplies its own FD. */
+                        if (!local && !result->status && path && strcmp(path, "-") && strcmp(path, "/dev/null")) {
                             if (asprintf(&result->temporary[i], "%s.distcc-XXXXXX", path) < 0) {
                                 result->temporary[i] = NULL; goto done;
                             }
@@ -205,19 +206,9 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                         fstat(fd, &st) || !S_ISREG(st.st_mode) ||
                         (uint64_t)st.st_size != result->size[index] ||
                         (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY) goto done;
-                    if (result->temporary[index]) {
-                        off_t offset = 0;
-                        while ((uint64_t)offset < result->size[index]) {
-                            uint64_t left = result->size[index] - offset;
-                            ssize_t copied = sendfile(result->fd[index], fd, &offset,
-                                left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK);
-                            if (copied < 0 && errno == EINTR) continue;
-                            if (copied <= 0) goto done;
-                        }
-                    } else {
-                        close(result->fd[index]); result->fd[index] = fd;
-                        incoming.fd_plus_one = 0;
-                    }
+                    if (result->fd[index] >= 0) close(result->fd[index]);
+                    result->fd[index] = fd;
+                    incoming.fd_plus_one = 0;
                     received[index] = result->size[index];
                     finals |= 1U << index;
                 } else if (type == DCC_TCP_OUTPUT && have_result && !local) {

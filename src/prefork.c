@@ -155,6 +155,7 @@ static void finish_shutdown(void)
     for (int i = 0; i < MAX_PENDING; ++i) {
         dcc_tcp_server_free(tcp[i]); tcp[i] = NULL;
     }
+    dcc_tcp_server_quiesce(); /* Includes trees detached during final reclamation. */
     dcc_remove_pid();
     raise(shutdown_signal);
     _exit(128 + shutdown_signal);
@@ -295,7 +296,6 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
     dcc_tcp_server_collect();
     for (i = 0; i < worker_count; ++i)
         if (polls[base + i].revents) receive_worker(&workers[i]);
-    dcc_tcp_dispatch_ready();
     for (i = 0; i < MAX_PENDING; ++i) {
         struct pending *p = &pending[i];
         if (p->fd >= 0 && polls[sockets + i].fd == p->fd && polls[sockets + i].revents) {

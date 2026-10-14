@@ -3,6 +3,7 @@
 #include <config.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
@@ -11,6 +12,8 @@
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ready = PTHREAD_COND_INITIALIZER;
 static struct dcc_tcp_work *head, **tail = &head;
+static struct dcc_tcp_work *completed, **completed_tail = &completed;
+static unsigned outstanding; /* Parent-owned; includes uncollected completions. */
 static pthread_t threads[2];
 static unsigned count;
 static int stopping, wake = -1;
@@ -33,12 +36,18 @@ static void *worker(void *unused)
         w->run(w->argument);
         atomic_fetch_sub(&active, 1);
         atomic_fetch_add(&tasks, 1);
-        atomic_store_explicit(&w->done, 1, memory_order_release);
-        uint64_t one = 1;
-        while (write(wake, &one, sizeof(one)) < 0 && errno == EINTR) {}
+        pthread_mutex_lock(&lock);
+        int notify = completed == NULL;
+        w->next = NULL; *completed_tail = w; completed_tail = &w->next;
+        if (notify) {
+            uint64_t one = 1;
+            while (write(wake, &one, sizeof(one)) < 0 && errno == EINTR) {}
+        }
+        pthread_mutex_unlock(&lock);
     }
 }
-int dcc_tcp_async_submit(struct dcc_tcp_work *w, void (*run)(void *), void *argument)
+int dcc_tcp_async_submit(struct dcc_tcp_work *w, void (*run)(void *),
+                         void (*complete)(void *), void *argument)
 {
     if (wake < 0 && (wake = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0) return -1;
     if (!count) {
@@ -52,8 +61,8 @@ int dcc_tcp_async_submit(struct dcc_tcp_work *w, void (*run)(void *), void *argu
         pthread_attr_destroy(&attr);
         if (!count) return -1;
     }
-    w->run = run; w->argument = argument; w->next = NULL;
-    atomic_store_explicit(&w->done, 0, memory_order_relaxed);
+    w->run = run; w->complete = complete; w->argument = argument; w->next = NULL;
+    ++outstanding;
     pthread_mutex_lock(&lock);
     *tail = w; tail = &w->next;
     pthread_cond_signal(&ready);
@@ -61,12 +70,26 @@ int dcc_tcp_async_submit(struct dcc_tcp_work *w, void (*run)(void *), void *argu
     return 0;
 }
 int dcc_tcp_async_fd(void) { return wake; }
+int dcc_tcp_async_pending(void) { return outstanding != 0; }
 unsigned long dcc_tcp_async_tasks(void) { return atomic_load(&tasks); }
 unsigned dcc_tcp_async_peak(void) { return atomic_load(&peak); }
 void dcc_tcp_async_drain(void)
 {
     uint64_t value;
-    while (read(wake, &value, sizeof(value)) < 0 && errno == EINTR) {}
+    pthread_mutex_lock(&lock);
+    if (wake >= 0) while (read(wake, &value, sizeof(value)) < 0 && errno == EINTR) {}
+    struct dcc_tcp_work *list = completed;
+    completed = NULL; completed_tail = &completed;
+    pthread_mutex_unlock(&lock);
+    while (list) {
+        struct dcc_tcp_work *w = list;
+        list = w->next;
+        void (*complete)(void *) = w->complete;
+        void *argument = w->argument;
+        w->next = NULL; w->run = NULL;
+        --outstanding;
+        complete(argument); /* May release or resubmit w. */
+    }
 }
 void dcc_tcp_async_stop(void)
 {

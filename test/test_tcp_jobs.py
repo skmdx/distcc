@@ -101,6 +101,104 @@ sys.exit(result.returncode)
         self.assertIn('dcc_local_input_jobs 4\n', after)
         self.assertGreater(int(re.search(r'dcc_local_input_bytes (\d+)', after)[1]), 0)
 
+    def test_cache_and_cleanup_leave_event_loop_responsive(self):
+        hook, library = self.work / 'file-gate.c', self.work / 'file-gate.so'
+        arm, marker, release = (self.work / name for name in ('arm', 'entered', 'release'))
+        hook.write_text(r'''
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <linux/fs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static void gate(const char *kind) {
+    const char *mode = getenv("TEST_FILE_KIND"), *arm = getenv("TEST_FILE_ARM");
+    if (!mode || strcmp(mode, kind) || !arm || access(arm, F_OK)) return;
+    int fd = open(getenv("TEST_FILE_ENTERED"), O_WRONLY|O_CREAT|O_EXCL, 0600);
+    if (fd < 0) return;
+    dprintf(fd, "%ld %ld", (long)getpid(), (long)syscall(SYS_gettid)); close(fd);
+    for (int i = 0; i < 1000 && access(getenv("TEST_FILE_RELEASE"), F_OK); ++i) usleep(10000);
+}
+ssize_t read(int fd, void *data, size_t size) {
+    ssize_t (*real_read)(int, void *, size_t) = dlsym(RTLD_NEXT, "read");
+    char link[64], path[4096];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, path, sizeof(path)-1);
+    if (n > 0) { path[n] = 0; if (strstr(path, "/distcc-tcp-")) gate("cache"); }
+    return real_read(fd, data, size);
+}
+int unlinkat(int fd, const char *path, int flags) {
+    int (*real_unlinkat)(int, const char *, int) = dlsym(RTLD_NEXT, "unlinkat");
+    if ((flags & AT_REMOVEDIR) && strstr(path, "/distcc-tcp-")) gate("cleanup");
+    return real_unlinkat(fd, path, flags);
+}
+int ioctl(int fd, unsigned long request, ...) {
+    va_list args; va_start(args, request);
+    unsigned long argument;
+    if (request == FICLONE) { argument = va_arg(args, int); gate("copy"); }
+    else argument = (unsigned long)va_arg(args, void *);
+    va_end(args);
+    return syscall(SYS_ioctl, fd, request, argument);
+}
+''')
+        subprocess.run([self.cc, '-shared', '-fPIC', str(hook), '-ldl', '-o', str(library)],
+                       check=True, capture_output=True)
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        for kind in ('cache', 'cleanup', 'copy'):
+            with self.subTest(kind=kind):
+                for path in (arm, marker, release): path.unlink(missing_ok=True)
+                self.restart_server(self.build / 'distccd', LD_PRELOAD=str(library),
+                                    DISTCCD_FILE_CACHE='' if kind == 'copy' else str(self.work / 'cache'),
+                                    TEST_FILE_KIND=kind, TEST_FILE_ARM=str(arm),
+                                    TEST_FILE_ENTERED=str(marker), TEST_FILE_RELEASE=str(release))
+                body = f'int asynchronous_{kind};\n'.encode()
+                if kind == 'cache':
+                    first = self.wire_job(body)
+                    self.assertEqual(self.frame(first), (0x54000201, bytes(4)))
+                    self.upload(first, body)
+                    self.result(first)
+                    first.close()
+                arm.touch()
+                owner = None
+                if kind == 'copy':
+                    before = int(re.search(r'dcc_tcp_parallel_tasks (\d+)', self.get_stats(self.stats_ports[0]))[1])
+                    owner = self.wire_job(body)
+                    self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
+                net = self.wire_job(body, cached=kind != 'cleanup')
+                if owner:
+                    deadline = time.monotonic() + 5
+                    while True:
+                        stats = self.get_stats(self.stats_ports[0])
+                        if ('dcc_preparing 2\n' in stats and
+                            int(re.search(r'dcc_tcp_parallel_tasks (\d+)', stats)[1]) >= before + 2): break
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.01)
+                    self.upload(owner, body)
+                if kind == 'cleanup': self.upload(net, body)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not marker.exists() or not marker.read_text():
+                        self.assertLess(time.monotonic(), deadline, 'file operation was not reached')
+                        time.sleep(.01)
+                    pid, tid = map(int, marker.read_text().split())
+                    self.assertEqual(pid, self.daemons[0].pid)
+                    self.assertNotEqual(pid, tid, 'file operation ran in the event loop')
+                    if owner: owner.close()
+                    self.assertIn('dcc_cpus ', self.get_stats(self.stats_ports[0]))
+                    if kind == 'cleanup': self.result(net)
+                finally:
+                    release.touch()
+                if kind != 'cleanup': self.result(net)
+                net.close()
+                deadline = time.monotonic() + 5
+                while list(self.root.glob('distcc-tcp-*')):
+                    self.assertLess(time.monotonic(), deadline, 'async cleanup leaked a tree')
+                    time.sleep(.01)
+
     def test_local_input_matches_native_and_rejects_writable_fd(self):
         prefix = str(self.root / 'local-validation')
         self.restart_server(self.build / 'distccd', DISTCC_LOCAL_SOCKET=prefix)
@@ -119,7 +217,7 @@ sys.exit(result.returncode)
         tracer = shutil.which('strace')
         if tracer:
             trace = self.work / 'local-input.trace'
-            subprocess.run([tracer, '-f', '-yy', '-e', 'trace=memfd_create,sendfile,recvmsg',
+            subprocess.run([tracer, '-f', '-yy', '-e', 'trace=memfd_create,sendfile,recvmsg,sendmsg',
                             '-o', str(trace), str(self.build / 'distcc'), 'gcc',
                             '-c', str(source), '-o', str(actual)],
                            env=self.env, check=True, capture_output=True, timeout=15)
@@ -129,6 +227,9 @@ sys.exit(result.returncode)
             self.assertIn('SCM_RIGHTS', calls)
             self.assertIn('sendfile(', calls)  # Result publication, not an input snapshot.
             self.assertNotRegex(calls, r'sendfile\([^\n]*distcc-preprocessed')
+            returned = re.search(r'sendmsg\([^\n]*iov_len=8[^\n]*SCM_RIGHTS', calls)
+            self.assertIsNotNone(returned, 'pooled connection was not returned')
+            self.assertLess(returned.start(), calls.index('sendfile('), 'copy held the pooled connection')
             self.assertEqual(actual.read_bytes(), expected.read_bytes())
         self.assertGreater(int(re.search(r'dcc_local_input_bytes (\d+)',
                                         self.get_stats(self.stats_ports[0]))[1]), 2 * 1024 * 1024)
@@ -540,7 +641,9 @@ ssize_t write(int fd, const void *data, size_t size) {
                 break
             self.assertLess(time.monotonic(), deadline, 'compiler outlived its worker')
             time.sleep(.01)
-        self.assertFalse(list(self.root.glob('distcc-tcp-*')))
+        while list(self.root.glob('distcc-tcp-*')):
+            self.assertLess(time.monotonic(), deadline, 'input cleanup did not finish')
+            time.sleep(.01)
         self.assertFalse(list(self.root.glob('distccd_*')))
         self.assertFalse((self.root / 'compiler-owned').exists())
         wrapper.write_text(original)
