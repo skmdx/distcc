@@ -201,18 +201,18 @@ class BrokerTest(BrokerTestCase):
         _, net = self.acquire_reserved(10)
         self.assertEqual(net.getpeername()[1], self.ports[0])
 
-    def test_tcp_fills_idle_worker_before_queueing_on_fast_worker(self):
+    def test_tcp_balances_demand_before_fast_worker_is_full(self):
         peers = [self.peer(stats_response(running=0, busy=0, queued=0,
                                          preparing=0, returning=0, capacity=4))
                  for _ in range(2)]
         hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={4 if i == 0 else 1}')
                          for i, p in enumerate(peers))
         self.start_broker(hosts)
-        for _ in range(4):
+        for _ in range(3):
             _, net = self.acquire_reserved(10)
             self.assertEqual(net.getpeername()[1], self.ports[0])
-        # A queued fast compile must not prevent an idle slow core from
-        # contributing to a sustained build. Keep the fast pipeline bounded.
+        # Normalized demand must rise below saturation as well. A flat
+        # single-job score would fill the faster host before using this one.
         _, net = self.acquire_reserved(10)
         self.assertEqual(net.getpeername()[1], self.ports[1])
 

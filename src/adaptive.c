@@ -219,7 +219,8 @@ int dcc_capacity_slots(const struct dcc_hostdef *host, const struct dcc_capacity
     return slots;
 }
 
-/* One job takes one core's service time until the host is saturated. Global
+/* Prepared-job streams balance normalized demand across aggregate capacity.
+ * Legacy reservations retain the single-job service-time floor. Global
  * occupancy overlaps local leases: take the maximum, never add both counts.
  * Admission on the server closes the race between independent brokers. */
 double dcc_capacity_score(const struct dcc_hostdef *host,
@@ -227,7 +228,7 @@ double dcc_capacity_score(const struct dcc_hostdef *host,
 {
     int slots = dcc_capacity_slots(host, cap), occupied = busy;
     int parallelism = cap ? (cap->cpus < cap->jobs ? cap->cpus : cap->jobs) : slots;
-    double service = 1, demand;
+    double service = host->tcp_jobs ? 0 : 1, demand;
     if (cap) {
         int remote = (cap->busy > 0 ? cap->busy : 0) + (cap->queued > 0 ? cap->queued : 0);
         if (remote > occupied) occupied = remote;

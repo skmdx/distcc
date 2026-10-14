@@ -76,12 +76,13 @@ CPU count and `--jobs` limit. An explicit `/LIMIT`, for example
 limits. Servers without statistics retain their configured slot count (default
 4). An old server without the new `dcc_cpus` metric also uses this fallback.
 
-For each eligible host, the client estimates relative completion time as
-`max(1, (work + 1) / parallelism, (runnable + 1) / cpus) / speed`.
+For each eligible prepared-job host, the broker scores normalized demand as
+`max((work + 1) / parallelism, (runnable + 1) / cpus) / speed`.
+Legacy paths retain a minimum service cost of 1 before dividing by speed.
 Parallelism is the smallest of CPUs, the server's job limit and its reported
 memory admission capacity. Legacy paths use the larger of local reservations
 and the sum of server execution and ready-queue counts; they do not add the
-same queued jobs twice. Faster cores win while capacity is free. Equal
+same queued jobs twice. Lower normalized demand wins. Equal
 estimates favor lower estimated work per configured slot, then list order.
 Missing live runnable counts fall back to the one-minute load average.
 Reported memory PSI (`some avg10`, percent) multiplies the estimate by
@@ -96,10 +97,10 @@ first consume the snapshot's returning count, so output-only jobs do not free
 CPU capacity twice. No per-stage IPC or extra network round trip is required.
 Input preparation can overlap execution within a pipeline of up to four jobs
 (also capped by effective parallelism); excess preparation increases the score.
-Hosts with estimated free execution capacity are preferred to hosts whose
-assignments already fill that capacity. Within either group, load and speed
-determine the score. This keeps idle workers contributing when a faster host's
-memory estimate allows a deeper queue.
+Prepared-job hosts are ranked by projected work divided by execution capacity
+and relative speed, with runnable CPU load and memory pressure as additional
+costs. The score increases below saturation too, so raising memory capacity
+does not give a fast host a flat score that starves the other workers.
 Execution, ready jobs, preparation and new assignments share this estimated
 global limit of parallelism plus pipeline depth. Returning jobs have a separate
 bounded allowance for socket leases. A zero memory capacity stops new uploads;
