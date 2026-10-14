@@ -123,8 +123,9 @@ are excluded. The reference frequency interpolates at the observed active CPU
 count. The current/reference ratio, capped at 1, scales the CPU service cost
 once, including single-job work. Frequency is an approximation to compilation
 capacity, not a cross-machine speed measurement. The filter uses
-`alpha = dt / (tau + dt)`, with tau 0.5 seconds for decreases and 10 seconds for
-increases. Idle time never advances recovery or changes the reference curve.
+`alpha = dt / (2 + dt)` in both directions. Symmetric smoothing avoids a
+persistent low estimate when valid frequencies fluctuate. Idle time never
+advances recovery or changes the reference curve.
 
 Statistics expose `dcc_cpu_scale`, `dcc_cpu_age` (seconds since the last valid
 sample), `dcc_cpu_probe`, frequency/reference in kHz, active CPU count, and sample

@@ -128,11 +128,11 @@ static int sample(double now)
         double *scale = &cpu_perf.perf.scale;
         if (*scale < 0) *scale = observed;
         else {
-            /* Idle time is not evidence of recovery: only this busy interval
-             * advances the asymmetric filter. No learned baseline drift. */
+            /* Only busy intervals advance the filter. Symmetric smoothing
+             * tracks sustained performance without turning alternating high
+             * and low frequency samples into a persistent throttle penalty. */
             double dt = now - cpu_perf.sampled_at;
-            double tau = observed < *scale ? .5 : 10;
-            *scale += (observed - *scale) * dt / (tau + dt);
+            *scale += (observed - *scale) * dt / (2 + dt);
         }
         cpu_perf.perf.frequency = frequency;
         cpu_perf.perf.reference = reference;
