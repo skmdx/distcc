@@ -42,8 +42,8 @@ must provide the same target headers. Pump does not synchronize a sysroot.
 For Gentoo, source `packaging/gentoo/pump.bashrc` (installed by the overlay as
 `/usr/share/distcc/portage-pump.bashrc`) from `/etc/portage/bashrc`, and call
 `distcc_pump_start` from `pre_src_compile` and `distcc_pump_stop` from
-`post_src_compile`. Call `register_die_hook distcc_pump_stop` for failure
-cleanup. Enable selected packages with `DISTCC_PUMP=1` in their `package.env`
+`post_src_compile`. The start helper registers failure cleanup within the compile
+phase. Enable selected packages with `DISTCC_PUMP=1` in their `package.env`
 environment file. The helper preserves Portage's compiler wrapper search order.
 
 Standalone GCC and Clang `-E` calls with a source file are also distributed.

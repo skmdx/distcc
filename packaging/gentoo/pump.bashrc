@@ -5,6 +5,7 @@ distcc_pump_start() {
     [[ ${DISTCC_PUMP:-0} == 1 ]] || return 0
     [[ -z ${INCLUDE_SERVER_PORT} ]] || return 0
     has distcc ${FEATURES} || die "DISTCC_PUMP requires FEATURES=distcc"
+    register_die_hook distcc_pump_stop
     local settings original_path=${PATH}
     export DISTCC_CLIENT_TMP=${T}/distcc-pump
     mkdir -p "${DISTCC_CLIENT_TMP}" || die
