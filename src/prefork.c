@@ -642,7 +642,9 @@ static int dcc_preforked_child(int listen_fd)
 #endif
 
         dcc_close(acc_fd);
+#ifndef __linux__
         now = time(NULL);
+#endif
     }
 
     rs_log_info("worn out");
