@@ -65,6 +65,10 @@ export DISTCC_HOSTS='builder-a,stats=3633,speed=1 builder-b,stats=3633,speed=2'
 make -j"$(distcc -j)" CC='distcc gcc' CXX='distcc g++'
 ```
 
+Statistics report worker occupancy and memory availability without scanning
+every process. The global D-state count and largest-process RSS diagnostics
+are no longer included in the statistics response.
+
 `speed=2` means twice the per-core compile throughput of `speed=1`. Measure a
 representative single-job compile with the same compiler/options on idle hosts
 and use `reference_time / host_time`. The default is 1; CPU clock frequency is

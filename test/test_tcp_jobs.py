@@ -139,7 +139,7 @@ int unlinkat(int fd, const char *path, int flags) {
 int ioctl(int fd, unsigned long request, ...) {
     va_list args; va_start(args, request);
     unsigned long argument;
-    if (request == FICLONE) { argument = va_arg(args, int); gate("copy"); }
+    if (request == FICLONE) { argument = va_arg(args, int); gate("copy"); gate("store"); }
     else argument = (unsigned long)va_arg(args, void *);
     va_end(args);
     return syscall(SYS_ioctl, fd, request, argument);
@@ -148,7 +148,7 @@ int ioctl(int fd, unsigned long request, ...) {
         subprocess.run([self.cc, '-shared', '-fPIC', str(hook), '-ldl', '-o', str(library)],
                        check=True, capture_output=True)
         self.addCleanup(self.restart_server, self.build / 'distccd')
-        for kind in ('cache', 'cleanup', 'copy'):
+        for kind in ('cache', 'store', 'cleanup', 'copy'):
             with self.subTest(kind=kind):
                 for path in (arm, marker, release): path.unlink(missing_ok=True)
                 self.restart_server(self.build / 'distccd', LD_PRELOAD=str(library),
@@ -178,7 +178,9 @@ int ioctl(int fd, unsigned long request, ...) {
                         self.assertLess(time.monotonic(), deadline)
                         time.sleep(.01)
                     self.upload(owner, body)
-                if kind == 'cleanup': self.upload(net, body)
+                if kind == 'store':
+                    self.assertEqual(self.frame(net), (0x54000201, bytes(4)))
+                if kind in ('store', 'cleanup'): self.upload(net, body)
                 try:
                     deadline = time.monotonic() + 5
                     while not marker.exists() or not marker.read_text():

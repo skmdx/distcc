@@ -47,10 +47,7 @@ int dcc_get_dns_domain(const char **domain_name);
 #define str_equal(a, b) (!strcmp((a), (b)))
 
 
-void dcc_get_proc_stats(int *num_D,
-                        int *mem_available,
-                        int *max_RSS,
-                        char **max_RSS_name);
+int dcc_get_available_memory_mb(void);
 void dcc_get_disk_io_stats(int *n_reads, int *n_writes);
 
 int dcc_which(const char *cmd, char **out);

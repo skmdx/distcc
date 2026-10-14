@@ -23,7 +23,6 @@
 
 #include <config.h>
 
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -685,97 +684,15 @@ static int dcc_get_proc_meminfo_mem_available(FILE* f) {
 }
 #endif
 
-/* Returns the number of processes in state D, the max non-cc/c++ RSS in kB,
- * the max RSS program's name, and the amount of available memory reported
- * by the kernel (in MB, or -1, if unknown). */
-void dcc_get_proc_stats(int *num_D,
-                        int *mem_available,
-                        int *max_RSS,
-                        char **max_RSS_name) {
+/* Available system memory in MB, or -1 when unavailable. */
+int dcc_get_available_memory_mb(void)
+{
 #ifdef linux
-    DIR *proc = opendir("/proc");
-    struct dirent *procsubdir;
-    static int pagesize = -1;
-    static char RSS_name[1024];
-    char statfile[1024];
-    FILE *f;
-    char name[1024];
-    char state;
-    int pid;
-    int rss_size;
-    int l;
-    char *c;
-    int isCC;
-
-    /* If this doesn't cut it for you, see how CVS does it:
-     * http://savannah.nongnu.org/cgi-bin/viewcvs/cvs/ccvs/lib/getpagesize.h */
-    if (pagesize == -1) {
-#if HAVE_GETPAGESIZE
-        pagesize = getpagesize();
+    return dcc_get_proc_meminfo_mem_available(fopen("/proc/meminfo", "r"));
 #else
-        pagesize = 8192;
-#endif
-    }
-
-    *num_D = 0;
-    *max_RSS = 0;
-    *max_RSS_name = RSS_name;
-    RSS_name[0] = 0;
-
-    f = fopen("/proc/meminfo", "r");
-    if (f != NULL)
-        *mem_available = dcc_get_proc_meminfo_mem_available(f);
-    else
-        *mem_available = -1;
-
-    while ((procsubdir = readdir(proc)) != NULL) {
-        if (sscanf(procsubdir->d_name, "%d", &pid) != 1)
-            continue;
-
-        strcpy(statfile, "/proc/");
-        strcat(statfile, procsubdir->d_name);
-        strcat(statfile, "/stat");
-
-        f = fopen(statfile, "r");
-        if (f == NULL)
-            continue;
-
-        if (fscanf(f, "%*d %1023s %c %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %d",
-                        name, &state, &rss_size) != 3) {
-            fclose(f);
-            continue;
-        }
-
-        rss_size = (rss_size * pagesize) / 1024; /* get rss_size in KB */
-
-        if (state == 'D') {
-            (*num_D)++;
-        }
-
-        l = strlen(RSS_name);
-        c = RSS_name;
-
-        /* check for .*{++,cc} */
-        isCC = (l >= 2) && ((c[l-1] == 'c' && c[l-2] == 'c')
-                                || (c[l-1] == '+' && c[l-2] == '+'));
-        if ((rss_size > *max_RSS) && !isCC) {
-            *max_RSS = rss_size;
-            strncpy(RSS_name, name, 1024);
-        }
-
-        fclose(f);
-    }
-
-    closedir(proc);
-#else
-    static char RSS_name[] = "none";
-    *num_D = -1;
-    *mem_available = -1;
-    *max_RSS = -1;
-    *max_RSS_name = RSS_name;
+    return -1;
 #endif
 }
-
 
 /* Returns the number of sector read/writes since boot */
 void dcc_get_disk_io_stats(int *n_reads, int *n_writes) {

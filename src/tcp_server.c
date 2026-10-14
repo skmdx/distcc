@@ -616,7 +616,7 @@ static int receive_input(struct dcc_tcp_server *s, const struct dcc_tcp_frame *f
     /* RAW already points into the receive frame: avoid a thread handoff for
      * a bounded write. Offload expansion, where independent jobs can use CPUs. */
     if ((length >= 65536 && compressed) ||
-        (s->job->inputs[index].cached && (f->type & DCC_TCP_FINAL)))
+        (s->job->inputs[index].cached && (s->decoding.type & DCC_TCP_FINAL)))
         return dcc_tcp_async_submit(&s->work, decode_input, input_complete, s) ? -1 : 1;
     decode_input(s);
     return complete_input(s);

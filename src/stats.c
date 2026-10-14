@@ -359,9 +359,6 @@ static long dcc_get_tmpdirinfo(void) {
 static void dcc_service_stats_request(int http_fd) {
     int acc_fd;
     int *ct;
-    int num_D;
-    int max_RSS;
-    char *max_RSS_name;
     size_t reply_len;
     char challenge[1024];
     char reply[4096];
@@ -431,9 +428,6 @@ dcc_memory_pressure %.2f\n\
 dcc_num_compiles1 %d\n\
 dcc_num_compiles2 %d\n\
 dcc_num_compiles3 %d\n\
-dcc_num_procstate_D %d\n\
-dcc_max_RSS %d\n\
-dcc_max_RSS_name %s\n\
 dcc_io_rate %d\n\
 dcc_free_space %d MB\n\
 dcc_free_mem %d MB\n\
@@ -456,7 +450,7 @@ dcc_free_mem %d MB\n\
 #endif
 
     free_space_mb = dcc_get_tmpdirinfo();
-    dcc_get_proc_stats(&num_D, &free_mem_mb, &max_RSS, &max_RSS_name);
+    free_mem_mb = dcc_get_available_memory_mb();
 
     if (dcc_stats.longest_job_name[0] == 0)
         strcpy(dcc_stats.longest_job_name, "none");
@@ -496,7 +490,6 @@ dcc_free_mem %d MB\n\
                                (unsigned long long)dcc_tcp_output_overlaps(),
                                load.links, admission, available, memory_pressure,
                                ct[0], ct[1], ct[2],
-                               num_D, max_RSS, max_RSS_name,
                                dcc_stats.io_rate,
                                free_space_mb,
                                free_mem_mb

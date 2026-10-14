@@ -205,6 +205,9 @@ class AdaptiveTest(DistccTestCase):
             self.assertRegex(stats, r"dcc_cpus [1-9][0-9]*\n")
             self.assertIn("dcc_max_kids 4\n", stats)
             self.assertRegex(stats, r"dcc_load1 [0-9.]+\n")
+            self.assertRegex(stats, r"dcc_free_mem -?[0-9]+ MB\n")
+            for diagnostic in ('dcc_num_procstate_D', 'dcc_max_RSS', 'dcc_max_RSS_name'):
+                self.assertNotIn(diagnostic + ' ', stats)
         hosts = " ".join(self.host(i, f",stats={self.stats_ports[i]},speed={speed}")
                          for i, speed in enumerate((1, 4)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
