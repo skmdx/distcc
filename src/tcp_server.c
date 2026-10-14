@@ -29,7 +29,7 @@ struct packet {
     unsigned char *data;
     size_t size, sent, header_size, file_left;
     off_t file_offset;
-    int file;
+    int file, rights;
 };
 struct upload;
 struct input {
@@ -38,7 +38,7 @@ struct input {
     struct upload *upload;
     char *path;
     unsigned index;
-    int wanted, done;
+    int wanted;
 };
 struct upload {
     struct upload *next;
@@ -48,7 +48,7 @@ struct upload {
     int ready;
 };
 struct dcc_tcp_server {
-    int socket, failed, metadata, input_fd;
+    int socket, failed, metadata, input_fd, local;
     enum phase phase;
     time_t active;
     /* The reader owns frame; the decoder exclusively owns decoding. */
@@ -64,7 +64,6 @@ struct dcc_tcp_server {
     XXH3_state_t *hash;
     struct dcc_job_result result;
     unsigned char *buffer;
-    int complete_queued;
     struct dcc_tcp_server *ready_next;
     int enqueued;
     struct dcc_tcp_work work;
@@ -262,7 +261,7 @@ static void reset_job(struct dcc_tcp_server *s)
     returning_bytes -= s->result_bytes;
     s->result_bytes = 0;
     s->reserved = 0;
-    s->remaining = s->output_index = s->complete_queued = s->prepared = 0;
+    s->remaining = s->output_index = s->prepared = 0;
     s->input_offset = s->output_offset = 0;
     s->phase = PREPARING;
 }
@@ -281,6 +280,7 @@ struct dcc_tcp_server *dcc_tcp_server_new(int fd, const struct dcc_tcp_dispatch 
         free(s); return NULL;
     }
     s->socket = fd; s->metadata = s->input_fd = -1;
+    s->local = domain == AF_UNIX;
     atomic_init(&s->work.done, 1);
     s->dispatch = dispatch; s->tail = &s->head; s->active = time(NULL);
     s->buffer = malloc(DCC_TCP_CHUNK);
@@ -402,11 +402,10 @@ static int prepare_inputs(struct dcc_tcp_server *s)
             if (ret && errno != EEXIST) return -1;
         }
         if (description->kind != DCC_JOB_FILE) continue;
-        if (description->fd >= 0) { in->done = 1; continue; }
+        if (description->fd >= 0) continue;
         if (description->cached && dcc_file_cache_get(description->digest, in->path)) {
             struct stat st;
             if (stat(in->path, &st) || (uint64_t)st.st_size != description->plain_size) return -1;
-            in->done = 1;
             limit = i + 1; /* Bound cache copying/hashing to one file per turn. */
             continue;
         }
@@ -475,7 +474,7 @@ static int begin(struct dcc_tcp_server *s, struct dcc_tcp_frame *f)
 }
 static void completed_input(struct input *in)
 {
-    in->done = 1; in->wanted = 0; --in->server->remaining;
+    in->wanted = 0; --in->server->remaining;
 }
 static void decode_input(void *argument)
 {
@@ -547,7 +546,7 @@ static int install_links(struct dcc_tcp_server *s)
     for (unsigned i = 0; i < s->job->count; ++i) {
         struct input *in = &s->inputs[i];
         const struct dcc_job_input *d = &s->job->inputs[i];
-        if (in->done || d->kind == DCC_JOB_FILE) continue;
+        if (d->kind == DCC_JOB_FILE) continue;
         if (d->kind == DCC_JOB_EMPTY) {
             int fd = open(in->path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
             if (fd < 0) return -1;
@@ -561,7 +560,6 @@ static int install_links(struct dcc_tcp_server *s)
             free(target);
             if (ret) return -1;
         }
-        in->done = 1;
     }
     return 0;
 }
@@ -628,11 +626,12 @@ static void encode_output(void *argument)
     size_t amount = left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK;
     struct packet *p = calloc(1, sizeof(*p));
     if (!p) return;
-    p->data = malloc(amount + 16);
-    if (!p->data || pread(s->result.fd[i], s->buffer, amount, s->output_offset) != (ssize_t)amount) {
+    p->data = dcc_tcp_file_chunk(DCC_TCP_OUTPUT, i, s->result.fd[i],
+                                s->output_offset, amount, amount == left, 1, &p->size);
+    if (!p->data) {
         free(p->data); free(p); return;
     }
-    p->size = p->header_size = dcc_tcp_encode(DCC_TCP_OUTPUT, i, s->buffer, amount, amount == left, p->data);
+    p->header_size = p->size;
     p->file = -1;
     if (p->size == 16) {
         p->file = s->result.fd[i]; p->file_left = amount; p->file_offset = s->output_offset;
@@ -642,26 +641,40 @@ static void encode_output(void *argument)
     p->data = compact;
     s->encoded = p;
 }
+static int accept_output(struct dcc_tcp_server *s)
+{
+    struct packet *p = s->encoded; s->encoded = NULL;
+    retained -= s->encoding_bytes; s->encoding_bytes = 0;
+    if (!p) return -1;
+    /* At most two packets, including the one being encoded. Result FDs
+     * outlive both the sender and the encoder. */
+    *s->tail = p; s->tail = &p->next;
+    s->queued += p->size; retained += p->size;
+    s->output_offset += dcc_tcp_get32(p->data + 12);
+    return 0;
+}
 static int output(struct dcc_tcp_server *s)
 {
     if (s->work.run) {
         if (!atomic_load_explicit(&s->work.done, memory_order_acquire)) return 0;
         s->work.run = NULL;
-        struct packet *p = s->encoded; s->encoded = NULL;
-        retained -= s->encoding_bytes; s->encoding_bytes = 0;
-        if (!p) return -1;
-        /* At most two packets, including the one being encoded. Result FDs
-         * outlive both the sender and the encoder. */
-        *s->tail = p; s->tail = &p->next;
-        s->queued += p->size; retained += p->size;
-        s->output_offset += dcc_tcp_get32(p->data + 12);
-        return 0;
+        return accept_output(s);
     }
     if (s->head && s->head->next) return 0;
     while (s->output_index < DCC_JOB_RESULT_COUNT) {
         unsigned i = s->output_index;
         uint64_t left = s->result.size[i] - s->output_offset;
         if (!left) { ++s->output_index; s->output_offset = 0; continue; }
+        if (s->local) {
+            unsigned char index[4];
+            dcc_tcp_put32(index, i);
+            if (queue(s, DCC_TCP_RESULT_FD, index, sizeof(index))) return -1;
+            struct packet *p = s->head;
+            while (p->next) p = p->next;
+            p->file = s->result.fd[i]; p->rights = 1;
+            s->output_offset = s->result.size[i];
+            return 0;
+        }
         size_t amount = left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK;
         if (amount + 16 > DCC_TCP_BYTES - retained) return -1;
         s->encoding_bytes = amount + 16; retained += s->encoding_bytes;
@@ -672,20 +685,18 @@ static int output(struct dcc_tcp_server *s)
             return 0;
         }
         encode_output(s);
-        s->work.run = encode_output; atomic_store(&s->work.done, 1);
-        return output(s);
+        return accept_output(s);
     }
-    if (!s->head && !s->complete_queued) {
+    if (!s->head) {
         unsigned char id[8];
         dcc_tcp_put64(id, s->run.id);
         /* Reclaim job resources before exposing the reusable boundary. */
         reset_job(s);
-        s->complete_queued = 1;
         return queue(s, DCC_TCP_COMPLETE, id, sizeof(id));
     }
     return 0;
 }
-void dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
+int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
 {
     p->fd = s->socket;
     int pending = s->work.run && !atomic_load_explicit(&s->work.done, memory_order_acquire);
@@ -694,9 +705,10 @@ void dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
         int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
         p->events = POLLRDHUP | (buffered ? 0 : POLLIN);
     }
-    if (s->job && s->phase == PREPARING && s->prepared < s->job->count)
-        p->events = POLLOUT;
+    int preparing = s->job && s->phase == PREPARING && s->prepared < s->job->count;
+    if (preparing) p->events = POLLRDHUP;
     p->revents = 0;
+    return preparing;
 }
 int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
 {
@@ -739,8 +751,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         uint32_t type = s->frame.type & ~DCC_TCP_FLAGS;
         if (s->frame.fd_plus_one && type != DCC_TCP_BEGIN) return -1;
         if (type == DCC_TCP_BEGIN) {
-            if (s->complete_queued && s->head) return -1;
-            s->complete_queued = 0;
+            if (!s->job && s->head) return -1;
             ret = begin(s, &s->frame);
         } else if (type == DCC_TCP_INPUT) ret = receive_input(s, &s->frame);
         else ret = -1;
@@ -764,7 +775,17 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         struct packet *p = s->head;
         if (!p) break;
         ssize_t n;
-        if (p->sent < p->header_size)
+        if (p->rights) {
+            struct iovec iov = {p->data + p->sent, p->header_size - p->sent};
+            union { struct cmsghdr align; char data[CMSG_SPACE(sizeof(int))]; } control = {0};
+            struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1,
+                .msg_control = control.data, .msg_controllen = sizeof(control)};
+            struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+            c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(c), &p->file, sizeof(int));
+            n = sendmsg(s->socket, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (n > 0) p->rights = 0;
+        } else if (p->sent < p->header_size)
             n = send(s->socket, p->data + p->sent, p->header_size - p->sent,
                      MSG_NOSIGNAL | MSG_DONTWAIT | (p->file_left ? MSG_MORE : 0));
         else {

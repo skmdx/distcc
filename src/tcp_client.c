@@ -51,15 +51,21 @@ done:
     return readonly;
 }
 static unsigned char *next_chunk(struct input_stream *stream, const struct dcc_job_input *in,
-                                 unsigned char *buffer, size_t *size, off_t *file_offset, size_t *file_left)
+                                 size_t *size, off_t *file_offset, size_t *file_left)
 {
     *file_left = 0;
     uint64_t remaining = in->plain_size - stream->plain;
     size_t amount = remaining < DCC_TCP_CHUNK ? remaining : DCC_TCP_CHUNK;
     if (in->encoding == DCC_JOB_RAW) {
-        if (pread(stream->fd, buffer, amount, stream->offset) != (ssize_t)amount) return NULL;
+        int seals = fcntl(stream->fd, F_GET_SEALS);
+        int immutable = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
+        unsigned char *p = dcc_tcp_file_chunk(DCC_TCP_INPUT, stream->index, stream->fd,
+            stream->offset, amount, amount == remaining,
+            seals >= 0 && (seals & immutable) == immutable, size);
+        if (!p) return NULL;
+        if (*size == 16) { *file_offset = stream->offset; *file_left = amount; }
         stream->offset += amount; stream->plain += amount;
-        return dcc_tcp_chunk(DCC_TCP_INPUT, stream->index, buffer, amount, amount == remaining, size);
+        return p;
     }
     /* Pump files already contain independent LZ4 blocks. Reframe, don't
      * decompress and recompress, and require their terminal marker. */
@@ -105,10 +111,10 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     int ret = EXIT_IO_ERROR, have_result = 0;
     struct sockaddr_storage address;
     socklen_t address_size = sizeof(address);
-    int local_input = job->kind == DCC_JOB_COMPILE && job->count == 1 &&
-        job->inputs[0].encoding == DCC_JOB_RAW && job->inputs[0].fd >= 0 &&
-        !getsockname(host->broker_fd, (struct sockaddr *)&address, &address_size) &&
+    int local = !getsockname(host->broker_fd, (struct sockaddr *)&address, &address_size) &&
         address.ss_family == AF_UNIX;
+    int local_input = local && job->kind == DCC_JOB_COMPILE && job->count == 1 &&
+        job->inputs[0].encoding == DCC_JOB_RAW && job->inputs[0].fd >= 0;
     int send_input_fd = local_input;
     int shared_input = -1;
     time_t active = time(NULL);
@@ -143,25 +149,25 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     open(files ? files[stream.index] : cpp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
                 if (stream.fd < 0) goto done;
             }
-            outgoing = next_chunk(&stream, &job->inputs[stream.index], buffer, &length, &file_offset, &file_left);
+            outgoing = next_chunk(&stream, &job->inputs[stream.index], &length, &file_offset, &file_left);
             if (!outgoing) goto done;
             sent = 0;
         }
         int timeout = dcc_get_io_timeout() - (time(NULL) - active);
         if (timeout <= 0) { ret = EXIT_TIMEOUT; goto done; }
         struct pollfd p = {host->broker_fd, POLLIN | (outgoing ? POLLOUT : 0), 0};
-        int n = poll(&p, 1, timeout * 1000);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) goto done;
+        int ready = poll(&p, 1, timeout * 1000);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) goto done;
         for (unsigned turn = 0; turn < 4 && (p.revents & (POLLIN | POLLHUP | POLLERR)); ++turn) {
             size_t before = incoming.used;
             int complete = dcc_tcp_frame_read(host->broker_fd, &incoming, DCC_TCP_CHUNK + 8U);
             if (before != incoming.used) active = time(NULL);
             if (complete < 0) goto done;
-            if (incoming.fd_plus_one) goto done;
             if (!complete) break;
             if (complete) {
                 uint32_t type = incoming.type & ~DCC_TCP_FLAGS;
+                if (incoming.fd_plus_one && (!local || type != DCC_TCP_RESULT_FD)) goto done;
                 if (type == DCC_TCP_NEED && !have_result && incoming.size && !(incoming.size % 4)) {
                     for (size_t i = 0; i < incoming.size; i += 4) {
                         unsigned index = dcc_tcp_get32(incoming.data + i);
@@ -190,7 +196,31 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                         } else result->fd[i] = dcc_job_memfd("distcc-tcp-result");
                         if (result->fd[i] < 0) goto done;
                     }
-                } else if (type == DCC_TCP_OUTPUT && have_result) {
+                } else if (type == DCC_TCP_RESULT_FD && local && have_result && incoming.size == 4 &&
+                           incoming.fd_plus_one) {
+                    unsigned index = dcc_tcp_get32(incoming.data);
+                    int fd = incoming.fd_plus_one - 1;
+                    struct stat st;
+                    if (index >= DCC_JOB_RESULT_COUNT || (finals & (1U << index)) || received[index] ||
+                        fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+                        (uint64_t)st.st_size != result->size[index] ||
+                        (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY) goto done;
+                    if (result->temporary[index]) {
+                        off_t offset = 0;
+                        while ((uint64_t)offset < result->size[index]) {
+                            uint64_t left = result->size[index] - offset;
+                            ssize_t copied = sendfile(result->fd[index], fd, &offset,
+                                left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK);
+                            if (copied < 0 && errno == EINTR) continue;
+                            if (copied <= 0) goto done;
+                        }
+                    } else {
+                        close(result->fd[index]); result->fd[index] = fd;
+                        incoming.fd_plus_one = 0;
+                    }
+                    received[index] = result->size[index];
+                    finals |= 1U << index;
+                } else if (type == DCC_TCP_OUTPUT && have_result && !local) {
                     unsigned index;
                     size_t size;
                     const void *data;

@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <lz4.h>
 #include "tcp_job.h"
 
@@ -78,7 +79,7 @@ int dcc_tcp_frame_read(int fd, struct dcc_tcp_frame *f, size_t available)
                 f->type = dcc_tcp_get32(f->header);
                 f->size = dcc_tcp_get32(f->header + 4);
                 kind = f->type & ~DCC_TCP_FLAGS;
-                if (kind < DCC_TCP_BEGIN || kind > DCC_TCP_COMPLETE ||
+                if (kind < DCC_TCP_BEGIN || kind > DCC_TCP_RESULT_FD ||
                     f->size > available ||
                     f->size > (kind == DCC_TCP_BEGIN ? DCC_JOB_METADATA_MAX + 8U :
                                kind == DCC_TCP_NEED ? DCC_JOB_INPUT_MAX * 4U : DCC_TCP_CHUNK + 8U) ||
@@ -155,12 +156,37 @@ size_t dcc_tcp_encode(uint32_t type, unsigned index, const void *data,
     dcc_tcp_put32(p + 12, length);
     return 16 + compressed;
 }
-unsigned char *dcc_tcp_chunk(uint32_t type, unsigned index, const void *data,
-                             size_t length, int final, size_t *size)
+unsigned char *dcc_tcp_file_chunk(uint32_t type, unsigned index, int fd,
+                                  off_t offset, size_t length, int final, int immutable, size_t *size)
 {
-    unsigned char *p;
-    if (length > DCC_TCP_CHUNK || !(p = malloc(length + 16))) return NULL;
+    struct stat st;
+    long page = sysconf(_SC_PAGESIZE);
+    if (length > DCC_TCP_CHUNK || offset < 0 || page <= 0 || fstat(fd, &st) ||
+        st.st_size < offset || (uint64_t)(st.st_size - offset) < length) return NULL;
+    size_t delta = offset % page;
+    void *mapping = MAP_FAILED;
+    unsigned char *snapshot = NULL;
+    const void *data = NULL;
+    unsigned char *p = malloc(length + 16);
+    if (!p) return NULL;
+    if (length && immutable) {
+        mapping = mmap(NULL, delta + length, PROT_READ, MAP_PRIVATE, fd, offset - delta);
+        if (mapping == MAP_FAILED) { free(p); return NULL; }
+        data = (char *)mapping + delta;
+    } else if (length) {
+        snapshot = malloc(length + 16);
+        if (!snapshot || pread(fd, snapshot + 16, length, offset) != (ssize_t)length) {
+            free(snapshot); free(p); return NULL;
+        }
+        data = snapshot + 16;
+    }
     *size = dcc_tcp_encode(type, index, data, length, final, p);
-    if (*size == 16 && length) { memcpy(p + 16, data, length); *size += length; }
+    if (mapping != MAP_FAILED) munmap(mapping, delta + length);
+    if (snapshot && *size == 16) {
+        memcpy(snapshot, p, 16); free(p);
+        *size += length;
+        return snapshot;
+    }
+    free(snapshot);
     return p;
 }

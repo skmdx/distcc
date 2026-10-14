@@ -27,6 +27,55 @@ class TcpJobsTest(BrokerTestCase):
     def start_tcp(self):
         return self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
 
+    @unittest.skipUnless(shutil.which('strace'), 'strace is required')
+    def test_sealed_input_maps_and_sends_raw_tail(self):
+        self.start_tcp()
+        wrappers = self.work / 'client-bin'
+        wrappers.mkdir()
+        compiler = wrappers / 'gcc'
+        # Real preprocessing and compilation, with an incompressible comment
+        # added to CPP stdout to exercise raw sealed extents and a short tail.
+        compiler.write_text(f'''#!/usr/bin/python3
+import random, subprocess, sys
+result = subprocess.run([{self.cc!r}, *sys.argv[1:]])
+if result.returncode == 0 and '-E' in sys.argv:
+    data = random.Random(718).randbytes(1024 * 1024 + 17).replace(b'\\x00', b'x').replace(b'*', b'x')
+    sys.stdout.buffer.write(b'\\n/*' + data + b'*/\\n')
+sys.exit(result.returncode)
+''')
+        compiler.chmod(0o755)
+        target = subprocess.check_output([self.cc, '-dumpmachine'], text=True).strip()
+        (wrappers / (target + '-gcc')).symlink_to('gcc')
+        env = dict(self.env, PATH=str(wrappers) + os.pathsep + os.environ['PATH'])
+        trace = self.work / 'input.trace'
+        actual, expected = self.work / 'raw.o', self.work / 'native.o'
+        subprocess.run([self.cc, '-c', str(self.source), '-o', str(expected)], check=True)
+        subprocess.run(['strace', '-f', '-yy', '-e', 'trace=pread64,mmap,sendfile',
+                        '-o', str(trace), str(self.build / 'distcc'), 'gcc', '-c',
+                        str(self.source), '-o', str(actual)], env=env, check=True,
+                       capture_output=True, timeout=20)
+        self.assertEqual(actual.read_bytes(), expected.read_bytes())
+        calls = trace.read_text()
+        self.assertTrue(re.search(r'mmap\([^\n]*distcc-preprocessed', calls), 'sealed input was not mapped')
+        self.assertTrue(re.search(r'sendfile\([^\n]*distcc-preprocessed', calls), 'raw input did not use sendfile')
+        self.assertFalse(re.search(r'pread64\([^\n]*distcc-preprocessed', calls), 'sealed input was copied')
+
+    def test_local_error_result_preserves_object_and_reuses_connection(self):
+        prefix = str(self.root / 'local-error')
+        self.restart_server(self.build / 'distccd', DISTCC_LOCAL_SOCKET=prefix)
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.base_env = dict(self.base_env, DISTCC_LOCAL_SOCKET=prefix)
+        self.start_tcp()
+        source, obj = self.work / 'bad.c', self.work / 'bad.o'
+        source.write_text('int = ;\n')
+        obj.write_bytes(b'previous object')
+        result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(source),
+                                 '-o', str(obj)], env=self.env, capture_output=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'expected identifier', result.stderr)
+        self.assertEqual(obj.read_bytes(), b'previous object')
+        self.job('after-local-error')
+
     def test_local_input_descriptor_and_pool_reuse(self):
         prefix = str(self.root / 'local-jobs')
         self.restart_server(self.build / 'distccd', DISTCC_LOCAL_SOCKET=prefix)
@@ -70,14 +119,16 @@ class TcpJobsTest(BrokerTestCase):
         tracer = shutil.which('strace')
         if tracer:
             trace = self.work / 'local-input.trace'
-            subprocess.run([tracer, '-f', '-e', 'trace=memfd_create,sendfile',
+            subprocess.run([tracer, '-f', '-yy', '-e', 'trace=memfd_create,sendfile,recvmsg',
                             '-o', str(trace), str(self.build / 'distcc'), 'gcc',
                             '-c', str(source), '-o', str(actual)],
                            env=self.env, check=True, capture_output=True, timeout=15)
             calls = trace.read_text()
             self.assertIn('memfd_create("distcc-preprocessed"', calls)
             self.assertNotIn('memfd_create("distcc-local-input"', calls)
-            self.assertNotIn('sendfile(', calls)
+            self.assertIn('SCM_RIGHTS', calls)
+            self.assertIn('sendfile(', calls)  # Result publication, not an input snapshot.
+            self.assertNotRegex(calls, r'sendfile\([^\n]*distcc-preprocessed')
             self.assertEqual(actual.read_bytes(), expected.read_bytes())
         self.assertGreater(int(re.search(r'dcc_local_input_bytes (\d+)',
                                         self.get_stats(self.stats_ports[0]))[1]), 2 * 1024 * 1024)

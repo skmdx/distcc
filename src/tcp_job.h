@@ -7,13 +7,14 @@
 #include <limits.h>
 #include <poll.h>
 #include <sys/un.h>
+#include <sys/types.h>
 #include "job.h"
 
 /* 'T' distinguishes this protocol on the existing ACL-protected listener.
  * One framing layer; flags never introduce an inner RPC stream. */
 enum dcc_tcp_type {
     DCC_TCP_BEGIN = 0x54000200, DCC_TCP_NEED, DCC_TCP_INPUT,
-    DCC_TCP_RESULT, DCC_TCP_OUTPUT, DCC_TCP_COMPLETE
+    DCC_TCP_RESULT, DCC_TCP_OUTPUT, DCC_TCP_COMPLETE, DCC_TCP_RESULT_FD
 };
 #define DCC_TCP_COMPRESSED 0x10000U
 #define DCC_TCP_FINAL      0x20000U
@@ -40,9 +41,10 @@ int dcc_tcp_frame_read(int, struct dcc_tcp_frame *, size_t);
  * this framing. Returned allocation includes the complete 8-byte header. */
 unsigned char *dcc_tcp_frame_make(uint32_t, const void *, size_t, size_t *);
 int dcc_tcp_unpack(const struct dcc_tcp_frame *, unsigned *, void *, const void **, size_t *);
-unsigned char *dcc_tcp_chunk(uint32_t, unsigned, const void *, size_t, int, size_t *);
 /* Caller supplies CHUNK+16 bytes. RAW returns only its 16-byte header. */
 size_t dcc_tcp_encode(uint32_t, unsigned, const void *, size_t, int, void *);
+/* Immutable extents use mmap/sendfile; mutable files retain a private read buffer. */
+unsigned char *dcc_tcp_file_chunk(uint32_t, unsigned, int, off_t, size_t, int, int, size_t *);
 
 #define DCC_TCP_RUN 128
 struct dcc_tcp_run { uint32_t operation; uint64_t id; char root[PATH_MAX]; };
@@ -65,7 +67,7 @@ void dcc_tcp_server_abandon(struct dcc_tcp_server *);
 void dcc_tcp_server_collect(void);
 void dcc_tcp_server_quiesce(void);
 int dcc_tcp_server_pending(void);
-void dcc_tcp_server_poll(struct dcc_tcp_server *, struct pollfd *);
+int dcc_tcp_server_poll(struct dcc_tcp_server *, struct pollfd *);
 int dcc_tcp_server_process(struct dcc_tcp_server *, short);
 struct dcc_server_load;
 void dcc_tcp_server_load(struct dcc_tcp_server *, struct dcc_server_load *);

@@ -281,12 +281,13 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
         }
         polls[sockets + i] = (struct pollfd){ p->fd, p->ready ? 0 : POLLIN, 0 };
     }
+    int runnable = dcc_tcp_server_pending();
     for (i = 0; i < MAX_PENDING; ++i) {
         polls[tcp_base + i] = (struct pollfd){ .fd = -1 };
-        if (tcp[i]) dcc_tcp_server_poll(tcp[i], &polls[tcp_base + i]);
+        if (tcp[i]) runnable |= dcc_tcp_server_poll(tcp[i], &polls[tcp_base + i]);
     }
     /* Bound idle expiry even without statistics or other activity. */
-    result = poll(polls, total, dcc_tcp_server_pending() ? 0 : timeout < 1000 ? timeout : 1000);
+    result = poll(polls, total, runnable ? 0 : timeout < 1000 ? timeout : 1000);
     if (shutdown_signal) finish_shutdown();
     for (i = 0; i < count; ++i) extra[i].revents = polls[i].revents;
     if (result < 0) return result;

@@ -184,8 +184,11 @@ input's permissions. This removes input compression, socket payload transfer
 and server-side materialization, rather than eliminating every copy. The
 existing server worker receives it with the metadata in one IPC message and
 inherits it only for that compilation. Input lifetime, cancellation and the
-server's common admission limit are unchanged. Results retain the existing
-atomic publication path. Pump and link inputs still use framed payloads.
+server's common admission limit are unchanged. Local results also pass read-only
+descriptors instead of compressed payloads. The client copies objects and
+dependencies into its own unpublished files before atomic rename; diagnostics
+use the received descriptors directly. Update both endpoints together.
+Pump and link inputs still use framed payloads.
 `dcc_local_input_jobs` and `dcc_local_input_bytes` count accepted input
 descriptors and their uncompressed sizes, independently of TCP accept counts.
 
@@ -247,6 +250,11 @@ the shared storage budget; result completion waits for the last byte.
 `dcc_tcp_input_prefetch_bytes` counts wire bytes read during decoding, and
 `dcc_tcp_output_overlaps` counts encodes started while an output chunk remains
 queued. These demonstrate overlap, not time saved.
+Compression reads sealed input and completed result extents through bounded
+read-only mappings. Incompressible immutable extents use `sendfile`; mutable
+named inputs retain a private read buffer, reused directly if compression fails.
+Input preparation runs in bounded event-loop turns without depending on socket
+writability. Synchronous chunk encoding publishes its result directly.
 Uncached inputs start without a request round trip, and received
 objects go directly into unpublished destination files. Update clients and
 daemons together: this wire version does not accept earlier `,tcp` clients.
