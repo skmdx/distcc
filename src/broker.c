@@ -1073,10 +1073,8 @@ static void accept_client(struct broker *broker, int listener_fd)
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *client = &broker->clients[i];
             if (client->fd < 0) {
-                client->fd = fd;
-                client->state = REQUEST;
-                client->pooled = 0;
-                client->deadline = now_seconds() + 3;
+                *client = (struct client){ .fd = fd, .net = -1, .peer = -1,
+                    .state = REQUEST, .deadline = now_seconds() + 3 };
                 return;
             }
         }

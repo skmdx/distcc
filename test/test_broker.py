@@ -100,6 +100,33 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerTest(BrokerTestCase):
+    def test_reused_cpp_requests_do_not_inherit_old_job_priority(self):
+        peer = self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
+                         queued=0, preparing=0, returning=0, capacity=1))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}') + ' --localslots_cpp=1')
+        held = self.request(12)
+        self.assertEqual(self.receive(held), (0, 1, []))
+        first_seed, first_net = self.acquire_reserved(10, (201, 65536, 1))
+        first_seed.close()
+        first_net.close()
+        first = self.request(12)
+        first.settimeout(.05)
+        with self.assertRaises(socket.timeout):
+            first.recv(1032)
+        second_seed, second_net = self.acquire_reserved(10, (202, 64 * 1024 * 1024, 2))
+        second_seed.close()
+        second_net.close()
+        second = self.request(12)
+        second.settimeout(.05)
+        with self.assertRaises(socket.timeout):
+            second.recv(1032)
+        held.close()
+        first.settimeout(.5)
+        self.assertEqual(self.receive(first), (0, 1, []))
+        first.close()
+        second.settimeout(.5)
+        self.assertEqual(self.receive(second), (0, 1, []))
+
     def test_local_cpp_lease_wakes_waiter_without_reserving_worker(self):
         self.start_broker(self.host(0, ',tcp') + ' --localslots_cpp=1')
         first = self.request(12)
