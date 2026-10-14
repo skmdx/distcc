@@ -637,7 +637,7 @@ ssize_t write(int fd, const void *data, size_t size) {
             try:
                 with open(f'/proc/{compiler}/stat') as status:
                     state = status.read().rsplit(')', 1)[1].split()[0]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 break
             if state == 'Z':
                 break

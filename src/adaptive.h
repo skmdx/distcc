@@ -1,7 +1,8 @@
 /* Adaptive host selection.  SPDX-License-Identifier: GPL-2.0-or-later */
 struct dcc_hostdef;
 struct dcc_capacity {
-    int cpus, jobs;
+    int cpus, cores, jobs;
+    double core_scale, smt_gain;
     double load, memory_pressure;
     /* Optional live metrics; -1 means unavailable, never idle. */
     int running, busy, queued, links, admission, available;

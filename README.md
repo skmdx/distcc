@@ -56,8 +56,8 @@ typical case, three machines are 2.6 times faster than one.
 
 ## Adaptive scheduling (this fork)
 
-This fork adds opt-in allocation by online CPU count, one-minute load average,
-and relative per-core compilation speed. Start each server with `distccd --stats`
+This fork adds opt-in allocation by physical cores, SMT contention, runnable
+load and relative single-job compilation speed. Start each server with `distccd --stats`
 in addition to its usual listen/access options, then configure the client:
 
 ```sh
@@ -74,18 +74,22 @@ representative single-job compile with the same compiler/options on idle hosts
 and use `reference_time / host_time`. The default is 1; CPU clock frequency is
 not used as a performance estimate. Valid factors range from 0.01 to 1000.
 
-With `stats=PORT`, the slot limit defaults to the smaller of the server's online
-CPU count and `--jobs` limit. An explicit `/LIMIT`, for example
+With `stats=PORT`, the slot limit defaults to the smaller of the server's allowed
+logical CPU count and `--jobs` limit. An explicit `/LIMIT`, for example
 `builder-a/8,stats=3633`, adds a client-side ceiling. `distcc -j` reports these
 limits. Servers without statistics retain their configured slot count (default
-4). An old server without the new `dcc_cpus` metric also uses this fallback.
+4). Missing or invalid statistics also use this fallback. Clients and servers
+must report the same statistics schema, including CPU topology and coefficients.
 
-For each eligible host, the broker scores estimated completion cost as
-`max(1, (work + 1) / parallelism, (runnable + 1) / cpus) / speed`.
-Idle cores permit concurrent jobs, but cannot reduce a single compile below
-its own execution time. The lower bound favors faster workers for short
-queues and the build tail; bounded per-host pipelines still spill work to
-other workers when faster workers fill.
+For each eligible host, the broker estimates completion cost from aggregate
+CPU throughput, expressed in units of one idle compile. Throughput interpolates
+from 1 at one job to `physical_cores * core_scale` at one job per physical core.
+Each additional SMT thread contributes `smt_gain * core_scale`; throughput is
+bounded below by 1. Work beyond the execution limit queues rather than adding
+throughput. Estimated service time is `max(1, demand / throughput) / speed`.
+The broker takes the larger estimate from projected work and runnable system
+load, without multiplying or adding these overlapping contention penalties.
+Faster SMT threads can still beat idle cores on a slower host.
 Parallelism is the smallest of CPUs, the server's job limit and its reported
 memory admission capacity. Legacy paths use the larger of local reservations
 and the sum of server execution and ready-queue counts; they do not add the
@@ -95,6 +99,24 @@ Missing live runnable counts fall back to the one-minute load average.
 Reported memory PSI (`some avg10`, percent) multiplies the estimate by
 `1 + pressure / 100`. Estimates do not predict individual translation-unit
 sizes, transfer time, compiler-specific speed or container CPU quotas.
+
+Linux statistics count physical cores from the allowed CPUs' sysfs sibling
+lists and cache the topology until CPU affinity changes. If topology cannot
+be read, each allowed CPU is treated as a core. Configure the server environment
+with `DISTCC_CORE_SCALE` (0..1, default 1) and `DISTCC_SMT_GAIN` (-1..1, default
+0.25). Negative SMT gain represents an observed loss of aggregate throughput;
+these coefficients affect selection, not hard worker or memory limits.
+They are fixed calibration values, while occupancy and runnable load refresh
+with statistics. Restart the daemon after changing them.
+
+To calibrate, measure batch completion time for identical representative
+compiles started together at concurrency 1, P (physical cores), and L (logical
+CPUs). Average repeated batches to obtain T1, TP, TL.
+Use `core_scale = T1 / TP` and `smt_gain = (L * TP / TL - P) / (L - P)`, bounded
+to the accepted ranges. SMT gain is irrelevant when L equals P. Repeat with
+warm inputs and constant compiler/options and memory limits. The default gain
+is an initial estimate; validate calibrated values on a whole build because
+frequency, memory bandwidth and compiler workload change the throughput curve.
 
 For a distributed Ninja build, bound total jobs with `-j`. A local load limit
 (`-l`) can stop new remote jobs when the client also executes compiler work,
@@ -113,10 +135,9 @@ first consume the snapshot's returning count, so output-only jobs do not free
 CPU capacity twice. No per-stage IPC or extra network round trip is required.
 Input preparation can overlap execution within a pipeline of up to four jobs
 (also capped by effective parallelism); excess preparation increases the score.
-Prepared-job hosts are ranked by projected work divided by execution capacity
-and relative speed, with runnable CPU load and memory pressure as additional
-costs. The score increases below saturation too, so raising memory capacity
-does not give a fast host a flat score that starves the other workers.
+Prepared-job hosts use the same contention curve with projected work, runnable
+CPU load and memory pressure. Memory capacity bounds concurrency but does not
+make SMT threads equivalent to independent cores.
 Execution, ready jobs, preparation and new assignments share this estimated
 global limit of parallelism plus pipeline depth. Returning jobs have a separate
 bounded allowance for socket leases. A zero memory capacity stops new uploads;

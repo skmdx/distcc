@@ -259,8 +259,9 @@ wizards only.
 .B --stats
 Turn on the statistics HTTP server. By default it is off.
 (Daemon mode only.)
-This fork also reports dcc_cpus (online logical CPU count), alongside
-dcc_max_kids and dcc_load1, for clients using the stats=PORT host option.
+This fork reports dcc_cpus (allowed logical CPU count), dcc_cores (physical
+cores), dcc_core_scale and dcc_smt_gain alongside dcc_max_kids and dcc_load1
+for clients using the stats=PORT host option.
 .TP
 .B --stats-port PORT
 Set the TCP port to listen on for HTTP requests, rather than the default of 3633.
@@ -355,6 +356,15 @@ Log messages can be sent to a
 different file using the
 .B --log-file option.
 .SH "ENVIRONMENT VARIABLES"
+.TP
+.B "DISTCC_CORE_SCALE, DISTCC_SMT_GAIN"
+Calibrate CPU contention estimates advertised to adaptive clients.
+CORE_SCALE is per-core throughput at one job per physical core relative to
+one idle job (0..1, default 1). SMT_GAIN is the additional throughput of each
+SMT thread relative to a loaded physical core (-1..1, default 0.25).
+Negative values represent measured SMT throughput losses. These affect host
+selection, not worker or memory admission limits. Values are read at startup;
+restart after changes. See README.md for measurement and calibration.
 .TP
 .B "DISTCC_CMDLIST"
 If the environment variable DISTCC_CMDLIST is set,

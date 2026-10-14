@@ -62,6 +62,22 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
                 return -1;
             cap->cpus = value;
             fields |= 1;
+        } else if (!strncmp(line, "dcc_cores ", 10)) {
+            if ((fields & 8192) || sscanf(line + 10, "%lf %c", &value, &extra) != 1 ||
+                !(value >= 1 && value <= 10000) || value != (int)value)
+                return -1;
+            cap->cores = value;
+            fields |= 8192;
+        } else if (!strncmp(line, "dcc_core_scale ", 15)) {
+            if ((fields & 32768) || sscanf(line + 15, "%lf %c", &value, &extra) != 1 ||
+                !(value >= 0 && value <= 1)) return -1;
+            cap->core_scale = value;
+            fields |= 32768;
+        } else if (!strncmp(line, "dcc_smt_gain ", 13)) {
+            if ((fields & 16384) || sscanf(line + 13, "%lf %c", &value, &extra) != 1 ||
+                !(value >= -1 && value <= 1)) return -1;
+            cap->smt_gain = value;
+            fields |= 16384;
         } else if (!strncmp(line, "dcc_max_kids ", 13)) {
             if ((fields & 2) || sscanf(line + 13, "%lf %c", &value, &extra) != 1 ||
                 !(value >= 1 && value <= 10000) || value != (int)value)
@@ -98,7 +114,8 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
             }
         }
     }
-    return (fields & 7) == 7 ? 0 : -1;
+    const int required = 7 | 8192 | 16384 | 32768;
+    return (fields & required) == required && cap->cores <= cap->cpus ? 0 : -1;
 }
 
 /* Isolate the existing resolver and socket code so the entire probe, including
@@ -219,17 +236,32 @@ int dcc_capacity_slots(const struct dcc_hostdef *host, const struct dcc_capacity
     return slots;
 }
 
-/* Prepared-job streams balance normalized demand across aggregate capacity.
- * Legacy reservations retain the single-job service-time floor. Global
- * occupancy overlaps local leases: take the maximum, never add both counts.
- * Admission on the server closes the race between independent brokers. */
+/* Estimate per-job service time relative to an idle single-job compile. */
+static double cpu_service(double demand, int limit, const struct dcc_capacity *cap)
+{
+    int cores = cap ? cap->cores : limit;
+    double active = demand < limit ? demand : limit;
+    double physical = cap ? cores * cap->core_scale : cores;
+    if (physical < 1) physical = 1;
+    /* Interpolate measured throughput from one job to one job/core, then
+     * through the SMT range. Negative SMT gain represents measured losses
+     * from sharing execution resources or reducing sustained clock speed. */
+    double capacity = active <= 1 ? active : active <= cores ?
+                      1 + (active - 1) * (physical - 1) / (cores - 1) :
+                      physical + (active - cores) * cap->smt_gain * cap->core_scale;
+    if (capacity < 1) capacity = 1;
+    return demand > capacity && capacity > 0 ? demand / capacity : 1;
+}
+
+/* Global occupancy overlaps local leases: take the maximum, never add both
+ * counts. Admission on the server closes the race between brokers. */
 double dcc_capacity_score(const struct dcc_hostdef *host,
                           const struct dcc_capacity *cap, int busy)
 {
     int slots = dcc_capacity_slots(host, cap), occupied = busy;
     int parallelism = cap ? (cap->cpus < cap->jobs ? cap->cpus : cap->jobs) : slots;
-    /* Spare cores allow concurrency, not a fraction of one compile's runtime.
-     * Below saturation compare single-job speed; above it include queueing. */
+    /* Physical cores provide independent execution. Additional SMT threads
+     * add only part of a core's throughput; beyond admission, work queues. */
     double service = 1, demand;
     if (cap) {
         int remote = (cap->busy > 0 ? cap->busy : 0) + (cap->queued > 0 ? cap->queued : 0);
@@ -237,10 +269,13 @@ double dcc_capacity_score(const struct dcc_hostdef *host,
         if (cap->capacity >= 0 && cap->capacity < parallelism) parallelism = cap->capacity;
     }
     /* A client's /LIMIT restricts its own leases, not other clients' CPUs. */
-    demand = (occupied + 1.0) / (parallelism > 0 ? parallelism : 1);
+    demand = cpu_service(occupied + 1.0, parallelism > 0 ? parallelism : 1, cap);
     if (demand > service) service = demand;
     if (cap) {
-        demand = ((cap->running >= 0 ? cap->running : cap->load) + 1) / cap->cpus;
+        /* Runnable load includes compiler work: take the larger contention
+         * estimate, never add it to reservations or multiply both penalties. */
+        demand = cpu_service((cap->running >= 0 ? cap->running : cap->load) + 1,
+                             cap->cpus, cap);
         if (demand > service) service = demand;
         if (cap->memory_pressure > 0) service *= 1 + cap->memory_pressure / 100;
     }

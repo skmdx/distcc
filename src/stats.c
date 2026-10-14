@@ -367,7 +367,8 @@ static void dcc_service_stats_request(int http_fd) {
     double loadavg[3];
     int free_space_mb;
     int free_mem_mb;
-    int ncpus;
+    int ncpus, ncores;
+    double core_scale, smt_gain;
     struct dcc_server_load load = { .busy = -1, .queued = -1, .links = -1,
                                     .preparing = -1, .returning = -1 };
     int admission = 0, available = -1, capacity = -1;
@@ -397,6 +398,9 @@ dcc_longest_job_compiler %s\n\
 dcc_longest_job_time_msecs %d\n\
 dcc_max_kids %d\n\
 dcc_cpus %d\n\
+dcc_cores %d\n\
+dcc_core_scale %.3f\n\
+dcc_smt_gain %.3f\n\
 dcc_avg_kids1 %d\n\
 dcc_avg_kids2 %d\n\
 dcc_avg_kids3 %d\n\
@@ -436,7 +440,7 @@ dcc_free_mem %d MB\n\
     dcc_stats_minutely_update(); /* force update to get fresh disk io data */
     ct = dcc_stats_get_compile_totals();
     dcc_getloadavg(loadavg);
-    dcc_ncpus(&ncpus);
+    dcc_cpu_topology(&ncpus, &ncores, &core_scale, &smt_gain);
 #ifdef __linux__
     admission = dcc_prefork_status(&load);
     capacity = dcc_resource_slots(dcc_max_kids);
@@ -475,6 +479,7 @@ dcc_free_mem %d MB\n\
                                dcc_stats.longest_job_time,
                                dcc_max_kids,
                                ncpus,
+                               ncores, core_scale, smt_gain,
                                dcc_stats.kids_avg[0],
                                dcc_stats.kids_avg[1],
                                dcc_stats.kids_avg[2],

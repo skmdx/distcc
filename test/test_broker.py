@@ -190,6 +190,16 @@ class BrokerTest(BrokerTestCase):
         time.sleep(1.05)
         self.assertEqual(jobs(), 8)
 
+    def test_tcp_smt_contention_prefers_spare_physical_cores(self):
+        first = self.peer(stats_response(cpus=8, cores=4, jobs=8, running=4, busy=4,
+                                        queued=0, preparing=0, returning=0, capacity=8))
+        second = self.peer(stats_response(cpus=8, cores=8, jobs=8, running=0, busy=0,
+                                         queued=0, preparing=0, returning=0, capacity=8))
+        hosts = self.host(0, f',tcp,stats={first.port},speed=1') + ' ' + self.host(1, f',tcp,stats={second.port},speed=.9')
+        self.start_broker(hosts)
+        _, net = self.acquire_reserved(10)
+        self.assertEqual(net.getpeername()[1], self.ports[1])
+
     def test_tcp_global_pipeline_and_resource_limits(self):
         for name, metrics in (
                 ('memory', dict(capacity=0)),

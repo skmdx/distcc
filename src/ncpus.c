@@ -31,10 +31,80 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 #include "distcc.h"
 #include "trace.h"
 #include "exitcode.h"
+
+static double cpu_fraction(const char *name, double minimum, double fallback)
+{
+    const char *option = getenv(name);
+    if (!option) return fallback;
+    char *end;
+    double value = strtod(option, &end);
+    if (end != option && !*end && value >= minimum && value <= 1) return value;
+    rs_log_warning("%s must be between %.1f and 1; using %.2f", name, minimum, fallback);
+    return fallback;
+}
+
+/* CPU topology is stable while the allowed CPU set is unchanged. Read sysfs
+ * only when that set changes, not for every scheduler statistics request.
+ * Sibling lists identify a core even across sockets/dies with reused IDs. */
+void dcc_cpu_topology(int *logical, int *physical, double *core_scale, double *smt_gain)
+{
+    static int configured;
+    static double gain, scale;
+    if (!configured) {
+        gain = cpu_fraction("DISTCC_SMT_GAIN", -1, .25);
+        scale = cpu_fraction("DISTCC_CORE_SCALE", 0, 1);
+        configured = 1;
+    }
+    *smt_gain = gain;
+    *core_scale = scale;
+#ifdef __linux__
+    static cpu_set_t cached;
+    static int cores;
+    cpu_set_t allowed;
+    if (!sched_getaffinity(0, sizeof(allowed), &allowed)) {
+        *logical = CPU_COUNT(&allowed);
+        if (*logical > 0) {
+            if (!cores || !CPU_EQUAL(&allowed, &cached)) {
+                char **groups = calloc(*logical, sizeof(*groups));
+                int count = 0, valid = groups != NULL;
+                for (int cpu = 0; valid && cpu < CPU_SETSIZE; ++cpu) {
+                    if (!CPU_ISSET(cpu, &allowed)) continue;
+                    char path[128], siblings[1024];
+                    snprintf(path, sizeof(path),
+                             "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+                    FILE *file = fopen(path, "r");
+                    valid = file && fgets(siblings, sizeof(siblings), file) &&
+                            strchr(siblings, '\n');
+                    if (file) fclose(file);
+                    if (!valid) break;
+                    int i;
+                    for (i = 0; i < count && strcmp(groups[i], siblings); ++i) ;
+                    if (i == count) {
+                        groups[count] = strdup(siblings);
+                        if (!groups[count]) valid = 0;
+                        else ++count;
+                    }
+                }
+                cores = valid ? count : *logical;
+                for (int i = 0; i < count; ++i) free(groups[i]);
+                free(groups);
+                cached = allowed;
+            }
+            *physical = cores;
+            return;
+        }
+    }
+#endif
+    dcc_ncpus(logical);
+    *physical = *logical;
+}
 
 /**
  * Determine number of processors online.

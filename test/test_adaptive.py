@@ -27,9 +27,11 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def stats_response(cpus=4, jobs=4, load: float | str = 0, **metrics):
+def stats_response(cpus=4, jobs=4, load: float | str = 0, cores=None, core_scale=1, smt_gain=.25, **metrics):
     return ("HTTP/1.0 200 OK\n\n<distccstats>\n"
             f"dcc_cpus {cpus}\ndcc_max_kids {jobs}\ndcc_load1 {load}\n"
+            f"dcc_cores {cpus if cores is None else cores}\ndcc_smt_gain {smt_gain}\n"
+            f"dcc_core_scale {core_scale}\n"
             + ''.join(f'dcc_{name} {value}\n' for name, value in metrics.items())
             + "</distccstats>\n").encode()
 
@@ -199,6 +201,47 @@ class DistccTestCase(unittest.TestCase):
         return stream
 
 class AdaptiveTest(DistccTestCase):
+    def test_topology_tracks_allowed_cpu_set(self):
+        if not hasattr(os, 'sched_getaffinity'):
+            self.skipTest('Linux CPU affinity is required')
+        pid = self.daemons[0].pid
+        original = os.sched_getaffinity(pid)
+        groups = {}
+        for cpu in original:
+            key = Path(f'/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list').read_text()
+            groups.setdefault(key, []).append(cpu)
+        try:
+            for selected in (original, set(next(iter(groups.values()))), {min(original)}, original):
+                os.sched_setaffinity(pid, selected)
+                stats = self.get_stats(self.stats_ports[0])
+                cores = len({Path(f'/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list').read_text()
+                             for cpu in selected})
+                self.assertIn(f'dcc_cpus {len(selected)}\n', stats)
+                self.assertIn(f'dcc_cores {cores}\n', stats)
+        finally:
+            os.sched_setaffinity(pid, original)
+
+    def test_smt_load_changes_host_selection(self):
+        first = self.peer(stats_response(cpus=8, cores=4, jobs=8, busy=4, queued=0))
+        second = self.peer(stats_response(cpus=8, cores=8, jobs=8, busy=0, queued=0))
+        hosts = self.host(0, f',stats={first.port},speed=1') + ' ' + self.host(1, f',stats={second.port},speed=.9')
+        port, _ = self.compile(hosts, 'smt-contention')
+        self.assertEqual(port, self.ports[1])
+
+    def test_measured_cpu_contention_changes_host_selection(self):
+        for name, metrics, other_speed, selected in (
+                ('physical-scaling', dict(busy=3, core_scale=.5), .8, 1),
+                ('smt-loss', dict(busy=7, smt_gain=-.25), .4, 1),
+                ('fast-smt', dict(busy=4), .5, 0),
+                ('external-work', dict(busy=0, running=4), .9, 1)):
+            with self.subTest(name=name):
+                first = self.peer(stats_response(cpus=8, cores=4, jobs=8, queued=0, **metrics))
+                second = self.peer(stats_response(cpus=8, cores=8, jobs=8, busy=0, queued=0))
+                hosts = (self.host(0, f',stats={first.port},speed=1') + ' ' +
+                         self.host(1, f',stats={second.port},speed={other_speed}'))
+                port, _ = self.compile(hosts, name)
+                self.assertEqual(port, self.ports[selected])
+
     def test_real_stats_and_speed_distribution(self):
         for port in self.stats_ports:
             stats = self.get_stats(port)
@@ -290,6 +333,11 @@ class AdaptiveTest(DistccTestCase):
     def test_missing_invalid_and_stalled_stats(self):
         for i, response in enumerate((b"garbage", stats_response(load="nan"),
                                       stats_response(cpus=-1),
+                                      stats_response(cores=5),
+                                      stats_response(smt_gain='nan'),
+                                      stats_response(smt_gain=1.1),
+                                      stats_response(core_scale='nan'),
+                                      stats_response().replace(b'dcc_cores 4\n', b''),
                                       stats_response().replace(b"dcc_cpus 4\n", b""),
                                       stats_response()[:-20])):
             peer = self.peer(response)
@@ -404,6 +452,18 @@ int main(void) {
             subprocess.run(['gcc','-Isrc',str(source),'src/resource.c','-o',str(executable)],
                            check=True,capture_output=True)
             subprocess.run([str(executable)],check=True,capture_output=True)
+
+
+class CpuCalibrationTest(DistccTestCase):
+    daemon_env = {'DISTCC_CORE_SCALE': '.7', 'DISTCC_SMT_GAIN': '-.125'}
+
+    def test_server_advertises_calibration(self):
+        stats = self.get_stats(self.stats_ports[0])
+        self.assertIn('dcc_core_scale 0.700\n', stats)
+        self.assertIn('dcc_smt_gain -0.125\n', stats)
+        # Exercise the actual response parser and compiler path as well.
+        port, _ = self.compile(self.host(0, f',stats={self.stats_ports[0]}'))
+        self.assertEqual(port, self.ports[0])
 
 
 if __name__ == "__main__":

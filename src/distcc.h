@@ -154,6 +154,7 @@ int dcc_parse_hosts(const char *where, const char *source_name,
 
 /* ncpu.c */
 int dcc_ncpus(int *);
+void dcc_cpu_topology(int *logical, int *physical, double *core_scale, double *smt_gain);
 
 /* ssh.c */
 int dcc_ssh_connect(char *ssh_cmd, char *user,
