@@ -726,6 +726,7 @@ dcc_build_somewhere(char *argv[],
     struct dcc_hostdef *host = NULL;
     struct dcc_work_hint work = {0};
     char *discrepancy_filename = NULL;
+    char *deferred_include_server = NULL;
     char **new_argv;
 
     max_retries = dcc_get_max_retries();
@@ -822,9 +823,14 @@ dcc_build_somewhere(char *argv[],
             }
         }
         if (count && same_format && ret) {
-            if (ret == EXIT_BUSY)
+            if (ret == EXIT_BUSY) {
                 rs_trace("include analyzer busy; preprocessing locally before worker selection");
-            else {
+                deferred_include_server = strdup(getenv("INCLUDE_SERVER_PORT"));
+                if (!deferred_include_server) {
+                    ret = EXIT_OUT_OF_MEMORY;
+                    goto fallback;
+                }
+            } else {
                 rs_log_warning("failed to get includes from include server, "
                            "preprocessing locally before worker selection");
                 if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) dcc_exit(ret);
@@ -1059,6 +1065,32 @@ dcc_build_somewhere(char *argv[],
         goto clean_up;
     }
     if (ret < 128) {
+        if (deferred_include_server) {
+            /* Local preprocessing can lose macro provenance and turn a
+             * suppressed warning into an error. Retry the original input
+             * remotely before occupying the client's compilation slots.
+             * The worker lease is already released; wait only on analysis.
+             * Consume this deferred attempt even if analysis fails. */
+            rs_trace("retrying with remote preprocessing after client preprocessing failed");
+            int scan_ret = setenv("INCLUDE_SERVER_PORT", deferred_include_server, 1);
+            free(deferred_include_server);
+            deferred_include_server = NULL;
+            if (!scan_ret)
+                scan_ret = dcc_talk_to_include_server(argv, &files, host->compr, 1, NULL);
+            if (!scan_ret) {
+                if (cpp_fd >= 0) close(cpp_fd);
+                free(cpp_fname);
+                cpp_fd = -1;
+                cpp_fname = NULL;
+                cpp_ready = 0;
+                *status = 0;
+                dcc_work_describe(&work, argv, input_fname, NULL, -1, 0);
+                goto choose_host;
+            }
+            dcc_free_argv(files);
+            files = NULL;
+            unsetenv("INCLUDE_SERVER_PORT");
+        }
         /* Remote compile just failed, e.g. with syntax error.
            It may be that the remote compilation failed because
            the file has an error, or because we did something
@@ -1187,6 +1219,7 @@ dcc_build_somewhere(char *argv[],
         free(localcpp_server_argv);
     }
     free(discrepancy_filename);
+    free(deferred_include_server);
     dcc_free_buffer(&server_stdout);
     dcc_free_buffer(&server_stderr);
     return ret;

@@ -142,23 +142,47 @@ class PreprocessTest(BrokerTestCase):
                               cwd=self.work, env=self.env, capture_output=True,
                               timeout=15)
 
-    def test_busy_scanner_local_cpp_difference_does_not_disable_pump(self):
+    def retry_after_busy_scanner(self, args):
+        log = self.work / 'client.log'
+        client = None
+        try:
+            with open(self.env['INCLUDE_SERVER_PORT'] + '.lock', 'a') as lock:
+                fcntl.lockf(lock, fcntl.LOCK_EX)
+                client = subprocess.Popen(
+                    [str(self.build / 'distcc'), 'gcc', *map(str, args)],
+                    cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                deadline = time.monotonic() + 5
+                while not log.exists() or 'retrying with remote preprocessing' not in log.read_text():
+                    self.assertIsNone(client.poll(), 'remote preprocessing retry not reached')
+                    self.assertLess(time.monotonic(), deadline, 'waiting for remote preprocessing retry')
+                    time.sleep(.01)
+            stdout, stderr = client.communicate(timeout=15)
+            return subprocess.CompletedProcess(client.args, client.returncode, stdout, stderr)
+        finally:
+            if client is not None and client.poll() is None:
+                client.kill()
+                client.communicate(timeout=5)
+
+    def test_busy_scanner_cpp_diagnostic_retries_without_local_compilation(self):
         self.source.write_text('#define PRESENT(p) ((p) != 0)\n'
                                'int present(void) { int values[1]; return PRESENT(values); }\n')
-        args = ['-Werror=address', '-c', self.source, '-o', 'macro.o']
+        args = ['-Werror=address', '-c', self.source, '-o', 'macro.o', '-MMD', '-MF', 'macro.d']
         local = self.run_cc('gcc', args, remote=False)
         self.assertEqual(local.returncode, 0, local.stderr.decode())
-        self.env.pop('DISTCC_SKIP_LOCAL_RETRY')
-        self.env['DISTCC_FALLBACK'] = '1'
         log = self.work / 'client.log'
-        lock = Path(self.env['INCLUDE_SERVER_PORT'] + '.lock')
-        with lock.open('a') as fd:
-            fcntl.lockf(fd, fcntl.LOCK_EX)
-            result = self.run_cc('gcc', args)
+        expected = (self.work / 'macro.o').read_bytes()
+        expected_deps = (self.work / 'macro.d').read_bytes()
+        (self.work / 'macro.o').unlink()
+        (self.work / 'macro.d').unlink()
+        result = self.retry_after_busy_scanner(args)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual((self.work / 'macro.o').read_bytes(), expected)
+        self.assertEqual((self.work / 'macro.d').read_bytes(), expected_deps)
+        self.assertEqual(result.stderr, local.stderr)
         text = log.read_text()
         self.assertIn('include analyzer busy', text)
-        self.assertIn('retrying locally', text)
+        self.assertIn('retrying with remote preprocessing', text)
+        self.assertNotIn('running locally instead', text)
         counter = Path(self.env['INCLUDE_SERVER_PORT']).parent / 'discrepancy_counter'
         self.assertFalse(counter.exists(), text)
         log.write_text('')
@@ -168,6 +192,15 @@ class PreprocessTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertIn('send CDIR', log.read_text())
         self.assertNotIn('preprocessing locally', log.read_text())
+
+    def test_busy_scanner_syntax_error_retries_remote_only_once(self):
+        self.source.write_text('int value = ;\n')
+        result = self.retry_after_busy_scanner(['-c', self.source, '-o', 'invalid.o'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.work / 'invalid.o').exists())
+        log = (self.work / 'client.log').read_text()
+        self.assertEqual(log.count('retrying with remote preprocessing'), 1)
+        self.assertNotIn('running locally instead', log)
 
     def test_compiler_probe_bypasses_local_cpp_admission(self):
         masquerade = self.work / 'masquerade'
