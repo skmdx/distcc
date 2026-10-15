@@ -690,22 +690,10 @@ static int dcc_link_candidate(char **argv)
  *
  * Implementation notes:
  *
- * This code might be simpler if we would only acquire one lock
- * at a time.  But we need to choose the server host in order
- * to determine whether it supports pump mode or not,
- * and choosing the server host requires acquiring its lock
- * (otherwise it might be busy when we we try to acquire it).
- * So if the server chosen is not localhost, we need to hold the
- * remote host lock while we're doing local preprocessing or include
- * scanning.  Since local preprocessing/include scanning requires
- * us to acquire the local cpu lock, that means we need to hold two
- * locks at one time.
- *
- * TODO: make pump mode a global flag, and drop support for
- * building with cpp mode on some hosts and not on others.
- * Then change the code so that we only choose the remote
- * host after local preprocessing/include scanning is finished
- * and the local cpu lock is released.
+ * Broker pools with a common input format finish include analysis before
+ * selecting a worker. Local preprocessing likewise precedes selection.
+ * Legacy or mixed-format pools still select a host first to determine the
+ * include transfer format; their lock order is remote then local.
  */
 static int
 dcc_build_somewhere(char *argv[],
@@ -714,7 +702,7 @@ dcc_build_somewhere(char *argv[],
 {
     char *input_fname = NULL, *output_fname, *cpp_fname = NULL, *deps_fname = NULL;
     int cpp_fd = -1;
-    char **files;
+    char **files = NULL;
     char **server_side_argv = NULL;
     char **localcpp_server_argv = NULL;
     char **remotecpp_server_argv = NULL;
@@ -794,6 +782,36 @@ dcc_build_somewhere(char *argv[],
     /* turned off because we never spend long in this state. */
     dcc_note_state(DCC_PHASE_STARTUP, input_fname, NULL);
 #endif
+    /* A homogeneous broker pool has a known input format before selection.
+     * Finish include analysis before reserving a worker or opening its socket:
+     * a serialized scanner must not consume slots or the worker's idle timeout. */
+    if (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER") &&
+        getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes) {
+        struct dcc_hostdef *list = NULL, *entry;
+        int count, same_format = 1;
+        enum dcc_compress compr = DCC_COMPRESS_NONE;
+        if ((ret = dcc_get_hostlist(&list, &count))) goto fallback;
+        for (entry = list; entry;) {
+            struct dcc_hostdef *next = entry->next;
+            enum dcc_compress format = entry->compr == DCC_COMPRESS_NONE ?
+                DCC_COMPRESS_LZO1X : entry->compr;
+            if (entry->mode != DCC_MODE_TCP ||
+                (compr != DCC_COMPRESS_NONE && compr != format)) same_format = 0;
+            compr = format;
+            dcc_free_hostdef(entry);
+            entry = next;
+        }
+        if (count && same_format &&
+            (ret = dcc_talk_to_include_server(argv, &files, compr))) {
+            rs_log_warning("failed to get includes from include server, "
+                           "preprocessing locally before worker selection");
+            if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) dcc_exit(ret);
+            files = NULL;
+            unsetenv("INCLUDE_SERVER_PORT");
+            if (preprocess_only) goto fallback;
+        }
+    }
+
     /* With a broker, finish local preprocessing before reserving a worker.
      * Release the local lock before requesting the remote lease; never wait
      * for a remote slot while holding a local slot. Reuse this input on retry. */
@@ -860,7 +878,7 @@ dcc_build_somewhere(char *argv[],
         goto unlock_and_clean_up;
     }
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        if ((ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
+        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
             /* Fallback to doing cpp locally */
             /* It's unfortunate that the variable that controls that is in the
              * "host" datastructure, even though in this case it's the client

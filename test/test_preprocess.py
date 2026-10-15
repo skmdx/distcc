@@ -9,8 +9,10 @@ import select
 import shlex
 import shutil
 import socket
+import signal
 import subprocess
 import threading
+import time
 import unittest
 
 from test_broker import BrokerTestCase
@@ -41,6 +43,41 @@ class PreprocessTest(BrokerTestCase):
     def shutdown_pump(self):
         subprocess.run([str(self.build / 'pump'), '--shutdown'], env=self.env,
                        cwd=self.work, capture_output=True, timeout=10, check=True)
+
+    def test_scanner_wait_does_not_reserve_worker(self):
+        pid = int(self.env['INCLUDE_SERVER_PID'])
+        os.kill(pid, signal.SIGSTOP)
+        client = subprocess.Popen([str(self.build / 'distcc'), 'gcc', '-c',
+                                   str(self.source), '-o', 'waiting.o'],
+                                  cwd=self.work, env=self.env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        leases = []
+        try:
+            deadline = time.monotonic() + 5
+            while 'send CDIR' not in (self.work / 'client.log').read_text():
+                self.assertLess(time.monotonic(), deadline, 'scanner not reached')
+                time.sleep(.01)
+            # All four real worker slots must remain available while this
+            # client's include request is blocked in the stopped scanner.
+            for _ in range(4):
+                lease = self.request(9)
+                leases.append(lease)
+                status, _, descriptors = self.receive(lease)
+                for fd in descriptors:
+                    os.close(fd)
+                self.assertEqual(status, 0)
+        finally:
+            for lease in leases:
+                lease.close()
+            os.kill(pid, signal.SIGCONT)
+            try:
+                client.wait(timeout=15)
+            finally:
+                if client.poll() is None:
+                    client.kill()
+                    client.wait()
+        self.assertEqual(client.returncode, 0)
+        self.assertTrue((self.work / 'waiting.o').exists())
 
     def run_cc(self, compiler, args, remote=True):
         prefix = [str(self.build / 'distcc')] if remote else []
