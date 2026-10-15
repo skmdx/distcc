@@ -41,6 +41,38 @@ class ClangScanTest(unittest.TestCase):
                      [(0, 'MAKE_HEADER(foo, nested(bar))'), (1, '<next.h>'),
                       (0, '     "comment.h"')])
 
+  def test_system_checks_keep_directory_and_leaf_aliases(self):
+    system = self.root / 'system'
+    project = self.root / 'project'
+    system.mkdir()
+    project.mkdir()
+    (system / 'present.h').write_text('int present;\n')
+    (project / 'local.h').write_text('int local;\n')
+    (project / 'alias').symlink_to(system, target_is_directory=True)
+    (project / 'leaf.h').symlink_to(system / 'present.h')
+    (project / 'dangling.h').symlink_to(system / 'missing.h')
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    analyzer.systemdir_prefix_cache.systemdirs = [str(system)]
+    analyzer.compiler_defaults.missing_system_dirs = set()
+    expected = {str(system / 'present.h'), str(project / 'alias' / 'present.h'),
+                str(project / 'alias' / 'missing.h'), str(project / 'leaf.h'),
+                str(project / 'dangling.h'), str(system / 'missing.h')}
+    for path in expected | {str(project / 'local.h'), str(project / 'missing.h')}:
+      analyzer.build_stat_cache.file_stamps.Observe(path)
+    payload = analyzer.SystemChecks({})
+    self.assertEqual(payload[:4], b'DCSH')
+    count = struct.unpack_from('!I', payload, 4)[0]
+    offset, actual = 8, set()
+    for _ in range(count):
+      length, kind, size, digest = struct.unpack_from('!IIQ8s', payload, offset)
+      offset += 24
+      actual.add(os.fsdecode(payload[offset:offset + length]))
+      offset += length
+    self.assertEqual(actual, expected)
+    self.assertEqual(offset, len(payload))
+
   def test_gcc_rejects_absolute_forwarder_before_clang_preprocessing(self):
     gcc = shutil.which('gcc')
     if not gcc:

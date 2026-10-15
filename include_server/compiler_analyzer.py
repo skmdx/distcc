@@ -89,15 +89,36 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     directories = tuple(path.rstrip('/') + '/' for path in
                         (*self.systemdir_prefix_cache.systemdirs,
                          *self.compiler_defaults.missing_system_dirs))
-    records = []
-    remaining = 64 * 1024 * 1024
-    for (path, ancestor), stamp in sorted(self.build_stat_cache.file_stamps.paths.items()):
+    def system_path(path):
+      return (path.rstrip('/') + '/').startswith(directories)
+
+    paths = self.build_stat_cache.file_stamps.paths
+    parents = {}
+    inputs = []
+    for (path, ancestor), stamp in paths.items():
       if ancestor:
         continue
-      canonical = self.canonical_path.Canonicalize(path)
-      if not any(name.startswith(directories) or name + '/' in directories
-                 for name in (path, canonical)):
-        continue
+      if system_path(path):
+        canonical = self.canonical_path.Canonicalize(path)
+      else:
+        # Most failed lookups belong to project include directories. Resolve
+        # their shared parent once, rather than realpath'ing every missing
+        # header. A leaf symlink still needs its own target checked.
+        leaf = paths.get((path, True))
+        if leaf is not None and stat.S_ISLNK(leaf[2]):
+          canonical = os.path.realpath(path)
+        else:
+          parent = os.path.dirname(path)
+          if parent not in parents:
+            # libc realpath cannot resolve a nonexistent tail. Missing
+            # probes through directory aliases still need system checks.
+            parents[parent] = os.path.realpath(parent)
+          canonical = os.path.normpath(os.path.join(parents[parent], os.path.basename(path)))
+      if system_path(path) or system_path(canonical):
+        inputs.append((path, canonical, stamp))
+    records = []
+    remaining = 64 * 1024 * 1024
+    for path, canonical, stamp in sorted(inputs):
       if path in self.system_records:
         record, size = self.system_records[path]
         records.append(record)
