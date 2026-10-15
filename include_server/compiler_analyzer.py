@@ -235,6 +235,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         # below and the actual compilation retain the original switches.
         scan_args = [arg for arg in scan_args if arg not in
                      ('-mabm', '-mno-abm', '-mhle', '-mno-hle',
+                      '-mdirect-extern-access', '-mno-direct-extern-access',
                       '-mamx-tf32', '-mno-amx-tf32',
                       '-mamx-transpose', '-mno-amx-transpose',
                       '-ftree-pre', '-fno-tree-pre')]

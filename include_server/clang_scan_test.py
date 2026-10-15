@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import shlex
 import struct
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -69,6 +70,27 @@ class ClangScanTest(unittest.TestCase):
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
     files = analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], '/', keeper, 'lz4s')
     self.assertTrue(any('/.distcc-system/' in path for path in files))
+
+  def test_gcc_direct_extern_access_flags_keep_compiler_analysis(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    macros = [gcc, '-dM', '-E', '-x', 'c', '-']
+    baseline = subprocess.check_output(macros, input=b'')
+    self.source.write_text('extern int value; int f(void) { return value; }\n')
+    self.addCleanup(os.chdir, os.getcwd())
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    for flag in ('-mdirect-extern-access', '-mno-direct-extern-access'):
+      with self.subTest(flag=flag):
+        probe = subprocess.run([*macros, flag], input=b'', capture_output=True)
+        if probe.returncode:
+          self.skipTest('GCC target does not support direct extern access options')
+        self.assertEqual(probe.stdout, baseline)
+        files = analyzer.DoCompilationCommand([gcc, flag, '-c', str(self.source)],
+                                             str(self.root), keeper, 'lz4s')
+        self.assertTrue(any('/.distcc-system/' in path for path in files))
 
   def test_missing_default_system_directory_is_verified_and_invalidated(self):
     gcc = shutil.which('gcc')
