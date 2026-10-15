@@ -24,7 +24,6 @@ __author__ = "Nils Klarlund"
 
 import os
 import re
-import glob
 import shutil
 import tempfile
 import unittest
@@ -210,156 +209,59 @@ class IncludeAnalyzerTest(unittest.TestCase):
       shutil.rmtree(tmp_dir)
 
   def test_StatResetTriggers(self):
+    """Explicit triggers rebuild the graph against actual generated headers."""
+    def CheckFiles(files, expected, generation):
+      names = [os.path.basename(os.path.dirname(path)) + '/' +
+               os.path.basename(path)[:-4] for path in files if path.endswith('.lzo')]
+      self.assertEqual(names, ['test_data/stat_triggers.c', expected])
+      self.assertEqual(self.include_analyzer.generation, generation)
+      for path in files:
+        self.assertRegex(path, r'[.]include_server-[0-9]+-%d/' % generation)
 
-    """Check that the include analysis of a file is done from scratch after a
-    trigger path went from non-existing to existing.
-    """
+    previous = os.getcwd()
+    with tempfile.TemporaryDirectory() as root:
+      data = os.path.join(root, 'test_data')
+      os.makedirs(os.path.join(data, 'dfoo'))
+      with open(os.path.join(data, 'stat_triggers.c'), 'w') as source:
+        source.write('#include "stat_triggers.h"\n')
+      with open(os.path.join(data, 'dfoo', 'stat_triggers.h'), 'w') as header:
+        header.write('#define VALUE 1\n')
+      trigger = os.path.join(root, 'ate')
+      with open(trigger, 'w') as stream:
+        stream.write('initial\n')
+      self.include_analyzer.stat_reset_triggers = {
+          os.path.join(root, 'seven*'): {},
+          trigger: {trigger: basics.Stamp(trigger)},
+          os.path.join(root, 'nine'): {}}
+      command = 'gcc -Itest_data/dfoo test_data/stat_triggers.c'.split()
+      try:
+        files = self.include_analyzer.DoCompilationCommand(
+            command, root, self.include_analyzer.client_root_keeper)
+        CheckFiles(files, 'dfoo/stat_triggers.h', 1)
 
-    def CheckGeneration(lst, expected):
-      for f_name in lst:
-        self.assertTrue(
-            re.match(r"%s/.+[.]include_server[-][0-9]+[-]%s"
-                     % (self.include_analyzer.client_root_keeper.client_tmp,
-                        expected),
-                     f_name),
-            f_name)
+        generated = os.path.join(data, 'stat_triggers.h')
+        with open(generated, 'w') as header:
+          header.write('#define VALUE 2\n')
+        stamp = os.stat(trigger)
+        os.utime(trigger, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1000000000))
+        # Prove the explicit trigger resets the generation before normal
+        # per-request filesystem invalidation gets an opportunity to do so.
+        self.include_analyzer.DoStatResetTriggers()
+        self.assertEqual(self.include_analyzer.generation, 2)
+        files = self.include_analyzer.DoCompilationCommand(
+            command, root, self.include_analyzer.client_root_keeper)
+        CheckFiles(files, 'test_data/stat_triggers.h', 2)
 
-    def GetFileNamesFromAbsLzoName(lst):
-      """Transform lists with elements like:
-        '/dev/shm/tmpsn6NQT.include_server-12272-X/.../test_data/foo.c.lzo'
-      to lists with elements like:
-        'test_data/foo.c'"""
-      return [  f_name.split('/')[-2]
-                + '/'
-                + f_name.split('/')[-1][:-4]
-                for f_name in lst if f_name.endswith('.lzo') ]
-
-    self.include_analyzer.stat_reset_triggers = {"seven*": {},
-                                                 "ate": {"ate": (1,111,2)},
-                                                 "nine": {} }
-
-    try:
-
-      real_glob_glob = glob.glob
-      def Mock_GlobGlob(f):
-        if f in ["seven*", "nine"]: return []
-        if f == 'ate':  return ["ate"]
-        return real_glob_glob(f)
-      glob.glob = Mock_GlobGlob
-
-      real_os_stat = os.stat
-      def Mock_OsStat(f, dir_fd=None, follow_symlinks=True):
-        # Return the same as initial value in two cases below.
-        if f in ["seven", "nine"]: raise OSError
-        if f == 'ate':
-          obj = lambda: None
-          obj.st_mtime = 1
-          obj.st_ino = 111
-          obj.st_dev = 2
-          return obj
-        return real_os_stat(f)
-      os.stat = Mock_OsStat
-
-      real_cache_basic_OsPathIsFile = cache_basics._OsPathIsFile
-      def Mock_OsPathIsFile(f):
-        # We postulate that the test_data/stat_reset_triggers.h file does not
-        # yet exists. Moreover, we pretend that a version ind test_data/dfoo is
-        # in existence.
-        return f in [ "test_data/stat_triggers.c",
-                      "test_data/dfoo/stat_triggers.h"]
-      cache_basics._OsPathIsFile = Mock_OsPathIsFile
-
-      files_and_links = self.include_analyzer.DoCompilationCommand(
-        "gcc -Itest_data/dfoo test_data/stat_triggers.c".split(),
-        os.getcwd(),
-        self.include_analyzer.client_root_keeper)
-
-      # Check that we picked up the dfoo version of the .h file!
-      self.assertEqual(GetFileNamesFromAbsLzoName(files_and_links),
-                       ['test_data/stat_triggers.c',
-                        'dfoo/stat_triggers.h'])
-
-      # The generation should still be the original, namely 1.
-      self.assertEqual(self.include_analyzer.generation, 1)
-      CheckGeneration(files_and_links, 1)
-
-      def New_Mock_OsStat(f, dir_fd=None, follow_symlinks=True):
-        if f in ["seven", "nine"]: raise OSError
-        if f == 'ate':
-          obj = lambda: None
-          obj.st_mtime = 1
-          obj.st_ino = 111
-          obj.st_dev = 3  # so, this component changed from previous value
-          return obj
-        return real_os_stat(f)
-
-      os.stat = New_Mock_OsStat
-
-      def New_Mock_OsPathIsFile(f):
-        return f in [ "test_data/stat_triggers.c",
-                      "test_data/stat_triggers.h",
-                      "test_data/dfoo/stat_triggers.h"]
-      cache_basics._OsPathIsFile = New_Mock_OsPathIsFile
-
-      files_and_links = self.include_analyzer.DoCompilationCommand(
-        "gcc -Itest_data/dfoo test_data/stat_triggers.c".split(),
-        os.getcwd(),
-        self.include_analyzer.client_root_keeper)
-
-      self.assertEqual(self.include_analyzer.generation, 2)
-      CheckGeneration(files_and_links, 2)
-
-      # Now, check that we picked up the test_data version of the .h file, not
-      # the dfoo one!
-      self.assertEqual(GetFileNamesFromAbsLzoName(files_and_links),
-                       ['test_data/stat_triggers.c',
-                        'test_data/stat_triggers.h'])
-
-      # Third time.
-      def New_Mock_GlobGlob(f):
-        if f in ["seven*"]: return ["seventy"]
-        if f in ["nine"]: return []
-        if f == 'ate':  return ["ate"]
-        return real_glob_glob(f)
-      glob.glob = New_Mock_GlobGlob
-
-      def New_New_Mock_OsStat(f, dir_fd=None, follow_symlinks=True):
-        if f in ["seven", "nine"]: raise OSError
-        if f == 'ate':
-          obj = lambda: None
-          obj.st_mtime = 1
-          obj.st_ino = 111
-          obj.st_dev = 3
-          return obj
-        if f == 'seventy':
-          obj = lambda: None
-          obj.st_mtime = 2
-          obj.st_ino = 222
-          obj.st_dev = 3
-          return obj
-        return real_os_stat(f)
-      os.stat = New_New_Mock_OsStat
-
-      # Revert _OsPathIsFile
-      cache_basics._OsPathIsFile = Mock_OsPathIsFile
-
-      files_and_links = self.include_analyzer.DoCompilationCommand(
-        "gcc -Itest_data/dfoo test_data/stat_triggers.c".split(),
-        os.getcwd(),
-        self.include_analyzer.client_root_keeper)
-
-      # Now, check that we again picked up the dfoo version of the .h file.
-      self.assertEqual(GetFileNamesFromAbsLzoName(files_and_links),
-                       ['test_data/stat_triggers.c',
-                        'dfoo/stat_triggers.h'])
-
-      self.assertEqual(self.include_analyzer.generation, 3)
-      CheckGeneration(files_and_links, 3)
-
-    finally:
-      glob.glob = real_glob_glob
-      os.stat = real_os_stat
-      cache_basics._OsPathIsFile = real_cache_basic_OsPathIsFile
+        os.unlink(generated)
+        with open(os.path.join(root, 'seventy'), 'w') as stream:
+          stream.write('new trigger\n')
+        self.include_analyzer.DoStatResetTriggers()
+        self.assertEqual(self.include_analyzer.generation, 3)
+        files = self.include_analyzer.DoCompilationCommand(
+            command, root, self.include_analyzer.client_root_keeper)
+        CheckFiles(files, 'dfoo/stat_triggers.h', 3)
+      finally:
+        os.chdir(previous)
 
 
   def test_DotdotInInclude(self):

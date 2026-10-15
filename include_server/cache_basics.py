@@ -697,6 +697,7 @@ class FileStampCache(object):
       stamp = self.paths[key] = self.Stamp(original)
       if stamp is not None:
         self.files[original] = stamp
+    return self.paths[key]
 
   def Changed(self):
     if self.watch_fd < 0:
@@ -912,8 +913,8 @@ class BuildStatCache(object):
         # We do not explicitly take into account currdir_idx, because
         # of the check above that os.getcwd is set to current_dir.
         relpath = dir_map_string[sl_idx] + includepath
-        self.file_stamps.Observe(relpath)
-        if _OsPathIsFile(relpath):
+        stamp = self.file_stamps.Observe(relpath)
+        if stamp is not None and stat.S_ISREG(stamp[2]):
           searchdir_stats[sl_idx] = True
           rpath = os.path.join(dir_map_string[currdir_idx], relpath)
           realpath_idx = searchdir_realpaths[sl_idx] = (
