@@ -25,6 +25,7 @@ __author__ = "Nils Klarlund"
 # introduced to verify soundness of node reutilization in FindNode.
 
 import os
+import re
 
 import basics
 import macro_eval
@@ -157,20 +158,23 @@ class SupportMaster(object):
       union_cache: a UnionCache for memoizing sets and their unions
     """
     self.symbol_to_records = {}
+    self.patterns = set()
     self.union_cache = UnionCache()
 
   def SupportRecordDependencyAdd(self, symbols, support_record):
     """Add dependency of support record on symbol."""
     for symbol in symbols:
+      if isinstance(symbol, re.Pattern):
+        self.patterns.add(symbol)
       if symbol not in self.symbol_to_records:
         self.symbol_to_records[symbol] = set([])
       self.symbol_to_records[symbol].add(support_record)
 
   def InvalidateRecords(self, symbol):
     """Mark as invalid all support records whose set contains symbol."""
-    # None denotes dependence on the macro namespace: token pasting can form
-    # an alias that did not exist when the condition was first analyzed.
-    for key in (symbol, None):
+    # Token pasting can form a previously unknown alias. Invalidate only the
+    # patterns that can produce this name, not every node using a paste.
+    for key in [symbol, *(p for p in self.patterns if p.fullmatch(symbol))]:
       for support_record in self.symbol_to_records.get(key, ()):
         support_record.valid = False
 

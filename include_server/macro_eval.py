@@ -327,6 +327,8 @@ def _EvalExprHelper(expr, symbol_table, disabled, budget):
       # expansions, before substituting.
       (lhs, rhs) = definition  # lhs = formal parameters, rhs =
                                # expansion before substitution
+      if budget.bounded and args_list is not None and any('...' in arg for arg in lhs):
+        raise basics.NotCoveredError('Variadic macro in header condition: ' + symbol)
       # Verify that the number of formal parameters match the
       # number of actual parameters; otherwise skip.
       if not args_list or len(lhs) != len(args_list):
@@ -459,6 +461,7 @@ def ResolveExpr(includepath_map_index,
   is_probe = isinstance(expr, parse_file.ProbeExpression)
   if is_probe:
     pending: list[str] = [expr]
+    queued: set[str] = {expr}
     seen = set()
     has_probe = False
     while pending:
@@ -469,21 +472,26 @@ def ResolveExpr(includepath_map_index,
       for name in names - seen:
         seen.add(name)
         for definition in symbol_table.get(name, ()):
-          if isinstance(definition, tuple) and any('...' in arg for arg in definition[0]):
-            raise basics.NotCoveredError('Variadic macro in header condition: ' + name)
           body = definition[1] if isinstance(definition, tuple) else definition
           if body:
-            pending.append(body)
-            # A fixed prefix such as __GLIBC_USE_ cannot directly generate an
-            # existence operator. Follow only identifiers that the paste can
-            # actually form, including aliases defined elsewhere in the graph.
+            if body not in queued:
+              queued.add(body)
+              pending.append(body)
             parameters = set(definition[0]) if isinstance(definition, tuple) else set()
             for paste in re.finditer(r'\b\w+(?:\s*##\s*\w+)+', body):
-              seen.add(None)
               parts = re.split(r'\s*##\s*', paste.group())
-              pattern = ''.join('.*' if part in parameters else re.escape(part) for part in parts)
-              pending.extend(candidate for candidate in set(symbol_table) | probe_names
-                             if re.fullmatch(pattern, candidate))
+              if all(part in parameters for part in parts):
+                # Resolve unconstrained pastes with actual arguments below.
+                has_probe = True
+                continue
+              pattern = re.compile(''.join('.*' if part in parameters else re.escape(part)
+                                           for part in parts))
+              # Only a matching new alias can change this condition's graph.
+              seen.add(pattern)
+              for candidate in set(symbol_table) | probe_names:
+                if candidate not in seen and candidate not in queued and pattern.fullmatch(candidate):
+                  queued.add(candidate)
+                  pending.append(candidate)
     symbols.extend(seen)
     if not has_probe:
       return ([], seen)

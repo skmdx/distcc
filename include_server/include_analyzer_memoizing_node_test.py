@@ -20,6 +20,7 @@
 __author__ = "Nils Klarlund"
 
 import os
+import re
 import time
 
 import basics
@@ -31,6 +32,15 @@ import unittest
 NotCoveredError = basics.NotCoveredError
 
 class IncludeAnalyzerMemoizingNodeUnitTest(unittest.TestCase):
+
+  def test_token_paste_invalidates_only_matching_aliases(self):
+    master = include_analyzer_memoizing_node.SupportMaster()
+    record = include_analyzer_memoizing_node.SupportRecord(master)
+    record.UpdateSet({re.compile('FEATURE_.*')})
+    master.InvalidateRecords('UNRELATED_HEADER_GUARD')
+    self.assertTrue(record.valid)
+    master.InvalidateRecords('FEATURE_NEW_ALIAS')
+    self.assertFalse(record.valid)
 
   def _ToString(self, include_closure):
     """Translate the indices in an include closure to their denoted strings."""

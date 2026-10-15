@@ -360,6 +360,7 @@ class IncludeAnalyzerTimer(object):
   """
 
   def __init__(self):
+    self.quota = USER_TIME_QUOTA
     self.start_utime = resource.getrusage(resource.RUSAGE_SELF).ru_utime
     self.old = signal.signal(signal.SIGALRM, self._TimeIsUp)
     signal.alarm(USER_TIME_QUOTA_CHECK_INTERVAL_TIME)
@@ -367,11 +368,11 @@ class IncludeAnalyzerTimer(object):
   def _TimeIsUp(self, unused_sig_number, unused_frame):
     """Check CPU time spent and raise exception or reschedule."""
     if (resource.getrusage(resource.RUSAGE_SELF).ru_utime
-        > self.start_utime + USER_TIME_QUOTA):
+        > self.start_utime + self.quota):
       raise NotCoveredTimeOutError(('Bailing out because include server '
                                     + 'spent more than %3.1fs user time '
                                     + 'handling request') %
-                                   USER_TIME_QUOTA)
+                                   self.quota)
     else:
       # Reschedule ourselves.
       signal.alarm(USER_TIME_QUOTA_CHECK_INTERVAL_TIME)

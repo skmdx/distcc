@@ -54,7 +54,8 @@ class PreprocessTest(BrokerTestCase):
         local_deps = ((self.work / 'dep.d').read_text().split()
                       if '-MF' in args else None)
         remote = self.run_cc(compiler, args)
-        self.assertEqual(remote.returncode, local.returncode, remote.stderr.decode())
+        self.assertEqual(remote.returncode, local.returncode,
+                         remote.stderr.decode() + (self.work / 'client.log').read_text())
         self.assertEqual(remote.stdout, local.stdout, remote.stderr.decode())
         if local.returncode:
             self.assertEqual(remote.stderr, local.stderr)
@@ -169,6 +170,20 @@ class PreprocessTest(BrokerTestCase):
         dependencies = self.run_cc('gcc', ['-M', self.source], False)
         self.assertNotIn(b'probe.h', dependencies.stdout)
         self.compare('gcc', ['-P'])
+
+    def test_gcc_native_and_optimizer_flags_preserve_header_selection(self):
+        (self.work / 'abm.h').write_text('#define VALUE 19\n')
+        (self.work / 'plain.h').write_text('#define VALUE 7\n')
+        self.source.write_text('#ifdef __ABM__\n#include "abm.h"\n'
+                               '#else\n#include "plain.h"\n#endif\nint n = VALUE;\n')
+        for flags in (['-mabm', '-fno-tree-pre'],
+                      ['-mno-abm', '-ftree-pre'], ['-march=native', '-mtune=native']):
+            with self.subTest(flags=flags):
+                self.compare('gcc', ['-P', *flags])
+
+    def test_gcc_cxx_system_header_conditions(self):
+        self.source.write_text('#include <string>\nstd::string value;\n')
+        self.compare('g++', ['-P', '-std=c++17'])
 
     def test_gcc_only_indirect_probe_is_transferred(self):
         (self.work / 'probe.h').write_text('/* existence only */\n')
@@ -464,10 +479,6 @@ class TcpPreprocessTest(PreprocessTest):
         for _ in range(2):
             self.compare(args=['-P'])
         self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
-
-
-class TcpPreprocessTest(TcpPreprocessTest):
-    transport = ',tcp'
 
 
 if __name__ == '__main__':

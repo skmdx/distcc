@@ -143,9 +143,24 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
            for arg in command[1:]):
       raise basics.NotCoveredError('Modules, PCH, plugins and frontend overrides require local preprocessing')
     clang, options = self.context(command, self.translation_unit)
+    if not clang and self.timer and (self.currdir_idx, self.quote_dirs, self.angle_dirs) not in self.master_cache:
+      # The first conservative GCC graph may search hundreds of include
+      # directories. Let it finish populating the cache instead of repeatedly
+      # timing out and discarding it. Warm requests retain the normal quota.
+      self.timer.quota = 20.0
     try:
       compiler = shutil.which(command[0]) or command[0]
-      result = clang_scan.scan([compiler, *options, *command[1:], '-c'], currdir)
+      scan_args = command[1:]
+      if not clang:
+        # These GCC switches have no Clang driver equivalents.
+        # Predefined macros come from GCC above; its dependency verification
+        # below and the actual compilation retain the original switches.
+        scan_args = [arg for arg in scan_args if arg not in
+                     ('-mabm', '-mno-abm', '-mhle', '-mno-hle',
+                      '-mamx-tf32', '-mno-amx-tf32',
+                      '-mamx-transpose', '-mno-amx-transpose',
+                      '-ftree-pre', '-fno-tree-pre')]
+      result = clang_scan.scan([compiler, *options, *scan_args, '-c'], currdir)
     except (RuntimeError, ValueError) as error:
       raise basics.NotCoveredError(str(error)) from error
     canonicalize = self.canonical_path.Canonicalize
