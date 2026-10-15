@@ -28,6 +28,7 @@ man/*.gz
 _testtmp/
 __pycache__/
 /h_*
+/cpp_lookup.so
 
 # `make dist` products
 distcc-*.tar.*

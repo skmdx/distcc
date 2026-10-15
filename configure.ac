@@ -21,11 +21,13 @@ case "${host_os}" in
 linux*)
 	AC_MSG_RESULT(yes)
 	AC_DEFINE(HAVE_LINUX, 1, [Define to 1 if the host system type is Linux.])
+	CPP_LOOKUP_TARGET=cpp_lookup.so
 	;;
 *)
 	AC_MSG_RESULT(no)
 	;;
 esac
+AC_SUBST(CPP_LOOKUP_TARGET)
 
 # FreeBSD installs its version of libpopt into /usr/local/, but does
 # not put that on the default library and header path.

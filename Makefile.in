@@ -58,6 +58,8 @@ include_server_builddir = $(builddir)/_include_server
 # These must be done from here, not from autoconf, because they can
 # contain variable expansions written in Make syntax.  Ew.
 DIR_DEFS = -DLIBDIR="\"${prefix}/lib\"" -DSYSCONFDIR="\"${sysconfdir}\"" -DICONDIR="\"${icondir}\""
+DIR_DEFS += -DCPP_LOOKUP_LIBRARY='"$(libdir)/distcc/cpp_lookup.so"'
+CPP_LOOKUP_TARGET = @CPP_LOOKUP_TARGET@
 
 # arguments to pkgconfig
 GNOME_PACKAGES = @GNOME_PACKAGES@
@@ -222,6 +224,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_retry.py \
 	test/test_admission.py \
 	test/test_preprocess.py \
+	test/test_cpp_lookup.py \
 	find_c_extension.sh
 
 dist_common = Makefile.in install-sh configure configure.ac \
@@ -346,7 +349,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c src/workload.c	\
 	src/backoff.c src/bulk.c src/compress_stream.c src/file_cache.c	\
 	src/cleanup.c							\
 	src/climasq.c src/clinet.c src/clirpc.c src/compile.c src/native.c \
-	src/compress.c src/cpp.c					\
+	src/compress.c src/cpp.c src/cpp_lookup.c			\
 	src/daemon.c src/distcc.c src/dsignal.c				\
 	src/dopt.c src/dparent.c src/exec.c src/filename.c		\
 	src/h_argvtostr.c						\
@@ -480,7 +483,10 @@ check_include_server_PY = \
 
 ## NOTE: "all" must be the first (default) rule, aside from patterns.
 
-all: $(bin_PROGRAMS) $(sbin_PROGRAMS) pump include-server
+all: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) pump include-server
+
+cpp_lookup.so: $(srcdir)/src/cpp_lookup.c
+	$(CC) $(CFLAGS) -fPIC -shared $(LDFLAGS) -o $@ $< -ldl -pthread
 
 #  src/config.h.in is used by config.status
 Makefile: Makefile.in src/config.h.in config.status
@@ -808,8 +814,9 @@ adaptive-check: distcc distccd h_hosts
 	$(PYTHON) "$(srcdir)/test/test_retry.py" -v
 	$(PYTHON) "$(srcdir)/test/test_admission.py" -v
 
-preprocess-check: distcc distccd pump include-server
+preprocess-check: distcc distccd pump include-server $(CPP_LOOKUP_TARGET)
 	$(PYTHON) "$(srcdir)/test/test_preprocess.py" -v
+	if test -n "$(CPP_LOOKUP_TARGET)"; then $(PYTHON) "$(srcdir)/test/test_cpp_lookup.py" -v; fi
 
 check: adaptive-check
 	@if test -n "$(PYTHON)"; then \
@@ -964,6 +971,7 @@ clean: clean-autoconf clean-lzo clean-include-server
 	rm -f src/*.[od]
 	rm -f test/*.pyc
 	rm -f $(check_PROGRAMS) $(bin_PROGRAMS) $(sbin_PROGRAMS)
+	rm -f cpp_lookup.so
 	rm -f `echo $(man1_MEN) | sed -e 's/ /.gz /g' -e 's/$$/.gz/'`
 	rm -f $(man_HTML)
 	rm -f distccmon-gnome
@@ -1077,7 +1085,11 @@ showpaths:
 install: showpaths install-doc install-man install-programs \
 	install-include-server install-example @INSTALL_GNOME@ install-conf
 
-install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS)
+install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET)
+	if test -n "$(CPP_LOOKUP_TARGET)"; then \
+	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
+	  $(INSTALL_PROGRAM) cpp_lookup.so "$(DESTDIR)$(libdir)/distcc/cpp_lookup.so"; \
+	fi
 	$(mkinstalldirs) "$(DESTDIR)$(bindir)"
 	$(mkinstalldirs) "$(DESTDIR)$(sbindir)"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-link" "$(DESTDIR)$(bindir)/distcc-link"
@@ -1207,6 +1219,7 @@ uninstall: uninstall-man uninstall-programs @UNINSTALL_GNOME@ \
 	uninstall-include-server uninstall-example uninstall-doc uninstall-conf
 
 uninstall-programs:
+	rm -f "$(DESTDIR)$(libdir)/distcc/cpp_lookup.so"
 	rm -f "$(DESTDIR)$(bindir)/distcc-link"
 	for p in $(bin_PROGRAMS) pump; do			\
 	  file="$(DESTDIR)$(bindir)/`basename $$p`";            \

@@ -26,6 +26,7 @@ class PreprocessTest(BrokerTestCase):
         super().setUp()
         self.start_broker(self.host(0, ',' + self.compression + self.transport) + ' --localslots_cpp=1', idle=60)
         self.env.update(TMPDIR=str(self.root), DISTCC_CLIENT_TMP=str(self.work),
+                        DISTCC_CPP_LOOKUP_LIBRARY=str(self.build / 'cpp_lookup.so'),
                         DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_TESTING_INCLUDE_SERVER='1',
                         DISTCC_VERBOSE='1', DISTCC_LOG=str(self.work / 'client.log'))
         result = subprocess.run([str(self.build / 'pump'), '--startup'],
@@ -43,6 +44,23 @@ class PreprocessTest(BrokerTestCase):
     def shutdown_pump(self):
         subprocess.run([str(self.build / 'pump'), '--shutdown'], env=self.env,
                        cwd=self.work, capture_output=True, timeout=10, check=True)
+
+    def test_local_lookup_cache_then_remote_compile(self):
+        search = []
+        for i in range(300):
+            directory = self.root / ('lookup-' + str(i))
+            directory.mkdir()
+            search.append('-I' + str(directory))
+        (directory / 'answer.h').write_text('#define ANSWER 42\n')
+        self.source.write_text('#include "answer.h"\nint answer(void) { return ANSWER; }\n')
+        scanner = self.env.pop('INCLUDE_SERVER_PORT')
+        try:
+            result = self.run_cc('gcc', [*search, '-c', self.source, '-o', 'lookup.o'])
+        finally:
+            self.env['INCLUDE_SERVER_PORT'] = scanner
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertTrue((self.work / 'lookup.o').exists())
+        self.assertRegex(self.get_stats(self.stats_ports[0]), r'dcc_compile_ok [1-9]')
 
     def test_scanner_wait_does_not_reserve_worker(self):
         pid = int(self.env['INCLUDE_SERVER_PID'])

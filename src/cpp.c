@@ -44,6 +44,31 @@
 #include "exec.h"
 #include "dotd.h"
 
+static int spawn_preprocessor(char **argv, pid_t *pid, const char *output)
+{
+#ifdef __linux__
+    const char *library = getenv("DISTCC_CPP_LOOKUP_LIBRARY");
+    if (!library) library = CPP_LOOKUP_LIBRARY;
+    if (dcc_getenv_bool("DISTCC_CPP_LOOKUP", 1) && !access(library, R_OK)) {
+        const char *preload = getenv("LD_PRELOAD"), *setting = getenv("DISTCC_CPP_LOOKUP");
+        char *old_preload = preload ? strdup(preload) : NULL;
+        char *old_setting = setting ? strdup(setting) : NULL;
+        char *value = NULL;
+        if ((!preload || old_preload) && (!setting || old_setting) &&
+            asprintf(&value, "%s%s%s", library, preload ? ":" : "", preload ? preload : "") >= 0) {
+            int ready = !setenv("LD_PRELOAD", value, 1) && !setenv("DISTCC_CPP_LOOKUP", "1", 1);
+            int ret = ready ? dcc_spawn_child(argv, pid, "/dev/null", output, NULL) : EXIT_OUT_OF_MEMORY;
+            if (old_preload) setenv("LD_PRELOAD", old_preload, 1); else unsetenv("LD_PRELOAD");
+            if (old_setting) setenv("DISTCC_CPP_LOOKUP", old_setting, 1); else unsetenv("DISTCC_CPP_LOOKUP");
+            free(value); free(old_preload); free(old_setting);
+            return ret;
+        }
+        free(old_preload); free(old_setting);
+    }
+#endif
+    return dcc_spawn_child(argv, pid, "/dev/null", output, NULL);
+}
+
 /* Expanding macros on the client loses their provenance, changing Clang's
  * diagnostics (including -Werror) and source locations. Rewrite includes only
  * and let the remote frontend expand macros in the original language. */
@@ -159,8 +184,7 @@ int dcc_cpp_maybe(char **argv, char *input_fname, char **cpp_fname,
             dcc_argv_append(cpp_argv, (char *)output);
         }
     }
-    ret = dcc_spawn_child(cpp_argv, cpp_pid,
-                         "/dev/null", *cpp_fname, NULL);
+    ret = spawn_preprocessor(cpp_argv, cpp_pid, *cpp_fname);
     free(cpp_argv);
     free(deps);
     return ret;

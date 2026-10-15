@@ -985,6 +985,14 @@ load on the distcc client machine.
 If set to 1, temporary files are not deleted after use.  Good for
 debugging, or if your disks are too empty.
 .TP
+.B "DISTCC_CPP_LOOKUP"
+Set to 0 to disable the Linux GCC preprocessor's request-local directory
+cache. By default, missing header candidates are checked against directory
+listings instead of repeatedly opening nonexistent files. Existing files
+still use normal compiler reads. Directory changes discard the preprocessed
+output and repeat preprocessing without the cache. No cache survives a job.
+Piped output and compiler plugins use the normal lookup path.
+.TP
 .B "DISTCC_TCP_CORK"
 If set to 0, disable use of "TCP corks", even if they're present on
 this system.  Using corks normally helps pack requests into fewer
