@@ -92,7 +92,7 @@ Faster SMT threads can still beat idle cores on a slower host.
 Parallelism is the smallest of CPUs, the server's job limit and its reported
 memory admission capacity. Legacy paths use the larger of local reservations
 and the sum of server execution and ready-queue counts; they do not add the
-same queued jobs twice. Lower completion cost wins. Equal
+same queued jobs twice. Lower service cost wins on legacy paths. Equal
 estimates favor lower estimated work per configured slot, then list order.
 Missing live runnable counts fall back to the one-minute load average.
 Reported memory PSI (`some avg10`, percent) multiplies the estimate by
@@ -167,14 +167,23 @@ The total job count also includes preprocessing and transfer waits: a CPU-sized
 while holding preprocessing slots and worker memory limits constant.
 
 With `,tcp` and live pipeline statistics, the broker projects the global server
-snapshot instead of counting all local socket leases as CPU work. It adds
+snapshot. It adds
 outstanding assignments made since the probe started, and subtracts completed
 snapshot work using the existing connection-return notification. Completions
 first consume the snapshot's returning count, so output-only jobs do not free
-CPU capacity twice. No per-stage IPC or extra network round trip is required.
+CPU capacity twice. Outstanding local leases provide a lower bound on projected
+work: a request can still be preparing on the client when the worker reports
+an idle snapshot. The pipeline bound takes the larger of local leases and global
+occupancy, rather than adding preparation twice. No per-stage IPC or extra
+network round trip is required.
 Input preparation can overlap execution within a pipeline of up to four jobs
-(also capped by effective parallelism). For compile jobs with an input-size
-hint, the broker selects the smallest predicted completion time:
+(also capped by effective parallelism). The broker first uses available execution
+capacity, comparing input preparation time plus estimated work divided by the
+additional throughput gained by dispatching a job. This gain includes the effect
+on competing CPU work, such as client preprocessing. An idle independent core
+can therefore take precedence over an SMT sibling or a queue on a faster host.
+Unknown job costs use one normalized work unit. Once useful execution capacity
+is occupied, jobs with an input-size hint use predicted completion time:
 `max(input_ready, cpu_slot_ready) + estimated_work * cpu_service_cost`.
 The existing contention curve accounts for SMT, frequency and external CPU
 load; memory capacity continues to bound execution.
@@ -298,6 +307,8 @@ the broker). A compile tries
 at most three remote jobs even when backoff is disabled, then follows
 `DISTCC_FALLBACK`. Server protocol reads and writes use `DISTCC_IO_TIMEOUT`
 (default 300 seconds), so a silent partial request cannot retain a worker forever.
+A live broker's refusal when no workers are available follows this bounded retry
+policy immediately; it does not enter the separate broker reconnection wait.
 
 Without a broker, statistics successes and failures are shared within each wall-clock second in
 `DISTCC_DIR/lock`. Each uncached probe has a 250ms deadline including DNS; probes

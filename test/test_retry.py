@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import unittest
+from typing import cast
 
 from test_adaptive import stats_response
 from test_broker import BrokerTestCase
@@ -33,7 +34,8 @@ class RejectingProxy(socketserver.ThreadingTCPServer):
 
 class RejectionConnection(socketserver.BaseRequestHandler):
     def handle(self):
-        with socket.create_connection(('127.0.0.1', self.server.worker_port), timeout=3) as worker:
+        server = cast(RejectingProxy, self.server)
+        with socket.create_connection(('127.0.0.1', server.worker_port), timeout=3) as worker:
             worker.settimeout(5)
             self.request.settimeout(5)
 
@@ -45,7 +47,7 @@ class RejectionConnection(socketserver.BaseRequestHandler):
                         pending += data
                         if reject and needle in pending:
                             pending = pending.replace(needle, b'ARGV00000002-M', 1)
-                            self.server.rejections += 1
+                            server.rejections += 1
                             reject = False
                         # Retain only a possible fragmented token, so SLOT and
                         # POOL handshakes are forwarded without buffering.
@@ -139,7 +141,8 @@ class RetryTest(BrokerTestCase):
         self.source.write_text('#include "missing-distcc-test-header.h"\n')
         for codec in ('lz4', 'tcp'):
             self.start_broker(self.host(0, ',' + codec), name='cpp-error-' + codec)
-            before = re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1]
+            before = re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))
+            assert before is not None
             for fallback in ('0', '1'):
                 obj = self.work / f'failed-{codec}-{fallback}.o'
                 result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c',
@@ -149,8 +152,9 @@ class RetryTest(BrokerTestCase):
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 self.assertIn(b'missing-distcc-test-header.h', result.stderr)
                 self.assertFalse(obj.exists())
-            after = re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1]
-            self.assertEqual(before, after)
+            after = re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))
+            assert after is not None
+            self.assertEqual(before[1], after[1])
 
     def rejecting_host(self):
         proxy = RejectingProxy(self.ports[0])
@@ -196,9 +200,8 @@ class RetryTest(BrokerTestCase):
         return marker, gate
 
     def test_disabled_backoff_still_bounds_retries(self):
-        self.base_env = dict(self.base_env, DISTCC_BACKOFF_PERIOD='0')
         proxy, host = self.rejecting_host()
-        self.start_broker(host)
+        self.start_broker(host, backoff=0)
         result = subprocess.run([str(self.build/'distcc'), 'gcc', '-c', str(self.source),
                                  '-o', str(self.work/'rejected.o')], env=self.env,
                                 capture_output=True, timeout=8)

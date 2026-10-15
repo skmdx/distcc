@@ -245,7 +245,9 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
         goto failed;
     }
     if (reply->status) {
-        errno = reply->status == EXIT_CONNECT_FAILED ? ECONNREFUSED : EPROTO;
+        /* A valid refusal is a scheduling result, not a broken IPC channel.
+         * Reconnecting to the same live broker cannot recover failed workers. */
+        errno = reply->status == EXIT_CONNECT_FAILED ? EHOSTUNREACH : EPROTO;
         goto failed;
     }
     if (((command == ACQUIRE || command == ACQUIRE_POOL || command == ACQUIRE_CPP ||
@@ -755,7 +757,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         }
         return 0;
     }
-    int i, slots, best = -1, available = 0, best_probe = 0, best_wait = 0;
+    int i, slots, best = -1, available = 0, best_priority = 0, best_wait = 0;
     double best_score = 0, best_fill = 0;
     double cost = dcc_work_predict(&broker->model, &client->hint);
     struct prediction best_prediction = {0};
@@ -811,12 +813,17 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             }
             cpu = finished < cpu ? cpu - finished : 0;
             work = cpu + recent[i];
+            /* A lease can precede the worker's first input byte. A fresh idle
+             * snapshot must not erase that work and repeatedly refill the
+             * same worker while the client prepares its request. */
+            int leased = p->busy - (cap->returning > 0 ? cap->returning : 0);
             if (link && (cap->links > 0 || recent_links[i])) continue;
-            blocked = work + preparing >= limit + pipeline;
+            blocked = work + preparing >= limit + pipeline || leased >= limit + pipeline;
             if (blocked && !predicted) continue;
             /* Input preparation overlaps execution; only excess preparation
              * beyond the bounded pipeline adds CPU queueing delay. */
             if (preparing > pipeline) work += preparing - pipeline;
+            if (leased > work) work = leased;
             if (cap->returning > 0)
                 inflight += cap->returning < slots ? cap->returning : slots;
             projected = *cap;
@@ -827,12 +834,32 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         if (p->busy < inflight || predicted) {
             double score = dcc_capacity_score(p->host, cap, work);
             struct prediction forecast = {0};
-            int wait = 0;
+            int wait = 0, growing = 0;
             if (predicted) {
                 forecast = predict(broker, client, i, work, cost, now, batch);
                 score = forecast.finish;
                 wait = blocked || p->busy >= inflight || forecast.start > forecast.prepare + .02;
             } else if (cost > 0) score *= cost;
+            /* Prefer added execution throughput to filling a fast host's
+             * queue. An SMT sibling contributes only its marginal capacity;
+             * its short service time must not displace an independent core.
+             * When all useful slots are occupied, retain finish-time prediction
+             * for bounded pipelining. Unknown jobs use one normalized work unit. */
+            if (staged && cap && !link && !blocked &&
+                work < dcc_capacity_jobs(p->host, cap)) {
+                const struct dcc_capacity *observed = &p->metrics;
+                double external = (observed->running >= 0 ? observed->running : observed->load)
+                                  - (observed->busy > 0 ? observed->busy : 0);
+                double demand = work + (external > 0 ? external : 0);
+                /* Include the CPU work displaced by this compile, notably
+                 * client preprocessing on a machine that also runs a worker. */
+                double before = demand ? demand / execution_factor(p, work - 1) : 0;
+                double gain = (demand + 1) / execution_factor(p, work) - before;
+                if (gain > 0) {
+                    growing = 1;
+                    score = forecast.prepare + (cost > 0 ? cost : 1) / gain;
+                }
+            }
             /* An idle host with stale degraded telemetry gets one real job
              * to observe recovery. Projection prevents this broker from
              * flooding it; server admission serializes different clients. */
@@ -840,9 +867,14 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             if (probe) score = 0;
             double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;
-            if (best < 0 || score < best_score || (score == best_score && fill < best_fill)) {
+            rs_trace("candidate host=%s work=%d capacity=%d cost=%.3f factor=%.3f prepare=%.3f start=%.3f score=%.3f wait=%d",
+                     p->host->hostname, work, cap ? cap->capacity : -1, cost,
+                     forecast.factor, forecast.prepare, forecast.start, score, wait);
+            int priority = probe ? 2 : growing;
+            if (best < 0 || priority > best_priority || (priority == best_priority &&
+                (score < best_score || (score == best_score && fill < best_fill)))) {
                 best = i;
-                best_probe = probe;
+                best_priority = priority;
                 best_wait = wait && !probe;
                 best_prediction = forecast;
                 best_score = score;
@@ -864,6 +896,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
     } else if (best >= 0 && best_wait) {
+        rs_trace("waiting for host=%s cost=%.3f score=%.3f", broker->peers[best].host->hostname, cost, best_score);
         unsigned index = batch->count++;
         batch->planned[index].peer = best;
         batch->planned[index].cost = cost;
@@ -874,6 +907,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         client->deadline = now + delay;
     } else if (best >= 0 && (!local_cpp || broker->cpp_busy < broker->cpp_limit)) {
         struct peer *p = &broker->peers[best];
+        rs_trace("assigning host=%s cost=%.3f score=%.3f", p->host->hostname, cost, best_score);
         client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
                             p->admission_supported && p->pool_supported >= 0;
         client->net = client->command != ACQUIRE ? pool_take(broker, best, now) : -1;
@@ -891,7 +925,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         client->factor = best_prediction.factor;
         client->ready_at = now + best_prediction.prepare;
         client->run_at = now + best_prediction.start;
-        if (best_probe) p->probe_after = now + 10;
+        if (best_priority == 2) p->probe_after = now + 10;
         client->serial = ++p->serial;
         client->state = CONNECTING;
         client->deadline = now + 3;
