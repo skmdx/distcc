@@ -96,6 +96,7 @@ AC_ARG_ENABLE(pump-mode,
 AM_PATH_PYTHON([3.1],,[:])
 AC_ARG_VAR(PYTHON, [Python interpreter])
 AC_SUBST(PYTHON_RELATIVE_LIB)
+AC_SUBST([cross_compiling])
 
 AC_ARG_ENABLE(rfc2553,
 	AS_HELP_STRING([--enable-rfc2553],[use getaddrinfo, getnameinfo, etc]))

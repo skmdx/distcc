@@ -184,11 +184,17 @@ def llvm_option(option):
 if llvm_option('--version').split('.')[0] not in ('19', '22', '23'):
   sys.exit('libclang-cpp header analysis requires LLVM 19, 22 or 23 headers and libraries.')
 llvm_lib = llvm_option('--libdir')
+# Search the target sysroot while linking, but retain its installed path in
+# the extension so a cross-built package does not depend on the build machine.
+llvm_runtime_lib = llvm_lib
+sysroot = os.environ.get('SYSROOT', '').rstrip('/')
+if sysroot and llvm_lib.startswith(sysroot + '/'):
+  llvm_runtime_lib = llvm_lib[len(sysroot):]
 scanner = setuptools.Extension(
     name='include_server.clang_scan',
     sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_scan.cpp')],
     language='c++', include_dirs=[llvm_option('--includedir')],
-    library_dirs=[llvm_lib], runtime_library_dirs=[llvm_lib],
+    library_dirs=[llvm_lib], runtime_library_dirs=[llvm_runtime_lib],
     libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
 )
 
