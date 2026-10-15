@@ -561,6 +561,17 @@ class PreprocessTest(BrokerTestCase):
         self.assertNotIn(b'probe.h', dependencies.stdout)
         self.compare('gcc', ['-P'])
 
+    def test_gcc_only_literal_directives_follow_compiler_lexing(self):
+        (self.work / 'gcc.h').write_text('#define VALUE 19\n')
+        (self.work / 'other.h').write_text('#define VALUE 42\n')
+        self.source.write_text(
+            '/*\n#include NOT_A_HEADER\n*/\n'
+            'const char *text = R"raw(\n#include ALSO_NOT_A_HEADER\n)raw";\n'
+            '#if __has_builtin(__builtin_speculation_safe_value)\n'
+            '#\\\r\ninc\\\r\nlude "gcc.h"\n'
+            '#else\n%:include "other.h"\n#endif\nint value = VALUE;\n')
+        self.assertIn(b'19', self.compare('g++', ['-x', 'c++', '-std=c++17', '-P']).stdout)
+
     def test_gcc_native_and_optimizer_flags_preserve_header_selection(self):
         (self.work / 'abm.h').write_text('#define VALUE 19\n')
         (self.work / 'plain.h').write_text('#define VALUE 7\n')

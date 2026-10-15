@@ -38,16 +38,19 @@ Each request gets a fresh FileManager to avoid stale negative lookup caches.
 
 GCC jobs also use libclang-cpp, with GCC's predefined macros, implicit headers
 and include paths. Since compiler-specific feature predicates can differ,
-GCC's own dependency output is checked and a conservative, branch-independent
-include graph supplies existence-only probes omitted by GCC -M. Clang's lexer
-extracts complete conditional expressions for this graph. Their possible macro
+Clang's lexer builds a conservative, branch-independent include graph, handling
+comments, continued lines and digraph directives. Literal includes are covered
+in all branches; computed includes additionally require GCC's own dependency
+check. The graph supplies existence-only probes omitted by GCC -M. Complete
+conditional expressions are extracted for this graph. Their possible macro
 expansions are inspected for existence probes, including aliases, function
 wrappers and token-pasted operator names. Effective GCC predefined and command-line
 macros seed the graph; newly defined pasted aliases invalidate cached conditions.
 Conditional expansion is bounded and falls back locally if the budget is exceeded
 or the guard encounters unsupported variadic or ambiguous macro arguments.
-This adds a GCC dependency
-pass per job; it is a correctness check, not a claimed performance improvement.
+Trigraphs, implicit precompiled headers and unsupported header-changing
+directives require local preprocessing. The real compiler always performs
+preprocessing on the worker using the transferred inputs.
 
 The conservative graph and compressed source/header files are cached. Before reusing the
 graph it checks metadata for positive include lookups. On supported local Linux

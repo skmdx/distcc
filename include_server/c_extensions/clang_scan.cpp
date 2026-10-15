@@ -285,31 +285,87 @@ struct SourceTokens {
     }
 };
 
-PyObject *conditional_expressions(PyObject *, PyObject *arguments) {
+// Header-name lexing is context dependent: <a//b.h> contains no comment.
+// Raw mode keeps all branches while using the compiler's translation phases.
+class DirectiveLexer : public Lexer {
+public:
+    using Lexer::Lexer;
+    void filename(bool enabled) { ParsingFilename = enabled; }
+};
+
+std::string cleanDirectiveName(llvm::StringRef spelling) {
+    std::string result;
+    for (size_t i = 0; i < spelling.size(); ++i) {
+        if (spelling[i] == '\\') {
+            size_t next = i + 1;
+            while (next < spelling.size() &&
+                   llvm::StringRef(" \t\v\f\r").contains(spelling[next])) ++next;
+            if (next < spelling.size() && spelling[next] == '\n') {
+                i = next;
+                continue;
+            }
+        }
+        result += spelling[i];
+    }
+    return result;
+}
+
+PyObject *directives(PyObject *, PyObject *arguments) {
     const char *text;
     Py_ssize_t size;
     if (!PyArg_ParseTuple(arguments, "y#", &text, &size)) return nullptr;
-    SourceTokens source(text, size);
-    const auto &tokens = source.tokens;
+    llvm::StringRef source(text, size);
+    // The graph is shared between language modes. Trigraph interpretation
+    // depends on that mode, so it cannot share this lexical cache.
+    for (size_t i = 0; i + 2 < source.size(); ++i)
+        if (source[i] == '?' && source[i + 1] == '?' &&
+            llvm::StringRef("=/'()!<>-").contains(source[i + 2]))
+            return PyErr_Format(PyExc_ValueError, "trigraphs require local preprocessing");
+    LangOptions options;
+    options.CPlusPlus = options.CPlusPlus11 = options.LineComment = options.Digraphs = true;
+    DirectiveLexer lexer(SourceLocation::getFromRawEncoding(1), options, text, text, text + size);
     PyObject *result = PyList_New(0);
     if (!result) return nullptr;
-    for (size_t i = 0; i + 2 < tokens.size(); ++i) {
-        if (!tokens[i].is(tok::hash) || !tokens[i].isAtStartOfLine() ||
-            !tokens[i + 1].is(tok::raw_identifier)) continue;
-        auto directive = tokens[i + 1].getRawIdentifier();
-        if (directive != "if" && directive != "elif") continue;
-        size_t end = i + 2;
-        while (end < tokens.size() && !tokens[end].isAtStartOfLine() &&
-               !tokens[end].is(tok::eof)) ++end;
-        unsigned start = tokens[i + 1].getLocation().getRawEncoding() - 1 + tokens[i + 1].getLength();
-        unsigned stop = end < tokens.size() ? tokens[end].getLocation().getRawEncoding() - 1 : size;
-        auto value = source.expression(text, start, stop);
-        PyObject *item = PyUnicode_DecodeLatin1(value.data(), value.size(), nullptr);
+    Token token;
+    auto spelling = [&]() {
+        return source.substr(token.getLocation().getRawEncoding() - 1, token.getLength());
+    };
+    for (;;) {
+        lexer.LexFromRawLexer(token);
+        if (token.is(tok::eof)) break;
+        if (!token.is(tok::hash) || !token.isAtStartOfLine()) continue;
+        lexer.setParsingPreprocessorDirective(true);
+        lexer.LexFromRawLexer(token);
+        auto name = token.is(tok::raw_identifier) ? cleanDirectiveName(spelling()) : std::string();
+        bool include = name == "include" || name == "include_next" || name == "import";
+        bool keep = include || name == "define" || name == "if" || name == "elif";
+        if (name == "embed" || name == "__include_macros") {
+            Py_DECREF(result);
+            return PyErr_Format(PyExc_ValueError, "unsupported preprocessing directive: %s", name.c_str());
+        }
+        std::string value;
+        lexer.filename(include);
+        while (!token.isOneOf(tok::eod, tok::eof)) {
+            lexer.LexFromRawLexer(token);
+            lexer.filename(false);
+            if (token.isOneOf(tok::eod, tok::eof)) break;
+            if (!value.empty() && token.hasLeadingSpace()) value += ' ';
+            value += spelling();
+        }
+        lexer.setParsingPreprocessorDirective(false);
+        if (name == "pragma" &&
+            (value.find("pch_preprocess") != std::string::npos ||
+             value.find("include_alias") != std::string::npos)) {
+            Py_DECREF(result);
+            return PyErr_Format(PyExc_ValueError, "unsupported header-changing pragma");
+        }
+        if (!keep) continue;
+        PyObject *operand = PyUnicode_DecodeLatin1(value.data(), value.size(), nullptr);
+        PyObject *item = operand ? Py_BuildValue("(sN)", name.c_str(), operand) : nullptr;
         if (!item || PyList_Append(result, item) < 0) {
             Py_XDECREF(item); Py_DECREF(result); return nullptr;
         }
         Py_DECREF(item);
-        i = end - 1;
     }
     return result;
 }
@@ -382,7 +438,7 @@ PyObject *include_probes(PyObject *, PyObject *arguments) {
 }
 
 PyMethodDef methods[] = {
-    {"conditional_expressions", conditional_expressions, METH_VARARGS, "Lex conditional expressions from all branches."},
+    {"directives", directives, METH_VARARGS, "Lex dependency directives independently of conditional branches."},
     {"scan", scan, METH_VARARGS, "Scan using libclang-cpp; return immutable inputs and lookup paths."},
     {"include_probes", include_probes, METH_VARARGS, "Lex existence probes independently of conditional branches."},
     {nullptr, nullptr, 0, nullptr}};

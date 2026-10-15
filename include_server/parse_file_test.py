@@ -23,6 +23,8 @@
 __author__ = "opensource@google.com"
 
 import unittest
+import tempfile
+from pathlib import Path
 
 import basics
 import cache_basics
@@ -41,87 +43,37 @@ class parse_file_Test(unittest.TestCase):
   def tearDown(self):
     pass
 
-  def test_RegularExpressions(self):
+  def test_lexical_directives_and_macro_adjacency(self):
+    with tempfile.TemporaryDirectory() as root:
+      source = Path(root) / 'source.cpp'
+      source.write_text(
+          '/*\n#include "comment.h"\n*/\n'
+          'const char *s = R"raw(\n#include "string.h"\n)raw";\n'
+          '#\\\ninc\\\nlude "split.h"\n'
+          '%:include <angle//header.h>\n'
+          '# include_next <next.h>\n'
+          '#define FUNCTION(x) x\n#define OBJECT /**/ (x)\n'
+          '#if __has_include("probe.h")\n#endif\n')
+      paths = cache_basics.MapToIndex()
+      symbols = {}
+      quote, angle, expr, following = parse_file.ParseFile(paths).Parse(str(source), symbols)
+      self.assertEqual([paths.string[p] for p in quote], ['split.h'])
+      self.assertEqual([paths.string[p] for p in angle], ['angle//header.h'])
+      self.assertEqual([paths.string[p] for p in following], ['next.h'])
+      self.assertEqual(expr, [parse_file.ProbeExpression('__has_include("probe.h")')])
+      self.assertEqual(symbols['FUNCTION'], [(['x'], 'x')])
+      self.assertEqual(symbols['OBJECT'], ['(x)'])
 
-    self.assertEqual(parse_file.POUND_SIGN_RE.match(
-        """  #\tinclude blah. blah."""
-        ).group(0), "  #\tinclude blah. blah.")
-
-    self.assertEqual(parse_file.POUND_SIGN_RE.match(
-        """  # gggg include blah. blah."""
-        ), None)
-
-    self.assertEqual(parse_file.POUND_SIGN_RE.match(
-        """  */  /**/ /*  a */ #  	include blah. blah."""
-        ).group(0), '  */  /**/ /*  a */ #  \tinclude blah. blah.')
-
-    self.assertEqual(
-      parse_file.MACRO_EXPR_RE.search("m(a, b) + c + n(d)").groupdict(),
-      {'args': 'a, b', 'symbol': 'm'})
-
-    # The expression we recognize do not include nested parenthesis
-    self.assertEqual(
-      parse_file.MACRO_EXPR_RE.search("m(a, (b)) + c + n(d)").groupdict(),
-      {'args': None, 'symbol': 'm'})
-
-    self.assertEqual(parse_file.MACRO_EXPR_RE.match("random()").group('symbol'),
-                     "random")
-
-    self.assertTrue(parse_file.DIRECTIVE_RE.match(
-	"""  # include <a.c>""").group('angle') == 'a.c')
-    self.assertTrue(parse_file.DIRECTIVE_RE.match(
-	"""  # include mac(a.c, mic)""").group('expr') == 'mac(a.c, mic)')
-    self.assertTrue(parse_file.DIRECTIVE_RE.match(
-	"""  # include "a.c" """).group('quote') == 'a.c')
-    self.assertTrue(parse_file.DIRECTIVE_RE.match(
-	"""  #include "a.c" """).group('quote') == 'a.c')
-    self.assertTrue(parse_file.DIRECTIVE_RE.match(
-	"""  #include"a.c" """).group('quote') == 'a.c')
-
-    self.assertEqual(parse_file.DIRECTIVE_RE.match(
-        """ #define m(a) <a##_post.c> """).group('rhs'),
-                     '<a##_post.c>')
-
-    self.assertEqual(
-      parse_file.DIRECTIVE_RE.match("#define xmlRealloc(ptr, size)"
-                         + " xmlReallocLoc((ptr), (size),"
-                         + " __FILE__, __LINE__)").group('lhs'),
-      "xmlRealloc(ptr, size)")
-
-    self.assertEqual(
-      parse_file.DIRECTIVE_RE.match("#define random() rand()").group('lhs'),
-      "random()")
-
-    self.assertEqual(
-      parse_file.DIRECTIVE_RE.match("#define ABBA ").group('lhs'),
-      "ABBA")
-
-    self.assertEqual(
-      parse_file.DIRECTIVE_RE.match("#define ABBA").group('lhs'),
-      "ABBA")
-
-    self.assertEqual(parse_file.BACKSLASH_RE.sub("",
-"""a\
-b\
-c\
-d"""), "abcd")
-    self.assertEqual(parse_file.BACKSLASH_RE.sub("", """a
-b
-"""),
-				      """a
-b
-""")
-
-    self.assertEqual(parse_file.PAIRED_COMMENT_RE.sub("", "ab/*./*..*/cd"), "abcd")
-    self.assertEqual(parse_file.PAIRED_COMMENT_RE.sub("", "ab/*/cd"), "ab/*/cd")
-
-    self.assertEqual(parse_file.COMMENT_RE.match("ab/*cd").group(), "ab")
-    self.assertEqual(parse_file.COMMENT_RE.match("ab//cd").group(), "ab")
-    self.assertEqual(parse_file.COMMENT_RE.match("ab/cd").group(), "ab/cd")
-
-    self.assertEqual(parse_file.
-      INCLUDE_STRING_RE.match(""" < ab.c>""").group('angle'),
-      "ab.c")
+  def test_unsupported_inputs_are_not_silently_ignored(self):
+    with tempfile.TemporaryDirectory() as root:
+      source = Path(root) / 'source.c'
+      for contents in ('#define NEXT "a.h"\n#include_next NEXT\n',
+                       '# /* comment */ em\\\nbed "a.bin"\n',
+                       '??=include "trigraph.h"\n'):
+        with self.subTest(contents=contents):
+          source.write_text(contents)
+          with self.assertRaises(basics.NotCoveredError):
+            parse_file.ParseFile(cache_basics.MapToIndex()).Parse(str(source), {})
 
   def test_ParseFile(self):
 
@@ -152,7 +104,7 @@ b
        []))
     self.assertEqual(symbol_table['A'], ['"p1.h"'])
     [val] = symbol_table['ILLFORMED']
-    self.assertEqual(val, "(_filename_,(x))   "
+    self.assertEqual(val, "(_filename_,(x)) "
                 + "AS_STRING(maps/_filename_.tpl.varnames.h, "
                 + "NOTHANDLED(_filename_))")
 

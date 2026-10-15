@@ -44,29 +44,6 @@ DEBUG_TRACE = basics.DEBUG_TRACE
 DEBUG_TRACE2 = basics.DEBUG_TRACE2
 NotCoveredError = basics.NotCoveredError
 
-# For coarse and fast scanning
-RE_INCLUDE_DEFINE = re.compile("include|define|import")
-
-# For fine-grained, but slow backtracking, parsing
-POUND_SIGN_RE = re.compile(r"""
-  ^                            # start of line
-  [ \t]*                       # space(s)
-  ([*][/])?                    # a possible ..*/ ending block comment
-  [ \t]*                       # space(s)
-  ([/][*] [^\n]* [*][/])*      # initial block comment(s) /*...*/
-  [ \t]*                       # space(s)
-  (?P<directive>               # group('directive') -- what we're after
-   [#]                         # the pound sign
-   [ \t]*                      # space(s)
-   (define|include_next|include|import)\b # the directive
-   ((?!\\\n).)*                 # the rest on this line: zero or more
-                                # characters, each not a backslash that
-                                # is followed by \n
-   (\\\n((?!\\\n).)*)*          # (backslash + \n + rest of line)*
-  )
-  """, re.VERBOSE + re.MULTILINE)
-
-
 NOT_COMMA_OR_PARENS = "([^(),])"
 
 # For parsing macro expressions of the form:
@@ -87,29 +64,8 @@ MACRO_EXPR = r"""
 
 MACRO_EXPR_RE = re.compile(MACRO_EXPR, re.VERBOSE)
 
-# Nice little parser of certain directive lines (after backslash-ended
-# line continuations and comments are removed)
-DIRECTIVE_RE = re.compile(r"""
- ^[ \t]*
-  [#]
-  [ \t]*
-  (
-   ((?P<include> include_next | include | import)
-    \s*
-    ( "(?P<quote> (\w|[_/.,+-])*)"            |  # "bar/foo.h"
-      <(?P<angle> (\w|[_/.,+-])*)>            |  # <stdio.h>
-      (?P<expr>   .*?))                         # expr, match . minimally
-    )
-   |
-   (?P<define> define \s+ (?P<lhs> %s)    # insert MACRO_EXPR here
-                      \s* (?P<rhs> .*?))  # match . minimally before
-                                          # trailing white space
-  )
-  \s*                                     # trailing whitespace
-  ((/[*]|//).*)?                          # optional trailing comment start
-  $
-  """ % MACRO_EXPR,
-  re.VERBOSE)
+# Function-like definitions require adjacency, unlike macro invocations.
+MACRO_DEFINITION_RE = re.compile(r'(\w+(?:\([^()]*\))?)\s*(.*)', re.S)
 
 #
 INCLUDE_STRING_RE = re.compile(r"""
@@ -122,14 +78,9 @@ INCLUDE_STRING_RE = re.compile(r"""
   $
 """, re.VERBOSE)
 
-# For ridding lines of backslash
-BACKSLASH_RE = re.compile(r"\\\n", re.MULTILINE)
-
-# For matching non-comment prefix of line.
-COMMENT_RE = re.compile(r"((?!/[*]|//).)*")
-
-# FOR SEARCHING AFTER /* .. */.
-PAIRED_COMMENT_RE = re.compile(r"(/[*].*?[*]/)")
+# Clang provides directive tokens; remove phase-two continuations inside a
+# token too (for example a split macro name or header name).
+BACKSLASH_RE = re.compile(r'\\[ \t\v\f]*(?:\r\n|\n|\r)')
 
 
 def InsertMacroDefInTable(lhs, rhs, symbol_table, callback_function):
@@ -203,65 +154,6 @@ class ParseFile(object):
 
     self.define_callback = callback_function
 
-  def _ParseFine(self, poundsign_match, includepath_map_index, file_contents,
-                 symbol_table, quote_includes, angle_includes, expr_includes,
-                 next_includes):
-    """Helper function for ParseFile."""
-    Debug(DEBUG_TRACE2, "_ParseFine %s",
-      file_contents[poundsign_match.start('directive'):
-                    poundsign_match.end('directive')])
-    m = DIRECTIVE_RE.match(  # parse the directive
-          PAIRED_COMMENT_RE.sub( # remove possible paired comments
-            "",
-            BACKSLASH_RE.sub(   # get rid of lines ending in backslash
-              "",
-              file_contents[poundsign_match.start('directive'):
-                            poundsign_match.end('directive')])))
-    if m:
-      try:
-        groupdict = m.groupdict()
-        if groupdict['include'] == 'include' or \
-           groupdict['include'] == 'import':
-          if groupdict['quote']:
-            quote_includes.append(includepath_map_index(m.group('quote')))
-          elif groupdict['angle']:
-            angle_includes.append(includepath_map_index(m.group('angle')))
-          elif groupdict['expr']:
-            expr_includes.append(m.group('expr').rstrip())
-          else:
-            assert False
-        elif groupdict['include'] == 'include_next':
-          # We do not, in fact, distinguish between the two kinds of
-          # include_next's, because we conservatively assume that they are of
-          # the quote variety.
-          if groupdict['quote']:
-            next_includes.append(includepath_map_index(m.group('quote')))
-          elif groupdict['angle']:
-            next_includes.append(includepath_map_index(m.group('angle')))
-          # The following restriction would not be too hard to remove.
-          elif groupdict['expr']:
-            NotCoveredError(
-              "For include_next: cannot deal with computed include here.")
-          else:
-            assert False
-            raise NotCoveredError("include_next not parsed")
-        elif groupdict['define']:
-          if not groupdict['lhs']:
-            raise NotCoveredError("Unexpected macro definition with no LHS.")
-          else:
-            lhs = m.group('lhs')
-            rhs = groupdict['rhs'] and groupdict['rhs'] or None
-            InsertMacroDefInTable(lhs, rhs, symbol_table, self.define_callback)
-      except NotCoveredError as inst:
-        # Decorate this exception with the filename, by recreating it
-        # appropriately.
-        if not inst.source_file:
-          raise NotCoveredError(inst.args[0],
-                                self.filepath,
-                                send_email = inst.send_email)
-        else:
-          raise
-
   def Parse(self, filepath, symbol_table):
     """Parse filepath for preprocessor directives and update symbol table.
 
@@ -283,76 +175,35 @@ class ParseFile(object):
 
     includepath_map_index = self.includepath_map.Index
 
+    quote_includes, angle_includes, expr_includes, next_includes = [], [], [], []
     try:
-      fd = open(filepath, "r", encoding='latin-1')
-    except IOError as msg:
-      # This normally does not happen because the file should be known to
-      # exists. Still there might be, say, a permissions issue that prevents it
-      # from being read.
-      raise NotCoveredError("Parse file: '%s': %s" % (filepath, msg),
-                            send_email=False)
-
-    file_contents = fd.read()
-    fd.close()
-
-    if re.search(r'^\s*#\s*embed\b', file_contents, re.M):
-      raise NotCoveredError("#embed requires local preprocessing")
-
-    quote_includes, angle_includes, expr_includes, next_includes = (
-      [], [], [], [])
-
-    # Expand complete conditions: aliases and token pasting can introduce an
-    # existence operator whose name does not appear in this source file.
-    probe_text = BACKSLASH_RE.sub('', file_contents)
-    expr_includes.extend(ProbeExpression(expression.strip()) for expression in
-                         clang_scan.conditional_expressions(probe_text.encode('latin-1')))
-
-    i = 0
-    line_start_last = None
-
-    while True:
-
-      # Scan coarsely to find something of interest
-      mfast = RE_INCLUDE_DEFINE.search(file_contents, i + 1)
-      if not mfast: break
-      i = mfast.end()
-      # Identify the line of interest by scanning backwards to \n
-      line_start = file_contents.rfind("\n", 0, i) + 1 # to beginning of line
-      # Now, line_start is -1 if \n was not found.
-
-      ### TODO(klarlund) continue going back if line continuation preceeding
-
-      # Is this really a new line?
-      if line_start == line_start_last: continue
-      line_start_last = line_start
-
-      # Here we should really skip back over lines to see whether a totally
-      # pathological situation involving '\'-terminated lines like:
-      #
-      # #include <stdio.h>
-      # # Start of pathological situation involving line continuations:
-      # # \
-      #    \
-      #     \
-      #      \
-      #       include     "nidgaard.h"
-      #
-      # occurs, where the first # on each line is just Python syntax and should
-      # not be considered as part of the C/C++ example. This code defines a
-      # valid directive to include "nidgaard.h". We will not handle such
-      # situations correctly -- the include will be missed.
-
-      # Parse the line of interest according to fine-grained parser
-      poundsign_match = POUND_SIGN_RE.match(file_contents, line_start)
-
-      if not poundsign_match:
-        continue
-
-      self._ParseFine(poundsign_match, includepath_map_index, file_contents,
-                      symbol_table, quote_includes, angle_includes,
-                      expr_includes, next_includes)
-
+      with open(filepath, 'rb') as source:
+        directives = clang_scan.directives(source.read())
+      for directive, operand in directives:
+        operand = BACKSLASH_RE.sub('', operand).strip()
+        if directive in ('if', 'elif'):
+          # Expand complete conditions: aliases and token pasting may introduce
+          # existence operators whose names are absent from this source file.
+          expr_includes.append(ProbeExpression(operand))
+        elif directive == 'define':
+          definition = MACRO_DEFINITION_RE.fullmatch(operand)
+          if not definition:
+            raise NotCoveredError('Cannot parse macro definition: ' + operand)
+          lhs, rhs = definition.groups()
+          InsertMacroDefInTable(lhs, rhs or None, symbol_table, self.define_callback)
+        else:
+          literal = re.fullmatch(r'"([^"\n]+)"|<([^>\n]+)>', operand)
+          if literal:
+            quote, angle = literal.groups()
+            destination = (next_includes if directive == 'include_next' else
+                           quote_includes if quote else angle_includes)
+            destination.append(includepath_map_index(quote or angle))
+          elif directive == 'include_next':
+            raise NotCoveredError('Computed include_next requires local preprocessing')
+          else:
+            expr_includes.append(operand)
+    except (OSError, ValueError) as error:
+      raise NotCoveredError(str(error), filepath, send_email=False) from error
 
     statistics.parse_file_total_time += time.perf_counter() - parse_file_start_time
-
-    return (quote_includes, angle_includes, expr_includes, next_includes)
+    return quote_includes, angle_includes, expr_includes, next_includes

@@ -1,4 +1,4 @@
-"""Compiler-backed pump analysis with an authoritative GCC dependency check."""
+"""Compiler-backed pump analysis with branch-independent GCC include coverage."""
 import collections
 import io
 import os
@@ -235,6 +235,11 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         for arg in command[1:]):
       raise basics.NotCoveredError('Modules, PCH, plugins and frontend overrides require local preprocessing')
     clang, options, self.system_includes = self.context(command, self.translation_unit)
+    if not clang:
+      implicit = tuple(self.includepath_map.Index(options[i + 1],
+                       ignore_absolute_path_warning=True)
+                       for i, option in enumerate(options[:-1]) if option == '-include')
+      parsed_command = (*parsed_command[:2], implicit + self.include_files, *parsed_command[3:])
     if not clang and self.timer and (self.currdir_idx, self.quote_dirs, self.angle_dirs) not in self.master_cache:
       # The first conservative GCC graph may search hundreds of include
       # directories. Let it finish populating the cache instead of repeatedly
@@ -271,6 +276,12 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       remaining = 64 * 1024 * 1024 - sum(map(len, snapshots.values()))
       for index in conservative:
         path = self.realpath_map.string[index]
+        # GCC can implicitly replace an ordinary header with its adjacent
+        # precompiled image, whose captured macro state is not in this graph.
+        precompiled = path + '.gch'
+        self.build_stat_cache.file_stamps.Observe(precompiled)
+        if self.build_stat_cache.file_stamps.Stamp(precompiled) is not None:
+          raise basics.NotCoveredError('Precompiled header requires local preprocessing: ' + path)
         if path not in snapshots:
           with open(path, 'rb') as source:
             data = source.read(remaining + 1)
@@ -278,18 +289,28 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
             raise basics.NotCoveredError('Compiler input snapshots exceed 64 MiB')
           snapshots[path] = data
           remaining -= len(data)
-      # GCC builtins such as __has_builtin are not defined by -dM. Clang is
-      # therefore never the sole authority for a GCC input closure.
-      native = run([*command, '-E', '-M', '-MT', 'distcc', '-MF', '-'], allow_errors=True)
-      dependencies = native.stdout.decode(errors='surrogateescape').replace('\\\n', '')
-      if not dependencies.startswith('distcc:'):
-        raise basics.NotCoveredError('Unexpected GCC dependency output')
-      native_paths = shlex.split(dependencies[len('distcc:'):].replace('$$', '$'))
-      for path in native_paths:
-        canonical = canonicalize(os.path.join(currdir, path))
-        if canonical not in snapshots:
-          raise basics.NotCoveredError('GCC and Clang dependencies differ: ' + path)
-      paths.update(native_paths)
+      # Literal include operands are covered in every branch by the lexical
+      # graph, including branches selected only by GCC builtins. Computed
+      # operands still need the real GCC check: the macro evaluator is an
+      # overapproximation, not an implementation of every GCC extension.
+      parsed_inputs = set(conservative) | {
+          self.realpath_map.Index(os.path.join(currdir, path)) for path in paths}
+      literal_graph = all(
+          index in self.file_cache and
+          all(isinstance(expr, parse_file.ProbeExpression)
+              for expr in self.file_cache[index][2])
+          for index in parsed_inputs)
+      if not literal_graph:
+        native = run([*command, '-E', '-M', '-MT', 'distcc', '-MF', '-'], allow_errors=True)
+        dependencies = native.stdout.decode(errors='surrogateescape').replace('\\\n', '')
+        if not dependencies.startswith('distcc:'):
+          raise basics.NotCoveredError('Unexpected GCC dependency output')
+        native_paths = shlex.split(dependencies[len('distcc:'):].replace('$$', '$'))
+        for path in native_paths:
+          canonical = canonicalize(os.path.join(currdir, path))
+          if canonical not in snapshots:
+            raise basics.NotCoveredError('GCC and Clang dependencies differ: ' + path)
+        paths.update(native_paths)
     stamps = self.build_stat_cache.file_stamps
     for path, expected in result['lookups'].items():
       stamps.Observe(path)

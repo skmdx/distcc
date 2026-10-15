@@ -108,6 +108,44 @@ class ClangScanTest(unittest.TestCase):
         analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
       self.assertEqual(frontend.call_count, 0)
 
+  def test_gcc_literal_graph_and_computed_verification_use_real_frontends(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    self.addCleanup(os.chdir, os.getcwd())
+    (self.root / 'gcc.h').write_text('int gcc_only;\n')
+    (self.root / 'clang.h').write_text('int clang_only;\n')
+    for computed in (False, True):
+      with self.subTest(computed=computed):
+        operand = 'HEADER' if computed else '"gcc.h"'
+        self.source.write_text(
+            '#define HEADER "gcc.h"\n'
+            '#if __has_builtin(__builtin_speculation_safe_value)\n'
+            '#\\\ninc\\\nlude ' + operand + '\n'
+            '#else\n%:include "clang.h"\n#endif\n')
+        keeper = basics.ClientRootKeeper()
+        self.addCleanup(keeper.CleanOutClientRoots)
+        analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+        with mock.patch.object(compiler_analyzer, 'run', wraps=compiler_analyzer.run) as probe:
+          files = analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
+        self.assertTrue(any(path.endswith('/gcc.h.lzo') for path in files))
+        self.assertTrue(any(path.endswith('/clang.h.lzo') for path in files))
+        self.assertEqual(any('-M' in call.args[0] for call in probe.call_args_list), computed)
+
+  def test_gcc_implicit_precompiled_header_requires_local_preprocessing(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    self.addCleanup(os.chdir, os.getcwd())
+    (self.root / 'header.h').write_text('int header;\n')
+    (self.root / 'header.h.gch').write_bytes(b'cached compiler state')
+    self.source.write_text('#include "header.h"\n')
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    with self.assertRaisesRegex(basics.NotCoveredError, 'Precompiled header'):
+      analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
+
   def test_compilation_from_filesystem_root(self):
     gcc = shutil.which('gcc')
     if not gcc:
@@ -232,7 +270,8 @@ class ClangScanTest(unittest.TestCase):
               b'/* #if hidden */\nconst char *s = "#if hidden";\n'
               b'#if HAS("a.h") /* explanation */\nint a;\n'
               b'#elif JOIN(__has_,include)("b.h")\n#endif\n')
-    self.assertEqual([value.strip() for value in clang_scan.conditional_expressions(source)],
+    self.assertEqual([value for name, value in clang_scan.directives(source)
+                      if name in ('if', 'elif')],
                      ['HAS("a.h")', 'JOIN(__has_,include)("b.h")'])
 
   def test_indirect_probe_is_not_silently_ignored(self):
