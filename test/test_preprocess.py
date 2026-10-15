@@ -169,6 +169,32 @@ class PreprocessTest(BrokerTestCase):
         self.assertIn('send CDIR', log.read_text())
         self.assertNotIn('preprocessing locally', log.read_text())
 
+    def test_compiler_probe_bypasses_local_cpp_admission(self):
+        masquerade = self.work / 'masquerade'
+        masquerade.mkdir()
+        (masquerade / 'gcc').symlink_to(self.build / 'distcc')
+        module = next((self.build / '_include_server').glob('lib*/include_server'))
+        env = dict(self.env, PATH=str(masquerade) + os.pathsep + self.env['PATH'],
+                   PYTHONPATH=str(module))
+        env.pop('INCLUDE_SERVER_PORT')
+        lease = self.request(12)
+        self.assertEqual(self.receive(lease), (0, 1, []))
+        script = ('from compiler_analyzer import run; import sys; '
+                  'result = run(sys.argv[1:]); sys.stdout.buffer.write(result.stdout)')
+        probe = subprocess.Popen([sys.executable, '-c', script, 'gcc', '-E', '-P', self.source],
+                                 cwd=self.work, env=env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            stdout, stderr = probe.communicate(timeout=3)
+            self.assertEqual(probe.returncode, 0, stderr.decode())
+            expected = self.run_cc('gcc', ['-E', '-P', self.source], False)
+            self.assertEqual(stdout, expected.stdout)
+        finally:
+            if probe.poll() is None:
+                os.killpg(probe.pid, signal.SIGTERM)
+                probe.wait(timeout=5)
+            lease.close()
+
     def test_waiting_local_cpp_reconsiders_scanner_without_holding_slot(self):
         lease = self.request(12)
         self.assertEqual(self.receive(lease), (0, 1, []))

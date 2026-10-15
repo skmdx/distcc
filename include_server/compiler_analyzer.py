@@ -38,8 +38,11 @@ def dependency_command(command, source):
 
 def run(command, allow_errors=False):
   try:
+    # Probes belong to the admitted analyzer. Portage's PATH can contain
+    # distcc wrappers; do not queue internal work behind the clients whose
+    # include requests this process is serving.
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            timeout=30, env=dict(os.environ, LC_ALL='C'))
+                            timeout=30, env=dict(os.environ, LC_ALL='C', _DISTCC_SAFEGUARD='1'))
   except (OSError, subprocess.TimeoutExpired) as error:
     raise basics.NotCoveredError('Compiler dependency check failed: %s' % error) from error
   if result.returncode and not allow_errors:

@@ -196,9 +196,8 @@ def _SystemSearchdirsGCC(compiler, sysroot, language, canonical_lookup):
     # declared by CPATH, for example, will be incorporated into the
     # result. (See the CPP manual for the meaning of CPATH.)  The only
     # thing we keep is PATH, so we can be sure to find the compiler.
-    # NOTE: having the full PATH can be tricky: what if there's a gcc
-    # -> distcc symlink somewhere on the PATH, before the real gcc?
-    # We think the right thing will happen here, but it's complicated.
+    # The recursion guard makes probes local without taking compilation slots
+    # when PATH contains distcc's compiler symlinks.
     # TODO(csilvers): it's possible we could need to pass in some
     # other environment vars, like LD_LIBRARY_PATH.  Instead of adding
     # in more env-vars by hand, consider just removing from os.environ
@@ -207,7 +206,7 @@ def _SystemSearchdirsGCC(compiler, sysroot, language, canonical_lookup):
     # or the "Environment Variables Affecting GCC" section of the gcc
     # info page.
     #
-    trimmed_env = {}
+    trimmed_env = {'_DISTCC_SAFEGUARD': '1'}
 
     if 'PATH' in os.environ:
       trimmed_env['PATH'] = os.environ['PATH']
