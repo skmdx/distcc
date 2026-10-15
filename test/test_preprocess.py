@@ -381,10 +381,18 @@ class PreprocessTest(BrokerTestCase):
         import io
         payload = b'DCSI' + struct.pack('!II', 1, 4096)
         compress_files.WriteCompressed(str(manifest), io.BytesIO(payload), manifest.suffix[1:])
+        started = time.monotonic()
         result = self.run_cc('gcc', ['-c', self.source, '-o', 'invalid.o'])
         self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertIn(b'invalid system include manifest', result.stderr)
         self.assertFalse((self.work / 'invalid.o').exists())
-        self.get_stats(self.stats_ports[0])
+        lease = self.request(9)
+        status, _, descriptors = self.receive(lease)
+        for fd in descriptors:
+            os.close(fd)
+        self.assertEqual(status, 0)
+        lease.close()
 
     def test_scan_includes_omits_header_validation_metadata(self):
         self.source.write_text('#include <stddef.h>\nint value;\n')
@@ -580,6 +588,28 @@ class PreprocessTest(BrokerTestCase):
         self.source.write_text('#include <header.h>\nint value = VALUE;\n')
         self.assertIn(b'42', self.compare('gcc', ['-I', 'first', '-I', 'second',
                                                '-isystem', 'first', '-P']).stdout)
+
+    def test_large_include_arguments_preserve_paths_and_precedence(self):
+        first = self.work / 'search with spaces,quotes\'"and\\slashes'
+        second = self.work / 'second'
+        for directory, value in ((first, 19), (second, 42)):
+            directory.mkdir()
+            (directory / 'selection.h').write_text(
+                '#define VALUE %d\nconst char *header = __FILE__;\n' % value)
+        self.source.write_text('#include <selection.h>\nint value = VALUE;\n')
+        flags = []
+        size = 0
+        while size < 96 * 1024:
+            extra = ['-I', str(first)] if len(flags) % 2 else ['-I' + str(first)]
+            flags += extra
+            size += sum(len(arg) + 1 for arg in extra)
+        flags += ['-I' + str(second), '-MD', '-MF', 'dep.d', '-MT', 'target.o']
+        for extra, value in (([], b'19'), (['-isystem', str(first)], b'42')):
+            with self.subTest(extra=extra):
+                result = self.compare('gcc', [*flags, *extra])
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertIn(b'int value = ' + value, result.stdout)
+        self.assertNotIn('gave up analyzing', (self.work / 'client.log').read_text())
 
     def test_c_macro_string_does_not_hide_a_header_probe(self):
         (self.work / 'present.h').write_text('/* existence only */\n')

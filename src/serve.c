@@ -604,21 +604,72 @@ static int tweak_input_argument_for_server(char **argv,
 }
 
 
-/**
- * Prepend @p root_dir to arguments of include options that are absolute.
- **/
+static int pack_include_arguments(char **argv, const unsigned *indices, unsigned count)
+{
+    char path[] = ".distcc-includes-XXXXXX", *option = NULL;
+    FILE *file;
+    unsigned i, read, write, next;
+    int fd, error;
+    if (!count) return 0;
+    /* The current directory is inside this job's private input tree. Its
+     * removal owns this file too. A relative name also avoids commas in
+     * TMPDIR being interpreted as -Wp argument separators. */
+    fd = mkstemp(path);
+    if (fd < 0) return EXIT_IO_ERROR;
+    file = fdopen(fd, "w");
+    if (!file) { close(fd); unlink(path); return EXIT_IO_ERROR; }
+    for (i = 0; i < count; ++i) {
+        fputc('"', file);
+        for (const char *p = argv[indices[i]]; *p; ++p) {
+            if (*p == '\\' || *p == '"') fputc('\\', file);
+            fputc(*p, file);
+        }
+        fputs("\"\n", file);
+    }
+    error = ferror(file);
+    if (fclose(file)) error = 1;
+    if (error) { unlink(path); return EXIT_IO_ERROR; }
+    /* A driver @file is expanded before GCC builds COLLECT_GCC_OPTIONS,
+     * which still exceeds Linux's per-string limit. Let cc1 expand only
+     * the ordered -I options, leaving driver actions and other flags intact. */
+    if (asprintf(&option, "-Wp,@%s", path) < 0) {
+        unlink(path);
+        return EXIT_OUT_OF_MEMORY;
+    }
+    for (read = write = next = 0; argv[read]; ++read) {
+        if (next < count && read == indices[next]) {
+            free(argv[read]);
+            if (!next) argv[write++] = option;
+            ++next;
+        } else argv[write++] = argv[read];
+    }
+    argv[write] = NULL;
+    return 0;
+}
+
+/** Relocate include paths and pack bulky GCC search lists for cc1. */
 static int tweak_include_arguments_for_server(char **argv,
                                               const char *root_dir)
 {
     int index_of_first_filename_char = 0;
     const char *include_option;
-    unsigned int i, j;
+    unsigned int i, j, count = 0, *indices = NULL;
+    int ret = 0;
+    size_t bytes = 0, prefix = strlen(root_dir);
+    for (i = 0; argv[i]; ++i) bytes += strlen(argv[i]) + prefix + 3;
+    if (bytes >= 64 * 1024 && !strstr(dcc_find_basename(argv[0]), "clang")) {
+        indices = malloc(i * sizeof(*indices));
+        if (!indices) return EXIT_OUT_OF_MEMORY;
+    }
     for (i = 0; argv[i]; ++i) {
         for (j = 0; include_options[j]; ++j) {
             if (str_startswith(include_options[j], argv[i])) {
+                int pack = indices && !strcmp(include_options[j], "-I");
+                if (pack) indices[count++] = i;
                 if (strcmp(argv[i], include_options[j]) == 0) {
                     /* "-I foo" , change the next argument */
                     ++i;
+                    if (pack && argv[i]) indices[count++] = i;
                     include_option = "";
                     index_of_first_filename_char = 0;
                 } else {
@@ -634,7 +685,8 @@ static int tweak_include_arguments_for_server(char **argv,
                                  root_dir,
                                  argv[i] + index_of_first_filename_char);
                         if (buf == NULL) {
-                            return EXIT_OUT_OF_MEMORY;
+                            ret = EXIT_OUT_OF_MEMORY;
+                            goto done;
                         }
                         free(argv[i]);
                         argv[i] = buf;
@@ -643,8 +695,12 @@ static int tweak_include_arguments_for_server(char **argv,
                 break;  /* from the inner loop; go look at the next argument */
             }
         }
+        if (!argv[i]) break;
     }
-    return 0;
+    ret = pack_include_arguments(argv, indices, count);
+done:
+    free(indices);
+    return ret;
 }
 
 /* The -MT command line flag does not work as advertised for distcc:
@@ -755,9 +811,9 @@ static int tweak_arguments_for_server(char **argv,
     dcc_argv_append(*tweaked_argv, strdup("-MF"));
     dcc_argv_append(*tweaked_argv, strdup(deps_fname));
 
-    tweak_include_arguments_for_server(*tweaked_argv, root_dir);
-    tweak_input_argument_for_server(*tweaked_argv, root_dir);
-    return 0;
+    if ((ret = tweak_include_arguments_for_server(*tweaked_argv, root_dir)))
+        return ret;
+    return tweak_input_argument_for_server(*tweaked_argv, root_dir);
 }
 
 
@@ -1039,9 +1095,9 @@ static int dcc_run_job(int in_fd,
      */
     if (cpp_where == DCC_CPP_ON_SERVER) {
         if ((!job && (ret = dcc_r_many_files(in_fd, temp_dir, compr)))
-            || (!stdout_output && dcc_set_output(argv, temp_o))
-            || tweak_arguments_for_server(argv, temp_dir, deps_fname,
-                                          &dotd_target, &tweaked_argv))
+            || (!stdout_output && (ret = dcc_set_output(argv, temp_o)))
+            || (ret = tweak_arguments_for_server(argv, temp_dir, deps_fname,
+                                                &dotd_target, &tweaked_argv)))
             goto out_cleanup;
         /* Repeat the switcharoo trick a few lines above. */
         dcc_free_argv(argv);
@@ -1112,8 +1168,16 @@ static int dcc_run_job(int in_fd,
     }
 
     if (cpp_where == DCC_CPP_ON_SERVER &&
-        (ret = add_system_includes(&argv, temp_dir)))
-        goto out_cleanup;
+        (ret = add_system_includes(&argv, temp_dir))) {
+        if (ret != EXIT_PROTOCOL_ERROR) goto out_cleanup;
+        /* The request arrived intact but its metadata is invalid. Return a
+         * completed error instead of making the client quarantine a healthy
+         * worker and wait for network recovery. */
+        rs_log_error("invalid system include manifest");
+        status = W_EXITCODE(ret, 0);
+        ret = 0;
+        goto report_result;
+    }
 
     if ((compile_ret = dcc_spawn_child(argv, &cc_pid,
                                        "/dev/null", out_fname, err_fname))
@@ -1124,6 +1188,7 @@ static int dcc_run_job(int in_fd,
         status = W_EXITCODE(compile_ret, 0);
     }
 
+report_result:
     if (preprocess_only && cpp_where == DCC_CPP_ON_SERVER) {
         if (((stdout_output || !status) &&
              (ret = remap_preprocessed(stdout_output ? out_fname : temp_o, temp_dir))) ||
