@@ -233,6 +233,7 @@ StartIncludeServer() {
   # include_server points to the installed include_server.py.
   if [ -n "$include_server" ]; then
     pythonpath=`dirname "$include_server"`
+    cpp_lookup_library='@libdir@/distcc/cpp_lookup.so'
   else
     # We assume this script is run from the build directory.  We pick up .py
     # files from the include_server directory in the source tree, and we pick up
@@ -248,6 +249,7 @@ StartIncludeServer() {
     # them all.
     so_dir=`"$distcc_srcdir/find_c_extension.sh" "$DISTCC_LOCATION"`
     pythonpath="$so_dir"
+    cpp_lookup_library="$DISTCC_LOCATION/cpp_lookup.so"
   fi
 
   # Create a temporary directory $socket_dir.
@@ -288,6 +290,7 @@ StartIncludeServer() {
     esac
 
     if [ -z "$PYTHONOPTIMIZE" ]; then PYTHONOPTIMIZE=1; fi
+    export DISTCC_CPP_LOOKUP_LIBRARY="${DISTCC_CPP_LOOKUP_LIBRARY-$cpp_lookup_library}"
     # We use 'eval' so that INCLUDE_SERVER_ARGS can use shell quoting such 
     # as in:
     #

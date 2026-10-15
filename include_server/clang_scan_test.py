@@ -83,6 +83,35 @@ class ClangScanTest(unittest.TestCase):
     self.assertIn(os.fsencode(project / 'local.h'), expanded)
     self.assertIn(os.fsencode(project / 'missing.h'), expanded)
 
+  def test_dependency_probe_keeps_replayable_output_private(self):
+    gcc = shutil.which('gcc')
+    library = Path(__file__).resolve().parents[1] / 'cpp_lookup.so'
+    if not gcc or not library.exists() or not hasattr(os, 'memfd_create'):
+      self.skipTest('GCC lookup cache is required')
+    self.source.write_text('#if __has_include("optional.h")\n#include "optional.h"\n#endif\n')
+    command = [gcc, '-E', '-M', str(self.source)]
+    real_run = subprocess.run
+    outputs = []
+    def checked_run(*args, **kwargs):
+      output = kwargs['stdout']
+      self.assertTrue(output.seekable())
+      self.assertEqual(kwargs['env']['DISTCC_CPP_LOOKUP'], '1')
+      self.assertIn(str(library), kwargs['env']['LD_PRELOAD'])
+      outputs.append(output)
+      return real_run(*args, **kwargs)
+    with mock.patch.dict(os.environ, DISTCC_CPP_LOOKUP_LIBRARY=str(library),
+                         DISTCC_CPP_LOOKUP='1'):
+      for present in (False, True):
+        if present:
+          (self.root / 'optional.h').write_text('int optional;\n')
+        expected = real_run(command, capture_output=True, check=True)
+        with mock.patch.object(subprocess, 'run', side_effect=checked_run):
+          actual = compiler_analyzer.run(command)
+        self.assertEqual(actual.stdout, expected.stdout)
+        self.assertEqual(actual.stderr, expected.stderr)
+        self.assertEqual(b'optional.h' in actual.stdout, present)
+    self.assertTrue(all(output.closed for output in outputs))
+
   def test_gcc_rejects_absolute_forwarder_before_clang_preprocessing(self):
     gcc = shutil.which('gcc')
     if not gcc:

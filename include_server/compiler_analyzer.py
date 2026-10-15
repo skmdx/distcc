@@ -37,14 +37,30 @@ def dependency_command(command, source):
 
 
 def run(command, allow_errors=False):
+  output = None
   try:
     # Probes belong to the admitted analyzer. Portage's PATH can contain
     # distcc wrappers; do not queue internal work behind the clients whose
     # include requests this process is serving.
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            timeout=30, env=dict(os.environ, LC_ALL='C', _DISTCC_SAFEGUARD='1'))
+    env = dict(os.environ, LC_ALL='C', _DISTCC_SAFEGUARD='1')
+    library = env.get('DISTCC_CPP_LOOKUP_LIBRARY')
+    if ('-M' in command and hasattr(os, 'memfd_create') and library and
+        env.get('DISTCC_CPP_LOOKUP', '1') != '0' and os.access(library, os.R_OK)):
+      # The lookup cache can replay a changed namespace only while stdout is
+      # seekable and unpublished. Dependency output is small and stays in RAM.
+      output = os.fdopen(os.memfd_create('distcc-dependencies', os.MFD_CLOEXEC), 'w+b')
+      env['DISTCC_CPP_LOOKUP'] = '1'
+      env['LD_PRELOAD'] = library + (':' + env['LD_PRELOAD'] if env.get('LD_PRELOAD') else '')
+    result = subprocess.run(command, stdout=output if output is not None else subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=30, env=env)
+    if output is not None:
+      output.seek(0)
+      result.stdout = output.read()
   except (OSError, subprocess.TimeoutExpired) as error:
     raise basics.NotCoveredError('Compiler dependency check failed: %s' % error) from error
+  finally:
+    if output is not None:
+      output.close()
   if result.returncode and not allow_errors:
     raise basics.NotCoveredError('Compiler dependency check failed: %s' %
                                  result.stderr.decode(errors='replace')[-2048:])
