@@ -113,6 +113,14 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
           raise basics.NotCoveredError('Unexpected compiler macro output')
         name, _, value = line[8:].partition(' ')
         options.append('-D' + name + '=' + value)
+      # Compiler-provided and command-line definitions participate in the
+      # same GCC-only branches as source definitions. Validate the actual
+      # effective definitions, including split -D and -U ordering, rather
+      # than treating an unobserved existence probe as an empty dependency.
+      try:
+        clang_scan.include_probes(macros.encode())
+      except ValueError as error:
+        raise basics.NotCoveredError(str(error)) from error
       for directory in search[1].splitlines():
         options += ['-isystem', directory.strip()]
       for header in shlex.split(implicit.replace('\\\n', '').replace('$$', '$')):
