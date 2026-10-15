@@ -4,9 +4,12 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
+import basics
 import clang_scan
 import cache_basics
+import compiler_analyzer
 
 
 class ClangScanTest(unittest.TestCase):
@@ -20,6 +23,7 @@ class ClangScanTest(unittest.TestCase):
       self.skipTest('Clang is required')
 
   def scan(self):
+    assert self.compiler is not None
     return clang_scan.scan([self.compiler, '-c', str(self.source), '-I', str(self.root),
                             '-o', str(self.root / 'never.o')], str(self.root))
 
@@ -33,6 +37,24 @@ class ClangScanTest(unittest.TestCase):
                      [(0, 'MAKE_HEADER(foo, nested(bar))'), (1, '<next.h>'),
                       (0, '     "comment.h"')])
 
+  def test_gcc_rejects_absolute_forwarder_before_clang_preprocessing(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    header = self.root / 'real.h'
+    header.write_text('int value;\n')
+    (self.root / 'forward.h').write_text('#include "%s"\n' % header)
+    self.source.write_text('#include "forward.h"\n')
+    cwd = os.getcwd()
+    self.addCleanup(os.chdir, cwd)
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    with mock.patch.object(clang_scan, 'scan') as frontend:
+      with self.assertRaisesRegex(basics.NotCoveredError, 'Filepath must be relative'):
+        analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
+      self.assertEqual(frontend.call_count, 0)
+
   def test_probe_only_header_and_immutable_contents(self):
     header = self.root / 'probe.h'
     header.write_bytes(b'original contents\n')
@@ -42,7 +64,9 @@ class ClangScanTest(unittest.TestCase):
     self.assertEqual(result['files'][str(header)], b'original contents\n')
     header.write_bytes(b'changed contents\n')
     self.assertEqual(result['files'][str(header)], b'original contents\n')
-    self.assertNotEqual(result['lookups'][str(header)][4], os.stat(header).st_mtime_ns)
+    stamp = result['lookups'][str(header)]
+    assert stamp is not None and len(stamp) == 6
+    self.assertNotEqual(stamp[4], os.stat(header).st_mtime_ns)
     self.assertFalse((self.root / 'never.o').exists())
 
   def test_directory_stamps_survive_unrelated_outputs(self):

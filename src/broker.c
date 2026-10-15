@@ -1403,7 +1403,6 @@ int dcc_broker_serve(const char *path)
         if (broker->peers[count].stats_fd >= 0)
             close(broker->peers[count].stats_fd);
 done:
-    for (count = 0; count < broker->count; ++count)
     if (mask_set) sigprocmask(SIG_SETMASK, &previous, NULL);
     for (count = 0; count < MAX_CLIENTS; ++count)
         if (broker->pool[count].fd >= 0) close(broker->pool[count].fd);

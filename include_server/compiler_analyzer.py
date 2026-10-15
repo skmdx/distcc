@@ -148,6 +148,10 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       # directories. Let it finish populating the cache instead of repeatedly
       # timing out and discarding it. Warm requests retain the normal quota.
       self.timer.quota = 20.0
+    # Reject unsupported GCC inputs before running another full preprocessor.
+    # Generated forwarding headers often contain absolute include operands.
+    conservative = (super().ProcessCompilationCommand(currdir, parsed_command)
+                    if not clang else {})
     try:
       compiler = shutil.which(command[0]) or command[0]
       scan_args = command[1:]
@@ -167,12 +171,10 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     snapshots = {canonicalize(os.path.join(currdir, path)): data
                  for path, data in result['files'].items()}
     paths = set(result['dependencies'])
-    conservative = {}
     if not clang:
       # -M omits existence-only probes. GCC may choose a different branch for
       # __has_builtin/__has_attribute, so also retain the branch-independent
       # include graph. Probe tokenization itself uses libclang-cpp.
-      conservative = super().ProcessCompilationCommand(currdir, parsed_command)
       remaining = 64 * 1024 * 1024 - sum(map(len, snapshots.values()))
       for index in conservative:
         path = self.realpath_map.string[index]
