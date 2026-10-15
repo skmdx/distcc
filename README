@@ -38,6 +38,10 @@ clients in a network sandbox. See distccd(1) for configuration and limits.
 Example systemd units are in packaging/systemd. For a Portage client, enable
 distcc-broker@portage.socket and set
 DISTCC_BROKER=/run/distcc-broker-portage.socket in its build environment.
+Lease acquisition reconnects for up to 90 seconds after a connection failure
+(DISTCC_RECONNECT_TIMEOUT); compiler errors are not replayed. The systemd
+broker service restarts after abnormal exits, with a three-start limit per
+minute to stop crash loops. Normal idle exits still use socket activation.
 
 The opt-in `,tcp` host option uses prepared jobs over pooled TCP connections.
 It supports shared input caching, pump and distributed links. The broker

@@ -2,8 +2,13 @@
 Description=Local distcc scheduling broker for %i
 Requires=distcc-broker@%i.socket
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
+Restart=on-failure
+RestartSec=2
+OOMPolicy=stop
 User=%i
 ExecStart=/usr/bin/distccd --broker /run/distcc-broker-%i.socket
 Environment=DISTCC_DIR=/var/cache/distcc-broker-%i

@@ -174,7 +174,8 @@ static int send_reply(int fd, const struct reply *reply, int net)
     return dcc_send_fd(fd, reply, sizeof(*reply), net);
 }
 
-static int broker_request(uint32_t command, struct reply *reply, int *net, const struct dcc_work_hint *hint)
+static int broker_request_once(uint32_t command, struct reply *reply, int *net,
+                               const struct dcc_work_hint *hint, double deadline)
 {
     struct sockaddr_un address;
     struct { struct request header; struct dcc_work_hint hint; } request = {{ BROKER_VERSION, command }, {0}};
@@ -184,7 +185,7 @@ static int broker_request(uint32_t command, struct reply *reply, int *net, const
     struct iovec iov = { reply, sizeof(*reply) };
     struct msghdr msg = {0};
     struct cmsghdr *cmsg;
-    int fd;
+    int fd, error;
     ssize_t n = -1;
     *net = -1;
     if (unix_address(getenv("DISTCC_BROKER"), &address))
@@ -192,6 +193,20 @@ static int broker_request(uint32_t command, struct reply *reply, int *net, const
     fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return -1;
+    if (deadline) {
+        struct timeval timeout;
+        double remaining = deadline - now_seconds();
+        if (remaining <= 0) { errno = ETIMEDOUT; goto failed; }
+        timeout.tv_sec = (time_t)remaining;
+        timeout.tv_usec = (remaining - timeout.tv_sec) * 1000000 + 1;
+        if (timeout.tv_usec >= 1000000) {
+            timeout.tv_sec++;
+            timeout.tv_usec = 0;
+        }
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ||
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)))
+            goto failed;
+    }
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) ||
         send(fd, &request, request_size, MSG_NOSIGNAL) != (ssize_t)request_size)
         goto failed;
@@ -208,22 +223,61 @@ static int broker_request(uint32_t command, struct reply *reply, int *net, const
             cmsg->cmsg_len == CMSG_LEN(sizeof(int)))
             memcpy(net, CMSG_DATA(cmsg), sizeof(*net));
     }
-    if (n != sizeof(*reply) || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
-        reply->status || !memchr(reply->host, '\0', sizeof(reply->host)) ||
-        ((command == ACQUIRE || command == ACQUIRE_POOL || command == ACQUIRE_CPP ||
-          command == ACQUIRE_READY) && *net < 0) ||
-        ((command == JOBS || command == LOCAL_CPP) && *net >= 0))
+    if (n <= 0) {
+        if (!n) errno = ECONNRESET;
         goto failed;
+    }
+    if (n != sizeof(*reply) || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
+        !memchr(reply->host, '\0', sizeof(reply->host))) {
+        errno = EPROTO;
+        goto failed;
+    }
+    if (reply->status) {
+        errno = reply->status == EXIT_CONNECT_FAILED ? ECONNREFUSED : EPROTO;
+        goto failed;
+    }
+    if (((command == ACQUIRE || command == ACQUIRE_POOL || command == ACQUIRE_CPP ||
+          command == ACQUIRE_READY) && *net < 0) ||
+        ((command == JOBS || command == LOCAL_CPP) && *net >= 0)) {
+        errno = EPROTO;
+        goto failed;
+    }
     return fd;
 failed:
+    error = errno;
     if (*net >= 0) {
         close(*net);
         *net = -1;
     }
     close(fd);
-    rs_log_error("local broker request failed (command=%u, bytes=%zd, status=%d, flags=%d)",
-                 command, n, n == sizeof(*reply) ? reply->status : -1, msg.msg_flags);
+    errno = error;
     return -1;
+}
+
+static int broker_request(uint32_t command, struct reply *reply, int *net,
+                          const struct dcc_work_hint *hint)
+{
+    double deadline = 0;
+    int delay = 100, fd;
+    const char *setting = getenv("DISTCC_RECONNECT_TIMEOUT");
+    int timeout = setting ? atoi(setting) : 90;
+    /* Closing a failed control socket releases its lease. No compiler request
+     * has been sent yet, so reconnecting cannot replay a completed job. */
+    while ((fd = broker_request_once(command, reply, net, hint, deadline)) < 0) {
+        int error = errno;
+        if (error != ENOENT && error != ECONNREFUSED &&
+            error != ECONNRESET && error != EPIPE)
+            break;
+        if (!deadline) deadline = now_seconds() + timeout;
+        double remaining = deadline - now_seconds();
+        if (remaining <= 0) break;
+        poll(NULL, 0, remaining * 1000 < delay ? (int)(remaining * 1000) : delay);
+        errno = error;
+        if (delay < 1000) delay *= 2;
+    }
+    if (fd < 0)
+        rs_log_error("local broker request failed (command=%u): %s", command, strerror(errno));
+    return fd;
 }
 
 int dcc_broker_local_cpp(int *lease, int *occupied)

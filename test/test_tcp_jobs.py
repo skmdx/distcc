@@ -780,7 +780,8 @@ with open(args[args.index('-o') + 1], 'ab') as output:
         thread = threading.Thread(target=server)
         thread.start()
         self.start_broker(f'127.0.0.1:{listener.getsockname()[1]}/1,tcp')
-        self.env.update(DISTCC_MAX_RETRIES='1', DISTCC_SKIP_LOCAL_RETRY='1')
+        self.env.update(DISTCC_MAX_RETRIES='1', DISTCC_SKIP_LOCAL_RETRY='1',
+                        DISTCC_RECONNECT_TIMEOUT='0')
         output = self.work / 'previous.o'
         output.write_bytes(b'original artifact')
         result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(self.source),

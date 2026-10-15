@@ -957,6 +957,14 @@ Measurements are cached for at most one second. Other platforms retain their
 configured slot limits. This is a contention estimate, not a hard per-job
 memory guarantee or a common budget for unrelated processes and users.
 .TP
+.B "DISTCC_RECONNECT_TIMEOUT"
+Maximum seconds to retry a lost local broker connection or unavailable workers
+while acquiring a lease (default 90; zero disables retries). The deadline starts
+at the first connection failure; ordinary admission waiting is unaffected.
+Requests are retried before submitting compiler input, not after compiler errors.
+Malformed replies and permission errors fail immediately. This does not replace
+the I/O timeout for a connection that remains open but stops making progress.
+.TP
 .B "DISTCC_IO_TIMEOUT"
 Specifies how long (in seconds) distcc will wait before deciding a
 distributed job has timed out.  If a distributed job is expected to

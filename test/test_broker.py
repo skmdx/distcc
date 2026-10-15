@@ -39,10 +39,11 @@ class BrokerTestCase(DistccTestCase):
                     raise
                 time.sleep(.02)
 
-    def start_broker(self, hosts=None, idle=10, name="broker"):
+    def start_broker(self, hosts=None, idle=10, name="broker", backoff=60):
         path = self.root / f"{name}.sock"
         env = dict(self.base_env, DISTCC_HOSTS=hosts or self.host(0),
-                   DISTCC_DIR=str(self.ddir), DISTCC_BROKER_IDLE=str(idle))
+                   DISTCC_DIR=str(self.ddir), DISTCC_BROKER_IDLE=str(idle),
+                   DISTCC_BACKOFF_PERIOD=str(backoff))
         log = open(self.work / f"{name}.log", "w+")
         self.addCleanup(log.close)
         proc = subprocess.Popen([str(self.build / "distccd"), "--broker", str(path)],
@@ -100,6 +101,56 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerTest(BrokerTestCase):
+    def test_client_waits_for_broker_start(self):
+        self.env = dict(self.base_env, DISTCC_HOSTS=self.host(0),
+                        DISTCC_DIR=str(self.ddir), TMPDIR=str(self.work),
+                        DISTCC_BROKER=str(self.root / 'broker.sock'),
+                        DISTCC_FALLBACK='0', DISTCC_RECONNECT_TIMEOUT='5')
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            job = pool.submit(self.job, 900)
+            time.sleep(.3)
+            self.assertFalse(job.done())
+            self.start_broker()
+            job.result(timeout=10)
+
+    def test_client_reconnects_after_broker_dies_while_queued(self):
+        broker = self.start_broker(self.host(0) + ' --localslots_cpp=1')
+        self.env['DISTCC_RECONNECT_TIMEOUT'] = '5'
+        held = self.request(12)
+        self.assertEqual(self.receive(held), (0, 1, []))
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            job = pool.submit(self.job, 901)
+            time.sleep(.3)
+            self.assertFalse(job.done())
+            broker.kill()
+            broker.wait(timeout=5)
+            self.start_broker()
+            job.result(timeout=10)
+
+    def test_unavailable_broker_reconnect_is_bounded(self):
+        env = dict(self.base_env, DISTCC_HOSTS=self.host(0),
+                   DISTCC_BROKER=str(self.root / 'absent.sock'),
+                   DISTCC_RECONNECT_TIMEOUT='1')
+        start = time.monotonic()
+        result = subprocess.run([str(self.build / 'distcc'), '-j'], env=env,
+                                capture_output=True, timeout=4)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertGreaterEqual(time.monotonic() - start, .9)
+
+    def test_worker_restart_during_compile(self):
+        self.start_broker(self.host(0, ',tcp'), backoff=1)
+        self.env['DISTCC_RECONNECT_TIMEOUT'] = '10'
+        # Observe actual execution before dropping the TCP connection.
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            job = pool.submit(self.job, 902)
+            deadline = time.monotonic() + 5
+            while '\ndcc_busy 1\n' not in self.get_stats(self.stats_ports[0]):
+                self.assertFalse(job.done())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            self.restart_server(self.build / 'distccd')
+            job.result(timeout=15)
+
     def test_reused_cpp_requests_do_not_inherit_old_job_priority(self):
         peer = self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
                          queued=0, preparing=0, returning=0, capacity=1))
