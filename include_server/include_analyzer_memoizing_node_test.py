@@ -64,7 +64,7 @@ class IncludeAnalyzerMemoizingNodeUnitTest(unittest.TestCase):
     self.realpath_map = self.include_analyzer.realpath_map
 
 
-  def test__CalculateIncludeClosureExceptSystem(self):
+  def test__CalculateIncludeClosure(self):
     """Construct a summary graph, then calculate closure and check."""
     includepath_map = self.includepath_map
     canonical_path = self.canonical_path
@@ -143,7 +143,7 @@ class IncludeAnalyzerMemoizingNodeUnitTest(unittest.TestCase):
     E_children.extend([])
 
     include_closure = {}
-    self.include_analyzer._CalculateIncludeClosureExceptSystem(A, include_closure)
+    self.include_analyzer._CalculateIncludeClosure(A, include_closure)
     stringified_include_closure = self._ToString(include_closure)
 
     # /curr/src/a.h is not known under absolute pathnames.
@@ -173,7 +173,7 @@ class IncludeAnalyzerMemoizingNodeUnitTest(unittest.TestCase):
             " -o src/%s.o" +
             " -c src/%s.c") % (src_stem, src_stem)
 
-  def test__CalculateIncludeClosureExceptSystem_on_distcc(self):
+  def test__CalculateIncludeClosure_on_distcc(self):
 
     includepath_map = self.includepath_map
     canonical_path = self.canonical_path
@@ -227,12 +227,16 @@ class IncludeAnalyzerMemoizingNodeUnitTest(unittest.TestCase):
 
     expected = set([ expected_prefix + expected_suffix
                      for expected_suffix in expected_suffixes ])
-    self.assertEqual(set([realpath_map.string[key]
-                          for key in include_closure.keys()]),
-                     expected)
+    systemdirs = include_analyzer.compiler_defaults.system_dirs_default_all
+    actual = {realpath_map.string[key] for key in include_closure}
+    system = {path for path in actual
+              if any(path.startswith(directory.rstrip('/') + '/') for directory in systemdirs)}
+    self.assertTrue(any(path.endswith('/stdio.h') for path in system))
+    self.assertEqual(actual - system, expected)
 
     for rp_idx in include_closure:
-      self.assertEqual(len(include_closure[rp_idx]), 0)
+      if realpath_map.string[rp_idx] in expected:
+        self.assertEqual(len(include_closure[rp_idx]), 0)
 
     # TODO(klarlund): massage command so as to test that with a
     # different search path files are reported as absolute. That is,

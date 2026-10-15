@@ -845,7 +845,6 @@ dcc_build_somewhere(char *argv[],
         }
     }
 
-  prepare_client_input:
     /* With a broker, finish local preprocessing before reserving a worker.
      * Release the local lock before requesting the remote lease; never wait
      * for a remote slot while holding a local slot. Reuse this input on retry. */
@@ -1026,21 +1025,6 @@ dcc_build_somewhere(char *argv[],
     local_cpu_lock_fd = -1;
     remote_completed = 1;
 
-    if (host->cpp_where == DCC_CPP_ON_SERVER && WIFEXITED(*status) &&
-        WEXITSTATUS(*status) == EXIT_LOCAL_CPP) {
-        rs_trace("worker system headers differ; preprocessing locally before remote retry");
-        release_host(host, &cpu_lock_fd, &local_cpu_lock_fd, 0);
-        dcc_free_argv(files);
-        files = NULL;
-        unsetenv("INCLUDE_SERVER_PORT");
-        *status = 0;
-        if (preprocess_only) {
-            ret = EXIT_LOCAL_CPP;
-            goto lock_local;
-        }
-        goto prepare_client_input;
-    }
-
     dcc_enjoyed_host(host);
 
     dcc_unlock(cpu_lock_fd);
@@ -1087,7 +1071,7 @@ dcc_build_somewhere(char *argv[],
                 dcc_work_describe(&work, argv, input_fname, NULL, -1, 0);
                 goto choose_host;
             }
-            dcc_free_argv(files);
+            if (files) dcc_free_argv(files);
             files = NULL;
             unsetenv("INCLUDE_SERVER_PORT");
         }

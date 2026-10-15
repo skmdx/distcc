@@ -212,13 +212,11 @@ NEWLINE_RE = re.compile(r"\n", re.MULTILINE)
 BACKSLASH_NEWLINE_RE = re.compile(r"\\\n", re.MULTILINE)
 
 
-def ExactDependencies(cmd, realpath_map, systemdir_prefix_cache,
-                      translation_unit):
+def ExactDependencies(cmd, realpath_map, translation_unit):
   """The dependencies as calculated by CPP, the C Preprocessor.
   Arguments:
     cmd:  the compilation command, a string
     realpath_map: map from filesystem paths (no symlink) to idx
-    systemdir_prefix_cache: says whether realpath starts with a systemdir
     translation_unit: string
   Returns:
     the set of realpath indices of the include dependencies.
@@ -268,8 +266,6 @@ def ExactDependencies(cmd, realpath_map, systemdir_prefix_cache,
                for filepath in dotd.split()
                for rp_idx in [ realpath_map.Index(os.path.join(os.getcwd(),
                                                                filepath)) ]
-               if not systemdir_prefix_cache.StartsWithSystemdir(rp_idx,
-                                                                 realpath_map)
               ])
   statistics.len_exact_closure = len(deps)
   return deps

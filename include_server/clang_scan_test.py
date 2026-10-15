@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 import shutil
 import shlex
-import struct
 import subprocess
 import tempfile
 import unittest
@@ -41,47 +40,26 @@ class ClangScanTest(unittest.TestCase):
                      [(0, 'MAKE_HEADER(foo, nested(bar))'), (1, '<next.h>'),
                       (0, '     "comment.h"')])
 
-  def test_system_checks_keep_directory_and_leaf_aliases(self):
-    system = self.root / 'system'
-    project = self.root / 'project'
-    system.mkdir()
-    project.mkdir()
+  def test_system_header_aliases_are_transferred(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    sysroot = self.root / 'sysroot'
+    system = sysroot / 'usr/include'
+    system.mkdir(parents=True)
     (system / 'present.h').write_text('int present;\n')
-    (project / 'local.h').write_text('int local;\n')
-    (project / 'alias').symlink_to(system, target_is_directory=True)
-    (project / 'leaf.h').symlink_to(system / 'present.h')
-    (project / 'dangling.h').symlink_to(system / 'missing.h')
+    (system / 'alias.h').symlink_to('present.h')
+    self.source.write_text('#include <alias.h>\n')
+    self.addCleanup(os.chdir, os.getcwd())
     keeper = basics.ClientRootKeeper()
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
-    analyzer.systemdir_prefix_cache.systemdirs = {str(system)}
-    analyzer.compiler_defaults.missing_system_dirs = set()
-    observed = {str(system / 'present.h'), str(project / 'alias' / 'present.h'),
-                str(project / 'alias' / 'missing.h'), str(project / 'leaf.h'),
-                str(project / 'dangling.h'), str(system / 'missing.h')}
-    for path in observed | {str(project / 'local.h'), str(project / 'missing.h')}:
-      analyzer.build_stat_cache.file_stamps.Observe(path)
-    payload = analyzer.SystemChecks({})
-    self.assertEqual(payload[:4], b'DCSH')
-    count = struct.unpack_from('!I', payload, 4)[0]
-    offset, actual = 8, set()
-    for _ in range(count):
-      length, kind, size, digest = struct.unpack_from('!IIQ8s', payload, offset)
-      offset += 24
-      actual.add(os.fsdecode(payload[offset:offset + length]))
-      offset += length
-    self.assertEqual(actual, {str(system / 'present.h'), str(system / 'missing.h')})
-    self.assertEqual(count, 2)
-    self.assertEqual(offset, len(payload))
-    # A warm request retains both relevant and irrelevant classifications.
-    with mock.patch('os.path.realpath', side_effect=AssertionError('repeated lookup')):
-      self.assertEqual(analyzer.SystemChecks({}), payload)
-    # Another compiler context may introduce a new default include directory.
-    # Previously ignored lookups must then be checked on the worker too.
-    analyzer.systemdir_prefix_cache.systemdirs.add(str(project))
-    expanded = analyzer.SystemChecks({})
-    self.assertIn(os.fsencode(project / 'local.h'), expanded)
-    self.assertIn(os.fsencode(project / 'missing.h'), expanded)
+    files = analyzer.DoCompilationCommand(
+        [gcc, '--sysroot=' + str(sysroot), '-c', str(self.source)], str(self.root), keeper)
+    self.assertTrue(any(path.endswith(str(system / 'present.h') + '.lzo') for path in files))
+    self.assertTrue(any(path.endswith(str(system / 'alias.h')) for path in files))
+    assert keeper.client_root is not None
+    self.assertFalse((Path(keeper.client_root) / str(system).lstrip('/')).is_symlink())
 
   def test_dependency_probe_keeps_replayable_output_private(self):
     gcc = shutil.which('gcc')
@@ -207,20 +185,20 @@ class ClangScanTest(unittest.TestCase):
     def checks():
       with mock.patch.object(compress_files, 'WriteCompressed',
                              wraps=compress_files.WriteCompressed) as writer:
-        analyzer.DoCompilationCommand([str(compiler), '-c', str(self.source)],
-                                      str(self.root), keeper, 'lz4s')
-      return next(call.args[1].getvalue() for call in writer.call_args_list
-                  if '/.distcc-system/' in call.args[0])
+        files = analyzer.DoCompilationCommand([str(compiler), '-c', str(self.source)],
+                                             str(self.root), keeper, 'lz4s')
+      manifest = next(call.args[1].getvalue() for call in writer.call_args_list
+                      if '/.distcc-system/' in call.args[0])
+      return manifest, files
     path = os.fsencode(missing)
-    negative = struct.pack('!IIQ8s', len(path), 0, 0, bytes(8)) + path
-    self.assertIn(negative, checks())
+    self.assertNotIn(path, checks()[0])
     missing.mkdir()
     (missing / 'feature.h').write_text('/* existence probe */\n')
-    updated = checks()
-    self.assertNotIn(negative, updated)
-    self.assertIn(os.fsencode(missing / 'feature.h'), updated)
+    updated, files = checks()
+    self.assertIn(path, updated)
+    self.assertTrue(any(p.endswith(str(missing / 'feature.h') + '.lz4s') for p in files))
     (missing / 'feature.h').write_text('/* different probe */\n')
-    self.assertNotEqual(updated, checks())
+    self.assertNotEqual(files, checks()[1])
 
   def test_probe_only_header_and_immutable_contents(self):
     header = self.root / 'probe.h'

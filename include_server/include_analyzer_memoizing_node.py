@@ -332,7 +332,7 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
                          filepath_real_idx)
     # Find the nodes reachable from node and represent as an include closure.
     include_closure = {}
-    self._CalculateIncludeClosureExceptSystem(node, include_closure)
+    self._CalculateIncludeClosure(node, include_closure)
     return include_closure
 
   def FindNode(self,
@@ -597,7 +597,7 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
         support_record.Update(node_[self.SUPPORT_RECORD].support_id)
     return node
 
-  def _CalculateIncludeClosureExceptSystem(self, node, include_closure):
+  def _CalculateIncludeClosure(self, node, include_closure):
     """Explore the subgraph reachable from node and gather real paths.
 
     Arguments:
@@ -609,10 +609,7 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
       include_closure.  We modify in place to avoid copying this big struct.
     """
     assert not include_closure  # should start out empty
-    # We access prefix_cache's vars directly, so we need to ensure it's filled.
-    self.systemdir_prefix_cache.FillCache(self.realpath_map)
     visited = set([])
-    starts_with_systemdir = self.systemdir_prefix_cache.cache
     dir_map_string = self.directory_map.string
     if not node: return
     stack = ([node])          # TODO(csilvers): consider using a deque
@@ -632,19 +629,19 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
       # is dispatched away with quickly:
       if node[0]:      # fp_real_idx
         statistics.len_calculated_closure += 1
-        # We ignore "system" includes like /usr/include/stdio.h.
-        # These files are not likely to change, so it's safe to skip them.
-        if not starts_with_systemdir[node[0]]:
-          # Add the resolved filepath to those found for realpath.
-          if node[0] not in include_closure:
-            include_closure[node[0]] = []
-          searchdir_idx = node[1][0]    # the searchdir part of fp_pair
-          if (searchdir_idx and dir_map_string[searchdir_idx] and
-              dir_map_string[searchdir_idx][0] == '/'):
-            include_closure[node[0]].append(node[1])
+        # System headers belong to the client too. Send their snapshots using
+        # the same immutable input cache as application headers.
+        if node[0] not in include_closure:
+          include_closure[node[0]] = []
+        searchdir_idx = node[1][0]
+        if (searchdir_idx and dir_map_string[searchdir_idx] and
+            dir_map_string[searchdir_idx][0] == '/'):
+          include_closure[node[0]].append(node[1])
       # Even when a node does not describe a filepath, it may still
       # have children that do if it is a dummy node.
       # TODO(csilvers): see if it speeds things up to append node[2],
       #                 so stack is a list of lists.
       stack.extend(node[2])
-    statistics.len_calculated_closure_nonsys = len(include_closure)
+    statistics.len_calculated_closure_nonsys = sum(
+        not self.systemdir_prefix_cache.StartsWithSystemdir(index, self.realpath_map)
+        for index in include_closure)

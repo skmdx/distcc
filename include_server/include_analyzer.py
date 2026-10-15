@@ -76,9 +76,7 @@ class IncludeAnalyzer(object):
     # Make a cache for the symbolic links encountered; also for their
     # replication into root directory.
     self.mirror_path = mirror_path.MirrorPath(self.simple_build_stat,
-                                              self.canonical_path,
-                                              self.realpath_map,
-                                              self.systemdir_prefix_cache)
+                                              self.canonical_path)
     # Make a parser for C/C++.
     self.parse_file = parse_file.ParseFile(self.includepath_map)
     # Make a compressor for source files.
@@ -273,7 +271,7 @@ class IncludeAnalyzer(object):
     # performance degradation for large link farms. We expect at most a
     # handful. We add put the system links first, because there should be very
     # few of them.
-    links = self.compiler_defaults.system_links + self.mirror_path.Links()
+    links = self.mirror_path.Links()
     files = self.compress_files.Compress(include_closure, client_root_keeper,
                                          self.currdir_idx, '-E' in cmd, compression,
                                          getattr(self, 'snapshots', None))
@@ -295,17 +293,16 @@ class IncludeAnalyzer(object):
 
     if basics.opt_verify:
       # Invoke the real preprocessor.
-      exact_no_system_header_dependency_set = (
+      exact_dependencies = (
         include_server.ExactDependencies(" ".join(cmd),
                           realpath_map,
-                          self.systemdir_prefix_cache,
                           translation_unit))
       if basics.opt_write_include_closure:
-        include_server.WriteDependencies(exact_no_system_header_dependency_set,
+        include_server.WriteDependencies(exact_dependencies,
                           self.result_file_prefix + '.d_exact',
                           realpath_map)
       include_server.VerifyExactDependencies(include_closure,
-                              exact_no_system_header_dependency_set,
+                              exact_dependencies,
                               realpath_map,
                               translation_unit)
     if basics.opt_write_include_closure:
@@ -357,11 +354,8 @@ class IncludeAnalyzer(object):
     index corresponding to a single #include (more exactly, it's the
     index of the path that the #include resolves to).
 
-    This include closure calculation omits any system header files,
-    that is, header files found in a systemdir (recall systemdirs are
-    those searchdirs that are built into the preprocessor, such as
-    "/usr/include").  It concentrates only on header files users might
-    edit.
+    The closure includes system headers as well as application headers so
+    remote preprocessing uses the client's immutable inputs.
 
     The keys are the most important part of the include_closure; the
     values are used only to munge the preprocessor output to give more

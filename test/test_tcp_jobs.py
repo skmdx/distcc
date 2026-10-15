@@ -497,7 +497,7 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.job('after-cancel')
 
     def wire_job(self, body, cached=True, paths=(b'/src/source.c',), identity=1, receive_buffer=None,
-                 verification: bytes | None = b'DCSH\0\0\0\0'):
+                 verification: bytes | None = b'DCSI\0\0\0\0'):
         def string(value):
             return struct.pack('!Q', len(value)) + value
         args = [b'gcc', b'-c', paths[0], b'-o', b'/src/result.o']
@@ -566,14 +566,16 @@ ssize_t write(int fd, const void *data, size_t size) {
             self.assertTrue(outputs[2].startswith(b'\x7fELF'))
         return outputs
 
-    def test_missing_or_invalid_header_verification_requests_client_cpp(self):
+    def test_missing_or_invalid_system_include_manifest_is_rejected(self):
         body = b'int unchecked_headers;\n'
-        for verification in (None, b'bad format', b'DCSH\0\0\0\1'):
+        for verification in (None, b'bad format', b'DCSI\0\0\0\1',
+                             b'DCSI' + struct.pack('!I', 4097),
+                             b'DCSI' + struct.pack('!III', 1, 0, 1) + b'x',
+                             b'DCSI' + struct.pack('!I', 0) + b'extra'):
             with self.subTest(verification=verification):
                 net = self.wire_job(body, cached=False, verification=verification)
                 self.upload(net, body)
-                outputs = self.result(net, expected_status=120 << 8)
-                self.assertFalse(outputs[2])
+                self.assertEqual(net.recv(1), b'')
 
     def test_single_upload_and_owner_disconnect(self):
         body = b'int cache_owner_recovery(void) { return 901; }\n'

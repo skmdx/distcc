@@ -61,16 +61,18 @@ dependencies must still prevent writes to an input during its compilation.
 An aborted analysis also invalidates the graph: incomplete nodes must not be
 reused by later requests, including requests for the same translation unit.
 
-The worker receives the raw source and needed application headers, runs the
-compiler's preprocessor and compiles the result. System headers in the compiler's
-default search paths are not transferred. Before preprocessing, the worker checks
-their content digests and the analyzer's positive and negative lookup results
-against a verification input sent with the source tree. A mismatch requests
-client preprocessing followed by distributed compilation, including when local
-compiler fallback is disabled. Matching headers retain server preprocessing.
-Compiler versions, target and search paths must still agree; pump does not
-synchronize a sysroot. Header digests share the analyzer's cache invalidation
-generation, and the worker verifies its installed files for every job.
+The worker receives the raw source and snapshots of application and system
+headers, runs the compiler's preprocessor and compiles the result. Default
+include paths are sent in compiler order, including Clang's system-header class
+and GCC's implicit headers. The worker disables its own default search paths
+and reads the client's private input tree. Explicit include options retain
+their search order and header classification. Missing probes stay missing
+even when a worker has additional headers installed.
+
+System headers use the same compression and immutable input cache as application
+headers. They do not need to match the worker installation or be retransmitted
+on every job. Compiler versions and target ABI must still agree. This transfers
+the required header closure, not libraries or a complete sysroot for linking.
 
 For Gentoo, source `packaging/gentoo/pump.bashrc` (installed by the overlay as
 `/usr/share/distcc/portage-pump.bashrc`) from `/etc/portage/bashrc`, and call

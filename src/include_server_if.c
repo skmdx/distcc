@@ -45,7 +45,6 @@
 #include "lock.h"
 
 static int dcc_count_slashes(const char *path);
-static int dcc_count_leading_dotdots(const char *path);
 static int dcc_categorize_file(const char *include_server_filename);
 
 /* The include server puts all files in its own special directory,
@@ -232,17 +231,14 @@ dcc_approximate_includes(struct dcc_hostdef *host, char **argv)
  * Take a filename output from the include server,
  * convert the filename back so that it refers to the original source tree
  * (as opposed to the include server's mirror tree),
- * categorize it as SYSTEMDIR, DIRECTORY, SYMLINK, or FILE,
+ * categorize it as DIRECTORY, SYMLINK, or FILE,
  * and print the category and original name to stdout.
- * For SYMLINKs, also print out what the symlink points to.
  */
 static int
 dcc_categorize_file(const char *include_server_filename) {
     char *filename;
     int is_symlink = 0;
     int is_forced_directory = 0;
-    int is_system_include_directory = 0;
-    char link_target[MAXPATHLEN + 1];
     int ret;
 
     if ((ret = dcc_get_original_fname(include_server_filename, &filename))) {
@@ -264,25 +260,17 @@ dcc_categorize_file(const char *include_server_filename) {
 
     /* forced directories don't exist */
     if (!is_forced_directory &&
-        (ret = dcc_is_link(include_server_filename, &is_symlink)))
+        (ret = dcc_is_link(include_server_filename, &is_symlink))) {
+        free(filename);
         return ret;
-
-    if (is_symlink) {
-        if ((ret = dcc_read_link(include_server_filename, link_target)))
-            return ret;
-        int leading_dotdots = dcc_count_leading_dotdots(link_target);
-        is_system_include_directory =
-            leading_dotdots > 0 &&
-            leading_dotdots > dcc_count_slashes(filename) &&
-            strcmp(link_target + 3 * leading_dotdots - 1, filename) == 0;
     }
 
-    printf("%-9s %s\n", is_system_include_directory ? "SYSTEMDIR" :
-                        is_forced_directory         ? "DIRECTORY" :
+    printf("%-9s %s\n", is_forced_directory         ? "DIRECTORY" :
                         is_symlink                  ? "SYMLINK" :
                                                       "FILE",
                         filename);
 
+    free(filename);
     return 0;
 }
 
@@ -295,18 +283,6 @@ dcc_count_slashes(const char *path)
     for (i = 0; path[i]; i++) {
         if (path[i] == '/')
             count++;
-    }
-    return count;
-}
-
-/* Count the number of leading "../" references in a path. */
-static int
-dcc_count_leading_dotdots(const char *path)
-{
-    int count = 0;
-    while (str_startswith("../", path)) {
-        path += 3;
-        count++;
     }
     return count;
 }

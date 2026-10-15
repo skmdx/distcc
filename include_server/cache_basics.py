@@ -984,7 +984,7 @@ class SetUpCaches(object):
     # sure "our" system_dirs_default_all is updated.
     # TODO(csilvers): get rid of this once prefix_cache TODO is cleaned up
     self.compiler_defaults = compiler_defaults.CompilerDefaults(
-      self.canonical_path.Canonicalize, client_root)
+      self.canonical_path.Canonicalize)
     self.systemdir_prefix_cache = SystemdirPrefixCache(
       self.compiler_defaults.system_dirs_default_all)
 

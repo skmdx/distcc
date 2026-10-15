@@ -193,7 +193,7 @@ dcc_check_unsupported_directives(const char *cpp_fname, const char *input_fname)
 	}
     }
 
-    if (bytes_read < 0 && errno != 0)
+    if (ferror(cpp_f))
         rs_log_warning("%s: getline failed: %s (%d), file %s", __func__, strerror(errno), errno, cpp_fname);
 out:
     if (line)

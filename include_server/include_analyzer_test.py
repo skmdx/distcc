@@ -90,8 +90,12 @@ class IncludeAnalyzerTest(unittest.TestCase):
         "gcc test_data/test_computed_includes/src.c",
         os.getcwd()))
 
+    system = self.include_analyzer.compiler_defaults.system_dirs_default_all
+    system_inputs = {path for path in includes
+                     if any(path.startswith(directory.rstrip('/') + '/') for directory in system)}
+    self.assertTrue(any(path.endswith('/stdio.h') for path in system_inputs))
     self.assertEqual(
-      includes,
+      includes - system_inputs,
       self.CanonicalPathsForTestData(['test_computed_includes/src.c',
                                       'test_computed_includes/helper.c',
                                       'test_computed_includes/incl.h']))
@@ -101,8 +105,9 @@ class IncludeAnalyzerTest(unittest.TestCase):
         "gcc test_data/test_computed_includes/srcA.c",
         os.getcwd()))
 
+    self.assertTrue(system_inputs <= includes)
     self.assertEqual(
-      includes,
+      includes - system_inputs,
       self.CanonicalPathsForTestData(['test_computed_includes/srcA.c',
                                       'test_computed_includes/helper.c',
                                       'test_computed_includes/incl.h',
@@ -138,7 +143,7 @@ class IncludeAnalyzerTest(unittest.TestCase):
         os.getcwd()))
 
     self.assertEqual(
-      includes,
+      includes - system_inputs,
       self.CanonicalPathsForTestData(['test_computed_includes/src.c',
                                       'test_computed_includes/helper.c',
                                       'test_computed_includes/incl.h',
@@ -156,7 +161,7 @@ class IncludeAnalyzerTest(unittest.TestCase):
         os.getcwd()))
 
     self.assertEqual(
-      includes,
+      includes - system_inputs,
       self.CanonicalPathsForTestData(
         ['func_macro.c',
          'dfoo/foo.h',

@@ -47,9 +47,7 @@ class MirrorPathTest(unittest.TestCase):
     self.canonical_path = caches.canonical_path
     self.simple_build_stat = caches.simple_build_stat
     self.mirror_path = mirror_path.MirrorPath(self.simple_build_stat,
-                                              self.canonical_path,
-                                              caches.realpath_map,
-                                              caches.systemdir_prefix_cache)
+                                              self.canonical_path)
 
     self.directories = ['/', '/a', '/link', '/a/link', '/a/b',
                         '/link/link', '/root']

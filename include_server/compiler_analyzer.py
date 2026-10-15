@@ -5,7 +5,6 @@ import os
 import re
 import shlex
 import shutil
-import stat
 import struct
 import subprocess
 import xxhash
@@ -73,9 +72,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     self.contexts = collections.OrderedDict()
     self.command = None
     self.snapshots = None
-    self.system_checks = None
-    self.system_records = {}
-    self.system_directories = None
+    self.system_includes = ()
 
   def DoCompilationCommand(self, cmd, *args, **kwargs):
     self.command = cmd
@@ -84,109 +81,23 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       compression = kwargs.get('compression', args[2] if len(args) > 2 else 'lzo')
       directory = os.path.join(self.client_root_keeper.client_root, '.distcc-system')
       os.makedirs(directory, exist_ok=True)
-      assert self.system_checks is not None
-      name = xxhash.xxh3_64_hexdigest(self.system_checks) + '.' + compression
+      encoded = [(kind, os.fsencode(path)) for kind, path in self.system_includes]
+      manifest = (b'DCSI' + struct.pack('!I', len(encoded)) +
+                  b''.join(struct.pack('!II', kind, len(path)) + path for kind, path in encoded))
+      name = xxhash.xxh3_64_hexdigest(manifest) + '.' + compression
       path = os.path.join(directory, name)
       if not os.path.exists(path):
-        compress_files.WriteCompressed(path, io.BytesIO(self.system_checks), compression)
+        compress_files.WriteCompressed(path, io.BytesIO(manifest), compression)
       return files + [path]
     finally:
       self.snapshots = None
-      self.system_checks = None
       self.command = None
-
-  def SystemChecks(self, snapshots):
-    """Describe default-header inputs and probes omitted from the sent tree.
-
-    Include the conservative GCC graph's lookups too: a GCC-only existence
-    probe need not appear in Clang's active dependency list. Stamps are checked
-    again before publishing the immutable request. Encoded records share the
-    graph's invalidation generation so warm requests do not reread headers.
-    """
-    directories = tuple(path.rstrip('/') + '/' for path in
-                        (*self.systemdir_prefix_cache.systemdirs,
-                         *self.compiler_defaults.missing_system_dirs))
-    if directories != self.system_directories:
-      self.system_records.clear()
-      self.system_directories = directories
-    def system_path(path):
-      return (path.rstrip('/') + '/').startswith(directories)
-
-    paths = self.build_stat_cache.file_stamps.paths
-    parents = {}
-    records = {}
-    remaining = 64 * 1024 * 1024
-    for (path, ancestor), stamp in paths.items():
-      if ancestor:
-        continue
-      if path in self.system_records:
-        cached = self.system_records[path]
-        if cached is not None:
-          check_path, record, size = cached
-          if check_path not in records:
-            remaining -= size
-            records[check_path] = record, size
-          if remaining < 0:
-            raise basics.NotCoveredError('System header checks exceed 64 MiB')
-        continue
-      if system_path(path):
-        canonical = self.canonical_path.Canonicalize(path)
-      else:
-        # Most failed lookups belong to project include directories. Resolve
-        # their shared parent once, rather than realpath'ing every missing
-        # header. A leaf symlink still needs its own target checked.
-        leaf = paths.get((path, True))
-        if leaf is not None and stat.S_ISLNK(leaf[2]):
-          canonical = os.path.realpath(path)
-        else:
-          parent = os.path.dirname(path)
-          if parent not in parents:
-            # libc realpath cannot resolve a nonexistent tail. Missing
-            # probes through directory aliases still need system checks.
-            parents[parent] = os.path.realpath(parent)
-          canonical = os.path.normpath(os.path.join(parents[parent], os.path.basename(path)))
-      if not system_path(path) and not system_path(canonical):
-        self.system_records[path] = None
-        continue
-      # Project aliases exist only in the transferred private tree. Validate
-      # their omitted system target at its worker-visible path instead.
-      check_path = path if system_path(path) else canonical
-      if check_path in records:
-        record, size = records[check_path]
-        self.system_records[path] = check_path, record, size
-        continue
-      kind, size, digest = 0, 0, bytes(8)
-      if stamp is not None:
-        if stat.S_ISDIR(stamp[2]):
-          kind = 2
-        elif stat.S_ISREG(stamp[2]):
-          kind = 1
-          data = snapshots.get(canonical)
-          if data is None:
-            with open(path, 'rb') as source:
-              data = source.read(remaining + 1)
-          remaining -= len(data)
-          if remaining < 0:
-            raise basics.NotCoveredError('System header checks exceed 64 MiB')
-          size, digest = len(data), xxhash.xxh3_64_digest(data)
-        else:
-          raise basics.NotCoveredError('Unsupported system header input: ' + path)
-      encoded = os.fsencode(check_path)
-      record = struct.pack('!IIQ8s', len(encoded), kind, size, digest) + encoded
-      self.system_records[path] = check_path, record, size
-      records[check_path] = record, size
-    result = (b'DCSH' + struct.pack('!I', len(records)) +
-              b''.join(records[path][0] for path in sorted(records)))
-    if len(result) > 16 * 1024 * 1024 or len(records) > 65536:
-      raise basics.NotCoveredError('Too many system header checks')
-    return result
 
   def ClearStatCaches(self):
     self.contexts.clear()
-    self.system_records.clear()
     super().ClearStatCaches()
 
-  def context(self, command, source):
+  def context(self, command, source) -> tuple[bool, list[str], tuple[tuple[int, str], ...]]:
     language = ('c++' if source.endswith(('.cc', '.cpp', '.cxx', '.C')) or
                 os.path.basename(command[0]).endswith('++') else 'c')
     probe = []
@@ -224,7 +135,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     if clang:
       if version_match[1] != clang_scan.version:
         raise basics.NotCoveredError('Clang compiler and libclang-cpp versions differ')
-      context = (True, [])
+      options = []
     else:
       if 'Free Software Foundation' not in banner:
         raise basics.NotCoveredError('Unsupported compiler for header analysis')
@@ -243,7 +154,6 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       for header in shlex.split(implicit.replace('\\\n', '').replace('$$', '$')):
         if header != '/dev/null':
           options += ['-include', header]
-      context = (False, options)
       # The graph and compiler contexts share a cache generation. Seed once;
       # later commands only add definitions when their context is new.
       for option in options:
@@ -251,6 +161,50 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
           name, _, value = option[2:].partition('=')
           parse_file.InsertMacroDefInTable(name, value, self.symbol_table,
                                           self.support_master.InvalidateRecords)
+    # Probe only built-in search directories. Explicit -I/-isystem/-idirafter
+    # arguments remain on the worker's command line with their original class
+    # and ordering. Target, sysroot and -nostdinc options still apply here.
+    search_options = ('-I', '-isystem', '-iquote', '-idirafter', '-iprefix',
+                      '-iwithprefixbefore', '-iwithprefix', '-F', '-iframework')
+    default_probe = []
+    args = iter(probe)
+    for arg in args:
+      if arg in search_options:
+        next(args)
+      elif not arg.startswith(search_options):
+        default_probe.append(arg)
+    defaults = run([compiler, *default_probe, '-x', language, '-E', '-v', '/dev/null'])
+    search = re.search(r'#include <\.\.\.> search starts here:\n(.*?)End of search list\.',
+                       defaults.stderr.decode(errors='surrogateescape'), re.S)
+    if search is None and '-nostdinc' not in default_probe:
+      raise basics.NotCoveredError('Cannot obtain compiler default header search path')
+    directories = tuple(line.strip() for line in search[1].splitlines()) if search else ()
+    if len(directories) > 4096 or any(not os.path.isabs(path) for path in directories):
+      raise basics.NotCoveredError('Unsupported compiler default header search path')
+    if clang:
+      # Clang distinguishes C++ system headers from implicit extern-C system
+      # headers. Plain -isystem loses that distinction (including line flags).
+      invocation = next((shlex.split(line) for line in defaults.stderr.decode().splitlines()
+                         if ' -cc1 ' in line or ' "-cc1" ' in line), [])
+      kinds = {invocation[i + 1]: (2 if arg == '-internal-externc-isystem' else 1)
+               for i, arg in enumerate(invocation[:-1])
+               if arg in ('-internal-isystem', '-internal-externc-isystem')}
+      if any(path not in kinds for path in directories):
+        raise basics.NotCoveredError('Cannot classify Clang default header directories')
+      search_entries = [(kinds[path], path) for path in directories]
+    else:
+      search_entries = [(0, path) for path in directories]
+      # -nostdinc suppresses GCC's implicit stdc-predef.h inclusion. Restore
+      # the compiler-reported inputs explicitly, using their sent snapshots.
+      for path in shlex.split(implicit.replace('\\\n', '').replace('$$', '$')):
+        if path == '/dev/null':
+          continue
+        directory = next((directory for directory in directories
+                          if path.startswith(directory.rstrip('/') + '/')), None)
+        if directory is None:
+          raise basics.NotCoveredError('Implicit header is outside compiler search paths')
+        search_entries.append((3, path[len(directory.rstrip('/')) + 1:]))
+    context = (clang, options, tuple(search_entries))
     self.contexts[key] = context
     if len(self.contexts) > 8:
       self.contexts.popitem(last=False)
@@ -280,7 +234,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
                         '-serialize-diagnostics', '--serialize-diagnostics'))
         for arg in command[1:]):
       raise basics.NotCoveredError('Modules, PCH, plugins and frontend overrides require local preprocessing')
-    clang, options = self.context(command, self.translation_unit)
+    clang, options, self.system_includes = self.context(command, self.translation_unit)
     if not clang and self.timer and (self.currdir_idx, self.quote_dirs, self.angle_dirs) not in self.master_cache:
       # The first conservative GCC graph may search hundreds of include
       # directories. Let it finish populating the cache instead of repeatedly
@@ -351,15 +305,16 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       absolute = path if os.path.isabs(path) else os.path.join(currdir, path)
       real_idx = self.realpath_map.Index(absolute)
       assert real_idx is not None  # A non-null path always has an index.
-      if self.systemdir_prefix_cache.StartsWithSystemdir(real_idx, self.realpath_map):
-        continue
       canonical = self.realpath_map.string[real_idx]
       if canonical not in snapshots:
         raise basics.NotCoveredError('Dependency has no input snapshot: ' + path)
       self.mirror_path.DoPath(absolute, self.currdir_idx, self.client_root_keeper.client_root)
       closure[real_idx] = ()
     self.snapshots = snapshots
-    self.system_checks = self.SystemChecks(snapshots)
+    for kind, path in self.system_includes:
+      if kind != 3:
+        self.mirror_path.DoPath(os.path.join(path, 'forcing_technique_271828'),
+                               self.currdir_idx, self.client_root_keeper.client_root)
     basics.Debug(basics.DEBUG_TRACE, 'libclang-cpp analysis (%s): %d inputs',
                  'clang' if clang else 'gcc verified', len(closure))
     return closure

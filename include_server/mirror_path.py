@@ -41,18 +41,12 @@ class MirrorPath(object):
   server for the semantics of '..' to work.  These are called must_exist_dirs.
   """
 
-  def __init__(self,
-	       simple_build_stat,
-	       canonical_path,
-               realpath_map,
-               systemdir_prefix_cache):
+  def __init__(self, simple_build_stat, canonical_path):
     """Constructor.
 
     Arguments:
       simple_build_stat: object of type SimpleBuildStat
       canonical_path: function of type CanonicalPath
-      realpath_map: a CanonicalMapToIndex; see cache_basics.py
-      systemdir_prefix_cache: a SystemdirPrefixCache; see cache_basics.py.
     """
     assert isinstance(simple_build_stat, cache_basics.SimpleBuildStat)
     assert isinstance(canonical_path, cache_basics.CanonicalPath)
@@ -65,8 +59,6 @@ class MirrorPath(object):
     self.simple_build_stat = simple_build_stat
     self.canonical_path = canonical_path
     self.must_exist_dirs = []
-    self.realpath_map = realpath_map
-    self.systemdir_prefix_cache = systemdir_prefix_cache
 
   def Links(self):
     """Return the list of symbolic links created."""
@@ -120,21 +112,8 @@ class MirrorPath(object):
       if not lookup(root_prefix_real):
         # We have not been in this real location before.
         if not os.path.isdir(root_prefix_real):
-          # Now check that the parent of the link is not under a default system
-          # dir.  If it is, then we assume that the parent and indeed the
-          # link itself exist on the server as well, and thus, don't need to
-          # be mirrored.
-          realpath_map = self.realpath_map
-          realpath_idx = realpath_map.Index(prefix_real)
-          if not self.systemdir_prefix_cache.StartsWithSystemdir(realpath_idx,
-                                                                 realpath_map):
-            # Not under default system dir.  Mark this directory as one that
-            # must always be created on the server.
-            self.must_exist_dirs.append(root_prefix_real)
-            # Create parent path in mirror directory.
-            os.makedirs(root_prefix_real)
-          else:
-            break
+          self.must_exist_dirs.append(root_prefix_real)
+          os.makedirs(root_prefix_real)
         self.simple_build_stat.cache[root_prefix_real] = True
       assert os.path.isdir(root_prefix_real)
       # Create the mirrored symbolic link if applicable.
