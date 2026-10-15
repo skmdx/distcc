@@ -6,6 +6,20 @@ import unittest
 
 
 class PortageJobsTest(unittest.TestCase):
+    def test_portage_saved_phase_environment(self):
+        helpers = list(Path('/usr/lib/portage').glob('*/save-ebuild-env.sh'))
+        if not helpers:
+            self.skipTest('Portage environment serializer is not installed')
+        self.assertEqual(self.run_hook('''
+source "''' + str(helpers[-1]) + '''"
+saved=$(__save_ebuild_env)
+unset ${!DISTCC_AUTO_@} ${!distcc_auto_@}
+eval "$saved"
+workers=6
+source "$JOBS_HOOK"
+echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
+'''), ['-j6 -j6 6'])
+
     def run_hook(self, script):
         hook = Path(__file__).resolve().parents[1] / 'packaging/gentoo/jobs.bashrc'
         env = {key: value for key, value in os.environ.items()
