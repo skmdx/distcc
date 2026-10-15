@@ -44,6 +44,18 @@ class ClangScanTest(unittest.TestCase):
     self.assertNotEqual(result['lookups'][str(header)][4], os.stat(header).st_mtime_ns)
     self.assertFalse((self.root / 'never.o').exists())
 
+  def test_indirect_probe_is_not_silently_ignored(self):
+    for source in (b'#define HAS __has_include\n',
+                   b'#define HAS(x) __has_include(x)\n',
+                   b'#define HAS(x) __has_include_next(x)\n',
+                   b'#if CALL(__has_include, "probe.h")\n#endif\n'):
+      with self.subTest(source=source):
+        with self.assertRaisesRegex(ValueError, 'indirect header existence probe'):
+          clang_scan.include_probes(source)
+    self.assertEqual(clang_scan.include_probes(
+        b'#ifdef __has_include\n#endif\n#if defined(__has_include)\n#endif\n'
+        b'#if defined __has_include_next\n#endif\n'), [])
+
   def test_failed_scan_is_not_reused_after_header_creation(self):
     self.source.write_text('#include "generated.h"\nint n = VALUE;\n')
     with self.assertRaises(RuntimeError):

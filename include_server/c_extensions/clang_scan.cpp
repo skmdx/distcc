@@ -262,7 +262,31 @@ PyObject *include_probes(PyObject *, PyObject *arguments) {
         if (!tokens[i].is(tok::raw_identifier)) continue;
         auto name = tokens[i].getRawIdentifier();
         if (name != "__has_include" && name != "__has_include_next") continue;
-        if (!tokens[i + 1].is(tok::l_paren)) continue;
+        size_t line = i;
+        while (line && !tokens[line].isAtStartOfLine()) --line;
+        bool macro = line + 2 <= i && tokens[line].is(tok::hash) &&
+                     tokens[line + 1].is(tok::raw_identifier) &&
+                     tokens[line + 1].getRawIdentifier() == "define";
+        // The graph expands header operands, not arbitrary condition macros.
+        // A wrapper/alias can otherwise silently omit GCC-only existence probes.
+        if (macro && i != line + 2) {
+            Py_DECREF(result);
+            return PyErr_Format(PyExc_ValueError, "indirect header existence probe requires local preprocessing");
+        }
+        if (!tokens[i + 1].is(tok::l_paren)) {
+            auto identifier = [&](size_t position, llvm::StringRef word) {
+                return tokens[position].is(tok::raw_identifier) &&
+                       tokens[position].getRawIdentifier() == word;
+            };
+            bool feature_test = (i && (identifier(i - 1, "defined") ||
+                                      identifier(i - 1, "ifdef") || identifier(i - 1, "ifndef"))) ||
+                                (i >= 2 && tokens[i - 1].is(tok::l_paren) && identifier(i - 2, "defined"));
+            if (!macro && !feature_test) {
+                Py_DECREF(result);
+                return PyErr_Format(PyExc_ValueError, "indirect header existence probe requires local preprocessing");
+            }
+            continue;
+        }
         // A function-like compatibility definition declares a parameter. Its
         // replacement body is still scanned for real existence probes.
         bool definition = i && tokens[i - 1].is(tok::raw_identifier) &&

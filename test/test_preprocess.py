@@ -170,6 +170,25 @@ class PreprocessTest(BrokerTestCase):
         self.assertNotIn(b'probe.h', dependencies.stdout)
         self.compare('gcc', ['-P'])
 
+    def test_gcc_only_indirect_probe_falls_back_safely(self):
+        self.env.pop('DISTCC_TESTING_INCLUDE_SERVER')
+        self.env['DISTCC_FALLBACK'] = '1'
+        (self.work / 'probe.h').write_text('/* existence only */\n')
+        for definition in ('#define HAS __has_include',
+                           '#define HAS(x) __has_include(x)'):
+            with self.subTest(definition=definition):
+                self.source.write_text(
+                    definition + '\n#if __has_builtin(__builtin_speculation_safe_value)\n'
+                    '#if HAS("probe.h")\nint present;\n#else\nint absent;\n#endif\n'
+                    '#else\nint other;\n#endif\n')
+                local = self.run_cc('gcc', ['-E', '-P', self.source], False)
+                self.assertEqual(local.returncode, 0, local.stderr.decode())
+                self.assertIn(b'present', local.stdout)
+                remote = self.run_cc('gcc', ['-E', '-P', self.source])
+                self.assertEqual(remote.returncode, 0, remote.stderr.decode())
+                self.assertEqual(remote.stdout, local.stdout)
+                self.assertIn('preprocessing locally', (self.work / 'client.log').read_text())
+
     def test_compile_execute_and_pool_reuse(self):
         self.source.write_text('#include "value.h"\nint main(void) { return VALUE - 19; }\n')
         (self.work / 'value.h').write_text('#define VALUE 19\n')

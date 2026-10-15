@@ -74,15 +74,16 @@ int dcc_scan_includes = 0;
 static const char *const include_server_port_suffix = "/socket";
 static const char *const discrepancy_suffix = "/discrepancy_counter";
 
-static void bad_host(struct dcc_hostdef *host, int *cpu_lock_fd , int *local_cpu_lock_fd)
+static void release_host(struct dcc_hostdef *host, int *cpu_lock_fd,
+                         int *local_cpu_lock_fd, int failed)
 {
-   if (host && host->broker_managed && *cpu_lock_fd >= 0)
+   if (failed && host && host->broker_managed && *cpu_lock_fd >= 0)
        dcc_broker_failed(host);
    if (host && host->broker_managed && host->broker_fd >= 0) {
        close(host->broker_fd);
        host->broker_fd = -1;
    }
-   if (host)
+   if (failed && host)
        dcc_disliked_host(host);
 
    if (*cpu_lock_fd != -1) {
@@ -955,7 +956,7 @@ dcc_build_somewhere(char *argv[],
             ret = EXIT_IO_ERROR;
             goto unlock_and_clean_up;
         }
-        bad_host(host, &cpu_lock_fd, &local_cpu_lock_fd);
+        release_host(host, &cpu_lock_fd, &local_cpu_lock_fd, 1);
         retry_count++;
         if (retry_count < max_retries)
             goto choose_host;
@@ -1030,7 +1031,8 @@ dcc_build_somewhere(char *argv[],
 
 
   fallback:
-    bad_host(host, &cpu_lock_fd, &local_cpu_lock_fd);
+    /* Unsupported local analysis says nothing about the worker's health. */
+    release_host(host, &cpu_lock_fd, &local_cpu_lock_fd, ret != EXIT_LOCAL_CPP);
 
     if (!dcc_getenv_bool("DISTCC_FALLBACK", 1)) {
         rs_log_error("failed to distribute and fallbacks are disabled");

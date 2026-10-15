@@ -34,6 +34,9 @@ GCC's own dependency output is checked and a conservative, branch-independent
 include graph supplies existence-only probes omitted by GCC -M. Clang's lexer
 recognizes nested probe expressions for this graph. This adds a GCC dependency
 pass per job; it is a correctness check, not a claimed performance improvement.
+GCC jobs with aliases or wrapper macros around the existence operators fall
+back to local preprocessing: the conservative graph cannot substitute wrapper
+parameters reliably. Direct probes with computed header names remain supported.
 
 The conservative graph and compressed source/header files are cached. Before reusing the
 graph it checks metadata for positive include lookups. On supported local Linux
