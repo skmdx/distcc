@@ -275,7 +275,8 @@ class IncludeAnalyzer(object):
     # few of them.
     links = self.compiler_defaults.system_links + self.mirror_path.Links()
     files = self.compress_files.Compress(include_closure, client_root_keeper,
-                                         self.currdir_idx, '-E' in cmd, compression)
+                                         self.currdir_idx, '-E' in cmd, compression,
+                                         getattr(self, 'snapshots', None))
 
     files_and_links = files + links
 
@@ -338,7 +339,7 @@ class IncludeAnalyzer(object):
     # a bottleneck in include processing due to many open() calls
     return forcing_files
 
-  def RunAlgorithm(self, filepath_resolved_pair, filepath_real_idx):
+  def RunAlgorithm(self, filepath_resolved_pair, filepath_real_idx) -> dict:
     """Run FindNode on filepath; then compute include closure.
     Arguments:
       filepath_resolved_pair: (directory_idx, includepath_idx)

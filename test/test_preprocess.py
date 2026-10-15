@@ -128,6 +128,48 @@ class PreprocessTest(BrokerTestCase):
         self.source.write_text('int changed_source = 15;\n')
         self.assertIn(b'15', self.compare().stdout)
 
+    def test_compiler_scanner_computed_has_include_and_generation(self):
+        self.source.write_text('#define HEADER(name) <name.h>\n'
+                               '#if __has_include(HEADER(generated))\n'
+                               '#include HEADER(generated)\n'
+                               '#else\n#define VALUE 7\n#endif\nint n = VALUE;\n')
+        header = self.work / 'generated.h'
+        for compiler in ('gcc', shutil.which('clang')):
+            if not compiler:
+                continue
+            with self.subTest(compiler=compiler):
+                self.assertIn(b'7', self.compare(compiler, ['-I.', '-P']).stdout)
+                header.write_text('#define VALUE 19\n')
+                self.assertIn(b'19', self.compare(compiler, ['-I.', '-P']).stdout)
+                header.unlink()
+                self.assertIn(b'7', self.compare(compiler, ['-I.', '-P']).stdout)
+
+    def test_compiler_scanner_uses_gcc_macros(self):
+        (self.work / 'gcc.h').write_text('#define VALUE 41\n')
+        (self.work / 'clang.h').write_text('#define VALUE 43\n')
+        self.source.write_text('#ifdef __clang__\n#define HEADER "clang.h"\n'
+                               '#else\n#define HEADER "gcc.h"\n#endif\n'
+                               '#include HEADER\nint n = VALUE;\n')
+        for compiler, value in (('gcc', b'41'), ('g++', b'41'),
+                                (shutil.which('clang'), b'43')):
+            if compiler:
+                with self.subTest(compiler=compiler):
+                    args = ['-P'] if compiler != 'g++' else ['-x', 'c++', '-P']
+                    self.assertIn(value, self.compare(compiler, args).stdout)
+
+    def test_gcc_only_branch_existence_probe_is_transferred(self):
+        # GCC -M does not list existence-only probes, and Clang selects the
+        # other branch for this GCC builtin. The conservative guard is needed.
+        (self.work / 'probe.h').write_text('/* must exist remotely */\n')
+        self.source.write_text(
+            '#if __has_builtin(__builtin_speculation_safe_value)\n'
+            '#if __has_include("probe.h")\n#define VALUE 19\n'
+            '#else\n#define VALUE 7\n#endif\n'
+            '#else\n#define VALUE 42\n#endif\nint value = VALUE;\n')
+        dependencies = self.run_cc('gcc', ['-M', self.source], False)
+        self.assertNotIn(b'probe.h', dependencies.stdout)
+        self.compare('gcc', ['-P'])
+
     def test_compile_execute_and_pool_reuse(self):
         self.source.write_text('#include "value.h"\nint main(void) { return VALUE - 19; }\n')
         (self.work / 'value.h').write_text('#define VALUE 19\n')
@@ -157,7 +199,9 @@ class PreprocessTest(BrokerTestCase):
 
     def test_unsupported_inputs_preprocess_locally(self):
         self.env.pop('DISTCC_TESTING_INCLUDE_SERVER')
-        self.source.write_text('#define HEADER "optional.h"\n#if __has_include(HEADER)\n#include HEADER\n#endif\nint n;\n')
+        header = self.work / 'absolute.h'
+        header.write_text('int n;\n')
+        self.source.write_text('#include "%s"\n' % header)
         # Include-analysis fallback still permits remote compilation, while -E
         # itself runs locally only when fallback is allowed.
         self.env['DISTCC_FALLBACK'] = '1'
@@ -175,8 +219,7 @@ class PreprocessTest(BrokerTestCase):
 
     def test_failed_include_analysis_is_not_cached_as_complete(self):
         (self.work / 'unsupported.h').write_text(
-            '#define HEADER "value.h"\n#if __has_include(HEADER)\n'
-            '#include HEADER\n#endif\n')
+            '#include "%s"\n' % (self.work / 'value.h'))
         (self.work / 'value.h').write_text('#define VALUE 17\n')
         self.source.write_text('#include "unsupported.h"\nint n = VALUE;\n')
         for attempt in range(3):
@@ -186,6 +229,8 @@ class PreprocessTest(BrokerTestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(b'failed to get includes',
                               (self.work / 'client.log').read_bytes())
+        (self.work / 'unsupported.h').write_text('#include "value.h"\n')
+        self.assertIn(b'17', self.compare(args=['-P']).stdout)
 
     def test_has_include_compatibility_definition(self):
         (self.work / 'optional.h').write_text('#define VALUE 17\n')

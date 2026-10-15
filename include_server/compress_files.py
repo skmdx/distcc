@@ -20,6 +20,7 @@
 """Compress files in an include closure."""
 
 import os
+import io
 import xxhash
 import sys
 import struct
@@ -45,7 +46,7 @@ class CompressFiles(object):
     self.files_compressed = set([])
 
   def Compress(self, include_closure, client_root_keeper, currdir_idx,
-               preprocess_only=False, compression='lzo'):
+               preprocess_only=False, compression='lzo', snapshots=None):
     """Copy files in include_closure to the client_root directory, compressing
     them as we go, and also inserting #line directives.
 
@@ -103,7 +104,8 @@ class CompressFiles(object):
           # change its name.
           prefix = ""
         try:
-          real_file_fd = open(realpath, "rb")
+          real_file_fd = (io.BytesIO(snapshots[realpath]) if snapshots is not None
+                          else open(realpath, "rb"))
         except (IOError, OSError) as why:
           sys.exit("Could not open '%s' for reading: %s" % (realpath, why))
         try:

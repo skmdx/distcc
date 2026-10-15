@@ -30,6 +30,7 @@ __author__ = 'Nils Klarlund'
 
 import re
 import time
+import clang_scan
 
 import basics
 import cache_basics
@@ -296,19 +297,20 @@ class ParseFile(object):
       [], [], [], [])
 
     # An existence predicate is also an input even if no #include follows it.
-    # Track literal probes through the same positive/negative lookup cache.
-    probe_text = PAIRED_COMMENT_RE.sub('', BACKSLASH_RE.sub('', file_contents))
-    # A compatibility definition such as '#define __has_include(header) 0'
-    # declares a parameter; it does not probe for a header named 'header'.
-    # Keep the replacement body, which can itself contain real probes.
-    probe_text = re.sub(
-      r'^[ \t]*#[ \t]*define[ \t]+__has_include(?:_next)?\([^\n)]*\)',
-      '', probe_text, flags=re.M)
-    for probe in re.finditer(r'\b__has_include(_next)?\s*\(([^)]*)\)', probe_text):
-      operand = probe.group(2).strip()
+    # Track probes from every conditional branch for the conservative GCC guard.
+    probe_text = BACKSLASH_RE.sub('', file_contents)
+    try:
+      probes = clang_scan.include_probes(probe_text.encode('latin-1'))
+    except ValueError as error:
+      raise NotCoveredError(str(error)) from error
+    for is_next, expression in probes:
+      operand = expression.strip()
       if len(operand) < 2 or (operand[0], operand[-1]) not in [('"', '"'), ('<', '>')]:
-        raise NotCoveredError("Computed __has_include requires local preprocessing")
-      includes = (next_includes if probe.group(1) else
+        if is_next:
+          raise NotCoveredError("Computed __has_include_next requires local preprocessing")
+        expr_includes.append(operand)
+        continue
+      includes = (next_includes if is_next else
                   quote_includes if operand[0] == '"' else angle_includes)
       includes.append(includepath_map_index(operand[1:-1]))
 

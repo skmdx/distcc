@@ -170,6 +170,8 @@ include_server_PY = \
 	include_server/basics.py \
 	include_server/cache_basics.py \
 	include_server/compiler_defaults.py \
+	include_server/compiler_analyzer.py \
+	include_server/clang_scan.pyi \
 	include_server/compress_files.py \
 	include_server/include_analyzer.py \
 	include_server/include_analyzer_memoizing_node.py \
@@ -183,7 +185,8 @@ include_server_PY = \
 	include_server/statistics.py
 
 include_server_SRC = \
-	include_server/c_extensions/distcc_pump_c_extensions_module.c
+	include_server/c_extensions/distcc_pump_c_extensions_module.c \
+	include_server/c_extensions/clang_scan.cpp
 
 update_distcc_symlinks_PY = update-distcc-symlinks.py
 
@@ -450,6 +453,7 @@ check_PROGRAMS = \
 
 check_include_server_PY = \
 	include_server/c_extensions_test.py \
+	include_server/clang_scan_test.py \
 	include_server/include_server_test.py \
 	include_server/macro_eval_test.py \
 	include_server/mirror_path_test.py \

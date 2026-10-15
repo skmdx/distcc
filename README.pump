@@ -20,8 +20,22 @@ broker. Adaptive scheduling and the TCP connection pool are reused. These jobs
 do not reserve a local preprocessing slot. Without a broker, configure remote
 hosts with the `,cpp,lzo` options.
 
-The include server conservatively analyzes include directives and caches both
-the dependency graph and compressed source/header files. Before reusing the
+The include server calls libclang-cpp directly through a resident Python C++
+extension. Building pump requires LLVM 23 development headers, libclang-cpp,
+libLLVM and a C++17 compiler; set LLVM_CONFIG to the matching llvm-config if it
+is not on PATH or beside clang. Clang jobs must match the library's version.
+The canonical preprocessor discovers includes and existence probes without
+building an AST or generating code. Its input buffers are reused for transfer.
+Each request gets a fresh FileManager to avoid stale negative lookup caches.
+
+GCC jobs also use libclang-cpp, with GCC's predefined macros, implicit headers
+and include paths. Since compiler-specific feature predicates can differ,
+GCC's own dependency output is checked and a conservative, branch-independent
+include graph supplies existence-only probes omitted by GCC -M. Clang's lexer
+recognizes nested probe expressions for this graph. This adds a GCC dependency
+pass per job; it is a correctness check, not a claimed performance improvement.
+
+The conservative graph and compressed source/header files are cached. Before reusing the
 graph it checks metadata for positive include lookups. On supported local Linux
 filesystems, directory notifications select which negative lookups and ancestor
 identities need rechecking. Other filesystems and unavailable or exhausted
@@ -55,8 +69,9 @@ local retry does not duplicate output. Upgrade clients and workers together to
 use remote `-E`.
 
 Stdin input, dependency-only `-M`/`-MM`, `-E -MD` without explicit `-MF`, absolute
-include directives, computed `__has_include` operands and `#embed` remain local.
-Literal `__has_include` probes participate in include lookup invalidation even
+include directives, PCH/modules, frontend overrides and `#embed` remain local.
+Computed `__has_include` operands are supported; computed `__has_include_next`
+still requires local preprocessing for GCC. Existence probes participate in include lookup invalidation even
 when no include directive follows. Other include-analysis failures fall back to
 ordinary distcc; standalone preprocessing falls back to a local compiler when
 DISTCC_FALLBACK permits it. DISTCC_TESTING_INCLUDE_SERVER=1 turns analysis fallback

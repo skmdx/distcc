@@ -40,7 +40,6 @@ import traceback
 # Include server imports
 import basics
 import distcc_pump_c_extensions
-import include_analyzer_memoizing_node
 import statistics
 
 # The default size passed to listen by a streaming socket server of
@@ -600,6 +599,9 @@ def _SetUp(include_server_port):
 
   Returns: (include_analyzer, server)"""
 
+  # The base analyzer uses this module's dependency reporting helpers.
+  import compiler_analyzer
+
   try:
     os.unlink(include_server_port)
   except (IOError, OSError):
@@ -616,7 +618,7 @@ def _SetUp(include_server_port):
 
   # Create the analyser.
   include_analyzer = (
-      include_analyzer_memoizing_node.IncludeAnalyzerMemoizingNode(
+      compiler_analyzer.CompilerAnalyzer(
            client_root_keeper,
            basics.opt_stat_reset_triggers))
   include_analyzer.email_sender = _EmailSender()

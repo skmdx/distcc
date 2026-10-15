@@ -36,6 +36,8 @@ import doctest
 import glob
 import os
 import shlex
+import shutil
+import subprocess
 import sys
 
 OPTIONS_NOT_ALLOWED = ['-Iquote', '-Isystem', '-I-']
@@ -167,6 +169,28 @@ ext = setuptools.Extension(
     extra_compile_args=[]
     )
 
+# The scanner uses the C++ API from the selected LLVM installation. Do not
+# silently build a regex-only pump when its declared analysis dependency is absent.
+llvm_config = os.environ.get('LLVM_CONFIG') or shutil.which('llvm-config')
+if not llvm_config:
+  clang = shutil.which('clang')
+  if clang:
+    llvm_config = os.path.join(os.path.dirname(os.path.realpath(clang)), 'llvm-config')
+if not llvm_config or not os.path.isfile(llvm_config):
+  sys.exit('libclang-cpp header analysis requires LLVM_CONFIG pointing to llvm-config (LLVM 23).')
+def llvm_option(option):
+  return subprocess.check_output([llvm_config, option], text=True).strip()
+if llvm_option('--version').split('.')[0] != '23':
+  sys.exit('libclang-cpp header analysis currently requires LLVM 23 headers and libraries.')
+llvm_lib = llvm_option('--libdir')
+scanner = setuptools.Extension(
+    name='include_server.clang_scan',
+    sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_scan.cpp')],
+    language='c++', include_dirs=[llvm_option('--includedir')],
+    library_dirs=[llvm_lib], runtime_library_dirs=[llvm_lib],
+    libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
+)
+
 args = {
     'name': 'include_server',
     # The 'include_server' package is in the srcdir_include_server.
@@ -178,7 +202,8 @@ args = {
     'url': 'http://code.google.com/p/distcc',
     'long_description': 'The include server is part of distcc.',
     'packages': ['include_server'],
-    'ext_modules': [ext],
+    'package_data': {'include_server': ['*.pyi']},
+    'ext_modules': [ext, scanner],
     'install_requires': ['xxhash>=3.0.0'],
 }
 
