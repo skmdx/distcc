@@ -32,3 +32,4 @@ int dcc_make_lock_filename(const char *lockname,
                            char **);
 
 int dcc_open_lockfile(const char *fname, int *plockfd);
+int dcc_lock_file(const char *fname, int block, int *lock_fd);

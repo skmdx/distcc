@@ -42,6 +42,7 @@
 #include "hosts.h"
 #include "include_server_if.h"
 #include "job.h"
+#include "lock.h"
 
 static int dcc_count_slashes(const char *path);
 static int dcc_count_leading_dotdots(const char *path);
@@ -58,10 +59,10 @@ static int dcc_categorize_file(const char *include_server_filename);
  * if anything goes wrong, it returns a non-zero value.
  */
 
-int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr)
+int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr, int block)
 {
     char *include_server_port;
-    int fd;
+    int fd = -1, lock_fd = -1;
     struct sockaddr_un sa;
 
     int ret;
@@ -94,8 +95,18 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
     strcpy(sa.sun_path, include_server_port);
     sa.sun_family = AF_UNIX;
 
+    /* One analyzer owns the mutable include graph. Do not queue a build's
+     * whole parallel batch behind it: busy callers can use the separately
+     * bounded client preprocessor and keep remote workers supplied. */
+    char *lock_path;
+    if (asprintf(&lock_path, "%s.lock", include_server_port) < 0)
+        return EXIT_OUT_OF_MEMORY;
+    ret = dcc_lock_file(lock_path, block, &lock_fd);
+    free(lock_path);
+    if (ret) return ret;
+    ret = 1;
     if (dcc_connect_by_addr((struct sockaddr *) &sa, sizeof(sa), &fd))
-        return 1;
+        goto out;
 
     /* TODO? switch include_server to use more appropriate token names */
     if (dcc_x_cwd(fd) ||
@@ -103,21 +114,18 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
         dcc_r_argv(fd, "ARGC", "ARGV", files)) {
         rs_log_warning("failed to talk to include server '%s'",
                        include_server_port);
-        dcc_close(fd);
-        /* We are failing anyway, so we can ignore
-           the return value of dcc_close() */
-        return 1;
-    }
-
-    if (dcc_close(fd)) {
-        return 1;
+        goto out;
     }
 
     if (dcc_argv_len(*files) == 0) {
         rs_log_warning("include server gave up analyzing");
-        return 1;
+        goto out;
     }
-    return 0;
+    ret = 0;
+out:
+    if (fd != -1 && dcc_close(fd)) ret = 1;
+    dcc_unlock(lock_fd);
+    return ret;
 }
 
 /* The include server puts all files in its own special directory,
@@ -198,7 +206,7 @@ dcc_approximate_includes(struct dcc_hostdef *host, char **argv)
         //return 0;
     }
 
-    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
+    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr, 1))) {
         rs_log_error("failed to get includes from include server");
         return ret;
     }

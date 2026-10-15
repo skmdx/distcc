@@ -74,7 +74,8 @@ class PreprocessTest(BrokerTestCase):
         leases = []
         try:
             deadline = time.monotonic() + 5
-            while 'send CDIR' not in (self.work / 'client.log').read_text():
+            log = self.work / 'client.log'
+            while not log.exists() or 'send CDIR' not in log.read_text():
                 self.assertLess(time.monotonic(), deadline, 'scanner not reached')
                 time.sleep(.01)
             # All four real worker slots must remain available while this
@@ -86,6 +87,24 @@ class PreprocessTest(BrokerTestCase):
                 for fd in descriptors:
                     os.close(fd)
                 self.assertEqual(status, 0)
+            for lease in leases:
+                lease.close()
+            leases.clear()
+            # Another client must finish even while the analyzer is stopped.
+            # FALLBACK=0 ensures that this still exercises a remote worker.
+            remote = self.run_cc('gcc', ['-c', self.source, '-o', 'busy.o'])
+            local = self.run_cc('gcc', ['-c', self.source, '-o', 'native.o'], False)
+            self.assertEqual(remote.returncode, 0, remote.stderr.decode())
+            self.assertEqual(local.returncode, 0, local.stderr.decode())
+            self.assertEqual((self.work / 'busy.o').read_bytes(),
+                             (self.work / 'native.o').read_bytes())
+            self.assertRegex(self.get_stats(self.stats_ports[0]), r'dcc_compile_ok [1-9]')
+            remote = self.run_cc('gcc', ['-E', self.source])
+            local = self.run_cc('gcc', ['-E', self.source], False)
+            self.assertEqual(remote.returncode, 0, remote.stderr.decode())
+            self.assertEqual(remote.stdout, local.stdout)
+            self.assertIn('include analyzer busy', log.read_text())
+            self.assertNotIn('failed to get includes', log.read_text())
         finally:
             for lease in leases:
                 lease.close()
@@ -98,6 +117,11 @@ class PreprocessTest(BrokerTestCase):
                     client.wait()
         self.assertEqual(client.returncode, 0)
         self.assertTrue((self.work / 'waiting.o').exists())
+        log.write_text('')
+        recovered = self.run_cc('gcc', ['-c', self.source, '-o', 'recovered.o'])
+        self.assertEqual(recovered.returncode, 0, recovered.stderr.decode())
+        self.assertIn('send CDIR', log.read_text())
+        self.assertNotIn('include analyzer busy', log.read_text())
 
     def run_cc(self, compiler, args, remote=True):
         prefix = [str(self.build / 'distcc')] if remote else []

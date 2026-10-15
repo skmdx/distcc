@@ -809,13 +809,21 @@ dcc_build_somewhere(char *argv[],
             entry = next;
         }
         if (count && same_format &&
-            (ret = dcc_talk_to_include_server(argv, &files, compr))) {
-            rs_log_warning("failed to get includes from include server, "
+            (ret = dcc_talk_to_include_server(argv, &files, compr, 0))) {
+            if (ret == EXIT_BUSY)
+                rs_trace("include analyzer busy; preprocessing locally before worker selection");
+            else {
+                rs_log_warning("failed to get includes from include server, "
                            "preprocessing locally before worker selection");
-            if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) dcc_exit(ret);
+                if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) dcc_exit(ret);
+            }
             files = NULL;
             unsetenv("INCLUDE_SERVER_PORT");
-            if (preprocess_only) goto fallback;
+            if (preprocess_only) {
+                if (ret != EXIT_BUSY) goto fallback;
+                ret = EXIT_LOCAL_CPP;
+                goto lock_local;
+            }
         }
     }
 
@@ -886,7 +894,7 @@ dcc_build_somewhere(char *argv[],
         goto unlock_and_clean_up;
     }
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
+        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr, 0))) {
             /* Fallback to doing cpp locally */
             /* It's unfortunate that the variable that controls that is in the
              * "host" datastructure, even though in this case it's the client
@@ -896,10 +904,14 @@ dcc_build_somewhere(char *argv[],
              * again (it won't, not in the same process) we wouldn't know if
              * the server supports it or not.
              */
-            rs_log_warning("failed to get includes from include server, "
+            if (ret == EXIT_BUSY)
+                rs_trace("include analyzer busy; preprocessing locally");
+            else {
+                rs_log_warning("failed to get includes from include server, "
                            "preprocessing locally");
-            if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0))
-                dcc_exit(ret);
+                if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0))
+                    dcc_exit(ret);
+            }
             host->cpp_where = DCC_CPP_ON_CLIENT;
             dcc_get_protover_from_features(host->compr,
                                            host->cpp_where,

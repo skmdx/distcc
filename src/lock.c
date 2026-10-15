@@ -296,17 +296,20 @@ int dcc_lock_host(const char *lockname,
     if ((ret = dcc_make_lock_filename(lockname, host, slot, &fname)))
         return ret;
 
-    if ((ret = dcc_open_lockfile(fname, lock_fd)) != 0) {
-        free(fname);
-        return ret;
-    }
-
-    if (sys_lock(*lock_fd, block) == 0) {
+    ret = dcc_lock_file(fname, block, lock_fd);
+    if (!ret)
         rs_trace("got %s lock on %s slot %d as fd%d", lockname,
                  host->hostdef_string, slot, *lock_fd);
-        free(fname);
-        return 0;
-    } else {
+    free(fname);
+    return ret;
+}
+
+int dcc_lock_file(const char *fname, int block, int *lock_fd)
+{
+    int ret = dcc_open_lockfile(fname, lock_fd);
+    if (ret) return ret;
+    if (sys_lock(*lock_fd, block) == 0) return 0;
+    else {
         switch (errno) {
 #if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
         case EWOULDBLOCK:
@@ -323,7 +326,7 @@ int dcc_lock_host(const char *lockname,
         }
 
         dcc_close(*lock_fd);
-        free(fname);
+        *lock_fd = -1;
         return ret;
     }
 }

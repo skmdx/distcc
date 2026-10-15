@@ -20,6 +20,13 @@ broker. Adaptive scheduling and the TCP connection pool are reused. These jobs
 do not reserve a local preprocessing slot. Without a broker, configure remote
 hosts with the `,cpp,lzo` options.
 
+Only one compilation at a time uses the include analyzer. When it is busy,
+other compilations use the bounded client preprocessing slots, then distribute
+the resulting input normally. Broker clients prepare this input before reserving
+a worker. Standalone `-E` requests also use local preprocessing when the analyzer
+is busy; this is normal admission, even with DISTCC_FALLBACK=0. Explicit
+`--scan-includes` queries wait for the analyzer instead.
+
 The include server calls libclang-cpp directly through a resident Python C++
 extension. Building pump requires LLVM 19, 22 or 23 development headers, libclang-cpp,
 libLLVM and a C++17 compiler; set LLVM_CONFIG to the matching llvm-config if it
