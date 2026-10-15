@@ -1,7 +1,7 @@
 # Source from /etc/portage/bashrc. Leave MAKEOPTS empty in make.conf to
 # discover parallelism; package.env can still provide an explicit job limit.
 distcc_configure_jobs() {
-    local jobs variable marker
+    local jobs variable marker compiler resolved distributed
     # Portage saves the phase environment. Refresh only values we generated;
     # package.env and ebuild overrides remain authoritative. Portage removes
     # DISTCC_* when saving phases, so keep provenance outside that namespace.
@@ -14,6 +14,18 @@ distcc_configure_jobs() {
     done
     if [[ -z ${MAKEOPTS} ]]; then
         if has distcc ${FEATURES} && ! has distcc ${RESTRICT}; then
+            distributed=1
+            # Absolute compiler paths bypass Portage's PATH wrappers. Only an
+            # explicit distcc executable (or a symlink to it) opts back in.
+            for compiler in "${CC}" "${CXX}"; do
+                compiler=${compiler%%[[:space:]]*}
+                if [[ ${compiler} == */* ]]; then
+                    resolved=$(readlink -f -- "${compiler}") || resolved=
+                    [[ ${resolved##*/} == distcc ]] || distributed=0
+                fi
+            done
+        fi
+        if [[ ${distributed} == 1 ]]; then
             jobs=$(DISTCC_RECONNECT_TIMEOUT=2 timeout 5 distcc -j 2>/dev/null) || jobs=
             # A reachable but temporarily exhausted pool must not turn into
             # an unlimited -j0 or a larger local fallback.

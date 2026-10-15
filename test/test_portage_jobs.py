@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 
 
@@ -28,7 +29,8 @@ echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
     def run_hook(self, script):
         hook = Path(__file__).resolve().parents[1] / 'packaging/gentoo/jobs.bashrc'
         env = {key: value for key, value in os.environ.items()
-               if not key.startswith(('DISTCC_', 'MAKE', 'NINJA', 'CMAKE_'))}
+               if key not in ('CC', 'CXX') and
+               not key.startswith(('DISTCC_', 'MAKE', 'NINJA', 'CMAKE_'))}
         env['JOBS_HOOK'] = str(hook)
         result = subprocess.run(['bash', '-c', '''
 has() { local word=$1; shift; [[ " $* " == *" $word "* ]]; }
@@ -66,6 +68,27 @@ workers=0
 source "$JOBS_HOOK"
 echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
 '''), ['-j1 -j1 1'])
+
+    def test_absolute_compilers_do_not_claim_distributed_capacity(self):
+        for compiler in ('CC', 'CXX'):
+            with self.subTest(compiler=compiler):
+                self.assertEqual(self.run_hook(compiler + '''=/usr/bin/gcc
+source "$JOBS_HOOK"
+echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
+'''), ['-j3 -j3 3'])
+
+    def test_explicit_distcc_path_and_symlink_keep_distributed_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'distcc'
+            target.touch()
+            link = Path(directory) / 'compiler'
+            link.symlink_to(target)
+            for compiler in (target, link):
+                with self.subTest(compiler=compiler):
+                    self.assertEqual(self.run_hook('CC="' + str(compiler) + ''' gcc"
+source "$JOBS_HOOK"
+echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
+'''), ['-j12 -j12 12'])
 
 
 if __name__ == '__main__':
