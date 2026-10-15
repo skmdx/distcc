@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+import xxhash
 
 import basics
 import clang_scan
@@ -169,6 +170,51 @@ class ClangScanTest(unittest.TestCase):
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
     with self.assertRaisesRegex(basics.NotCoveredError, 'Precompiled header'):
       analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
+
+  def test_literal_graph_reuses_images_and_refreshes_changed_bytes(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    self.addCleanup(os.chdir, os.getcwd())
+    header = self.root / 'header.h'
+    header.write_text('int original;\n')
+    self.source.write_text('#include "header.h"\n')
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    command = [gcc, '-c', str(self.source)]
+    analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+    with mock.patch('builtins.open', wraps=open) as opened:
+      analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+    self.assertFalse(any(call.args[0] == str(header) for call in opened.call_args_list))
+    header.write_text('int updated;\n')
+    files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+    image = next(path for path in files if path.endswith('/header.h.lz4s'))
+    self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(header.read_bytes()))
+
+  def test_literal_graph_does_not_publish_a_change_during_compression(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    self.addCleanup(os.chdir, os.getcwd())
+    header = self.root / 'header.h'
+    header.write_text('int original;\n')
+    self.source.write_text('#include "header.h"\n')
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    command = [gcc, '-c', str(self.source)]
+    write = compress_files.WriteCompressed
+    def changing_write(path, *args):
+      write(path, *args)
+      if path.endswith('/header.h.lz4s'):
+        header.write_text('int updated_during_collection;\n')
+    with mock.patch.object(compress_files, 'WriteCompressed', side_effect=changing_write):
+      with self.assertRaisesRegex(basics.NotCoveredError, 'changed while collecting'):
+        analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+    files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+    image = next(path for path in files if path.endswith('/header.h.lz4s'))
+    self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(header.read_bytes()))
 
   def test_compilation_from_filesystem_root(self):
     gcc = shutil.which('gcc')

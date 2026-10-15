@@ -136,7 +136,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       if version_match[1] != clang_scan.version:
         raise basics.NotCoveredError('Clang compiler and libclang-cpp versions differ')
       options = []
-      search_dirs = None
+      matching_search = False
     else:
       if 'Free Software Foundation' not in banner:
         raise basics.NotCoveredError('Unsupported compiler for header analysis')
@@ -146,9 +146,17 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         raise basics.NotCoveredError('Cannot obtain GCC header search path')
       quote_search = re.search(r'#include "\.\.\." search starts here:\n(.*?)#include <\.\.\.>',
                                result.stderr.decode(errors='surrogateescape'), re.S)
-      search_dirs = (tuple(line.strip() for line in quote_search[1].splitlines())
-                     if quote_search else (),
-                     tuple(line.strip() for line in search[1].splitlines()))
+      quote_dirs = tuple(line.strip() for line in quote_search[1].splitlines()) if quote_search else ()
+      angle_dirs = tuple(line.strip() for line in search[1].splitlines())
+      def directory_identities(paths):
+        # GCC removes missing and duplicate search directories. The context
+        # shares the graph's invalidation generation, including directory and
+        # symlink changes, so compare their identities once per context.
+        return tuple(dict.fromkeys(os.path.realpath(path) for path in paths
+                                   if os.path.isdir(path)))
+      matching_search = ('-I-' not in command and
+          directory_identities(self.directory_map.string[index] for index in self.angle_dirs) == directory_identities(angle_dirs) and
+          directory_identities(self.directory_map.string[index] for index in self.quote_dirs) == directory_identities((*quote_dirs, *angle_dirs)))
       options = ['--no-default-config', '-undef', '-nostdinc']
       for line in macros.splitlines():
         if not line.startswith('#define '):
@@ -210,7 +218,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         if directory is None:
           raise basics.NotCoveredError('Implicit header is outside compiler search paths')
         search_entries.append((3, path[len(directory.rstrip('/')) + 1:]))
-    context = (clang, options, tuple(search_entries), search_dirs)
+    context = (clang, options, tuple(search_entries), matching_search)
     self.contexts[key] = context
     if len(self.contexts) > 8:
       self.contexts.popitem(last=False)
@@ -240,7 +248,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
                         '-serialize-diagnostics', '--serialize-diagnostics'))
         for arg in command[1:]):
       raise basics.NotCoveredError('Modules, PCH, plugins and frontend overrides require local preprocessing')
-    clang, options, self.system_includes, search_dirs = self.context(command, self.translation_unit)
+    clang, options, self.system_includes, matching_search = self.context(command, self.translation_unit)
     if not clang:
       implicit = tuple(self.includepath_map.Index(options[i + 1],
                        ignore_absolute_path_warning=True)
@@ -255,20 +263,9 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     # Generated forwarding headers often contain absolute include operands.
     conservative = (super().ProcessCompilationCommand(currdir, parsed_command)
                     if not clang else {})
-    literal_graph = not clang and all(
+    literal_graph = not clang and matching_search and all(
         all(isinstance(expr, parse_file.ProbeExpression) for expr in self.file_cache[index][2])
         for index in conservative)
-    if literal_graph:
-      assert search_dirs is not None
-      def directories(paths):
-        # GCC removes missing and duplicate search directories. Compare their
-        # identities in order before relying on the cached lexical graph.
-        return tuple(dict.fromkeys(os.path.realpath(path) for path in paths
-                                   if os.path.isdir(path)))
-      quote, angle = search_dirs
-      literal_graph = ('-I-' not in command and
-          directories(self.directory_map.string[index] for index in self.angle_dirs) == directories(angle) and
-          directories(self.directory_map.string[index] for index in self.quote_dirs) == directories((*quote, *angle)))
     result = {'files': {}, 'dependencies': [], 'lookups': {}}
     if not literal_graph:
       try:
@@ -301,10 +298,19 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         # GCC can implicitly replace an ordinary header with its adjacent
         # precompiled image, whose captured macro state is not in this graph.
         precompiled = path + '.gch'
-        self.build_stat_cache.file_stamps.Observe(precompiled)
-        if self.build_stat_cache.file_stamps.Stamp(precompiled) is not None:
+        if self.build_stat_cache.file_stamps.Observe(precompiled) is not None:
           raise basics.NotCoveredError('Precompiled header requires local preprocessing: ' + path)
-        if path not in snapshots:
+        if literal_graph:
+          # The compressor already owns immutable images for cached inputs.
+          # Stream only new files there; the shared publication check below
+          # compression rejects any source change during collection.
+          stamp = self.build_stat_cache.file_stamps.Observe(path)
+          if stamp is None:
+            raise basics.NotCoveredError('Compiler input disappeared: ' + path)
+          remaining -= stamp[3]
+          if remaining < 0:
+            raise basics.NotCoveredError('Compiler input snapshots exceed 64 MiB')
+        elif path not in snapshots:
           with open(path, 'rb') as source:
             data = source.read(remaining + 1)
           if len(data) > remaining:
@@ -346,7 +352,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         raise basics.NotCoveredError('Dependency has no input snapshot: ' + path)
       self.mirror_path.DoPath(absolute, self.currdir_idx, self.client_root_keeper.client_root)
       closure[real_idx] = ()
-    self.snapshots = snapshots
+    self.snapshots = None if literal_graph else snapshots
     for kind, path in self.system_includes:
       if kind != 3:
         self.mirror_path.DoPath(os.path.join(path, 'forcing_technique_271828'),
