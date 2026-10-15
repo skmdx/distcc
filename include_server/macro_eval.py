@@ -241,6 +241,7 @@ class _ExpansionBudget:
     self.preserve_functions = preserve_functions or basics.opt_consider_unexpanded_macro_fns
     self.calls = 8192
     self.characters = 8 * 1024 * 1024
+    self.expansions = {}
 
   def consume(self, expr):
     if not self.bounded:
@@ -252,7 +253,16 @@ class _ExpansionBudget:
 
 
 def _EvalExprHelper(expr, symbol_table, disabled, budget):
-  budget.consume(expr)
+  if not budget.bounded:
+    return _ExpandExpr(expr, symbol_table, disabled, budget)
+  key = (expr, frozenset(disabled))
+  if key not in budget.expansions:
+    budget.consume(expr)
+    budget.expansions[key] = _ExpandExpr(expr, symbol_table, disabled, budget)
+  return budget.expansions[key]
+
+
+def _ExpandExpr(expr, symbol_table, disabled, budget):
   if __debug__:
     Debug(DEBUG_TRACE2, "EvalExprHelper: expr: %s", expr)
 

@@ -71,6 +71,32 @@ class ClangScanTest(unittest.TestCase):
     files = analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], '/', keeper, 'lz4s')
     self.assertTrue(any('/.distcc-system/' in path for path in files))
 
+  def test_clang_expanded_cpu_flags_reach_header_analysis(self):
+    self.source.write_text('#ifndef __AVX2__\n#error missing CPU feature\n#endif\nint value;\n')
+    self.addCleanup(os.chdir, os.getcwd())
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    files = analyzer.DoCompilationCommand(
+        [self.compiler, '-Xclang', '-target-cpu', '-Xclang', 'haswell',
+         '-Xclang', '-tune-cpu', '-Xclang', 'haswell',
+         '-Xclang', '-target-feature', '-Xclang', '+avx2',
+         '-c', str(self.source)], str(self.root), keeper, 'lz4s')
+    self.assertTrue(any('/.distcc-system/' in path for path in files))
+
+  def test_clang_other_frontend_overrides_still_require_local_preprocessing(self):
+    self.source.write_text('int value;\n')
+    self.addCleanup(os.chdir, os.getcwd())
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    for flags in (['-Xclang', '-load', '-Xclang', 'plugin.so'],
+                  ['-Xclang=-load'], ['-Xclang', '-target-feature']):
+      with self.subTest(flags=flags):
+        analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+        with self.assertRaises(basics.NotCoveredError):
+          analyzer.DoCompilationCommand([self.compiler, *flags, '-c', str(self.source)],
+                                        str(self.root), keeper, 'lz4s')
+
   def test_gcc_direct_extern_access_flags_keep_compiler_analysis(self):
     gcc = shutil.which('gcc')
     if not gcc:

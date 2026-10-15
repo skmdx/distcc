@@ -211,10 +211,20 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       if self.build_stat_cache.file_stamps.Stamp(path) is not None:
         raise basics.NotCoveredError('Compiler default include directory appeared: ' + path)
     command = dependency_command(self.command, self.translation_unit)
-    if any(arg.startswith(('-fmodule', '-include-pch', '-fplugin', '-Xclang', '@',
-                           '-Wp,', '-save-temps', '--save-temps', '-ftime-trace',
-                           '-serialize-diagnostics', '--serialize-diagnostics'))
-           for arg in command[1:]):
+    frontend_args = [command[i + 1] for i, arg in enumerate(command[:-1])
+                     if arg == '-Xclang']
+    # Native CPU expansion uses paired cc1 option/value arguments. They affect
+    # predefined macros and must reach the same frontend that scans the input.
+    cpu_options = {'-target-cpu', '-tune-cpu', '-target-feature'}
+    safe_frontend = (len(frontend_args) % 2 == 0 and
+                     all(frontend_args[i] in cpu_options and frontend_args[i + 1]
+                         for i in range(0, len(frontend_args), 2)))
+    if not safe_frontend or command[-1] == '-Xclang' or any(
+        (arg.startswith('-Xclang') and arg != '-Xclang') or
+        arg.startswith(('-fmodule', '-include-pch', '-fplugin', '@',
+                        '-Wp,', '-save-temps', '--save-temps', '-ftime-trace',
+                        '-serialize-diagnostics', '--serialize-diagnostics'))
+        for arg in command[1:]):
       raise basics.NotCoveredError('Modules, PCH, plugins and frontend overrides require local preprocessing')
     clang, options = self.context(command, self.translation_unit)
     if not clang and self.timer and (self.currdir_idx, self.quote_dirs, self.angle_dirs) not in self.master_cache:

@@ -348,5 +348,26 @@ class MacroEvalTest(unittest.TestCase):
     self.assertIn('__has_include("probe.h")', macro_eval.EvalExpression(
         'defined_alias("probe.h")', table, preserve_functions=True))
 
+  def test_nested_module_pastes_reuse_expansions_within_condition(self):
+    table = {'PASTE_NAME1': [(['a', 'b'], 'a##b')],
+             'PASTE_NAME': [(['a', 'b'], 'PASTE_NAME1 (a,b)')],
+             'IN_MODULE': ['PASTE_NAME (MODULE_, MODULE_NAME)', '(-1)'],
+             'MODULE_NAME': ['libc'],
+             'IS_IN': [(['lib'], '(IN_MODULE == MODULE_##lib)'), (['lib'], '0')],
+             'MODULE_libc': ['18'], 'MODULE_testsuite': ['14'],
+             'MODULE_testsuite_internal': ['15']}
+    files, symbols = macro_eval.ResolveExpr(None, None, parse_file.ProbeExpression(
+        'IS_IN (testsuite) || IS_IN (testsuite_internal)'), 0, 0, (), (), table)
+    self.assertEqual(files, [])
+    self.assertIn('MODULE_NAME', symbols)
+    # Each request observes the current definitions; memoization cannot hide a
+    # newly defined probe or share results between different disabled macros.
+    table['MODULE_libc'].append('__has_include("new.h")')
+    resolved = []
+    macro_eval.ResolveExpr(lambda value: value,
+        lambda *args: resolved.append(args[0]), parse_file.ProbeExpression('IS_IN (libc)'),
+        0, 0, (), (), table)
+    self.assertIn('new.h', resolved)
+
 
 unittest.main()
