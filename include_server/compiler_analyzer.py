@@ -13,6 +13,7 @@ import basics
 import clang_scan
 import compress_files
 import include_analyzer_memoizing_node
+import parse_command
 import parse_file
 
 
@@ -98,8 +99,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     super().ClearStatCaches()
 
   def context(self, command, source):
-    language = ('c++' if source.endswith(('.cc', '.cpp', '.cxx', '.C')) or
-                os.path.basename(command[0]).endswith('++') else 'c')
+    language = 'none'
     probe = []
     args = iter(command[1:])
     for arg in args:
@@ -109,13 +109,17 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         language = next(args)
         probe += ['-x', language]
         continue
+      if arg.startswith('-x'):
+        language = arg[2:]
       if arg in ('-include', '-imacros'):
         next(args)
         continue
       probe.append(arg)
+    language = parse_command.CompilerLanguage(command[0], source, language)
     compiler = shutil.which(command[0]) or command[0]
     identity = os.stat(compiler)
     key = (compiler, identity.st_ino, identity.st_mtime_ns, language, tuple(probe), os.getcwd(),
+           self.quote_dirs, self.angle_dirs,
            tuple((k, os.environ.get(k)) for k in
                  ('CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH', 'OBJC_INCLUDE_PATH',
                   'GCC_EXEC_PREFIX', 'COMPILER_PATH', 'SDKROOT')))

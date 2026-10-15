@@ -79,6 +79,15 @@ class ParseCommandUnitTest(unittest.TestCase):
     self.assertEqual(parse_command._SplitMacroArg("A="), ["A", ""])
     self.assertEqual(parse_command._SplitMacroArg("A=B=C"), ["A", "B=C"])
 
+  def test_CompilerLanguage(self):
+    for compiler in ('g++', 'clang++', 'c++', 'target-linux-gnu-g++-15'):
+      self.assertEqual(parse_command.CompilerLanguage(compiler, 'source.c'), 'c++')
+      self.assertEqual(parse_command.CompilerLanguage(compiler, 'source.c', 'c'), 'c')
+      self.assertEqual(parse_command.CompilerLanguage(compiler, 'source.c', 'none'), 'c++')
+    self.assertEqual(parse_command.CompilerLanguage('gcc', 'source.c'), 'c')
+    self.assertEqual(parse_command.CompilerLanguage('gcc', 'source.CXX'), 'c++')
+    self.assertEqual(parse_command.CompilerLanguage('gcc', 'source', 'c++'), 'c++')
+
 
   def _RetrieveDirectoriesExceptSys(self, directory_idxs):
     return cache_basics.RetrieveDirectoriesExceptSys(

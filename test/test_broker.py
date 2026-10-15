@@ -152,6 +152,20 @@ class BrokerTest(BrokerTestCase):
             self.restart_server(self.build / 'distccd')
             job.result(timeout=15)
 
+    def test_unavailable_worker_reconnect_is_bounded(self):
+        self.start_broker('127.0.0.1:%d/1,tcp' % free_port())
+        self.env['DISTCC_RECONNECT_TIMEOUT'] = '1'
+        start = time.monotonic()
+        result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c',
+                                 str(self.source), '-o', 'unavailable.o'],
+                                cwd=self.work, env=self.env, capture_output=True,
+                                timeout=4)
+        elapsed = time.monotonic() - start
+        self.assertNotEqual(result.returncode, 0)
+        self.assertGreaterEqual(elapsed, .9)
+        self.assertLess(elapsed, 3)
+        self.assertFalse((self.work / 'unavailable.o').exists())
+
     def test_reused_cpp_requests_do_not_inherit_old_job_priority(self):
         peer = self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
                          queued=0, preparing=0, returning=0, capacity=1))

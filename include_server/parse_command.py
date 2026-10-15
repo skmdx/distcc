@@ -332,6 +332,20 @@ TRANSLATION_UNIT_FILEPATH_RE = (
                        for ext in basics.TRANSLATION_UNIT_MAP.keys()])))
 
 
+def CompilerLanguage(compiler, source, explicit='none'):
+  """Resolve -x, then the input suffix and C++ driver's C-input override."""
+  if explicit != 'none':
+    return explicit
+  match = TRANSLATION_UNIT_FILEPATH_RE.match(source)
+  if not match:
+    raise NotCoveredError("For source file '%s': unrecognized filename extension" % source)
+  language = basics.TRANSLATION_UNIT_MAP[match.group('suffix')]
+  if language == 'c' and re.search(r'(?:^|-)(?:g\+\+|clang\+\+|c\+\+)(?:-[0-9.]+)?$',
+                                   os.path.basename(compiler)):
+    return 'c++'
+  return language
+
+
 def ParseCommandArgs(args, current_dir, includepath_map, dir_map,
                      compiler_defaults, timer=None):
   """Parse arguments like -I to make include directory lists.
@@ -476,13 +490,7 @@ def ParseCommandArgs(args, current_dir, includepath_map, dir_map,
                                   "",
                                   source_file)
   source_file_prefix = os.path.join(current_dir, source_file_prefix)
-  if parse_state.language == 'none':    # no explicit -x flag, or -x none
-    language_match = TRANSLATION_UNIT_FILEPATH_RE.match(source_file)
-    if not language_match:
-      raise NotCoveredError(
-          "For source file '%s': unrecognized filename extension" % source_file)
-    suffix = language_match.group('suffix')
-    parse_state.language = basics.TRANSLATION_UNIT_MAP[suffix]
+  parse_state.language = CompilerLanguage(compiler, source_file, parse_state.language)
   assert parse_state.language in basics.LANGUAGES
 
   sysroot = parse_state.include_sysroot()

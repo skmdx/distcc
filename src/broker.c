@@ -245,8 +245,8 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
         goto failed;
     }
     if (reply->status) {
-        /* A valid refusal is a scheduling result, not a broken IPC channel.
-         * Reconnecting to the same live broker cannot recover failed workers. */
+        /* Admission can be temporarily unavailable while failed workers
+         * restart or remain in backoff. No job has been sent on this lease. */
         errno = reply->status == EXIT_CONNECT_FAILED ? EHOSTUNREACH : EPROTO;
         goto failed;
     }
@@ -280,7 +280,8 @@ static int broker_request(uint32_t command, struct reply *reply, int *net,
     while ((fd = broker_request_once(command, reply, net, hint, deadline)) < 0) {
         int error = errno;
         if (error != ENOENT && error != ECONNREFUSED &&
-            error != ECONNRESET && error != EPIPE)
+            error != ECONNRESET && error != EPIPE &&
+            !(error == EHOSTUNREACH && command != JOBS))
             break;
         if (!deadline) deadline = now_seconds() + timeout;
         double remaining = deadline - now_seconds();

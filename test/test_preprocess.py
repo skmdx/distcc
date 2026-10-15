@@ -613,6 +613,25 @@ class PreprocessTest(BrokerTestCase):
         self.source.write_text('#include <string>\nstd::string value;\n')
         self.compare('g++', ['-P', '-std=c++17'])
 
+    def test_cxx_driver_keeps_system_headers_when_suffix_changes(self):
+        sources = [self.work / name for name in ('first.cpp', 'second.c')]
+        for source in sources:
+            source.write_text('#include <cstdio>\nint value = EOF;\n')
+        for source in (sources[0], sources[1], sources[0]):
+            with self.subTest(source=source.name):
+                self.source = source
+                result = self.compare('g++', ['-std=c++14', '-P'])
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertNotIn('gave up analyzing', (self.work / 'client.log').read_text())
+
+    def test_explicit_cpp_language_with_c_driver(self):
+        self.source.write_text('#include <cstdio>\nint value = EOF;\n')
+        for flags in (['-xc++'], ['-x', 'c++']):
+            with self.subTest(flags=flags):
+                result = self.compare('gcc', [*flags, '-std=c++14', '-P'])
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertNotIn('gave up analyzing', (self.work / 'client.log').read_text())
+
     def test_gcc_only_indirect_probe_is_transferred(self):
         (self.work / 'probe.h').write_text('/* existence only */\n')
         for definition in ('#define HAS __has_include',
