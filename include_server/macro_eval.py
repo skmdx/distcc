@@ -225,7 +225,25 @@ def _MassageAccordingToPoundSigns(string):
 
 # EVALUATION
 
-def _EvalExprHelper(expr, symbol_table, disabled):
+class _ExpansionBudget:
+  def __init__(self, preserve_functions, expression):
+    self.expression = expression
+    self.bounded = preserve_functions
+    self.preserve_functions = preserve_functions or basics.opt_consider_unexpanded_macro_fns
+    self.calls = 8192
+    self.characters = 8 * 1024 * 1024
+
+  def consume(self, expr):
+    if not self.bounded:
+      return
+    self.calls -= 1
+    self.characters -= len(expr)
+    if self.calls < 0 or self.characters < 0:
+      raise basics.NotCoveredError('Macro expansion exceeds analysis budget: ' + self.expression[:200])
+
+
+def _EvalExprHelper(expr, symbol_table, disabled, budget):
+  budget.consume(expr)
   if __debug__:
     Debug(DEBUG_TRACE2, "EvalExprHelper: expr: %s", expr)
 
@@ -281,11 +299,11 @@ def _EvalExprHelper(expr, symbol_table, disabled):
       _PrependToSet(expr[:match.start()],
                    _BigUnion([ _EvalExprHelper(expansion + after_expansion,
                                               symbol_table,
-                                              disabled | set([symbol]))
+                                              disabled | set([symbol]), budget)
                               for after_expansion in
                               _EvalExprHelper(after,
                                               symbol_table,
-                                              disabled) ])))
+                                              disabled, budget) ])))
 
   def _EvalMacro(definition, disabled):
     """Evaluate symbol according to definition.
@@ -293,12 +311,12 @@ def _EvalExprHelper(expr, symbol_table, disabled):
     Here definition is either object-like or function-like.
     """
     # Consider that this symbol goes unevaluated.
-    if isinstance(definition, str) or basics.opt_consider_unexpanded_macro_fns:
+    if isinstance(definition, str) or budget.preserve_functions:
       value_set.update(
         _PrependToSet(expr[:match.end()],
                       _EvalExprHelper(expr[match.end():],
                                       symbol_table,
-                                      disabled)))
+                                      disabled, budget)))
 
     if isinstance(definition, str):
       # The expansion is the definition.
@@ -312,15 +330,19 @@ def _EvalExprHelper(expr, symbol_table, disabled):
       # Verify that the number of formal parameters match the
       # number of actual parameters; otherwise skip.
       if not args_list or len(lhs) != len(args_list):
+        if budget.bounded and args_list is not None:
+          raise basics.NotCoveredError('Ambiguous macro arguments in header condition: ' + symbol)
         return
       # Expand arguments recursively.
-      args_expand = [ _EvalExprHelper(arg, symbol_table, disabled)
+      args_expand = [ _EvalExprHelper(arg, symbol_table, disabled, budget)
                         for arg in args_list ]
       # Do the substitutions. Again, we'll need to piece together
       # strings from a cross product. In this the fragments come from
       # the expansions of the arguments.
-      expansions = [rhs]
+      expansions = [rhs or '']
       for i in range(len(args_expand)):
+        if budget.bounded and len(expansions) * len(args_expand[i]) > budget.calls:
+          raise basics.NotCoveredError('Macro expansion product exceeds analysis budget')
         expansions = [ _SubstituteSymbolInString(lhs[i], arg, expansion)
                        for expansion in expansions
                        for arg in args_expand[i] ]
@@ -352,14 +374,14 @@ def _EvalExprHelper(expr, symbol_table, disabled):
       return _PrependToSet(expr[:match.end()],
                           _EvalExprHelper(expr[match.end():],
                                           symbol_table,
-                                          disabled))
+                                          disabled, budget))
     else:
       # Now consider the set of meanings of this symbol.  But first
       # note that the string remaining unexpanded is always a
       # possibility, because we are doing a "forall" analysis.
 
       defs = symbol_table[symbol]
-      if isinstance(defs[0], str) or basics.opt_consider_unexpanded_macro_fns:
+      if isinstance(defs[0], str) or budget.preserve_functions:
         value_set = set([expr])
       else:
         value_set = set()
@@ -377,7 +399,7 @@ def _EvalExprHelper(expr, symbol_table, disabled):
       return value_set
 
 
-def EvalExpression(expr, symbol_table):
+def EvalExpression(expr, symbol_table, preserve_functions=False):
   """Calculate sets of possibly values of expr given symbol_table.
 
   Arguments:
@@ -389,7 +411,7 @@ def EvalExpression(expr, symbol_table):
   """
   if __debug__:
     Debug(DEBUG_TRACE, "EvalExpression: expr: %s", expr)
-  r = set(_EvalExprHelper(expr, symbol_table, set([])))
+  r = set(_EvalExprHelper(expr, symbol_table, set(), _ExpansionBudget(preserve_functions, expr)))
   if __debug__:
     Debug(DEBUG_TRACE, "EvalExpression: return: %s", r)
   return r
@@ -434,7 +456,63 @@ def ResolveExpr(includepath_map_index,
   resolved_files = []
   symbols = []
   statistics.resolve_expr_counter += 1
-  for val in EvalExpression(expr, symbol_table):
+  is_probe = isinstance(expr, parse_file.ProbeExpression)
+  if is_probe:
+    pending: list[str] = [expr]
+    seen = set()
+    has_probe = False
+    while pending:
+      value = pending.pop()
+      names = set(SYMBOL_RE.findall(value))
+      probe_names = {'__has_include', '__has_include_next'}
+      has_probe |= bool(names & probe_names)
+      for name in names - seen:
+        seen.add(name)
+        for definition in symbol_table.get(name, ()):
+          if isinstance(definition, tuple) and any('...' in arg for arg in definition[0]):
+            raise basics.NotCoveredError('Variadic macro in header condition: ' + name)
+          body = definition[1] if isinstance(definition, tuple) else definition
+          if body:
+            pending.append(body)
+            # A fixed prefix such as __GLIBC_USE_ cannot directly generate an
+            # existence operator. Follow only identifiers that the paste can
+            # actually form, including aliases defined elsewhere in the graph.
+            parameters = set(definition[0]) if isinstance(definition, tuple) else set()
+            for paste in re.finditer(r'\b\w+(?:\s*##\s*\w+)+', body):
+              seen.add(None)
+              parts = re.split(r'\s*##\s*', paste.group())
+              pattern = ''.join('.*' if part in parameters else re.escape(part) for part in parts)
+              pending.extend(candidate for candidate in set(symbol_table) | probe_names
+                             if re.fullmatch(pattern, candidate))
+    symbols.extend(seen)
+    if not has_probe:
+      return ([], seen)
+  for val in EvalExpression(expr, symbol_table, preserve_functions=is_probe):
+    if is_probe:
+      # Keep symbol support even for currently unresolved aliases. A later
+      # definition must invalidate this graph node and discover its probes.
+      symbols.extend(SYMBOL_RE.findall(val))
+      try:
+        probes = parse_file.clang_scan.include_probes(val.encode('latin-1'))
+      except ValueError as error:
+        raise basics.NotCoveredError(str(error)) from error
+      for is_next, operand in probes:
+        matches = [parse_file.INCLUDE_STRING_RE.fullmatch(value.strip())
+                   for value in EvalExpression(operand, symbol_table, preserve_functions=True)]
+        matches = [match for match in matches if match]
+        if not matches:
+          raise basics.NotCoveredError('Unresolved header existence operand: ' + operand)
+        for match in matches:
+          quoted = match.group('quote') is not None
+          path = match.group('quote') if quoted else match.group('angle')
+          if is_next:
+            for directory in quote_dirs:
+              resolved_files.append(resolve(includepath_map_index(path), currdir_idx, None, (directory,)))
+          else:
+            resolved_files.append(resolve(includepath_map_index(path), currdir_idx,
+                                          searchdir_idx if quoted else None,
+                                          quote_dirs if quoted else angle_dirs))
+      continue
     match_result = parse_file.INCLUDE_STRING_RE.match(val)
     if match_result:
       if match_result.group('quote'):

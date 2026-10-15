@@ -44,6 +44,14 @@ class ClangScanTest(unittest.TestCase):
     self.assertNotEqual(result['lookups'][str(header)][4], os.stat(header).st_mtime_ns)
     self.assertFalse((self.root / 'never.o').exists())
 
+  def test_conditions_are_extracted_without_comments_or_macro_bodies(self):
+    source = (b'#define HAS(x) __has_include(x)\n'
+              b'/* #if hidden */\nconst char *s = "#if hidden";\n'
+              b'#if HAS("a.h") /* explanation */\nint a;\n'
+              b'#elif JOIN(__has_,include)("b.h")\n#endif\n')
+    self.assertEqual([value.strip() for value in clang_scan.conditional_expressions(source)],
+                     ['HAS("a.h")', 'JOIN(__has_,include)("b.h")'])
+
   def test_indirect_probe_is_not_silently_ignored(self):
     for source in (b'#define HAS __has_include\n',
                    b'#define HAS(x) __has_include(x)\n',

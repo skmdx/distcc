@@ -240,22 +240,66 @@ PyObject *scan(PyObject *, PyObject *arguments) {
     return Py_BuildValue("{s:N,s:N,s:N}", "files", files, "lookups", paths, "dependencies", deps);
 }
 
+struct SourceTokens {
+    std::vector<Token> tokens, comments;
+    SourceTokens(const char *text, Py_ssize_t size) {
+        LangOptions options;
+        options.CPlusPlus = true;
+        options.LineComment = true;
+        Lexer lexer(SourceLocation::getFromRawEncoding(1), options, text, text, text + size);
+        lexer.SetCommentRetentionState(true);
+        Token token;
+        do {
+            lexer.LexFromRawLexer(token);
+            (token.is(tok::comment) ? comments : tokens).push_back(token);
+        } while (!token.is(tok::eof));
+    }
+    std::string expression(const char *text, unsigned start, unsigned end) const {
+        std::string value(text + start, end - start);
+        for (const auto &comment : comments) {
+            unsigned offset = comment.getLocation().getRawEncoding() - 1;
+            if (offset >= start && offset + comment.getLength() <= end)
+                value.replace(offset - start, comment.getLength(), comment.getLength(), ' ');
+        }
+        return value;
+    }
+};
+
+PyObject *conditional_expressions(PyObject *, PyObject *arguments) {
+    const char *text;
+    Py_ssize_t size;
+    if (!PyArg_ParseTuple(arguments, "y#", &text, &size)) return nullptr;
+    SourceTokens source(text, size);
+    const auto &tokens = source.tokens;
+    PyObject *result = PyList_New(0);
+    if (!result) return nullptr;
+    for (size_t i = 0; i + 2 < tokens.size(); ++i) {
+        if (!tokens[i].is(tok::hash) || !tokens[i].isAtStartOfLine() ||
+            !tokens[i + 1].is(tok::raw_identifier)) continue;
+        auto directive = tokens[i + 1].getRawIdentifier();
+        if (directive != "if" && directive != "elif") continue;
+        size_t end = i + 2;
+        while (end < tokens.size() && !tokens[end].isAtStartOfLine() &&
+               !tokens[end].is(tok::eof)) ++end;
+        unsigned start = tokens[i + 1].getLocation().getRawEncoding() - 1 + tokens[i + 1].getLength();
+        unsigned stop = end < tokens.size() ? tokens[end].getLocation().getRawEncoding() - 1 : size;
+        auto value = source.expression(text, start, stop);
+        PyObject *item = PyUnicode_DecodeLatin1(value.data(), value.size(), nullptr);
+        if (!item || PyList_Append(result, item) < 0) {
+            Py_XDECREF(item); Py_DECREF(result); return nullptr;
+        }
+        Py_DECREF(item);
+        i = end - 1;
+    }
+    return result;
+}
+
 PyObject *include_probes(PyObject *, PyObject *arguments) {
     const char *text;
     Py_ssize_t size;
     if (!PyArg_ParseTuple(arguments, "y#", &text, &size)) return nullptr;
-    LangOptions options;
-    options.CPlusPlus = true;
-    options.LineComment = true;
-    Lexer lexer(SourceLocation::getFromRawEncoding(1), options, text, text, text + size);
-    lexer.SetCommentRetentionState(true);
-    std::vector<Token> tokens;
-    std::vector<Token> comments;
-    Token token;
-    do {
-        lexer.LexFromRawLexer(token);
-        (token.is(tok::comment) ? comments : tokens).push_back(token);
-    } while (!token.is(tok::eof));
+    SourceTokens source(text, size);
+    const auto &tokens = source.tokens;
     PyObject *result = PyList_New(0);
     if (!result) return nullptr;
     for (size_t i = 0; i + 1 < tokens.size(); ++i) {
@@ -267,8 +311,8 @@ PyObject *include_probes(PyObject *, PyObject *arguments) {
         bool macro = line + 2 <= i && tokens[line].is(tok::hash) &&
                      tokens[line + 1].is(tok::raw_identifier) &&
                      tokens[line + 1].getRawIdentifier() == "define";
-        // The graph expands header operands, not arbitrary condition macros.
-        // A wrapper/alias can otherwise silently omit GCC-only existence probes.
+        // Callers must expand conditions before extracting probes. This
+        // lexer cannot substitute arguments inside wrapper definitions.
         if (macro && i != line + 2) {
             Py_DECREF(result);
             return PyErr_Format(PyExc_ValueError, "indirect header existence probe requires local preprocessing");
@@ -304,12 +348,7 @@ PyObject *include_probes(PyObject *, PyObject *arguments) {
         if (!definition) {
             unsigned start = tokens[i + 1].getLocation().getRawEncoding();
             unsigned end = tokens[j].getLocation().getRawEncoding() - 1;
-            std::string expression(text + start, end - start);
-            for (const auto &comment : comments) {
-                unsigned offset = comment.getLocation().getRawEncoding() - 1;
-                if (offset >= start && offset + comment.getLength() <= end)
-                    expression.replace(offset - start, comment.getLength(), comment.getLength(), ' ');
-            }
+            auto expression = source.expression(text, start, end);
             PyObject *operand = PyUnicode_DecodeLatin1(expression.data(), expression.size(), nullptr);
             PyObject *item = operand ? Py_BuildValue("(iN)", name == "__has_include_next", operand) : nullptr;
             if (!item || PyList_Append(result, item) < 0) {
@@ -323,6 +362,7 @@ PyObject *include_probes(PyObject *, PyObject *arguments) {
 }
 
 PyMethodDef methods[] = {
+    {"conditional_expressions", conditional_expressions, METH_VARARGS, "Lex conditional expressions from all branches."},
     {"scan", scan, METH_VARARGS, "Scan using libclang-cpp; return immutable inputs and lookup paths."},
     {"include_probes", include_probes, METH_VARARGS, "Lex existence probes independently of conditional branches."},
     {nullptr, nullptr, 0, nullptr}};

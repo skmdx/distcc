@@ -31,10 +31,13 @@ __author__ = 'Nils Klarlund'
 import re
 import time
 import clang_scan
-
 import basics
 import cache_basics
 import statistics
+
+
+class ProbeExpression(str):
+  """A conditional expression whose expanded existence probes are inputs."""
 
 Debug = basics.Debug
 DEBUG_TRACE = basics.DEBUG_TRACE
@@ -139,7 +142,7 @@ def InsertMacroDefInTable(lhs, rhs, symbol_table, callback_function):
     callback_function: a function called with value "symbol"
   """
   m_expr = MACRO_EXPR_RE.match(lhs)
-  if m_expr.end(0) != len(lhs):
+  if m_expr is None or m_expr.end(0) != len(lhs):
     raise NotCoveredError(
       "Unexpected macro definition with LHS: '%s'." % lhs)
   # Calculate the definition df, either
@@ -160,6 +163,8 @@ def InsertMacroDefInTable(lhs, rhs, symbol_table, callback_function):
   if lhs not in symbol_table:
     symbol_table[lhs] = [df]
   else:
+    if df in symbol_table[lhs]:
+      return
     symbol_table[lhs].append(df)
   callback_function(lhs)
 
@@ -296,23 +301,11 @@ class ParseFile(object):
     quote_includes, angle_includes, expr_includes, next_includes = (
       [], [], [], [])
 
-    # An existence predicate is also an input even if no #include follows it.
-    # Track probes from every conditional branch for the conservative GCC guard.
+    # Expand complete conditions: aliases and token pasting can introduce an
+    # existence operator whose name does not appear in this source file.
     probe_text = BACKSLASH_RE.sub('', file_contents)
-    try:
-      probes = clang_scan.include_probes(probe_text.encode('latin-1'))
-    except ValueError as error:
-      raise NotCoveredError(str(error)) from error
-    for is_next, expression in probes:
-      operand = expression.strip()
-      if len(operand) < 2 or (operand[0], operand[-1]) not in [('"', '"'), ('<', '>')]:
-        if is_next:
-          raise NotCoveredError("Computed __has_include_next requires local preprocessing")
-        expr_includes.append(operand)
-        continue
-      includes = (next_includes if is_next else
-                  quote_includes if operand[0] == '"' else angle_includes)
-      includes.append(includepath_map_index(operand[1:-1]))
+    expr_includes.extend(ProbeExpression(expression.strip()) for expression in
+                         clang_scan.conditional_expressions(probe_text.encode('latin-1')))
 
     i = 0
     line_start_last = None

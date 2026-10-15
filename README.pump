@@ -32,11 +32,14 @@ GCC jobs also use libclang-cpp, with GCC's predefined macros, implicit headers
 and include paths. Since compiler-specific feature predicates can differ,
 GCC's own dependency output is checked and a conservative, branch-independent
 include graph supplies existence-only probes omitted by GCC -M. Clang's lexer
-recognizes nested probe expressions for this graph. This adds a GCC dependency
+extracts complete conditional expressions for this graph. Their possible macro
+expansions are inspected for existence probes, including aliases, function
+wrappers and token-pasted operator names. Effective GCC predefined and command-line
+macros seed the graph; newly defined pasted aliases invalidate cached conditions.
+Conditional expansion is bounded and falls back locally if the budget is exceeded
+or the guard encounters unsupported variadic or ambiguous macro arguments.
+This adds a GCC dependency
 pass per job; it is a correctness check, not a claimed performance improvement.
-GCC jobs with aliases or wrapper macros around the existence operators fall
-back to local preprocessing: the conservative graph cannot substitute wrapper
-parameters reliably. Direct probes with computed header names remain supported.
 
 The conservative graph and compressed source/header files are cached. Before reusing the
 graph it checks metadata for positive include lookups. On supported local Linux
@@ -73,8 +76,8 @@ use remote `-E`.
 
 Stdin input, dependency-only `-M`/`-MM`, `-E -MD` without explicit `-MF`, absolute
 include directives, PCH/modules, frontend overrides and `#embed` remain local.
-Computed `__has_include` operands are supported; computed `__has_include_next`
-still requires local preprocessing for GCC. Existence probes participate in include lookup invalidation even
+Computed `__has_include` and `__has_include_next` operands are supported.
+Existence probes participate in include lookup invalidation even
 when no include directive follows. Other include-analysis failures fall back to
 ordinary distcc; standalone preprocessing falls back to a local compiler when
 DISTCC_FALLBACK permits it. DISTCC_TESTING_INCLUDE_SERVER=1 turns analysis fallback

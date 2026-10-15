@@ -170,28 +170,19 @@ class PreprocessTest(BrokerTestCase):
         self.assertNotIn(b'probe.h', dependencies.stdout)
         self.compare('gcc', ['-P'])
 
-    def test_gcc_only_indirect_probe_falls_back_safely(self):
-        self.env.pop('DISTCC_TESTING_INCLUDE_SERVER')
-        self.env['DISTCC_FALLBACK'] = '1'
+    def test_gcc_only_indirect_probe_is_transferred(self):
         (self.work / 'probe.h').write_text('/* existence only */\n')
         for definition in ('#define HAS __has_include',
-                           '#define HAS(x) __has_include(x)'):
+                           '#define HAS(x) __has_include(x)',
+                           '#define JOIN(a,b) a ## b\n#define HAS JOIN(__has_,include)'):
             with self.subTest(definition=definition):
                 self.source.write_text(
                     definition + '\n#if __has_builtin(__builtin_speculation_safe_value)\n'
                     '#if HAS("probe.h")\nint present;\n#else\nint absent;\n#endif\n'
                     '#else\nint other;\n#endif\n')
-                local = self.run_cc('gcc', ['-E', '-P', self.source], False)
-                self.assertEqual(local.returncode, 0, local.stderr.decode())
-                self.assertIn(b'present', local.stdout)
-                remote = self.run_cc('gcc', ['-E', '-P', self.source])
-                self.assertEqual(remote.returncode, 0, remote.stderr.decode())
-                self.assertEqual(remote.stdout, local.stdout)
-                self.assertIn('preprocessing locally', (self.work / 'client.log').read_text())
+                self.assertIn(b'present', self.compare('gcc', ['-P']).stdout)
 
-    def test_gcc_command_line_probe_alias_falls_back_safely(self):
-        self.env.pop('DISTCC_TESTING_INCLUDE_SERVER')
-        self.env['DISTCC_FALLBACK'] = '1'
+    def test_gcc_command_line_probe_alias_is_transferred(self):
         (self.work / 'probe.h').write_text('/* existence only */\n')
         self.source.write_text(
             '#if __has_builtin(__builtin_speculation_safe_value)\n'
@@ -199,14 +190,36 @@ class PreprocessTest(BrokerTestCase):
             '#else\nint other;\n#endif\n')
         for definition in ('HAS=__has_include', 'HAS(x)=__has_include(x)'):
             with self.subTest(definition=definition):
-                args = ['-E', '-P', '-D' + definition, self.source]
-                local = self.run_cc('gcc', args, False)
-                self.assertEqual(local.returncode, 0, local.stderr.decode())
-                self.assertIn(b'present', local.stdout)
-                remote = self.run_cc('gcc', args)
-                self.assertEqual(remote.returncode, 0, remote.stderr.decode())
-                self.assertEqual(remote.stdout, local.stdout)
-                self.assertIn('preprocessing locally', (self.work / 'client.log').read_text())
+                self.assertIn(b'present', self.compare('gcc', ['-P', '-D' + definition]).stdout)
+
+    def test_gcc_pasted_alias_rechecks_macro_namespace_and_header(self):
+        header = self.work / 'probe.h'
+        header.write_text('/* existence only */\n')
+        self.source.write_text(
+            '#define JOIN(a,b) a ## b\n'
+            '#if __has_builtin(__builtin_speculation_safe_value)\n'
+            '#if JOIN(H,A)("probe.h")\nint present;\n#else\nint absent;\n#endif\n'
+            '#else\nint other;\n#endif\n')
+        self.assertIn(b'absent', self.compare('gcc', ['-P', '-DHA(x)=0']).stdout)
+        args = ['-P', '-DHA=__has_include']
+        self.assertIn(b'present', self.compare('gcc', args).stdout)
+        header.unlink()
+        self.assertIn(b'absent', self.compare('gcc', args).stdout)
+        header.write_text('/* recreated */\n')
+        self.assertIn(b'present', self.compare('gcc', args).stdout)
+
+    def test_gcc_computed_next_probe_is_transferred(self):
+        first, second = self.work / 'first', self.work / 'second'
+        first.mkdir()
+        second.mkdir()
+        (second / 'optional.h').write_text('/* existence only */\n')
+        (first / 'probe.h').write_text(
+            '#define NAME(x) <x.h>\n'
+            '#if __has_builtin(__builtin_speculation_safe_value)\n'
+            '#if __has_include_next(NAME(optional))\nint present;\n'
+            '#else\nint absent;\n#endif\n#else\nint other;\n#endif\n')
+        self.source.write_text('#include "probe.h"\n')
+        self.assertIn(b'present', self.compare('gcc', ['-P', '-Ifirst', '-Isecond']).stdout)
 
     def test_compile_execute_and_pool_reuse(self):
         self.source.write_text('#include "value.h"\nint main(void) { return VALUE - 19; }\n')

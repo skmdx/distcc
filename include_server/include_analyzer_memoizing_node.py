@@ -168,8 +168,10 @@ class SupportMaster(object):
 
   def InvalidateRecords(self, symbol):
     """Mark as invalid all support records whose set contains symbol."""
-    if symbol in self.symbol_to_records:
-      for support_record in self.symbol_to_records[symbol]:
+    # None denotes dependence on the macro namespace: token pasting can form
+    # an alias that did not exist when the condition was first analyzed.
+    for key in (symbol, None):
+      for support_record in self.symbol_to_records.get(key, ()):
         support_record.valid = False
 
 

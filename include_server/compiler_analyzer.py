@@ -9,6 +9,7 @@ import subprocess
 import basics
 import clang_scan
 import include_analyzer_memoizing_node
+import parse_file
 
 
 def dependency_command(command, source):
@@ -113,14 +114,6 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
           raise basics.NotCoveredError('Unexpected compiler macro output')
         name, _, value = line[8:].partition(' ')
         options.append('-D' + name + '=' + value)
-      # Compiler-provided and command-line definitions participate in the
-      # same GCC-only branches as source definitions. Validate the actual
-      # effective definitions, including split -D and -U ordering, rather
-      # than treating an unobserved existence probe as an empty dependency.
-      try:
-        clang_scan.include_probes(macros.encode())
-      except ValueError as error:
-        raise basics.NotCoveredError(str(error)) from error
       for directory in search[1].splitlines():
         options += ['-isystem', directory.strip()]
       for header in shlex.split(implicit.replace('\\\n', '').replace('$$', '$')):
@@ -151,6 +144,13 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     paths = set(result['dependencies'])
     conservative = {}
     if not clang:
+      # The branch-independent graph must see the same effective GCC macros
+      # as the Clang scan, including command-line aliases and function macros.
+      for option in options:
+        if option.startswith('-D'):
+          name, _, value = option[2:].partition('=')
+          parse_file.InsertMacroDefInTable(name, value, self.symbol_table,
+                                          self.support_master.InvalidateRecords)
       # -M omits existence-only probes. GCC may choose a different branch for
       # __has_builtin/__has_attribute, so also retain the branch-independent
       # include graph. Probe tokenization itself uses libclang-cpp.
