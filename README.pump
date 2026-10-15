@@ -21,9 +21,10 @@ do not reserve a local preprocessing slot. Without a broker, configure remote
 hosts with the `,cpp,lzo` options.
 
 The include server calls libclang-cpp directly through a resident Python C++
-extension. Building pump requires LLVM 23 development headers, libclang-cpp,
+extension. Building pump requires LLVM 19, 22 or 23 development headers, libclang-cpp,
 libLLVM and a C++17 compiler; set LLVM_CONFIG to the matching llvm-config if it
 is not on PATH or beside clang. Clang jobs must match the library's version.
+The Clang and LLVM libraries must also use the same assertion/debug ABI settings.
 The canonical preprocessor discovers includes and existence probes without
 building an AST or generating code. Its input buffers are reused for transfer.
 Each request gets a fresh FileManager to avoid stale negative lookup caches.

@@ -95,7 +95,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       raise basics.NotCoveredError('Compiler did not report implicit headers')
     macros, implicit = sections
     banner = run([compiler, '--version']).stdout.decode(errors='replace')
-    version_match = re.search(r'clang version (\d+\.\d+\.\d+)', banner)
+    version_match = re.search(r'clang version (\S+)', banner)
     clang = version_match is not None
     if clang:
       if version_match[1] != clang_scan.version:
