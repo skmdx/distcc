@@ -39,7 +39,9 @@ public:
     llvm::ErrorOr<llvm::vfs::Status> status() override { return info; }
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> getBuffer(
         const llvm::Twine &name, int64_t = -1, bool = true, bool = false) override {
-        return llvm::MemoryBuffer::getMemBufferCopy(bytes, name.str());
+        // Inputs owns these immutable, NUL-terminated strings until the
+        // invocation and all of its SourceManager buffers have been destroyed.
+        return llvm::MemoryBuffer::getMemBuffer(bytes, name.str());
     }
     std::error_code close() override { return {}; }
 };

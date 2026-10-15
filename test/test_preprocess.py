@@ -406,14 +406,17 @@ class TcpPreprocessTest(PreprocessTest):
         for name, value in (('first', 71), ('second', 72)):
             directory = self.work / name
             directory.mkdir()
+            (directory / 'nested').mkdir()
             (directory / 'value.h').write_text(padding + f'#define VALUE {value}\n')
         alias = self.work / 'alias'
-        alias.symlink_to('first')
-        self.source.write_text('#include "alias/value.h"\nint n = VALUE;\n')
+        alias.symlink_to('first/nested')
+        # Resolving '..' before the symlink would choose the wrong header.
+        (self.work / 'value.h').write_text('#error incorrect path normalization\n')
+        self.source.write_text('#include "alias/../value.h"\nint n = VALUE;\n')
         self.assertIn(b'71', self.compare(args=['-P']).stdout)
         self.cache_counts()
         alias.unlink()
-        alias.symlink_to('second')
+        alias.symlink_to('second/nested')
         self.assertIn(b'72', self.compare(args=['-P']).stdout)
         self.cache_counts()
         self.compare(args=['-P'])

@@ -120,6 +120,13 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         if header != '/dev/null':
           options += ['-include', header]
       context = (False, options)
+      # The graph and compiler contexts share a cache generation. Seed once;
+      # later commands only add definitions when their context is new.
+      for option in options:
+        if option.startswith('-D'):
+          name, _, value = option[2:].partition('=')
+          parse_file.InsertMacroDefInTable(name, value, self.symbol_table,
+                                          self.support_master.InvalidateRecords)
     self.contexts[key] = context
     if len(self.contexts) > 8:
       self.contexts.popitem(last=False)
@@ -140,17 +147,12 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       result = clang_scan.scan([command[0], *options, *command[1:], '-c'], currdir)
     except (RuntimeError, ValueError) as error:
       raise basics.NotCoveredError(str(error)) from error
-    snapshots = {os.path.realpath(path): data for path, data in result['files'].items()}
+    canonicalize = self.canonical_path.Canonicalize
+    snapshots = {canonicalize(os.path.join(currdir, path)): data
+                 for path, data in result['files'].items()}
     paths = set(result['dependencies'])
     conservative = {}
     if not clang:
-      # The branch-independent graph must see the same effective GCC macros
-      # as the Clang scan, including command-line aliases and function macros.
-      for option in options:
-        if option.startswith('-D'):
-          name, _, value = option[2:].partition('=')
-          parse_file.InsertMacroDefInTable(name, value, self.symbol_table,
-                                          self.support_master.InvalidateRecords)
       # -M omits existence-only probes. GCC may choose a different branch for
       # __has_builtin/__has_attribute, so also retain the branch-independent
       # include graph. Probe tokenization itself uses libclang-cpp.
@@ -173,7 +175,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         raise basics.NotCoveredError('Unexpected GCC dependency output')
       native_paths = shlex.split(dependencies[len('distcc:'):].replace('$$', '$'))
       for path in native_paths:
-        canonical = os.path.realpath(path)
+        canonical = canonicalize(os.path.join(currdir, path))
         if canonical not in snapshots:
           raise basics.NotCoveredError('GCC and Clang dependencies differ: ' + path)
       paths.update(native_paths)
