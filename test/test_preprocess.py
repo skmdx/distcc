@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Remote preprocessing with mutable inputs, real compilers and pooled TCP."""
 import os
+import fcntl
 import xxhash
 import random
 from pathlib import Path
@@ -140,6 +141,48 @@ class PreprocessTest(BrokerTestCase):
         return subprocess.run(prefix + [compiler] + list(map(str, args)),
                               cwd=self.work, env=self.env, capture_output=True,
                               timeout=15)
+
+    def test_busy_scanner_local_cpp_difference_does_not_disable_pump(self):
+        self.source.write_text('#define PRESENT(p) ((p) != 0)\n'
+                               'int present(void) { int values[1]; return PRESENT(values); }\n')
+        args = ['-Werror=address', '-c', self.source, '-o', 'macro.o']
+        local = self.run_cc('gcc', args, remote=False)
+        self.assertEqual(local.returncode, 0, local.stderr.decode())
+        self.env.pop('DISTCC_SKIP_LOCAL_RETRY')
+        self.env['DISTCC_FALLBACK'] = '1'
+        log = self.work / 'client.log'
+        lock = Path(self.env['INCLUDE_SERVER_PORT'] + '.lock')
+        with lock.open('a') as fd:
+            fcntl.lockf(fd, fcntl.LOCK_EX)
+            result = self.run_cc('gcc', args)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        text = log.read_text()
+        self.assertIn('include analyzer busy', text)
+        self.assertIn('retrying locally', text)
+        counter = Path(self.env['INCLUDE_SERVER_PORT']).parent / 'discrepancy_counter'
+        self.assertFalse(counter.exists(), text)
+        log.write_text('')
+        self.env['DISTCC_FALLBACK'] = '0'
+        self.env['DISTCC_SKIP_LOCAL_RETRY'] = '1'
+        result = self.run_cc('gcc', args)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn('send CDIR', log.read_text())
+        self.assertNotIn('preprocessing locally', log.read_text())
+
+    def test_remote_cpp_difference_still_disables_pump(self):
+        self.source.write_text('#ifdef REMOTE_COMPILER_FAULT\n#error wrong worker setup\n#endif\nint value;\n')
+        wrapper = self.root / 'bin/gcc'
+        original = wrapper.read_text()
+        self.addCleanup(wrapper.write_text, original)
+        wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(self.cc) +
+                           ' -DREMOTE_COMPILER_FAULT=1 "$@"\n')
+        self.env.pop('DISTCC_SKIP_LOCAL_RETRY')
+        self.env['DISTCC_FALLBACK'] = '1'
+        result = self.run_cc('gcc', ['-c', self.source, '-o', 'recovered.o'])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        counter = Path(self.env['INCLUDE_SERVER_PORT']).parent / 'discrepancy_counter'
+        self.assertTrue(counter.exists())
+        self.assertIn('send CDIR', (self.work / 'client.log').read_text())
 
     def reject_system_header_check(self, kind, path):
         """Corrupt only the expected worker environment after a real scan."""

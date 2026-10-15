@@ -1135,7 +1135,7 @@ dcc_build_somewhere(char *argv[],
        as assembling, linking, etc. */
     ret = dcc_compile_local(argv, input_fname);
     if (remote_ret != 0) {
-        if (remote_ret != ret) {
+        if (remote_ret != ret && host->cpp_where == DCC_CPP_ON_SERVER) {
             /* Oops! it seems what we did remotely is not the same as what we did
               locally. We normally send email in such situations (if emailing is
               enabled), but we attempt an a time analysis of source files in order
@@ -1146,8 +1146,9 @@ dcc_build_somewhere(char *argv[],
                 deps_fname,
                 discrepancy_filename);
         } else if (host) {
-            /* Remote compilation failed, but we failed to compile this file too.
-             * Don't punish that server, it's innocent.
+            /* A local-CPP diagnostic difference can result from lost macro
+             * provenance; it does not implicate the include graph or worker.
+             * Matching compiler failures likewise say nothing about health.
              */
             dcc_enjoyed_host(host);
         }
