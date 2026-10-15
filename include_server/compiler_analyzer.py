@@ -1,13 +1,18 @@
 """Compiler-backed pump analysis with an authoritative GCC dependency check."""
 import collections
+import io
 import os
 import re
 import shlex
 import shutil
+import stat
+import struct
 import subprocess
+import xxhash
 
 import basics
 import clang_scan
+import compress_files
 import include_analyzer_memoizing_node
 import parse_file
 
@@ -49,17 +54,82 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     self.contexts = collections.OrderedDict()
     self.command = None
     self.snapshots = None
+    self.system_checks = None
+    self.system_records = {}
 
   def DoCompilationCommand(self, cmd, *args, **kwargs):
     self.command = cmd
     try:
-      return super().DoCompilationCommand(cmd, *args, **kwargs)
+      files = super().DoCompilationCommand(cmd, *args, **kwargs)
+      compression = kwargs.get('compression', args[2] if len(args) > 2 else 'lzo')
+      directory = os.path.join(self.client_root_keeper.client_root, '.distcc-system')
+      os.makedirs(directory, exist_ok=True)
+      assert self.system_checks is not None
+      name = xxhash.xxh3_64_hexdigest(self.system_checks) + '.' + compression
+      path = os.path.join(directory, name)
+      if not os.path.exists(path):
+        compress_files.WriteCompressed(path, io.BytesIO(self.system_checks), compression)
+      return files + [path]
     finally:
       self.snapshots = None
+      self.system_checks = None
       self.command = None
+
+  def SystemChecks(self, snapshots):
+    """Describe default-header inputs and probes omitted from the sent tree.
+
+    Include the conservative GCC graph's lookups too: a GCC-only existence
+    probe need not appear in Clang's active dependency list. Stamps are checked
+    again before publishing the immutable request. Encoded records share the
+    graph's invalidation generation so warm requests do not reread headers.
+    """
+    directories = tuple(path.rstrip('/') + '/' for path in
+                        (*self.systemdir_prefix_cache.systemdirs,
+                         *self.compiler_defaults.missing_system_dirs))
+    records = []
+    remaining = 64 * 1024 * 1024
+    for (path, ancestor), stamp in sorted(self.build_stat_cache.file_stamps.paths.items()):
+      if ancestor:
+        continue
+      canonical = self.canonical_path.Canonicalize(path)
+      if not any(name.startswith(directories) or name + '/' in directories
+                 for name in (path, canonical)):
+        continue
+      if path in self.system_records:
+        record, size = self.system_records[path]
+        records.append(record)
+        remaining -= size
+        if remaining < 0:
+          raise basics.NotCoveredError('System header checks exceed 64 MiB')
+        continue
+      kind, size, digest = 0, 0, bytes(8)
+      if stamp is not None:
+        if stat.S_ISDIR(stamp[2]):
+          kind = 2
+        elif stat.S_ISREG(stamp[2]):
+          kind = 1
+          data = snapshots.get(canonical)
+          if data is None:
+            with open(path, 'rb') as source:
+              data = source.read(remaining + 1)
+          remaining -= len(data)
+          if remaining < 0:
+            raise basics.NotCoveredError('System header checks exceed 64 MiB')
+          size, digest = len(data), xxhash.xxh3_64_digest(data)
+        else:
+          raise basics.NotCoveredError('Unsupported system header input: ' + path)
+      encoded = os.fsencode(path)
+      record = struct.pack('!IIQ8s', len(encoded), kind, size, digest) + encoded
+      self.system_records[path] = record, size
+      records.append(record)
+    result = b'DCSH' + struct.pack('!I', len(records)) + b''.join(records)
+    if len(result) > 16 * 1024 * 1024 or len(records) > 65536:
+      raise basics.NotCoveredError('Too many system header checks')
+    return result
 
   def ClearStatCaches(self):
     self.contexts.clear()
+    self.system_records.clear()
     super().ClearStatCaches()
 
   def context(self, command, source):
@@ -136,6 +206,10 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     (self.quote_dirs, self.angle_dirs, self.include_files, self.translation_unit,
      self.result_file_prefix, self.d_opts) = parsed_command
     self.currdir_idx = self.directory_map.Index(currdir)
+    for path in self.compiler_defaults.missing_system_dirs:
+      self.build_stat_cache.file_stamps.Observe(path)
+      if self.build_stat_cache.file_stamps.Stamp(path) is not None:
+        raise basics.NotCoveredError('Compiler default include directory appeared: ' + path)
     command = dependency_command(self.command, self.translation_unit)
     if any(arg.startswith(('-fmodule', '-include-pch', '-fplugin', '-Xclang', '@',
                            '-Wp,', '-save-temps', '--save-temps', '-ftime-trace',
@@ -220,6 +294,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       self.mirror_path.DoPath(absolute, self.currdir_idx, self.client_root_keeper.client_root)
       closure[real_idx] = ()
     self.snapshots = snapshots
+    self.system_checks = self.SystemChecks(snapshots)
     basics.Debug(basics.DEBUG_TRACE, 'libclang-cpp analysis (%s): %d inputs',
                  'clang' if clang else 'gcc verified', len(closure))
     return closure

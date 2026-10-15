@@ -2,6 +2,8 @@
 import os
 from pathlib import Path
 import shutil
+import shlex
+import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -10,6 +12,7 @@ import basics
 import clang_scan
 import cache_basics
 import compiler_analyzer
+import compress_files
 
 
 class ClangScanTest(unittest.TestCase):
@@ -54,6 +57,51 @@ class ClangScanTest(unittest.TestCase):
       with self.assertRaisesRegex(basics.NotCoveredError, 'Filepath must be relative'):
         analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
       self.assertEqual(frontend.call_count, 0)
+
+  def test_compilation_from_filesystem_root(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    self.source.write_text('int value;\n')
+    self.addCleanup(os.chdir, os.getcwd())
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    files = analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], '/', keeper, 'lz4s')
+    self.assertTrue(any('/.distcc-system/' in path for path in files))
+
+  def test_missing_default_system_directory_is_verified_and_invalidated(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    missing = self.root / 'default-headers'
+    compiler = self.root / 'gcc'
+    compiler.write_text('#!/bin/sh\nexec %s -isystem %s "$@"\n' %
+                        (shlex.quote(gcc), shlex.quote(str(missing))))
+    compiler.chmod(0o755)
+    self.source.write_text('#if __has_include(<feature.h>)\nint yes;\n#else\nint no;\n#endif\n')
+    cwd = os.getcwd()
+    self.addCleanup(os.chdir, cwd)
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    def checks():
+      with mock.patch.object(compress_files, 'WriteCompressed',
+                             wraps=compress_files.WriteCompressed) as writer:
+        analyzer.DoCompilationCommand([str(compiler), '-c', str(self.source)],
+                                      str(self.root), keeper, 'lz4s')
+      return next(call.args[1].getvalue() for call in writer.call_args_list
+                  if '/.distcc-system/' in call.args[0])
+    path = os.fsencode(missing)
+    negative = struct.pack('!IIQ8s', len(path), 0, 0, bytes(8)) + path
+    self.assertIn(negative, checks())
+    missing.mkdir()
+    (missing / 'feature.h').write_text('/* existence probe */\n')
+    updated = checks()
+    self.assertNotIn(negative, updated)
+    self.assertIn(os.fsencode(missing / 'feature.h'), updated)
+    (missing / 'feature.h').write_text('/* different probe */\n')
+    self.assertNotEqual(updated, checks())
 
   def test_probe_only_header_and_immutable_contents(self):
     header = self.root / 'probe.h'

@@ -10,7 +10,9 @@ import shlex
 import shutil
 import socket
 import signal
+import struct
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -102,6 +104,77 @@ class PreprocessTest(BrokerTestCase):
         return subprocess.run(prefix + [compiler] + list(map(str, args)),
                               cwd=self.work, env=self.env, capture_output=True,
                               timeout=15)
+
+    def reject_system_header_check(self, kind, path):
+        """Corrupt only the expected worker environment after a real scan."""
+        self.source.write_text('#include <stddef.h>\nint value = 7;\n')
+        result = self.run_cc('gcc', ['-c', self.source, '-o', 'warm.o'])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        manifests = [p for p in self.work.rglob('.distcc-system/*')
+                     if not p.name.endswith('.xxh3')]
+        self.assertEqual(len(manifests), 1)
+        manifest = manifests[0]
+        module = next((self.build / '_include_server').glob('lib*/include_server'))
+        sys.path.insert(0, str(module))
+        try:
+            import compress_files
+        finally:
+            sys.path.pop(0)
+        import io
+        data = b'x' * path.stat().st_size if path.exists() else b'expected header'
+        encoded = os.fsencode(path)
+        payload = (b'DCSH' + struct.pack('!I', 1) +
+                   struct.pack('!IIQ8s', len(encoded), kind, len(data) if kind == 1 else 0,
+                               xxhash.xxh3_64_digest(data) if kind == 1 else bytes(8)) + encoded)
+        compress_files.WriteCompressed(str(manifest), io.BytesIO(payload), manifest.suffix[1:])
+
+    def assert_header_rejection_retries_remote(self):
+        self.assertEqual(self.env['DISTCC_FALLBACK'], '0')
+        result = self.run_cc('gcc', ['-c', self.source, '-o', 'checked.o'])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        log = (self.work / 'client.log').read_text()
+        self.assertIn('worker system headers differ; preprocessing locally before remote retry', log)
+        self.assertNotIn('running locally instead', log)
+        self.assertEqual((self.work / 'warm.o').read_bytes(), (self.work / 'checked.o').read_bytes())
+
+    def test_changed_system_header_retries_remote_with_local_preprocessing(self):
+        self.reject_system_header_check(1, self.source)
+        self.assert_header_rejection_retries_remote()
+
+    def test_missing_system_header_retries_remote_with_local_preprocessing(self):
+        self.reject_system_header_check(1, self.work / 'missing-system-header.h')
+        self.assert_header_rejection_retries_remote()
+
+    def test_extra_system_probe_retries_remote_with_local_preprocessing(self):
+        self.reject_system_header_check(0, self.source)
+        self.assert_header_rejection_retries_remote()
+
+    def test_system_header_rejection_without_broker(self):
+        if self.transport:
+            self.skipTest('Prepared TCP requires the broker')
+        self.reject_system_header_check(1, self.source)
+        self.env.pop('DISTCC_BROKER')
+        self.env['DISTCC_HOSTS'] = self.host(0, ',' + self.compression + ',cpp')
+        self.assert_header_rejection_retries_remote()
+
+    def test_scan_includes_omits_header_validation_metadata(self):
+        self.source.write_text('#include <stddef.h>\nint value;\n')
+        env = dict(self.env, DISTCC_HOSTS=self.host(0, ',cpp,' + self.compression))
+        env.pop('DISTCC_BROKER')
+        result = subprocess.run([str(self.build / 'distcc'), '--scan-includes',
+                                 'gcc', '-c', str(self.source)], env=env,
+                                cwd=self.work, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn(os.fsencode(self.source), result.stdout)
+        self.assertNotIn(b'.distcc-system', result.stdout)
+
+    def test_system_header_rejection_of_preprocess_only(self):
+        self.reject_system_header_check(1, self.source)
+        local = self.run_cc('gcc', ['-E', self.source], False)
+        remote = self.run_cc('gcc', ['-E', self.source])
+        self.assertEqual(remote.returncode, 0, remote.stderr.decode())
+        self.assertEqual(remote.stdout, local.stdout)
+        self.assertIn('worker system headers differ', (self.work / 'client.log').read_text())
 
     def compare(self, compiler='gcc', args=()):
         args = ['-E', *args, self.source]
@@ -490,6 +563,29 @@ class TcpPreprocessTest(PreprocessTest):
     compression = 'lz4s'
     transport = ',tcp'
 
+    def use_local_socket(self):
+        prefix = str(self.root / 'header-jobs')
+        self.restart_server(self.build / 'distccd', DISTCC_LOCAL_SOCKET=prefix)
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.base_env = dict(self.base_env, DISTCC_LOCAL_SOCKET=prefix)
+        pump_env = dict(self.env)
+        self.start_broker(self.host(0, ',lz4s,tcp'), name='header-local')
+        broker = self.env['DISTCC_BROKER']
+        self.env.update(pump_env, DISTCC_BROKER=broker, DISTCC_LOCAL_SOCKET=prefix)
+
+    def test_local_socket_validates_matching_system_headers(self):
+        self.use_local_socket()
+        self.source.write_text('#include <stddef.h>\nint value = 7;\n')
+        self.compare(args=['-P'])
+        self.assertNotIn('worker system headers differ', (self.work / 'client.log').read_text())
+        stats = self.get_stats(self.stats_ports[0])
+        self.assertIn('dcc_tcp_accept 0\n', stats)
+        self.assertIn('dcc_compile_ok 1\n', stats)
+
+    def test_local_socket_rejects_changed_system_headers(self):
+        self.use_local_socket()
+        self.reject_system_header_check(1, self.source)
+        self.assert_header_rejection_retries_remote()
 
     def cache_counts(self):
         log = (self.work / 'client.log').read_text()

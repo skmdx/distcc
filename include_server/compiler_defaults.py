@@ -166,7 +166,7 @@ def _SystemSearchdirsGCC(compiler, sysroot, language, canonical_lookup):
     language: 'c' or 'c++' or other item in basics.LANGUAGES
     canonical_lookup: a function that maps strings to their realpaths
   Returns:
-    list of system search dirs for this compiler and language
+    Existing system search dirs and default directories rejected as missing.
 
   """
 
@@ -248,12 +248,15 @@ def _SystemSearchdirsGCC(compiler, sysroot, language, canonical_lookup):
              + "for compiler '%s', language '%s':\n"
              + "couldn't parse output of '%s'.\nReceived:\n%s") %
              (compiler, language, command, out))
-  return [ canonical_lookup(directory)
+  directories = [ canonical_lookup(directory)
            for line in match_obj.group(1).split("\n")
            for directory in line.split()
            # Ignore Apple-modified MacOS gcc's "framework" directories.
            if not line.endswith(" (framework directory)")
            ]
+  missing = {canonical_lookup(directory) for directory in
+             re.findall(r'^\s*ignoring nonexistent directory "([^"]+)"', out, re.M)}
+  return directories, missing
            # TODO: Rather than just ignoring framework directories, we
            # should handle them properly, fully emulating the search
            # algorithm used by Apple's modified GCC.
@@ -338,6 +341,7 @@ class CompilerDefaults(object):
     self.canonical_lookup = canonical_lookup
     self.system_dirs_default_all = set([])
     self.system_dirs_default = {}
+    self.missing_system_dirs = set()
     self.system_links = []
     self.client_root = client_root
 
@@ -374,9 +378,10 @@ class CompilerDefaults(object):
         # executed when calling the compiler through Popen gives up if presented
         # with a SIGALRM.
         timer.Stop()
-      self.system_dirs_default[compiler][sysroot][language] = (
-        _SystemSearchdirsGCC(compiler,
-                             sysroot, language, self.canonical_lookup))
+      directories, missing = _SystemSearchdirsGCC(compiler, sysroot, language,
+                                                 self.canonical_lookup)
+      self.system_dirs_default[compiler][sysroot][language] = directories
+      self.missing_system_dirs.update(missing)
       Debug(DEBUG_DATA,
             "system_dirs_default[%s][%s][%s]: %s" %
             (compiler, sysroot, language,

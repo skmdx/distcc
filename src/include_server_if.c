@@ -41,6 +41,7 @@
 #include "util.h"
 #include "hosts.h"
 #include "include_server_if.h"
+#include "job.h"
 
 static int dcc_count_slashes(const char *path);
 static int dcc_count_leading_dotdots(const char *path);
@@ -231,6 +232,11 @@ dcc_categorize_file(const char *include_server_filename) {
     if ((ret = dcc_get_original_fname(include_server_filename, &filename))) {
         rs_log_error("dcc_get_original_fname failed");
         return ret;
+    }
+
+    if (!strncmp(filename, "/" DCC_SYSTEM_HEADERS "/", sizeof(DCC_SYSTEM_HEADERS) + 1)) {
+        free(filename);
+        return 0;
     }
 
     if (str_endswith("/forcing_technique_271828", filename)) {

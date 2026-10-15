@@ -7,6 +7,7 @@
 #define DCC_JOB_METADATA_MAX (16 * 1024 * 1024)
 #define DCC_JOB_INPUT_MAX 65536
 #define DCC_JOB_RESULT_COUNT 4
+#define DCC_SYSTEM_HEADERS ".distcc-system"
 enum dcc_job_kind { DCC_JOB_COMPILE, DCC_JOB_PUMP, DCC_JOB_LINK };
 enum dcc_job_input_kind { DCC_JOB_FILE, DCC_JOB_SYMLINK, DCC_JOB_EMPTY };
 enum dcc_job_encoding { DCC_JOB_RAW, DCC_JOB_LZ4 };

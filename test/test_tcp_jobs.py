@@ -496,20 +496,30 @@ ssize_t write(int fd, const void *data, size_t size) {
                 net.close()
         self.job('after-cancel')
 
-    def wire_job(self, body, cached=True, paths=(b'/src/source.c',), identity=1, receive_buffer=None):
+    def wire_job(self, body, cached=True, paths=(b'/src/source.c',), identity=1, receive_buffer=None,
+                 verification: bytes | None = b'DCSH\0\0\0\0'):
         def string(value):
             return struct.pack('!Q', len(value)) + value
         args = [b'gcc', b'-c', paths[0], b'-o', b'/src/result.o']
-        manifest = struct.pack('!Q3Q', identity, 1, len(args), len(paths)) + string(b'/src')
+        count = len(paths) + (verification is not None)
+        manifest = struct.pack('!Q3Q', identity, 1, len(args), count) + string(b'/src')
         manifest += b''.join(map(string, args))
         for path in paths:
             manifest += (struct.pack('!5Q', 0, 0, cached, len(body), len(body)) +
                          xxhash.xxh3_64(body).digest() + string(path) + string(b''))
+        if verification is not None:
+            # These wire fixtures contain no system includes. Production
+            # analyzer manifests are exercised by test_preprocess.
+            manifest += (struct.pack('!5Q', 0, 0, 0, len(verification), len(verification)) +
+                         xxhash.xxh3_64(verification).digest() +
+                         string(b'/.distcc-system/check') + string(b''))
         net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
         if receive_buffer:
             net.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
         self.addCleanup(net.close)
         self.send(net, 0x54000200, manifest)
+        if verification is not None:
+            self.upload(net, verification, len(paths))
         return net
 
     @staticmethod
@@ -531,7 +541,7 @@ ssize_t write(int fd, const void *data, size_t size) {
     def upload(self, net, body, index=0):
         self.send(net, 0x54000202 | 0x20000, struct.pack('!II', index, len(body)) + body)
 
-    def result(self, net, identity=1):
+    def result(self, net, identity=1, expected_status=0):
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
         kind, description = self.frame(net)
         self.assertEqual(kind, 0x54000203)
@@ -551,9 +561,19 @@ ssize_t write(int fd, const void *data, size_t size) {
             data = codec.decode(body[8:], plain) if kind & 0x10000 else body[8:]
             outputs[index].extend(data)
         self.assertEqual(list(map(len, outputs)), sizes)
-        self.assertEqual(status, 0, outputs[0].decode(errors='replace'))
-        self.assertTrue(outputs[2].startswith(b'\x7fELF'))
+        self.assertEqual(status, expected_status, outputs[0].decode(errors='replace'))
+        if not status:
+            self.assertTrue(outputs[2].startswith(b'\x7fELF'))
         return outputs
+
+    def test_missing_or_invalid_header_verification_requests_client_cpp(self):
+        body = b'int unchecked_headers;\n'
+        for verification in (None, b'bad format', b'DCSH\0\0\0\1'):
+            with self.subTest(verification=verification):
+                net = self.wire_job(body, cached=False, verification=verification)
+                self.upload(net, body)
+                outputs = self.result(net, expected_status=120 << 8)
+                self.assertFalse(outputs[2])
 
     def test_single_upload_and_owner_disconnect(self):
         body = b'int cache_owner_recovery(void) { return 901; }\n'
@@ -583,7 +603,7 @@ ssize_t write(int fd, const void *data, size_t size) {
 
     def test_path_ancestor_rejected_even_with_intervening_name(self):
         # Checking only adjacent sorted names misses /a as parent of /a/b.
-        net = self.wire_job(b'int invalid;', paths=(b'/a', b'/a.b', b'/a/b'))
+        net = self.wire_job(b'int invalid;', paths=(b'/a', b'/a.b', b'/a/b'), verification=None)
         self.assertEqual(net.recv(8), b'')
 
     def test_bad_digest_discards_connection_and_releases_waiter(self):

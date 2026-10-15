@@ -224,6 +224,13 @@ static void dcc_perhaps_adjust_cpp_where_and_protover(
     /* It's unfortunate that the variable that controls preprocessing is in the
        "host" datastructure. See elaborate complaint in dcc_build_somewhere. */
 
+    const char *include_server = getenv("INCLUDE_SERVER_PORT");
+    if (!include_server || !*include_server) {
+        host->cpp_where = DCC_CPP_ON_CLIENT;
+        dcc_get_protover_from_features(host->compr, host->cpp_where, &host->protover);
+        return;
+    }
+
     /* Check whether there has been too much trouble running distcc-pump during
        this build. */
     if (dcc_read_number_discrepancies(discrepancy_filename) >=
@@ -812,6 +819,7 @@ dcc_build_somewhere(char *argv[],
         }
     }
 
+  prepare_client_input:
     /* With a broker, finish local preprocessing before reserving a worker.
      * Release the local lock before requesting the remote lease; never wait
      * for a remote slot while holding a local slot. Reuse this input on retry. */
@@ -987,6 +995,21 @@ dcc_build_somewhere(char *argv[],
     /* dcc_compile_remote() already unlocked local_cpu_lock_fd. */
     local_cpu_lock_fd = -1;
     remote_completed = 1;
+
+    if (host->cpp_where == DCC_CPP_ON_SERVER && WIFEXITED(*status) &&
+        WEXITSTATUS(*status) == EXIT_LOCAL_CPP) {
+        rs_trace("worker system headers differ; preprocessing locally before remote retry");
+        release_host(host, &cpu_lock_fd, &local_cpu_lock_fd, 0);
+        dcc_free_argv(files);
+        files = NULL;
+        unsetenv("INCLUDE_SERVER_PORT");
+        *status = 0;
+        if (preprocess_only) {
+            ret = EXIT_LOCAL_CPP;
+            goto lock_local;
+        }
+        goto prepare_client_input;
+    }
 
     dcc_enjoyed_host(host);
 

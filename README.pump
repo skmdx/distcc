@@ -56,9 +56,14 @@ reused by later requests, including requests for the same translation unit.
 
 The worker receives the raw source and needed application headers, runs the
 compiler's preprocessor and compiles the result. System headers in the compiler's
-default search paths are not transferred: compiler versions, target, search paths
-and default system headers must match between client and workers. A cross compiler
-must provide the same target headers. Pump does not synchronize a sysroot.
+default search paths are not transferred. Before preprocessing, the worker checks
+their content digests and the analyzer's positive and negative lookup results
+against a verification input sent with the source tree. A mismatch requests
+client preprocessing followed by distributed compilation, including when local
+compiler fallback is disabled. Matching headers retain server preprocessing.
+Compiler versions, target and search paths must still agree; pump does not
+synchronize a sysroot. Header digests share the analyzer's cache invalidation
+generation, and the worker verifies its installed files for every job.
 
 For Gentoo, source `packaging/gentoo/pump.bashrc` (installed by the overlay as
 `/usr/share/distcc/portage-pump.bashrc`) from `/etc/portage/bashrc`, and call

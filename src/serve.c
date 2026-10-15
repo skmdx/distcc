@@ -62,6 +62,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <dirent.h>
+#include <xxhash.h>
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -90,6 +92,7 @@
 #include "dotd.h"
 #include "fix_debug_info.h"
 #include "job.h"
+#include "tcp_job.h"
 #ifdef HAVE_GSSAPI
 #include "auth.h"
 
@@ -111,6 +114,92 @@ static int dcc_compile_log_fd = -1;
 static int dcc_run_job(int in_fd, int out_fd, enum dcc_protover protover,
                        const struct dcc_job *job, const char *root,
                        struct dcc_job_result *result);
+
+/* The analyzer sends this through the ordinary immutable input cache. Default
+ * headers remain on the worker only when their contents and lookup results
+ * agree with the client. A mismatch requests client preprocessing, not a
+ * compiler retry against the same incompatible header installation. */
+static int system_headers_match(const char *root)
+{
+    char *directory = NULL;
+    DIR *dir = NULL;
+    FILE *manifest = NULL;
+    XXH3_state_t *hash = NULL;
+    int match = 0, count = 0;
+    uint64_t budget = 64 * 1024 * 1024;
+    unsigned char header[24], buffer[65536];
+    char path[PATH_MAX];
+    const char *where = NULL;
+    struct stat st;
+    if (asprintf(&directory, "%s/" DCC_SYSTEM_HEADERS, root) < 0) return 0;
+    dir = opendir(directory);
+    if (!dir) goto done;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (manifest) goto done;
+        /* Local FD inputs are links to sealed descriptors in this worker. */
+        int fd = openat(dirfd(dir), entry->d_name, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) goto done;
+        if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size > 16 * 1024 * 1024) {
+            close(fd);
+            goto done;
+        }
+        manifest = fdopen(fd, "rb");
+        if (!manifest) { close(fd); goto done; }
+        if (unlinkat(dirfd(dir), entry->d_name, 0)) goto done;
+    }
+    if (!manifest || fread(header, 1, 8, manifest) != 8 || memcmp(header, "DCSH", 4)) goto done;
+    count = dcc_tcp_get32(header + 4);
+    if (count < 0 || count > 65536 || !(hash = XXH3_createState())) goto done;
+    for (int i = 0; i < count; ++i) {
+        where = NULL;
+        if (fread(header, 1, sizeof(header), manifest) != sizeof(header)) goto done;
+        unsigned length = dcc_tcp_get32(header), kind = dcc_tcp_get32(header + 4);
+        uint64_t size = dcc_tcp_get64(header + 8);
+        if (!length || length >= sizeof(path) || kind > 2 || size > budget ||
+            fread(path, 1, length, manifest) != length || path[0] != '/' ||
+            memchr(path, 0, length)) goto done;
+        path[length] = 0;
+        where = path;
+        int exists = !stat(path, &st);
+        if (!kind) {
+            if (exists || (errno != ENOENT && errno != ENOTDIR)) goto done;
+            continue;
+        }
+        if (!exists) goto done;
+        if (kind == 2) {
+            if (!S_ISDIR(st.st_mode)) goto done;
+            continue;
+        }
+        if (!S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t)st.st_size != size) goto done;
+        FILE *input = fopen(path, "rb");
+        if (!input) goto done;
+        XXH3_64bits_reset(hash);
+        uint64_t read_size = 0;
+        size_t n;
+        while ((n = fread(buffer, 1, sizeof(buffer), input))) {
+            read_size += n;
+            if (read_size > size) break;
+            XXH3_64bits_update(hash, buffer, n);
+        }
+        int failed = ferror(input) || read_size != size;
+        fclose(input);
+        XXH64_canonical_t digest;
+        XXH64_canonicalFromHash(&digest, XXH3_64bits_digest(hash));
+        if (failed || memcmp(&digest, header + 16, 8)) goto done;
+        budget -= size;
+    }
+    match = fgetc(manifest) == EOF && !ferror(manifest);
+done:
+    if (hash) XXH3_freeState(hash);
+    if (manifest) fclose(manifest);
+    if (dir) closedir(dir);
+    if (match && rmdir(directory)) match = 0;
+    if (!match && where) rs_trace("system header lookup differs at %s", where);
+    free(directory);
+    return match;
+}
 
 int dcc_execute_job(struct dcc_job *job, const char *root, int cancel_fd,
                      struct dcc_job_result *result)
@@ -1038,6 +1127,12 @@ static int dcc_run_job(int in_fd,
        }
     }
 
+    if (cpp_where == DCC_CPP_ON_SERVER && !system_headers_match(temp_dir)) {
+        rs_trace("worker system headers differ; client preprocessing required");
+        status = W_EXITCODE(EXIT_LOCAL_CPP, 0);
+        goto send_result;
+    }
+
     if ((compile_ret = dcc_spawn_child(argv, &cc_pid,
                                        "/dev/null", out_fname, err_fname))
         || (compile_ret = dcc_collect_child("cc", cc_pid, &status, in_fd,
@@ -1054,6 +1149,7 @@ static int dcc_run_job(int in_fd,
             goto out_cleanup;
     }
 
+send_result:
     if (result) {
         result->status = status;
         if ((ret = retain_artifact(result, DCC_JOB_STDERR, err_fname)) ||

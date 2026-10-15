@@ -29,12 +29,11 @@ see README.pump for preprocessing behavior and toolchain requirements.
 
 The distcc "pump" functionality, added in distcc 3.0, improves on
 distcc by distributing not only compilation but also preprocessing to
-distcc servers. This requires that the server and client have the same
-system headers (the client takes responsibility for transmitting
-application-specific headers).  Given that, distcc in pump mode yields
-the same results that distcc would in non-pump mode, but faster, since
-the preprocessor no longer runs locally. For more details on the pump
-functionality, see README.pump.
+distcc servers. The client transmits application headers and verification
+data for the system headers that remain on the worker. If system headers
+differ, the client preprocesses and retries distributed compilation.
+Matching environments retain remote preprocessing. For analyzer behavior
+and remaining toolchain requirements, see README.pump.
 
 distcc is not itself a compiler, but rather a front-end to the GNU
 C/C++ compiler (gcc), or another compiler of your choice. All the

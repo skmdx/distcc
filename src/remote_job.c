@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/sendfile.h>
 #include <arpa/inet.h>
 #include "distcc.h"
@@ -185,9 +186,12 @@ int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, i
 {
     struct dcc_job *job = describe(argv, cpp, cpp_fd, files);
     struct dcc_job_result result;
-    int ret = EXIT_IO_ERROR, transport_complete = 0;
+    int ret = EXIT_IO_ERROR, transport_complete = 0, need_cpp = 0;
     dcc_job_result_init(&result);
     if (!job || (ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result))) goto done;
+    need_cpp = files && WIFEXITED(result.status) && WEXITSTATUS(result.status) == EXIT_LOCAL_CPP;
+    /* No compiler ran: do not train the scheduler on header verification. */
+    if (need_cpp) result.execute_ns = 0;
     /* COMPLETE ends the network transaction; publication is local work. */
     dcc_broker_return(host, host->broker_fd, &result);
     transport_complete = 1;
@@ -198,7 +202,7 @@ int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, i
     if (!*status) {
         if ((ret = publish(&result.fd[DCC_JOB_OBJECT], &result, DCC_JOB_OBJECT, output))) goto done;
         if (files) ret = publish(&result.fd[DCC_JOB_DEPS], &result, DCC_JOB_DEPS, deps);
-    } else if (dcc_argv_search(argv, "-E") && strcmp(output, "-")) {
+    } else if (!need_cpp && dcc_argv_search(argv, "-E") && strcmp(output, "-")) {
         struct stat st;
         if (!stat(output, &st) && S_ISREG(st.st_mode)) unlink(output);
     }

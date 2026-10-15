@@ -789,7 +789,7 @@ class BuildStatCache(object):
     # start with / (who does "#include </usr/include/string.h>"??), we can
     # use + instead of the more expensive os.path.join().
     # Make sure $PWD is currdir, so we don't need to include it in our stat().
-    assert os.getcwd() + '/' == self.directory_map.string[currdir_idx]
+    assert os.getcwd().rstrip('/') + '/' == self.directory_map.string[currdir_idx]
     really_exists = _OsPathIsFile(
       self.directory_map.string[searchdir_idx]
       + self.includepath_map.string[includepath_idx])
@@ -843,7 +843,7 @@ class BuildStatCache(object):
          realpath_map of os.path.join(currdir, sp, includepath).
 
     Again, we require as a prequesite that os.getcwd() must equal currdir:
-       os.getcwd() + '/' == self.directory_map.string[currdir_idx]
+       os.getcwd().rstrip('/') + '/' == self.directory_map.string[currdir_idx]
     """
     includepath = self.includepath_map.string[includepath_idx]
     if includepath.startswith('/'):
@@ -861,7 +861,7 @@ class BuildStatCache(object):
       assert searchdir_idx is None or 1 <= searchdir_idx < dir_map.Length()
       for sl_idx in searchlist_idxs:
         assert sl_idx < dir_map.Length()
-      assert os.getcwd() + '/' == dir_map_string[currdir_idx]
+      assert os.getcwd().rstrip('/') + '/' == dir_map_string[currdir_idx]
       Debug(DEBUG_TRACE2, "Resolve: includepath: '%s', currdir: '%s', "
             "searchdir: '%s', searchlist: %s" %
             (includepath,

@@ -28,6 +28,40 @@ import os.path
 
 import distcc_pump_c_extensions
 
+
+def WriteCompressed(path, source, compression, prefix=''):
+  """Write one immutable input, including the prepared-TCP digest sidecar."""
+  compress = (distcc_pump_c_extensions.CompressLz4Alloc if compression in ('lz4', 'lz4s')
+              else distcc_pump_c_extensions.CompressLzo1xAlloc)
+  with open(path, 'wb') as output:
+    if prefix:
+      if source.read(3) == b'\xef\xbb\xbf':
+        prefix = '\ufeff' + prefix
+      else:
+        source.seek(0)
+    if compression != 'lz4s':
+      output.write(compress(prefix.encode() + source.read()))
+      return
+    digest = xxhash.xxh3_64()
+    plain_size = 0
+    chunk = prefix.encode()
+    while True:
+      chunk += source.read(256 * 1024 - len(chunk))
+      if not chunk:
+        break
+      digest.update(chunk)
+      plain_size += len(chunk)
+      encoded = compress(chunk)[4:]
+      compressed = len(encoded) < len(chunk)
+      output.write(struct.pack('!II', len(chunk), len(encoded) if compressed else 0))
+      output.write(encoded if compressed else chunk)
+      chunk = b''
+    output.write(bytes(8))
+  with open(path + '.xxh3', 'wb') as sidecar:
+    sidecar.write(digest.digest())
+    sidecar.write(struct.pack('!Q', plain_size))
+
+
 class CompressFiles(object):
 
   def __init__(self, includepath_map, directory_map, realpath_map, mirror_path):
@@ -61,8 +95,6 @@ class CompressFiles(object):
     filepaths in a list, which is the return value.
     """
     realpath_string = self.realpath_map.string
-    compress = (distcc_pump_c_extensions.CompressLz4Alloc if compression in ('lz4', 'lz4s')
-                else distcc_pump_c_extensions.CompressLzo1xAlloc)
     files = [] # where we accumulate files
 
     for realpath_idx in include_closure:
@@ -109,40 +141,9 @@ class CompressFiles(object):
         except (IOError, OSError) as why:
           sys.exit("Could not open '%s' for reading: %s" % (realpath, why))
         try:
-          new_filepath_fd = open(new_filepath, "wb")
-        except (IOError, OSError) as why:
-          sys.exit("Could not open '%s' for writing: %s" % (new_filepath, why))
-        try:
-          # A UTF-8 signature is only recognized at byte zero. Keep it before
-          # our line directive, otherwise GCC sees it as a source token.
-          if prefix:
-            if real_file_fd.read(3) == b'\xef\xbb\xbf':
-              prefix = '\ufeff' + prefix
-            else:
-              real_file_fd.seek(0)
-          if compression == 'lz4s':
-            digest = xxhash.xxh3_64()
-            plain_size = 0
-            chunk = prefix.encode()
-            while True:
-              chunk += real_file_fd.read(256 * 1024 - len(chunk))
-              if not chunk:
-                break
-              digest.update(chunk)
-              plain_size += len(chunk)
-              encoded = compress(chunk)[4:]
-              compressed = len(encoded) < len(chunk)
-              new_filepath_fd.write(struct.pack('!II', len(chunk), len(encoded) if compressed else 0))
-              new_filepath_fd.write(encoded if compressed else chunk)
-              chunk = b''
-            new_filepath_fd.write(bytes(8))
-            with open(new_filepath + '.xxh3', 'wb') as hash_file:
-              hash_file.write(digest.digest())
-              hash_file.write(struct.pack('!Q', plain_size))
-          else:
-            new_filepath_fd.write(compress(prefix.encode() + real_file_fd.read()))
+          WriteCompressed(new_filepath, real_file_fd, compression, prefix)
         except (IOError, OSError) as why:
           sys.exit("Could not write to '%s': %s" % (new_filepath, why))
-        new_filepath_fd.close()
-        real_file_fd.close()
+        finally:
+          real_file_fd.close()
     return files
