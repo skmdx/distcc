@@ -160,6 +160,18 @@ struct Diagnostics : DiagnosticConsumer {
     }
 };
 
+bool requiresModules(llvm::StringRef source) {
+    using namespace dependency_directives_scan;
+    llvm::SmallVector<dependency_directives_scan::Token, 64> tokens;
+    llvm::SmallVector<Directive, 16> directives;
+    if (scanSourceForDependencyDirectives(source, tokens, directives)) return true;
+    for (const auto &directive : directives)
+        if (directive.Kind == decl_at_import || directive.Kind == cxx_module_decl ||
+            directive.Kind == cxx_import_decl || directive.Kind == cxx_export_module_decl ||
+            directive.Kind == cxx_export_import_decl) return true;
+    return false;
+}
+
 PyObject *scan(PyObject *, PyObject *arguments) {
     PyObject *argv;
     const char *cwd;
@@ -199,7 +211,7 @@ PyObject *scan(PyObject *, PyObject *arguments) {
         result.dependencies.insert(inputs->probes.begin(), inputs->probes.end());
         for (const auto &path : result.dependencies) {
             auto it = inputs->contents.find(inputs->path(path));
-            if (it != inputs->contents.end() && scanInputForCXX20ModulesUsage(it->second))
+            if (it != inputs->contents.end() && requiresModules(it->second))
                 result.unsupported = true;
         }
         ok = inputs->validate() && ok && !result.unsupported;

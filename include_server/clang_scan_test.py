@@ -75,6 +75,17 @@ class ClangScanTest(unittest.TestCase):
     with self.assertRaises(RuntimeError):
       self.scan()
 
+  def test_module_declarations_require_local_preprocessing(self):
+    command = [self.compiler, '-x', 'c++', '-std=c++20', '-c', str(self.source)]
+    for text in ('export module example;', 'import example;',
+                 'module;', 'export import example;'):
+      with self.subTest(text=text):
+        self.source.write_text(text + '\n')
+        with self.assertRaises(RuntimeError):
+          clang_scan.scan(command, str(self.root))
+    self.source.write_text('/* import example; */\nconst char *s = "export module example;";\n')
+    self.assertIn(str(self.source), clang_scan.scan(command, str(self.root))['files'])
+
 
 if __name__ == '__main__':
   unittest.main()
