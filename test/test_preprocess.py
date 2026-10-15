@@ -187,6 +187,17 @@ class PreprocessTest(BrokerTestCase):
                 self.assertIn(b'failed to get includes',
                               (self.work / 'client.log').read_bytes())
 
+    def test_has_include_compatibility_definition(self):
+        (self.work / 'optional.h').write_text('#define VALUE 17\n')
+        self.source.write_text(
+            '#ifndef __has_include\n#define __has_include(header) 0\n#endif\n'
+            '#if __has_include("optional.h")\n#include "optional.h"\n'
+            '#else\n#define VALUE 0\n#endif\nint n = VALUE;\n')
+        for compiler in ('gcc', shutil.which('clang')):
+            if compiler:
+                with self.subTest(compiler=compiler):
+                    self.compare(compiler, ['-P'])
+
     def test_remote_cpp_does_not_wait_for_local_cpp_slot(self):
         lease = self.request(6)
         status, _, descriptors = self.receive(lease)

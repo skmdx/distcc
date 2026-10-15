@@ -298,6 +298,12 @@ class ParseFile(object):
     # An existence predicate is also an input even if no #include follows it.
     # Track literal probes through the same positive/negative lookup cache.
     probe_text = PAIRED_COMMENT_RE.sub('', BACKSLASH_RE.sub('', file_contents))
+    # A compatibility definition such as '#define __has_include(header) 0'
+    # declares a parameter; it does not probe for a header named 'header'.
+    # Keep the replacement body, which can itself contain real probes.
+    probe_text = re.sub(
+      r'^[ \t]*#[ \t]*define[ \t]+__has_include(?:_next)?\([^\n)]*\)',
+      '', probe_text, flags=re.M)
     for probe in re.finditer(r'\b__has_include(_next)?\s*\(([^)]*)\)', probe_text):
       operand = probe.group(2).strip()
       if len(operand) < 2 or (operand[0], operand[-1]) not in [('"', '"'), ('<', '>')]:
