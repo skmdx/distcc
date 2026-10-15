@@ -572,6 +572,15 @@ class PreprocessTest(BrokerTestCase):
             '#else\n%:include "other.h"\n#endif\nint value = VALUE;\n')
         self.assertIn(b'19', self.compare('g++', ['-x', 'c++', '-std=c++17', '-P']).stdout)
 
+    def test_gcc_duplicate_system_search_directory_preserves_precedence(self):
+        for name, value in (('first', 19), ('second', 42)):
+            directory = self.work / name
+            directory.mkdir()
+            (directory / 'header.h').write_text('#define VALUE %d\n' % value)
+        self.source.write_text('#include <header.h>\nint value = VALUE;\n')
+        self.assertIn(b'42', self.compare('gcc', ['-I', 'first', '-I', 'second',
+                                               '-isystem', 'first', '-P']).stdout)
+
     def test_gcc_native_and_optimizer_flags_preserve_header_selection(self):
         (self.work / 'abm.h').write_text('#define VALUE 19\n')
         (self.work / 'plain.h').write_text('#define VALUE 7\n')

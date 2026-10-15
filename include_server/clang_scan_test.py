@@ -126,11 +126,35 @@ class ClangScanTest(unittest.TestCase):
         keeper = basics.ClientRootKeeper()
         self.addCleanup(keeper.CleanOutClientRoots)
         analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
-        with mock.patch.object(compiler_analyzer, 'run', wraps=compiler_analyzer.run) as probe:
+        with (mock.patch.object(compiler_analyzer, 'run', wraps=compiler_analyzer.run) as probe,
+              mock.patch.object(clang_scan, 'scan', wraps=clang_scan.scan) as frontend):
           files = analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
         self.assertTrue(any(path.endswith('/gcc.h.lzo') for path in files))
         self.assertTrue(any(path.endswith('/clang.h.lzo') for path in files))
         self.assertEqual(any('-M' in call.args[0] for call in probe.call_args_list), computed)
+        self.assertEqual(frontend.call_count, int(computed))
+
+  def test_compiler_search_order_mismatch_keeps_native_verification(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    self.addCleanup(os.chdir, os.getcwd())
+    first, second = self.root / 'first', self.root / 'second'
+    for directory in (first, second):
+      directory.mkdir()
+      (directory / 'header.h').write_text('int %s;\n' % directory.name)
+    self.source.write_text('#include <header.h>\n')
+    command = [gcc, '-I', str(first), '-I', str(second), '-isystem', str(first),
+               '-c', str(self.source)]
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    with (mock.patch.object(compiler_analyzer, 'run', wraps=compiler_analyzer.run) as probe,
+          mock.patch.object(clang_scan, 'scan', wraps=clang_scan.scan) as frontend):
+      files = analyzer.DoCompilationCommand(command, str(self.root), keeper)
+    self.assertTrue(any(path.endswith('/second/header.h.lzo') for path in files))
+    self.assertEqual(frontend.call_count, 1)
+    self.assertTrue(any('-M' in call.args[0] for call in probe.call_args_list))
 
   def test_gcc_implicit_precompiled_header_requires_local_preprocessing(self):
     gcc = shutil.which('gcc')

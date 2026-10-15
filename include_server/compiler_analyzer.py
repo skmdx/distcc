@@ -97,7 +97,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     self.contexts.clear()
     super().ClearStatCaches()
 
-  def context(self, command, source) -> tuple[bool, list[str], tuple[tuple[int, str], ...]]:
+  def context(self, command, source):
     language = ('c++' if source.endswith(('.cc', '.cpp', '.cxx', '.C')) or
                 os.path.basename(command[0]).endswith('++') else 'c')
     probe = []
@@ -136,6 +136,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       if version_match[1] != clang_scan.version:
         raise basics.NotCoveredError('Clang compiler and libclang-cpp versions differ')
       options = []
+      search_dirs = None
     else:
       if 'Free Software Foundation' not in banner:
         raise basics.NotCoveredError('Unsupported compiler for header analysis')
@@ -143,6 +144,11 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
                          result.stderr.decode(errors='replace'), re.S)
       if search is None:
         raise basics.NotCoveredError('Cannot obtain GCC header search path')
+      quote_search = re.search(r'#include "\.\.\." search starts here:\n(.*?)#include <\.\.\.>',
+                               result.stderr.decode(errors='surrogateescape'), re.S)
+      search_dirs = (tuple(line.strip() for line in quote_search[1].splitlines())
+                     if quote_search else (),
+                     tuple(line.strip() for line in search[1].splitlines()))
       options = ['--no-default-config', '-undef', '-nostdinc']
       for line in macros.splitlines():
         if not line.startswith('#define '):
@@ -204,7 +210,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         if directory is None:
           raise basics.NotCoveredError('Implicit header is outside compiler search paths')
         search_entries.append((3, path[len(directory.rstrip('/')) + 1:]))
-    context = (clang, options, tuple(search_entries))
+    context = (clang, options, tuple(search_entries), search_dirs)
     self.contexts[key] = context
     if len(self.contexts) > 8:
       self.contexts.popitem(last=False)
@@ -234,7 +240,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
                         '-serialize-diagnostics', '--serialize-diagnostics'))
         for arg in command[1:]):
       raise basics.NotCoveredError('Modules, PCH, plugins and frontend overrides require local preprocessing')
-    clang, options, self.system_includes = self.context(command, self.translation_unit)
+    clang, options, self.system_includes, search_dirs = self.context(command, self.translation_unit)
     if not clang:
       implicit = tuple(self.includepath_map.Index(options[i + 1],
                        ignore_absolute_path_warning=True)
@@ -249,22 +255,38 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     # Generated forwarding headers often contain absolute include operands.
     conservative = (super().ProcessCompilationCommand(currdir, parsed_command)
                     if not clang else {})
-    try:
-      compiler = shutil.which(command[0]) or command[0]
-      scan_args = command[1:]
-      if not clang:
-        # These GCC switches have no Clang driver equivalents.
-        # Predefined macros come from GCC above; its dependency verification
-        # below and the actual compilation retain the original switches.
-        scan_args = [arg for arg in scan_args if arg not in
+    literal_graph = not clang and all(
+        all(isinstance(expr, parse_file.ProbeExpression) for expr in self.file_cache[index][2])
+        for index in conservative)
+    if literal_graph:
+      assert search_dirs is not None
+      def directories(paths):
+        # GCC removes missing and duplicate search directories. Compare their
+        # identities in order before relying on the cached lexical graph.
+        return tuple(dict.fromkeys(os.path.realpath(path) for path in paths
+                                   if os.path.isdir(path)))
+      quote, angle = search_dirs
+      literal_graph = ('-I-' not in command and
+          directories(self.directory_map.string[index] for index in self.angle_dirs) == directories(angle) and
+          directories(self.directory_map.string[index] for index in self.quote_dirs) == directories((*quote, *angle)))
+    result = {'files': {}, 'dependencies': [], 'lookups': {}}
+    if not literal_graph:
+      try:
+        compiler = shutil.which(command[0]) or command[0]
+        scan_args = command[1:]
+        if not clang:
+          # These GCC switches have no Clang driver equivalents.
+          # Predefined macros come from GCC above; its dependency verification
+          # below and the actual compilation retain the original switches.
+          scan_args = [arg for arg in scan_args if arg not in
                      ('-mabm', '-mno-abm', '-mhle', '-mno-hle',
                       '-mdirect-extern-access', '-mno-direct-extern-access',
                       '-mamx-tf32', '-mno-amx-tf32',
                       '-mamx-transpose', '-mno-amx-transpose',
                       '-ftree-pre', '-fno-tree-pre')]
-      result = clang_scan.scan([compiler, *options, *scan_args, '-c'], currdir)
-    except (RuntimeError, ValueError) as error:
-      raise basics.NotCoveredError(str(error)) from error
+        result = clang_scan.scan([compiler, *options, *scan_args, '-c'], currdir)
+      except (RuntimeError, ValueError) as error:
+        raise basics.NotCoveredError(str(error)) from error
     canonicalize = self.canonical_path.Canonicalize
     snapshots = {canonicalize(os.path.join(currdir, path)): data
                  for path, data in result['files'].items()}
@@ -293,13 +315,6 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       # graph, including branches selected only by GCC builtins. Computed
       # operands still need the real GCC check: the macro evaluator is an
       # overapproximation, not an implementation of every GCC extension.
-      parsed_inputs = set(conservative) | {
-          self.realpath_map.Index(os.path.join(currdir, path)) for path in paths}
-      literal_graph = all(
-          index in self.file_cache and
-          all(isinstance(expr, parse_file.ProbeExpression)
-              for expr in self.file_cache[index][2])
-          for index in parsed_inputs)
       if not literal_graph:
         native = run([*command, '-E', '-M', '-MT', 'distcc', '-MF', '-'], allow_errors=True)
         dependencies = native.stdout.decode(errors='surrogateescape').replace('\\\n', '')
@@ -337,5 +352,5 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         self.mirror_path.DoPath(os.path.join(path, 'forcing_technique_271828'),
                                self.currdir_idx, self.client_root_keeper.client_root)
     basics.Debug(basics.DEBUG_TRACE, 'libclang-cpp analysis (%s): %d inputs',
-                 'clang' if clang else 'gcc verified', len(closure))
+                 'clang' if clang else 'gcc literal graph' if literal_graph else 'gcc verified', len(closure))
     return closure

@@ -32,16 +32,18 @@ extension. Building pump requires LLVM 19, 22 or 23 development headers, libclan
 libLLVM and a C++17 compiler; set LLVM_CONFIG to the matching llvm-config if it
 is not on PATH or beside clang. Clang jobs must match the library's version.
 The Clang and LLVM libraries must also use the same assertion/debug ABI settings.
-The canonical preprocessor discovers includes and existence probes without
+For Clang jobs, the canonical preprocessor discovers includes and existence probes without
 building an AST or generating code. Its input buffers are reused for transfer.
 Each request gets a fresh FileManager to avoid stale negative lookup caches.
 
 GCC jobs also use libclang-cpp, with GCC's predefined macros, implicit headers
 and include paths. Since compiler-specific feature predicates can differ,
 Clang's lexer builds a conservative, branch-independent include graph, handling
-comments, continued lines and digraph directives. Literal includes are covered
-in all branches; computed includes additionally require GCC's own dependency
-check. The graph supplies existence-only probes omitted by GCC -M. Complete
+comments, continued lines and digraph directives. When every include is literal
+and the graph's search order matches GCC's reported search order, cached graph
+results supply the complete input snapshots without preprocessing the job again
+on the client. Other jobs use Clang preprocessing and GCC's own dependency check.
+The graph supplies existence-only probes omitted by GCC -M. Complete
 conditional expressions are extracted for this graph. Their possible macro
 expansions are inspected for existence probes, including aliases, function
 wrappers and token-pasted operator names. Effective GCC predefined and command-line

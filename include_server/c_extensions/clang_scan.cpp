@@ -315,6 +315,8 @@ PyObject *directives(PyObject *, PyObject *arguments) {
     Py_ssize_t size;
     if (!PyArg_ParseTuple(arguments, "y#", &text, &size)) return nullptr;
     llvm::StringRef source(text, size);
+    if (requiresModules(source))
+        return PyErr_Format(PyExc_ValueError, "unsupported dependency syntax or module declaration");
     // The graph is shared between language modes. Trigraph interpretation
     // depends on that mode, so it cannot share this lexical cache.
     for (size_t i = 0; i + 2 < source.size(); ++i)
