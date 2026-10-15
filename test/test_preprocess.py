@@ -293,6 +293,19 @@ class PreprocessTest(BrokerTestCase):
                     '#else\nint other;\n#endif\n')
                 self.assertIn(b'present', self.compare('gcc', ['-P']).stdout)
 
+    def test_gcc_defined_guard_keeps_active_probe_and_invalidation(self):
+        header = self.work / 'probe.h'
+        header.write_text('/* existence only */\n')
+        self.source.write_text(
+            '#include <stdint.h>\n'
+            '#define HAS(x) __has_include(x)\n'
+            '#if defined(INT64_C) && __has_builtin(__builtin_speculation_safe_value)\n'
+            '#if defined(HAS) && HAS("probe.h")\nint present;\n'
+            '#else\nint absent;\n#endif\n#else\nint other;\n#endif\n')
+        self.assertIn(b'present', self.compare('gcc', ['-P']).stdout)
+        header.unlink()
+        self.assertIn(b'absent', self.compare('gcc', ['-P']).stdout)
+
     def test_gcc_command_line_probe_alias_is_transferred(self):
         (self.work / 'probe.h').write_text('/* existence only */\n')
         self.source.write_text(

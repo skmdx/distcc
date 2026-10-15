@@ -22,6 +22,7 @@ __author__ = "Nils Klarlund"
 # See also tests in include_server_test.py.
 
 import os
+import re
 import basics
 import parse_file
 import cache_basics
@@ -320,6 +321,32 @@ class MacroEvalTest(unittest.TestCase):
                      set(['TEMPLATE_VARNAME', 'maps',
                           'AS_STRING', 'AS_STRING_INTERNAL',
                           'tpl', 'varnames', 'h', 'foo']))
+
+  def test_defined_operands_do_not_expand_or_track_macro_bodies(self):
+    table = {'INT64_C': [(['x'], 'x ## L')],
+             'UNRELATED_L': ['__has_include("unrelated.h")'],
+             'CHECK': ['defined(INT64_C)']}
+    for expr in ('defined(INT64_C)', 'defined INT64_C', 'CHECK'):
+      with self.subTest(expr=expr):
+        files, symbols = macro_eval.ResolveExpr(
+            None, None, parse_file.ProbeExpression(expr), 0, 0, (), (), table)
+        self.assertEqual(files, [])
+        self.assertNotIn('UNRELATED_L', symbols)
+        self.assertFalse(any(isinstance(symbol, re.Pattern) for symbol in symbols))
+
+  def test_defined_does_not_hide_probes_or_change_header_literals(self):
+    table = {'HAS': [(['h'], '__has_include(h)')],
+             'CHECK': [(['x'], 'defined(x) && HAS("probe.h")')]}
+    for expr in ('defined(HAS) && HAS("probe.h")', 'CHECK(HAS)'):
+      values = macro_eval.EvalExpression(expr, table, preserve_functions=True)
+      self.assertTrue(any('__has_include("probe.h")' in value for value in values))
+      self.assertFalse(any('defined(' in value for value in values))
+    for header in ('defined(INT64_C).h', 'path/defined(INT64_C).h'):
+      expr = '__has_include("%s")' % header
+      self.assertIn(expr, macro_eval.EvalExpression(expr, {}, preserve_functions=True))
+    table['defined_alias'] = table['HAS']
+    self.assertIn('__has_include("probe.h")', macro_eval.EvalExpression(
+        'defined_alias("probe.h")', table, preserve_functions=True))
 
 
 unittest.main()

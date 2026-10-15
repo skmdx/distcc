@@ -144,9 +144,18 @@ NotCoveredError = basics.NotCoveredError
 SINGLE_POUND_RE = re.compile(r"\B#\s*(\S*)") # \B = here: not at end of word
 DOUBLE_POUND_RE = re.compile(r"\s*##\s*")
 SYMBOL_RE = re.compile(r"\b\w+\b") # \b = word boundary \w = word constituent
+DEFINED_RE = re.compile(
+    r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|'''
+    r'(?P<defined>\bdefined\b\s*(?:\(\s*[A-Za-z_]\w*\s*\)|[A-Za-z_]\w*))')
 
 
 # HELPER FUNCTIONS
+
+def _WithoutDefined(expr):
+  # Only existence probes matter here: all conditional branches are visited.
+  # A defined operand is never macro-expanded and cannot introduce a probe.
+  # Preserve literals, including header names containing "defined(...)".
+  return DEFINED_RE.sub(lambda match: '0' if match.group('defined') else match[0], expr)
 
 def _BigUnion(list_of_sets):
   """Return the set that is the union of the sets or lists in list_of_sets."""
@@ -320,6 +329,8 @@ def _EvalExprHelper(expr, symbol_table, disabled, budget):
 
     if isinstance(definition, str):
       # The expansion is the definition.
+      if budget.preserve_functions:
+        definition = _WithoutDefined(definition)
       _ReEvalRecursivelyForExpansion(definition, expr[match.end():])
     elif isinstance(definition, tuple):
       # We have an invocation a function-like macro. Find the possible
@@ -341,7 +352,7 @@ def _EvalExprHelper(expr, symbol_table, disabled, budget):
       # Do the substitutions. Again, we'll need to piece together
       # strings from a cross product. In this the fragments come from
       # the expansions of the arguments.
-      expansions = [rhs or '']
+      expansions = [_WithoutDefined(rhs or '') if budget.preserve_functions else rhs or '']
       for i in range(len(args_expand)):
         if budget.bounded and len(expansions) * len(args_expand[i]) > budget.calls:
           raise basics.NotCoveredError('Macro expansion product exceeds analysis budget')
@@ -413,6 +424,8 @@ def EvalExpression(expr, symbol_table, preserve_functions=False):
   """
   if __debug__:
     Debug(DEBUG_TRACE, "EvalExpression: expr: %s", expr)
+  if preserve_functions:
+    expr = _WithoutDefined(expr)
   r = set(_EvalExprHelper(expr, symbol_table, set(), _ExpansionBudget(preserve_functions, expr)))
   if __debug__:
     Debug(DEBUG_TRACE, "EvalExpression: return: %s", r)
@@ -460,12 +473,13 @@ def ResolveExpr(includepath_map_index,
   statistics.resolve_expr_counter += 1
   is_probe = isinstance(expr, parse_file.ProbeExpression)
   if is_probe:
+    expr = _WithoutDefined(expr)
     pending: list[str] = [expr]
     queued: set[str] = {expr}
     seen = set()
     has_probe = False
     while pending:
-      value = pending.pop()
+      value = _WithoutDefined(pending.pop())
       names = set(SYMBOL_RE.findall(value))
       probe_names = {'__has_include', '__has_include_next'}
       has_probe |= bool(names & probe_names)
