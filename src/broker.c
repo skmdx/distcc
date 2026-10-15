@@ -207,8 +207,19 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)))
             goto failed;
     }
-    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) ||
-        send(fd, &request, request_size, MSG_NOSIGNAL) != (ssize_t)request_size)
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)))
+        goto failed;
+    struct ucred credentials;
+    socklen_t credentials_size = sizeof(credentials);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &credentials_size))
+        goto failed;
+    /* A foreign user's broker will reject us; that is not a reconnectable
+     * outage. Root may share a build user's broker during privileged phases. */
+    if (geteuid() != 0 && credentials.uid != geteuid()) {
+        errno = EACCES;
+        goto failed;
+    }
+    if (send(fd, &request, request_size, MSG_NOSIGNAL) != (ssize_t)request_size)
         goto failed;
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
@@ -1123,7 +1134,7 @@ static void accept_client(struct broker *broker, int listener_fd)
     if (fd < 0)
         return;
     if (!getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size) &&
-        credentials.uid == geteuid()) {
+        (credentials.uid == geteuid() || credentials.uid == 0)) {
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *client = &broker->clients[i];
             if (client->fd < 0) {

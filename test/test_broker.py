@@ -10,6 +10,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import tempfile
 import time
 import unittest
 
@@ -669,6 +670,43 @@ class BrokerTest(BrokerTestCase):
             finally:
                 if proc.poll() is None:
                     proc.terminate()
+
+
+@unittest.skipUnless(os.geteuid() == 0, 'requires real cross-UID peers')
+class BrokerIdentityTest(unittest.TestCase):
+    def test_root_build_phase_and_foreign_user(self):
+        build = Path.cwd()
+        owner = build.stat().st_uid
+        self.assertNotEqual(owner, 0, 'checkout must belong to the build user')
+        with tempfile.TemporaryDirectory(prefix='distcc-identity-') as directory:
+            root = Path(directory)
+            root.chmod(0o777)
+            path = root / 'broker.sock'
+            env = dict(os.environ, DISTCC_BROKER=str(path), DISTCC_DIR=str(root),
+                       DISTCC_HOSTS='127.0.0.1/2 --localslots_cpp=2',
+                       DISTCC_BROKER_IDLE='10', DISTCC_RECONNECT_TIMEOUT='30',
+                       DISTCC_JOB_MEMORY='64')
+            broker = subprocess.Popen([str(build / 'distccd'), '--broker', str(path)],
+                                      env=env, user=owner)
+            try:
+                deadline = time.monotonic() + 5
+                while not path.exists():
+                    self.assertIsNone(broker.poll())
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                # Exercise broker credential checks, not filesystem permissions.
+                path.chmod(0o777)
+                result = subprocess.run([str(build / 'distcc'), 'gcc', '-E', '-P', '-'],
+                                        env=env, input=b'42\n', capture_output=True, timeout=3)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), b'42')
+                result = subprocess.run([str(build / 'distcc'), '-j'], env=env,
+                                        user=65534, capture_output=True, timeout=3)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b'Permission denied', result.stderr)
+            finally:
+                broker.terminate()
+                broker.wait(timeout=5)
 
 
 if __name__ == "__main__":
