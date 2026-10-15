@@ -618,7 +618,9 @@ include-server:
 	  $(PYTHON) "$(srcdir)/include_server/setup.py" \
 	      build 					\
 	        --build-base="$(include_server_builddir)"  \
-	        --build-temp="$(include_server_builddir)"; \
+	        --build-temp="$(include_server_builddir)" && \
+	  PYTHONPATH="`"$(srcdir)/find_c_extension.sh" "$(builddir)"`" \
+	    $(PYTHON) -c 'import distcc_pump_c_extensions, clang_scan'; \
 	fi
 
 

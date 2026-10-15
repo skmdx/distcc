@@ -47,6 +47,18 @@ class PreprocessTest(BrokerTestCase):
         subprocess.run([str(self.build / 'pump'), '--shutdown'], env=self.env,
                        cwd=self.work, capture_output=True, timeout=10, check=True)
 
+    def test_failed_scanner_start_reports_error_and_cleans_up(self):
+        env = dict(self.env, INCLUDE_SERVER_ARGS='--unknown-test-option')
+        for key in ('INCLUDE_SERVER_PID', 'INCLUDE_SERVER_DIR', 'INCLUDE_SERVER_PORT'):
+            env.pop(key, None)
+        before = set(self.root.glob('distcc-pump*'))
+        failed = subprocess.run([str(self.build / 'pump'), '--startup'],
+                                cwd=self.work, env=env, capture_output=True,
+                                text=True, timeout=15)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn('Usage:', failed.stdout)
+        self.assertEqual(set(self.root.glob('distcc-pump*')), before)
+
     def test_local_lookup_cache_then_remote_compile(self):
         search = []
         for i in range(300):

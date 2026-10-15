@@ -531,8 +531,8 @@ Main() {
       trap 'ShutDown' EXIT  # In case we get interrupted.
       StartIncludeServerAndDetermineHosts
       include_server_status=$?
-      trap '' EXIT
       if [ "$include_server_status" = 0 ]; then
+        trap '' EXIT
         DumpEnvironmentVariables
         exit 0
       else
