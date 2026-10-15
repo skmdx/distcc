@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 import clang_scan
+import cache_basics
 
 
 class ClangScanTest(unittest.TestCase):
@@ -43,6 +44,19 @@ class ClangScanTest(unittest.TestCase):
     self.assertEqual(result['files'][str(header)], b'original contents\n')
     self.assertNotEqual(result['lookups'][str(header)][4], os.stat(header).st_mtime_ns)
     self.assertFalse((self.root / 'never.o').exists())
+
+  def test_directory_stamps_survive_unrelated_outputs(self):
+    self.source.write_text('#if __has_include("generated.h")\nint yes;\n#endif\n')
+    result = self.scan()
+    self.assertIn(str(self.root), result['lookups'])
+    (self.root / 'unrelated.o').write_bytes(b'object')
+    for path, expected in result['lookups'].items():
+      self.assertEqual(cache_basics.FileStampCache.Stamp(path), expected, path)
+    header = self.root / 'generated.h'
+    self.assertIsNone(result['lookups'][str(header)])
+    header.write_text('/* generated */\n')
+    self.assertNotEqual(cache_basics.FileStampCache.Stamp(str(header)),
+                        result['lookups'][str(header)])
 
   def test_conditions_are_extracted_without_comments_or_macro_bodies(self):
     source = (b'#define HAS(x) __has_include(x)\n'

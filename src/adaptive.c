@@ -248,7 +248,7 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
 int dcc_host_slots(const struct dcc_hostdef *host)
 {
     struct dcc_capacity cap;
-    return dcc_capacity_slots(host,
+    return dcc_capacity_jobs(host,
         host->is_up && host->n_slots > 0 && host->stats_port &&
         !cached_capacity(host, &cap) ? &cap : NULL);
 }
@@ -261,6 +261,16 @@ int dcc_capacity_slots(const struct dcc_hostdef *host, const struct dcc_capacity
         if (!host->slots_specified || slots > cap->cpus) slots = cap->cpus;
         if (slots > cap->jobs) slots = cap->jobs;
     }
+    return slots;
+}
+
+/* Build parallelism reflects sustainable concurrency, not momentary vacancy.
+ * Keep admission slots separate so a temporarily zero capacity can recover. */
+int dcc_capacity_jobs(const struct dcc_hostdef *host, const struct dcc_capacity *cap)
+{
+    int slots = dcc_capacity_slots(host, cap);
+    if (cap && cap->capacity >= 0 && slots > cap->capacity)
+        slots = cap->capacity;
     return slots;
 }
 

@@ -272,6 +272,12 @@ class BrokerTest(BrokerTestCase):
         time.sleep(1.05)
         self.assertEqual(jobs(), 8)
 
+    def test_jobs_use_effective_capacity_without_changing_admission(self):
+        peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2, busy=2, available=0))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
+        status, slots, fds = self.receive(self.request(2))
+        self.assertEqual((status, slots, fds), (0, 2, []))
+
     def test_job_cost_waits_for_fast_cpu_without_holding_back_small_jobs(self):
         peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
                     queued=0, preparing=0, returning=0, capacity=1)) for _ in range(2)]

@@ -4,7 +4,7 @@ version: str
 
 class ScanResult(TypedDict):
     files: dict[str, bytes]
-    lookups: dict[str, tuple[int, int, int, int, int, int] | None]
+    lookups: dict[str, tuple[int, int, int] | tuple[int, int, int, int, int, int] | None]
     dependencies: list[str]
 
 def scan(argv: Sequence[str], cwd: str) -> ScanResult: ...

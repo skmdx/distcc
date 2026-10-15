@@ -160,6 +160,47 @@ class PreprocessTest(BrokerTestCase):
             remote = self.run_cc(compiler, args)
             self.assertEqual(remote.returncode, 0, remote.stderr.decode())
 
+    def test_parallel_outputs_do_not_invalidate_header_analysis(self):
+        (self.work / 'value.h').write_text('#define VALUE 17\n')
+        self.source.write_text('#include "value.h"\n' + 'int n;\n' * 10000)
+        stop = threading.Event()
+        writes = []
+        def build_outputs():
+            output = self.work / 'unrelated.o'
+            while not stop.is_set():
+                output.write_bytes(b'object')
+                output.unlink()
+                writes.append(1)
+                stop.wait(.002)
+        writer = threading.Thread(target=build_outputs)
+        writer.start()
+        try:
+            self.compare(args=['-I', str(self.work), '-P'])
+        finally:
+            stop.set()
+            writer.join()
+        self.assertGreater(len(writes), 1)
+
+    def test_compiled_file_macros_preserve_relative_spelling(self):
+        (self.work / 'value.h').write_text('const char *header = __FILE__;\n')
+        self.source.write_text('#include <stdio.h>\n#include "value.h"\n'
+                               'int main(void) { printf("%s\\n%s\\n%s\\n", '
+                               '__FILE__, __BASE_FILE__, header); }\n')
+        for compiler in ('gcc', 'clang'):
+            if not shutil.which(compiler):
+                continue
+            for source in ('./' + self.source.name, str(self.source)):
+                with self.subTest(compiler=compiler, source=source):
+                    output = []
+                    for remote in (False, True):
+                        result = self.run_cc(compiler, ['-c', source, '-o', 'macros.o'], remote)
+                        self.assertEqual(result.returncode, 0, result.stderr.decode())
+                        self.assertNotIn(b'preprocessing locally', result.stderr)
+                        subprocess.run([compiler, 'macros.o', '-o', 'macros'], cwd=self.work,
+                                       check=True, capture_output=True, timeout=10)
+                        output.append(subprocess.check_output([str(self.work / 'macros')]))
+                    self.assertEqual(*output)
+
     def test_changed_generated_deleted_headers_and_symlinks(self):
         for directory in ('first', 'second'):
             (self.work / directory).mkdir()

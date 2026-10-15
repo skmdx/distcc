@@ -631,20 +631,33 @@ static int tweak_arguments_for_server(char **argv,
     int ret;
     char *debug_map;
     int argc = dcc_argv_len(argv), i;
+    int preserve_spelling = strstr(dcc_find_basename(argv[0]), "clang") != NULL;
+    for (i = 1; preserve_spelling && argv[i]; i++)
+        if (str_startswith("-ffile-prefix-map=", argv[i]) ||
+            str_startswith("-fmacro-prefix-map=", argv[i]) ||
+            !strcmp(argv[i], "-ffile-reproducible") ||
+            !strcmp(argv[i], "-fno-file-reproducible"))
+            preserve_spelling = 0;
     *dotd_target = 0;
-    if ((ret = dcc_copy_argv(argv, tweaked_argv, 4)))
+    if ((ret = dcc_copy_argv(argv, tweaked_argv, 4 + preserve_spelling)))
       return 1;
 
-    /* Let the compiler remap paths before emitting compressed DWARF. The ELF
-     * string fixup cannot edit compressed sections or LLVM bitcode. */
-    checked_asprintf(&debug_map, "-fdebug-prefix-map=%s=", root_dir);
+    /* Remap absolute input names and DWARF in the compiler, preserving relative
+     * __FILE__/__BASE_FILE__ spellings and user mappings. A #line prefix cannot
+     * represent the same header reached through different include spellings. */
+    checked_asprintf(&debug_map, "-ffile-prefix-map=%s=", root_dir);
     if (!debug_map) return EXIT_OUT_OF_MEMORY;
-    memmove(*tweaked_argv + 2, *tweaked_argv + 1, argc * sizeof(char *));
+    memmove(*tweaked_argv + 2 + preserve_spelling, *tweaked_argv + 1, argc * sizeof(char *));
     (*tweaked_argv)[1] = debug_map;
+    /* Clang's prefix map implicitly normalizes './' even for unmatched paths.
+     * Restore its default only when the user did not request that behavior. */
+    if (preserve_spelling &&
+        !((*tweaked_argv)[2] = strdup("-fno-file-reproducible")))
+        return EXIT_OUT_OF_MEMORY;
 
     /* Preserve user mappings after relocating absolute input paths. Keep the
      * user's order and let their mappings take precedence over our default. */
-    for (i = 2; (*tweaked_argv)[i]; ++i) {
+    for (i = 2 + preserve_spelling; (*tweaked_argv)[i]; ++i) {
         char *arg = (*tweaked_argv)[i];
         if (str_startswith("-fdebug-prefix-map=/", arg) ||
             str_startswith("-fmacro-prefix-map=/", arg) ||

@@ -202,7 +202,10 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         raise basics.NotCoveredError('Input changed after Clang dependency scan: ' + path)
     if not clang and stamps.Changed():
       raise basics.NotCoveredError('Input changed during GCC dependency verification')
-    closure = conservative.copy()
+    # Keep source bytes unchanged. A shared header can be reached through both
+    # relative and absolute spellings; one injected #line cannot represent both.
+    # The worker remaps its private root with compiler prefix-map options.
+    closure = dict.fromkeys(conservative, ())
     for path in paths:
       absolute = path if os.path.isabs(path) else os.path.join(currdir, path)
       real_idx = self.realpath_map.Index(absolute)
@@ -213,9 +216,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       if canonical not in snapshots:
         raise basics.NotCoveredError('Dependency has no input snapshot: ' + path)
       self.mirror_path.DoPath(absolute, self.currdir_idx, self.client_root_keeper.client_root)
-      # Preserve the existing transfer format's logical source names.
-      closure[real_idx] = [(self.directory_map.Index(os.path.dirname(absolute)),
-                            self.includepath_map.Index(os.path.basename(absolute)))]
+      closure[real_idx] = ()
     self.snapshots = snapshots
     basics.Debug(basics.DEBUG_TRACE, 'libclang-cpp analysis (%s): %d inputs',
                  'clang' if clang else 'gcc verified', len(closure))

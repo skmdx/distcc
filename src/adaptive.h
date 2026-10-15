@@ -12,6 +12,7 @@ struct dcc_capacity {
 };
 int dcc_parse_capacity(char *buf, struct dcc_capacity *cap);
 int dcc_capacity_slots(const struct dcc_hostdef *host, const struct dcc_capacity *cap);
+int dcc_capacity_jobs(const struct dcc_hostdef *host, const struct dcc_capacity *cap);
 int dcc_host_slots(const struct dcc_hostdef *host);
 double dcc_capacity_score(const struct dcc_hostdef *host,
                           const struct dcc_capacity *cap, int busy);

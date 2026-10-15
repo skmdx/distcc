@@ -23,11 +23,12 @@ struct Stamp {
     bool operator==(const Stamp &other) const {
         return exists == other.exists && (!exists ||
             (value.st_dev == other.value.st_dev && value.st_ino == other.value.st_ino &&
-             value.st_mode == other.value.st_mode && value.st_size == other.value.st_size &&
+             value.st_mode == other.value.st_mode &&
+             (S_ISDIR(value.st_mode) || (value.st_size == other.value.st_size &&
              value.st_mtim.tv_sec == other.value.st_mtim.tv_sec &&
              value.st_mtim.tv_nsec == other.value.st_mtim.tv_nsec &&
              value.st_ctim.tv_sec == other.value.st_ctim.tv_sec &&
-             value.st_ctim.tv_nsec == other.value.st_ctim.tv_nsec));
+             value.st_ctim.tv_nsec == other.value.st_ctim.tv_nsec))));
     }
 };
 
@@ -241,11 +242,16 @@ PyObject *scan(PyObject *, PyObject *arguments) {
         if (!success) break;
         const auto &st = entry.second.value;
         PyObject *key = PyUnicode_DecodeFSDefault(entry.first.c_str());
-        PyObject *value = entry.second.exists ? Py_BuildValue("(KKKKLL)",
+        // A directory lookup observes identity, not unrelated build outputs.
+        // Negative file lookups still detect newly generated/shadowing headers.
+        PyObject *value = !entry.second.exists ? Py_NewRef(Py_None) :
+            S_ISDIR(st.st_mode) ? Py_BuildValue("(KKK)",
+            (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
+            (unsigned long long)st.st_mode) : Py_BuildValue("(KKKKLL)",
             (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
             (unsigned long long)st.st_mode, (unsigned long long)st.st_size,
             (long long)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec,
-            (long long)st.st_ctim.tv_sec * 1000000000 + st.st_ctim.tv_nsec) : Py_NewRef(Py_None);
+            (long long)st.st_ctim.tv_sec * 1000000000 + st.st_ctim.tv_nsec);
         if (!key || !value || PyDict_SetItem(paths, key, value) < 0) success = false;
         Py_XDECREF(key); Py_XDECREF(value);
     }

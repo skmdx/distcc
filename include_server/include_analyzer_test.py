@@ -553,6 +553,33 @@ class IncludeAnalyzerTest(unittest.TestCase):
 
 
 class FileStampCacheTest(unittest.TestCase):
+  def test_directory_replacement_is_detected(self):
+    with tempfile.TemporaryDirectory() as root:
+      directory = os.path.join(root, 'include')
+      os.mkdir(directory)
+      cache = cache_basics.FileStampCache()
+      cache.Observe(directory)
+      os.rename(directory, directory + '-old')
+      os.mkdir(directory)
+      self.assertTrue(cache.Changed())
+
+  def test_directory_probe_ignores_outputs_but_tracks_headers(self):
+    for notifications in (False, True):
+      with self.subTest(notifications=notifications), tempfile.TemporaryDirectory() as root:
+        cache = cache_basics.FileStampCache()
+        if not notifications and cache.watch_fd >= 0:
+          os.close(cache.watch_fd)
+          cache.watch_fd = -1
+        cache.Observe(root)
+        header = os.path.join(root, 'generated.h')
+        cache.Observe(header)
+        with open(os.path.join(root, 'unrelated.o'), 'w') as output:
+          output.write('output')
+        self.assertFalse(cache.Changed())
+        with open(header, 'w') as output:
+          output.write('header')
+        self.assertTrue(cache.Changed())
+
   def test_dangling_symlink_target_created_elsewhere(self):
     with tempfile.TemporaryDirectory() as root:
       os.mkdir(os.path.join(root, 'targets'))

@@ -663,7 +663,7 @@ class FileStampCache(object):
     except NotADirectoryError:
       return None
     identity = (st.st_dev, st.st_ino, st.st_mode)
-    if ancestor:
+    if ancestor or stat.S_ISDIR(st.st_mode):
       return identity
     return identity + (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 

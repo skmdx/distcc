@@ -297,6 +297,17 @@ class AdaptiveTest(DistccTestCase):
         host = f"127.0.0.1:{self.ports[0]},stats={peer.port},speed=10"
         self.assertEqual(self.compile(host + " " + self.host(1))[0], self.ports[0])
 
+    def test_jobs_use_effective_capacity_not_idle_slots(self):
+        for capacity, expected in ((2, 2), (0, 0), (-1, 8)):
+            with self.subTest(capacity=capacity):
+                peer = self.peer(stats_response(cpus=8, jobs=8, capacity=capacity,
+                                                busy=2, available=0))
+                result = subprocess.run([str(self.build / 'distcc'), '-j'],
+                    env=dict(self.base_env, DISTCC_HOSTS=f'127.0.0.1:{self.ports[0]},stats={peer.port}',
+                             DISTCC_DIR=str(self.ddir)),
+                    capture_output=True, text=True, check=True, timeout=5)
+                self.assertEqual(int(result.stdout), expected)
+
     def test_load_changes_after_cache_expiry(self):
         loaded = self.peer(stats_response(load=12))
         idle = self.peer(stats_response())

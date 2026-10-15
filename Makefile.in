@@ -215,6 +215,7 @@ test_SOURCE = test/comfychair.py \
 	test/onetest.py \
 	test/testdistcc.py \
 	test/test_adaptive.py \
+	test/test_portage_jobs.py \
 	test/test_broker.py \
 	test/test_tcp_jobs.py \
 	test/test_link.py \
@@ -804,6 +805,7 @@ maintainer-check: distcc-maintainer-check include-server-maintainer-check prepro
 	pump-maintainer-check
 
 adaptive-check: distcc distccd h_hosts
+	$(PYTHON) "$(srcdir)/test/test_portage_jobs.py" -v
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v
 	$(PYTHON) "$(srcdir)/test/test_broker.py" -v
 	$(PYTHON) "$(srcdir)/test/test_tcp_jobs.py" -v

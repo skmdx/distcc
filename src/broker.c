@@ -778,7 +778,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         if (!p->address_len || p->retry_at > now || slots <= 0)
             continue;
         available++;
-        reply.slots += slots;
+        if (client->command == JOBS) {
+            reply.slots += dcc_capacity_jobs(p->host, cap);
+            continue;
+        }
         int staged = p->host->tcp_jobs;
         int predicted = staged && cap && cost > 0 && !link;
         int blocked = 0;
