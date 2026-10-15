@@ -352,6 +352,15 @@ class ClangScanTest(unittest.TestCase):
         self.assertEqual([value for name, value in clang_scan.directives(source, raw_strings)
                           if name == 'if'], expected)
 
+  def test_harmless_comment_trigraphs_do_not_disable_analysis(self):
+    source = b'// double check ???)\n/* ??= ??( ??! ??- */\n#include "present.h"\n'
+    self.assertEqual(clang_scan.directives(source, True), [('include', '"present.h"')])
+    for source in (b'??=include "real.h"\n', b'// ??/\n#include "hidden.h"\n',
+                   b'/* *??/\n/\n#include "real.h"\n'):
+      with self.subTest(source=source):
+        with self.assertRaisesRegex(ValueError, 'trigraphs require'):
+          clang_scan.directives(source, True)
+
   def test_indirect_probe_is_not_silently_ignored(self):
     for source in (b'#define HAS __has_include\n',
                    b'#define HAS(x) __has_include(x)\n',

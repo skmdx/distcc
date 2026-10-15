@@ -318,16 +318,29 @@ PyObject *directives(PyObject *, PyObject *arguments) {
     llvm::StringRef source(text, size);
     if (requiresModules(source))
         return PyErr_Format(PyExc_ValueError, "unsupported dependency syntax or module declaration");
-    // Trigraph interpretation varies by dialect and is not represented in
-    // the graph's lexical cache key.
-    for (size_t i = 0; i + 2 < source.size(); ++i)
-        if (source[i] == '?' && source[i + 1] == '?' &&
-            llvm::StringRef("=/'()!<>-").contains(source[i + 2]))
-            return PyErr_Format(PyExc_ValueError, "trigraphs require local preprocessing");
     LangOptions options;
     options.CPlusPlus = options.LineComment = options.Digraphs = true;
     options.CPlusPlus11 = raw_strings;
     options.RawStringLiterals = raw_strings;
+    // Non-backslash trigraphs inside comments cannot change directives in
+    // either dialect. Backslashes can splice lines and alter comment bounds;
+    // those and trigraphs in real tokens still require local preprocessing.
+    // Only files containing the rare marker need this extra lexical pass.
+    if (source.contains("??")) {
+        DirectiveLexer comments(SourceLocation::getFromRawEncoding(1), options, text, text, text + size);
+        comments.SetCommentRetentionState(true);
+        Token comment;
+        size_t end = 0;
+        for (size_t i = source.find("??"); i != llvm::StringRef::npos; i = source.find("??", i + 1)) {
+            if (i + 2 >= source.size() || !llvm::StringRef("=/'()!<>-").contains(source[i + 2])) continue;
+            while (end <= i) {
+                comments.LexFromRawLexer(comment);
+                end = comment.getLocation().getRawEncoding() - 1 + comment.getLength();
+            }
+            if (!comment.is(tok::comment) || source[i + 2] == '/')
+                return PyErr_Format(PyExc_ValueError, "trigraphs require local preprocessing");
+        }
+    }
     DirectiveLexer lexer(SourceLocation::getFromRawEncoding(1), options, text, text, text + size);
     PyObject *result = PyList_New(0);
     if (!result) return nullptr;

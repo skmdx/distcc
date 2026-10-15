@@ -643,6 +643,21 @@ class PreprocessTest(BrokerTestCase):
         self.source.write_text('#include <string>\nstd::string value;\n')
         self.compare('g++', ['-P', '-std=c++17'])
 
+    def test_comment_trigraphs_preserve_remote_macro_diagnostics(self):
+        (self.work / 'macro.h').write_text('// double check ???)\n#define PRESENT(p) ((p) != 0)\n')
+        self.source.write_text('#include "macro.h"\nint present(void) { int values[1]; return PRESENT(values); }\n')
+        for standard in ('c++14', 'c++17'):
+            with self.subTest(standard=standard):
+                args = ['-std=' + standard, '-Werror=address', '-c', self.source, '-o', 'macro.o']
+                local = self.run_cc('g++', args, False)
+                self.assertEqual(local.returncode, 0, local.stderr.decode())
+                expected = (self.work / 'macro.o').read_bytes()
+                (self.work / 'macro.o').unlink()
+                result = self.run_cc('g++', args)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertEqual((self.work / 'macro.o').read_bytes(), expected)
+        self.assertNotIn('gave up analyzing', (self.work / 'client.log').read_text())
+
     def test_cxx_driver_keeps_system_headers_when_suffix_changes(self):
         sources = [self.work / name for name in ('first.cpp', 'second.c')]
         for source in sources:
