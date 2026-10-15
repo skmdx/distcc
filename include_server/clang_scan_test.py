@@ -54,7 +54,7 @@ class ClangScanTest(unittest.TestCase):
     keeper = basics.ClientRootKeeper()
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
-    analyzer.systemdir_prefix_cache.systemdirs = [str(system)]
+    analyzer.systemdir_prefix_cache.systemdirs = {str(system)}
     analyzer.compiler_defaults.missing_system_dirs = set()
     expected = {str(system / 'present.h'), str(project / 'alias' / 'present.h'),
                 str(project / 'alias' / 'missing.h'), str(project / 'leaf.h'),
