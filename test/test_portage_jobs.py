@@ -11,10 +11,15 @@ class PortageJobsTest(unittest.TestCase):
         if not helpers:
             self.skipTest('Portage environment serializer is not installed')
         self.assertEqual(self.run_hook('''
-source "''' + str(helpers[-1]) + '''"
-saved=$(__save_ebuild_env)
+PORTAGE_BIN_PATH="''' + str(helpers[-1].parent) + '''"
+EAPI=8
+source "$PORTAGE_BIN_PATH/eapi.sh"
+source "$PORTAGE_BIN_PATH/phase-functions.sh"
+source "$PORTAGE_BIN_PATH/save-ebuild-env.sh"
+set -o pipefail
+saved=$(__save_ebuild_env | __filter_readonly_variables) || exit 1
 unset ${!DISTCC_AUTO_@} ${!distcc_auto_@}
-eval "$saved"
+eval "$saved" || exit 1
 workers=6
 source "$JOBS_HOOK"
 echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
@@ -33,6 +38,7 @@ nproc() { echo 3; }
 FEATURES=distcc EBUILD_PHASE=compile workers=12
 source "$JOBS_HOOK"
 ''' + script], env=env, capture_output=True, text=True, check=True)
+        self.assertEqual(result.stderr, '')
         return result.stdout.strip().splitlines()
 
     def test_refresh_and_explicit_package_override(self):
