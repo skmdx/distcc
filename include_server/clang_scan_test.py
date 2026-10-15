@@ -56,10 +56,10 @@ class ClangScanTest(unittest.TestCase):
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
     analyzer.systemdir_prefix_cache.systemdirs = {str(system)}
     analyzer.compiler_defaults.missing_system_dirs = set()
-    expected = {str(system / 'present.h'), str(project / 'alias' / 'present.h'),
+    observed = {str(system / 'present.h'), str(project / 'alias' / 'present.h'),
                 str(project / 'alias' / 'missing.h'), str(project / 'leaf.h'),
                 str(project / 'dangling.h'), str(system / 'missing.h')}
-    for path in expected | {str(project / 'local.h'), str(project / 'missing.h')}:
+    for path in observed | {str(project / 'local.h'), str(project / 'missing.h')}:
       analyzer.build_stat_cache.file_stamps.Observe(path)
     payload = analyzer.SystemChecks({})
     self.assertEqual(payload[:4], b'DCSH')
@@ -70,8 +70,18 @@ class ClangScanTest(unittest.TestCase):
       offset += 24
       actual.add(os.fsdecode(payload[offset:offset + length]))
       offset += length
-    self.assertEqual(actual, expected)
+    self.assertEqual(actual, {str(system / 'present.h'), str(system / 'missing.h')})
+    self.assertEqual(count, 2)
     self.assertEqual(offset, len(payload))
+    # A warm request retains both relevant and irrelevant classifications.
+    with mock.patch('os.path.realpath', side_effect=AssertionError('repeated lookup')):
+      self.assertEqual(analyzer.SystemChecks({}), payload)
+    # Another compiler context may introduce a new default include directory.
+    # Previously ignored lookups must then be checked on the worker too.
+    analyzer.systemdir_prefix_cache.systemdirs.add(str(project))
+    expanded = analyzer.SystemChecks({})
+    self.assertIn(os.fsencode(project / 'local.h'), expanded)
+    self.assertIn(os.fsencode(project / 'missing.h'), expanded)
 
   def test_gcc_rejects_absolute_forwarder_before_clang_preprocessing(self):
     gcc = shutil.which('gcc')

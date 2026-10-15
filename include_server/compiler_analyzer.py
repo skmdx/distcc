@@ -59,6 +59,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     self.snapshots = None
     self.system_checks = None
     self.system_records = {}
+    self.system_directories = None
 
   def DoCompilationCommand(self, cmd, *args, **kwargs):
     self.command = cmd
@@ -89,14 +90,28 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     directories = tuple(path.rstrip('/') + '/' for path in
                         (*self.systemdir_prefix_cache.systemdirs,
                          *self.compiler_defaults.missing_system_dirs))
+    if directories != self.system_directories:
+      self.system_records.clear()
+      self.system_directories = directories
     def system_path(path):
       return (path.rstrip('/') + '/').startswith(directories)
 
     paths = self.build_stat_cache.file_stamps.paths
     parents = {}
-    inputs = []
+    records = {}
+    remaining = 64 * 1024 * 1024
     for (path, ancestor), stamp in paths.items():
       if ancestor:
+        continue
+      if path in self.system_records:
+        cached = self.system_records[path]
+        if cached is not None:
+          check_path, record, size = cached
+          if check_path not in records:
+            remaining -= size
+            records[check_path] = record, size
+          if remaining < 0:
+            raise basics.NotCoveredError('System header checks exceed 64 MiB')
         continue
       if system_path(path):
         canonical = self.canonical_path.Canonicalize(path)
@@ -114,17 +129,15 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
             # probes through directory aliases still need system checks.
             parents[parent] = os.path.realpath(parent)
           canonical = os.path.normpath(os.path.join(parents[parent], os.path.basename(path)))
-      if system_path(path) or system_path(canonical):
-        inputs.append((path, canonical, stamp))
-    records = []
-    remaining = 64 * 1024 * 1024
-    for path, canonical, stamp in sorted(inputs):
-      if path in self.system_records:
-        record, size = self.system_records[path]
-        records.append(record)
-        remaining -= size
-        if remaining < 0:
-          raise basics.NotCoveredError('System header checks exceed 64 MiB')
+      if not system_path(path) and not system_path(canonical):
+        self.system_records[path] = None
+        continue
+      # Project aliases exist only in the transferred private tree. Validate
+      # their omitted system target at its worker-visible path instead.
+      check_path = path if system_path(path) else canonical
+      if check_path in records:
+        record, size = records[check_path]
+        self.system_records[path] = check_path, record, size
         continue
       kind, size, digest = 0, 0, bytes(8)
       if stamp is not None:
@@ -142,11 +155,12 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
           size, digest = len(data), xxhash.xxh3_64_digest(data)
         else:
           raise basics.NotCoveredError('Unsupported system header input: ' + path)
-      encoded = os.fsencode(path)
+      encoded = os.fsencode(check_path)
       record = struct.pack('!IIQ8s', len(encoded), kind, size, digest) + encoded
-      self.system_records[path] = record, size
-      records.append(record)
-    result = b'DCSH' + struct.pack('!I', len(records)) + b''.join(records)
+      self.system_records[path] = check_path, record, size
+      records[check_path] = record, size
+    result = (b'DCSH' + struct.pack('!I', len(records)) +
+              b''.join(records[path][0] for path in sorted(records)))
     if len(result) > 16 * 1024 * 1024 or len(records) > 65536:
       raise basics.NotCoveredError('Too many system header checks')
     return result
