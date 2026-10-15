@@ -66,8 +66,8 @@ class PreprocessTest(BrokerTestCase):
     def test_stdout_files_macros_and_dependencies(self):
         header = self.work / 'value.h'
         header.write_text('#define VALUE 17\n')
-        self.source.write_text('#include "value.h"\nint n = VALUE;\nconst char *p = __FILE__;\n')
-        for compiler in ('gcc', shutil.which('clang')):
+        self.source.write_text('#include <stddef.h>\n#include "value.h"\nint n = VALUE;\nconst char *p = __FILE__;\n')
+        for compiler in ('gcc', shutil.which('clang'), 'clang' if shutil.which('clang') else None):
             if not compiler:
                 continue
             with self.subTest(compiler=compiler):

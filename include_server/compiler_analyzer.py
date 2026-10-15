@@ -144,7 +144,8 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       raise basics.NotCoveredError('Modules, PCH, plugins and frontend overrides require local preprocessing')
     clang, options = self.context(command, self.translation_unit)
     try:
-      result = clang_scan.scan([command[0], *options, *command[1:], '-c'], currdir)
+      compiler = shutil.which(command[0]) or command[0]
+      result = clang_scan.scan([compiler, *options, *command[1:], '-c'], currdir)
     except (RuntimeError, ValueError) as error:
       raise basics.NotCoveredError(str(error)) from error
     canonicalize = self.canonical_path.Canonicalize
