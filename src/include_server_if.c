@@ -59,7 +59,8 @@ static int dcc_categorize_file(const char *include_server_filename);
  * if anything goes wrong, it returns a non-zero value.
  */
 
-int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr, int block)
+int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr,
+                               int block, int *cpp_lock_fd)
 {
     char *include_server_port;
     int fd = -1, lock_fd = -1;
@@ -104,6 +105,13 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
     ret = dcc_lock_file(lock_path, block, &lock_fd);
     free(lock_path);
     if (ret) return ret;
+    /* A caller may have waited for a local preprocessing slot while the
+     * analyzer was busy. Once analysis is admitted, return that slot before
+     * doing I/O: a stalled analyzer must not prevent local preprocessing. */
+    if (cpp_lock_fd && *cpp_lock_fd != -1) {
+        dcc_unlock(*cpp_lock_fd);
+        *cpp_lock_fd = -1;
+    }
     ret = 1;
     if (dcc_connect_by_addr((struct sockaddr *) &sa, sizeof(sa), &fd))
         goto out;
@@ -206,7 +214,7 @@ dcc_approximate_includes(struct dcc_hostdef *host, char **argv)
         //return 0;
     }
 
-    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr, 1))) {
+    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr, 1, NULL))) {
         rs_log_error("failed to get includes from include server");
         return ret;
     }

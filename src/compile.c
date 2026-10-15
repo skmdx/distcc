@@ -808,8 +808,20 @@ dcc_build_somewhere(char *argv[],
             dcc_free_hostdef(entry);
             entry = next;
         }
-        if (count && same_format &&
-            (ret = dcc_talk_to_include_server(argv, &files, compr, 0))) {
+        if (count && same_format) {
+            ret = dcc_talk_to_include_server(argv, &files, compr, 0, NULL);
+            if (ret == EXIT_BUSY) {
+                /* Reconsider analysis after waiting for local capacity. A
+                 * busy snapshot must not commit the whole queued batch to
+                 * preprocessing after the analyzer becomes available. */
+                rs_trace("include analyzer busy; waiting for local preprocessing capacity");
+                dcc_read_localslots_configuration();
+                if ((ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
+                ret = dcc_talk_to_include_server(argv, &files, compr, 0,
+                                                  &local_cpu_lock_fd);
+            }
+        }
+        if (count && same_format && ret) {
             if (ret == EXIT_BUSY)
                 rs_trace("include analyzer busy; preprocessing locally before worker selection");
             else {
@@ -834,7 +846,7 @@ dcc_build_somewhere(char *argv[],
     if (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER") &&
         !getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes) {
         dcc_read_localslots_configuration();
-        if (!dcc_is_preprocessed(input_fname) &&
+        if (local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
             (ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
         ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid, &cpp_fd);
         if (!ret) ret = dcc_wait_for_cpp(cpp_pid, status, input_fname);
@@ -894,7 +906,7 @@ dcc_build_somewhere(char *argv[],
         goto unlock_and_clean_up;
     }
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr, 0))) {
+        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr, 0, NULL))) {
             /* Fallback to doing cpp locally */
             /* It's unfortunate that the variable that controls that is in the
              * "host" datastructure, even though in this case it's the client
@@ -1125,7 +1137,7 @@ dcc_build_somewhere(char *argv[],
   lock_local:
     dcc_read_localslots_configuration();
     if (ret == EXIT_LOCAL_CPP) {
-        dcc_lock_local_cpp(&local_cpu_lock_fd);
+        if (local_cpu_lock_fd == -1) dcc_lock_local_cpp(&local_cpu_lock_fd);
     } else {
         dcc_lock_local(&cpu_lock_fd);
     }

@@ -169,6 +169,52 @@ class PreprocessTest(BrokerTestCase):
         self.assertIn('send CDIR', log.read_text())
         self.assertNotIn('preprocessing locally', log.read_text())
 
+    def test_waiting_local_cpp_reconsiders_scanner_without_holding_slot(self):
+        lease = self.request(12)
+        self.assertEqual(self.receive(lease), (0, 1, []))
+        pid = int(self.env['INCLUDE_SERVER_PID'])
+        log = self.work / 'client.log'
+        client = None
+        with open(self.env['INCLUDE_SERVER_PORT'] + '.lock', 'a') as lock:
+            fcntl.lockf(lock, fcntl.LOCK_EX)
+            try:
+                client = subprocess.Popen(
+                    [str(self.build / 'distcc'), 'gcc', '-c', str(self.source), '-o', 'queued.o'],
+                    cwd=self.work, env=self.env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.monotonic() + 5
+                while not log.exists() or 'include analyzer busy' not in log.read_text():
+                    self.assertIsNone(client.poll())
+                    self.assertLess(time.monotonic(), deadline, 'busy scanner not reached')
+                    time.sleep(.01)
+                # The analyzer becomes available while this client waits for
+                # local admission. Stop its I/O to verify lease ownership.
+                os.kill(pid, signal.SIGSTOP)
+                fcntl.lockf(lock, fcntl.LOCK_UN)
+                lease.close()
+                deadline = time.monotonic() + 5
+                while 'send CDIR' not in log.read_text():
+                    self.assertIsNone(client.poll(), 'queued client preprocessed instead of rescanning')
+                    self.assertLess(time.monotonic(), deadline, 'scanner not reconsidered')
+                    time.sleep(.01)
+                other = self.request(12)
+                self.assertEqual(self.receive(other), (0, 1, []))
+                other.close()
+            finally:
+                lease.close()
+                os.kill(pid, signal.SIGCONT)
+                if client is not None:
+                    try:
+                        client.wait(timeout=15)
+                    finally:
+                        if client.poll() is None:
+                            client.kill()
+                            client.wait()
+        assert client is not None
+        self.assertEqual(client.returncode, 0)
+        self.assertTrue((self.work / 'queued.o').exists())
+        self.assertNotIn('preprocessing locally', log.read_text())
+
     def test_remote_cpp_difference_still_disables_pump(self):
         self.source.write_text('#ifdef REMOTE_COMPILER_FAULT\n#error wrong worker setup\n#endif\nint value;\n')
         wrapper = self.root / 'bin/gcc'
