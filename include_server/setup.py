@@ -177,11 +177,11 @@ if not llvm_config:
   if clang:
     llvm_config = os.path.join(os.path.dirname(os.path.realpath(clang)), 'llvm-config')
 if not llvm_config or not os.path.isfile(llvm_config):
-  sys.exit('libclang-cpp header analysis requires LLVM_CONFIG pointing to llvm-config (LLVM 22 or 23).')
+  sys.exit('libclang-cpp header analysis requires LLVM_CONFIG pointing to llvm-config (LLVM 19, 22 or 23).')
 def llvm_option(option):
   return subprocess.check_output([llvm_config, option], text=True).strip()
-if llvm_option('--version').split('.')[0] not in ('22', '23'):
-  sys.exit('libclang-cpp header analysis requires LLVM 22 or 23 headers and libraries.')
+if llvm_option('--version').split('.')[0] not in ('19', '22', '23'):
+  sys.exit('libclang-cpp header analysis requires LLVM 19, 22 or 23 headers and libraries.')
 llvm_lib = llvm_option('--libdir')
 scanner = setuptools.Extension(
     name='include_server.clang_scan',

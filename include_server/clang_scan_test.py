@@ -78,7 +78,7 @@ class ClangScanTest(unittest.TestCase):
   def test_module_declarations_require_local_preprocessing(self):
     command = [self.compiler, '-x', 'c++', '-std=c++20', '-c', str(self.source)]
     for text in ('export module example;', 'import example;',
-                 'module;', 'export import example;'):
+                 'module;\nexport module example;', 'export import example;'):
       with self.subTest(text=text):
         self.source.write_text(text + '\n')
         with self.assertRaises(RuntimeError):
