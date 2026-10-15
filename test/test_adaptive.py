@@ -103,6 +103,11 @@ class DistccTestCase(unittest.TestCase):
         wrapper.write_text('#!/bin/sh\nsleep 0.3\nexec ' +
                            "'" + cls.cc.replace("'", "'\\''") + "' \"$@\"\n")
         wrapper.chmod(0o755)
+        # Use the client's selected slotted compiler for bare Clang names too.
+        for name in ('clang', 'clang++'):
+            compiler_path = shutil.which(name)
+            if compiler_path:
+                (wrappers / name).symlink_to(compiler_path)
         target = subprocess.check_output([cls.cc, "-dumpmachine"], text=True).strip()
         (wrappers / (target + "-gcc")).symlink_to("gcc")
         for i in range(2):
