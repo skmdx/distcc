@@ -68,7 +68,9 @@ def _SystemSearchdirsGCC(compiler, sysroot, language, canonical_lookup):
   command = [compiler]
   if sysroot:
     command += ["--sysroot=" + sysroot]
-  command += ["-x", language, "-v", "-c", "/dev/null", "-o", "/dev/null"]
+  # Include discovery needs no object output. Preprocessing also lets ccache
+  # pass through without opening a cache outside the build sandbox.
+  command += ["-x", language, "-v", "-E", "/dev/null", "-o", "/dev/null"]
   Debug(DEBUG_DATA, "system search dirs command: %s" % command)
 
   try:
