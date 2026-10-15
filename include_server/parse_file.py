@@ -132,6 +132,7 @@ class ParseFile(object):
     """
     assert isinstance(includepath_map, cache_basics.MapToIndex)
     self.includepath_map = includepath_map
+    self.raw_strings = True
     self.define_callback = lambda x: None
 
   def SetDefineCallback(self, callback_function):
@@ -178,7 +179,7 @@ class ParseFile(object):
     quote_includes, angle_includes, expr_includes, next_includes = [], [], [], []
     try:
       with open(filepath, 'rb') as source:
-        directives = clang_scan.directives(source.read())
+        directives = clang_scan.directives(source.read(), self.raw_strings)
       for directive, operand in directives:
         operand = BACKSLASH_RE.sub('', operand).strip()
         if directive in ('if', 'elif'):

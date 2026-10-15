@@ -187,7 +187,7 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
     master_cache: a two-level node cache
 
   The key of the top-level cache is an include configuration of the form
-     (currdir_idx, quote_dirs, angle_dirs)
+     (currdir_idx, quote_dirs, angle_dirs, raw_strings)
 
   The value of the top-level cache is a node-cache (defined next).
 
@@ -306,7 +306,7 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
 
   def RunAlgorithm(self, filepath_resolved_pair, filepath_real_idx):
     """See RunAlgorithm of class IncludeAnalyzer in include_analyzer."""
-    incl_config = (self.currdir_idx, self.quote_dirs, self.angle_dirs)
+    incl_config = (self.currdir_idx, self.quote_dirs, self.angle_dirs, self.parse_file.raw_strings)
     try:
       nodes_for_incl_config = self.master_cache[incl_config]
     except KeyError:
@@ -533,14 +533,14 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
     # Try to get the cached result of parsing file.
     try:
       (quote_includes, angle_includes, expr_includes, next_includes) = (
-        self.file_cache[fp_real_idx])
+        self.file_cache[fp_real_idx, self.parse_file.raw_strings])
     except KeyError:
       # Parse the file.
-      self.file_cache[fp_real_idx] = self.parse_file.Parse(
+      self.file_cache[fp_real_idx, self.parse_file.raw_strings] = self.parse_file.Parse(
          self.realpath_map.string[fp_real_idx],
          self.symbol_table)
       (quote_includes, angle_includes, expr_includes, next_includes) = (
-        self.file_cache[fp_real_idx])
+        self.file_cache[fp_real_idx, self.parse_file.raw_strings])
 
 
     # Do the includes of the form #include "foo.h".

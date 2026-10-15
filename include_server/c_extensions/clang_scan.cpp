@@ -313,18 +313,21 @@ std::string cleanDirectiveName(llvm::StringRef spelling) {
 PyObject *directives(PyObject *, PyObject *arguments) {
     const char *text;
     Py_ssize_t size;
-    if (!PyArg_ParseTuple(arguments, "y#", &text, &size)) return nullptr;
+    int raw_strings;
+    if (!PyArg_ParseTuple(arguments, "y#p", &text, &size, &raw_strings)) return nullptr;
     llvm::StringRef source(text, size);
     if (requiresModules(source))
         return PyErr_Format(PyExc_ValueError, "unsupported dependency syntax or module declaration");
-    // The graph is shared between language modes. Trigraph interpretation
-    // depends on that mode, so it cannot share this lexical cache.
+    // Trigraph interpretation varies by dialect and is not represented in
+    // the graph's lexical cache key.
     for (size_t i = 0; i + 2 < source.size(); ++i)
         if (source[i] == '?' && source[i + 1] == '?' &&
             llvm::StringRef("=/'()!<>-").contains(source[i + 2]))
             return PyErr_Format(PyExc_ValueError, "trigraphs require local preprocessing");
     LangOptions options;
-    options.CPlusPlus = options.CPlusPlus11 = options.LineComment = options.Digraphs = true;
+    options.CPlusPlus = options.LineComment = options.Digraphs = true;
+    options.CPlusPlus11 = raw_strings;
+    options.RawStringLiterals = raw_strings;
     DirectiveLexer lexer(SourceLocation::getFromRawEncoding(1), options, text, text, text + size);
     PyObject *result = PyList_New(0);
     if (!result) return nullptr;

@@ -218,7 +218,12 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         if directory is None:
           raise basics.NotCoveredError('Implicit header is outside compiler search paths')
         search_entries.append((3, path[len(directory.rstrip('/')) + 1:]))
-    context = (clang, options, tuple(search_entries), matching_search)
+    # GCC accepts raw strings as a GNU extension even in C. In strict modes
+    # they require C++11; treating a C macro as a multiline raw string can hide
+    # active directives, so both the file and graph caches include this mode.
+    raw_strings = ('#define __STRICT_ANSI__ ' not in macros or
+                   '#define __cpp_raw_strings ' in macros)
+    context = (clang, options, tuple(search_entries), matching_search, raw_strings)
     self.contexts[key] = context
     if len(self.contexts) > 8:
       self.contexts.popitem(last=False)
@@ -248,13 +253,15 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
                         '-serialize-diagnostics', '--serialize-diagnostics'))
         for arg in command[1:]):
       raise basics.NotCoveredError('Modules, PCH, plugins and frontend overrides require local preprocessing')
-    clang, options, self.system_includes, matching_search = self.context(command, self.translation_unit)
+    (clang, options, self.system_includes, matching_search,
+     self.parse_file.raw_strings) = self.context(command, self.translation_unit)
     if not clang:
       implicit = tuple(self.includepath_map.Index(options[i + 1],
                        ignore_absolute_path_warning=True)
                        for i, option in enumerate(options[:-1]) if option == '-include')
       parsed_command = (*parsed_command[:2], implicit + self.include_files, *parsed_command[3:])
-    if not clang and self.timer and (self.currdir_idx, self.quote_dirs, self.angle_dirs) not in self.master_cache:
+    if not clang and self.timer and (self.currdir_idx, self.quote_dirs, self.angle_dirs,
+                                    self.parse_file.raw_strings) not in self.master_cache:
       # The first conservative GCC graph may search hundreds of include
       # directories. Let it finish populating the cache instead of repeatedly
       # timing out and discarding it. Warm requests retain the normal quota.
@@ -264,7 +271,8 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     conservative = (super().ProcessCompilationCommand(currdir, parsed_command)
                     if not clang else {})
     literal_graph = not clang and matching_search and all(
-        all(isinstance(expr, parse_file.ProbeExpression) for expr in self.file_cache[index][2])
+        all(isinstance(expr, parse_file.ProbeExpression)
+            for expr in self.file_cache[index, self.parse_file.raw_strings][2])
         for index in conservative)
     result = {'files': {}, 'dependencies': [], 'lookups': {}}
     if not literal_graph:

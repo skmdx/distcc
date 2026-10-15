@@ -340,9 +340,17 @@ class ClangScanTest(unittest.TestCase):
               b'/* #if hidden */\nconst char *s = "#if hidden";\n'
               b'#if HAS("a.h") /* explanation */\nint a;\n'
               b'#elif JOIN(__has_,include)("b.h")\n#endif\n')
-    self.assertEqual([value for name, value in clang_scan.directives(source)
+    self.assertEqual([value for name, value in clang_scan.directives(source, True)
                       if name in ('if', 'elif')],
                      ['HAS("a.h")', 'JOIN(__has_,include)("b.h")'])
+
+  def test_raw_string_mode_preserves_active_directives(self):
+    source = (b'#define START R"(\n#if __has_include("present.h")\n'
+              b'int present;\n#endif\n#define FINISH )"\n')
+    for raw_strings, expected in ((True, []), (False, ['__has_include("present.h")'])):
+      with self.subTest(raw_strings=raw_strings):
+        self.assertEqual([value for name, value in clang_scan.directives(source, raw_strings)
+                          if name == 'if'], expected)
 
   def test_indirect_probe_is_not_silently_ignored(self):
     for source in (b'#define HAS __has_include\n',

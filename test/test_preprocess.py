@@ -581,6 +581,24 @@ class PreprocessTest(BrokerTestCase):
         self.assertIn(b'42', self.compare('gcc', ['-I', 'first', '-I', 'second',
                                                '-isystem', 'first', '-P']).stdout)
 
+    def test_c_macro_string_does_not_hide_a_header_probe(self):
+        (self.work / 'present.h').write_text('/* existence only */\n')
+        self.source.write_text(
+            '#define START R"(\n'
+            '#if __has_builtin(__builtin_speculation_safe_value)\n'
+            '#if __has_include("present.h")\nint included = 1;\n'
+            '#else\nint included = 0;\n#endif\n#endif\n'
+            '#define FINISH )"\n')
+        # Reuse one analyzer and unchanged input across modes in both orders.
+        # GNU C accepts raw strings as an extension, but ISO C does not.
+        for standard, expected in (('gnu11', b''), ('c11', b'int included = 1;\n'),
+                                   ('gnu11', b''), ('c11', b'int included = 1;\n')):
+            with self.subTest(standard=standard):
+                result = self.compare('gcc', ['-std=' + standard, '-P'])
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertEqual(result.stdout, expected)
+        self.assertNotIn('gave up analyzing', (self.work / 'client.log').read_text())
+
     def test_gcc_native_and_optimizer_flags_preserve_header_selection(self):
         (self.work / 'abm.h').write_text('#define VALUE 19\n')
         (self.work / 'plain.h').write_text('#define VALUE 7\n')
