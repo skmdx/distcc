@@ -65,11 +65,12 @@ const char *file = __FILE__, *base = __BASE_FILE__, *stamp = __TIMESTAMP__;
         self.check_changed_directory_replays_preprocessing()
 
     def test_symlink_parent_search_replays_preprocessing(self):
-        nested = self.root / 'elsewhere' / 'nested'
+        nested = self.root / 'elsewhere' / 'deeper' / 'nested'
         nested.mkdir(parents=True)
         (self.work / 'link').symlink_to(nested, target_is_directory=True)
-        # link/../.. resolves outside cwd, unlike lexical removal of "..".
-        self.search = ['-Ilink/../../' + Path(arg[2:]).name for arg in self.search]
+        # Actual resolution reaches the fixture root; lexical removal of
+        # these parents would escape it and search the wrong directories.
+        self.search = ['-Ilink/../../../' + Path(arg[2:]).name for arg in self.search]
         self.check_changed_directory_replays_preprocessing()
 
     def check_changed_directory_replays_preprocessing(self):
