@@ -5,6 +5,7 @@
 #include "gcc-plugin.h"
 #include "plugin-version.h"
 #include "c-family/c-pragma.h"
+#include "langhooks.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,33 @@ bool precompiled = false;
 std::string input_root;
 std::vector<std::string> cxx_system_dirs;
 void (*read_pch)(cpp_reader *, const char *, int, const char *) = nullptr;
+
+uintptr_t scan_tokens(cpp_reader *reader, const cpp_token *, uintptr_t)
+{
+    // Explicit directives-only preprocessing has a different native scanner.
+    if (cpp_get_options(reader)->directives_only) return 0;
+    // GCC calls this hook after initializing the preprocessor, before streaming
+    // its first token. Consume the native stream here without formatting ordinary
+    // tokens. cpp_scan_nooutput is unsuitable: it skips ordinary macro uses,
+    // whose side effects (notably __COUNTER__) can change later dependencies.
+    cpp_get_callbacks(reader)->line_change = nullptr;
+    for (;;) {
+        location_t location;
+        const cpp_token *token = cpp_get_token_with_location(reader, &location);
+        input_location = location;
+        if (token->type == CPP_EOF) {
+            // Leave EOF for the caller; lexing again after the input buffer has
+            // been popped is invalid. GCC's token lookahead owns its lifetime.
+            _cpp_backup_tokens(reader, 1);
+            break;
+        }
+        // Keep the same early pragma dispatch as GCC's token_streamer, including
+        // diagnostic push/pop. All parsing and expansion remain in the frontend.
+        if (token->type == CPP_PRAGMA && token->val.pragma >= PRAGMA_FIRST_EXTERNAL)
+            c_pp_invoke_early_pragma_handler(token->val.pragma);
+    }
+    return 0;
+}
 
 void read_precompiled(cpp_reader *reader, const char *name, int fd, const char *original)
 {
@@ -110,6 +138,10 @@ int plugin_init(struct plugin_name_args *arguments, struct plugin_gcc_version *v
     if (fstat(descriptor, &info) || !S_ISREG(info.st_mode) || lseek(descriptor, 0, SEEK_CUR) != 0) return 1;
     output = fdopen(descriptor, "wb");
     if (!output || setvbuf(output, output_buffer, _IOFBF, sizeof output_buffer)) return 1;
+    // Module preprocessing has a language-specific token observer and is not
+    // supported by the dependency collector. Never replace that observer.
+    if (flag_modules) return 1;
+    lang_hooks.preprocess_token = scan_tokens;
     register_callback(arguments->base_name, PLUGIN_FINISH, finish, nullptr);
     register_callback(arguments->base_name, PLUGIN_INCLUDE_FILE, entered_file, nullptr);
     return 0;

@@ -135,6 +135,51 @@ class GccScanTest(unittest.TestCase):
     self.assertIn('int selected;', native.stdout)
     self.assertIn(str(header), self.scan()['dependencies'])
 
+  def test_token_collection_omits_text_but_keeps_pragma_and_forced_include_effects(self):
+    forced, selected = self.root/'forced.h', self.root/'selected.h'
+    forced.write_text('int forced = __COUNTER__;\n')
+    selected.write_text('int selected;\n')
+    self.source.write_text(
+        '#define VALUE 1\n#pragma push_macro("VALUE")\n'
+        '#undef VALUE\n#define VALUE 2\n#pragma pop_macro("VALUE")\n'
+        'int value = __COUNTER__;\n'
+        '#if __COUNTER__ == 2 && VALUE == 1\n#include "selected.h"\n#endif\n'
+        '_Pragma("GCC diagnostic error \\\"-Wundef\\\"")\n'
+        '#if UNDEFINED\n#endif\n')
+    for language in ('c', 'c++'):
+      with self.subTest(language=language):
+        command = [self.compiler, '-x', language, '-E', '-P',
+                   '-ftrack-macro-expansion=0', '-include', str(forced), str(self.source)]
+        native = subprocess.run(command, capture_output=True)
+        self.assertIn(b'int selected;', native.stdout)
+        self.assertIn(b'UNDEFINED', native.stderr)
+        with os.fdopen(os.memfd_create('gcc-test', os.MFD_CLOEXEC), 'w+b') as output:
+          fd = output.fileno()
+          scanned = subprocess.run([*command, '-fplugin=' + self.library,
+              '-fplugin-arg-' + Path(self.library).stem + '-output-fd=' + str(fd)],
+              pass_fds=(fd,), capture_output=True)
+          # Early pragma handlers may echo their arguments; ordinary tokens
+          # must bypass the text formatter completely.
+          self.assertNotIn(b'int ', scanned.stdout)
+          self.assertEqual(scanned.returncode, native.returncode)
+          self.assertEqual(scanned.stderr, native.stderr)
+          output.seek(0)
+          manifest = output.read()
+        self.assertTrue(manifest.startswith(b'DCGS2\0'))
+        self.assertTrue(manifest.endswith(b'\0\0'))
+        self.assertIn(os.fsencode(selected) + b'\0', manifest)
+        self.assertIn(str(selected), self.scan('-x', language, '-include', str(forced))['dependencies'])
+
+  def test_explicit_directives_only_keeps_native_scanner(self):
+    header = self.root/'selected.h'
+    header.write_text('int selected;\n')
+    self.source.write_text('#define HEADER "selected.h"\n'
+                           'int before = __COUNTER__;\n#include HEADER\n')
+    native = subprocess.run([self.compiler, '-E', '-fdirectives-only', str(self.source)],
+                            check=True, capture_output=True, text=True)
+    self.assertIn('int selected;', native.stdout)
+    self.assertIn(str(header), self.scan('-fdirectives-only')['dependencies'])
+
   def test_large_manifest_preserves_all_negative_probes(self):
     names = [('missing-' + str(i) + '-' + 'x' * 64 + '.h') for i in range(1000)]
     self.source.write_text(''.join('#if __has_include("' + name + '")\n#endif\n'

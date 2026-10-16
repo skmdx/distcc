@@ -19,8 +19,8 @@ def scan(command, cwd, library):
       env['DISTCC_CPP_LOOKUP_OUTPUT_FD'] = str(fd)
     # Dependency-only mode skips ordinary tokens, including __COUNTER__ uses
     # that can change a later include condition. Run the full preprocessor;
-    # only diagnostic expansion provenance can be omitted during collection.
-    invocation = [*command, '-E', '-ftrack-macro-expansion=0',
+    # the module consumes its tokens without serializing preprocessed text.
+    invocation = [*command, '-E', '-P', '-ftrack-macro-expansion=0',
                   '-fplugin=' + library,
                   '-fplugin-arg-' + Path(library).stem + '-output-fd=' + str(fd)]
     result = subprocess.run(invocation, cwd=cwd, env=env, pass_fds=(fd,),
