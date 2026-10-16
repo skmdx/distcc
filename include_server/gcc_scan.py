@@ -27,6 +27,8 @@ def scan(command, cwd, library):
   fields = data[6:-1].split(b'\0')
   if fields.pop() != b'' or len(fields) % 2:
     raise RuntimeError('Malformed GCC dependency scan')
+  # None denotes a failed header candidate, including a directory. The common
+  # publication cache records its identity and verifies namespace changes.
   lookups = {}
   for path, metadata in zip(fields[::2], fields[1::2]):
     path = os.path.join(cwd, os.fsdecode(path))

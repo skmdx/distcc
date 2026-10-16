@@ -61,13 +61,15 @@ analysis failure; it does not silently switch to another parser.
 Compressed source/header files are cached. The compiler scans every request and
 its observed input identities are checked before publishing the manifest. On supported local Linux
 filesystems, directory notifications select which negative lookups and ancestor
-identities need rechecking. Other filesystems and unavailable or exhausted
+identities need rechecking. Failed header candidates reuse these observations,
+including directories that the compiler skipped; positive files retain fresh
+metadata checks. Other filesystems and unavailable or exhausted
 notification watches retain full metadata checks. Header creation, modification, removal and symlink
 replacement invalidate cached inputs. A new generation holds new compressed files;
-previously issued manifests keep their old files until pump exits. If earlier
-cached observations change during a native scan, the cache generation is retired
+previously issued manifests keep their old files until pump exits. If cached
+observations change during a native scan, the cache generation is retired
 and the request is restarted once. Repeated invalidation or changed current
-inputs causes local preprocessing instead. Build
+file contents causes local preprocessing instead. Build
 dependencies must still prevent writes to an input during its compilation.
 An aborted analysis does not publish a partial manifest.
 

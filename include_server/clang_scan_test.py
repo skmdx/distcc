@@ -272,6 +272,46 @@ class ClangScanTest(unittest.TestCase):
     self.assertFalse(any(path.endswith('/prior.h.lz4s') for path in files))
     self.assertEqual(Path(image).read_bytes(), old_image)
 
+  def test_cached_failed_lookup_is_revalidated_when_a_header_appears(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    self.addCleanup(os.chdir, os.getcwd())
+    self.source.write_text('#if __has_include("generated/header.h")\n'
+                           '#include "generated/header.h"\n#endif\n')
+    header = self.root / 'generated/header.h'
+    native_scan = compiler_analyzer.gcc_scan.scan
+    for notifications in (True, False):
+      with self.subTest(notifications=notifications):
+        if header.exists():
+          header.unlink()
+          header.parent.rmdir()
+        keeper = basics.ClientRootKeeper()
+        self.addCleanup(keeper.CleanOutClientRoots)
+        analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+        command = [gcc, '-c', str(self.source)]
+        analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+        stamps = analyzer.build_stat_cache.file_stamps
+        if notifications and stamps.watch_fd < 0:
+          self.skipTest('inotify is required for the notification case')
+        if not notifications and stamps.watch_fd >= 0:
+          os.close(stamps.watch_fd)
+          stamps.watch_fd = -1
+        calls = []
+        def create_header(*args):
+          result = native_scan(*args)
+          calls.append(result)
+          if len(calls) == 1:
+            header.parent.mkdir()
+            header.write_text('int generated;\n')
+          return result
+        with mock.patch.object(compiler_analyzer.gcc_scan, 'scan', side_effect=create_header):
+          files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+        self.assertEqual(len(calls), 2)
+        image = next(path for path in files if path.endswith('/generated/header.h.lz4s'))
+        self.assertEqual(Path(image + '.xxh3').read_bytes()[:8],
+                         xxhash.xxh3_64_digest(header.read_bytes()))
+
   def test_compiler_scan_does_not_publish_a_change_during_compression(self):
     gcc = shutil.which('gcc')
     if not gcc:

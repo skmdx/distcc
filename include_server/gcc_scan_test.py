@@ -84,7 +84,7 @@ class GccScanTest(unittest.TestCase):
     self.source.write_text('#include <stdint.h>\nint n;\n')
     result = self.scan()
     self.assertNotIn(str(directory), result['dependencies'])
-    self.assertEqual(len(result['lookups'][str(directory)]), 3)
+    self.assertIsNone(result['lookups'][str(directory)])
 
 
 if __name__ == '__main__':

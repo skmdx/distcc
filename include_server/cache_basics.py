@@ -657,6 +657,10 @@ class FileStampCache(object):
     return identity + (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
   def Observe(self, path):
+    try:
+      return self.paths[(path, False)]
+    except KeyError:
+      pass
     # Keep '..' components: resolving them before following symlinks can refer
     # to a different file from the compiler's lookup.
     if not os.path.isabs(path):

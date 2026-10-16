@@ -23,14 +23,10 @@ static int missing_input(void **slot, void *opaque)
 {
     auto &visitor = *static_cast<input_visitor *>(opaque);
     const auto *path = static_cast<const char *>(*slot);
-    struct stat stamp;
-    // GCC also caches directories as failed header candidates. Their identity
-    // must be observed, but they are not absent paths or transferable files.
-    if (!stat(path, &stamp))
-        visitor.ok = S_ISDIR(stamp.st_mode) && visitor.callback(path, &stamp, visitor.context);
-    else
-        visitor.ok = (errno == ENOENT || errno == ENOTDIR) &&
-                     visitor.callback(path, nullptr, visitor.context);
+    // libcpp records ENOENT here, including directories and ENOTDIR. The
+    // publication cache observes these failed candidates and their ancestors;
+    // do not repeat every failed filesystem lookup in this process as well.
+    visitor.ok = visitor.callback(path, nullptr, visitor.context);
     return visitor.ok;
 }
 

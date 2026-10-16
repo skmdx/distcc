@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import struct
 import subprocess
 import time
@@ -263,8 +264,14 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     paths = set(result['dependencies'])
     stamps = self.build_stat_cache.file_stamps
     for path, expected in result['lookups'].items():
-      stamps.Observe(path)
-      if stamps.Stamp(path) != expected:
+      observed = stamps.Observe(path)
+      # Failed header candidates include directories. Reuse their observed
+      # absence: Changed below checks creation/replacement notifications (or
+      # stats every path when notifications cannot be trusted). Positive files
+      # still need a fresh stamp for mmap and hard-link writes.
+      changed = (observed is not None and not stat.S_ISDIR(observed[2])
+                 if expected is None else stamps.Stamp(path) != expected)
+      if changed:
         raise basics.NotCoveredError('Input changed after compiler dependency scan: ' + path)
     if stamps.Changed():
       raise _CacheInvalidated()
