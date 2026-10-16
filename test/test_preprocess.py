@@ -651,6 +651,11 @@ class PreprocessTest(BrokerTestCase):
         self.source.write_text('#include <string>\nstd::string value;\n')
         self.compare('g++', ['-P', '-std=c++17'])
 
+    def test_directory_candidate_does_not_shadow_system_header(self):
+        (self.work / 'stdint.h').mkdir()
+        self.source.write_text('#include <stdint.h>\nuint64_t value;\n')
+        self.compare(args=['-I' + str(self.work), '-P'])
+
     def test_comment_trigraphs_preserve_remote_macro_diagnostics(self):
         (self.work / 'macro.h').write_text('// double check ???)\n#define PRESENT(p) ((p) != 0)\n')
         self.source.write_text('#include "macro.h"\nint present(void) { int values[1]; return PRESENT(values); }\n')

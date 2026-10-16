@@ -22,7 +22,15 @@ struct input_visitor {
 static int missing_input(void **slot, void *opaque)
 {
     auto &visitor = *static_cast<input_visitor *>(opaque);
-    visitor.ok = visitor.callback(static_cast<const char *>(*slot), nullptr, visitor.context);
+    const auto *path = static_cast<const char *>(*slot);
+    struct stat stamp;
+    // GCC also caches directories as failed header candidates. Their identity
+    // must be observed, but they are not absent paths or transferable files.
+    if (!stat(path, &stamp))
+        visitor.ok = S_ISDIR(stamp.st_mode) && visitor.callback(path, &stamp, visitor.context);
+    else
+        visitor.ok = (errno == ENOENT || errno == ENOTDIR) &&
+                     visitor.callback(path, nullptr, visitor.context);
     return visitor.ok;
 }
 

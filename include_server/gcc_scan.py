@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import subprocess
+import stat
 
 
 def scan(command, cwd, library):
@@ -32,13 +33,15 @@ def scan(command, cwd, library):
     expected = None if metadata == b'-' else tuple(map(int, metadata.split()))
     if expected is not None and len(expected) != 6:
       raise RuntimeError('Malformed GCC dependency metadata')
+    if expected is not None and stat.S_ISDIR(expected[2]):
+      expected = expected[:3]
     if path in lookups and lookups[path] != expected:
       raise RuntimeError('Input changed during GCC dependency scan: ' + path)
     lookups[path] = expected
   files = []
   remaining = 64 * 1024 * 1024
   for path, expected in lookups.items():
-    if expected is None:
+    if expected is None or stat.S_ISDIR(expected[2]):
       continue
     remaining -= expected[3]
     if remaining < 0:

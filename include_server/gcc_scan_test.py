@@ -78,6 +78,14 @@ class GccScanTest(unittest.TestCase):
         result = self.scan(*options)
         self.assertEqual(result['lookups'][str(self.source)][3], len(contents))
 
+  def test_directory_candidates_are_observed_but_not_transferred(self):
+    directory = self.root/'stdint.h'
+    directory.mkdir()
+    self.source.write_text('#include <stdint.h>\nint n;\n')
+    result = self.scan()
+    self.assertNotIn(str(directory), result['dependencies'])
+    self.assertEqual(len(result['lookups'][str(directory)]), 3)
+
 
 if __name__ == '__main__':
   unittest.main()
