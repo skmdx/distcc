@@ -2,6 +2,7 @@
 """Bounded Gentoo build measurement, invoked by fleet.py inside its service."""
 import concurrent.futures
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -123,6 +124,22 @@ def fingerprint(tree):
     return digest.hexdigest()
 
 
+def implementation():
+    """Record code visible inside the build's mount namespace, before timing."""
+    spec = importlib.util.find_spec('include_server')
+    if spec is None or not spec.submodule_search_locations:
+        raise RuntimeError('installed include server is missing')
+    package = Path(next(iter(spec.submodule_search_locations)))
+    paths = []
+    for name in ('distcc', 'pump'):
+        binary = shutil.which(name)
+        if binary is None:
+            raise RuntimeError(name + ' is missing')
+        paths.append(Path(binary))
+    paths += sorted(p for p in package.iterdir() if p.suffix in ('.py', '.so'))
+    return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+
 def copy_configuration(source, destination):
     subprocess.run(['cp', '-a', '--reflink=auto', source, destination], check=True)
     # Relative links into repositories must retain their original meaning after
@@ -181,6 +198,7 @@ def measure(config, out, buildroot):
     assert os.path.samefile('/var/tmp', buildroot), 'private build mount is missing'
     buildtree = Path('/var/tmp/portage')
     out.mkdir()
+    (out / 'implementation.json').write_text(json.dumps(implementation(), indent=2) + '\n')
     runtime = out / 'runtime'
     runtime.mkdir(mode=0o755)
     account = pwd.getpwnam('portage')
