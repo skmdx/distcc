@@ -68,8 +68,7 @@ def _SystemSearchdirsGCC(compiler, sysroot, language, canonical_lookup):
   command = [compiler]
   if sysroot:
     command += ["--sysroot=" + sysroot]
-  # Include discovery needs no object output. Preprocessing also lets ccache
-  # pass through without opening a cache outside the build sandbox.
+  # Include discovery needs no object output.
   command += ["-x", language, "-v", "-E", "/dev/null", "-o", "/dev/null"]
   Debug(DEBUG_DATA, "system search dirs command: %s" % command)
 
@@ -88,7 +87,9 @@ def _SystemSearchdirsGCC(compiler, sysroot, language, canonical_lookup):
     # or the "Environment Variables Affecting GCC" section of the gcc
     # info page.
     #
-    trimmed_env = {'_DISTCC_SAFEGUARD': '1'}
+    # ccache initializes its cache even for -E, although the result is not
+    # cached. Disable it for probes to avoid writes outside the build sandbox.
+    trimmed_env = {'_DISTCC_SAFEGUARD': '1', 'CCACHE_DISABLE': '1'}
 
     if 'PATH' in os.environ:
       trimmed_env['PATH'] = os.environ['PATH']

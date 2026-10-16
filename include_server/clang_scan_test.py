@@ -32,27 +32,21 @@ class ClangScanTest(unittest.TestCase):
     return clang_scan.scan([self.compiler, '-c', str(self.source), '-I', str(self.root),
                             '-o', str(self.root / 'never.o')], str(self.root))
 
-  def test_system_search_probe_bypasses_unwritable_ccache(self):
+  def test_system_search_probe_does_not_initialize_ccache(self):
     ccache, gcc = shutil.which('ccache'), shutil.which('gcc')
     if not ccache or not gcc:
       self.skipTest('ccache and GCC are required')
-    blocked = self.root / 'not-a-directory'
-    blocked.write_text('')
+    cache = self.root / 'cache'
     compiler = self.root / 'wrapped-gcc'
     compiler.write_text('#!/bin/sh\nexport CCACHE_DIR=%s\nexec %s %s "$@"\n' %
-                        tuple(map(shlex.quote, (str(blocked / 'cache'), ccache, gcc))))
+                        tuple(map(shlex.quote, (str(cache), ccache, gcc))))
     compiler.chmod(0o755)
-    env = dict(os.environ)
-    env.pop('CCACHE_DISABLE', None)
-    failed = subprocess.run([str(compiler), '-x', 'c', '-c', '/dev/null', '-o', '/dev/null'],
-                            env=env, capture_output=True, timeout=10)
-    self.assertNotEqual(failed.returncode, 0)
-    self.assertIn(b'ccache: error:', failed.stderr)
     for language in ('c', 'c++'):
       with self.subTest(language=language):
         expected = compiler_defaults._SystemSearchdirsGCC(gcc, '', language, os.path.realpath)
         self.assertEqual(compiler_defaults._SystemSearchdirsGCC(
             str(compiler), '', language, os.path.realpath), expected)
+        self.assertFalse(cache.exists(), 'compiler probes must not initialize ccache')
 
   def test_probe_tokens_preserve_nested_macros_and_ignore_strings(self):
     source = (b'#define __has_include(header) 0\n'
