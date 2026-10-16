@@ -187,7 +187,11 @@ Without an input hint, selection uses marginal throughput and prefers available
 execution capacity. A missed completion forecast uses the running job's service
 age as a conservative residual estimate, so an overdue job cannot indefinitely
 appear about to finish. Recovery trials use calibrated speed rather than bypassing
-the completion-time comparison.
+the completion-time comparison. Hinted jobs remain in the broker until the
+selected worker has an execution lane available. An expired forecast alone does
+not authorize uploading another job into that worker's queue. Keeping the job
+movable lets a newly available worker take it; preparation and result transfer
+still overlap execution, and completion feedback releases capacity immediately.
 
 Successful TCP results carry input preparation, queue and execution durations
 in the existing reply and connection-return message. Only execution time is

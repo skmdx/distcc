@@ -482,13 +482,22 @@ class BrokerTest(BrokerTestCase):
             seed.sendmsg([struct.pack('=II3Q', 2, 7, 0, 0, duration)],
                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
         first, _ = self.acquire_reserved(10, (63, 1024 * 1024, 2))
-        self.acquire_reserved(10, (66, 4 * 1024 * 1024, 1), 16384)
+        short, _ = self.acquire_reserved(10, (66, 4 * 1024 * 1024, 1), 16384)
         heavy = self.request(10, (64, 4 * 1024 * 1024, 1), 1048576)
         heavy.settimeout(.05)
         with self.assertRaises(socket.timeout):
             heavy.recv(1032)
-        _, small = self.acquire_reserved(10, (65, 4 * 1024 * 1024, 1), 16384)
-        self.assertEqual(small.getpeername()[1], self.ports[1])
+        small = self.request(10, (65, 4 * 1024 * 1024, 1), 16384)
+        small.settimeout(.05)
+        with self.assertRaises(socket.timeout):
+            small.recv(1032)
+        # Expiring the short estimate alone must not enqueue another job on
+        # that worker. A real completion makes the lane available.
+        short.close()
+        small.settimeout(1)
+        _, _, descriptors = self.receive(small)
+        with socket.socket(fileno=descriptors[0]) as selected:
+            self.assertEqual(selected.getpeername()[1], self.ports[1])
         first.close()
         heavy.settimeout(1)
         _, _, descriptors = self.receive(heavy)

@@ -861,7 +861,15 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             if (predicted) {
                 forecast = predict(broker, client, i, work, cost, now, batch, probe, cap->capacity);
                 score = forecast.finish;
-                wait = blocked || p->busy >= inflight || forecast.start > forecast.prepare + .02;
+                /* Keep a ready job movable until an execution lane is actually
+                 * available. Near-zero predicted residuals are not completion
+                 * evidence: uploading then would strand it behind an overrun
+                 * while a different worker becomes free. Input preparation
+                 * and returning results still overlap running compilers. */
+                int lanes = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
+                if (cap->capacity >= 0 && cap->capacity < lanes) lanes = cap->capacity;
+                wait = blocked || work >= lanes || p->busy >= inflight ||
+                       forecast.start > forecast.prepare + .02;
             } else if (cost > 0) score *= cost;
             /* Protect this build's input producers when compilation shares
              * their machine. Otherwise compare actual completion estimates:
