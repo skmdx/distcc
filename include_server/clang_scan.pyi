@@ -1,6 +1,7 @@
 from typing import Sequence, TypedDict
 
 version: str
+gcc_scan_dir: str
 
 class ScanResult(TypedDict):
     files: dict[str, bytes]
@@ -8,5 +9,3 @@ class ScanResult(TypedDict):
     dependencies: list[str]
 
 def scan(argv: Sequence[str], cwd: str) -> ScanResult: ...
-def include_probes(source: bytes) -> list[tuple[int, str]]: ...
-def directives(source: bytes, raw_strings: bool) -> list[tuple[str, str]]: ...

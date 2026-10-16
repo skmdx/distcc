@@ -1,0 +1,51 @@
+"""Collect input identities from GCC's own preprocessing state."""
+import os
+from pathlib import Path
+import subprocess
+
+
+def scan(command, cwd, library):
+  """Use the selected GCC frontend; never interpret C/C++ in Python."""
+  env = dict(os.environ, LC_ALL='C', _DISTCC_SAFEGUARD='1', CCACHE_DISABLE='1')
+  with os.fdopen(os.memfd_create('distcc-gcc-inputs', os.MFD_CLOEXEC), 'w+b') as output:
+    fd = output.fileno()
+    invocation = [*command, '-E', '-M', '-MF', '/dev/null',
+                  '-fplugin=' + library,
+                  '-fplugin-arg-' + Path(library).stem + '-output-fd=' + str(fd)]
+    result = subprocess.run(invocation, cwd=cwd, env=env, pass_fds=(fd,),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30)
+    output.seek(0)
+    data = output.read(64 * 1024 * 1024 + 1)
+  # Source diagnostics (for example #error) need not prevent input collection.
+  # A completed manifest lets the worker reproduce both diagnostics and partial
+  # output. Startup failures, signals and incomplete collection remain failures.
+  if (result.returncode < 0 or len(data) > 64 * 1024 * 1024 or
+      not data.startswith(b'DCGS1\0') or not data.endswith(b'\0\0')):
+    raise RuntimeError('Incomplete or unsupported GCC dependency scan: ' +
+                       result.stderr.decode(errors='replace')[-2048:])
+  fields = data[6:-1].split(b'\0')
+  if fields.pop() != b'' or len(fields) % 2:
+    raise RuntimeError('Malformed GCC dependency scan')
+  lookups = {}
+  for path, metadata in zip(fields[::2], fields[1::2]):
+    path = os.path.join(cwd, os.fsdecode(path))
+    expected = None if metadata == b'-' else tuple(map(int, metadata.split()))
+    if expected is not None and len(expected) != 6:
+      raise RuntimeError('Malformed GCC dependency metadata')
+    if path in lookups and lookups[path] != expected:
+      raise RuntimeError('Input changed during GCC dependency scan: ' + path)
+    lookups[path] = expected
+  files = []
+  remaining = 64 * 1024 * 1024
+  for path, expected in lookups.items():
+    if expected is None:
+      continue
+    remaining -= expected[3]
+    if remaining < 0:
+      raise RuntimeError('Compiler input snapshots exceed 64 MiB')
+    files.append(path)
+  if not files:
+    raise RuntimeError('GCC dependency scan returned no inputs')
+  # The common publication path validates these identities before and after
+  # compression. Its immutable image cache reads only new or changed files.
+  return {'files': None, 'dependencies': files, 'lookups': lookups}

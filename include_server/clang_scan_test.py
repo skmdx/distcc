@@ -11,6 +11,7 @@ import xxhash
 
 import basics
 import clang_scan
+import gcc_scan
 import cache_basics
 import compiler_analyzer
 import compiler_defaults
@@ -48,15 +49,16 @@ class ClangScanTest(unittest.TestCase):
             str(compiler), '', language, os.path.realpath), expected)
         self.assertFalse(cache.exists(), 'compiler probes must not initialize ccache')
 
-  def test_probe_tokens_preserve_nested_macros_and_ignore_strings(self):
-    source = (b'#define __has_include(header) 0\n'
-              b'const char *s = "__has_include(fake.h)";\n'
-              b'#if __has_include(MAKE_HEADER(foo, nested(bar)))\n#endif\n'
-              b'#if __has_include_next(<next.h>)\n#endif\n'
-              b'#if __has_include/*x*/(/*y*/"comment.h")\n#endif\n')
-    self.assertEqual(clang_scan.include_probes(source),
-                     [(0, 'MAKE_HEADER(foo, nested(bar))'), (1, '<next.h>'),
-                      (0, '     "comment.h"')])
+  def test_clang_expands_nested_probe_macros_and_ignores_strings(self):
+    (self.root/'present.h').write_text('int present;\n')
+    self.source.write_text(
+        '#define SELECT(x,...) x\n#define CHECK(x) __has_include(x)\n'
+        'const char *s = "__has_include(fake.h)";\n'
+        '#if CHECK(SELECT("present.h", \'(\', "a,b", (nested, (args))))\n'
+        'int selected;\n#endif\n')
+    result = self.scan()
+    self.assertIn(str(self.root/'present.h'), result['dependencies'])
+    self.assertFalse(any(path.endswith('/fake.h') for path in result['lookups']))
 
   def test_system_header_aliases_are_transferred(self):
     gcc = shutil.which('gcc')
@@ -135,7 +137,7 @@ class ClangScanTest(unittest.TestCase):
         self.assertEqual(b'optional.h' in actual.stdout, present)
     self.assertTrue(all(output.closed for output in outputs))
 
-  def test_gcc_rejects_absolute_forwarder_before_clang_preprocessing(self):
+  def test_gcc_rejects_absolute_forwarder_in_native_preprocessing(self):
     gcc = shutil.which('gcc')
     if not gcc:
       self.skipTest('GCC is required')
@@ -149,11 +151,11 @@ class ClangScanTest(unittest.TestCase):
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
     with mock.patch.object(clang_scan, 'scan') as frontend:
-      with self.assertRaisesRegex(basics.NotCoveredError, 'Filepath must be relative'):
+      with self.assertRaisesRegex(basics.NotCoveredError, 'unsupported GCC dependency scan'):
         analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
       self.assertEqual(frontend.call_count, 0)
 
-  def test_gcc_literal_graph_and_computed_verification_use_real_frontends(self):
+  def test_gcc_literal_and_computed_includes_use_native_frontend(self):
     gcc = shutil.which('gcc')
     if not gcc:
       self.skipTest('GCC is required')
@@ -171,15 +173,15 @@ class ClangScanTest(unittest.TestCase):
         keeper = basics.ClientRootKeeper()
         self.addCleanup(keeper.CleanOutClientRoots)
         analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
-        with (mock.patch.object(compiler_analyzer, 'run', wraps=compiler_analyzer.run) as probe,
+        with (mock.patch.object(gcc_scan, 'scan', wraps=gcc_scan.scan) as probe,
               mock.patch.object(clang_scan, 'scan', wraps=clang_scan.scan) as frontend):
           files = analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
         self.assertTrue(any(path.endswith('/gcc.h.lzo') for path in files))
-        self.assertTrue(any(path.endswith('/clang.h.lzo') for path in files))
-        self.assertEqual(any('-M' in call.args[0] for call in probe.call_args_list), computed)
-        self.assertEqual(frontend.call_count, int(computed))
+        self.assertFalse(any(path.endswith('/clang.h.lzo') for path in files))
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(frontend.call_count, 0)
 
-  def test_compiler_search_order_mismatch_keeps_native_verification(self):
+  def test_compiler_search_order_uses_native_header_resolution(self):
     gcc = shutil.which('gcc')
     if not gcc:
       self.skipTest('GCC is required')
@@ -194,12 +196,12 @@ class ClangScanTest(unittest.TestCase):
     keeper = basics.ClientRootKeeper()
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
-    with (mock.patch.object(compiler_analyzer, 'run', wraps=compiler_analyzer.run) as probe,
+    with (mock.patch.object(gcc_scan, 'scan', wraps=gcc_scan.scan) as probe,
           mock.patch.object(clang_scan, 'scan', wraps=clang_scan.scan) as frontend):
       files = analyzer.DoCompilationCommand(command, str(self.root), keeper)
     self.assertTrue(any(path.endswith('/second/header.h.lzo') for path in files))
-    self.assertEqual(frontend.call_count, 1)
-    self.assertTrue(any('-M' in call.args[0] for call in probe.call_args_list))
+    self.assertEqual(frontend.call_count, 0)
+    self.assertEqual(probe.call_count, 1)
 
   def test_gcc_implicit_precompiled_header_requires_local_preprocessing(self):
     gcc = shutil.which('gcc')
@@ -207,15 +209,17 @@ class ClangScanTest(unittest.TestCase):
       self.skipTest('GCC is required')
     self.addCleanup(os.chdir, os.getcwd())
     (self.root / 'header.h').write_text('int header;\n')
-    (self.root / 'header.h.gch').write_bytes(b'cached compiler state')
+    subprocess.run([gcc, '-x', 'c-header', str(self.root/'header.h'),
+                    '-o', str(self.root/'header.h.gch')], check=True)
     self.source.write_text('#include "header.h"\n')
     keeper = basics.ClientRootKeeper()
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
-    with self.assertRaisesRegex(basics.NotCoveredError, 'Precompiled header'):
-      analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
+    with self.assertRaisesRegex(basics.NotCoveredError, 'unsupported GCC dependency scan'):
+      analyzer.DoCompilationCommand([gcc, '-fpch-preprocess', '-c', str(self.source)],
+                                    str(self.root), keeper)
 
-  def test_literal_graph_reuses_images_and_refreshes_changed_bytes(self):
+  def test_compiler_scan_reuses_images_and_refreshes_changed_bytes(self):
     gcc = shutil.which('gcc')
     if not gcc:
       self.skipTest('GCC is required')
@@ -236,7 +240,7 @@ class ClangScanTest(unittest.TestCase):
     image = next(path for path in files if path.endswith('/header.h.lz4s'))
     self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(header.read_bytes()))
 
-  def test_literal_graph_does_not_publish_a_change_during_compression(self):
+  def test_compiler_scan_does_not_publish_a_change_during_compression(self):
     gcc = shutil.which('gcc')
     if not gcc:
       self.skipTest('GCC is required')
@@ -379,49 +383,28 @@ class ClangScanTest(unittest.TestCase):
     self.assertNotEqual(cache_basics.FileStampCache.Stamp(str(header)),
                         result['lookups'][str(header)])
 
-  def test_conditions_are_extracted_without_comments_or_macro_bodies(self):
-    source = (b'#define HAS(x) __has_include(x)\n'
-              b'/* #if hidden */\nconst char *s = "#if hidden";\n'
-              b'#if HAS("a.h") /* explanation */\nint a;\n'
-              b'#elif JOIN(__has_,include)("b.h")\n#endif\n')
-    self.assertEqual([value for name, value in clang_scan.directives(source, True)
-                      if name in ('if', 'elif')],
-                     ['HAS("a.h")', 'JOIN(__has_,include)("b.h")'])
+  def test_clang_comments_and_raw_strings_do_not_create_includes(self):
+    self.source = self.root/'source.cpp'
+    (self.root/'present.h').write_text('int present;\n')
+    self.source.write_text(
+        '/* ?????/2019: fixed */\n// ?????/2015: still present\n'
+        '/* #include "comment.h" */\n'
+        'const char *s = R"text(\n#include "raw.h"\n)text";\n'
+        '#include "present.h"\n')
+    result = self.scan()
+    self.assertIn(str(self.root/'present.h'), result['dependencies'])
+    self.assertFalse(any(path.endswith(('/comment.h', '/raw.h')) for path in result['lookups']))
 
-  def test_raw_string_mode_preserves_active_directives(self):
-    source = (b'#define START R"(\n#if __has_include("present.h")\n'
-              b'int present;\n#endif\n#define FINISH )"\n')
-    for raw_strings, expected in ((True, []), (False, ['__has_include("present.h")'])):
-      with self.subTest(raw_strings=raw_strings):
-        self.assertEqual([value for name, value in clang_scan.directives(source, raw_strings)
-                          if name == 'if'], expected)
-
-  def test_harmless_comment_trigraphs_do_not_disable_analysis(self):
-    source = (b'// double check ???)\n/* ??= ??( ??! ??- */\n'
-              b'/* ?????/2019: fixed on newer devices */\n'
-              b'// ?????/2015: still present in older devices\n'
-              b'// ??/ \t is not followed by a newline\n'
-              b'#include "present.h"\n')
-    self.assertEqual(clang_scan.directives(source, True), [('include', '"present.h"')])
-    for source in (b'??=include "real.h"\n', b'// ??/\n#include "hidden.h"\n',
-                   b'// ??/ \t\n#include "hidden.h"\n',
-                   b'/* *??/\n/\n#include "real.h"\n',
-                   b'/* *??/\r\n/\n#include "real.h"\n'):
-      with self.subTest(source=source):
-        with self.assertRaisesRegex(ValueError, 'trigraphs require'):
-          clang_scan.directives(source, True)
-
-  def test_indirect_probe_is_not_silently_ignored(self):
-    for source in (b'#define HAS __has_include\n',
-                   b'#define HAS(x) __has_include(x)\n',
-                   b'#define HAS(x) __has_include_next(x)\n',
-                   b'#if CALL(__has_include, "probe.h")\n#endif\n'):
-      with self.subTest(source=source):
-        with self.assertRaisesRegex(ValueError, 'indirect header existence probe'):
-          clang_scan.include_probes(source)
-    self.assertEqual(clang_scan.include_probes(
-        b'#ifdef __has_include\n#endif\n#if defined(__has_include)\n#endif\n'
-        b'#if defined __has_include_next\n#endif\n'), [])
+  def test_clang_condition_aliases_use_preprocessor_expansion(self):
+    (self.root/'probe.h').write_text('int present;\n')
+    self.source.write_text(
+        '#define JOIN(a,b) a##b\n#define CHECK JOIN(__has_,include)\n'
+        '#define FORWARD(arg) CHECK(arg)\n'
+        '#if defined(CHECK) && FORWARD("probe.h")\nint selected;\n#endif\n')
+    subprocess.run([self.compiler, '-E', str(self.source)],
+                   stdout=subprocess.DEVNULL, check=True)
+    result = self.scan()
+    self.assertIn(str(self.root/'probe.h'), result['dependencies'])
 
   def test_failed_scan_is_not_reused_after_header_creation(self):
     self.source.write_text('#include "generated.h"\nint n = VALUE;\n')

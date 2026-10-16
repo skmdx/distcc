@@ -40,7 +40,7 @@ import traceback
 # Include server imports
 import basics
 import distcc_pump_c_extensions
-import statistics
+import scan_statistics as statistics
 
 # The default size passed to listen by a streaming socket server of
 # socketserver is only 5. Make it 4096, which is the default net.core.somaxconn
@@ -108,20 +108,6 @@ OPTIONS:
 
  -t, --time                  Print elapsed, user, and system time to stderr.
 
- --unsafe_absolute_includes  Do preprocessing on the compilation server even if
-                             includes of absolute filepaths are encountered.
-                             Such includes are then ignored for the purposes of
-                             gathering the include closure. See the
-                             include_server(1) man page for further information.
-                             Using this option may lead to incorrect results.
-
- --unsafe_no_unexpanded_functions
-                             Do not consider the unexpanded function macro name
-                             a possibility in the set of all possible macro
-                             expansions. Improves macro-heavy parsing performance
-                             significantly at the cost of possible edge cases.
-                             See the include_server(1) for more information.
-
  --no_force_dirs             Do not force the creation of all directories used
                              in an include path.  May improve performance for
                              some cases, but will break builds which use
@@ -133,14 +119,10 @@ OPTIONS:
 
  -w, --write_include_closure Write a .d_approx file which lists all the
                              included files calculated by the include server;
-                             with -x, additionally write the included files
+                             with -v, additionally write the included files
                              as calculated by CPP to a .d_exact file.
 
- -x, --exact_analysis        Use CPP instead, do not omit system headers files.
 """)
-
-# TODO(klarlund)
-#   --simple_algorithm         not currently implemented
 
 
 # UTILITIES
@@ -473,21 +455,17 @@ def _ParseCommandLineOptions():
   """
   try:
     opts, args = getopt.getopt(sys.argv[1:],
-			       "d:estvwx",
+			       "d:estvw",
 			       ["port=",
                                 "pid_file=",
                                 "debug_pattern=",
                                 "email",
                                 "no-email",
                                 "email_bound=",
-                                "exact_analysis",
                                 "path_observation_re=",
                                 "stat_reset_triggers=",
-                                "simple_algorithm",
                                 "statistics",
                                 "time",
-                                "unsafe_absolute_includes",
-                                "unsafe_no_unexpanded_functions",
                                 "no_force_dirs",
                                 "verify",
                                 "write_include_closure"])
@@ -519,11 +497,6 @@ def _ParseCommandLineOptions():
                   dict ([ (path, basics.Stamp(path))
                           for path in glob.glob(glob_expr) ]))
                  for glob_expr in arg.split(':') ]))
-      if opt in ("--simple_algorithm",):
-        basics.opt_simple_algorithm = True
-        sys.exit("Not implemented")
-      if opt in ("--unsafe_absolute_includes",):
-        basics.opt_unsafe_absolute_includes = True
       if opt in ("--no_force_dirs",):
         basics.opt_no_force_dirs = True
       if opt in ("-s", "--statistics"):
@@ -534,10 +507,6 @@ def _ParseCommandLineOptions():
         basics.opt_verify = True
       if opt in ("-w", "--write_include_closure"):
         basics.opt_write_include_closure = True
-      if opt in ("-x", "--exact_analysis"):
-        basics.opt_exact_include_analysis = True
-      if opt in ("--unsafe_no_unexpanded_functions"):
-        basics.opt_consider_unexpanded_macro_fns = False
     except ValueError:
       Usage()
       sys.exit(1)

@@ -186,12 +186,6 @@ USER_TIME_QUOTA = 3.8  # seconds
 # careful to wait a full 4 s before issuing SIGALRM.
 USER_TIME_QUOTA_CHECK_INTERVAL_TIME = 4  # seconds, an integer
 
-# ALGORITHMS
-
-SIMPLE = 0     # not implemented
-MEMOIZING = 1  # only one currently implemented
-ALGORITHMS = [SIMPLE, MEMOIZING]
-
 # PYTHON TUNING
 
 # The default for the first parameter of gc.set_threshold is 700; see
@@ -205,18 +199,13 @@ GC_THRESHOLD = 10000
 
 # FLAGS FOR COMMAND LINE OPTIONS
 
-opt_algorithm = MEMOIZING  # currently, only choice
 opt_debug_pattern = 1  # see DEBUG below
 opt_email_bound = MAX_EMAILS_TO_SEND
-opt_exact_analysis = False         # use CPP instead of include analyzer
 opt_print_times = False
 opt_path_observation_re = None
 opt_send_email = False
-opt_simple_algorithm = False
 opt_stat_reset_triggers = {}
 opt_statistics = False
-opt_unsafe_absolute_includes = False
-opt_consider_unexpanded_macro_fns = True # inverse of CLI to avoid double negative
 opt_no_force_dirs = False
 opt_verify = False     # whether to compare calculated include closure to that
                        # produced by compiler

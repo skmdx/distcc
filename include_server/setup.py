@@ -190,12 +190,15 @@ llvm_runtime_lib = llvm_lib
 sysroot = os.environ.get('SYSROOT', '').rstrip('/')
 if sysroot and llvm_lib.startswith(sysroot + '/'):
   llvm_runtime_lib = llvm_lib[len(sysroot):]
+libdir = next(flag.partition('=')[2] for flag in shlex.split(cpp_flags_env)
+              if flag.startswith('-DLIBDIR='))
 scanner = setuptools.Extension(
     name='include_server.clang_scan',
     sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_scan.cpp')],
     language='c++', include_dirs=[llvm_option('--includedir')],
     library_dirs=[llvm_lib], runtime_library_dirs=[llvm_runtime_lib],
     libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
+    define_macros=[('DCC_GCC_SCAN_DIR', '"' + libdir + '/distcc/gcc"')],
 )
 
 args = {

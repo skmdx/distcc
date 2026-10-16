@@ -23,9 +23,8 @@ __author__ = "Nils Klarlund"
 
 import time
 
-resolve_expr_counter = 0 # number of computed includes
-master_hit_counter = 0 # summary node hits
-master_miss_counter = 0 # summary node misses
+scan_counter = 0
+scan_seconds = 0.0
 resolve_counter = 0 # calls of Resolve method
 search_counter = 0 # number of probes in directory lists
 build_stat_counter = 0 # number of stats in build_stat_cache
@@ -38,12 +37,6 @@ min_time = float('Inf')
 max_time = 0.0
 total_time = 0.0
 
-parse_file_total_time = 0.0
-parse_file_counter = 0 # number of files parsed
-
-parse_file_counter_last = 0 # the number of files parsed after previous
-                            # translation unit
-
 quote_path_total = 0 # total length of quote directory lists
 angle_path_total = 0 # total length of angle directory lists
 
@@ -54,8 +47,6 @@ len_exact_closure = 0 # number of all files in CPP-calculated closure
 len_surplus_nonsys = 0  # the difference between
                         # len_calculated_closure and number of files
                         # in exact closure that are not known to compiler
-
-find_node_counter = 0 # number of times FindNode is called
 
 
 def StartTiming():
@@ -68,6 +59,7 @@ def StartTiming():
 def EndTiming():
   """Mark the end of an include closure calculation."""
   global translation_unit_time, min_time, max_time, total_time
+  assert start_time is not None
   translation_unit_time = time.perf_counter() - start_time
   min_time = min(translation_unit_time, min_time)
   max_time = max(translation_unit_time, max_time)
@@ -84,14 +76,7 @@ def PrintStatistics(include_analyzer):
            (translation_unit_time, min_time, max_time,
             total_time/translation_unit_counter,
             translation_unit_counter, total_time))
-    print ("PARSING: total %-5.3fs, total count: %4d, new files: %-5d" %
-           (parse_file_total_time, parse_file_counter,
-            parse_file_counter - parse_file_counter_last))
-    print("COUNTER: resolve_expr_counter:      %8d" % resolve_expr_counter)
-    print("COUNTER: master_hit_counter:        %8d" % master_hit_counter)
-    print("COUNTER: master_miss_counter:       %8d" % master_miss_counter)
-    print("SIZE:    master_cache               %8d" % (
-      len(include_analyzer.master_cache)))
+    print("SCANNING: total %.3fs, requests: %d" % (scan_seconds, scan_counter))
     print("COUNTER: sys_stat_counter:        %10d"  % sys_stat_counter)
     print("COUNTER: build_stat_counter:      %10d" % build_stat_counter)
     if resolve_counter != 0:

@@ -1,4 +1,4 @@
-"""Compiler-backed pump analysis with branch-independent GCC include coverage."""
+"""Compiler-backed pump analysis and immutable dependency snapshots."""
 import collections
 import io
 import os
@@ -7,14 +7,16 @@ import shlex
 import shutil
 import struct
 import subprocess
+import time
 import xxhash
 
 import basics
 import clang_scan
+import gcc_scan
 import compress_files
-import include_analyzer_memoizing_node
+import include_analyzer
 import parse_command
-import parse_file
+import scan_statistics as statistics
 
 
 def dependency_command(command, source):
@@ -42,7 +44,7 @@ def run(command, allow_errors=False):
     # Probes belong to the admitted analyzer. Portage's PATH can contain
     # distcc wrappers; do not queue internal work behind the clients whose
     # include requests this process is serving.
-    env = dict(os.environ, LC_ALL='C', _DISTCC_SAFEGUARD='1')
+    env = dict(os.environ, LC_ALL='C', _DISTCC_SAFEGUARD='1', CCACHE_DISABLE='1')
     library = env.get('DISTCC_CPP_LOOKUP_LIBRARY')
     if ('-M' in command and hasattr(os, 'memfd_create') and library and
         env.get('DISTCC_CPP_LOOKUP', '1') != '0' and os.access(library, os.R_OK)):
@@ -67,7 +69,7 @@ def run(command, allow_errors=False):
   return result
 
 
-class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingNode):
+class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
     self.contexts = collections.OrderedDict()
@@ -132,7 +134,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     sections = re.split(r'^distcc:', output, maxsplit=1, flags=re.M)
     if len(sections) != 2:
       raise basics.NotCoveredError('Compiler did not report implicit headers')
-    macros, implicit = sections
+    _, implicit = sections
     banner = run([compiler, '--version']).stdout.decode(errors='replace')
     version_match = re.search(r'clang version (\S+)', banner)
     clang = version_match is not None
@@ -140,45 +142,16 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
       if version_match[1] != clang_scan.version:
         raise basics.NotCoveredError('Clang compiler and libclang-cpp versions differ')
       options = []
-      matching_search = False
     else:
       if 'Free Software Foundation' not in banner:
         raise basics.NotCoveredError('Unsupported compiler for header analysis')
-      search = re.search(r'#include <\.\.\.> search starts here:\n(.*?)End of search list\.',
-                         result.stderr.decode(errors='replace'), re.S)
-      if search is None:
-        raise basics.NotCoveredError('Cannot obtain GCC header search path')
-      quote_search = re.search(r'#include "\.\.\." search starts here:\n(.*?)#include <\.\.\.>',
-                               result.stderr.decode(errors='surrogateescape'), re.S)
-      quote_dirs = tuple(line.strip() for line in quote_search[1].splitlines()) if quote_search else ()
-      angle_dirs = tuple(line.strip() for line in search[1].splitlines())
-      def directory_identities(paths):
-        # GCC removes missing and duplicate search directories. The context
-        # shares the graph's invalidation generation, including directory and
-        # symlink changes, so compare their identities once per context.
-        return tuple(dict.fromkeys(os.path.realpath(path) for path in paths
-                                   if os.path.isdir(path)))
-      matching_search = ('-I-' not in command and
-          directory_identities(self.directory_map.string[index] for index in self.angle_dirs) == directory_identities(angle_dirs) and
-          directory_identities(self.directory_map.string[index] for index in self.quote_dirs) == directory_identities((*quote_dirs, *angle_dirs)))
-      options = ['--no-default-config', '-undef', '-nostdinc']
-      for line in macros.splitlines():
-        if not line.startswith('#define '):
-          raise basics.NotCoveredError('Unexpected compiler macro output')
-        name, _, value = line[8:].partition(' ')
-        options.append('-D' + name + '=' + value)
-      for directory in search[1].splitlines():
-        options += ['-isystem', directory.strip()]
-      for header in shlex.split(implicit.replace('\\\n', '').replace('$$', '$')):
-        if header != '/dev/null':
-          options += ['-include', header]
-      # The graph and compiler contexts share a cache generation. Seed once;
-      # later commands only add definitions when their context is new.
-      for option in options:
-        if option.startswith('-D'):
-          name, _, value = option[2:].partition('=')
-          parse_file.InsertMacroDefInTable(name, value, self.symbol_table,
-                                          self.support_master.InvalidateRecords)
+      options = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
+      if not options:
+        target = run([compiler, '-dumpmachine']).stdout.decode().strip()
+        version = run([compiler, '-dumpfullversion']).stdout.decode().strip()
+        options = os.path.join(clang_scan.gcc_scan_dir, target, version, 'distcc_gcc_scan.so')
+      if not os.path.isfile(options):
+        raise basics.NotCoveredError('GCC dependency module is not installed for this compiler')
     # Probe only built-in search directories. Explicit -I/-isystem/-idirafter
     # arguments remain on the worker's command line with their original class
     # and ordering. Target, sysroot and -nostdinc options still apply here.
@@ -222,12 +195,7 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
         if directory is None:
           raise basics.NotCoveredError('Implicit header is outside compiler search paths')
         search_entries.append((3, path[len(directory.rstrip('/')) + 1:]))
-    # GCC accepts raw strings as a GNU extension even in C. In strict modes
-    # they require C++11; treating a C macro as a multiline raw string can hide
-    # active directives, so both the file and graph caches include this mode.
-    raw_strings = ('#define __STRICT_ANSI__ ' not in macros or
-                   '#define __cpp_raw_strings ' in macros)
-    context = (clang, options, tuple(search_entries), matching_search, raw_strings)
+    context = (clang, options, tuple(search_entries))
     self.contexts[key] = context
     if len(self.contexts) > 8:
       self.contexts.popitem(last=False)
@@ -237,6 +205,11 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
     (self.quote_dirs, self.angle_dirs, self.include_files, self.translation_unit,
      self.result_file_prefix, self.d_opts) = parsed_command
     self.currdir_idx = self.directory_map.Index(currdir)
+    self.include_dir_pairs.add((self.quote_dirs, self.angle_dirs))
+    self.quote_dirs_set.add(self.quote_dirs)
+    self.angle_dirs_set.add(self.angle_dirs)
+    statistics.quote_path_total += len(self.quote_dirs)
+    statistics.angle_path_total += len(self.angle_dirs)
     for path in self.compiler_defaults.missing_system_dirs:
       self.build_stat_cache.file_stamps.Observe(path)
       if self.build_stat_cache.file_stamps.Stamp(path) is not None:
@@ -257,118 +230,47 @@ class CompilerAnalyzer(include_analyzer_memoizing_node.IncludeAnalyzerMemoizingN
                         '-serialize-diagnostics', '--serialize-diagnostics'))
         for arg in command[1:]):
       raise basics.NotCoveredError('Modules, PCH, plugins and frontend overrides require local preprocessing')
-    (clang, options, self.system_includes, matching_search,
-     self.parse_file.raw_strings) = self.context(command, self.translation_unit)
-    if not clang:
-      implicit = tuple(self.includepath_map.Index(options[i + 1],
-                       ignore_absolute_path_warning=True)
-                       for i, option in enumerate(options[:-1]) if option == '-include')
-      parsed_command = (*parsed_command[:2], implicit + self.include_files, *parsed_command[3:])
-    if not clang and self.timer and (self.currdir_idx, self.quote_dirs, self.angle_dirs,
-                                    self.parse_file.raw_strings) not in self.master_cache:
-      # The first conservative GCC graph may search hundreds of include
-      # directories. Let it finish populating the cache instead of repeatedly
-      # timing out and discarding it. Warm requests retain the normal quota.
-      self.timer.quota = 20.0
-    # Reject unsupported GCC inputs before running another full preprocessor.
-    # Generated forwarding headers often contain absolute include operands.
-    conservative = (super().ProcessCompilationCommand(currdir, parsed_command)
-                    if not clang else {})
-    literal_graph = not clang and matching_search and all(
-        all(isinstance(expr, parse_file.ProbeExpression)
-            for expr in self.file_cache[index, self.parse_file.raw_strings][2])
-        for index in conservative)
-    result = {'files': {}, 'dependencies': [], 'lookups': {}}
-    if not literal_graph:
-      try:
-        compiler = shutil.which(command[0]) or command[0]
-        scan_args = command[1:]
-        if not clang:
-          # These GCC switches have no Clang driver equivalents.
-          # Predefined macros come from GCC above; its dependency verification
-          # below and the actual compilation retain the original switches.
-          scan_args = [arg for arg in scan_args if arg not in
-                     ('-mabm', '-mno-abm', '-mhle', '-mno-hle',
-                      '-mdirect-extern-access', '-mno-direct-extern-access',
-                      '-mamx-tf32', '-mno-amx-tf32',
-                      '-mamx-transpose', '-mno-amx-transpose',
-                      '-ftree-pre', '-fno-tree-pre')]
-        result = clang_scan.scan([compiler, *options, *scan_args, '-c'], currdir)
-      except (RuntimeError, ValueError) as error:
-        raise basics.NotCoveredError(str(error)) from error
+    clang, options, self.system_includes = self.context(command, self.translation_unit)
+    started = time.perf_counter()
+    try:
+      compiler = shutil.which(command[0]) or command[0]
+      result = (clang_scan.scan([compiler, *command[1:], '-c'], currdir) if clang else
+                gcc_scan.scan([compiler, *command[1:]], currdir, options))
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+      raise basics.NotCoveredError(str(error), send_email=False) from error
+    finally:
+      statistics.scan_seconds += time.perf_counter() - started
+      statistics.scan_counter += 1
     canonicalize = self.canonical_path.Canonicalize
-    snapshots = {canonicalize(os.path.join(currdir, path)): data
-                 for path, data in result['files'].items()}
+    snapshots = (None if result['files'] is None else
+                 {canonicalize(os.path.join(currdir, path)): data
+                  for path, data in result['files'].items()})
     paths = set(result['dependencies'])
-    if not clang:
-      # -M omits existence-only probes. GCC may choose a different branch for
-      # __has_builtin/__has_attribute, so also retain the branch-independent
-      # include graph. Probe tokenization itself uses libclang-cpp.
-      remaining = 64 * 1024 * 1024 - sum(map(len, snapshots.values()))
-      for index in conservative:
-        path = self.realpath_map.string[index]
-        # GCC can implicitly replace an ordinary header with its adjacent
-        # precompiled image, whose captured macro state is not in this graph.
-        precompiled = path + '.gch'
-        if self.build_stat_cache.file_stamps.Observe(precompiled) is not None:
-          raise basics.NotCoveredError('Precompiled header requires local preprocessing: ' + path)
-        if literal_graph:
-          # The compressor already owns immutable images for cached inputs.
-          # Stream only new files there; the shared publication check below
-          # compression rejects any source change during collection.
-          stamp = self.build_stat_cache.file_stamps.Observe(path)
-          if stamp is None:
-            raise basics.NotCoveredError('Compiler input disappeared: ' + path)
-          remaining -= stamp[3]
-          if remaining < 0:
-            raise basics.NotCoveredError('Compiler input snapshots exceed 64 MiB')
-        elif path not in snapshots:
-          with open(path, 'rb') as source:
-            data = source.read(remaining + 1)
-          if len(data) > remaining:
-            raise basics.NotCoveredError('Compiler input snapshots exceed 64 MiB')
-          snapshots[path] = data
-          remaining -= len(data)
-      # Literal include operands are covered in every branch by the lexical
-      # graph, including branches selected only by GCC builtins. Computed
-      # operands still need the real GCC check: the macro evaluator is an
-      # overapproximation, not an implementation of every GCC extension.
-      if not literal_graph:
-        native = run([*command, '-E', '-M', '-MT', 'distcc', '-MF', '-'], allow_errors=True)
-        dependencies = native.stdout.decode(errors='surrogateescape').replace('\\\n', '')
-        if not dependencies.startswith('distcc:'):
-          raise basics.NotCoveredError('Unexpected GCC dependency output')
-        native_paths = shlex.split(dependencies[len('distcc:'):].replace('$$', '$'))
-        for path in native_paths:
-          canonical = canonicalize(os.path.join(currdir, path))
-          if canonical not in snapshots:
-            raise basics.NotCoveredError('GCC and Clang dependencies differ: ' + path)
-        paths.update(native_paths)
     stamps = self.build_stat_cache.file_stamps
     for path, expected in result['lookups'].items():
       stamps.Observe(path)
       if stamps.Stamp(path) != expected:
-        raise basics.NotCoveredError('Input changed after Clang dependency scan: ' + path)
-    if not clang and stamps.Changed():
-      raise basics.NotCoveredError('Input changed during GCC dependency verification')
+        raise basics.NotCoveredError('Input changed after compiler dependency scan: ' + path)
+    if stamps.Changed():
+      raise basics.NotCoveredError('Input changed during compiler dependency scan')
     # Keep source bytes unchanged. A shared header can be reached through both
     # relative and absolute spellings; one injected #line cannot represent both.
     # The worker remaps its private root with compiler prefix-map options.
-    closure = dict.fromkeys(conservative, ())
+    closure = {}
     for path in paths:
       absolute = path if os.path.isabs(path) else os.path.join(currdir, path)
       real_idx = self.realpath_map.Index(absolute)
       assert real_idx is not None  # A non-null path always has an index.
       canonical = self.realpath_map.string[real_idx]
-      if canonical not in snapshots:
+      if snapshots is not None and canonical not in snapshots:
         raise basics.NotCoveredError('Dependency has no input snapshot: ' + path)
       self.mirror_path.DoPath(absolute, self.currdir_idx, self.client_root_keeper.client_root)
       closure[real_idx] = ()
-    self.snapshots = None if literal_graph else snapshots
+    self.snapshots = snapshots
     for kind, path in self.system_includes:
       if kind != 3:
         self.mirror_path.DoPath(os.path.join(path, 'forcing_technique_271828'),
                                self.currdir_idx, self.client_root_keeper.client_root)
-    basics.Debug(basics.DEBUG_TRACE, 'libclang-cpp analysis (%s): %d inputs',
-                 'clang' if clang else 'gcc literal graph' if literal_graph else 'gcc verified', len(closure))
+    basics.Debug(basics.DEBUG_TRACE, 'Compiler dependency analysis (%s): %d inputs',
+                 'clang' if clang else 'gcc', len(closure))
     return closure

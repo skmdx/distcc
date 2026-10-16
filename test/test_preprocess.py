@@ -32,6 +32,12 @@ class PreprocessTest(BrokerTestCase):
                         DISTCC_CPP_LOOKUP_LIBRARY=str(self.build / 'cpp_lookup.so'),
                         DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_TESTING_INCLUDE_SERVER='1',
                         DISTCC_VERBOSE='1', DISTCC_LOG=str(self.work / 'client.log'))
+        # The isolated broker fixture drops production DISTCC settings. This
+        # path selects a build artifact and is required before pump starts.
+        module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
+        if module:
+            self.assertTrue(Path(module).is_file(), 'Build the GCC dependency module first')
+            self.env['DISTCC_GCC_SCAN_LIBRARY'] = module
         result = subprocess.run([str(self.build / 'pump'), '--startup'],
                                 cwd=self.work, env=self.env, capture_output=True,
                                 text=True, timeout=15)
@@ -460,7 +466,9 @@ class PreprocessTest(BrokerTestCase):
             local = self.run_cc(compiler, args, False)
             self.assertEqual(local.returncode, 0, local.stderr.decode())
             remote = self.run_cc(compiler, args)
-            self.assertEqual(remote.returncode, 0, remote.stderr.decode())
+            self.assertEqual(remote.returncode, 0,
+                             compiler + ': ' + remote.stderr.decode() +
+                             (self.work / 'client.log').read_text())
 
     def test_parallel_outputs_do_not_invalidate_header_analysis(self):
         (self.work / 'value.h').write_text('#define VALUE 17\n')
@@ -558,7 +566,7 @@ class PreprocessTest(BrokerTestCase):
 
     def test_gcc_only_branch_existence_probe_is_transferred(self):
         # GCC -M does not list existence-only probes, and Clang selects the
-        # other branch for this GCC builtin. The conservative guard is needed.
+        # other branch for this GCC builtin. Use the actual GCC frontend.
         (self.work / 'probe.h').write_text('/* must exist remotely */\n')
         self.source.write_text(
             '#if __has_builtin(__builtin_speculation_safe_value)\n'

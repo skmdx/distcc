@@ -1,6 +1,6 @@
 .TH include_server 1 "9 June 2008"
 .SH "NAME"
-include_server.py \- conservative approximation of include dependencies for C/C++
+include_server.py \- compiler-backed include dependencies for C/C++
 .SH "SYNOPSIS"
 .B include_server
 --port
@@ -88,40 +88,6 @@ invalidation triggers.
 .B -t, --time
 Print elapsed, user, and system time to stderr.
 .TP
-.B --unsafe_absolute_includes
-Do preprocessing on the compilation server even if includes of absolute
-filepaths are encountered.  Normally the include-server will fall back on local
-preprocessing if it detects any absolute includes.  Thus, this flag is useful
-for preventing such fallbacks when the absolute includes are a false alarm,
-either because the absolute include is discarded during preprocessing or because
-the absolutely included file exists on the compilation servers.
-.IP
-More precisely, with --unsafe_absolute_includes absolute includes are ignored
-for the purposes of gathering the include closure.  Using this option may lead
-to incorrect results because (1) the header may actually be included on the
-compilation server and it may not be the same as on the client, (2) the include
-directives of the header are not further analyzed.
-.IP
-The option is useful for compiling code that has such hardcoded absolute
-locations of header files inside conditional directives (e.g. "#ifdef") that
-render the includes irrelevant.  More precisely, these includes must be
-eliminated during preprocessing for the actual configuration. Then the question
-of existence of the header file is moot and the remote compilation is sound.
-This is often the case if such includes are meant for unusual configurations
-different from the actual configuration.
-.TP
-.B --unsafe_no_unexpanded_functions
-Because the include server does not follow #if branching, it must consider
-all possible values for macros, including the unexpanded macro name itself.
-This creates combinatorially large expansions when multiple functions
-are composed (as each can evaluate to their definition or their name).
-.IP
-At the risk of potentially missing headers to send in the closure, this
-option disables the consideration of function-type macro names in their
-unexpanded state to reduce the combinations considered. Errors should only
-occur if a function name collides with a token used in an include line,
-which should be rare in practice.
-.TP
 .B --no_force_dirs
 Do not force the creation of all directories used
 in an include path.  May improve performance for
@@ -135,11 +101,8 @@ closure calculated by include processor.
 .TP
 .B -w, --write_include_closure
 Write a .d_approx file which lists all the included files calculated by the
-include server; with -x, additionally write the included files as calculated by
+include server; with -v, additionally write the included files as calculated by
 CPP to a .d_exact file.
-.TP
-.B -x, --exact_analysis
-Use CPP instead, do not omit system headers files.
 
 .SH "INCLUDE SERVER SYMPTOMS AND ISSUES"
 

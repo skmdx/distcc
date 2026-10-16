@@ -197,7 +197,7 @@ import struct
 import sys
 
 import basics
-import statistics
+import scan_statistics as statistics
 import compiler_defaults
 
 DIR_ARRAY_SIZE = 500
@@ -504,9 +504,6 @@ class RelpathMapToIndex(MapToIndex):
   os.path.join(some-directorymap-string, some-relpathmap-string) can
   be implemented using +.
 
-  We actually do allow storing absolute paths if option
-  --unsafe_absolute_includes is in use.  But, then, we're careful in Resolve
-  (below) to bail out.
   """
 
   def Index(self, relpath, ignore_absolute_path_warning=False):
@@ -522,16 +519,8 @@ class RelpathMapToIndex(MapToIndex):
     The server tweaks their location to become relative to the server root.
     """
     if os.path.isabs(relpath) and not ignore_absolute_path_warning:
-      if basics.opt_unsafe_absolute_includes:
-        Debug(DEBUG_WARNING,
-              "absolute filepath '%s' was IGNORED"
-              " (correctness of build may be affected)", relpath)
-      else:
-          raise NotCoveredError("Filepath must be relative but isn't: '%s'."
-                                " Consider setting INCLUDE_SERVER_ARGS='--"
-                                "unsafe_absolute_includes'."
-                                % relpath,
-                                send_email=False)
+      raise NotCoveredError("Filepath must be relative but isn't: '%s'." % relpath,
+                            send_email=False)
     # Now, remove leading "./" so as not to start an infinite regression when
     # say foo.c contains:
     #
