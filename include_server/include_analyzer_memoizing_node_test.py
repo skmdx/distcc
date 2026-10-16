@@ -34,6 +34,20 @@ NotCoveredError = basics.NotCoveredError
 
 class IncludeAnalyzerMemoizingNodeUnitTest(unittest.TestCase):
 
+  def test_overlapping_support_updates_preserve_every_dependency(self):
+    for name in ('SHARED', 'FIRST', 'SECOND'):
+      with self.subTest(name=name):
+        master = include_analyzer_memoizing_node.SupportMaster({})
+        record = include_analyzer_memoizing_node.SupportRecord(master)
+        record.UpdateSet({'SHARED', 'FIRST'})
+        record.UpdateSet({'SHARED', 'SECOND'})
+        record.UpdateSet({'FIRST'})
+        self.assertEqual(master.union_cache.Elements(record.support_id),
+                         {'SHARED', 'FIRST', 'SECOND'})
+        self.assertTrue(record.valid)
+        master.InvalidateRecords(name)
+        self.assertFalse(record.valid)
+
   def test_token_paste_invalidates_only_matching_aliases(self):
     table = {'FEATURE_EXISTING': ['1']}
     master = include_analyzer_memoizing_node.SupportMaster(table)

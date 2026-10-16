@@ -131,7 +131,7 @@ class SupportRecord(object):
                                       set_id)
     if union_id != self.support_id:
       self.support_master.SupportRecordDependencyAdd(
-        self.union_cache.Elements(set_id),
+        self.union_cache.Elements(set_id) - self.union_cache.Elements(self.support_id),
         self)
       self.support_id = union_id
 
