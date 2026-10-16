@@ -201,6 +201,8 @@ dist_extra =							\
 	packaging/deb.sh \
 	packaging/systemd/distcc-broker@.socket \
 	packaging/systemd/distcc-broker@.service \
+	packaging/systemd/distccd-memory.py \
+	packaging/systemd/distccd-memory.conf \
 	packaging/rpm.sh \
 	packaging/googlecode_upload.py
 
@@ -222,6 +224,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_pool.py \
 	test/test_retry.py \
 	test/test_admission.py \
+	test/test_service_memory.py \
 	test/test_preprocess.py \
 	test/test_cpp_lookup.py \
 	find_c_extension.sh
@@ -815,6 +818,7 @@ adaptive-check: distcc distccd h_hosts
 	$(PYTHON) "$(srcdir)/test/test_pool.py" -v
 	$(PYTHON) "$(srcdir)/test/test_retry.py" -v
 	$(PYTHON) "$(srcdir)/test/test_admission.py" -v
+	$(PYTHON) "$(srcdir)/test/test_service_memory.py" -v
 
 preprocess-check: distcc distccd pump include-server $(CPP_LOOKUP_TARGET)
 	$(PYTHON) "$(srcdir)/test/test_preprocess.py" -v

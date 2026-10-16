@@ -255,6 +255,29 @@ or available headroom is too small. After a PSI stop, admission resumes below
 preprocessing slots. Existing work finishes normally; these estimates are not
 hard per-job limits or a common scheduler for unrelated build processes.
 
+For Linux/systemd workers, `packaging/systemd/distccd-memory.py` and
+`distccd-memory.conf` provide an optional kernel-derived service limit. Install
+the helper as `/usr/lib/distcc/distccd-memory.py` and the configuration as a
+`distccd.service.d` drop-in; remove a previous fixed `MemoryMax` when enabling
+this policy. Before worker startup it sets `MemoryMax` to the smaller of:
+
+* `MemAvailable` plus this service's resident anonymous and shmem pages, capped
+  by `MemTotal`. File cache is not added again. The kernel's available-memory
+  estimate already accounts for its watermarks and reclaimability.
+* Each parent cgroup's limit minus the usage outside this service. Parent cache
+  is counted conservatively as used.
+
+The result is rounded down to whole pages and swap is disabled. The helper
+prints the measured operands and resulting limit to the service journal;
+invoking it with the unit name but without `--apply` prints a dry run. A
+root-owned ceiling in `/run/distccd-memory` prevents restarts, including OOM
+recovery, from increasing the bound during the same boot. This ceiling is a
+startup guard, not a continuously growing allowance: the admission checks above
+continue to reduce concurrency when other processes consume memory. Missing
+accounting or a proposed limit below current usage prevents application/startup.
+This policy requires a writable system systemd manager and cgroup v2 memory
+accounting. It does not remove the uncertainty of an unseen job's memory demand.
+
 On Linux, `DISTCC_MEMORY_LEARNING=1` on the daemon uses compiler peak RSS
 reported by `wait4` for prepared jobs. `DISTCC_JOB_MEMORY` is the cold-start
 estimate. After eight successful observations, the estimate becomes the
