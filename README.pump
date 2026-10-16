@@ -6,8 +6,8 @@ Run a build under `pump` to distribute preprocessing as well as compilation:
     pump make -j"$(distcc -j)"
 
 The build must invoke distcc as its compiler, as with ordinary distcc. Pump
-starts one include-analysis process for the build and stops it when the command
-exits. It does not require build-system hooks or special handling of generated
+starts a pool of persistent include analyzers for the build and stops it when
+the command exits. It does not require build-system hooks or special handling of generated
 headers. Without pump, ordinary client-side preprocessing remains the default.
 For Clang C-family sources, the client rewrites includes while preserving macros
 and the worker finishes preprocessing. This preserves macro-sensitive diagnostics
@@ -17,15 +17,17 @@ produced on the client.
 
 With DISTCC_BROKER set, clients request remote preprocessing through the existing
 broker. Adaptive scheduling and the TCP connection pool are reused. These jobs
-do not reserve a local preprocessing slot. Without a broker, configure remote
+reserve a local preprocessing slot only during input analysis. Without a broker, configure remote
 hosts with the `,cpp,lzo` options.
 
-Only one compilation at a time uses the include analyzer. When it is busy,
-other compilations use the bounded client preprocessing slots, then distribute
-the resulting input normally. Broker clients prepare this input before reserving
-a worker. Standalone `-E` requests also use local preprocessing when the analyzer
-is busy; this is normal admission, even with DISTCC_FALLBACK=0. Explicit
-`--scan-includes` queries wait for the analyzer instead.
+Pump obtains the pool size from `distcc --show-cpp-slots`: the configured local
+preprocessing slots capped by the client's memory budget. Analysis and ordinary
+local preprocessing share that admission limit. Busy clients wait for capacity
+without switching preprocessing mode, including `-E` and `--scan-includes`.
+Homogeneous broker clients finish analysis before reserving a remote worker.
+Each analyzer owns its cwd and caches. The supervisor replaces failed analyzers
+and retains their published input snapshots until pump shuts down, so an
+in-progress transfer cannot lose its inputs during recovery.
 
 The include server calls libclang-cpp directly through a resident Python C++
 extension. Building pump requires LLVM 19, 22 or 23 development headers, libclang-cpp,

@@ -34,6 +34,7 @@
 #include "trace.h"
 #include "util.h"
 #include "exitcode.h"
+#include "include_server_if.h"
 
 
 
@@ -334,4 +335,72 @@ int dcc_output_from_source(const char *sfile,
     }
 
     return dcc_set_file_extension(sfile, out_extn, ofile);
+}
+
+/* Count the number of slashes in a path. */
+static int
+dcc_count_slashes(const char *path)
+{
+    int i;
+    int count = 0;
+    for (i = 0; path[i]; i++) {
+        if (path[i] == '/')
+            count++;
+    }
+    return count;
+}
+
+/* Strip the include server's private root and compression suffix. */
+int dcc_get_original_fname(const char *fname, char **original_fname)
+{
+    int i;
+    int depth = 3; /* ClientRootKeeper pads shallow roots to three components. */
+    const char *client_tmp = getenv("DISTCC_CLIENT_TMP");
+    char *work, *alloced_work, *extension;
+
+    if (client_tmp && client_tmp[0] == '/') {
+        int components = dcc_count_slashes(client_tmp) + 1;
+        const char *end = client_tmp + strlen(client_tmp);
+        while (end > client_tmp && end[-1] == '/') {
+            components--;
+            end--;
+        }
+        if (components > depth) depth = components;
+    }
+
+    alloced_work = work = strdup(fname);
+    if (work == NULL)
+        return EXIT_OUT_OF_MEMORY;
+
+    /* Since all names are supposed to be absolute, they start with
+     * a slash. We are trying to drop the private root's path
+     * components, so we start right after the first slash, and we look
+     * for a slash, and then we skip that slash and look for a slash, etc.
+     */
+
+    for (i = 0; i < depth; ++i) {
+        work = strchr(work + 1, '/');
+        if (work == NULL) {
+            free(alloced_work);
+            return 1;
+        }
+    }
+
+    /* Remove the optional .abs suffix before the compression suffix. */
+    extension = dcc_find_extension(work);
+    if (extension && (strcmp(extension, ".abs") == 0)) {
+        *extension = '\0';
+    }
+    extension = dcc_find_extension(work);
+    if (extension && (!strcmp(extension, ".lzo") || !strcmp(extension, ".lz4") || !strcmp(extension, ".lz4s"))) {
+        *extension = '\0';
+    }
+
+    *original_fname = strdup(work);
+    if (*original_fname == NULL) {
+        free(alloced_work);
+        return EXIT_OUT_OF_MEMORY;
+    }
+    free(alloced_work);
+    return 0;
 }

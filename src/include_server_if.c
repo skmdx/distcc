@@ -43,14 +43,9 @@
 #include "include_server_if.h"
 #include "job.h"
 #include "lock.h"
+#include "where.h"
 
-static int dcc_count_slashes(const char *path);
 static int dcc_categorize_file(const char *include_server_filename);
-
-/* The include server puts all files in its own special directory,
- * which is n path components long, where n = INCLUDE_SERVER_DIR_DEPTH
- */
-#define INCLUDE_SERVER_DIR_DEPTH 3
 
 /** Talks to the include server, over the AF_UNIX socket specified
  * in env variable INCLUDE_SERVER_PORT. If all goes well,
@@ -58,8 +53,7 @@ static int dcc_categorize_file(const char *include_server_filename);
  * if anything goes wrong, it returns a non-zero value.
  */
 
-int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr,
-                               int block, int *cpp_lock_fd)
+int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr)
 {
     char *include_server_port;
     int fd = -1, lock_fd = -1;
@@ -95,22 +89,12 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
     strcpy(sa.sun_path, include_server_port);
     sa.sun_family = AF_UNIX;
 
-    /* One analyzer owns the mutable include graph. Do not queue a build's
-     * whole parallel batch behind it: busy callers can use the separately
-     * bounded client preprocessor and keep remote workers supplied. */
-    char *lock_path;
-    if (asprintf(&lock_path, "%s.lock", include_server_port) < 0)
-        return EXIT_OUT_OF_MEMORY;
-    ret = dcc_lock_file(lock_path, block, &lock_fd);
-    free(lock_path);
+    /* Native analysis and ordinary preprocessing share the client's CPU and
+     * memory admission budget. The include-server pool owns private caches;
+     * congestion no longer changes preprocessing mode or compiler semantics. */
+    dcc_read_localslots_configuration();
+    ret = dcc_lock_local_cpp(&lock_fd);
     if (ret) return ret;
-    /* A caller may have waited for a local preprocessing slot while the
-     * analyzer was busy. Once analysis is admitted, return that slot before
-     * doing I/O: a stalled analyzer must not prevent local preprocessing. */
-    if (cpp_lock_fd && *cpp_lock_fd != -1) {
-        dcc_unlock(*cpp_lock_fd);
-        *cpp_lock_fd = -1;
-    }
     ret = 1;
     if (dcc_connect_by_addr((struct sockaddr *) &sa, sizeof(sa), &fd))
         goto out;
@@ -135,65 +119,6 @@ out:
     return ret;
 }
 
-/* The include server puts all files in its own special directory,
- * which is n path components long, where n = INCLUDE_SERVER_DIR_DEPTH
- * The original file should drop those components.
- * Also strip the compression suffix and optional .abs suffix.
- */
-int dcc_get_original_fname(const char *fname, char **original_fname)
-{
-    int i;
-    int depth = INCLUDE_SERVER_DIR_DEPTH;
-    const char *client_tmp = getenv("DISTCC_CLIENT_TMP");
-    char *work, *alloced_work, *extension;
-
-    if (client_tmp && client_tmp[0] == '/') {
-        int components = dcc_count_slashes(client_tmp) + 1;
-        const char *end = client_tmp + strlen(client_tmp);
-        while (end > client_tmp && end[-1] == '/') {
-            components--;
-            end--;
-        }
-        if (components > depth) depth = components;
-    }
-
-    alloced_work = work = strdup(fname);
-    if (work == NULL)
-        return EXIT_OUT_OF_MEMORY;
-
-    /* Since all names are supposed to be absolute, they start with
-     * a slash. We are trying to drop INCLUDE_SERVER_DIR_DEPTH path
-     * components, so we start right after the first slash, and we look
-     * for a slash, and then we skip that slash and look for a slash, etc.
-     */
-
-    for (i = 0; i < depth; ++i) {
-        work = strchr(work + 1, '/');
-        if (work == NULL) {
-            free(alloced_work);
-            return 1;
-        }
-    }
-
-    /* Remove the optional .abs suffix before the compression suffix. */
-    extension = dcc_find_extension(work);
-    if (extension && (strcmp(extension, ".abs") == 0)) {
-        *extension = '\0';
-    }
-    extension = dcc_find_extension(work);
-    if (extension && (!strcmp(extension, ".lzo") || !strcmp(extension, ".lz4") || !strcmp(extension, ".lz4s"))) {
-        *extension = '\0';
-    }
-
-    *original_fname = strdup(work);
-    if (*original_fname == NULL) {
-        free(alloced_work);
-        return EXIT_OUT_OF_MEMORY;
-    }
-    free(alloced_work);
-    return 0;
-}
-
 /**
  * This implements the --scan_includes option.
  * Talks to the include server, and prints the results to stdout.
@@ -213,7 +138,7 @@ dcc_approximate_includes(struct dcc_hostdef *host, char **argv)
         //return 0;
     }
 
-    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr, 1, NULL))) {
+    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
         rs_log_error("failed to get includes from include server");
         return ret;
     }
@@ -272,17 +197,4 @@ dcc_categorize_file(const char *include_server_filename) {
 
     free(filename);
     return 0;
-}
-
-/* Count the number of slashes in a path. */
-static int
-dcc_count_slashes(const char *path)
-{
-    int i;
-    int count = 0;
-    for (i = 0; path[i]; i++) {
-        if (path[i] == '/')
-            count++;
-    }
-    return count;
 }

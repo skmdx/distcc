@@ -726,7 +726,6 @@ dcc_build_somewhere(char *argv[],
     struct dcc_hostdef *host = NULL;
     struct dcc_work_hint work = {0};
     char *discrepancy_filename = NULL;
-    char *deferred_include_server = NULL;
     char **new_argv;
 
     max_retries = dcc_get_max_retries();
@@ -792,7 +791,7 @@ dcc_build_somewhere(char *argv[],
 #endif
     /* A homogeneous broker pool has a known input format before selection.
      * Finish include analysis before reserving a worker or opening its socket:
-     * a serialized scanner must not consume slots or the worker's idle timeout. */
+     * analysis must not consume worker slots or their idle timeout. */
     if (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER") &&
         getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes) {
         struct dcc_hostdef *list = NULL, *entry;
@@ -810,38 +809,15 @@ dcc_build_somewhere(char *argv[],
             entry = next;
         }
         if (count && same_format) {
-            ret = dcc_talk_to_include_server(argv, &files, compr, 0, NULL);
-            if (ret == EXIT_BUSY) {
-                /* Reconsider analysis after waiting for local capacity. A
-                 * busy snapshot must not commit the whole queued batch to
-                 * preprocessing after the analyzer becomes available. */
-                rs_trace("include analyzer busy; waiting for local preprocessing capacity");
-                dcc_read_localslots_configuration();
-                if ((ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
-                ret = dcc_talk_to_include_server(argv, &files, compr, 0,
-                                                  &local_cpu_lock_fd);
-            }
+            ret = dcc_talk_to_include_server(argv, &files, compr);
         }
         if (count && same_format && ret) {
-            if (ret == EXIT_BUSY) {
-                rs_trace("include analyzer busy; preprocessing locally before worker selection");
-                deferred_include_server = strdup(getenv("INCLUDE_SERVER_PORT"));
-                if (!deferred_include_server) {
-                    ret = EXIT_OUT_OF_MEMORY;
-                    goto fallback;
-                }
-            } else {
-                rs_log_warning("failed to get includes from include server, "
+            rs_log_warning("failed to get includes from include server, "
                            "preprocessing locally before worker selection");
-                if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) dcc_exit(ret);
-            }
+            if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) dcc_exit(ret);
             files = NULL;
             unsetenv("INCLUDE_SERVER_PORT");
-            if (preprocess_only) {
-                if (ret != EXIT_BUSY) goto fallback;
-                ret = EXIT_LOCAL_CPP;
-                goto lock_local;
-            }
+            if (preprocess_only) goto fallback;
         }
     }
 
@@ -911,7 +887,7 @@ dcc_build_somewhere(char *argv[],
         goto unlock_and_clean_up;
     }
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr, 0, NULL))) {
+        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
             /* Fallback to doing cpp locally */
             /* It's unfortunate that the variable that controls that is in the
              * "host" datastructure, even though in this case it's the client
@@ -921,14 +897,10 @@ dcc_build_somewhere(char *argv[],
              * again (it won't, not in the same process) we wouldn't know if
              * the server supports it or not.
              */
-            if (ret == EXIT_BUSY)
-                rs_trace("include analyzer busy; preprocessing locally");
-            else {
-                rs_log_warning("failed to get includes from include server, "
+            rs_log_warning("failed to get includes from include server, "
                            "preprocessing locally");
-                if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0))
-                    dcc_exit(ret);
-            }
+            if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0))
+                dcc_exit(ret);
             host->cpp_where = DCC_CPP_ON_CLIENT;
             dcc_get_protover_from_features(host->compr,
                                            host->cpp_where,
@@ -1049,32 +1021,6 @@ dcc_build_somewhere(char *argv[],
         goto clean_up;
     }
     if (ret < 128) {
-        if (deferred_include_server) {
-            /* Local preprocessing can lose macro provenance and turn a
-             * suppressed warning into an error. Retry the original input
-             * remotely before occupying the client's compilation slots.
-             * The worker lease is already released; wait only on analysis.
-             * Consume this deferred attempt even if analysis fails. */
-            rs_trace("retrying with remote preprocessing after client preprocessing failed");
-            int scan_ret = setenv("INCLUDE_SERVER_PORT", deferred_include_server, 1);
-            free(deferred_include_server);
-            deferred_include_server = NULL;
-            if (!scan_ret)
-                scan_ret = dcc_talk_to_include_server(argv, &files, host->compr, 1, NULL);
-            if (!scan_ret) {
-                if (cpp_fd >= 0) close(cpp_fd);
-                free(cpp_fname);
-                cpp_fd = -1;
-                cpp_fname = NULL;
-                cpp_ready = 0;
-                *status = 0;
-                dcc_work_describe(&work, argv, input_fname, NULL, -1, 0);
-                goto choose_host;
-            }
-            if (files) dcc_free_argv(files);
-            files = NULL;
-            unsetenv("INCLUDE_SERVER_PORT");
-        }
         /* Remote compile just failed, e.g. with syntax error.
            It may be that the remote compilation failed because
            the file has an error, or because we did something
@@ -1203,7 +1149,6 @@ dcc_build_somewhere(char *argv[],
         free(localcpp_server_argv);
     }
     free(discrepancy_filename);
-    free(deferred_include_server);
     dcc_free_buffer(&server_stdout);
     dcc_free_buffer(&server_stderr);
     return ret;

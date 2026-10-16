@@ -35,6 +35,7 @@ import signal
 import socketserver
 import sys
 import tempfile
+import time
 import traceback
 
 # Include server imports
@@ -93,6 +94,9 @@ OPTIONS:
 
  --pid_file FILEPATH         The pid of the include server is written to file
                              FILEPATH.
+
+ --workers NUMBER           Persistent analyzers. Pump derives this from the
+                             local preprocessing CPU/memory admission limit.
 
  -s, --statistics            Print information to stdout about include analysis.
 
@@ -306,7 +310,7 @@ class Queuingsocketserver(socketserver.UnixStreamServer):
   """A socket server whose request queue have size REQUEST_QUEUE_SIZE."""
   request_queue_size = REQUEST_QUEUE_SIZE
 
-  def handle_error(self, _, client_address):
+  def handle_error(self, request, client_address):
     """Re-raise current exception; overrides socketserver.handle_error.
     """
     raise
@@ -448,7 +452,7 @@ def _ParseCommandLineOptions():
   """Parse arguments and options for the include server command.
 
   Returns:
-    (include_server_port, pid_file), where include_server_port
+    (include_server_port, pid_file, workers), where include_server_port
     is a string and pid_file is a string or None
   Modifies:
     option variables in module basics
@@ -456,7 +460,7 @@ def _ParseCommandLineOptions():
   try:
     opts, args = getopt.getopt(sys.argv[1:],
 			       "d:estvw",
-			       ["port=",
+			       ["port=", "workers=",
                                 "pid_file=",
                                 "debug_pattern=",
                                 "email",
@@ -474,6 +478,7 @@ def _ParseCommandLineOptions():
     Usage()
     sys.exit(1)
   pid_file = None
+  workers = 1
   include_server_port = None
   for opt, arg in opts:
     try:
@@ -483,6 +488,10 @@ def _ParseCommandLineOptions():
         include_server_port = arg
       if opt in ("--pid_file",):
         pid_file = arg
+      if opt == "--workers":
+        workers = int(arg)
+        if workers < 1:
+          raise ValueError('workers must be positive')
       if opt in ("-e", "--email"):
         basics.opt_send_email = True
       if opt in ("--no-email",):
@@ -516,7 +525,7 @@ def _ParseCommandLineOptions():
     print("-------------------------------------------", "\n", file=sys.stderr)
     Usage()
     sys.exit(1)
-  return (include_server_port, pid_file)
+  return (include_server_port, pid_file, workers)
 
 
 def _PrintTimes(times_at_start, times_at_fork, times_child):
@@ -528,7 +537,7 @@ def _PrintTimes(times_at_start, times_at_fork, times_child):
   total_u = (times_at_fork[0] + times_at_fork[2]
              + times_child[0] + times_child[2])
   total_s = (times_at_fork[1] + times_at_fork[3]
-             + times_child[1] + times_child[1])
+             + times_child[1] + times_child[3])
   total_cpu = total_u + total_s
   total_e = times_child[4] - times_at_start[4]
   print("Include server timing. ", sys.stderr)
@@ -536,128 +545,156 @@ def _PrintTimes(times_at_start, times_at_fork, times_child):
     (total_e, total_u, total_s, total_cpu), file=sys.stderr)
 
 
-class _IncludeServerPortReady(object):
-  """A simple semaphore for forked processes.
+class AnalyzerPool:
+  """Persistent, process-isolated analyzers sharing one listening socket.
 
-   The implementation uses an unnamed pipe."""
+  Each worker has its own cwd, compiler contexts, timers and input generations.
+  All published roots belong to the supervisor, so replacing a failed worker
+  cannot invalidate inputs a distcc client is still transmitting.
+  """
 
-  def __init__(self):
-    """Constructor.
+  def __init__(self, port):
+    self.workers = set()
+    self.keeper = basics.ClientRootKeeper()
+    self.keeper.CleanOutOthers()
+    self.server = Queuingsocketserver(port, socketserver.BaseRequestHandler)
+    # Several workers can wake for one connection. Losing accept must not block.
+    self.server.socket.setblocking(False)
 
-    Should be called before fork.
-    """
-    (self.read_fd, self.write_fd) = os.pipe()
+  def start_worker(self, startup_fd=None):
+    read_fd, write_fd = os.pipe()
+    # Publish child ownership before a shutdown signal can unwind this method.
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+    try:
+      pid = os.fork()
+    except BaseException:
+      os.close(read_fd)
+      os.close(write_fd)
+      signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+      raise
+    if pid == 0:
+      os.close(read_fd)
+      if startup_fd is not None:
+        os.close(startup_fd)
+      status = 1
+      try:
+        os.setpgid(0, 0)
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        import compiler_analyzer
+        analyzer = compiler_analyzer.CompilerAnalyzer(
+            self.keeper, basics.opt_stat_reset_triggers)
+        analyzer.email_sender = _EmailSender()
+        self.server.RequestHandlerClass = DistccIncludeHandlerGenerator(analyzer)
+        gc.set_threshold(basics.GC_THRESHOLD)
+        os.write(write_fd, b'\n')
+        os.close(write_fd)
+        write_fd = None
+        self.server.serve_forever()
+      except (SignalSIGTERM, KeyboardInterrupt):
+        status = 0
+      except BaseException:
+        traceback.print_exc()
+      finally:
+        if write_fd is not None:
+          os.close(write_fd)
+        self.server.server_close()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(status)
+    self.workers.add(pid)
+    os.close(write_fd)
+    try:
+      signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+      if os.read(read_fd, 1) != b'\n':
+        raise RuntimeError('include analyzer failed to start')
+    finally:
+      os.close(read_fd)
 
-  def Acquire(self):
-    """Acquire the semaphore after fork;  blocks until a call of Release."""
-    if os.read(self.read_fd, 1) != b'\n':
-      sys.exit("Include server: _IncludeServerPortReady.Acquire failed.")
+  def serve(self, count, ready_fd):
+    try:
+      for _ in range(count):
+        self.start_worker(ready_fd)
+      os.write(ready_fd, b'\n')
+    finally:
+      os.close(ready_fd)
+    while True:
+      # A killed scanner may leave its GCC subprocess behind. Reclaim that
+      # group before reaping its leader, while its PID cannot be reused.
+      exited = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOWAIT)
+      assert exited is not None  # Blocking wait; WNOHANG is deliberately absent.
+      pid = exited.si_pid
+      self.signal_worker(pid, signal.SIGKILL)
+      _, status = os.waitpid(pid, 0)
+      self.workers.remove(pid)
+      print('Include server: replacing analyzer (status %d)' % status,
+            file=sys.stderr, flush=True)
+      self.start_worker()
 
-  def Release(self):
-    """Release the semaphore after fork."""
-    if os.write(self.write_fd, b'\n') != 1:
-      sys.exit("Include server: _IncludeServerPortReady.Release failed.")
+  @staticmethod
+  def signal_worker(pid, sig):
+    try:
+      os.killpg(pid, sig)
+    except ProcessLookupError:
+      pass
 
-
-def _SetUp(include_server_port):
-  """Setup include_analyzer and socket server.
-
-  Returns: (include_analyzer, server)"""
-
-  # The base analyzer uses this module's dependency reporting helpers.
-  import compiler_analyzer
-
-  try:
-    os.unlink(include_server_port)
-  except (IOError, OSError):
-    pass  # this would be expected, the port provided should not exist
-
-  if os.sep != '/':
-    sys.exit("Expected '/' as separator in filepaths.")
-
-  client_root_keeper = basics.ClientRootKeeper()
-  # Clean out any junk left over from prior runs.
-  client_root_keeper.CleanOutOthers()
-
-  Debug(DEBUG_TRACE, "Starting socketserver %s" % include_server_port)
-
-  # Create the analyser.
-  include_analyzer = (
-      compiler_analyzer.CompilerAnalyzer(
-           client_root_keeper,
-           basics.opt_stat_reset_triggers))
-  include_analyzer.email_sender = _EmailSender()
-
-  # Wrap it inside a handler that is a part of a UnixStreamServer.
-  server = Queuingsocketserver(
-    include_server_port,
-    # Now, produce a StreamRequestHandler subclass whose new objects has
-    # a handler which calls the include_analyzer just made.
-    DistccIncludeHandlerGenerator(include_analyzer))
-
-  return (include_analyzer, server)
-
-
-def _CleanOut(include_analyzer, include_server_port):
-  """Prepare shutdown by cleaning out files and unlinking port."""
-  if include_analyzer and include_analyzer.client_root_keeper:
-    include_analyzer.client_root_keeper.CleanOutClientRoots()
-  try:
-    os.unlink(include_server_port)
-  except OSError:
-    pass
+  def close(self):
+    self.server.server_close()
+    for pid in self.workers:
+      self.signal_worker(pid, signal.SIGTERM)
+    # Native library calls can delay Python signal handling. Bound shutdown,
+    # then reap every worker before removing the shared published-input roots.
+    deadline = time.monotonic() + 2
+    while self.workers and time.monotonic() < deadline:
+      for pid in tuple(self.workers):
+        if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT):
+          self.signal_worker(pid, signal.SIGKILL)
+          os.waitpid(pid, 0)
+          self.workers.remove(pid)
+      if self.workers:
+        time.sleep(.01)
+    for pid in self.workers:
+      self.signal_worker(pid, signal.SIGKILL)
+      os.waitpid(pid, 0)
+    self.workers.clear()
+    self.keeper.CleanOutClientRoots()
+    os.unlink(str(self.server.server_address))
 
 
 def Main():
   """Parse command line, fork, and start stream request handler."""
   # Remember the time spent in the parent.
   times_at_start = os.times()
-  include_server_port, pid_file = _ParseCommandLineOptions()
-  # Get locking mechanism.
-  include_server_port_ready = _IncludeServerPortReady()
+  include_server_port, pid_file, workers = _ParseCommandLineOptions()
+  read_fd, ready_fd = os.pipe()
   # Now spawn child so that parent can exit immediately after writing
   # the process id of child to the pid file.
   times_at_fork = os.times()
   pid = os.fork()
   if pid != 0:
-    # In parent.
-    #
+    os.close(ready_fd)
     if pid_file:
       pid_file_fd = open(pid_file, "w")
       print(pid, file=pid_file_fd)
       pid_file_fd.close()
-    # Just run to completion now -- after making sure that child is ready.
-    include_server_port_ready.Acquire()
-    # concerned.
-  else:
-    # In child.
-    #
-    # We call _Setup only now, because the process id, used in naming the client
-    # root, must be that of this process, not that of the parent process. See
-    # _CleanOutOthers for the importance of the process id.
-    (include_analyzer, server) = _SetUp(include_server_port)
-    include_server_port_ready.Release()
     try:
-      try:
-        gc.set_threshold(basics.GC_THRESHOLD)
-        # Use commented-out line below to have a message printed for each
-        # collection.
-        # gc.set_debug(gc.DEBUG_STATS + gc.DEBUG_COLLECTABLE)
-        server.serve_forever()
-      except KeyboardInterrupt:
-        print("Include server: keyboard interrupt, quitting after cleaning up.",
-            file=sys.stderr)
-        _CleanOut(include_analyzer, include_server_port)
-      except SignalSIGTERM:
-        Debug(DEBUG_TRACE, "Include server shutting down.")
-        _CleanOut(include_analyzer, include_server_port)
-      except:
-        print("Include server: exception occurred, quitting after cleaning up.",
-                file=sys.stderr)
-        _PrintStackTrace(sys.stderr)
-        _CleanOut(include_analyzer, include_server_port)
-        raise # reraise exception
+      if os.read(read_fd, 1) != b'\n':
+        os.waitpid(pid, 0)
+        sys.exit('Include server: analyzer pool failed to start')
     finally:
+      os.close(read_fd)
+  else:
+    os.close(read_fd)
+    pool = None
+    try:
+      pool = AnalyzerPool(include_server_port)
+      pool.serve(workers, ready_fd)
+    except (KeyboardInterrupt, SignalSIGTERM):
+      Debug(DEBUG_TRACE, 'Include server shutting down.')
+    finally:
+      signal.signal(signal.SIGTERM, signal.SIG_IGN)
+      signal.signal(signal.SIGINT, signal.SIG_IGN)
+      if pool is not None:
+        pool.close()
       if basics.opt_print_times:
         _PrintTimes(times_at_start, times_at_fork, os.times())
 

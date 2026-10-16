@@ -291,6 +291,7 @@ StartIncludeServer() {
 
     if [ -z "$PYTHONOPTIMIZE" ]; then PYTHONOPTIMIZE=1; fi
     export DISTCC_CPP_LOOKUP_LIBRARY="${DISTCC_CPP_LOOKUP_LIBRARY-$cpp_lookup_library}"
+    analyzer_workers=$("$DISTCC_LOCATION/distcc" --show-cpp-slots) || exit 1
     # We use 'eval' so that INCLUDE_SERVER_ARGS can use shell quoting such 
     # as in:
     #
@@ -305,6 +306,7 @@ StartIncludeServer() {
          "'$include_server'"            \
          --port "'$socket'"             \
          --pid_file "'$tmp_pid_file'"   \
+         --workers "'$analyzer_workers'" \
          -d1                            \
          $INCLUDE_SERVER_ARGS
   )

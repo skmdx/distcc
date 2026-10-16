@@ -59,7 +59,7 @@ class ClientRootKeeper(object):
   # This constant is embedded in names of client root directories.
   INCLUDE_SERVER_NAME = 'include_server'
 
-  def __init__(self):
+  def __init__(self, owner_pid=None):
     """Constructor."""
     if 'DISTCC_CLIENT_TMP' in os.environ:
       self.client_tmp = os.environ['DISTCC_CLIENT_TMP']
@@ -74,6 +74,9 @@ class ClientRootKeeper(object):
     # Preserve the old minimum prefix depth; deeper temporary roots need no padding.
     self.number_missing_levels = max(0, 3 - len(self.client_tmp.split('/')))
     self.client_root = None
+    # Pool workers own their caches, but published inputs survive worker
+    # replacement. Only the supervisor removes them when the build ends.
+    self.owner_pid = os.getpid() if owner_pid is None else owner_pid
 
   def Glob(self, pid_expr):
     """Glob unpadded client roots whose pid is matched by pid expression."""
@@ -94,7 +97,7 @@ class ClientRootKeeper(object):
       self._client_root_before_padding = tempfile.mkdtemp(
           '.%s-%s-%d' %
           (self.INCLUDE_SERVER_NAME,
-           os.getpid(), generation),
+           self.owner_pid, generation),
           dir=self.client_tmp)
       self.client_root = (self._client_root_before_padding
                           + '/padding' * self.number_missing_levels)
@@ -110,7 +113,7 @@ class ClientRootKeeper(object):
       pid: None (which means 'pid of current process') or an integer
     """
     if not pid:
-      pid = os.getpid()
+      pid = self.owner_pid
     for client_root in self.Glob(str(pid)):
       shutil.rmtree(client_root, ignore_errors=True)
 

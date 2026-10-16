@@ -143,7 +143,6 @@ ext = setuptools.Extension(
               'src/pump.c',
               'src/rpc.c',
               'src/io.c',
-              'src/include_server_if.c',
               'src/lock.c',
               'src/trace.c',
               'src/snprintf.c',

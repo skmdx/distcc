@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Remote preprocessing with mutable inputs, real compilers and pooled TCP."""
 import os
-import fcntl
+import concurrent.futures
 import xxhash
 import random
 from pathlib import Path
@@ -21,9 +21,10 @@ import unittest
 from test_broker import BrokerTestCase
 
 
-class PreprocessTest(BrokerTestCase):
+class PumpTestCase(BrokerTestCase):
     compression = 'lzo'
     transport = ''
+    cpp_slots = 1
 
     @classmethod
     def setUpClass(cls):
@@ -35,7 +36,8 @@ class PreprocessTest(BrokerTestCase):
 
     def setUp(self):
         super().setUp()
-        self.start_broker(self.host(0, ',' + self.compression + self.transport) + ' --localslots_cpp=1', idle=60)
+        self.start_broker(self.host(0, ',' + self.compression + self.transport) +
+                          f' --localslots_cpp={self.cpp_slots}', idle=60)
         self.env.update(TMPDIR=str(self.root), DISTCC_CLIENT_TMP=str(self.work),
                         DISTCC_CPP_LOOKUP_LIBRARY=str(self.build / 'cpp_lookup.so'),
                         DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_TESTING_INCLUDE_SERVER='1',
@@ -61,6 +63,182 @@ class PreprocessTest(BrokerTestCase):
     def shutdown_pump(self):
         subprocess.run([str(self.build / 'pump'), '--shutdown'], env=self.env,
                        cwd=self.work, capture_output=True, timeout=10, check=True)
+
+    def run_cc(self, compiler, args, remote=True):
+        prefix = [str(self.build / 'distcc')] if remote else []
+        return subprocess.run(prefix + [compiler] + list(map(str, args)),
+                              cwd=self.work, env=self.env, capture_output=True,
+                              timeout=15)
+
+    def analyzer_pids(self):
+        pid = int(self.env['INCLUDE_SERVER_PID'])
+        return set(map(int, Path(f'/proc/{pid}/task/{pid}/children').read_text().split()))
+
+
+class AnalyzerPoolTest(PumpTestCase):
+    cpp_slots = 2
+    compression = 'lz4'
+    transport = ',tcp'
+
+    def test_parallel_admission_and_context_isolation(self):
+        workers = self.analyzer_pids()
+        self.assertEqual(len(workers), self.cpp_slots)
+        for pid in workers:
+            os.kill(pid, signal.SIGSTOP)
+        clients = []
+        try:
+            for i in range(2):
+                directory = self.work / f'context-{i}'
+                directory.mkdir()
+                (directory / 'value.h').write_text(f'#define VALUE {i + 17}\n')
+                (directory / 'input.c').write_text('#include "value.h"\nint value = VALUE + OFFSET;\n')
+                clients.append(subprocess.Popen(
+                    [str(self.build / 'distcc'), 'gcc', '-E', '-P', '-DOFFSET=3', 'input.c'],
+                    cwd=directory, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            log = self.work / 'client.log'
+            deadline = time.monotonic() + 5
+            while not log.exists() or log.read_text().count('send CDIR') < 2:
+                self.assertTrue(all(client.poll() is None for client in clients))
+                self.assertLess(time.monotonic(), deadline, 'parallel requests not admitted')
+                time.sleep(.01)
+            lease = self.request(12)
+            self.assertFalse(select.select([lease], [], [], .1)[0])
+            lease.close()
+        finally:
+            for pid in workers:
+                os.kill(pid, signal.SIGCONT)
+            for i, client in enumerate(clients):
+                try:
+                    stdout, stderr = client.communicate(timeout=15)
+                    self.assertEqual(client.returncode, 0, stderr.decode())
+                    self.assertIn(f'int value = {i + 17} + 3;'.encode(), stdout)
+                finally:
+                    if client.poll() is None:
+                        client.kill()
+                        client.communicate()
+        # Exercise both native backends with different cwd/header namespaces,
+        # generated headers, definitions and output actions across warm workers.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            def compare(index):
+                compiler = 'gcc' if index % 2 else 'clang'
+                source = self.work / f'context-{index % 2}' / 'input.c'
+                args = ['-E', '-P', f'-DOFFSET={index}', source]
+                remote = self.run_cc(compiler, args)
+                local = self.run_cc(compiler, args, False)
+                self.assertEqual(remote.returncode, 0, remote.stderr.decode())
+                self.assertEqual((remote.stdout, remote.stderr), (local.stdout, local.stderr))
+            for generation in range(2):
+                for i in range(2):
+                    (self.work / f'context-{i}' / 'value.h').write_text(
+                        f'#define VALUE {generation * 11 + i}\n')
+                list(pool.map(compare, range(8)))
+        self.assertEqual(self.analyzer_pids(), workers)
+        self.assertNotIn('preprocessing locally', log.read_text())
+
+    def test_recovery_preserves_published_inputs_and_shutdown_reaps_workers(self):
+        result = self.run_cc('gcc', ['-c', self.source, '-o', 'first.o'])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        supervisor = int(self.env['INCLUDE_SERVER_PID'])
+        roots = list(self.work.glob(f'*.include_server-{supervisor}-*'))
+        snapshots = {p: p.read_bytes() for root in roots for p in root.rglob('*') if p.is_file()}
+        self.assertTrue(snapshots, 'published inputs not reached')
+        workers = self.analyzer_pids()
+        victim = next(iter(workers))
+        os.kill(victim, signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while True:
+            replacements = self.analyzer_pids()
+            if len(replacements) == 2 and victim not in replacements:
+                break
+            self.assertLess(time.monotonic(), deadline, 'analyzer was not replaced')
+            time.sleep(.01)
+        self.assertTrue(all(p.read_bytes() == content for p, content in snapshots.items()))
+        result = self.run_cc('gcc', ['-c', self.source, '-o', 'recovered.o'])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual((self.work / 'first.o').read_bytes(), (self.work / 'recovered.o').read_bytes())
+        for pid in replacements:
+            os.kill(pid, signal.SIGSTOP)
+        self.shutdown_pump()
+        self.assertFalse(any(Path(f'/proc/{pid}').exists() for pid in replacements))
+        self.assertFalse(list(self.work.glob(f'*.include_server-{supervisor}-*')))
+        self.assertFalse(Path(self.env['INCLUDE_SERVER_PORT']).exists())
+
+
+class PreprocessTest(PumpTestCase):
+    def test_analysis_holds_cpp_capacity_without_reserving_remote_worker(self):
+        workers = self.analyzer_pids()
+        self.assertEqual(len(workers), 1)
+        for pid in workers:
+            os.kill(pid, signal.SIGSTOP)
+        client = subprocess.Popen([str(self.build / 'distcc'), 'gcc', '-c',
+                                   str(self.source), '-o', 'waiting.o'],
+                                  cwd=self.work, env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        leases = []
+        try:
+            deadline = time.monotonic() + 5
+            log = self.work / 'client.log'
+            while not log.exists() or 'send CDIR' not in log.read_text():
+                self.assertIsNone(client.poll())
+                self.assertLess(time.monotonic(), deadline, 'analysis not admitted')
+                time.sleep(.01)
+            # Input analysis owns one CPP lease and no remote worker lease.
+            other = self.request(12)
+            self.assertFalse(select.select([other], [], [], .1)[0])
+            other.close()
+            for _ in range(4):
+                lease = self.request(9)
+                leases.append(lease)
+                status, _, descriptors = self.receive(lease)
+                for fd in descriptors:
+                    os.close(fd)
+                self.assertEqual(status, 0)
+        finally:
+            for lease in leases:
+                lease.close()
+            for pid in workers:
+                os.kill(pid, signal.SIGCONT)
+            try:
+                stdout, stderr = client.communicate(timeout=15)
+            finally:
+                if client.poll() is None:
+                    client.kill()
+                    client.communicate()
+        self.assertEqual(client.returncode, 0, stderr.decode())
+        self.assertTrue((self.work / 'waiting.o').exists())
+        self.assertNotIn('preprocessing locally', log.read_text())
+        lease = self.request(12)
+        self.assertEqual(self.receive(lease), (0, 1, []))
+        lease.close()
+
+    def test_queued_analysis_preserves_macro_diagnostics(self):
+        self.source.write_text('#define PRESENT(p) ((p) != 0)\n'
+                               'int present(void) { int values[1]; return PRESENT(values); }\n')
+        args = ['-Werror=address', '-c', self.source, '-o', 'macro.o', '-MMD', '-MF', 'macro.d']
+        local = self.run_cc('gcc', args, remote=False)
+        self.assertEqual(local.returncode, 0, local.stderr.decode())
+        expected = (self.work / 'macro.o').read_bytes()
+        expected_deps = (self.work / 'macro.d').read_bytes()
+        lease = self.request(12)
+        self.assertEqual(self.receive(lease), (0, 1, []))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            jobs = [pool.submit(self.run_cc, 'gcc', ['-Werror=address', '-c', self.source,
+                                                    '-o', f'macro-{i}.o'])
+                    for i in range(2)]
+            try:
+                self.assertFalse(concurrent.futures.wait(jobs, timeout=.1).done)
+            finally:
+                lease.close()
+            for i, job in enumerate(jobs):
+                result = job.result(timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertEqual((self.work / f'macro-{i}.o').read_bytes(), expected)
+                self.assertEqual(result.stderr, local.stderr)
+        result = self.run_cc('gcc', args)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual((self.work / 'macro.d').read_bytes(), expected_deps)
+        self.assertNotIn('preprocessing locally', (self.work / 'client.log').read_text())
+
 
     def test_failed_scanner_start_reports_error_and_cleans_up(self):
         env = dict(self.env, INCLUDE_SERVER_ARGS='--unknown-test-option')
@@ -92,142 +270,6 @@ class PreprocessTest(BrokerTestCase):
         self.assertNotIn('getline failed', (self.work / 'client.log').read_text())
         self.assertRegex(self.get_stats(self.stats_ports[0]), r'dcc_compile_ok [1-9]')
 
-    def test_scanner_wait_does_not_reserve_worker(self):
-        pid = int(self.env['INCLUDE_SERVER_PID'])
-        os.kill(pid, signal.SIGSTOP)
-        client = subprocess.Popen([str(self.build / 'distcc'), 'gcc', '-c',
-                                   str(self.source), '-o', 'waiting.o'],
-                                  cwd=self.work, env=self.env,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        leases = []
-        try:
-            deadline = time.monotonic() + 5
-            log = self.work / 'client.log'
-            while not log.exists() or 'send CDIR' not in log.read_text():
-                self.assertLess(time.monotonic(), deadline, 'scanner not reached')
-                time.sleep(.01)
-            # All four real worker slots must remain available while this
-            # client's include request is blocked in the stopped scanner.
-            for _ in range(4):
-                lease = self.request(9)
-                leases.append(lease)
-                status, _, descriptors = self.receive(lease)
-                for fd in descriptors:
-                    os.close(fd)
-                self.assertEqual(status, 0)
-            for lease in leases:
-                lease.close()
-            leases.clear()
-            # Another client must finish even while the analyzer is stopped.
-            # FALLBACK=0 ensures that this still exercises a remote worker.
-            remote = self.run_cc('gcc', ['-c', self.source, '-o', 'busy.o'])
-            local = self.run_cc('gcc', ['-c', self.source, '-o', 'native.o'], False)
-            self.assertEqual(remote.returncode, 0, remote.stderr.decode())
-            self.assertEqual(local.returncode, 0, local.stderr.decode())
-            self.assertEqual((self.work / 'busy.o').read_bytes(),
-                             (self.work / 'native.o').read_bytes())
-            self.assertRegex(self.get_stats(self.stats_ports[0]), r'dcc_compile_ok [1-9]')
-            remote = self.run_cc('gcc', ['-E', self.source])
-            local = self.run_cc('gcc', ['-E', self.source], False)
-            self.assertEqual(remote.returncode, 0, remote.stderr.decode())
-            self.assertEqual(remote.stdout, local.stdout)
-            self.assertIn('include analyzer busy', log.read_text())
-            self.assertNotIn('failed to get includes', log.read_text())
-        finally:
-            for lease in leases:
-                lease.close()
-            os.kill(pid, signal.SIGCONT)
-            try:
-                client.wait(timeout=15)
-            finally:
-                if client.poll() is None:
-                    client.kill()
-                    client.wait()
-        self.assertEqual(client.returncode, 0)
-        self.assertTrue((self.work / 'waiting.o').exists())
-        log.write_text('')
-        recovered = self.run_cc('gcc', ['-c', self.source, '-o', 'recovered.o'])
-        self.assertEqual(recovered.returncode, 0, recovered.stderr.decode())
-        self.assertIn('send CDIR', log.read_text())
-        self.assertNotIn('include analyzer busy', log.read_text())
-
-    def run_cc(self, compiler, args, remote=True):
-        prefix = [str(self.build / 'distcc')] if remote else []
-        return subprocess.run(prefix + [compiler] + list(map(str, args)),
-                              cwd=self.work, env=self.env, capture_output=True,
-                              timeout=15)
-
-    def retry_after_busy_scanner(self, args):
-        log = self.work / 'client.log'
-        client = None
-        try:
-            with open(self.env['INCLUDE_SERVER_PORT'] + '.lock', 'a') as lock:
-                fcntl.lockf(lock, fcntl.LOCK_EX)
-                client = subprocess.Popen(
-                    [str(self.build / 'distcc'), 'gcc', *map(str, args)],
-                    cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                deadline = time.monotonic() + 5
-                while not log.exists() or 'retrying with remote preprocessing' not in log.read_text():
-                    self.assertIsNone(client.poll(), 'remote preprocessing retry not reached')
-                    self.assertLess(time.monotonic(), deadline, 'waiting for remote preprocessing retry')
-                    time.sleep(.01)
-            stdout, stderr = client.communicate(timeout=15)
-            return subprocess.CompletedProcess(client.args, client.returncode, stdout, stderr)
-        finally:
-            if client is not None and client.poll() is None:
-                client.kill()
-                client.communicate(timeout=5)
-
-    def test_busy_scanner_cpp_diagnostic_retries_without_local_compilation(self):
-        self.source.write_text('#define PRESENT(p) ((p) != 0)\n'
-                               'int present(void) { int values[1]; return PRESENT(values); }\n')
-        args = ['-Werror=address', '-c', self.source, '-o', 'macro.o', '-MMD', '-MF', 'macro.d']
-        local = self.run_cc('gcc', args, remote=False)
-        self.assertEqual(local.returncode, 0, local.stderr.decode())
-        log = self.work / 'client.log'
-        expected = (self.work / 'macro.o').read_bytes()
-        expected_deps = (self.work / 'macro.d').read_bytes()
-        (self.work / 'macro.o').unlink()
-        (self.work / 'macro.d').unlink()
-        result = self.retry_after_busy_scanner(args)
-        self.assertEqual(result.returncode, 0, result.stderr.decode())
-        self.assertEqual((self.work / 'macro.o').read_bytes(), expected)
-        self.assertEqual((self.work / 'macro.d').read_bytes(), expected_deps)
-        self.assertEqual(result.stderr, local.stderr)
-        text = log.read_text()
-        self.assertIn('include analyzer busy', text)
-        self.assertIn('retrying with remote preprocessing', text)
-        self.assertNotIn('running locally instead', text)
-        counter = Path(self.env['INCLUDE_SERVER_PORT']).parent / 'discrepancy_counter'
-        self.assertFalse(counter.exists(), text)
-        log.write_text('')
-        self.env['DISTCC_FALLBACK'] = '0'
-        self.env['DISTCC_SKIP_LOCAL_RETRY'] = '1'
-        result = self.run_cc('gcc', args)
-        self.assertEqual(result.returncode, 0, result.stderr.decode())
-        self.assertIn('send CDIR', log.read_text())
-        self.assertNotIn('preprocessing locally', log.read_text())
-
-    def test_busy_scanner_syntax_error_retries_remote_only_once(self):
-        self.source.write_text('int value = ;\n')
-        result = self.retry_after_busy_scanner(['-c', self.source, '-o', 'invalid.o'])
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((self.work / 'invalid.o').exists())
-        log = (self.work / 'client.log').read_text()
-        self.assertEqual(log.count('retrying with remote preprocessing'), 1)
-        self.assertNotIn('running locally instead', log)
-
-    def test_deferred_scan_failure_returns_compiler_error(self):
-        header = self.work / 'absolute.h'
-        header.write_text('#define PRESENT(p) ((p) != 0)\n')
-        self.source.write_text('#include "%s"\n' % (self.work/'..'/self.work.name/header.name) +
-                               'int present(void) { int values[1]; return PRESENT(values); }\n')
-        args = ['-Werror=address', '-c', self.source, '-o', 'failed.o']
-        result = self.retry_after_busy_scanner(args)
-        self.assertEqual(result.returncode, 1, result.stderr.decode())
-        self.assertFalse((self.work / 'failed.o').exists())
-        self.assertIn('gave up analyzing', (self.work / 'client.log').read_text())
-
     def test_compiler_probe_bypasses_local_cpp_admission(self):
         masquerade = self.work / 'masquerade'
         masquerade.mkdir()
@@ -253,52 +295,6 @@ class PreprocessTest(BrokerTestCase):
                 os.killpg(probe.pid, signal.SIGTERM)
                 probe.wait(timeout=5)
             lease.close()
-
-    def test_waiting_local_cpp_reconsiders_scanner_without_holding_slot(self):
-        lease = self.request(12)
-        self.assertEqual(self.receive(lease), (0, 1, []))
-        pid = int(self.env['INCLUDE_SERVER_PID'])
-        log = self.work / 'client.log'
-        client = None
-        with open(self.env['INCLUDE_SERVER_PORT'] + '.lock', 'a') as lock:
-            fcntl.lockf(lock, fcntl.LOCK_EX)
-            try:
-                client = subprocess.Popen(
-                    [str(self.build / 'distcc'), 'gcc', '-c', str(self.source), '-o', 'queued.o'],
-                    cwd=self.work, env=self.env,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                deadline = time.monotonic() + 5
-                while not log.exists() or 'include analyzer busy' not in log.read_text():
-                    self.assertIsNone(client.poll())
-                    self.assertLess(time.monotonic(), deadline, 'busy scanner not reached')
-                    time.sleep(.01)
-                # The analyzer becomes available while this client waits for
-                # local admission. Stop its I/O to verify lease ownership.
-                os.kill(pid, signal.SIGSTOP)
-                fcntl.lockf(lock, fcntl.LOCK_UN)
-                lease.close()
-                deadline = time.monotonic() + 5
-                while 'send CDIR' not in log.read_text():
-                    self.assertIsNone(client.poll(), 'queued client preprocessed instead of rescanning')
-                    self.assertLess(time.monotonic(), deadline, 'scanner not reconsidered')
-                    time.sleep(.01)
-                other = self.request(12)
-                self.assertEqual(self.receive(other), (0, 1, []))
-                other.close()
-            finally:
-                lease.close()
-                os.kill(pid, signal.SIGCONT)
-                if client is not None:
-                    try:
-                        client.wait(timeout=15)
-                    finally:
-                        if client.poll() is None:
-                            client.kill()
-                            client.wait()
-        assert client is not None
-        self.assertEqual(client.returncode, 0)
-        self.assertTrue((self.work / 'queued.o').exists())
-        self.assertNotIn('preprocessing locally', log.read_text())
 
     def test_remote_cpp_difference_still_disables_pump(self):
         self.source.write_text('#ifdef REMOTE_COMPILER_FAULT\n#error wrong worker setup\n#endif\nint value;\n')
@@ -863,15 +859,6 @@ class PreprocessTest(BrokerTestCase):
             if compiler:
                 with self.subTest(compiler=compiler):
                     self.compare(compiler, ['-P'])
-
-    def test_remote_cpp_does_not_wait_for_local_cpp_slot(self):
-        lease = self.request(6)
-        status, _, descriptors = self.receive(lease)
-        self.assertEqual(status, 0)
-        for fd in descriptors:
-            os.close(fd)
-        self.compare(args=['-P'])
-        lease.close()
 
     def test_truncated_response_does_not_publish_stdout_twice(self):
         # Forward a real compilation, then drop the end of its result after
