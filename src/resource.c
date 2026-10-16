@@ -140,6 +140,13 @@ static int order_bytes(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
+static unsigned long long measured_job_bytes(unsigned long long peak)
+{
+    const unsigned long long overhead = 64ULL * 1024 * 1024;
+    return peak <= (ULLONG_MAX - overhead) / 5 * 4 ?
+        peak + peak / 4 + overhead : ULLONG_MAX;
+}
+
 void dcc_resource_observe(unsigned long long peak_bytes, int success)
 {
     /* Keep the largest working set as spare capacity, not a charge on every
@@ -156,8 +163,10 @@ void dcc_resource_observe(unsigned long long peak_bytes, int success)
      * the maximum, not the 90th percentile; charging an isolated peak both
      * here and as spare can starve a worker of the samples needed to recover. */
     unsigned long long p90 = sorted[(observation_count - 1) * 9 / 10];
-    learned_job = p90 <= (ULLONG_MAX - 64ULL * 1024 * 1024) / 2 ?
-        p90 * 2 + 64ULL * 1024 * 1024 : ULLONG_MAX;
+    /* The largest observed working set is already reserved once per host.
+     * Doubling every job as well can leave only one admissible slot even
+     * when two regular jobs and that reserve fit the unchanged budget. */
+    learned_job = measured_job_bytes(p90);
     if (learned_job < 256ULL * 1024 * 1024) learned_job = 256ULL * 1024 * 1024;
 }
 
@@ -200,9 +209,8 @@ int dcc_resource_slots(int maximum)
         (budget < job || budget - job < spare)) {
         /* Do not deadlock learning when a short window contains a large
          * outlier: one measured working set may fit even when the usual
-         * two-times estimate plus the separate reserve does not. */
-        unsigned long long one = peak_job <= (ULLONG_MAX - 64ULL * 1024 * 1024) / 5 * 4 ?
-            peak_job + peak_job / 4 + 64ULL * 1024 * 1024 : ULLONG_MAX;
+         * usual per-job estimate plus the separate reserve does not. */
+        unsigned long long one = measured_job_bytes(peak_job);
         return maximum > 0 && available >= one && budget >= one ? 1 : 0;
     }
     /* PSI is reactive; keep headroom and reserve a budget before the burst.

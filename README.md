@@ -257,11 +257,13 @@ hard per-job limits or a common scheduler for unrelated build processes.
 
 On Linux, `DISTCC_MEMORY_LEARNING=1` on the daemon uses compiler peak RSS
 reported by `wait4` for prepared jobs. `DISTCC_JOB_MEMORY` is the cold-start
-estimate. After eight successful observations, the estimate becomes twice the
-lower 90th-percentile rank of the last 64 successful RSS observations plus 64 MiB, with a
-256 MiB minimum. Spare capacity is the greater of a quarter-job margin and the
+estimate. After eight successful observations, the estimate becomes the
+lower 90th-percentile rank of the last 64 successful RSS observations plus 25%
+and 64 MiB, with a 256 MiB minimum. Spare capacity is the greater of a
+quarter-job margin and the
 largest observed RSS, including failed compiles. This high-water reserve lasts
-until daemon restart; an unusually large job does not inflate the estimate for
+until daemon restart. The shared reserve covers an additional observed working
+set without doubling every job's estimate. An unusually large job does not inflate the estimate for
 every subsequent small job. Cgroup limits, available headroom, PSI and `--jobs`
 remain in force. Multiple simultaneous unseen large jobs can still exceed the
 estimate; the service's memory limit must remain configured. When the combined

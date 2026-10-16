@@ -469,6 +469,7 @@ class MemoryEstimateTest(unittest.TestCase):
             root = Path(directory)
             source = root/'memory.c'
             source.write_text('''#include <assert.h>
+#include <limits.h>
 #include <stdlib.h>
 #include "resource.h"
 #define M (1024ULL*1024)
@@ -491,8 +492,17 @@ int main(void) {
     assert(dcc_resource_spare_bytes() == 1536*M);
     assert(dcc_resource_samples() == 17);
     for (int i=0; i<64; ++i) dcc_resource_observe(160*M, 1);
-    assert(dcc_resource_job_bytes() == 384*M);
+    assert(dcc_resource_job_bytes() == 264*M);
     assert(dcc_resource_spare_bytes() == 1536*M);
+    for (int i=0; i<64; ++i) dcc_resource_observe(896*M, 1);
+    /* Two observed working sets, their margins and the failed-job reserve
+       must fit a 4-GiB service. A third job must still be held back. */
+    assert(dcc_resource_job_bytes() == 1184*M);
+    assert(2*dcc_resource_job_bytes() + dcc_resource_spare_bytes() <= 4096*M);
+    assert(3*dcc_resource_job_bytes() + dcc_resource_spare_bytes() > 4096*M);
+    for (int i=0; i<64; ++i) dcc_resource_observe(ULLONG_MAX, 1);
+    assert(dcc_resource_job_bytes() == ULLONG_MAX);
+    assert(dcc_resource_spare_bytes() == ULLONG_MAX);
     unsetenv("DISTCC_MEMORY_LEARNING");
     assert(dcc_resource_job_bytes() == 512*M);
     assert(dcc_resource_spare_bytes() == 128*M);
