@@ -256,6 +256,7 @@ preprocessing slots. Existing work finishes normally; these estimates are not
 hard per-job limits or a common scheduler for unrelated build processes.
 
 For an already configured Gentoo fleet, run `./deploy` without arguments.
+The launcher can also be symlinked into `PATH` as `distcc-deploy`.
 It reads the private `~/.config/distcc/deploy.json` (or `$XDG_CONFIG_HOME`),
 selects the latest committed overlay ebuild, installs it on all targets,
 applies service settings, and verifies native versus remote C/C++ compilation,
