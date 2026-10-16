@@ -1,12 +1,13 @@
 /* Collect inputs from the actual GCC frontend. SPDX-License-Identifier: GPL-3.0-or-later */
+// Let GCC include the standard library before poisoning libc identifiers.
+#define INCLUDE_STRING
+#define INCLUDE_VECTOR
 #include "gcc-plugin.h"
 #include "plugin-version.h"
 #include "c-family/c-pragma.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
-#include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
 
