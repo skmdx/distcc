@@ -472,6 +472,14 @@ class PreprocessTest(BrokerTestCase):
         self.source.write_text('#include <clocale>\n')
         self.compare('g++')
 
+    def test_parent_components_in_include_search_paths(self):
+        directory = self.work/'headers'
+        directory.mkdir()
+        (directory/'child').mkdir()
+        (directory/'selected.h').write_text('int selected;\n')
+        self.source.write_text('#include <selected.h>\n#if __has_include(<absent.h>)\n#error unexpected\n#endif\n')
+        self.compare(args=['-I'+str(directory/'child'/'..'), '-MD', '-MF', 'dep.d'])
+
     def test_utf8_bom_header_and_macro_diagnostic(self):
         header = self.work / 'bom.h'
         header.write_bytes(b'\xef\xbb\xbf#define NONNULL(x) ((x) != 0)\n'

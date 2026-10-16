@@ -65,8 +65,10 @@ static int missing_input(void **slot, void *opaque)
     // libcpp records ENOENT here, including directories and ENOTDIR. The
     // publication cache observes these failed candidates and their ancestors;
     // do not repeat every failed filesystem lookup in this process as well.
-    visitor.ok = !unsupported_absolute(path) &&
-                 visitor.callback(path, nullptr, -1, visitor.context);
+    // These are constructed search candidates, not source include operands.
+    // A valid -I directory may contain ".."; rejecting it here rejects normal
+    // failed probes even though command-line paths are already transferred.
+    visitor.ok = visitor.callback(path, nullptr, -1, visitor.context);
     return visitor.ok;
 }
 

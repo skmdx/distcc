@@ -82,6 +82,16 @@ class GccScanTest(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, 'unsupported'):
       self.scan()
 
+  def test_parent_components_in_search_paths_are_supported(self):
+    directory = self.root/'headers'
+    directory.mkdir()
+    (directory/'child').mkdir()
+    header = directory/'selected.h'
+    header.write_text('int selected;\n')
+    self.source.write_text('#include <selected.h>\n#if __has_include(<absent.h>)\n#error unexpected\n#endif\n')
+    result = self.scan('-I' + str(directory/'child'/'..'))
+    self.assertIn(str(directory/'child'/'..'/'selected.h'), result['dependencies'])
+
   def test_worker_absolute_lookup_is_confined_to_input_tree(self):
     header, absent = self.root/'present.h', self.root/'worker-only.h'
     header.write_text('int wrong;\n')
