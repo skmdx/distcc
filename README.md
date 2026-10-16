@@ -274,6 +274,40 @@ Failed stages retain their logs and return nonzero. Successful deployment logs
 are moved to the configured results directory; intermediate binary packages
 are removed. The command does not create commits or publish a new release.
 
+Run `./benchmark` without arguments to measure the installed fleet. It can be
+symlinked into `PATH` as `distcc-bench`. The private
+`~/.config/distcc/bench.json` selects the build client and workers by their names
+in `deploy.json`; see `bench/fleet.example.json`. Configure a known complete
+Ninja build and its expected object count, finite memory limit with swap
+disabled, and an available `perf` executable. The example uses the previously
+validated media-driver workload. Parallelism comes from the normal Portage
+configuration, including distcc's automatic job calculation.
+Observed automatic job counts are recorded as scheduler outcomes; changing an
+explicit job limit changes the configuration and prevents comparison.
+
+The command pauses configured build services, runs at least two clean builds
+with a private Portage configuration and ccache disabled, and resumes the
+services on success or failure. It records full build times, per-worker
+completion/concurrency/queue statistics, broker preparation/queue/execution
+feedback, TCP counters, cgroup CPU/memory/I/O, and a client CPU perf profile.
+Phase totals sum overlapping jobs and are not elapsed wall time. Worker CPU
+utilization includes unrelated host activity. Detailed logs and profiling have
+overhead; compare results collected with the same instrumentation.
+
+Each run saves `result.json`, `summary.txt` and its raw evidence under the
+configured results directory. A successful run updates `latest.json`; matching
+workload/compiler/configuration/resource conditions permit comparison with the
+previous successful invocation. Different conditions, missing statistics,
+worker restarts, incomplete object counts, analysis failures or memory-limit
+events prevent a valid comparison. The first invocation establishes a baseline;
+it does not establish a speedup. Failures exit nonzero and retain evidence.
+Interrupted resume state is retained for the next invocation. Deployment and
+measurement share a lock so they cannot modify the fleet simultaneously.
+Perf samples stay in a memory file within the build's cgroup limit. The command
+checks that the report contains samples and no recording/decoding errors, then
+saves a verified `perf.data.zst` archive. Decompress it before reading it with
+perf. An exit code of zero alone does not establish a valid profile.
+
 For Linux/systemd workers, `packaging/systemd/distccd-memory.py` and
 `distccd-memory.conf` provide an optional kernel-derived service limit. Install
 the helper as `/usr/lib/distcc/distccd-memory.py` and the configuration as a

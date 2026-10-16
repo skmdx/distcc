@@ -144,6 +144,10 @@ bench_PY = bench/Build.py \
 	bench/buildutil.py \
 	bench/compiler.py \
 	bench/rpc.py \
+	benchmark \
+	bench/fleet.py \
+	bench/measure.py \
+	bench/fleet.example.json \
 	bench/statistics.py
 
 pkgdoc_DOCS = AUTHORS COPYING NEWS \
@@ -230,6 +234,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_admission.py \
 	test/test_service_memory.py \
 	test/test_deploy.py \
+	test/test_fleet_bench.py \
 	test/test_preprocess.py \
 	test/test_cpp_lookup.py \
 	find_c_extension.sh
@@ -825,6 +830,7 @@ adaptive-check: distcc distccd h_hosts
 	$(PYTHON) "$(srcdir)/test/test_admission.py" -v
 	$(PYTHON) "$(srcdir)/test/test_service_memory.py" -v
 	$(PYTHON) "$(srcdir)/test/test_deploy.py" -v
+	$(PYTHON) "$(srcdir)/test/test_fleet_bench.py" -v
 
 preprocess-check: distcc distccd pump include-server $(CPP_LOOKUP_TARGET)
 	$(PYTHON) "$(srcdir)/test/test_preprocess.py" -v

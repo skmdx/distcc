@@ -250,7 +250,9 @@ def main():
             for target in targets:
                 if target.get('binary'):
                     run(['sudo', '-n', 'rm', '-rf', target['temporary'] + '/distcc-deploy-binpkgs/' + version], target)
-            shutil.rmtree(work / 'binpkgs', ignore_errors=True)
+            # Cross builds create root-owned package subdirectories. Failure to
+            # remove them must not be hidden before moving logs across devices.
+            run(['sudo', '-n', 'rm', '-rf', '--', work / 'binpkgs'])
             (work / 'result.json').write_text(json.dumps({'version': version, 'success': True,
                                                         'targets': [t['name'] for t in targets]}))
             results = Path(settings['results'])

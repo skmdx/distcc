@@ -1,0 +1,12 @@
+{
+  "client": "builder",
+  "results": "/path/to/retained/measurements",
+  "package": "media-libs/libva-intel-media-driver-26.2.0",
+  "ebuild": "/var/db/repos/gentoo/media-libs/libva-intel-media-driver/libva-intel-media-driver-26.2.0.ebuild",
+  "expected_objects": 845,
+  "repetitions": 2,
+  "sample_seconds": 0.5,
+  "limits": ["MemoryMax=4G", "MemorySwapMax=0"],
+  "perf": {"executable": "/usr/bin/perf", "frequency": 49, "environment": {}},
+  "workers": [{"name": "builder", "address": "builder.example.invalid", "port": 3633}]
+}
