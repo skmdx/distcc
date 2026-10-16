@@ -82,6 +82,46 @@ class IncludeAnalyzerTest(unittest.TestCase):
   def RetrieveCanonicalPaths(self, files):
     return set([ self.include_analyzer.realpath_map.string[f] for f in files ])
 
+  def test_macro_changes_reach_cycles_include_next_and_new_aliases(self):
+    graphs = {
+      'cycle': {
+        'first.c': '#include "a.h"\n',
+        'second.c': '#include "b.h"\n',
+        'a.h': '#include "b.h"\n#if __has_include(CANDIDATE)\n#endif\n',
+        'b.h': '#include "a.h"\n',
+      },
+      'next': {
+        'first.c': '#include <wrapper.h>\n',
+        'second.c': '#include <wrapper.h>\n',
+        'one/wrapper.h': '#include_next <wrapper.h>\n',
+        'two/wrapper.h': '#if __has_include(CANDIDATE)\n#endif\n',
+      },
+      'alias': {
+        'first.c': '#include "one/wrapper.h"\n',
+        'second.c': '#include "one/./wrapper.h"\n',
+        'one/wrapper.h': '#if __has_include(CANDIDATE)\n#endif\n',
+      },
+    }
+    for case, files in graphs.items():
+      with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+        macro = 'CANDIDATE_' + case.upper()
+        for name, content in (files | {'old.h': '', 'new.h': ''}).items():
+          path = os.path.join(directory, name)
+          os.makedirs(os.path.dirname(path), exist_ok=True)
+          with open(path, 'w') as stream:
+            stream.write(content.replace('CANDIDATE', macro))
+        cwd = os.getcwd()
+        os.chdir(directory)
+        try:
+          for source, header in (('first.c', 'old.h'), ('second.c', 'new.h')):
+            includes = self.RetrieveCanonicalPaths(
+                self.ProcessCompilationCommandLine(
+                    'gcc -I. -Ione -Itwo -D' + macro + '=\\"' + header +
+                    '\\" ' + source, directory))
+            self.assertIn(os.path.join(directory, header), includes)
+        finally:
+          os.chdir(cwd)
+
 
   def test_AdvancedComputedIncludes(self):
 

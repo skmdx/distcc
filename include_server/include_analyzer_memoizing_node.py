@@ -52,115 +52,58 @@ RESOLUTION_MODES_STR = [ None, 'RESOLVED', 'QUOTE', 'ANGLE', 'NEXT' ]
 
 # MAIN COURSE
 
-class UnionCache(object):
-  """Frozen sets and their unions, represented by integers.
-
-  Frozensets are Python's immutable and hashable sets. We hash them into set
-  ids, which are integers. That allows us to cache union operations efficiently.
-  """
-
-  def __init__(self):
-    """Constructor:
-    Instance variables:
-      members: members[set_id] = frozenset([s1,..., sn]), the members of the set
-      cache: cache[(set1_id, set2_id)] = the id of the union of set1 and set2
-      id_map: the set of frozen sets we have seen mapped to {1, 2, ..}
-    """
-    self.members = {}
-    self.cache = {}
-    self.id_map = {}
-
-  def SetId(self, members):
-    """Memoize the frozenset of members and return set id."""
-    frozen = frozenset(members)
-    try:
-      return self.id_map[frozen]
-    except KeyError:
-      self.id_map[frozen] = len(self.id_map) + 1
-    self.members[len(self.id_map)] = frozen
-    return len(self.id_map)
-
-  def Elements(self, set_id):
-    """The frozenset corresponding to a set id."""
-    return self.members[set_id]
-
-  def Union(self, set1_id, set2_id):
-    """Return the set id of the union of sets represented by set ids."""
-    try:
-      return self.cache[(set1_id, set2_id)]
-    except KeyError:
-      frozen = self.members[set1_id] | self.members[set2_id]
-      frozen_id = self.SetId(frozen)
-      self.cache[(set1_id, set2_id)] = frozen_id
-      return frozen_id
-
-
 class SupportRecord(object):
-  """Record the symbols that expressions depend on.
+  """Direct macro dependencies and reverse edges of the include graph.
 
-  A support record is an object that contains a mutable support set of symbols.
-  Each node in the summary graph is associated with a support record.  It is the
-  set of symbols upon which the included computes depend. A support record is
-  initially deemed valid. If a symbol is redefined, then it becomes invalid.
-  For efficiency, the valid field is sometimes explicitly handled by a user of
-  this object.
+  A macro change invalidates its users and their parents. Keeping graph edges
+  avoids copying every descendant's macro set into each ancestor. Edges may
+  remain after rebuilding a node: macro definitions only accumulate until the
+  graph and symbol table are cleared together.
   """
 
   def __init__(self, support_master):
-    """Constructor.
-    Argument:
-      support_master: a record for holding the reverse mapping from symbols to
-                      support records that contain them.
-    Instance Variables:
-      support_master: see above
-      union_cache: a union cache for set manipulation
-      support_id: the id of a set in union_cache; the set consists of all
-                  symbols referenced by computed includes in any include
-                  dependency of the node to which the support record belongs
-      valid: a Boolean
-    """
     self.support_master = support_master
     self.valid = True
-    self.union_cache = support_master.union_cache
-    self.support_id = self.union_cache.SetId([])
+    self.symbols = set()
+    self.parents = set()
 
-  def Update(self, set_id):
-    """Augment the support record with the set represented by set_id.
-    """
-    union_id = self.union_cache.Union(self.support_id,
-                                      set_id)
-    if union_id != self.support_id:
-      self.support_master.SupportRecordDependencyAdd(
-        self.union_cache.Elements(set_id) - self.union_cache.Elements(self.support_id),
-        self)
-      self.support_id = union_id
+  def DependsOn(self, child):
+    child.parents.add(self)
+    if not child.valid:
+      self.Invalidate()
+
+  def Invalidate(self):
+    pending = [self]
+    while pending:
+      record = pending.pop()
+      if record.valid:
+        record.valid = False
+        pending.extend(record.parents)
 
   def UpdateSet(self, symbols):
-    """Add symbols to the support.
-
-    This function is similar to Update, but the argument is a list of elements.
-    """
-    self.Update(self.union_cache.SetId(symbols))
+    """Register only this node's new macro dependencies."""
+    added = set(symbols) - self.symbols
+    if added:
+      self.support_master.SupportRecordDependencyAdd(added, self)
+      self.symbols.update(added)
 
 
 class SupportMaster(object):
   """Record the support records that depend on a given symbol.
 
   A map symbol_to_records is maintained. For each symbol s
-  self.symbol_to_records[s] is the set of support records r whose support set
-  contains s."""
+  self.symbol_to_records[s] is the set of records that directly reference s.
+  Parent records are reached through the reverse include edges."""
 
   def __init__(self, symbol_table):
     """Constructor.
 
     Instance variables:
       symbol_to_records: a mapping to record sets
-      union_cache: a UnionCache for memoizing sets and their unions
     """
     self.symbol_to_records = {}
     self.symbol_table = symbol_table
     self.patterns = {}
-    self.union_cache = UnionCache()
 
   def MatchingSymbols(self, pattern):
     """Reuse paste-name matches until the existing definition callback updates them."""
@@ -190,7 +133,7 @@ class SupportMaster(object):
         keys.append(pattern)
     for key in keys:
       for support_record in self.symbol_to_records.get(key, ()):
-        support_record.valid = False
+        support_record.Invalidate()
 
 
 class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
@@ -483,6 +426,7 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
     nodes_for_incl_config[key] =  node
 
     if not fp_resolved_pair:
+      support_record.valid = True
       if resolution_mode == NEXT:
         # Create children of this dummy node. Try against all
         # directories in quote_dirs; that list includes the
@@ -497,6 +441,7 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
                                   None, # file_dir_idx
                                   fp_real_idx_)
             children.append(node_)
+            support_record.DependsOn(node_[self.SUPPORT_RECORD])
         return node
       else:
         # For non-NEXT resolution modes
@@ -526,12 +471,12 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
 
     if resolution_mode != RESOLVED:
       # See whether we know about filepath post-resolution.
-      if ((fp_real_idx, fp_dirname_real_idx) in nodes_for_incl_config
-          and support_record.valid):
+      cached = nodes_for_incl_config.get((fp_real_idx, fp_dirname_real_idx))
+      if cached and cached[self.SUPPORT_RECORD].valid:
         statistics.master_hit_counter += 1
         # Redo former decision about node: we use the one that is
         # already there.
-        node = nodes_for_incl_config[(fp_real_idx, fp_dirname_real_idx)]
+        node = cached
         nodes_for_incl_config[key] = node
         return node
       # Couldn't find node under real name. We'll remember the node, but have to
@@ -563,13 +508,13 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
                             fp_dirname_idx)
       if node_:
         children.append(node_)
-        support_record.Update(node_[self.SUPPORT_RECORD].support_id)
+        support_record.DependsOn(node_[self.SUPPORT_RECORD])
     # Do the includes of the form #include <foo.h>.
     for angle_filepath in angle_includes:
       node_ = self.FindNode(nodes_for_incl_config, angle_filepath, ANGLE)
       if node_:
         children.append(node_)
-        support_record.Update(node_[self.SUPPORT_RECORD].support_id)
+        support_record.DependsOn(node_[self.SUPPORT_RECORD])
     if __debug__:
       if expr_includes: # Computed includes are interesting
         Debug(DEBUG_DATA, "FindNode, expr_includes: file: %s: '%s'",
@@ -599,7 +544,7 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
                               RESOLVED, None, fp_real_idx_)
         if node_:
           children.append(node_)
-          support_record.Update(node_[self.SUPPORT_RECORD].support_id)
+          support_record.DependsOn(node_[self.SUPPORT_RECORD])
       #  Now the resolution of includes of the file of the present node depends
       #  on symbols.
       support_record.UpdateSet(symbols)
@@ -609,7 +554,7 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
       node_ = self.FindNode(nodes_for_incl_config, include_next_filepath, NEXT)
       if node_:
         children.append(node_)
-        support_record.Update(node_[self.SUPPORT_RECORD].support_id)
+        support_record.DependsOn(node_[self.SUPPORT_RECORD])
     return node
 
   def _CalculateIncludeClosure(self, node, include_closure):

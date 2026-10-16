@@ -42,11 +42,39 @@ class IncludeAnalyzerMemoizingNodeUnitTest(unittest.TestCase):
         record.UpdateSet({'SHARED', 'FIRST'})
         record.UpdateSet({'SHARED', 'SECOND'})
         record.UpdateSet({'FIRST'})
-        self.assertEqual(master.union_cache.Elements(record.support_id),
-                         {'SHARED', 'FIRST', 'SECOND'})
+        self.assertEqual(record.symbols, {'SHARED', 'FIRST', 'SECOND'})
         self.assertTrue(record.valid)
         master.InvalidateRecords(name)
         self.assertFalse(record.valid)
+
+  def test_macro_invalidation_reaches_shared_parents_and_cycles(self):
+    master = include_analyzer_memoizing_node.SupportMaster({})
+    root, left, right, leaf, unrelated = [
+        include_analyzer_memoizing_node.SupportRecord(master) for _ in range(5)]
+    root.DependsOn(left)
+    root.DependsOn(right)
+    left.DependsOn(leaf)
+    right.DependsOn(leaf)
+    leaf.DependsOn(left)
+    # A symbol discovered after a cycle was connected must reach every parent.
+    leaf.UpdateSet({'HEADER'})
+    master.InvalidateRecords('HEADER')
+    self.assertTrue(unrelated.valid)
+    self.assertTrue(all(not record.valid for record in (root, left, right, leaf)))
+    # Reusing a rebuilt child must retain the dependency of a cached parent.
+    for record in (root, left, right, leaf):
+      record.valid = True
+    master.InvalidateRecords('HEADER')
+    self.assertFalse(root.valid)
+
+  def test_invalid_child_invalidates_a_new_parent(self):
+    master = include_analyzer_memoizing_node.SupportMaster({})
+    parent = include_analyzer_memoizing_node.SupportRecord(master)
+    child = include_analyzer_memoizing_node.SupportRecord(master)
+    child.UpdateSet({'HEADER'})
+    master.InvalidateRecords('HEADER')
+    parent.DependsOn(child)
+    self.assertFalse(parent.valid)
 
   def test_token_paste_invalidates_only_matching_aliases(self):
     table = {'FEATURE_EXISTING': ['1']}
