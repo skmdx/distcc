@@ -23,6 +23,7 @@ class LookupTest(unittest.TestCase):
             directory = self.root / ('empty-' + str(i))
             directory.mkdir()
             self.search.append('-I' + str(directory))
+        self.search.append('-I' + str(self.headers))
         self.source = self.root / 'input.c'
         self.env = dict(os.environ, LC_ALL='C',
                         LD_PRELOAD=str(self.build / 'cpp_lookup.so'), DISTCC_CPP_LOOKUP='1')
@@ -30,7 +31,7 @@ class LookupTest(unittest.TestCase):
     def preprocess(self, cache, *options):
         env = dict(self.env, DISTCC_CPP_LOOKUP=str(int(cache)))
         with tempfile.TemporaryFile(dir=self.work) as output:
-            result = subprocess.run(['gcc', '-E', *self.search, '-I' + str(self.headers), *options,
+            result = subprocess.run(['gcc', '-E', *self.search, *options,
                                      str(self.source)], cwd=self.work, env=env,
                                     stdout=output, stderr=subprocess.PIPE, timeout=15)
             output.seek(0)
@@ -57,6 +58,21 @@ const char *file = __FILE__, *base = __BASE_FILE__, *stamp = __TIMESTAMP__;
         self.assertEqual((self.work / 'deps.d').read_bytes(), deps)
 
     def test_changed_directory_replays_preprocessing(self):
+        self.check_changed_directory_replays_preprocessing()
+
+    def test_relative_search_replays_preprocessing(self):
+        self.search = ['-I' + os.path.relpath(arg[2:], self.work) for arg in self.search]
+        self.check_changed_directory_replays_preprocessing()
+
+    def test_symlink_parent_search_replays_preprocessing(self):
+        nested = self.root / 'elsewhere' / 'nested'
+        nested.mkdir(parents=True)
+        (self.work / 'link').symlink_to(nested, target_is_directory=True)
+        # link/../.. resolves outside cwd, unlike lexical removal of "..".
+        self.search = ['-Ilink/../../' + Path(arg[2:]).name for arg in self.search]
+        self.check_changed_directory_replays_preprocessing()
+
+    def check_changed_directory_replays_preprocessing(self):
         self.source.write_text('''#if __has_include("appeared.h")
 #include "appeared.h"
 #else

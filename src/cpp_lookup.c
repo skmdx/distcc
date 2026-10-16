@@ -89,11 +89,24 @@ static int absent(char *path)
     struct directory *d = directories[hash];
     while (d && strcmp(d->path, path)) d = d->next;
     if (!d && allocated < BUDGET) {
-        /* Build/output trees change during parallel builds. Leave those
-         * lookups to libc, rather than repeatedly discarding useful output. */
+        /* Build/output trees change during parallel builds; leave them to libc.
+         * Relative -I paths commonly leave cwd through "..". Compare the
+         * resolved directory, but retain the original spelling below so the
+         * final stat also detects a symlink being redirected during the scan.
+         * A missing directory is covered by its nearest enumerated ancestor. */
         size_t cwd_len = strlen(working_directory);
         if (!strncmp(path, working_directory, cwd_len) &&
-            (!path[cwd_len] || path[cwd_len] == '/')) goto done;
+            (!path[cwd_len] || path[cwd_len] == '/')) {
+            // Most generated paths need no filesystem walk on every lookup.
+            if (!strstr(path + cwd_len, "/..")) goto done;
+            char *resolved = realpath(path, NULL);
+            if (resolved) {
+                int generated = !strncmp(resolved, working_directory, cwd_len) &&
+                    (!resolved[cwd_len] || resolved[cwd_len] == '/');
+                free(resolved);
+                if (generated) goto done;
+            }
+        }
         int missing = absent(path);
         d = calloc(1, sizeof(*d));
         if (!d) goto done;

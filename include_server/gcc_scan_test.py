@@ -160,6 +160,12 @@ class GccScanTest(unittest.TestCase):
     self.assertIsNone(result['lookups'][str(directory)])
 
   def test_lookup_cache_replaces_the_manifest_after_namespace_change(self):
+    self.check_lookup_cache_replaces_the_manifest_after_namespace_change(False)
+
+  def test_relative_lookup_cache_replaces_manifest_after_namespace_change(self):
+    self.check_lookup_cache_replaces_the_manifest_after_namespace_change(True)
+
+  def check_lookup_cache_replaces_the_manifest_after_namespace_change(self, relative):
     lookup = (os.environ.get('DISTCC_CPP_LOOKUP_LIBRARY') or
               str(Path(__file__).resolve().parents[1] / 'cpp_lookup.so'))
     if not os.path.isfile(lookup):
@@ -171,7 +177,7 @@ class GccScanTest(unittest.TestCase):
     for i in range(300):
       directory = self.root/('empty-' + str(i))
       directory.mkdir()
-      search.append('-I' + str(directory))
+      search.append('-I' + (os.path.relpath(directory, work) if relative else str(directory)))
     gate = headers/'gate.h'
     os.mkfifo(gate)
     self.source.write_text('#if __has_include("appeared.h")\n'
@@ -189,13 +195,15 @@ class GccScanTest(unittest.TestCase):
     thread = threading.Thread(target=change_inputs, daemon=True)
     thread.start()
     with mock.patch.dict(os.environ, DISTCC_CPP_LOOKUP_LIBRARY=lookup, DISTCC_CPP_LOOKUP='1'):
-      result = gcc_scan.scan([self.compiler, *search, '-I' + str(headers), str(self.source)],
+      header_path = os.path.relpath(headers, work) if relative else str(headers)
+      result = gcc_scan.scan([self.compiler, *search, '-I' + header_path, str(self.source)],
                              str(work), self.library)
     thread.join(timeout=5)
     self.assertFalse(thread.is_alive())
     self.assertFalse(errors, errors)
-    self.assertIn(str(headers/'appeared.h'), result['dependencies'])
-    self.assertIn(str(gate), result['dependencies'])
+    dependencies = {Path(path).resolve() for path in result['dependencies']}
+    self.assertIn(headers/'appeared.h', dependencies)
+    self.assertIn(gate, dependencies)
 
 
 if __name__ == '__main__':
