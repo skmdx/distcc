@@ -1,5 +1,6 @@
 """Exercise the actual libclang-cpp extension and its filesystem contract."""
 import os
+import mmap
 from pathlib import Path
 import shutil
 import shlex
@@ -272,6 +273,40 @@ class ClangScanTest(unittest.TestCase):
     self.assertFalse(any(path.endswith('/prior.h.lz4s') for path in files))
     self.assertEqual(Path(image).read_bytes(), old_image)
 
+  def test_cached_images_refresh_after_hardlink_and_mmap_writes(self):
+    self.addCleanup(os.chdir, os.getcwd())
+    header = self.root / 'header.h'
+    other = self.root / 'other'
+    other.mkdir()
+    alias = other / 'alias.h'
+    header.write_bytes(b'int original;\n')
+    os.link(header, alias)
+    self.source.write_text('#include "header.h"\n')
+    for compiler in ('gcc', 'clang'):
+      if not shutil.which(compiler):
+        continue
+      with self.subTest(compiler=compiler):
+        header.write_bytes(b'int original;\n')
+        keeper = basics.ClientRootKeeper()
+        self.addCleanup(keeper.CleanOutClientRoots)
+        analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+        command = [compiler, '-c', str(self.source)]
+        original = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+        old_image = next(path for path in original if path.endswith('/header.h.lz4s'))
+        old_bytes = Path(old_image).read_bytes()
+        for mapped, data in ((False, b'int hardlink;\n'), (True, b'int mmapdata;\n')):
+          with alias.open('r+b') as stream:
+            if mapped:
+              with mmap.mmap(stream.fileno(), 0) as memory:
+                memory[:] = data
+                memory.flush()
+            else:
+              stream.write(data)
+          files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+          image = next(path for path in files if path.endswith('/header.h.lz4s'))
+          self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(data))
+          self.assertEqual(Path(old_image).read_bytes(), old_bytes)
+
   def test_cached_failed_lookup_is_revalidated_when_a_header_appears(self):
     gcc = shutil.which('gcc')
     if not gcc:
@@ -312,7 +347,7 @@ class ClangScanTest(unittest.TestCase):
         self.assertEqual(Path(image + '.xxh3').read_bytes()[:8],
                          xxhash.xxh3_64_digest(header.read_bytes()))
 
-  def test_compiler_scan_does_not_publish_a_change_during_compression(self):
+  def test_compiler_scan_retries_a_change_during_compression(self):
     gcc = shutil.which('gcc')
     if not gcc:
       self.skipTest('GCC is required')
@@ -325,16 +360,41 @@ class ClangScanTest(unittest.TestCase):
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
     command = [gcc, '-c', str(self.source)]
     write = compress_files.WriteCompressed
+    images = {}
     def changing_write(path, *args):
       write(path, *args)
       if path.endswith('/header.h.lz4s'):
-        header.write_text('int updated_during_collection;\n')
+        images[path] = Path(path).read_bytes()
+        if len(images) == 1:
+          header.write_text('int updated_during_collection;\n')
     with mock.patch.object(compress_files, 'WriteCompressed', side_effect=changing_write):
-      with self.assertRaisesRegex(basics.NotCoveredError, 'changed while collecting'):
-        analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
-    files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+      files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+    self.assertEqual(len(images), 2)
+    for path, contents in images.items():
+      self.assertEqual(Path(path).read_bytes(), contents)
     image = next(path for path in files if path.endswith('/header.h.lz4s'))
     self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(header.read_bytes()))
+
+  def test_compiler_scan_rejects_continuous_changes_during_compression(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    self.addCleanup(os.chdir, os.getcwd())
+    self.source.write_text('int original;\n')
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    write = compress_files.WriteCompressed
+    changes = []
+    def changing_write(path, *args):
+      write(path, *args)
+      if path.endswith('/source.c.lz4s'):
+        changes.append(path)
+        self.source.write_text('int changed_%d;\n' % len(changes))
+    with mock.patch.object(compress_files, 'WriteCompressed', side_effect=changing_write):
+      with self.assertRaisesRegex(basics.NotCoveredError, 'Inputs keep changing'):
+        analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper, 'lz4s')
+    self.assertEqual(len(changes), 2)
 
   def test_compilation_from_filesystem_root(self):
     gcc = shutil.which('gcc')

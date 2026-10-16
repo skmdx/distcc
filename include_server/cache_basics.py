@@ -692,13 +692,18 @@ class FileStampCache(object):
         self.files[original] = stamp
     return self.paths[key]
 
-  def Changed(self):
+  def Changed(self, files=None):
     if self.watch_fd < 0:
       return any(self.Stamp(path, ancestor) != stamp
                  for (path, ancestor), stamp in self.paths.items())
-    # Positive files still need stamps: mmap writes and writes via another hard
-    # link need not produce a notification in the directory we watched.
-    if any(self.Stamp(path) != stamp for path, stamp in self.files.items()):
+    # Native scans supply fresh identities for the current inputs. Only those
+    # contents need rechecking before publication; earlier inputs are checked
+    # when used again. Namespace events still cover every cached path. Without
+    # reliable notifications the full validation above remains necessary.
+    # mmap/hard-link writes are why content stamps cannot be replaced by events.
+    if files is None:
+      files = self.files
+    if any(self.Stamp(path) != self.files[path] for path in files):
       return True
     while True:
       try:

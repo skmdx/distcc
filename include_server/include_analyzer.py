@@ -39,6 +39,9 @@ Debug = basics.Debug
 DEBUG_TRACE = basics.DEBUG_TRACE
 NotCoveredError = basics.NotCoveredError
 
+class CacheInvalidated(Exception):
+  """An input generation changed before its manifest could be published."""
+
 class IncludeAnalyzer(object):
   """The skeleton, including caches, of an include analyzer."""
 
@@ -90,6 +93,7 @@ class IncludeAnalyzer(object):
     self.stat_reset_triggers = stat_reset_triggers
     self.translation_unit = "unknown translation unit"
     self.timer = None
+    self.current_input_paths = ()
     self.include_server_cwd = os.getcwd()
     self._InitializeAllCaches()
 
@@ -143,7 +147,9 @@ class IncludeAnalyzer(object):
     # directory.
     os.chdir(self.include_server_cwd)
     self.DoStatResetTriggers()
-    if self.build_stat_cache.file_stamps.Changed():
+    # The compiler will report fresh content identities. Retire stale path
+    # mappings now, then validate this request's contents before publication.
+    if self.build_stat_cache.file_stamps.Changed(()):
       self.ClearStatCaches()
 
     # Now change to the distcc client's working directory.
@@ -163,9 +169,10 @@ class IncludeAnalyzer(object):
     # Do the real work.
     include_closure = (
       self.ProcessCompilationCommand(currdir, parsed_command))
-    # Cancel timer before I/O in compress_files.
+    # Pause the CPU timer during publication I/O. A generation retry resumes
+    # the same quota; the request owner cancels it when the request ends.
     if self.timer:  # timer may not always exist when testing
-      self.timer.Cancel()
+      self.timer.Stop()
     # Get name of the initial source file
     translation_unit = self.translation_unit
     # Links are accumulated intra-build (across different compilations in a
@@ -187,9 +194,8 @@ class IncludeAnalyzer(object):
 
     # Never publish a manifest assembled from changing inputs. Previous
     # manifests keep their immutable generation until the build finishes.
-    if self.build_stat_cache.file_stamps.Changed():
-      self.ClearStatCaches()
-      raise NotCoveredError("Input changed while collecting includes")
+    if self.build_stat_cache.file_stamps.Changed(self.current_input_paths):
+      raise CacheInvalidated()
 
     realpath_map = self.realpath_map
 

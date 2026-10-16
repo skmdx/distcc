@@ -70,10 +70,6 @@ def run(command, allow_errors=False):
   return result
 
 
-class _CacheInvalidated(Exception):
-  """Cached filesystem observations changed while the compiler was running."""
-
-
 class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
@@ -92,8 +88,10 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
         try:
           files = super().DoCompilationCommand(cmd, *args, **kwargs)
           break
-        except _CacheInvalidated:
+        except include_analyzer.CacheInvalidated:
           self.ClearStatCaches()
+          if self.timer:
+            self.timer.Start()
       else:
         raise basics.NotCoveredError('Inputs keep changing during dependency analysis',
                                      send_email=False)
@@ -275,6 +273,8 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
                   for path, data in result['files'].items()})
     paths = set(result['dependencies'])
     stamps = self.build_stat_cache.file_stamps
+    self.current_input_paths = tuple(path for path, expected in result['lookups'].items()
+                                     if expected is not None)
     for path, expected in result['lookups'].items():
       observed = stamps.Observe(path)
       # Failed header candidates include directories. Reuse their observed
@@ -282,11 +282,17 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       # stats every path when notifications cannot be trusted). Positive files
       # still need a fresh stamp for mmap and hard-link writes.
       changed = (observed is not None and not stat.S_ISDIR(observed[2])
-                 if expected is None else stamps.Stamp(path) != expected)
+                 if expected is None else observed != expected)
       if changed:
+        current = stamps.Stamp(path)
+        matches_scan = ((current is None or stat.S_ISDIR(current[2]))
+                        if expected is None else current == expected)
+        if matches_scan:
+          # Cached bytes/path mappings belong to a previous input generation.
+          raise include_analyzer.CacheInvalidated()
         raise basics.NotCoveredError('Input changed after compiler dependency scan: ' + path)
-    if stamps.Changed():
-      raise _CacheInvalidated()
+    if stamps.Changed(()):
+      raise include_analyzer.CacheInvalidated()
     # Keep source bytes unchanged. A shared header can be reached through both
     # relative and absolute spellings; one injected #line cannot represent both.
     # The worker remaps its private root with compiler prefix-map options.
