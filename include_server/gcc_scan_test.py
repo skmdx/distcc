@@ -46,6 +46,17 @@ class GccScanTest(unittest.TestCase):
     self.assertNotIn(str(self.root/'clang.h'), result['dependencies'])
     self.assertIsNone(result['lookups'][str(self.root/'missing.h')])
 
+  def test_compiler_reports_directory_attributes(self):
+    ordinary, system = self.root/'ordinary', self.root/'system'
+    ordinary.mkdir()
+    system.mkdir()
+    self.source.write_text('int n;\n')
+    result = self.scan('-I', str(ordinary), '-isystem', str(system))
+    self.assertEqual(result['directories'][str(ordinary)], 0)
+    self.assertEqual(result['directories'][str(system)], 2)
+    result = self.scan('-x', 'c++')
+    self.assertTrue(any(kind == 1 for kind in result['directories'].values()))
+
   def test_trigraphs_variadics_and_include_next_use_compiler_semantics(self):
     first, second = self.root/'first', self.root/'second'
     first.mkdir()

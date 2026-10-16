@@ -156,8 +156,9 @@ static int add_system_includes(char ***argv, const char *root)
     for (unsigned i = 0; i < count; ++i) {
         if (fread(header, 1, 8, manifest) != 8) goto done;
         unsigned kind = dcc_tcp_get32(header), length = dcc_tcp_get32(header + 4);
-        if (kind > 4 || !length || length >= sizeof(path) ||
-            fread(path, 1, length, manifest) != length || (kind < 3 && path[0] != '/') ||
+        if (kind > 5 || !length || length >= sizeof(path) ||
+            fread(path, 1, length, manifest) != length ||
+            (kind != 3 && kind != 4 && path[0] != '/') ||
             memchr(path, 0, length)) goto done;
         path[length] = 0;
         if (kind == 4) {
@@ -178,17 +179,25 @@ static int add_system_includes(char ***argv, const char *root)
             dcc_argv_append(args, option);
             continue;
         }
-        if (asprintf(&option, "%s%s%s", kind == 0 ? "-isystem" : "", kind == 3 ? "" : root, path) < 0) {
+        if (asprintf(&option, "%s%s%s", kind == 0 || kind == 5 ? "-isystem" : "",
+                     kind == 3 ? "" : root, path) < 0) {
             ret = EXIT_OUT_OF_MEMORY;
             goto done;
         }
         const char *prefix[] = {"-Xclang", kind == 1 ? "-internal-isystem" : "-internal-externc-isystem", "-Xclang"};
-        for (unsigned j = 0; j < (kind == 0 ? 0 : kind == 3 ? 1 : 3); ++j) {
+        for (unsigned j = 0; j < (kind == 3 ? 1 : kind == 1 || kind == 2 ? 3 : 0); ++j) {
             char *arg = strdup(kind == 3 ? "-include" : prefix[j]);
             if (!arg) { free(option); ret = EXIT_OUT_OF_MEMORY; goto done; }
             dcc_argv_append(args, arg);
         }
         dcc_argv_append(args, option);
+        if (kind == 5) {
+            if (asprintf(&option, "-fplugin-arg-distcc_gcc_scan-cxx-system=%s%s", root, path) < 0) {
+                ret = EXIT_OUT_OF_MEMORY;
+                goto done;
+            }
+            dcc_argv_append(args, option);
+        }
     }
     if (fgetc(manifest) != EOF || ferror(manifest) || rmdir(directory)) goto done;
     dcc_free_argv(*argv);

@@ -468,6 +468,10 @@ class PreprocessTest(BrokerTestCase):
         self.compare(args=['-MD', '-MF', 'dep.d'])
         self.assertNotIn('preprocessing locally', (self.work/'client.log').read_text())
 
+    def test_gcc_cxx_system_header_attributes(self):
+        self.source.write_text('#include <clocale>\n')
+        self.compare('g++')
+
     def test_utf8_bom_header_and_macro_diagnostic(self):
         header = self.work / 'bom.h'
         header.write_bytes(b'\xef\xbb\xbf#define NONNULL(x) ((x) != 0)\n'

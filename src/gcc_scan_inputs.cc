@@ -11,7 +11,8 @@
 #include "intl.h"
 #include "files.cc"
 
-using input_callback = bool (*)(const char *, const struct stat *, void *);
+// -1 identifies a file record; 0..2 are GCC's directory system-header classes.
+using input_callback = bool (*)(const char *, const struct stat *, int, void *);
 
 static const char *input_root;
 
@@ -25,10 +26,20 @@ static char *absolute_input(const char *name, cpp_dir *)
     return concat(input_root, name, nullptr);
 }
 
-extern "C" void distcc_gcc_input_root(cpp_reader *reader, const char *root)
+extern "C" bool distcc_gcc_input_root(cpp_reader *reader, const char *root)
 {
+    if (reader->no_search_path.construct == absolute_input) return false;
     input_root = root;
     reader->no_search_path.construct = absolute_input;
+    return true;
+}
+
+extern "C" void distcc_gcc_cxx_system(cpp_reader *reader, const char *path)
+{
+    // -isystem uses the extern-C system class. GCC's built-in C++ directories
+    // use class 1 instead; restore it before any headers are entered.
+    for (auto *dir = reader->quote_include; dir; dir = dir->next)
+        if (!strcmp(dir->name, path)) dir->sysp = 1;
 }
 
 static bool unsupported_absolute(const char *path)
@@ -55,7 +66,7 @@ static int missing_input(void **slot, void *opaque)
     // publication cache observes these failed candidates and their ancestors;
     // do not repeat every failed filesystem lookup in this process as well.
     visitor.ok = !unsupported_absolute(path) &&
-                 visitor.callback(path, nullptr, visitor.context);
+                 visitor.callback(path, nullptr, -1, visitor.context);
     return visitor.ok;
 }
 
@@ -78,9 +89,12 @@ bool distcc_gcc_inputs(cpp_reader *reader, input_callback callback, void *contex
             stamp.st_mtim.tv_nsec != file->st.st_mtim.tv_nsec ||
             stamp.st_ctim.tv_sec != file->st.st_ctim.tv_sec ||
             stamp.st_ctim.tv_nsec != file->st.st_ctim.tv_nsec ||
-            !callback(file->path, &stamp, context)) return false;
+            !callback(file->path, &stamp, -1, context)) return false;
     }
     input_visitor visitor{callback, context, true};
     htab_traverse(reader->nonexistent_file_hash, missing_input, &visitor);
+    if (!visitor.ok) return false;
+    for (const auto *dir = reader->quote_include; dir; dir = dir->next)
+        if (!callback(dir->name, nullptr, dir->sysp, context)) return false;
     return visitor.ok;
 }

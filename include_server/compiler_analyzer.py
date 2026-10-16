@@ -250,8 +250,20 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     started = time.perf_counter()
     try:
       compiler = shutil.which(command[0]) or command[0]
-      result = (clang_scan.scan([compiler, *command[1:], '-c'], currdir) if clang else
-                gcc_scan.scan([compiler, *command[1:]], currdir, options))
+      if clang:
+        result = clang_scan.scan([compiler, *command[1:], '-c'], currdir)
+      else:
+        native = gcc_scan.scan([compiler, *command[1:]], currdir, options)
+        # Preserve GCC's actual default directory classes.
+        # -isystem alone changes C++ directories into extern-C system headers.
+        classes = {1: 5, 2: 0}
+        if any(kind == 0 and native['directories'].get(path) not in classes
+               for kind, path in self.system_includes):
+          raise RuntimeError('GCC reported an unsupported default include directory')
+        self.system_includes = tuple(
+            (classes[native['directories'][path]] if kind == 0 else kind, path)
+            for kind, path in self.system_includes)
+        result = native
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
       raise basics.NotCoveredError(str(error), send_email=False) from error
     finally:
@@ -290,7 +302,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       closure[real_idx] = ()
     self.snapshots = snapshots
     for kind, path in self.system_includes:
-      if kind < 3:
+      if kind not in (3, 4):
         self.mirror_path.DoPath(os.path.join(path, 'forcing_technique_271828'),
                                self.currdir_idx, self.client_root_keeper.client_root)
     basics.Debug(basics.DEBUG_TRACE, 'Compiler dependency analysis (%s): %d inputs',

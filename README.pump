@@ -49,6 +49,9 @@ the same module's libcpp search callback to resolve absolute include operands
 and existence probes inside the transferred input tree. Absolute operands with
 parent-directory traversal and Clang absolute operands still require local
 preprocessing; they are never resolved against unrelated worker files.
+GCC also reports each search directory's native system-header class. Workers
+preserve ordinary, C++ system and extern-C system directories rather than
+converting all paths to -isystem, which changes C++ header attributes.
 
 Build the module using the exact source of the selected GCC, including any
 downstream changes to libcpp, and that compiler's installed plugin headers:

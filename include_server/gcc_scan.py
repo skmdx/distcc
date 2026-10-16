@@ -31,7 +31,7 @@ def scan(command, cwd, library):
   # A completed manifest lets the worker reproduce both diagnostics and partial
   # output. Startup failures, signals and incomplete collection remain failures.
   if (result.returncode < 0 or len(data) > 64 * 1024 * 1024 or
-      not data.startswith(b'DCGS1\0') or not data.endswith(b'\0\0')):
+      not data.startswith(b'DCGS2\0') or not data.endswith(b'\0\0')):
     raise RuntimeError('Incomplete or unsupported GCC dependency scan: ' +
                        result.stderr.decode(errors='replace')[-2048:])
   fields = data[6:-1].split(b'\0')
@@ -40,8 +40,12 @@ def scan(command, cwd, library):
   # None denotes a failed header candidate, including a directory. The common
   # publication cache records its identity and verifies namespace changes.
   lookups = {}
+  directories = {}
   for path, metadata in zip(fields[::2], fields[1::2]):
     path = os.path.join(cwd, os.fsdecode(path))
+    if metadata in (b'D0', b'D1', b'D2'):
+      directories[path] = int(metadata[1:])
+      continue
     expected = None if metadata == b'-' else tuple(map(int, metadata.split()))
     if expected is not None and len(expected) != 6:
       raise RuntimeError('Malformed GCC dependency metadata')
@@ -63,4 +67,5 @@ def scan(command, cwd, library):
     raise RuntimeError('GCC dependency scan returned no inputs')
   # The common publication path validates these identities before and after
   # compression. Its immutable image cache reads only new or changed files.
-  return {'files': None, 'dependencies': files, 'lookups': lookups}
+  return {'files': None, 'dependencies': files, 'lookups': lookups,
+          'directories': directories}
