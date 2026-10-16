@@ -60,12 +60,41 @@ class GccScanTest(unittest.TestCase):
     self.assertIn(str(first/'next.h'), result['dependencies'])
     self.assertIn(str(second/'next.h'), result['dependencies'])
 
-  def test_absolute_probe_is_rejected(self):
+  def test_absolute_probe_and_include_use_native_lookup(self):
     header = self.root/'present.h'
     header.write_text('int present;\n')
-    self.source.write_text('#if __has_include("%s")\n#endif\n' % header)
+    self.source.write_text('#if __has_include("%s")\n#include "%s"\n#endif\n' % (header, header))
+    self.assertIn(str(header), self.scan()['dependencies'])
+
+  def test_absolute_parent_traversal_is_rejected(self):
+    self.source.write_text('#if __has_include("/../missing-distcc-header.h")\n#endif\n')
     with self.assertRaisesRegex(RuntimeError, 'unsupported'):
       self.scan()
+
+  def test_worker_absolute_lookup_is_confined_to_input_tree(self):
+    header, absent = self.root/'present.h', self.root/'worker-only.h'
+    header.write_text('int wrong;\n')
+    absent.write_text('int worker_only;\n')
+    virtual = self.root/'worker'
+    copied = virtual/str(header).lstrip('/')
+    copied.parent.mkdir(parents=True)
+    copied.write_text('int transferred;\n')
+    self.source.write_text('#if !__has_include("%s")\n#error missing\n#endif\n'
+                           '#include "%s"\n#if __has_include("%s")\n'
+                           '#error worker file leaked\n#endif\n' % (header, header, absent))
+    invocation = [self.compiler, '-E', '-nostdinc', '-fplugin=' + self.library,
+                  '-fplugin-arg-' + Path(self.library).stem + '-input-root=' + str(virtual),
+                  str(self.source)]
+    result = subprocess.run(invocation, capture_output=True, text=True)
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertIn('int transferred;', result.stdout)
+    self.assertNotIn('int wrong;', result.stdout)
+    # Forced includes, whose paths are already rewritten by distccd, must be
+    # opened once under the root, not prefixed a second time.
+    result = subprocess.run([*invocation, '-include', str(copied)],
+                            capture_output=True, text=True)
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertIn('int transferred;', result.stdout)
 
   def test_source_error_retains_inputs_for_remote_diagnostics(self):
     header = self.root/'after.h'

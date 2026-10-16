@@ -200,7 +200,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
         raise basics.NotCoveredError('Cannot classify Clang default header directories')
       search_entries = [(kinds[path], path) for path in directories]
     else:
-      search_entries = [(0, path) for path in directories]
+      search_entries = [(4, 'gcc')] + [(0, path) for path in directories]
       # -nostdinc suppresses GCC's implicit stdc-predef.h inclusion. Restore
       # the compiler-reported inputs explicitly, using their sent snapshots.
       for path in shlex.split(implicit.replace('\\\n', '').replace('$$', '$')):
@@ -290,7 +290,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       closure[real_idx] = ()
     self.snapshots = snapshots
     for kind, path in self.system_includes:
-      if kind != 3:
+      if kind < 3:
         self.mirror_path.DoPath(os.path.join(path, 'forcing_technique_271828'),
                                self.currdir_idx, self.client_root_keeper.client_root)
     basics.Debug(basics.DEBUG_TRACE, 'Compiler dependency analysis (%s): %d inputs',

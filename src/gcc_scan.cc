@@ -12,6 +12,7 @@ extern "C" __attribute__((visibility("default"))) int plugin_is_GPL_compatible;
 int plugin_is_GPL_compatible;
 extern "C" bool distcc_gcc_inputs(cpp_reader *,
                                   bool (*)(const char *, const struct stat *, void *), void *);
+extern "C" void distcc_gcc_input_root(cpp_reader *, const char *);
 
 namespace {
 FILE *output = nullptr;
@@ -27,8 +28,12 @@ void read_precompiled(cpp_reader *reader, const char *name, int fd, const char *
     read_pch(reader, name, fd, original);
 }
 
-void entered_file(void *, void *)
+void entered_file(void *, void *root)
 {
+    if (root) {
+        distcc_gcc_input_root(parse_in, static_cast<const char *>(root));
+        return;
+    }
     auto *callbacks = cpp_get_callbacks(parse_in);
     if (!read_pch && callbacks->read_pch) {
         read_pch = callbacks->read_pch;
@@ -74,7 +79,16 @@ int plugin_init(struct plugin_name_args *arguments, struct plugin_gcc_version *v
 {
     if (!plugin_default_version_check(version, &gcc_version) ||
         strcmp(version->datestamp, DCC_GCC_SOURCE_DATE) || arguments->argc != 1 ||
-        strcmp(arguments->argv[0].key, "output-fd") || !arguments->argv[0].value) return 1;
+        !arguments->argv[0].value) return 1;
+    if (!strcmp(arguments->argv[0].key, "input-root")) {
+        const char *root = arguments->argv[0].value;
+        size_t length = strlen(root);
+        if (length < 2 || root[0] != '/' || root[length - 1] == '/') return 1;
+        register_callback(arguments->base_name, PLUGIN_INCLUDE_FILE, entered_file,
+                          const_cast<char *>(root));
+        return 0;
+    }
+    if (strcmp(arguments->argv[0].key, "output-fd")) return 1;
     char *end;
     long descriptor = strtol(arguments->argv[0].value, &end, 10);
     if (*end || descriptor < 3 || descriptor > INT_MAX) return 1;

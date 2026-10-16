@@ -25,6 +25,14 @@ class PreprocessTest(BrokerTestCase):
     compression = 'lzo'
     transport = ''
 
+    @classmethod
+    def setUpClass(cls):
+        cls.daemon_env = {}
+        module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
+        if module:
+            cls.daemon_env['DISTCC_GCC_SCAN_LIBRARY'] = module
+        super().setUpClass()
+
     def setUp(self):
         super().setUp()
         self.start_broker(self.host(0, ',' + self.compression + self.transport) + ' --localslots_cpp=1', idle=60)
@@ -212,7 +220,7 @@ class PreprocessTest(BrokerTestCase):
     def test_deferred_scan_failure_returns_compiler_error(self):
         header = self.work / 'absolute.h'
         header.write_text('#define PRESENT(p) ((p) != 0)\n')
-        self.source.write_text('#include "%s"\n' % header +
+        self.source.write_text('#include "%s"\n' % (self.work/'..'/self.work.name/header.name) +
                                'int present(void) { int values[1]; return PRESENT(values); }\n')
         args = ['-Werror=address', '-c', self.source, '-o', 'failed.o']
         result = self.retry_after_busy_scanner(args)
@@ -451,6 +459,14 @@ class PreprocessTest(BrokerTestCase):
         log = (self.work / 'client.log').read_text()
         self.assertIn('pooled TCP job completed' if self.transport == ',tcp' else
                       'client finished sending request to server', log)
+
+    def test_gcc_absolute_includes_probes_and_dependencies(self):
+        header = self.work / 'absolute.h'
+        header.write_text('int absolute_value;\nconst char *header_file = __FILE__;\n')
+        self.source.write_text('#define HEADER "%s"\n#if __has_include(HEADER)\n'
+                               '#include HEADER\n#else\n#error missing\n#endif\n' % header)
+        self.compare(args=['-MD', '-MF', 'dep.d'])
+        self.assertNotIn('preprocessing locally', (self.work/'client.log').read_text())
 
     def test_utf8_bom_header_and_macro_diagnostic(self):
         header = self.work / 'bom.h'
@@ -794,7 +810,7 @@ class PreprocessTest(BrokerTestCase):
         self.env.pop('DISTCC_TESTING_INCLUDE_SERVER')
         header = self.work / 'absolute.h'
         header.write_text('int n;\n')
-        self.source.write_text('#include "%s"\n' % header)
+        self.source.write_text('#include "%s"\n' % (self.work/'..'/self.work.name/header.name))
         # Include-analysis fallback still permits remote compilation, while -E
         # itself runs locally only when fallback is allowed.
         self.env['DISTCC_FALLBACK'] = '1'
@@ -812,7 +828,7 @@ class PreprocessTest(BrokerTestCase):
 
     def test_failed_include_analysis_is_not_cached_as_complete(self):
         (self.work / 'unsupported.h').write_text(
-            '#include "%s"\n' % (self.work / 'value.h'))
+            '#include "%s"\n' % (self.work / '..' / self.work.name / 'value.h'))
         (self.work / 'value.h').write_text('#define VALUE 17\n')
         self.source.write_text('#include "unsupported.h"\nint n = VALUE;\n')
         for attempt in range(3):

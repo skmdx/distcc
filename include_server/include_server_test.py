@@ -50,10 +50,11 @@ class IncludeServerTest(unittest.TestCase):
     self.assertFalse(force)
     self.assertTrue(never)
 
-  def test_unsupported_absolute_include_is_reported(self):
+  def test_unsupported_parent_traversal_is_reported(self):
     header = self.root/'header.h'
     header.write_text('int value;\n')
-    (self.root/'source.c').write_text('#include "%s"\n' % header)
+    (self.root/'source.c').write_text(
+        '#include "%s"\n' % (self.root/'..'/self.root.name/header.name))
     with self.assertRaises(basics.NotCoveredError):
       self.handle('source.c')
     message, _, never = self.reports[-1]

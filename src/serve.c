@@ -156,10 +156,28 @@ static int add_system_includes(char ***argv, const char *root)
     for (unsigned i = 0; i < count; ++i) {
         if (fread(header, 1, 8, manifest) != 8) goto done;
         unsigned kind = dcc_tcp_get32(header), length = dcc_tcp_get32(header + 4);
-        if (kind > 3 || !length || length >= sizeof(path) ||
-            fread(path, 1, length, manifest) != length || (kind != 3 && path[0] != '/') ||
+        if (kind > 4 || !length || length >= sizeof(path) ||
+            fread(path, 1, length, manifest) != length || (kind < 3 && path[0] != '/') ||
             memchr(path, 0, length)) goto done;
         path[length] = 0;
+        if (kind == 4) {
+            if (strcmp(path, "gcc")) goto done;
+            /* Resolve through the selected GCC's plugin directory. Only the
+             * server administrator may override the module for development;
+             * never load an executable path supplied by a client manifest. */
+            const char *module = getenv("DISTCC_GCC_SCAN_LIBRARY");
+            if (asprintf(&option, "-fplugin=%s", module ? module : "distcc_gcc_scan") < 0) {
+                ret = EXIT_OUT_OF_MEMORY;
+                goto done;
+            }
+            dcc_argv_append(args, option);
+            if (asprintf(&option, "-fplugin-arg-distcc_gcc_scan-input-root=%s", root) < 0) {
+                ret = EXIT_OUT_OF_MEMORY;
+                goto done;
+            }
+            dcc_argv_append(args, option);
+            continue;
+        }
         if (asprintf(&option, "%s%s%s", kind == 0 ? "-isystem" : "", kind == 3 ? "" : root, path) < 0) {
             ret = EXIT_OUT_OF_MEMORY;
             goto done;

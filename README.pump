@@ -44,8 +44,11 @@ One full GCC preprocessing process runs per request. Dependency-only mode is
 insufficient: ordinary macro expansion can affect later include conditions
 through __COUNTER__. Collected records use bounded buffered output; diagnostic
 macro-expansion provenance is disabled during collection only.
-PCH, modules, embed directives
-and absolute include operands require local preprocessing.
+PCH, modules and embed directives require local preprocessing. GCC workers use
+the same module's libcpp search callback to resolve absolute include operands
+and existence probes inside the transferred input tree. Absolute operands with
+parent-directory traversal and Clang absolute operands still require local
+preprocessing; they are never resolved against unrelated worker files.
 
 Build the module using the exact source of the selected GCC, including any
 downstream changes to libcpp, and that compiler's installed plugin headers:
@@ -54,7 +57,9 @@ downstream changes to libcpp, and that compiler's installed plugin headers:
         --output build/gcc
 
 Install the resulting target/version/distcc_gcc_scan.so under
-LIBDIR/distcc/gcc-scan. Repeat for each GCC used by pump. For an x86-hosted cross
+LIBDIR/distcc/gcc-scan, and register a symlink to it as distcc_gcc_scan.so in
+the directory reported by that GCC's -print-file-name=plugin. Both clients and
+workers need the module. Repeat for each GCC used by pump. For an x86-hosted cross
 compiler, build the module with an x86 C++ compiler. When building a module to
 run on another architecture, use --cxx and --plugin-headers for that architecture's
 native compiler. The source and installed cpplib.h must agree, and GCC checks

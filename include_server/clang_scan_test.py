@@ -137,7 +137,7 @@ class ClangScanTest(unittest.TestCase):
         self.assertEqual(b'optional.h' in actual.stdout, present)
     self.assertTrue(all(output.closed for output in outputs))
 
-  def test_gcc_rejects_absolute_forwarder_in_native_preprocessing(self):
+  def test_gcc_collects_absolute_forwarder_in_native_preprocessing(self):
     gcc = shutil.which('gcc')
     if not gcc:
       self.skipTest('GCC is required')
@@ -151,8 +151,8 @@ class ClangScanTest(unittest.TestCase):
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
     with mock.patch.object(clang_scan, 'scan') as frontend:
-      with self.assertRaisesRegex(basics.NotCoveredError, 'unsupported GCC dependency scan'):
-        analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
+      analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
+      self.assertIn(str(header), analyzer.realpath_map.string)
       self.assertEqual(frontend.call_count, 0)
 
   def test_gcc_literal_and_computed_includes_use_native_frontend(self):

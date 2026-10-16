@@ -13,6 +13,34 @@
 
 using input_callback = bool (*)(const char *, const struct stat *, void *);
 
+static const char *input_root;
+
+static char *absolute_input(const char *name, cpp_dir *)
+{
+    size_t length = strlen(input_root);
+    // Command-line paths have already been rooted by distccd. Operands in
+    // source files have not. GCC still owns lookup, caching and preprocessing.
+    if (!strncmp(name, input_root, length) && name[length] == '/')
+        return xstrdup(name);
+    return concat(input_root, name, nullptr);
+}
+
+extern "C" void distcc_gcc_input_root(cpp_reader *reader, const char *root)
+{
+    input_root = root;
+    reader->no_search_path.construct = absolute_input;
+}
+
+static bool unsupported_absolute(const char *path)
+{
+    if (!path || path[0] != '/') return false;
+    // Parent traversal can escape the private input tree. Its meaning also
+    // depends on symlinks, so lexical normalization would change semantics.
+    for (const char *part = path; (part = strchr(part, '/')); ++part)
+        if (part[1] == '.' && part[2] == '.' && (!part[3] || part[3] == '/')) return true;
+    return false;
+}
+
 struct input_visitor {
     input_callback callback;
     void *context;
@@ -26,7 +54,8 @@ static int missing_input(void **slot, void *opaque)
     // libcpp records ENOENT here, including directories and ENOTDIR. The
     // publication cache observes these failed candidates and their ancestors;
     // do not repeat every failed filesystem lookup in this process as well.
-    visitor.ok = visitor.callback(path, nullptr, visitor.context);
+    visitor.ok = !unsupported_absolute(path) &&
+                 visitor.callback(path, nullptr, visitor.context);
     return visitor.ok;
 }
 
@@ -36,8 +65,7 @@ bool distcc_gcc_inputs(cpp_reader *reader, input_callback callback, void *contex
     if (!reader || !reader->main_file) return false;
     for (const auto *file = reader->all_files; file; file = file->next_file) {
         if (file->embed || file->pchname || file->header_unit > 0 ||
-            (file != reader->main_file && !file->implicit_preinclude &&
-             file->name && file->name[0] == '/')) return false;
+            unsupported_absolute(file->name)) return false;
         if (file->err_no == ENOENT) continue;
         if (file->err_no || !file->path || !S_ISREG(file->st.st_mode)) return false;
         // libcpp replaces st_size with its decoded buffer length (BOM removal
