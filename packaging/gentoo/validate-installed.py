@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import resource
 from pathlib import Path
 import subprocess
 import tempfile
@@ -44,6 +45,13 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                 (result.stdout+result.stderr).decode(errors='replace'),
                 (root/'client.log').read_text()[-5000:] if (root/'client.log').exists() else '')
             assert b'gave up' not in result.stderr + result.stdout
+            if kind == 'native':
+                # Admission applies to native include analysis too. Size this
+                # small validation workload from its real compiler peak, rather
+                # than using a production C++ estimate larger than the bounded
+                # validation cgroup. Linux reports ru_maxrss in KiB.
+                peak_kib = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+                env['DISTCC_JOB_MEMORY'] = str(max(1, (peak_kib + 1023) // 1024))
             hashes[kind] = hashlib.sha256(obj.read_bytes()).hexdigest()
             if suffix == 'cc':
                 preprocessed = root/(kind+'.ii')
