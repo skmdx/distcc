@@ -198,7 +198,7 @@ scanner = setuptools.Extension(
     language='c++', include_dirs=[llvm_option('--includedir')],
     library_dirs=[llvm_lib], runtime_library_dirs=[llvm_runtime_lib],
     libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
-    define_macros=[('DCC_GCC_SCAN_DIR', '"' + libdir + '/distcc/gcc"')],
+    define_macros=[('DCC_GCC_SCAN_DIR', '"' + libdir + '/distcc/gcc-scan"')],
 )
 
 args = {

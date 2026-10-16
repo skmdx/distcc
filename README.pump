@@ -50,7 +50,7 @@ downstream changes to libcpp, and that compiler's installed plugin headers:
         --output build/gcc
 
 Install the resulting target/version/distcc_gcc_scan.so under
-LIBDIR/distcc/gcc. Repeat for each GCC used by pump. For an x86-hosted cross
+LIBDIR/distcc/gcc-scan. Repeat for each GCC used by pump. For an x86-hosted cross
 compiler, build the module with an x86 C++ compiler. When building a module to
 run on another architecture, use --cxx and --plugin-headers for that architecture's
 native compiler. The source and installed cpplib.h must agree, and GCC checks
