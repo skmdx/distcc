@@ -322,9 +322,9 @@ PyObject *directives(PyObject *, PyObject *arguments) {
     options.CPlusPlus = options.LineComment = options.Digraphs = true;
     options.CPlusPlus11 = raw_strings;
     options.RawStringLiterals = raw_strings;
-    // Non-backslash trigraphs inside comments cannot change directives in
-    // either dialect. Backslashes can splice lines and alter comment bounds;
-    // those and trigraphs in real tokens still require local preprocessing.
+    // Trigraphs inside comments cannot change directives in either dialect,
+    // except when a backslash splices a line and alters comment bounds.
+    // Those and trigraphs in real tokens still require local preprocessing.
     // Only files containing the rare marker need this extra lexical pass.
     if (source.contains("??")) {
         DirectiveLexer comments(SourceLocation::getFromRawEncoding(1), options, text, text, text + size);
@@ -337,7 +337,10 @@ PyObject *directives(PyObject *, PyObject *arguments) {
                 comments.LexFromRawLexer(comment);
                 end = comment.getLocation().getRawEncoding() - 1 + comment.getLength();
             }
-            if (!comment.is(tok::comment) || source[i + 2] == '/')
+            size_t next = source.find_first_not_of(" \t\v\f", i + 3);
+            if (!comment.is(tok::comment) ||
+                (source[i + 2] == '/' && next < source.size() &&
+                 (source[next] == '\n' || source[next] == '\r')))
                 return PyErr_Format(PyExc_ValueError, "trigraphs require local preprocessing");
         }
     }

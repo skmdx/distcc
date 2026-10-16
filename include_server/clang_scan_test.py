@@ -397,10 +397,16 @@ class ClangScanTest(unittest.TestCase):
                           if name == 'if'], expected)
 
   def test_harmless_comment_trigraphs_do_not_disable_analysis(self):
-    source = b'// double check ???)\n/* ??= ??( ??! ??- */\n#include "present.h"\n'
+    source = (b'// double check ???)\n/* ??= ??( ??! ??- */\n'
+              b'/* ?????/2019: fixed on newer devices */\n'
+              b'// ?????/2015: still present in older devices\n'
+              b'// ??/ \t is not followed by a newline\n'
+              b'#include "present.h"\n')
     self.assertEqual(clang_scan.directives(source, True), [('include', '"present.h"')])
     for source in (b'??=include "real.h"\n', b'// ??/\n#include "hidden.h"\n',
-                   b'/* *??/\n/\n#include "real.h"\n'):
+                   b'// ??/ \t\n#include "hidden.h"\n',
+                   b'/* *??/\n/\n#include "real.h"\n',
+                   b'/* *??/\r\n/\n#include "real.h"\n'):
       with self.subTest(source=source):
         with self.assertRaisesRegex(ValueError, 'trigraphs require'):
           clang_scan.directives(source, True)
