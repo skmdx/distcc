@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def command(args, target=None):
     if target and target.get('ssh'):
         return ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                target['ssh'], shlex.join(map(str, args))]
+                target['ssh'], 'exec /bin/sh -c ' + shlex.quote(shlex.join(map(str, args)))]
     return list(map(str, args))
 
 
@@ -60,6 +60,43 @@ def transfer(paths, destination, target=None):
     if not target or not target.get('ssh'):
         args = ['sudo', '-n', 'rsync', '-rt']
     run([*args, *paths, dest])
+
+
+def parallel(targets, action):
+    errors = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        pending = {pool.submit(action, target): target['name'] for target in targets}
+        for future in concurrent.futures.as_completed(pending):
+            try:
+                future.result()
+            except Exception as error:
+                message = pending[future] + ': ' + str(error)
+                print(message, file=sys.stderr, flush=True)
+                errors.append(message)
+    if errors:
+        raise RuntimeError('\n'.join(errors))
+
+
+def distribute_sources(settings, version, ebuild, targets, work):
+    import portage
+    transfer([str(ebuild), str(ebuild.parent / 'Manifest')], settings['local_repository'] + '/sys-devel/distcc')
+    fetcher = dict(targets[0], check_limits=targets[0]['build_limits'])
+    with (work / 'fetch.log').open('w') as log:
+        bounded(['ebuild', str(ebuild), 'fetch'], fetcher, 'fetch', log, cross=True)
+    directory = Path(run(['portageq', 'envvar', 'DISTDIR']))
+    # Portage initializes these public attributes lazily at module access.
+    database = getattr(portage, 'db')[getattr(portage, 'root')]['porttree'].dbapi
+    sources = [str(directory / name) for name in database.getFetchMap('sys-devel/' + version)]
+    def distribute(target):
+        if not target.get('binary'):
+            directory = target.get('distfiles') or run(['portageq', 'envvar', 'DISTDIR'], target)
+            transfer(sources, directory, target)
+    parallel(targets, distribute)
+    if any(t.get('binary') for t in targets):
+        root = settings['cross']['root']
+        directory = run(['env', 'ROOT=' + root, 'SYSROOT=' + root, 'PORTAGE_CONFIGROOT=' + root,
+                         'portageq', 'envvar', 'DISTDIR'])
+        transfer(sources, directory)
 
 
 def bounded(args, target, stage, log, *, cross=False):
@@ -192,6 +229,7 @@ def main():
             # Check all access before modifying any installed host.
             for target in targets:
                 run(['sudo', '-n', 'true'], target)
+            distribute_sources(settings, version, ebuild, targets, work)
             for target in targets:
                 for pattern in target.get('quiesce_units', []):
                     units = run(['systemctl', 'list-units', '--type=service', '--state=active',
@@ -201,17 +239,10 @@ def main():
                         resume[target['name']] = sorted(set(resume.get(target['name'], []) + names))
                         resume_path.write_text(json.dumps(resume))
                         run(['sudo', '-n', 'systemctl', 'stop', *names], target)
-            # Cross builds use the local repository; synchronize it first.
-            transfer([str(ebuild), str(ebuild.parent / 'Manifest')], settings['local_repository'] + '/sys-devel/distcc')
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
-                futures = [pool.submit(install, t, version, ebuild, work, settings['cross']) for t in targets]
-                for future in futures:
-                    future.result()
+            parallel(targets, lambda target: install(target, version, ebuild, work, settings['cross']))
             for target in targets:
                 configure(target, work)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
-                for future in [pool.submit(validate, t, work) for t in targets]:
-                    future.result()
+            parallel(targets, lambda target: validate(target, work))
             for target in targets:
                 if target['name'] in resume:
                     run(['sudo', '-n', 'systemctl', 'start', *resume[target['name']]], target)

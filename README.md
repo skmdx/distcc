@@ -259,7 +259,8 @@ For an already configured Gentoo fleet, run `./deploy` without arguments.
 It reads the private `~/.config/distcc/deploy.json` (or `$XDG_CONFIG_HOME`),
 selects the latest committed overlay ebuild, installs it on all targets,
 applies service settings, and verifies native versus remote C/C++ compilation,
-preprocessing and execution. Source builds use distcc and explicit finite
+preprocessing and execution. Source archives are fetched and verified locally,
+then synchronized to targets; remote internet access is not required. Source builds use distcc and explicit finite
 cgroup memory limits with swap disabled. A configured cross sysroot builds the
 binary package for targets without native build capacity. See
 `packaging/gentoo/deploy.example.json` for configuration fields; keep actual

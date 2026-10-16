@@ -3,12 +3,22 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+import shutil
 
 spec = importlib.util.spec_from_file_location('deploy', Path(__file__).resolve().parents[1] /
                                             'packaging/gentoo/deploy.py')
 assert spec is not None and spec.loader is not None
 deploy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(deploy)
+
+
+class TransportTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('zsh'), 'zsh required')
+    def test_remote_arguments_do_not_undergo_login_shell_expansion(self):
+        values = ['=category/package-1', 'a b; $(false)', "a'b"]
+        cmd = deploy.command(['python3', '-c', 'import sys; print(repr(sys.argv[1:]))', *values],
+                             {'ssh': 'unused'})
+        self.assertEqual(deploy.run(['zsh', '-c', cmd[-1]]), repr(values))
 
 
 @unittest.skipUnless(importlib.util.find_spec('portage'), 'Gentoo Portage required')
