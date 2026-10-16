@@ -1,0 +1,26 @@
+{
+  "overlay": "/path/to/overlay",
+  "local_repository": "/var/db/repos/overlay",
+  "temporary": "/path/to/workspace/tmp",
+  "results": "/path/to/workspace/note/distcc/deployments",
+  "cross": {
+    "root": "/path/to/prepared/target-sysroot",
+    "limits": ["MemoryMax=4G", "MemorySwapMax=0"],
+    "jobs": 4
+  },
+  "targets": [
+    {
+      "name": "worker",
+      "ssh": "worker-ssh-alias",
+      "repository": "/var/db/repos/overlay",
+      "temporary": "/path/to/remote/workspace/tmp",
+      "jobs": 4,
+      "build_limits": ["MemoryMax=4G", "MemorySwapMax=0"],
+      "check_limits": ["MemoryMax=512M", "MemorySwapMax=0"],
+      "auto_memory": true,
+      "validation_hosts": "worker-ssh-alias,cpp,lz4",
+      "quiesce_units": ["distcc-build.service"],
+      "mounts": []
+    }
+  ]
+}

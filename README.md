@@ -255,6 +255,23 @@ or available headroom is too small. After a PSI stop, admission resumes below
 preprocessing slots. Existing work finishes normally; these estimates are not
 hard per-job limits or a common scheduler for unrelated build processes.
 
+For an already configured Gentoo fleet, run `./deploy` without arguments.
+It reads the private `~/.config/distcc/deploy.json` (or `$XDG_CONFIG_HOME`),
+selects the latest committed overlay ebuild, installs it on all targets,
+applies service settings, and verifies native versus remote C/C++ compilation,
+preprocessing and execution. Source builds use distcc and explicit finite
+cgroup memory limits with swap disabled. A configured cross sysroot builds the
+binary package for targets without native build capacity. See
+`packaging/gentoo/deploy.example.json` for configuration fields; keep actual
+host identities and filesystem paths outside the repository.
+
+The command refuses uncommitted release inputs. Already installed revisions
+are reused. Configured build services are stopped and resumed after validation;
+the resume list survives failure so rerunning the same command can finish.
+Failed stages retain their logs and return nonzero. Successful deployment logs
+are moved to the configured results directory; intermediate binary packages
+are removed. The command does not create commits or publish a new release.
+
 For Linux/systemd workers, `packaging/systemd/distccd-memory.py` and
 `distccd-memory.conf` provide an optional kernel-derived service limit. Install
 the helper as `/usr/lib/distcc/distccd-memory.py` and the configuration as a
