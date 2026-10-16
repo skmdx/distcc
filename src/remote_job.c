@@ -88,9 +88,10 @@ static struct dcc_job *describe(char **argv, const char *cpp, int cpp_fd, char *
         } else {
             const char *extension = cpp_fd >= 0 ?
                 dcc_preproc_exten(dcc_find_extension(source)) : strrchr(cpp, '.');
-            /* Explicit-language input may still contain macros. Keep its
-             * source basename for compiler file symbols and diagnostics. */
-            if (dcc_argv_search(argv, "-x")) {
+            /* Preprocessed files can omit line markers; explicit-language
+             * input may still contain macros. Both need the source basename
+             * for compiler file symbols and diagnostics. */
+            if (dcc_is_preprocessed(source) || dcc_argv_search(argv, "-x")) {
                 if (asprintf(&in->path, "/%s", dcc_find_basename(source)) < 0) goto failed;
             } else if (asprintf(&in->path, "/input%s", extension ? extension : ".i") < 0) goto failed;
         }

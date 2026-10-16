@@ -106,6 +106,13 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
                 return -1;
             cap->load = value;
             fields |= 4;
+        } else if (!strncmp(line, "dcc_compile_memory_classes ", 27)) {
+            char *end;
+            if ((fields & 524288) || line[27] < '0' || line[27] > '9') return -1;
+            errno = 0;
+            cap->compile_memory_classes = strtoull(line + 27, &end, 10);
+            if (errno || *end) return -1;
+            fields |= 524288;
         } else if (!strncmp(line, "dcc_memory_pressure ", 20)) {
             if ((fields & 4096) || sscanf(line + 20, "%lf %c", &value, &extra) != 1 ||
                 !(value >= -1 && value <= 100)) return -1;
@@ -130,7 +137,7 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
             }
         }
     }
-    const int required = 7 | 8192 | 16384 | 32768 | 65536 | 131072 | 262144;
+    const int required = 7 | 8192 | 16384 | 32768 | 65536 | 131072 | 262144 | 524288;
     return (fields & required) == required && cap->cores <= cap->cpus &&
            ((cap->cpu_scale == -1 && cap->cpu_age == -1 && !cap->cpu_probe) ||
             (cap->cpu_scale > 0 && cap->cpu_age >= 0)) ? 0 : -1;

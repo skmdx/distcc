@@ -58,7 +58,7 @@ int dcc_tcp_worker(int, const struct dcc_tcp_run *, int, int, int);
 
 struct dcc_tcp_server;
 struct dcc_tcp_dispatch {
-    int (*start)(struct dcc_tcp_server *, const struct dcc_tcp_run *, int, int, int);
+    int (*start)(struct dcc_tcp_server *, const struct dcc_tcp_run *, int, int, const struct dcc_job *);
     void (*cancel)(struct dcc_tcp_server *);
 };
 struct dcc_tcp_server *dcc_tcp_server_new(int, const struct dcc_tcp_dispatch *);

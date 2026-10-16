@@ -80,6 +80,8 @@ struct worker {
     pid_t pid;
     int fd, busy, link;
     struct dcc_tcp_server *tcp;
+    unsigned memory_class;
+    unsigned long long reservation;
 };
 struct pending {
     int fd, session, ready, used;
@@ -97,11 +99,27 @@ static volatile sig_atomic_t shutdown_signal;
 static void receive_worker(struct worker *);
 static void receive_worker_message(struct worker *);
 
-static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *run, int fd, int input, int link)
+static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *run,
+                          int fd, int input, const struct dcc_job *description)
 {
     struct dcc_server_load load;
     dcc_prefork_status(&load);
-    if (load.busy >= dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids)) ||
+    int link = description->kind == DCC_JOB_LINK, probing = 0;
+    unsigned memory_class = dcc_resource_class(description);
+    unsigned long long reserved = 0;
+    for (int i = 0; i < worker_count; ++i) {
+        struct worker *w = &workers[i];
+        if (!w->busy || !w->reservation) continue;
+        unsigned long long charge = w->reservation;
+        if (w->tcp) {
+            unsigned long long estimate = dcc_resource_estimate(w->memory_class);
+            if (estimate > charge) charge = estimate;
+            probing |= !dcc_resource_known(w->memory_class);
+        }
+        reserved = charge <= ULLONG_MAX - reserved ? reserved + charge : ULLONG_MAX;
+    }
+    if (load.busy >= dcc_cpu_perf_limit(dcc_max_kids) ||
+        !dcc_resource_admit(memory_class, reserved, probing) ||
         (link && load.links)) return 0;
     for (int i = 0; i < worker_count; ++i) {
         struct worker *w = &workers[i];
@@ -113,6 +131,8 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
             return -1;
         }
         w->tcp = job; w->busy = EXECUTING; w->link = link;
+        w->memory_class = memory_class;
+        w->reservation = dcc_resource_estimate(memory_class);
         dcc_cpu_perf_started();
         return 1;
     }
@@ -240,7 +260,8 @@ static void receive_worker_message(struct worker *w)
             return;
         }
         struct dcc_tcp_server *job = w->tcp;
-        dcc_resource_observe(finished.peak_bytes, !finished.error && !finished.status);
+        dcc_resource_observe(w->memory_class, finished.peak_bytes, !finished.error && !finished.status);
+        w->reservation = 0;
         w->tcp = NULL; w->busy = finished.retiring ? RETIRING : IDLE; w->link = 0;
         dcc_tcp_ready_idle_ns();
         dcc_tcp_server_finished(job, &finished, fds, count);
@@ -256,6 +277,7 @@ static void receive_worker_message(struct worker *w)
     } else {
         w->busy = session & WORKER_RETIRING ? RETIRING : IDLE;
         w->link = 0;
+        w->reservation = 0;
         if (fd >= 0) park_connection(fd, 1);
     }
 }
@@ -370,6 +392,8 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             }
             w->busy = 1;
             w->link = p->used && p->request[11] == '2';
+            w->memory_class = 0;
+            w->reservation = dcc_resource_job_bytes();
             dcc_cpu_perf_started();
             /* A dead worker channel must not produce a grant followed by a
              * second reply. Grant only after a worker owns the connection. */

@@ -333,22 +333,22 @@ accounting. It does not remove the uncertainty of an unseen job's memory demand.
 
 On Linux, `DISTCC_MEMORY_LEARNING=1` on the daemon uses compiler peak RSS
 reported by `wait4` for prepared jobs. `DISTCC_JOB_MEMORY` is the cold-start
-estimate. After eight successful observations, the estimate becomes the
-lower 90th-percentile rank of the last 64 successful RSS observations plus 25%
-and 64 MiB, with a 256 MiB minimum. Spare capacity is the greater of a
-quarter-job margin and the
-largest observed RSS, including failed compiles. This high-water reserve lasts
-until daemon restart. The shared reserve covers an additional observed working
-set without doubling every job's estimate. An unusually large job does not inflate the estimate for
-every subsequent small job. Cgroup limits, available headroom, PSI and `--jobs`
-remain in force. Multiple simultaneous unseen large jobs can still exceed the
-estimate; the service's memory limit must remain configured. When the combined
-estimate and reserve exceed the budget, one job may run if the largest measured
-RSS plus 25% and 64 MiB fits both the budget and available memory. This allows
-new observations without opening a parallel burst. RSS
-is an estimate, not a guarantee for an unseen workload or a hard job budget.
-Statistics expose `dcc_job_memory_bytes`, `dcc_job_memory_samples` and
-`dcc_job_peak_bytes` and `dcc_memory_spare_bytes`. Leave learning unset to keep a fixed estimate.
+estimate. Prepared jobs are classified by operation and the binary size interval
+of their uncompressed inputs. Each class reserves its largest successful RSS
+plus 25% and 64 MiB, with a 256 MiB minimum, until daemon restart. Unseen classes
+use the larger of the configured estimate and the daemon's observed peak with
+headroom; only one unseen-class calibration runs at a time. Small jobs therefore
+cannot authorize a burst of larger, unmeasured jobs. The broker also avoids
+queueing prepared input behind an occupied worker that has not measured its size.
+
+The daemon sums reservations for active jobs and excludes actual shared-memory
+input/output storage from the compiler budget. A quarter-job spare applies when
+other jobs are active. Cgroup limits, available headroom, PSI and `--jobs` remain
+in force. RSS and input size are estimates: different compiler options or source
+complexity within a class can demand more memory. Keep the service memory limit
+configured. Statistics expose `dcc_job_memory_bytes`, `dcc_job_memory_samples`,
+`dcc_job_peak_bytes`, `dcc_memory_spare_bytes` and the prepared-input size mask
+`dcc_compile_memory_classes`. Leave learning unset to keep a fixed estimate.
 
 To avoid copying ordinary preprocessed input to a server on the same machine,
 set `DISTCC_LOCAL_SOCKET` to the same absolute socket prefix on the daemon and

@@ -914,7 +914,7 @@ void dcc_tcp_dispatch_ready(void)
         if (!link || !link_waiting) {
             s->run.operation = DCC_TCP_RUN;
             int input = s->job->kind == DCC_JOB_COMPILE && s->job->count == 1 ? s->job->inputs[0].fd : -1;
-            int ret = s->dispatch->start(s, &s->run, s->metadata, input, link);
+            int ret = s->dispatch->start(s, &s->run, s->metadata, input, s->job);
             if (ret < 0) { s->failed = 1; dequeue(s); }
             else if (ret) { dequeue(s); s->phase = RUNNING; s->started_at = monotonic_ns(); }
             else if (!link) break;

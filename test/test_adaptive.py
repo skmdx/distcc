@@ -31,12 +31,14 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
                    load: float | str = 0, cores=None,
                    core_scale: float | str = 1, smt_gain: float | str = .25,
                    cpu_scale: float | str = -1, cpu_age: float | str = -1,
-                   cpu_probe: float | str = 0, **metrics):
+                   cpu_probe: float | str = 0,
+                   compile_memory_classes: int | float | str = 2**64-1, **metrics):
     return ("HTTP/1.0 200 OK\n\n<distccstats>\n"
             f"dcc_cpus {cpus}\ndcc_max_kids {jobs}\ndcc_load1 {load}\n"
             f"dcc_cores {cpus if cores is None else cores}\ndcc_smt_gain {smt_gain}\n"
             f"dcc_core_scale {core_scale}\n"
             f"dcc_cpu_scale {cpu_scale}\ndcc_cpu_age {cpu_age}\ndcc_cpu_probe {cpu_probe}\n"
+            f"dcc_compile_memory_classes {compile_memory_classes}\n"
             + ''.join(f'dcc_{name} {value}\n' for name, value in metrics.items())
             + "</distccstats>\n").encode()
 
@@ -335,6 +337,15 @@ class AdaptiveTest(DistccTestCase):
         _, log = self.compile(hosts)
         self.assertIn('adaptive stats unavailable', log)
 
+    def test_memory_class_mask_requires_a_canonical_unsigned_value(self):
+        for index, value in enumerate(('-1', '18446744073709551616', 'nan',
+                                       '0 extra', '0\ndcc_compile_memory_classes 0')):
+            with self.subTest(value=value):
+                peer = self.peer(stats_response(compile_memory_classes=value))
+                hosts = self.host(0, f',stats={peer.port},speed=4') + ' ' + self.host(1)
+                _, log = self.compile(hosts, f'memory-mask-{index}')
+                self.assertIn('adaptive stats unavailable', log)
+
     def test_local_leases_and_server_queue_are_not_added_twice(self):
         peer = self.peer(stats_response(running=0, busy=1, queued=2))
         locks = [self.hold_slot(0, i) for i in range(3)]
@@ -464,7 +475,7 @@ class AdaptiveTest(DistccTestCase):
 
 
 class MemoryEstimateTest(unittest.TestCase):
-    def test_outlier_keeps_spare_without_charging_every_job(self):
+    def test_workload_classes_reserve_their_own_measured_peak(self):
         with tempfile.TemporaryDirectory(prefix='distcc-memory-model-') as directory:
             root = Path(directory)
             source = root/'memory.c'
@@ -472,46 +483,67 @@ class MemoryEstimateTest(unittest.TestCase):
 #include <limits.h>
 #include <stdlib.h>
 #include "resource.h"
+#include "job.h"
 #define M (1024ULL*1024)
 int main(void) {
     setenv("DISTCC_JOB_MEMORY", "512", 1);
     setenv("DISTCC_MEMORY_LEARNING", "1", 1);
     assert(dcc_resource_job_bytes() == 512*M);
-    for (int i=0; i<8; ++i) dcc_resource_observe(64*M, 1);
+    struct dcc_job_input input = {.plain_size = 1024};
+    struct dcc_job job = {.kind = DCC_JOB_COMPILE, .count = 1, .inputs = &input};
+    unsigned small = dcc_resource_class(&job);
+    input.plain_size = 2048;
+    unsigned large = dcc_resource_class(&job);
+    job.kind = DCC_JOB_PUMP;
+    unsigned pump = dcc_resource_class(&job);
+    assert(small != large && pump != large);
+    assert(dcc_resource_bucket(0) == 0);
+    assert(dcc_resource_bucket(ULLONG_MAX) == 63);
+    assert(!dcc_resource_known(small));
+    assert(dcc_resource_compile_classes() == 0);
+    assert(dcc_resource_estimate(small) == 512*M);
+    assert(!dcc_resource_admit(small, 0, 1));
+    dcc_resource_observe(small, 64*M, 1);
     assert(dcc_resource_job_bytes() == 256*M);
-    dcc_resource_observe(1024*M, 1);
-    assert(dcc_resource_job_bytes() == 256*M);
-    assert(dcc_resource_spare_bytes() == 1024*M);
-    dcc_resource_observe(64*M, 1);
-    assert(dcc_resource_job_bytes() == 256*M);
-    for (int i=0; i<7; ++i) dcc_resource_observe(64*M, 1);
-    assert(dcc_resource_job_bytes() == 256*M);
-    assert(dcc_resource_spare_bytes() == 1024*M);
-    assert(dcc_resource_samples() == 17);
-    dcc_resource_observe(1536*M, 0);
-    assert(dcc_resource_spare_bytes() == 1536*M);
-    assert(dcc_resource_samples() == 17);
-    for (int i=0; i<64; ++i) dcc_resource_observe(160*M, 1);
-    assert(dcc_resource_job_bytes() == 264*M);
-    assert(dcc_resource_spare_bytes() == 1536*M);
-    for (int i=0; i<64; ++i) dcc_resource_observe(896*M, 1);
-    /* Two observed working sets, their margins and the failed-job reserve
-       must fit a 4-GiB service. A third job must still be held back. */
+    assert(dcc_resource_known(small));
+    assert(!dcc_resource_known(large));
+    assert(dcc_resource_estimate(large) == 512*M);
+    assert(dcc_resource_compile_classes() == (1ULL << 10));
+    dcc_resource_observe(large, 896*M, 1);
     assert(dcc_resource_job_bytes() == 1184*M);
-    assert(2*dcc_resource_job_bytes() + dcc_resource_spare_bytes() <= 4096*M);
-    assert(3*dcc_resource_job_bytes() + dcc_resource_spare_bytes() > 4096*M);
-    for (int i=0; i<64; ++i) dcc_resource_observe(ULLONG_MAX, 1);
+    assert(dcc_resource_estimate(small) == 256*M);
+    assert(dcc_resource_estimate(large) == 1184*M);
+    assert(dcc_resource_estimate(pump) == 1184*M);
+    assert(!dcc_resource_known(pump));
+    assert(dcc_resource_compile_classes() == ((1ULL << 10) | (1ULL << 11)));
+    /* Later smaller successes must not erase the class's observed demand. */
+    dcc_resource_observe(large, 64*M, 1);
+    assert(dcc_resource_estimate(large) == 1184*M);
+    dcc_resource_observe(pump, 1536*M, 0);
+    assert(!dcc_resource_known(pump));
+    assert(dcc_resource_estimate(pump) == 1984*M);
+    assert(dcc_resource_samples() == 3);
+    assert(dcc_resource_peak_bytes() == 1536*M);
+    assert(!dcc_resource_admit(small, ULLONG_MAX, 0));
+    dcc_resource_observe(large, ULLONG_MAX, 1);
     assert(dcc_resource_job_bytes() == ULLONG_MAX);
-    assert(dcc_resource_spare_bytes() == ULLONG_MAX);
+    assert(dcc_resource_estimate(large) == ULLONG_MAX);
+    assert(!dcc_resource_admit(large, 0, 0));
+    assert(dcc_resource_estimate(small) == 256*M);
     unsetenv("DISTCC_MEMORY_LEARNING");
     assert(dcc_resource_job_bytes() == 512*M);
     assert(dcc_resource_spare_bytes() == 128*M);
+    assert(dcc_resource_estimate(large) == 512*M);
+    assert(dcc_resource_known(pump));
+    assert(dcc_resource_compile_classes() == ULLONG_MAX);
     return 0;
 }''')
             executable=root/'memory'
-            subprocess.run(['gcc','-Isrc',str(source),'src/resource.c','-o',str(executable)],
-                           check=True,capture_output=True)
-            subprocess.run([str(executable)],check=True,capture_output=True)
+            result = subprocess.run(['gcc','-D_GNU_SOURCE','-Isrc',str(source),'src/resource.c','-o',str(executable)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = subprocess.run([str(executable)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class CpuPerfTest(DistccTestCase):

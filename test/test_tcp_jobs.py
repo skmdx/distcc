@@ -276,6 +276,56 @@ int ioctl(int fd, unsigned long request, ...) {
         self.assertLess(estimate, 512 * 1024 * 1024)
         self.assertIn('dcc_job_memory_samples 8\n', after)
 
+    def test_server_calibrates_unseen_size_despite_cached_client_capacity(self):
+        def metric(text, name):
+            match = re.search(rf'^{name} (\d+)$', text, re.M)
+            assert match is not None, (name, text)
+            return int(match[1])
+        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='512', DISTCC_MEMORY_LEARNING='1')
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.start_tcp()
+        for i in range(8):
+            self.job(f'small-{i}')
+        source = self.work / 'larger.i'
+        source.write_text('/*' + ' ' * 8192 + '*/\nint main(void) { return 0; }\n')
+        mask = 1 << (source.stat().st_size.bit_length() - 1)
+        before = self.get_stats(self.stats_ports[0])
+        self.assertFalse(metric(before, 'dcc_compile_memory_classes') & mask)
+        completed = metric(before, 'dcc_compile_ok')
+        # Expose cached client capacity to force a burst onto the real daemon;
+        # the broker's own cold-class gate must not hide missing server leases.
+        advertised = re.sub(r'dcc_compile_memory_classes \d+',
+                            f'dcc_compile_memory_classes {2**64-1}', before)
+        peer = self.peer(advertised.encode())
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name='cached-capacity')
+        def compile_one(index):
+            state = self.work / f'independent-{index}'
+            state.mkdir()
+            env = dict(self.env, DISTCC_DIR=str(state))
+            obj = self.work / f'larger-{index}.o'
+            result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c',
+                                     str(source), '-o', str(obj)], env=env,
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return obj.read_bytes()
+        rows = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            jobs = [pool.submit(compile_one, i) for i in range(4)]
+            while not all(job.done() for job in jobs):
+                stats = self.get_stats(self.stats_ports[0])
+                rows.append((metric(stats, 'dcc_compile_ok'), metric(stats, 'dcc_busy')))
+                time.sleep(.01)
+            outputs = [job.result() for job in jobs]
+        cold = [busy for done, busy in rows if done == completed]
+        self.assertTrue(cold)
+        self.assertEqual(max(cold), 1)
+        self.assertGreaterEqual(max(busy for done, busy in rows if done > completed), 2)
+        native = self.work / 'native.o'
+        subprocess.run([self.cc, '-c', str(source), '-o', str(native)], check=True)
+        self.assertTrue(all(output == native.read_bytes() for output in outputs))
+        after = self.get_stats(self.stats_ports[0])
+        self.assertTrue(metric(after, 'dcc_compile_memory_classes') & mask)
+
     def test_compile_and_pool_reuse(self):
         self.start_tcp()
         before = int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
@@ -575,7 +625,10 @@ ssize_t write(int fd, const void *data, size_t size) {
             with self.subTest(verification=verification):
                 net = self.wire_job(body, cached=False, verification=verification)
                 self.upload(net, body)
-                self.assertEqual(net.recv(1), b'')
+                # Intact jobs with invalid metadata return a completed protocol
+                # error. EOF would incorrectly quarantine a healthy worker.
+                outputs = self.result(net, expected_status=109 << 8)
+                self.assertEqual(outputs[2], b'')
 
     def test_single_upload_and_owner_disconnect(self):
         body = b'int cache_owner_recovery(void) { return 901; }\n'

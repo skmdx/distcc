@@ -834,6 +834,12 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             projected.queued = 0;
             cap = &projected;
         }
+        /* Let an unfamiliar prepared-input size obtain a real memory sample
+         * before reserving more work there. Otherwise a fast input burst can
+         * strand a queue behind the worker's single calibration job. */
+        if (staged && cap && !link && client->hint.kind >= 1 && client->hint.kind <= 3 &&
+            !(cap->compile_memory_classes & (1ULL << dcc_resource_bucket(client->hint.bytes))) && work)
+            continue;
         if (p->busy < inflight || predicted) {
             double score = dcc_capacity_score(p->host, cap, work);
             struct prediction forecast = {0};

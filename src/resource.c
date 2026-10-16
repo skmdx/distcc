@@ -12,6 +12,7 @@
 #include <sched.h>
 #endif
 #include "resource.h"
+#include "job.h"
 
 static double pressure = -1;
 static int processors = 1;
@@ -33,7 +34,7 @@ static unsigned long long read_bytes(const char *group, const char *name)
     return value;
 }
 
-static unsigned long long memory_used(const char *group)
+static unsigned long long memory_used(const char *group, unsigned long long *backing)
 {
     unsigned long long used = read_bytes(group, "memory.current"), value, reclaimable = 0;
     char path[PATH_MAX], name[64];
@@ -43,8 +44,10 @@ static unsigned long long memory_used(const char *group)
         return used;
     file = fopen(path, "r");
     if (file) {
-        while (fscanf(file, "%63s %llu", name, &value) == 2)
+        while (fscanf(file, "%63s %llu", name, &value) == 2) {
             if (!strcmp(name, "inactive_file")) reclaimable = value;
+            else if (backing && !strcmp(name, "shmem")) *backing = value;
+        }
         fclose(file);
     }
     /* Completed jobs leave clean page cache charged to the service. Counting
@@ -68,7 +71,7 @@ static void sample_resources(void)
     static char group[PATH_MAX];
     static int located;
     char path[PATH_MAX], line[PATH_MAX];
-    unsigned long long own = 0, value;
+    unsigned long long own = 0, backing = 0, value;
     FILE *file;
     time_t now = time(NULL);
     if (sampled == now) return;
@@ -97,7 +100,7 @@ static void sample_resources(void)
         }
     }
     if (group[0]) {
-        value = memory_used(group);
+        value = memory_used(group, &backing);
         if (value != ULLONG_MAX) own = value;
     }
     file = fopen("/proc/meminfo", "r");
@@ -127,7 +130,7 @@ static void sample_resources(void)
                 }
             }
             unsigned long long limit = read_bytes(path, "memory.max");
-            unsigned long long used = memory_used(path);
+            unsigned long long used = memory_used(path, NULL);
             if (limit != ULLONG_MAX && used != ULLONG_MAX) {
                 unsigned long long free = limit > used ? limit - used : 0;
                 if (free < available) available = free;
@@ -140,6 +143,9 @@ static void sample_resources(void)
             *slash = 0;
         }
     }
+    /* Anonymous input/output files remain charged independently of compiler
+     * working sets. Their actual shared pages must not become job capacity. */
+    budget = budget > backing ? budget - backing : 0;
 }
 #else
 static void sample_resources(void)
@@ -163,13 +169,47 @@ double dcc_memory_pressure(void)
 
 static unsigned long long peak_job;
 static unsigned samples;
-static unsigned long long observations[64], learned_job;
-static unsigned observation_count, next_observation;
+static unsigned long long learned_job;
+/* Input kind and binary size interval distinguish materially different work.
+ * Class zero is reserved for legacy sessions without prepared metadata. */
+static unsigned long long class_peak[1 + (DCC_JOB_LINK + 1) * 64];
 
-static int order_bytes(const void *a, const void *b)
+static int memory_learning(void)
 {
-    unsigned long long x = *(const unsigned long long *)a, y = *(const unsigned long long *)b;
-    return (x > y) - (x < y);
+    const char *setting = getenv("DISTCC_MEMORY_LEARNING");
+    return setting && !strcmp(setting, "1");
+}
+
+unsigned dcc_resource_bucket(unsigned long long bytes)
+{
+    unsigned bucket = 0;
+    while (bytes >>= 1) ++bucket;
+    return bucket;
+}
+
+unsigned dcc_resource_class(const struct dcc_job *job)
+{
+    unsigned long long bytes = 0;
+    for (unsigned i = 0; i < job->count; ++i) {
+        unsigned long long size = job->inputs[i].plain_size;
+        bytes = size <= ULLONG_MAX - bytes ? bytes + size : ULLONG_MAX;
+    }
+    return 1 + job->kind * 64 + dcc_resource_bucket(bytes);
+}
+
+int dcc_resource_known(unsigned memory_class)
+{
+    return !memory_learning() ||
+        (memory_class < sizeof(class_peak) / sizeof(*class_peak) && class_peak[memory_class]);
+}
+
+unsigned long long dcc_resource_compile_classes(void)
+{
+    if (!memory_learning()) return ULLONG_MAX;
+    unsigned long long known = 0;
+    for (unsigned i = 0; i < 64; ++i)
+        if (class_peak[1 + DCC_JOB_COMPILE * 64 + i]) known |= 1ULL << i;
+    return known;
 }
 
 static unsigned long long measured_job_bytes(unsigned long long peak)
@@ -179,33 +219,25 @@ static unsigned long long measured_job_bytes(unsigned long long peak)
         peak + peak / 4 + overhead : ULLONG_MAX;
 }
 
-void dcc_resource_observe(unsigned long long peak_bytes, int success)
+void dcc_resource_observe(unsigned memory_class, unsigned long long peak_bytes, int success)
 {
-    /* Keep the largest working set as spare capacity, not a charge on every
-     * tiny job. A bounded recent distribution follows changes of workload. */
     if (peak_bytes > peak_job) peak_job = peak_bytes;
     if (!peak_bytes || !success) return;
     if (samples < UINT_MAX) ++samples;
-    observations[next_observation++ % 64] = peak_bytes;
-    if (observation_count < 64) ++observation_count;
-    unsigned long long sorted[64];
-    memcpy(sorted, observations, observation_count * sizeof(*sorted));
-    qsort(sorted, observation_count, sizeof(*sorted), order_bytes);
-    /* Use the lower quantile rank. With ten observations, index nine is
-     * the maximum, not the 90th percentile; charging an isolated peak both
-     * here and as spare can starve a worker of the samples needed to recover. */
-    unsigned long long p90 = sorted[(observation_count - 1) * 9 / 10];
-    /* The largest observed working set is already reserved once per host.
-     * Doubling every job as well can leave only one admissible slot even
-     * when two regular jobs and that reserve fit the unchanged budget. */
-    learned_job = measured_job_bytes(p90);
+    if (memory_class && memory_class < sizeof(class_peak) / sizeof(*class_peak)) {
+        if (peak_bytes > class_peak[memory_class]) class_peak[memory_class] = peak_bytes;
+        peak_bytes = class_peak[memory_class];
+    }
+    /* Advertise the current workload, not a percentile still dominated by a
+     * previous package. Admission separately charges every active class. */
+    learned_job = measured_job_bytes(peak_bytes);
     if (learned_job < 256ULL * 1024 * 1024) learned_job = 256ULL * 1024 * 1024;
 }
 
 unsigned dcc_resource_samples(void) { return samples; }
 unsigned long long dcc_resource_peak_bytes(void) { return peak_job; }
 
-unsigned long long dcc_resource_job_bytes(void)
+static unsigned long long configured_job_bytes(void)
 {
     const char *setting = getenv("DISTCC_JOB_MEMORY");
     char *end;
@@ -214,18 +246,33 @@ unsigned long long dcc_resource_job_bytes(void)
         unsigned long long requested = strtoull(setting, &end, 10);
         if (!*end && requested >= 1 && requested <= 1048576) job = requested;
     }
-    job *= 1024 * 1024;
-    const char *learn = getenv("DISTCC_MEMORY_LEARNING");
-    if (learn && !strcmp(learn, "1") && samples >= 8) job = learned_job;
-    return job;
+    return job * 1024 * 1024;
+}
+
+unsigned long long dcc_resource_job_bytes(void)
+{
+    return memory_learning() && samples ? learned_job : configured_job_bytes();
+}
+
+unsigned long long dcc_resource_estimate(unsigned memory_class)
+{
+    if (memory_learning() && memory_class < sizeof(class_peak) / sizeof(*class_peak) &&
+        class_peak[memory_class]) {
+        unsigned long long estimate = measured_job_bytes(class_peak[memory_class]);
+        return estimate < 256ULL * 1024 * 1024 ? 256ULL * 1024 * 1024 : estimate;
+    }
+    /* Small completed jobs cannot lower the reservation for unseen work. */
+    unsigned long long estimate = configured_job_bytes();
+    unsigned long long observed = measured_job_bytes(peak_job);
+    if (memory_learning() && peak_job && observed > estimate) estimate = observed;
+    return estimate;
 }
 
 unsigned long long dcc_resource_spare_bytes(void)
 {
-    unsigned long long spare = dcc_resource_job_bytes() / 4;
-    const char *learn = getenv("DISTCC_MEMORY_LEARNING");
-    if (learn && !strcmp(learn, "1") && peak_job > spare) spare = peak_job;
-    return spare;
+    /* Each active job now carries its own class reservation. Charging the
+     * lifetime maximum again would penalize unrelated small jobs indefinitely. */
+    return dcc_resource_job_bytes() / 4;
 }
 
 static int resource_slots(int maximum, unsigned long long job,
@@ -237,13 +284,11 @@ static int resource_slots(int maximum, unsigned long long job,
     if (pressure >= 10) pressure_blocked = 1;
     else if (pressure < 5) pressure_blocked = 0;
     const char *learn = getenv("DISTCC_MEMORY_LEARNING");
-    if (!pressure_blocked && learning && learn && !strcmp(learn, "1") && samples >= 8 &&
+    if (!pressure_blocked && learning && learn && !strcmp(learn, "1") && samples &&
         (budget < job || budget - job < spare)) {
-        /* Do not deadlock learning when a short window contains a large
-         * outlier: one measured working set may fit even when the usual
-         * usual per-job estimate plus the separate reserve does not. */
-        unsigned long long one = measured_job_bytes(peak_job);
-        return maximum > 0 && available >= one && budget >= one ? 1 : 0;
+        /* The estimate already includes measurement headroom. A separate
+         * host reserve must not strand one otherwise fitting measured job. */
+        return maximum > 0 && available >= job && budget >= job ? 1 : 0;
     }
     /* PSI is reactive; keep headroom and reserve a budget before the burst.
      * Existing jobs finish normally when the admissible limit falls. */
@@ -257,6 +302,17 @@ static int resource_slots(int maximum, unsigned long long job,
 int dcc_resource_slots(int maximum)
 {
     return resource_slots(maximum, dcc_resource_job_bytes(), dcc_resource_spare_bytes(), 1);
+}
+
+int dcc_resource_admit(unsigned memory_class, unsigned long long reserved, int probing)
+{
+    if (probing && !dcc_resource_known(memory_class)) return 0;
+    unsigned long long job = dcc_resource_estimate(memory_class);
+    /* One calibrated job already includes its own measurement headroom. An
+     * extra host reserve must not prevent an otherwise fitting idle probe. */
+    unsigned long long spare = reserved ? dcc_resource_spare_bytes() : 0;
+    if (!resource_slots(1, job, spare, 0)) return 0;
+    return reserved <= budget - job - spare;
 }
 
 int dcc_resource_analysis_slots(int maximum)
