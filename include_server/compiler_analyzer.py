@@ -69,6 +69,10 @@ def run(command, allow_errors=False):
   return result
 
 
+class _CacheInvalidated(Exception):
+  """Cached filesystem observations changed while the compiler was running."""
+
+
 class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
@@ -80,7 +84,18 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
   def DoCompilationCommand(self, cmd, *args, **kwargs):
     self.command = cmd
     try:
-      files = super().DoCompilationCommand(cmd, *args, **kwargs)
+      # Earlier jobs may have observed generated files unrelated to this one.
+      # If they change during the native scan, retire the cache generation and
+      # restart once. Never reuse path mappings from an invalidated generation.
+      for _ in range(2):
+        try:
+          files = super().DoCompilationCommand(cmd, *args, **kwargs)
+          break
+        except _CacheInvalidated:
+          self.ClearStatCaches()
+      else:
+        raise basics.NotCoveredError('Inputs keep changing during dependency analysis',
+                                     send_email=False)
       compression = kwargs.get('compression', args[2] if len(args) > 2 else 'lzo')
       directory = os.path.join(self.client_root_keeper.client_root, '.distcc-system')
       os.makedirs(directory, exist_ok=True)
@@ -252,7 +267,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       if stamps.Stamp(path) != expected:
         raise basics.NotCoveredError('Input changed after compiler dependency scan: ' + path)
     if stamps.Changed():
-      raise basics.NotCoveredError('Input changed during compiler dependency scan')
+      raise _CacheInvalidated()
     # Keep source bytes unchanged. A shared header can be reached through both
     # relative and absolute spellings; one injected #line cannot represent both.
     # The worker remaps its private root with compiler prefix-map options.

@@ -64,8 +64,10 @@ filesystems, directory notifications select which negative lookups and ancestor
 identities need rechecking. Other filesystems and unavailable or exhausted
 notification watches retain full metadata checks. Header creation, modification, removal and symlink
 replacement invalidate cached inputs. A new generation holds new compressed files;
-previously issued manifests keep their old files until pump exits. A change
-detected while gathering inputs causes local preprocessing instead. Build
+previously issued manifests keep their old files until pump exits. If earlier
+cached observations change during a native scan, the cache generation is retired
+and the request is restarted once. Repeated invalidation or changed current
+inputs causes local preprocessing instead. Build
 dependencies must still prevent writes to an input during its compilation.
 An aborted analysis does not publish a partial manifest.
 

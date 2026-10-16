@@ -240,6 +240,38 @@ class ClangScanTest(unittest.TestCase):
     image = next(path for path in files if path.endswith('/header.h.lz4s'))
     self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(header.read_bytes()))
 
+  def test_prior_input_change_restarts_current_scan_with_fresh_caches(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    self.addCleanup(os.chdir, os.getcwd())
+    prior = self.root / 'prior.h'
+    prior.write_text('int original;\n')
+    self.source.write_text('#include "prior.h"\n')
+    current = self.root / 'current.c'
+    current.write_text('int current;\n')
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    earlier = analyzer.DoCompilationCommand([gcc, '-c', str(self.source)],
+                                            str(self.root), keeper, 'lz4s')
+    image = next(path for path in earlier if path.endswith('/prior.h.lz4s'))
+    old_image = Path(image).read_bytes()
+    native_scan = compiler_analyzer.gcc_scan.scan
+    calls = []
+    def change_prior(*args):
+      result = native_scan(*args)
+      calls.append(result)
+      if len(calls) == 1:
+        prior.write_text('int generated_by_another_job;\n')
+      return result
+    with mock.patch.object(compiler_analyzer.gcc_scan, 'scan', side_effect=change_prior):
+      files = analyzer.DoCompilationCommand([gcc, '-c', str(current)],
+                                            str(self.root), keeper, 'lz4s')
+    self.assertEqual(len(calls), 2)
+    self.assertFalse(any(path.endswith('/prior.h.lz4s') for path in files))
+    self.assertEqual(Path(image).read_bytes(), old_image)
+
   def test_compiler_scan_does_not_publish_a_change_during_compression(self):
     gcc = shutil.which('gcc')
     if not gcc:
@@ -396,6 +428,7 @@ class ClangScanTest(unittest.TestCase):
     self.assertFalse(any(path.endswith(('/comment.h', '/raw.h')) for path in result['lookups']))
 
   def test_clang_condition_aliases_use_preprocessor_expansion(self):
+    assert self.compiler is not None
     (self.root/'probe.h').write_text('int present;\n')
     self.source.write_text(
         '#define JOIN(a,b) a##b\n#define CHECK JOIN(__has_,include)\n'
