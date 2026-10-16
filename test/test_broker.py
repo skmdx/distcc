@@ -318,40 +318,47 @@ class BrokerTest(BrokerTestCase):
         status, slots, fds = self.receive(self.request(2))
         self.assertEqual((status, slots, fds), (0, 2, []))
 
-    def test_job_cost_uses_idle_cpu_before_queueing_on_fast_worker(self):
+    def test_job_cost_uses_idle_cpu_when_it_finishes_sooner(self):
         peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
                     queued=0, preparing=0, returning=0, capacity=1)) for _ in range(2)]
         hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else 1}')
                          for i, p in enumerate(peers))
         self.start_broker(hosts)
-        first, net = self.acquire_reserved(10, (1, 4 * 1024 * 1024, 1))
+        first, net = self.acquire_reserved(10, (1, 64 * 1024 * 1024, 1))
         self.assertEqual(net.getpeername()[1], self.ports[0])
         heavy, other = self.acquire_reserved(10, (2, 16 * 1024 * 1024, 1))
         self.assertEqual(other.getpeername()[1], self.ports[1])
-        # With both CPUs occupied, finish-time prediction can still wait for
-        # the faster worker. Empty independent execution capacity comes first.
-        small = self.request(10, (3, 64 * 1024, 1))
-        small.settimeout(.05)
+
+    def test_job_cost_waits_for_fast_cpu_instead_of_extending_tail(self):
+        peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
+                    queued=0, preparing=0, returning=0, capacity=1)) for _ in range(2)]
+        hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else .1}')
+                         for i, p in enumerate(peers))
+        self.start_broker(hosts)
+        first, net = self.acquire_reserved(10, (1, 4 * 1024 * 1024, 1))
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+        waiting = self.request(10, (2, 64 * 1024 * 1024, 1))
+        waiting.settimeout(.05)
         with self.assertRaises(socket.timeout):
-            small.recv(1032)
+            waiting.recv(1032)
         first.close()
-        small.settimeout(1)
-        status, _, descriptors = self.receive(small)
+        waiting.settimeout(1)
+        status, _, descriptors = self.receive(waiting)
         self.assertEqual(status, 0)
         self.assertEqual(len(descriptors), 1)
         with socket.socket(fileno=descriptors[0]) as selected:
             self.assertEqual(selected.getpeername()[1], self.ports[0])
 
-    def test_independent_slow_cores_precede_fast_smt_siblings(self):
+    def test_fast_smt_and_independent_cores_compare_completion_time(self):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16,
                     running=0, busy=0, queued=0, preparing=0, returning=0, capacity=16)),
                  self.peer(stats_response(cpus=4, cores=2, jobs=4,
                     running=0, busy=0, queued=0, preparing=0, returning=0, capacity=2))]
-        hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={1 if i == 0 else .32}',
+        hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={1 if i == 0 else .8}',
                                   slots=16 if i == 0 else 4)
                          for i, p in enumerate(peers))
         self.start_broker(hosts)
-        for index, expected in enumerate([0] * 8 + [1] * 2 + [0]):
+        for index, expected in enumerate([0] * 10 + [1] * 2 + [0]):
             _, net = self.acquire_reserved(10, (1000 + index, 4 * 1024 * 1024, 1))
             self.assertEqual(net.getpeername()[1], self.ports[expected], index)
 
@@ -382,6 +389,7 @@ class BrokerTest(BrokerTestCase):
         self.start_broker(hosts)
         # Four preprocessors already occupy the faster host's physical cores.
         # Adding a compiler there gains only SMT throughput and slows them.
+        self.receive(self.request(13))  # This broker owns an active input producer.
         _, selected = self.acquire_reserved(10, (1100, 4 * 1024 * 1024, 1))
         self.assertEqual(selected.getpeername()[1], self.ports[1])
 
@@ -444,13 +452,24 @@ class BrokerTest(BrokerTestCase):
         seed, net = self.acquire_reserved(10, (21, 4 * 1024 * 1024, 1))
         seed.sendmsg([struct.pack('=II3Q', 2, 7, 0, 90_000_000_000, 100_000_000)],
                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
-        self.acquire_reserved(10, (21, 4 * 1024 * 1024, 1))
-        self.acquire_reserved(10, (23, 40 * 1024 * 1024, 2))
+        blocker, _ = self.acquire_reserved(10, (24, 40 * 1024 * 1024, 2))
+        _, long_job = self.acquire_reserved(10, (23, 20 * 1024 * 1024, 2))
+        self.assertEqual(long_job.getpeername()[1], self.ports[1])
+        blocker.close()
+        short, repeated = self.acquire_reserved(10, (21, 4 * 1024 * 1024, 1))
+        self.assertEqual(repeated.getpeername()[1], self.ports[0])
         # Ninety seconds of old queueing must not turn this repeat into a
         # long-running job. With both CPUs occupied, the fast CPU's short
         # remaining work must beat the other worker's long-running job.
-        _, other = self.acquire_reserved(10, (22, 2 * 1024 * 1024, 2))
-        self.assertEqual(other.getpeername()[1], self.ports[0])
+        waiting = self.request(10, (22, 2 * 1024 * 1024, 2))
+        waiting.settimeout(.05)
+        with self.assertRaises(socket.timeout):
+            waiting.recv(1032)
+        short.close()
+        waiting.settimeout(1)
+        _, _, descriptors = self.receive(waiting)
+        with socket.socket(fileno=descriptors[0]) as selected:
+            self.assertEqual(selected.getpeername()[1], self.ports[0])
 
     def test_job_cost_distinguishes_source_work_from_shared_headers(self):
         peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
@@ -504,7 +523,7 @@ class BrokerTest(BrokerTestCase):
         first = self.peer(stats_response(cpu_scale=.2, cpu_age=20, cpu_probe=1,
                                         busy=0, queued=0, preparing=0, returning=0, capacity=1))
         second = self.peer(stats_response(busy=0, queued=0, preparing=0, returning=0, capacity=4))
-        hosts = self.host(0, f',tcp,stats={first.port}') + ' ' + self.host(1, f',tcp,stats={second.port}')
+        hosts = self.host(0, f',tcp,stats={first.port},speed=2') + ' ' + self.host(1, f',tcp,stats={second.port}')
         self.start_broker(hosts)
         lease, net = self.acquire_reserved(10)
         self.assertEqual(net.getpeername()[1], self.ports[0])
@@ -513,6 +532,30 @@ class BrokerTest(BrokerTestCase):
         # Even a completed/cancelled short trial cannot trigger another probe
         # from the same stale stats snapshot.
         _, next_net = self.acquire_reserved(10)
+        self.assertEqual(next_net.getpeername()[1], self.ports[1])
+
+    def test_slow_recovery_trial_does_not_override_completion_time(self):
+        first = self.peer(stats_response(cpu_scale=.2, cpu_age=20, cpu_probe=1,
+                                        busy=0, queued=0, preparing=0, returning=0, capacity=1))
+        second = self.peer(stats_response(busy=0, queued=0, preparing=0, returning=0, capacity=4))
+        hosts = self.host(0, f',tcp,stats={first.port},speed=.1') + ' ' + self.host(1, f',tcp,stats={second.port}')
+        self.start_broker(hosts)
+        _, net = self.acquire_reserved(10, (89, 4 * 1024 * 1024, 1))
+        self.assertEqual(net.getpeername()[1], self.ports[1])
+
+    def test_prepared_input_uses_its_class_capacity_after_small_jobs(self):
+        capacities = [4] * 64
+        capacities[22] = 1
+        first = self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
+                         queued=0, preparing=0, returning=0, running=0,
+                         compile_capacity=capacities))
+        second = self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
+                          queued=0, preparing=0, returning=0, running=0))
+        hosts = self.host(0, f',tcp,stats={first.port},speed=1.5') + ' ' + self.host(1, f',tcp,stats={second.port}')
+        self.start_broker(hosts)
+        _, first_net = self.acquire_reserved(10, (90, 4 * 1024 * 1024, 1))
+        self.assertEqual(first_net.getpeername()[1], self.ports[0])
+        _, next_net = self.acquire_reserved(10, (91, 4 * 1024 * 1024, 1))
         self.assertEqual(next_net.getpeername()[1], self.ports[1])
 
     def test_tcp_global_pipeline_and_resource_limits(self):

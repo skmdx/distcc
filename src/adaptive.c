@@ -106,12 +106,18 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
                 return -1;
             cap->load = value;
             fields |= 4;
-        } else if (!strncmp(line, "dcc_compile_memory_classes ", 27)) {
-            char *end;
-            if ((fields & 524288) || line[27] < '0' || line[27] > '9') return -1;
-            errno = 0;
-            cap->compile_memory_classes = strtoull(line + 27, &end, 10);
-            if (errno || *end) return -1;
+        } else if (!strncmp(line, "dcc_compile_capacity ", 21)) {
+            char *item = line + 21, *end;
+            if (fields & 524288) return -1;
+            for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
+                if ((*item < '0' || *item > '9') && strncmp(item, "-1", 2)) return -1;
+                errno = 0;
+                long slots = strtol(item, &end, 10);
+                if (errno || slots < -1 || slots > 10000 ||
+                    *end != (i + 1 == DCC_MEMORY_BUCKETS ? '\0' : ',')) return -1;
+                cap->compile_capacity[i] = slots;
+                item = end + 1;
+            }
             fields |= 524288;
         } else if (!strncmp(line, "dcc_memory_pressure ", 20)) {
             if ((fields & 4096) || sscanf(line + 20, "%lf %c", &value, &extra) != 1 ||

@@ -32,13 +32,16 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
                    core_scale: float | str = 1, smt_gain: float | str = .25,
                    cpu_scale: float | str = -1, cpu_age: float | str = -1,
                    cpu_probe: float | str = 0,
-                   compile_memory_classes: int | float | str = 2**64-1, **metrics):
+                   compile_capacity=None, **metrics):
+    if compile_capacity is None:
+        compile_capacity = [metrics.get('capacity', jobs)] * 64
+    capacities = compile_capacity if isinstance(compile_capacity, str) else ','.join(map(str, compile_capacity))
     return ("HTTP/1.0 200 OK\n\n<distccstats>\n"
             f"dcc_cpus {cpus}\ndcc_max_kids {jobs}\ndcc_load1 {load}\n"
             f"dcc_cores {cpus if cores is None else cores}\ndcc_smt_gain {smt_gain}\n"
             f"dcc_core_scale {core_scale}\n"
             f"dcc_cpu_scale {cpu_scale}\ndcc_cpu_age {cpu_age}\ndcc_cpu_probe {cpu_probe}\n"
-            f"dcc_compile_memory_classes {compile_memory_classes}\n"
+            f"dcc_compile_capacity {capacities}\n"
             + ''.join(f'dcc_{name} {value}\n' for name, value in metrics.items())
             + "</distccstats>\n").encode()
 
@@ -337,11 +340,13 @@ class AdaptiveTest(DistccTestCase):
         _, log = self.compile(hosts)
         self.assertIn('adaptive stats unavailable', log)
 
-    def test_memory_class_mask_requires_a_canonical_unsigned_value(self):
-        for index, value in enumerate(('-1', '18446744073709551616', 'nan',
-                                       '0 extra', '0\ndcc_compile_memory_classes 0')):
+    def test_compile_capacity_requires_a_complete_bounded_vector(self):
+        valid = ','.join(['4'] * 64)
+        for index, value in enumerate(('-2,' + valid, '10001,' + valid, 'nan,' + valid,
+                                       valid + ' extra', valid + ',4', ','.join(['4'] * 63),
+                                       valid + '\ndcc_compile_capacity ' + valid)):
             with self.subTest(value=value):
-                peer = self.peer(stats_response(compile_memory_classes=value))
+                peer = self.peer(stats_response(compile_capacity=value))
                 hosts = self.host(0, f',stats={peer.port},speed=4') + ' ' + self.host(1)
                 _, log = self.compile(hosts, f'memory-mask-{index}')
                 self.assertIn('adaptive stats unavailable', log)
@@ -500,7 +505,7 @@ int main(void) {
     assert(dcc_resource_bucket(0) == 0);
     assert(dcc_resource_bucket(ULLONG_MAX) == 63);
     assert(!dcc_resource_known(small));
-    assert(dcc_resource_compile_classes() == 0);
+    assert(dcc_resource_compile_slots(16, 10) == -1);
     assert(dcc_resource_estimate(small) == 512*M);
     assert(!dcc_resource_admit(small, 0, 1));
     dcc_resource_observe(small, 64*M, 1);
@@ -508,14 +513,16 @@ int main(void) {
     assert(dcc_resource_known(small));
     assert(!dcc_resource_known(large));
     assert(dcc_resource_estimate(large) == 512*M);
-    assert(dcc_resource_compile_classes() == (1ULL << 10));
+    int small_slots = dcc_resource_compile_slots(16, 10);
+    assert(small_slots > 0);
     dcc_resource_observe(large, 896*M, 1);
     assert(dcc_resource_job_bytes() == 1184*M);
     assert(dcc_resource_estimate(small) == 256*M);
     assert(dcc_resource_estimate(large) == 1184*M);
     assert(dcc_resource_estimate(pump) == 1184*M);
     assert(!dcc_resource_known(pump));
-    assert(dcc_resource_compile_classes() == ((1ULL << 10) | (1ULL << 11)));
+    assert(dcc_resource_compile_slots(16, 11) < small_slots);
+    assert(dcc_resource_compile_slots(16, 10) == small_slots);
     /* Later smaller successes must not erase the class's observed demand. */
     dcc_resource_observe(large, 64*M, 1);
     assert(dcc_resource_estimate(large) == 1184*M);
@@ -528,6 +535,7 @@ int main(void) {
     dcc_resource_observe(large, ULLONG_MAX, 1);
     assert(dcc_resource_job_bytes() == ULLONG_MAX);
     assert(dcc_resource_estimate(large) == ULLONG_MAX);
+    assert(dcc_resource_compile_slots(16, 11) == 0);
     assert(!dcc_resource_admit(large, 0, 0));
     assert(dcc_resource_estimate(small) == 256*M);
     unsetenv("DISTCC_MEMORY_LEARNING");
@@ -535,7 +543,7 @@ int main(void) {
     assert(dcc_resource_spare_bytes() == 128*M);
     assert(dcc_resource_estimate(large) == 512*M);
     assert(dcc_resource_known(pump));
-    assert(dcc_resource_compile_classes() == ULLONG_MAX);
+    assert(dcc_resource_compile_slots(16, 63) > 0);
     return 0;
 }''')
             executable=root/'memory'

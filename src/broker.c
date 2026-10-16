@@ -611,9 +611,11 @@ static void deliver_connection(struct broker *broker, struct client *client)
 /* Service time while executing, excluding the queue predicted below. Replace
  * this daemon's runnable compilers with the projected execution concurrency;
  * external CPU demand remains in the existing contention calculation. */
-static double execution_factor(const struct peer *peer, int work)
+static double execution_factor(const struct peer *peer, int work, int recovering, int capacity)
 {
     struct dcc_capacity cap = peer->metrics;
+    cap.capacity = capacity;
+    if (recovering) cap.cpu_scale = 1;
     int parallel = cap.cpus < cap.jobs ? cap.cpus : cap.jobs;
     if (cap.capacity >= 0 && cap.capacity < parallel) parallel = cap.capacity;
     if (parallel < 1) parallel = 1;
@@ -655,19 +657,19 @@ static int bulk_input(const struct peer *peer, const struct dcc_work_hint *hint)
 
 static struct prediction predict(struct broker *broker, const struct client *client,
                                   int peer_index, int work, double cost, double now,
-                                  const struct dispatch_batch *batch)
+                                  const struct dispatch_batch *batch, int recovering, int capacity)
 {
     struct peer *peer = &broker->peers[peer_index];
     const struct dcc_capacity *cap = &peer->metrics;
     int waiting = 0;
     for (unsigned i = 0; i < batch->count; ++i) waiting += batch->planned[i].peer == peer_index;
-    struct prediction result = {.factor = execution_factor(peer, work + waiting)};
+    struct prediction result = {.factor = execution_factor(peer, work + waiting, recovering, capacity)};
     int bulk = bulk_input(peer, &client->hint);
     double prepare = peer->prepare_cost[client->hint.kind - 1];
     if (!prepare) prepare = bulk ? 1.0 / (64 * 1048576) : peer->local ? .001 : .005;
     result.prepare = bulk ? client->hint.bytes * prepare + .005 : prepare;
     int lanes = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
-    if (cap->capacity >= 0 && cap->capacity < lanes) lanes = cap->capacity;
+    if (capacity >= 0 && capacity < lanes) lanes = capacity;
     if (lanes < 1) lanes = 1;
     if (lanes > MAX_CLIENTS) lanes = MAX_CLIENTS;
     const struct client *assigned[MAX_CLIENTS];
@@ -691,10 +693,11 @@ static struct prediction predict(struct broker *broker, const struct client *cli
         double duration = c->cost * result.factor;
         double elapsed = now > c->run_at ? now - c->run_at : 0;
         double left = duration - elapsed;
-        /* An overrun gives no new remaining-work estimate. Let the bounded
-         * input pipeline overlap the uncertain tail; admission still enforces
-         * the real execution and memory limits. */
-        if (left < .02) left = .02;
+        /* A missed forecast no longer establishes when this lane will free.
+         * Use the observed service age as the conservative residual estimate;
+         * it grows while the job overruns instead of promising an imminent
+         * finish forever and starving an idle worker. */
+        if (left <= 0) left = elapsed;
         int first = 0;
         for (int j = 1; j < lanes; ++j) if (free_at[j] < free_at[first]) first = j;
         double ready = c->ready_at > now ? c->ready_at - now : 0;
@@ -760,7 +763,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         }
         return 0;
     }
-    int i, slots, best = -1, available = 0, best_priority = 0, best_wait = 0;
+    int i, slots, best = -1, available = 0, best_probe = 0, best_wait = 0, best_idle = 0;
     double best_score = 0, best_fill = 0;
     double cost = dcc_work_predict(&broker->model, &client->hint);
     struct prediction best_prediction = {0};
@@ -779,6 +782,14 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         struct peer *p = &broker->peers[i];
         const struct dcc_capacity *cap = p->valid_until > now ? &p->metrics : NULL;
         struct dcc_capacity projected;
+        int cold = 0;
+        if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= 3) {
+            projected = *cap;
+            int limit = cap->compile_capacity[dcc_resource_bucket(client->hint.bytes)];
+            cold = limit < 0;
+            projected.capacity = cold ? 1 : limit;
+            cap = &projected;
+        }
         slots = dcc_capacity_slots(p->host, cap);
         if (!p->address_len || p->retry_at > now || slots <= 0)
             continue;
@@ -837,24 +848,27 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         /* Let an unfamiliar prepared-input size obtain a real memory sample
          * before reserving more work there. Otherwise a fast input burst can
          * strand a queue behind the worker's single calibration job. */
-        if (staged && cap && !link && client->hint.kind >= 1 && client->hint.kind <= 3 &&
-            !(cap->compile_memory_classes & (1ULL << dcc_resource_bucket(client->hint.bytes))) && work)
-            continue;
+        if (cold && work) continue;
         if (p->busy < inflight || predicted) {
-            double score = dcc_capacity_score(p->host, cap, work);
+            /* A recovery trial uses the host's calibrated speed, not a zero
+             * completion time. An uncompetitive host need not delay this job
+             * just to refresh stale frequency telemetry. */
+            int probe = !link && cap && cap->cpu_probe && work == 0 && now >= p->probe_after;
+            double score = probe ? execution_factor(p, work, 1, cap->capacity) :
+                                   dcc_capacity_score(p->host, cap, work);
             struct prediction forecast = {0};
-            int wait = 0, growing = 0;
+            int wait = 0;
             if (predicted) {
-                forecast = predict(broker, client, i, work, cost, now, batch);
+                forecast = predict(broker, client, i, work, cost, now, batch, probe, cap->capacity);
                 score = forecast.finish;
                 wait = blocked || p->busy >= inflight || forecast.start > forecast.prepare + .02;
             } else if (cost > 0) score *= cost;
-            /* Prefer added execution throughput to filling a fast host's
-             * queue. An SMT sibling contributes only its marginal capacity;
-             * its short service time must not displace an independent core.
-             * When all useful slots are occupied, retain finish-time prediction
-             * for bounded pipelining. Unknown jobs use one normalized work unit. */
+            /* Protect this build's input producers when compilation shares
+             * their machine. Otherwise compare actual completion estimates:
+             * an idle slow core is not intrinsically better than a fast queue.
+             * Without a cost hint, marginal throughput remains the estimate. */
             if (staged && cap && !link && !blocked &&
+                (!predicted || (p->local && broker->cpp_busy > 0)) &&
                 work < dcc_capacity_jobs(p->host, cap)) {
                 const struct dcc_capacity *observed = &p->metrics;
                 double external = (observed->running >= 0 ? observed->running : observed->load)
@@ -862,29 +876,27 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 double demand = work + (external > 0 ? external : 0);
                 /* Include the CPU work displaced by this compile, notably
                  * client preprocessing on a machine that also runs a worker. */
-                double before = demand ? demand / execution_factor(p, work - 1) : 0;
-                double gain = (demand + 1) / execution_factor(p, work) - before;
+                double before = demand ? demand / execution_factor(p, work - 1, probe, cap->capacity) : 0;
+                double gain = (demand + 1) / execution_factor(p, work, probe, cap->capacity) - before;
                 if (gain > 0) {
-                    growing = 1;
-                    score = forecast.prepare + (cost > 0 ? cost : 1) / gain;
+                    double throughput = forecast.prepare + (cost > 0 ? cost : 1) / gain;
+                    if (!predicted || throughput > score) score = throughput;
                 }
             }
-            /* An idle host with stale degraded telemetry gets one real job
-             * to observe recovery. Projection prevents this broker from
-             * flooding it; server admission serializes different clients. */
-            int probe = !link && cap && cap->cpu_probe && work == 0 && now >= p->probe_after;
-            if (probe) score = 0;
             double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;
             rs_trace("candidate host=%s work=%d capacity=%d cost=%.3f factor=%.3f prepare=%.3f start=%.3f score=%.3f wait=%d",
                      p->host->hostname, work, cap ? cap->capacity : -1, cost,
                      forecast.factor, forecast.prepare, forecast.start, score, wait);
-            int priority = probe ? 2 : growing;
-            if (best < 0 || priority > best_priority || (priority == best_priority &&
+            /* Without any input description there is no completion estimate
+             * with which to justify waiting instead of using an idle CPU. */
+            int idle = !cost && staged && cap && !blocked && work < dcc_capacity_jobs(p->host, cap);
+            if (best < 0 || idle > best_idle || (idle == best_idle &&
                 (score < best_score || (score == best_score && fill < best_fill)))) {
                 best = i;
-                best_priority = priority;
-                best_wait = wait && !probe;
+                best_idle = idle;
+                best_probe = probe;
+                best_wait = wait;
                 best_prediction = forecast;
                 best_score = score;
                 best_fill = fill;
@@ -934,7 +946,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         client->factor = best_prediction.factor;
         client->ready_at = now + best_prediction.prepare;
         client->run_at = now + best_prediction.start;
-        if (best_priority == 2) p->probe_after = now + 10;
+        if (best_probe) p->probe_after = now + 10;
         client->serial = ++p->serial;
         client->state = CONNECTING;
         client->deadline = now + 3;

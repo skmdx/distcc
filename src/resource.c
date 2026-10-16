@@ -172,7 +172,7 @@ static unsigned samples;
 static unsigned long long learned_job;
 /* Input kind and binary size interval distinguish materially different work.
  * Class zero is reserved for legacy sessions without prepared metadata. */
-static unsigned long long class_peak[1 + (DCC_JOB_LINK + 1) * 64];
+static unsigned long long class_peak[1 + (DCC_JOB_LINK + 1) * DCC_MEMORY_BUCKETS];
 
 static int memory_learning(void)
 {
@@ -194,22 +194,13 @@ unsigned dcc_resource_class(const struct dcc_job *job)
         unsigned long long size = job->inputs[i].plain_size;
         bytes = size <= ULLONG_MAX - bytes ? bytes + size : ULLONG_MAX;
     }
-    return 1 + job->kind * 64 + dcc_resource_bucket(bytes);
+    return 1 + job->kind * DCC_MEMORY_BUCKETS + dcc_resource_bucket(bytes);
 }
 
 int dcc_resource_known(unsigned memory_class)
 {
     return !memory_learning() ||
         (memory_class < sizeof(class_peak) / sizeof(*class_peak) && class_peak[memory_class]);
-}
-
-unsigned long long dcc_resource_compile_classes(void)
-{
-    if (!memory_learning()) return ULLONG_MAX;
-    unsigned long long known = 0;
-    for (unsigned i = 0; i < 64; ++i)
-        if (class_peak[1 + DCC_JOB_COMPILE * 64 + i]) known |= 1ULL << i;
-    return known;
 }
 
 static unsigned long long measured_job_bytes(unsigned long long peak)
@@ -302,6 +293,15 @@ static int resource_slots(int maximum, unsigned long long job,
 int dcc_resource_slots(int maximum)
 {
     return resource_slots(maximum, dcc_resource_job_bytes(), dcc_resource_spare_bytes(), 1);
+}
+
+int dcc_resource_compile_slots(int maximum, unsigned bucket)
+{
+    unsigned memory_class = 1 + DCC_JOB_COMPILE * DCC_MEMORY_BUCKETS + bucket;
+    unsigned long long job = dcc_resource_estimate(memory_class);
+    if (!dcc_resource_known(memory_class))
+        return resource_slots(1, job, 0, 0) ? -1 : 0;
+    return resource_slots(maximum, job, job / 4, 1);
 }
 
 int dcc_resource_admit(unsigned memory_class, unsigned long long reserved, int probing)

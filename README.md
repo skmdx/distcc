@@ -176,16 +176,18 @@ an idle snapshot. The pipeline bound takes the larger of local leases and global
 occupancy, rather than adding preparation twice. No per-stage IPC or extra
 network round trip is required.
 Input preparation can overlap execution within a pipeline of up to four jobs
-(also capped by effective parallelism). The broker first uses available execution
-capacity, comparing input preparation time plus estimated work divided by the
-additional throughput gained by dispatching a job. This gain includes the effect
-on competing CPU work, such as client preprocessing. An idle independent core
-can therefore take precedence over an SMT sibling or a queue on a faster host.
-Unknown job costs use one normalized work unit. Once useful execution capacity
-is occupied, jobs with an input-size hint use predicted completion time:
+(also capped by effective parallelism). Jobs with an input-size hint compare
+predicted completion time across both idle and occupied workers:
 `max(input_ready, cpu_slot_ready) + estimated_work * cpu_service_cost`.
 The existing contention curve accounts for SMT, frequency and external CPU
-load; memory capacity continues to bound execution.
+load; memory capacity continues to bound execution. An idle slow core does not
+override a sooner finish on a busy fast host. While this broker owns local input
+producers, the estimate also accounts for throughput displaced by local compilation.
+Without an input hint, selection uses marginal throughput and prefers available
+execution capacity. A missed completion forecast uses the running job's service
+age as a conservative residual estimate, so an overdue job cannot indefinitely
+appear about to finish. Recovery trials use calibrated speed rather than bypassing
+the completion-time comparison.
 
 Successful TCP results carry input preparation, queue and execution durations
 in the existing reply and connection-return message. Only execution time is
@@ -347,8 +349,12 @@ other jobs are active. Cgroup limits, available headroom, PSI and `--jobs` remai
 in force. RSS and input size are estimates: different compiler options or source
 complexity within a class can demand more memory. Keep the service memory limit
 configured. Statistics expose `dcc_job_memory_bytes`, `dcc_job_memory_samples`,
-`dcc_job_peak_bytes`, `dcc_memory_spare_bytes` and the prepared-input size mask
-`dcc_compile_memory_classes`. Leave learning unset to keep a fixed estimate.
+`dcc_job_peak_bytes`, `dcc_memory_spare_bytes` and `dcc_compile_capacity`, a list
+of 64 capacities indexed by the binary input-size bucket. Each capacity applies
+that class's reservation, available memory and CPU recovery limit; -1 permits one
+unmeasured calibration and zero disallows admission. Selection and queue bounds
+use the incoming job's capacity, not the last completed job's memory estimate.
+Leave learning unset to keep a fixed estimate.
 
 To avoid copying ordinary preprocessed input to a server on the same machine,
 set `DISTCC_LOCAL_SOCKET` to the same absolute socket prefix on the daemon and

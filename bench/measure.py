@@ -131,7 +131,7 @@ def implementation():
         raise RuntimeError('installed include server is missing')
     package = Path(next(iter(spec.submodule_search_locations)))
     paths = []
-    for name in ('distcc', 'pump'):
+    for name in ('distcc', 'distccd', 'pump'):
         binary = shutil.which(name)
         if binary is None:
             raise RuntimeError(name + ' is missing')

@@ -288,14 +288,17 @@ int ioctl(int fd, unsigned long request, ...) {
             self.job(f'small-{i}')
         source = self.work / 'larger.i'
         source.write_text('/*' + ' ' * 8192 + '*/\nint main(void) { return 0; }\n')
-        mask = 1 << (source.stat().st_size.bit_length() - 1)
+        bucket = source.stat().st_size.bit_length() - 1
+        def capacity(text):
+            row = next(line for line in text.splitlines() if line.startswith('dcc_compile_capacity '))
+            return list(map(int, row.split(' ', 1)[1].split(',')))[bucket]
         before = self.get_stats(self.stats_ports[0])
-        self.assertFalse(metric(before, 'dcc_compile_memory_classes') & mask)
+        self.assertEqual(capacity(before), -1)
         completed = metric(before, 'dcc_compile_ok')
         # Expose cached client capacity to force a burst onto the real daemon;
         # the broker's own cold-class gate must not hide missing server leases.
-        advertised = re.sub(r'dcc_compile_memory_classes \d+',
-                            f'dcc_compile_memory_classes {2**64-1}', before)
+        advertised = re.sub(r'dcc_compile_capacity [^\n]+',
+                            'dcc_compile_capacity ' + ','.join(['4'] * 64), before)
         peer = self.peer(advertised.encode())
         self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name='cached-capacity')
         def compile_one(index):
@@ -324,7 +327,7 @@ int ioctl(int fd, unsigned long request, ...) {
         subprocess.run([self.cc, '-c', str(source), '-o', str(native)], check=True)
         self.assertTrue(all(output == native.read_bytes() for output in outputs))
         after = self.get_stats(self.stats_ports[0])
-        self.assertTrue(metric(after, 'dcc_compile_memory_classes') & mask)
+        self.assertGreater(capacity(after), 0)
 
     def test_compile_and_pool_reuse(self):
         self.start_tcp()

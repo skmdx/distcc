@@ -1,4 +1,7 @@
 /* Host and cgroup resource admission, shared by clients and workers. */
+#ifndef DCC_RESOURCE_H
+#define DCC_RESOURCE_H
+#define DCC_MEMORY_BUCKETS 64
 double dcc_memory_pressure(void);
 int dcc_resource_slots(int maximum);
 int dcc_resource_cpus(void);
@@ -8,10 +11,12 @@ unsigned dcc_resource_bucket(unsigned long long bytes);
 unsigned dcc_resource_class(const struct dcc_job *);
 int dcc_resource_known(unsigned memory_class);
 unsigned long long dcc_resource_estimate(unsigned memory_class);
-unsigned long long dcc_resource_compile_classes(void);
+/* -1 requires one calibration; zero denies work; positive values are slots. */
+int dcc_resource_compile_slots(int maximum, unsigned bucket);
 int dcc_resource_admit(unsigned memory_class, unsigned long long reserved, int probing);
 void dcc_resource_observe(unsigned memory_class, unsigned long long peak_bytes, int success);
 unsigned long long dcc_resource_job_bytes(void);
 unsigned dcc_resource_samples(void);
 unsigned long long dcc_resource_peak_bytes(void);
 unsigned long long dcc_resource_spare_bytes(void);
+#endif
