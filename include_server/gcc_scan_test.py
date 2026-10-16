@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -12,10 +13,12 @@ import gcc_scan
 
 class GccScanTest(unittest.TestCase):
   def setUp(self):
-    self.compiler = shutil.which('gcc')
-    self.library = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
-    if not self.compiler or not self.library:
+    compiler = shutil.which('gcc')
+    library = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
+    if not compiler or not library:
       self.skipTest('A GCC dependency module built for this compiler is required')
+    self.compiler = compiler
+    self.library = library
     self.storage = tempfile.TemporaryDirectory()
     self.addCleanup(self.storage.cleanup)
     self.root = Path(self.storage.name)
@@ -71,6 +74,24 @@ class GccScanTest(unittest.TestCase):
     result = self.scan()
     self.assertIn(str(header), result['dependencies'])
     self.assertIn(str(self.source), result['dependencies'])
+
+  def test_ordinary_macro_expansion_can_affect_later_includes(self):
+    header = self.root/'selected.h'
+    header.write_text('int selected;\n')
+    self.source.write_text('int before = __COUNTER__;\n'
+                           '#if __COUNTER__ == 1\n#include "selected.h"\n#endif\n')
+    native = subprocess.run([self.compiler, '-E', str(self.source)],
+                            check=True, capture_output=True, text=True)
+    self.assertIn('int selected;', native.stdout)
+    self.assertIn(str(header), self.scan()['dependencies'])
+
+  def test_large_manifest_preserves_all_negative_probes(self):
+    names = [('missing-' + str(i) + '-' + 'x' * 64 + '.h') for i in range(1000)]
+    self.source.write_text(''.join('#if __has_include("' + name + '")\n#endif\n'
+                                   for name in names))
+    result = self.scan()
+    self.assertTrue(all(str(self.root/name) in result['lookups'] for name in names))
+    self.assertTrue(all(result['lookups'][str(self.root/name)] is None for name in names))
 
   def test_bom_and_input_charset_keep_raw_input_size(self):
     for contents, options in ((b'\xef\xbb\xbfint n;\n', ()),

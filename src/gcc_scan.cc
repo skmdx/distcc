@@ -2,7 +2,6 @@
 #include "gcc-plugin.h"
 #include "plugin-version.h"
 #include "c-family/c-pragma.h"
-#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,7 +14,9 @@ extern "C" bool distcc_gcc_inputs(cpp_reader *,
                                   bool (*)(const char *, const struct stat *, void *), void *);
 
 namespace {
-int output = -1;
+FILE *output = nullptr;
+// Header search produces many short records; write them in bounded batches.
+char output_buffer[64 * 1024];
 size_t bytes = 0;
 bool precompiled = false;
 void (*read_pch)(cpp_reader *, const char *, int, const char *) = nullptr;
@@ -39,15 +40,7 @@ bool append(const void *data, size_t length)
 {
     if (length > 64 * 1024 * 1024 - bytes) return false;
     bytes += length;
-    const char *position = static_cast<const char *>(data);
-    while (length) {
-        ssize_t count = write(output, position, length);
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) return false;
-        position += count;
-        length -= count;
-    }
-    return true;
+    return fwrite(data, 1, length, output) == length;
 }
 
 bool input(const char *path, const struct stat *stamp, void *)
@@ -71,7 +64,8 @@ void finish(void *, void *)
     // Unsupported inputs never yield a usable manifest. Source diagnostics can
     // still be replayed by the worker when input collection was complete.
     if (!precompiled && append("DCGS1", 6) &&
-        distcc_gcc_inputs(parse_in, input, nullptr)) append("", 1);
+        distcc_gcc_inputs(parse_in, input, nullptr) && !fflush(output)) append("", 1);
+    fclose(output);
 }
 }
 
@@ -84,9 +78,10 @@ int plugin_init(struct plugin_name_args *arguments, struct plugin_gcc_version *v
     char *end;
     long descriptor = strtol(arguments->argv[0].value, &end, 10);
     if (*end || descriptor < 3 || descriptor > INT_MAX) return 1;
-    output = static_cast<int>(descriptor);
     struct stat info;
-    if (fstat(output, &info) || !S_ISREG(info.st_mode) || lseek(output, 0, SEEK_CUR) != 0) return 1;
+    if (fstat(descriptor, &info) || !S_ISREG(info.st_mode) || lseek(descriptor, 0, SEEK_CUR) != 0) return 1;
+    output = fdopen(descriptor, "wb");
+    if (!output || setvbuf(output, output_buffer, _IOFBF, sizeof output_buffer)) return 1;
     register_callback(arguments->base_name, PLUGIN_FINISH, finish, nullptr);
     register_callback(arguments->base_name, PLUGIN_INCLUDE_FILE, entered_file, nullptr);
     return 0;

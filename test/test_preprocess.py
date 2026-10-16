@@ -68,11 +68,11 @@ class PreprocessTest(BrokerTestCase):
 
     def test_local_lookup_cache_then_remote_compile(self):
         search = []
-        for i in range(300):
-            directory = self.root / ('lookup-' + str(i))
+        directories = [self.root / ('lookup-' + str(i)) for i in range(300)]
+        for directory in directories:
             directory.mkdir()
             search.append('-I' + str(directory))
-        (directory / 'answer.h').write_text('#define ANSWER 42\n')
+        (directories[-1] / 'answer.h').write_text('#define ANSWER 42\n')
         self.source.write_text('#include "answer.h"\nint answer(void) { return ANSWER; }\n')
         scanner = self.env.pop('INCLUDE_SERVER_PORT')
         try:
@@ -576,6 +576,15 @@ class PreprocessTest(BrokerTestCase):
         dependencies = self.run_cc('gcc', ['-M', self.source], False)
         self.assertNotIn(b'probe.h', dependencies.stdout)
         self.compare('gcc', ['-P'])
+
+    def test_ordinary_macro_expansion_selects_later_include(self):
+        (self.work / 'selected.h').write_text('int selected = 19;\n')
+        self.source.write_text('int before = __COUNTER__;\n'
+                               '#if __COUNTER__ == 1\n#include "selected.h"\n#endif\n')
+        for compiler in ('gcc', 'g++', 'clang'):
+            with self.subTest(compiler=compiler):
+                result = self.compare(compiler, ['-P'])
+                self.assertIn(b'int selected = 19;', result.stdout)
 
     def test_gcc_only_literal_directives_follow_compiler_lexing(self):
         (self.work / 'gcc.h').write_text('#define VALUE 19\n')

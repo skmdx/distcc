@@ -17,7 +17,10 @@ def scan(command, cwd, library):
       env['LD_PRELOAD'] = lookup + (':' + env['LD_PRELOAD'] if env.get('LD_PRELOAD') else '')
       env['DISTCC_CPP_LOOKUP'] = '1'
       env['DISTCC_CPP_LOOKUP_OUTPUT_FD'] = str(fd)
-    invocation = [*command, '-E', '-M', '-MF', '/dev/null',
+    # Dependency-only mode skips ordinary tokens, including __COUNTER__ uses
+    # that can change a later include condition. Run the full preprocessor;
+    # only diagnostic expansion provenance can be omitted during collection.
+    invocation = [*command, '-E', '-ftrack-macro-expansion=0',
                   '-fplugin=' + library,
                   '-fplugin-arg-' + Path(library).stem + '-output-fd=' + str(fd)]
     result = subprocess.run(invocation, cwd=cwd, env=env, pass_fds=(fd,),

@@ -40,7 +40,11 @@ GCC jobs invoke the selected GCC frontend with a dependency-collection plugin.
 The module accesses GCC's own libcpp input state, including existence-only probes
 that ordinary dependency output omits. GCC performs condition evaluation, macro
 expansion, token pasting and header search; Python does not interpret C/C++.
-One GCC preprocessing process runs per request. PCH, modules, embed directives
+One full GCC preprocessing process runs per request. Dependency-only mode is
+insufficient: ordinary macro expansion can affect later include conditions
+through __COUNTER__. Collected records use bounded buffered output; diagnostic
+macro-expansion provenance is disabled during collection only.
+PCH, modules, embed directives
 and absolute include operands require local preprocessing.
 
 Build the module using the exact source of the selected GCC, including any
