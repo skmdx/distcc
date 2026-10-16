@@ -647,6 +647,14 @@ class BrokerTest(BrokerTestCase):
         for fd in fds:
             os.close(fd)
         second.close()
+        time.sleep(.2)
+        self.assertIsNone(proc.poll(), "idle timeout must start after the last lease closes")
+        third = self.request()
+        status, _, fds = self.receive(third)
+        self.assertEqual(status, 0)
+        for fd in fds:
+            os.close(fd)
+        third.close()
         self.assertEqual(proc.wait(timeout=3), 0)
         self.assertFalse(Path(self.env["DISTCC_BROKER"]).exists())
 

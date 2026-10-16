@@ -1203,7 +1203,7 @@ int dcc_broker_serve(const char *path)
     long idle = setting ? strtol(setting, &end, 10) : 60;
     const char *backoff_setting = getenv("DISTCC_BACKOFF_PERIOD");
     int backoff = backoff_setting ? atoi(backoff_setting) : 60;
-    double last_request = now_seconds();
+    double idle_deadline = 0;
     if (!broker)
         return EXIT_OUT_OF_MEMORY;
     for (count = 0; count < MAX_CLIENTS; ++count) broker->pool[count].fd = -1;
@@ -1243,10 +1243,15 @@ int dcc_broker_serve(const char *path)
         }
         for (i = 0; i < MAX_CLIENTS; i++)
             clients += broker->clients[i].fd >= 0;
-        if (!clients && now - last_request >= idle)
-            break;
-        if (!clients)
-            if (last_request + idle < wake_at) wake_at = last_request + idle;
+        /* An idle period starts after the last client leaves, including
+         * leases held through long compiles and requests that time out. */
+        if (clients) {
+            idle_deadline = 0;
+        } else {
+            if (!idle_deadline) idle_deadline = now + idle;
+            if (now >= idle_deadline) break;
+            if (idle_deadline < wake_at) wake_at = idle_deadline;
+        }
         if (clients && now >= broker->refresh_at) {
             int fresh = 0;
             for (i = 0; i < broker->count; i++)
@@ -1390,7 +1395,6 @@ int dcc_broker_serve(const char *path)
                     packet.payload[0] && !packet.payload[length - sizeof(request) - 1] &&
                     strlen(packet.payload) == (size_t)length - sizeof(request) - 1) {
                     memo_request(broker, c, request.command, packet.payload, now);
-                    last_request = now;
                     continue;
                 }
                 if (c->state == ACTIVE && length == sizeof(request) &&
@@ -1420,7 +1424,6 @@ int dcc_broker_serve(const char *path)
                 c->command = request.command;
                 c->state = WAITING;
                 c->waiting_since = now;
-                last_request = now;
             }
             if (net_index[i] >= 0 && polls[net_index[i]].revents) {
                 if (c->state == CONNECTING) connection_event(broker, c, now, 0);
