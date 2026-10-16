@@ -144,6 +144,7 @@ NotCoveredError = basics.NotCoveredError
 SINGLE_POUND_RE = re.compile(r"\B#\s*(\S*)") # \B = here: not at end of word
 DOUBLE_POUND_RE = re.compile(r"\s*##\s*")
 SYMBOL_RE = re.compile(r"\b\w+\b") # \b = word boundary \w = word constituent
+INCLUDE_PROBE_NAMES = frozenset(('__has_include', '__has_include_next'))
 DEFINED_RE = re.compile(
     r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|'''
     r'(?P<defined>\bdefined\b\s*(?:\(\s*[A-Za-z_]\w*\s*\)|[A-Za-z_]\w*))')
@@ -464,7 +465,8 @@ def ResolveExpr(includepath_map_index,
                 searchdir_idx,
                 quote_dirs,
                 angle_dirs,
-                symbol_table):
+                symbol_table,
+                matching_symbols):
   """Evaluate and resolve possible values for expr using symbol table.
 
   Determine all possible values of expr. Those that are of the form "filepath"
@@ -481,6 +483,7 @@ def ResolveExpr(includepath_map_index,
     quote_dirs: a directory index list
     angle_dirs: a directory index list
     symbol_table: as described in module macro_expr
+    matching_symbols: a callback returning current names matching a paste pattern
   Returns:
     a pair(files, symbols), where files is a list of (filepath pair,
     realpath index), namely those files that are successful resolutions of
@@ -506,8 +509,7 @@ def ResolveExpr(includepath_map_index,
     while pending:
       value = _WithoutDefined(pending.pop())
       names = set(SYMBOL_RE.findall(value))
-      probe_names = {'__has_include', '__has_include_next'}
-      has_probe |= bool(names & probe_names)
+      has_probe |= bool(names & INCLUDE_PROBE_NAMES)
       for name in names - seen:
         seen.add(name)
         for definition in symbol_table.get(name, ()):
@@ -527,8 +529,8 @@ def ResolveExpr(includepath_map_index,
                                            for part in parts))
               # Only a matching new alias can change this condition's graph.
               seen.add(pattern)
-              for candidate in set(symbol_table) | probe_names:
-                if candidate not in seen and candidate not in queued and pattern.fullmatch(candidate):
+              for candidate in matching_symbols(pattern):
+                if candidate not in seen and candidate not in queued:
                   queued.add(candidate)
                   pending.append(candidate)
     symbols.update(seen)

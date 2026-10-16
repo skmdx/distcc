@@ -79,6 +79,33 @@ class ClangScanTest(unittest.TestCase):
     assert keeper.client_root is not None
     self.assertFalse((Path(keeper.client_root) / str(system).lstrip('/')).is_symlink())
 
+  def test_cached_paste_matches_follow_new_definitions_and_cache_reset(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    header = self.root / 'condition.h'
+    header.write_text('#define SELECT(x) FEATURE_##x\n#if SELECT(NEW)\nint found;\n#endif\n')
+    probe = self.root / 'probe.h'
+    probe.write_text('/* existence-only input */\n')
+    self.source.write_text('#include "condition.h"\n')
+    second = self.root / 'second.c'
+    second.write_text('#define FEATURE_NEW __has_include("probe.h")\n'
+                      '#include "condition.h"\n')
+    self.addCleanup(os.chdir, os.getcwd())
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    for source, expected, reset in ((self.source, False, False),
+                                     (second, True, False),
+                                     (self.source, False, True)):
+      with self.subTest(source=source.name, reset=reset):
+        if reset:
+          analyzer.ClearStatCaches()
+        files = analyzer.DoCompilationCommand(
+            [gcc, '-nostdinc', '-c', str(source)], str(self.root), keeper, 'lz4')
+        self.assertEqual(any(path.endswith(str(probe) + '.lz4') for path in files),
+                         expected)
+
   def test_dependency_probe_keeps_replayable_output_private(self):
     gcc = shutil.which('gcc')
     library = Path(__file__).resolve().parents[1] / 'cpp_lookup.so'

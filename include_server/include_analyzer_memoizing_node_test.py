@@ -27,6 +27,7 @@ import basics
 import parse_command
 import cache_basics
 import include_analyzer_memoizing_node
+import parse_file
 import unittest
 
 NotCoveredError = basics.NotCoveredError
@@ -34,13 +35,23 @@ NotCoveredError = basics.NotCoveredError
 class IncludeAnalyzerMemoizingNodeUnitTest(unittest.TestCase):
 
   def test_token_paste_invalidates_only_matching_aliases(self):
-    master = include_analyzer_memoizing_node.SupportMaster()
+    table = {'FEATURE_EXISTING': ['1']}
+    master = include_analyzer_memoizing_node.SupportMaster(table)
+    pattern = re.compile('FEATURE_.*')
     record = include_analyzer_memoizing_node.SupportRecord(master)
-    record.UpdateSet({re.compile('FEATURE_.*')})
-    master.InvalidateRecords('UNRELATED_HEADER_GUARD')
+    record.UpdateSet({pattern})
+    self.assertEqual(master.MatchingSymbols(pattern), {'FEATURE_EXISTING'})
+    parse_file.InsertMacroDefInTable('UNRELATED_HEADER_GUARD', '1', table,
+                                    master.InvalidateRecords)
     self.assertTrue(record.valid)
-    master.InvalidateRecords('FEATURE_NEW_ALIAS')
+    self.assertEqual(master.MatchingSymbols(pattern), {'FEATURE_EXISTING'})
+    parse_file.InsertMacroDefInTable('FEATURE_NEW_ALIAS', '__has_include("new.h")',
+                                    table, master.InvalidateRecords)
     self.assertFalse(record.valid)
+    self.assertEqual(master.MatchingSymbols(pattern),
+                     {'FEATURE_EXISTING', 'FEATURE_NEW_ALIAS'})
+    self.assertEqual(master.MatchingSymbols(re.compile('__has_.*')),
+                     {'__has_include', '__has_include_next'})
 
   def _ToString(self, include_closure):
     """Translate the indices in an include closure to their denoted strings."""

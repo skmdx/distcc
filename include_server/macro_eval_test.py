@@ -27,6 +27,7 @@ import basics
 import parse_file
 import cache_basics
 import macro_eval
+import include_analyzer_memoizing_node
 import shutil
 import tempfile
 import unittest
@@ -313,7 +314,8 @@ class MacroEvalTest(unittest.TestCase):
       caches.directory_map.Index(""), # file directory
       [caches.directory_map.Index("test_data")], # search directory
       [],
-      symbol_table)
+      symbol_table,
+      include_analyzer_memoizing_node.SupportMaster(symbol_table).MatchingSymbols)
     self.assertEqual(caches.directory_map.string[d], "test_data/")
     self.assertEqual(caches.includepath_map.string[ip],
                      "maps/foo.tpl.varnames.h")
@@ -329,7 +331,8 @@ class MacroEvalTest(unittest.TestCase):
     for expr in ('defined(INT64_C)', 'defined INT64_C', 'CHECK'):
       with self.subTest(expr=expr):
         files, symbols = macro_eval.ResolveExpr(
-            None, None, parse_file.ProbeExpression(expr), 0, 0, (), (), table)
+            None, None, parse_file.ProbeExpression(expr), 0, 0, (), (), table,
+            include_analyzer_memoizing_node.SupportMaster(table).MatchingSymbols)
         self.assertEqual(files, [])
         self.assertNotIn('UNRELATED_L', symbols)
         self.assertFalse(any(isinstance(symbol, re.Pattern) for symbol in symbols))
@@ -357,7 +360,8 @@ class MacroEvalTest(unittest.TestCase):
              'MODULE_libc': ['18'], 'MODULE_testsuite': ['14'],
              'MODULE_testsuite_internal': ['15']}
     files, symbols = macro_eval.ResolveExpr(None, None, parse_file.ProbeExpression(
-        'IS_IN (testsuite) || IS_IN (testsuite_internal)'), 0, 0, (), (), table)
+        'IS_IN (testsuite) || IS_IN (testsuite_internal)'), 0, 0, (), (), table,
+        include_analyzer_memoizing_node.SupportMaster(table).MatchingSymbols)
     self.assertEqual(files, [])
     self.assertIn('MODULE_NAME', symbols)
     # Each request observes the current definitions; memoization cannot hide a
@@ -366,7 +370,8 @@ class MacroEvalTest(unittest.TestCase):
     resolved = []
     macro_eval.ResolveExpr(lambda value: value,
         lambda *args: resolved.append(args[0]), parse_file.ProbeExpression('IS_IN (libc)'),
-        0, 0, (), (), table)
+        0, 0, (), (), table,
+        include_analyzer_memoizing_node.SupportMaster(table).MatchingSymbols)
     self.assertIn('new.h', resolved)
 
   def test_nested_build_flags_do_not_expand_partial_call_products(self):
@@ -380,13 +385,15 @@ class MacroEvalTest(unittest.TestCase):
     for name in ('APPLE', 'LINUX', 'OS'):
       table['FLAG_' + name] = [([''], '(1)'), ([''], '(0)')]
     expr = parse_file.ProbeExpression('FLAG(ENABLED) && CONFIG(ATFORK) || CONFIG(MOVE)')
-    files, symbols = macro_eval.ResolveExpr(None, None, expr, 0, 0, (), (), table)
+    master = include_analyzer_memoizing_node.SupportMaster(table)
+    files, symbols = macro_eval.ResolveExpr(None, None, expr, 0, 0, (), (), table,
+                                          master.MatchingSymbols)
     self.assertEqual(files, [])
     self.assertIn('FLAG_LINUX', symbols)
     table['FLAG_LINUX'].append(([''], '__has_include("found.h")'))
     resolved = []
     macro_eval.ResolveExpr(lambda value: value, lambda *args: resolved.append(args[0]),
-                          expr, 0, 0, (), (), table)
+                          expr, 0, 0, (), (), table, master.MatchingSymbols)
     self.assertIn('found.h', resolved)
 
   def test_probe_functions_keep_fallbacks_and_function_arguments(self):
@@ -401,7 +408,8 @@ class MacroEvalTest(unittest.TestCase):
         resolved = []
         macro_eval.ResolveExpr(lambda value: value,
             lambda *args: resolved.append(args[0]), parse_file.ProbeExpression(expr),
-            0, 0, (), (), table)
+            0, 0, (), (), table,
+            include_analyzer_memoizing_node.SupportMaster(table).MatchingSymbols)
         self.assertIn('found.h', resolved)
 
 

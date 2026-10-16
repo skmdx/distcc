@@ -150,7 +150,7 @@ class SupportMaster(object):
   self.symbol_to_records[s] is the set of support records r whose support set
   contains s."""
 
-  def __init__(self):
+  def __init__(self, symbol_table):
     """Constructor.
 
     Instance variables:
@@ -158,14 +158,23 @@ class SupportMaster(object):
       union_cache: a UnionCache for memoizing sets and their unions
     """
     self.symbol_to_records = {}
-    self.patterns = set()
+    self.symbol_table = symbol_table
+    self.patterns = {}
     self.union_cache = UnionCache()
+
+  def MatchingSymbols(self, pattern):
+    """Reuse paste-name matches until the existing definition callback updates them."""
+    if pattern not in self.patterns:
+      self.patterns[pattern] = {
+          name for name in self.symbol_table.keys() | macro_eval.INCLUDE_PROBE_NAMES
+          if pattern.fullmatch(name)}
+    return self.patterns[pattern]
 
   def SupportRecordDependencyAdd(self, symbols, support_record):
     """Add dependency of support record on symbol."""
     for symbol in symbols:
       if isinstance(symbol, re.Pattern):
-        self.patterns.add(symbol)
+        self.MatchingSymbols(symbol)
       if symbol not in self.symbol_to_records:
         self.symbol_to_records[symbol] = set([])
       self.symbol_to_records[symbol].add(support_record)
@@ -174,7 +183,12 @@ class SupportMaster(object):
     """Mark as invalid all support records whose set contains symbol."""
     # Token pasting can form a previously unknown alias. Invalidate only the
     # patterns that can produce this name, not every node using a paste.
-    for key in [symbol, *(p for p in self.patterns if p.fullmatch(symbol))]:
+    keys = [symbol]
+    for pattern, names in self.patterns.items():
+      if pattern.fullmatch(symbol):
+        names.add(symbol)
+        keys.append(pattern)
+    for key in keys:
       for support_record in self.symbol_to_records.get(key, ()):
         support_record.valid = False
 
@@ -278,7 +292,7 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
     # Keep track of the support of each included file. The support of the file
     # is the union of the support of expressions in computed includes in the
     # file or in recursively included file.
-    self.support_master = SupportMaster()
+    self.support_master = SupportMaster(self.symbol_table)
     # Enable the mechanism that invalidates all support records that contain a
     # symbol that is being defined or redefined.
     self.parse_file.SetDefineCallback(self.support_master.InvalidateRecords)
@@ -577,7 +591,8 @@ class IncludeAnalyzerMemoizingNode(include_analyzer.IncludeAnalyzer):
                                expr,
                                self.currdir_idx, fp_dirname_idx,
                                self.quote_dirs, self.angle_dirs,
-                               self.symbol_table))
+                               self.symbol_table,
+                               self.support_master.MatchingSymbols))
       for (fp_resolved_pair_, fp_real_idx_) in files:
         node_ = self.FindNode(nodes_for_incl_config,
                               fp_resolved_pair_,
