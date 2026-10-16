@@ -93,7 +93,7 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
      * memory admission budget. The include-server pool owns private caches;
      * congestion no longer changes preprocessing mode or compiler semantics. */
     dcc_read_localslots_configuration();
-    ret = dcc_lock_local_cpp(&lock_fd);
+    ret = dcc_lock_local_analysis(&lock_fd);
     if (ret) return ret;
     ret = 1;
     if (dcc_connect_by_addr((struct sockaddr *) &sa, sizeof(sa), &fd))

@@ -102,6 +102,32 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerTest(BrokerTestCase):
+    def test_analysis_shares_occupancy_without_cpp_head_of_line_blocking(self):
+        self.start_broker(self.host(0) + ' --localslots_cpp=1')
+        capacity = int(subprocess.check_output([str(self.build / 'distcc'), '--show-analyzer-slots'],
+                                               env=self.env, text=True))
+        if capacity < 2:
+            self.skipTest('requires at least two eligible CPUs')
+        held = self.request(12)
+        self.assertEqual(self.receive(held), (0, 1, []))
+        queued_cpp = self.request(12)
+        active = []
+        for index in range(1, capacity):
+            lease = self.request(13)
+            active.append(lease)
+            self.assertEqual(self.receive(lease), (0, index + 1, []))
+        queued_scan = self.request(13)
+        import select
+        self.assertFalse(select.select([queued_cpp, queued_scan], [], [], .1)[0])
+        active.pop().close()
+        self.assertEqual(self.receive(queued_scan), (0, capacity, []))
+        queued_scan.close()
+        for lease in active:
+            lease.close()
+        held.close()
+        self.assertEqual(self.receive(queued_cpp), (0, 1, []))
+        queued_cpp.close()
+
     def test_client_waits_for_broker_start(self):
         self.env = dict(self.base_env, DISTCC_HOSTS=self.host(0),
                         DISTCC_DIR=str(self.ddir), TMPDIR=str(self.work),

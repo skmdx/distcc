@@ -89,7 +89,7 @@ static void dcc_show_usage(void)
 "   --help                     Explain usage, and exit.\n"
 "   --version                  Show version, and exit.\n"
 "   --show-hosts               Show host list, and exit.\n"
-"   --show-cpp-slots           Show local preprocessing capacity, and exit.\n"
+"   --show-analyzer-slots      Show available CPU capacity for analysis, and exit.\n"
 "   -j                         Show the concurrency level, as calculated from\n"
 "                              the host list, and exit.\n"
 "   --scan-includes            Show the files that distcc would send to the\n"
@@ -288,13 +288,8 @@ int main(int argc, char **argv)
             goto out;
         }
 
-        if (!strcmp(argv[1], "--show-cpp-slots")) {
-            int slots;
-            dcc_read_localslots_configuration();
-            slots = dcc_resource_slots(dcc_hostdef_local_cpp->n_slots);
-            /* Keep one idle analyzer available when temporary memory pressure
-             * closes admission. Clients still wait for their actual budget. */
-            printf("%d\n", slots > 0 ? slots : 1);
+        if (!strcmp(argv[1], "--show-analyzer-slots")) {
+            printf("%d\n", dcc_resource_cpus());
             ret = 0;
             goto out;
         }

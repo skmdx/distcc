@@ -22,6 +22,7 @@
 #include "hosts.h"
 #include "adaptive.h"
 #include "broker.h"
+#include "resource.h"
 #include <netinet/tcp.h>
 #include "exitcode.h"
 #include "trace.h"
@@ -40,7 +41,7 @@
 #define MAX_CLIENTS 256
 enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3, MEMO_GET = 4, MEMO_PUT = 5,
        ACQUIRE_POOL = 6, RETURN = 7, ACQUIRE_LINK = 8, ACQUIRE_CPP = 9,
-       ACQUIRE_READY = 10, FAILED = 11, LOCAL_CPP = 12 };
+       ACQUIRE_READY = 10, FAILED = 11, LOCAL_CPP = 12, LOCAL_ANALYSIS = 13 };
 #define MAX_MEMOS 32
 struct request { uint32_t version, command; };
 struct feedback { uint64_t prepare_ns, queue_ns, execute_ns; };
@@ -252,7 +253,7 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
     }
     if (((command == ACQUIRE || command == ACQUIRE_POOL || command == ACQUIRE_CPP ||
           command == ACQUIRE_READY) && *net < 0) ||
-        ((command == JOBS || command == LOCAL_CPP) && *net >= 0)) {
+        ((command == JOBS || command == LOCAL_CPP || command == LOCAL_ANALYSIS) && *net >= 0)) {
         errno = EPROTO;
         goto failed;
     }
@@ -295,11 +296,11 @@ static int broker_request(uint32_t command, struct reply *reply, int *net,
     return fd;
 }
 
-int dcc_broker_local_cpp(int *lease, int *occupied)
+int dcc_broker_local_cpp(int *lease, int *occupied, int analysis)
 {
     struct reply reply;
     int net;
-    *lease = broker_request(LOCAL_CPP, &reply, &net, NULL);
+    *lease = broker_request(analysis ? LOCAL_ANALYSIS : LOCAL_CPP, &reply, &net, NULL);
     if (*lease >= 0) *occupied = reply.slots;
     return *lease < 0 ? EXIT_CONNECT_FAILED : 0;
 }
@@ -745,8 +746,9 @@ static void observe(struct broker *broker, struct client *client, const struct f
 static int dispatch(struct broker *broker, struct client *client, double now, struct dispatch_batch *batch)
 {
     struct reply reply = {0};
-    if (client->command == LOCAL_CPP) {
-        if (broker->cpp_busy < broker->cpp_limit) {
+    if (client->command == LOCAL_CPP || client->command == LOCAL_ANALYSIS) {
+        int limit = client->command == LOCAL_ANALYSIS ? dcc_resource_cpus() : broker->cpp_limit;
+        if (broker->cpp_busy < limit) {
             reply.slots = broker->cpp_busy + 1;
             if (send_reply(client->fd, &reply, -1)) {
                 release_client(broker, client);
@@ -947,8 +949,8 @@ struct waiting_job { struct client *client; double cost, age; };
 static int waiting_order(const void *a, const void *b)
 {
     const struct waiting_job *left = a, *right = b;
-    int lc = left->client->command == LOCAL_CPP || left->client->command == JOBS;
-    int rc = right->client->command == LOCAL_CPP || right->client->command == JOBS;
+    int lc = left->client->command == LOCAL_CPP || left->client->command == LOCAL_ANALYSIS || left->client->command == JOBS;
+    int rc = right->client->command == LOCAL_CPP || right->client->command == LOCAL_ANALYSIS || right->client->command == JOBS;
     if (lc != rc) return rc - lc;
     /* Large jobs have the greatest execution penalty on a slower worker.
      * Aging gives sustained arrivals a bounded opportunity to overtake. */
@@ -1308,7 +1310,7 @@ int dcc_broker_serve(const char *path)
         for (i = 0; i < MAX_CLIENTS; ++i) {
             struct client *c = &broker->clients[i];
             if (c->fd >= 0 && c->state == WAITING &&
-                (c->command == LOCAL_CPP || !probes || now >= broker->first_probe_until))
+                (c->command == LOCAL_CPP || c->command == LOCAL_ANALYSIS || !probes || now >= broker->first_probe_until))
                 waiting[count_waiting++] = (struct waiting_job){c,
                     dcc_work_predict(&broker->model, &c->hint), now - c->waiting_since};
         }
@@ -1412,7 +1414,7 @@ int dcc_broker_serve(const char *path)
                     request.version != BROKER_VERSION ||
                     (request.command != ACQUIRE && request.command != ACQUIRE_POOL &&
                      request.command != ACQUIRE_LINK && request.command != ACQUIRE_CPP &&
-                     request.command != ACQUIRE_READY && request.command != LOCAL_CPP &&
+                     request.command != ACQUIRE_READY && request.command != LOCAL_CPP && request.command != LOCAL_ANALYSIS &&
                      request.command != JOBS)) {
                     release_client(broker, c);
                     continue;
@@ -1461,8 +1463,9 @@ done:
 }
 
 #else
-int dcc_broker_local_cpp(int *lease, int *occupied)
+int dcc_broker_local_cpp(int *lease, int *occupied, int analysis)
 {
+    (void)analysis;
     (void)occupied;
     *lease = -1;
     return EXIT_CONNECT_FAILED;

@@ -26,14 +26,17 @@ __author__ = "Nils Klarlund"
 
 # Python imports
 import gc
+import fcntl
 import getopt
 import glob
 import os
 import re
+import resource
 import shutil
 import signal
 import socketserver
 import sys
+import struct
 import tempfile
 import time
 import traceback
@@ -96,7 +99,7 @@ OPTIONS:
                              FILEPATH.
 
  --workers NUMBER           Persistent analyzers. Pump derives this from the
-                             local preprocessing CPU/memory admission limit.
+                             CPU affinity and cgroup CPU quotas.
 
  -s, --statistics            Print information to stdout about include analysis.
 
@@ -318,7 +321,19 @@ class Queuingsocketserver(socketserver.UnixStreamServer):
 
 # HANDLER FOR SOCKETSERVER
 
-def DistccIncludeHandlerGenerator(include_analyzer):
+def RecordMemory(path):
+  """Publish a monotonic pool-wide resident plus native frontend high-water mark."""
+  peak = 1024 * (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss +
+                 resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+  with open(path, 'r+b', buffering=0) as output:
+    fcntl.lockf(output, fcntl.LOCK_EX)
+    previous, = struct.unpack('=Q', output.read(8))
+    if peak > previous:
+      output.seek(0)
+      output.write(struct.pack('=Q', peak))
+
+
+def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
   """Wrap a socketserver based on the include_analyzer object inside a new
   type that is a class named IncludeHandler."""
 
@@ -435,6 +450,8 @@ def DistccIncludeHandlerGenerator(include_analyzer):
         raise SignalSIGTERM  # to be caught in Main with no further stack trace
       else:
         # No exception raised, include closure can be trusted.
+        if memory_path is not None:
+          RecordMemory(memory_path)
         distcc_pump_c_extensions.XArgv(self.wfile.fileno(), files_and_links)
       # Print out observed paths.
       if basics.opt_path_observation_re:
@@ -554,10 +571,22 @@ class AnalyzerPool:
   """
 
   def __init__(self, port):
+    # Import before forking: immutable Python/native-library pages stay shared,
+    # while each child creates its own analyzer and mutable compiler contexts.
+    import compiler_analyzer
+    self.analyzer_type = compiler_analyzer.CompilerAnalyzer
     self.workers = set()
     self.keeper = basics.ClientRootKeeper()
     self.keeper.CleanOutOthers()
     self.server = Queuingsocketserver(port, socketserver.BaseRequestHandler)
+    self.memory_path = port + '.memory'
+    try:
+      with open(self.memory_path, 'xb') as output:
+        output.write(struct.pack('=Q', 0))
+    except BaseException:
+      self.server.server_close()
+      os.unlink(port)
+      raise
     # Several workers can wake for one connection. Losing accept must not block.
     self.server.socket.setblocking(False)
 
@@ -580,11 +609,10 @@ class AnalyzerPool:
       try:
         os.setpgid(0, 0)
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        import compiler_analyzer
-        analyzer = compiler_analyzer.CompilerAnalyzer(
+        analyzer = self.analyzer_type(
             self.keeper, basics.opt_stat_reset_triggers)
         analyzer.email_sender = _EmailSender()
-        self.server.RequestHandlerClass = DistccIncludeHandlerGenerator(analyzer)
+        self.server.RequestHandlerClass = DistccIncludeHandlerGenerator(analyzer, self.memory_path)
         gc.set_threshold(basics.GC_THRESHOLD)
         os.write(write_fd, b'\n')
         os.close(write_fd)
@@ -657,6 +685,7 @@ class AnalyzerPool:
       os.waitpid(pid, 0)
     self.workers.clear()
     self.keeper.CleanOutClientRoots()
+    os.unlink(self.memory_path)
     os.unlink(str(self.server.server_address))
 
 

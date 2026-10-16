@@ -75,7 +75,7 @@ such a \fBpump\fR to tear down the include server.
 .TP
 .B --workers NUMBER
 Run this many persistent analyzers, each with private compiler contexts and
-caches. Pump derives the count from distcc's local preprocessing capacity.
+caches. Pump derives the count from available CPUs and CPU quotas.
 The supervisor replaces failed workers and retains published inputs until the
 build ends. Client requests share admission with local preprocessing.
 .TP

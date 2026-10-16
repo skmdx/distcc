@@ -83,7 +83,7 @@
 
 static int dcc_lock_one(struct dcc_hostdef *hostlist,
                         struct dcc_hostdef **buildhost,
-                        int *cpu_lock_fd);
+                        int *cpu_lock_fd, int analysis);
 static void dcc_lock_pause(void);
 
 
@@ -134,7 +134,7 @@ int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
             return ret;
         }
     }
-    return dcc_lock_one(hostlist, buildhost, cpu_lock_fd);
+    return dcc_lock_one(hostlist, buildhost, cpu_lock_fd, 0);
 
     /* FIXME: Host list is leaked? */
 }
@@ -183,7 +183,7 @@ static void dcc_lock_pause(void)
  **/
 static int dcc_lock_one(struct dcc_hostdef *hostlist,
                         struct dcc_hostdef **buildhost,
-                        int *cpu_lock_fd)
+                        int *cpu_lock_fd, int analysis)
 {
     struct dcc_hostdef *h;
     int i_cpu;
@@ -194,11 +194,13 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
             char i_cpu_is_usable = 0;
 
             for (h = hostlist; h; h = h->next) {
-                if (i_cpu >= h->n_slots)
+                int limit = analysis ? dcc_resource_cpus() : h->n_slots;
+                if (i_cpu >= limit)
                     continue;
 
                 i_cpu_is_usable = 1;
-                if (h->mode == DCC_MODE_LOCAL && i_cpu >= dcc_resource_slots(h->n_slots))
+                if (h->mode == DCC_MODE_LOCAL && i_cpu >=
+                    (analysis ? dcc_resource_analysis_slots(limit) : dcc_resource_slots(limit)))
                     continue;
 
                 ret = dcc_lock_host("cpu", h, i_cpu, 0, cpu_lock_fd);
@@ -233,10 +235,10 @@ int dcc_lock_local(int *cpu_lock_fd)
 {
     struct dcc_hostdef *chosen;
 
-    return dcc_lock_one(dcc_hostdef_local, &chosen, cpu_lock_fd);
+    return dcc_lock_one(dcc_hostdef_local, &chosen, cpu_lock_fd, 0);
 }
 
-int dcc_lock_local_cpp(int *cpu_lock_fd)
+static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
 {
     int ret;
     struct dcc_hostdef *chosen = dcc_hostdef_local_cpp;
@@ -246,18 +248,29 @@ int dcc_lock_local_cpp(int *cpu_lock_fd)
     if (broker && *broker) {
         int occupied;
         for (;;) {
-            ret = dcc_broker_local_cpp(cpu_lock_fd, &occupied);
+            ret = dcc_broker_local_cpp(cpu_lock_fd, &occupied, analysis);
             /* The broker can live in a different cgroup. Keep admission
              * against this client's budget, not the small broker service. */
-            if (ret || occupied <= dcc_resource_slots(chosen->n_slots)) break;
+            if (ret || occupied <= (analysis ? dcc_resource_analysis_slots(dcc_resource_cpus()) :
+                                               dcc_resource_slots(chosen->n_slots))) break;
             dcc_unlock(*cpu_lock_fd);
             *cpu_lock_fd = -1;
             dcc_lock_pause();
         }
     } else
-        ret = dcc_lock_one(dcc_hostdef_local_cpp, &chosen, cpu_lock_fd);
+        ret = dcc_lock_one(dcc_hostdef_local_cpp, &chosen, cpu_lock_fd, analysis);
     if (ret == 0) {
         dcc_note_state(DCC_PHASE_CPP, NULL, chosen->hostname, DCC_LOCAL);
     }
     return ret;
+}
+
+int dcc_lock_local_cpp(int *cpu_lock_fd)
+{
+    return lock_local_preprocessing(cpu_lock_fd, 0);
+}
+
+int dcc_lock_local_analysis(int *cpu_lock_fd)
+{
+    return lock_local_preprocessing(cpu_lock_fd, 1);
 }

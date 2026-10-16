@@ -268,9 +268,10 @@ Displays the host list that distcc would use.
 See the Host Specifications section.
 .PP
 .TP
-.B --show-cpp-slots
-Displays local preprocessing capacity, capped by the current memory budget.
-Pump uses this value to size its persistent include-analyzer pool.
+.B --show-analyzer-slots
+Displays available logical CPUs, capped by affinity and cgroup CPU quotas.
+Pump uses this value to size its persistent include-analyzer pool. Actual
+admission also observes memory budgets and the pool's measured memory demand.
 .PP
 .TP
 .B --scan-includes

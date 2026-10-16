@@ -4,7 +4,7 @@ struct dcc_work_hint;
 struct dcc_job_result;
 int dcc_broker_serve(const char *path);
 int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, const struct dcc_work_hint *);
-int dcc_broker_local_cpp(int *lease, int *occupied);
+int dcc_broker_local_cpp(int *lease, int *occupied, int analysis);
 void dcc_broker_failed(const struct dcc_hostdef *host);
 void dcc_broker_return(const struct dcc_hostdef *host, int fd, const struct dcc_job_result *);
 #define DCC_BROKER_POOLED (1 << 30)

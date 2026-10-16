@@ -6,9 +6,15 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 #include "resource.h"
 
 static double pressure = -1;
+static int processors = 1;
 static unsigned long long available = ULLONG_MAX, budget = ULLONG_MAX;
 
 #ifdef __linux__
@@ -69,6 +75,11 @@ static void sample_resources(void)
     sampled = now;
     pressure = -1;
     available = budget = ULLONG_MAX;
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    processors = online > 0 && online < INT_MAX ? (int)online : 1;
+    cpu_set_t allowed;
+    if (!sched_getaffinity(0, sizeof(allowed), &allowed) && CPU_COUNT(&allowed))
+        processors = CPU_COUNT(&allowed);
     if (!located) {
         located = 1;
         file = fopen("/proc/self/cgroup", "r");
@@ -104,6 +115,17 @@ static void sample_resources(void)
         strcpy(path, group);
         for (;;) {
             char name[PATH_MAX], *slash;
+            if (snprintf(name, sizeof(name), "%s/cpu.max", path) < (int)sizeof(name)) {
+                unsigned long long quota, period;
+                file = fopen(name, "r");
+                if (file) {
+                    if (fscanf(file, "%llu %llu", &quota, &period) == 2 && quota && period) {
+                        unsigned long long capacity = quota / period + (quota % period != 0);
+                        if (capacity < (unsigned)processors) processors = (int)capacity;
+                    }
+                    fclose(file);
+                }
+            }
             unsigned long long limit = read_bytes(path, "memory.max");
             unsigned long long used = memory_used(path);
             if (limit != ULLONG_MAX && used != ULLONG_MAX) {
@@ -120,8 +142,18 @@ static void sample_resources(void)
     }
 }
 #else
-static void sample_resources(void) {}
+static void sample_resources(void)
+{
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    processors = online > 0 && online < INT_MAX ? (int)online : 1;
+}
 #endif
+
+int dcc_resource_cpus(void)
+{
+    sample_resources();
+    return processors;
+}
 
 double dcc_memory_pressure(void)
 {
@@ -196,16 +228,16 @@ unsigned long long dcc_resource_spare_bytes(void)
     return spare;
 }
 
-int dcc_resource_slots(int maximum)
+static int resource_slots(int maximum, unsigned long long job,
+                          unsigned long long spare, int learning)
 {
     static int pressure_blocked;
-    unsigned long long job = dcc_resource_job_bytes(), spare, slots;
-    spare = dcc_resource_spare_bytes();
+    unsigned long long slots;
     sample_resources();
     if (pressure >= 10) pressure_blocked = 1;
     else if (pressure < 5) pressure_blocked = 0;
     const char *learn = getenv("DISTCC_MEMORY_LEARNING");
-    if (!pressure_blocked && learn && !strcmp(learn, "1") && samples >= 8 &&
+    if (!pressure_blocked && learning && learn && !strcmp(learn, "1") && samples >= 8 &&
         (budget < job || budget - job < spare)) {
         /* Do not deadlock learning when a short window contains a large
          * outlier: one measured working set may fit even when the usual
@@ -220,4 +252,40 @@ int dcc_resource_slots(int maximum)
         return 0;
     slots = (budget - spare) / job;
     return slots < (unsigned)maximum ? (int)slots : maximum;
+}
+
+int dcc_resource_slots(int maximum)
+{
+    return resource_slots(maximum, dcc_resource_job_bytes(), dcc_resource_spare_bytes(), 1);
+}
+
+int dcc_resource_analysis_slots(int maximum)
+{
+    const char *port = getenv("INCLUDE_SERVER_PORT");
+    char path[PATH_MAX];
+    uint64_t peak = 0;
+    /* The build-scoped pool publishes its observed resident+frontend peak.
+     * Compilation and ordinary preprocessing continue using their own model. */
+    if (port && snprintf(path, sizeof(path), "%s.memory", port) < (int)sizeof(path)) {
+        int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd >= 0) {
+            struct flock lock = {.l_type = F_RDLCK, .l_whence = SEEK_SET};
+            if (fcntl(fd, F_SETLKW, &lock) || read(fd, &peak, sizeof(peak)) != sizeof(peak))
+                peak = 0;
+            close(fd);
+        }
+    }
+    if (!peak) {
+        /* One real request calibrates demand before enabling parallel scans.
+         * Reserve the available budget; a full-compilation estimate must not
+         * prevent smaller native analysis from ever collecting a sample. */
+        sample_resources();
+        unsigned long long initial = available < budget ? available : budget;
+        return initial ? resource_slots(1, initial, 0, 0) : 0;
+    }
+    unsigned long long job = measured_job_bytes(peak);
+    int slots = resource_slots(maximum, job, peak, 0);
+    /* Persistent caches can leave room for one measured scan but not a second
+     * peak as reserve. Keep the per-job margin and serialize that case. */
+    return slots ? slots : resource_slots(1, job, 0, 0);
 }

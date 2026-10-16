@@ -2,6 +2,7 @@
 """Remote preprocessing with mutable inputs, real compilers and pooled TCP."""
 import os
 import concurrent.futures
+import fcntl
 import xxhash
 import random
 from pathlib import Path
@@ -39,6 +40,7 @@ class PumpTestCase(BrokerTestCase):
         self.start_broker(self.host(0, ',' + self.compression + self.transport) +
                           f' --localslots_cpp={self.cpp_slots}', idle=60)
         self.env.update(TMPDIR=str(self.root), DISTCC_CLIENT_TMP=str(self.work),
+                        INCLUDE_SERVER_ARGS=f'--workers={self.cpp_slots}',
                         DISTCC_CPP_LOOKUP_LIBRARY=str(self.build / 'cpp_lookup.so'),
                         DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_TESTING_INCLUDE_SERVER='1',
                         DISTCC_VERBOSE='1', DISTCC_LOG=str(self.work / 'client.log'))
@@ -80,7 +82,49 @@ class AnalyzerPoolTest(PumpTestCase):
     compression = 'lz4'
     transport = ',tcp'
 
+    def test_cpu_capacity_obeys_affinity(self):
+        allowed = os.sched_getaffinity(0)
+        result = subprocess.check_output(
+            [str(self.build / 'distcc'), '--show-analyzer-slots'], env=self.env,
+            preexec_fn=lambda: os.sched_setaffinity(0, {min(allowed)}), text=True)
+        self.assertEqual(int(result), 1)
+
+    def test_measured_memory_controls_analysis_admission(self):
+        result = self.run_cc('gcc', ['-c', self.source, '-o', 'measured.o'])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        path = Path(self.env['INCLUDE_SERVER_PORT'] + '.memory')
+        peak, = struct.unpack('=Q', path.read_bytes())
+        self.assertGreater(peak, 0)
+        def publish(value):
+            with path.open('r+b', buffering=0) as stream:
+                fcntl.lockf(stream, fcntl.LOCK_EX)
+                stream.write(struct.pack('=Q', value))
+        # A measured demand larger than the test cgroup must close admission;
+        # no allocation or memory-limit violation is needed to test the gate.
+        publish(1 << 40)
+        log = self.work / 'client.log'
+        log.write_text('')
+        client = subprocess.Popen([str(self.build / 'distcc'), 'gcc', '-E', str(self.source)],
+                                  cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                client.wait(timeout=.2)
+            self.assertNotIn('send CDIR', log.read_text())
+            publish(peak)
+            stdout, stderr = client.communicate(timeout=15)
+            self.assertEqual(client.returncode, 0, stderr.decode())
+            self.assertTrue(stdout)
+            self.assertIn('send CDIR', log.read_text())
+            self.assertGreaterEqual(struct.unpack('=Q', path.read_bytes())[0], peak)
+        finally:
+            if client.poll() is None:
+                client.kill()
+                client.communicate()
+
     def test_parallel_admission_and_context_isolation(self):
+        warm = self.run_cc('gcc', ['-E', self.source])
+        self.assertEqual(warm.returncode, 0, warm.stderr.decode())
+        (self.work / 'client.log').write_text('')
         workers = self.analyzer_pids()
         self.assertEqual(len(workers), self.cpp_slots)
         for pid in workers:
@@ -219,8 +263,13 @@ class PreprocessTest(PumpTestCase):
         self.assertEqual(local.returncode, 0, local.stderr.decode())
         expected = (self.work / 'macro.o').read_bytes()
         expected_deps = (self.work / 'macro.d').read_bytes()
-        lease = self.request(12)
-        self.assertEqual(self.receive(lease), (0, 1, []))
+        capacity = int(subprocess.check_output([str(self.build / 'distcc'), '--show-analyzer-slots'],
+                                               env=self.env, text=True))
+        leases = []
+        for index in range(capacity):
+            lease = self.request(13)
+            leases.append(lease)
+            self.assertEqual(self.receive(lease), (0, index + 1, []))
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             jobs = [pool.submit(self.run_cc, 'gcc', ['-Werror=address', '-c', self.source,
                                                     '-o', f'macro-{i}.o'])
@@ -228,7 +277,8 @@ class PreprocessTest(PumpTestCase):
             try:
                 self.assertFalse(concurrent.futures.wait(jobs, timeout=.1).done)
             finally:
-                lease.close()
+                for lease in leases:
+                    lease.close()
             for i, job in enumerate(jobs):
                 result = job.result(timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr.decode())

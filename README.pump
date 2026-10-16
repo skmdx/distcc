@@ -20,9 +20,15 @@ broker. Adaptive scheduling and the TCP connection pool are reused. These jobs
 reserve a local preprocessing slot only during input analysis. Without a broker, configure remote
 hosts with the `,cpp,lzo` options.
 
-Pump obtains the pool size from `distcc --show-cpp-slots`: the configured local
-preprocessing slots capped by the client's memory budget. Analysis and ordinary
-local preprocessing share that admission limit. Busy clients wait for capacity
+Pump obtains the pool size from `distcc --show-analyzer-slots`: available logical
+CPUs capped by CPU affinity and ancestor cgroup quotas. Analysis and ordinary
+local preprocessing share occupied leases. Ordinary preprocessing keeps its
+configured slot limit; native analysis can use the available CPUs and publishes
+its observed resident plus frontend peak memory. One initial request calibrates
+demand before parallel scans are admitted using that peak and the existing
+memory headroom policy. Imports happen before forking so immutable library pages
+are shared. Memory budgets and pressure are checked
+in the requesting client's cgroup. Busy clients wait for capacity
 without switching preprocessing mode, including `-E` and `--scan-includes`.
 Homogeneous broker clients finish analysis before reserving a remote worker.
 Each analyzer owns its cwd and caches. The supervisor replaces failed analyzers
