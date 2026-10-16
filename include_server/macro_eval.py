@@ -242,6 +242,7 @@ class _ExpansionBudget:
     self.calls = 8192
     self.characters = 8 * 1024 * 1024
     self.expansions = {}
+    self.symbols = set()
 
   def consume(self, expr):
     if not self.bounded:
@@ -329,8 +330,10 @@ def _ExpandExpr(expr, symbol_table, disabled, budget):
 
     Here definition is either object-like or function-like.
     """
-    # Consider that this symbol goes unevaluated.
-    if isinstance(definition, str) or budget.preserve_functions:
+    # Probe analysis needs replacements of ordinary function invocations,
+    # rather than every partially expanded spelling. Intrinsics still retain
+    # their spelling when the source supplies a fallback macro definition.
+    if isinstance(definition, str) or preserve_call:
       value_set.update(
         _PrependToSet(expr[:match.end()],
                       _EvalExprHelper(expr[match.end():],
@@ -359,6 +362,9 @@ def _ExpandExpr(expr, symbol_table, disabled, budget):
       # Expand arguments recursively.
       args_expand = [ _EvalExprHelper(arg, symbol_table, disabled, budget)
                         for arg in args_list ]
+      if budget.bounded:
+        # Stringification and token pasting also need the original argument.
+        args_expand = [values | {arg} for values, arg in zip(args_expand, args_list)]
       # Do the substitutions. Again, we'll need to piece together
       # strings from a cross product. In this the fragments come from
       # the expansions of the arguments.
@@ -386,7 +392,12 @@ def _ExpandExpr(expr, symbol_table, disabled, budget):
     # symbol found. This is non-standard: the real CPP only tokenizes
     # once.
     symbol = match.group()
+    if budget.bounded:
+      budget.symbols.add(symbol)
     (args_list, args_end) = _ParseArgs(expr, match.end())
+    preserve_call = budget.preserve_functions and (
+        not budget.bounded or args_list is None or
+        symbol in ('__has_include', '__has_include_next'))
     Debug(DEBUG_TRACE2,
           "EvalExprHelper (inside): expr: %s\n" +
           "    symbol:     %s\n    args_list:       %s\n" +
@@ -404,7 +415,7 @@ def _ExpandExpr(expr, symbol_table, disabled, budget):
       # possibility, because we are doing a "forall" analysis.
 
       defs = symbol_table[symbol]
-      if isinstance(defs[0], str) or budget.preserve_functions:
+      if isinstance(defs[0], str) or preserve_call or (budget.bounded and symbol in disabled):
         value_set = set([expr])
       else:
         value_set = set()
@@ -422,13 +433,14 @@ def _ExpandExpr(expr, symbol_table, disabled, budget):
       return value_set
 
 
-def EvalExpression(expr, symbol_table, preserve_functions=False):
+def EvalExpression(expr, symbol_table, preserve_functions=False, symbols=None):
   """Calculate sets of possibly values of expr given symbol_table.
 
   Arguments:
     expr:          any string to be macro expanded
     symbol_table:  { symbol: {rhs, ..}, ,...,
                      symbol:{((param_1,...,param_n), rhs), ... }
+    symbols: optional set to receive identifiers visited during probe expansion
   Returns:
     [ expr_1, expr_2, ...], a list of strings: the possible expansions of expr.
   """
@@ -436,7 +448,10 @@ def EvalExpression(expr, symbol_table, preserve_functions=False):
     Debug(DEBUG_TRACE, "EvalExpression: expr: %s", expr)
   if preserve_functions:
     expr = _WithoutDefined(expr)
-  r = set(_EvalExprHelper(expr, symbol_table, set(), _ExpansionBudget(preserve_functions, expr)))
+  budget = _ExpansionBudget(preserve_functions, expr)
+  r = set(_EvalExprHelper(expr, symbol_table, set(), budget))
+  if symbols is not None:
+    symbols.update(budget.symbols)
   if __debug__:
     Debug(DEBUG_TRACE, "EvalExpression: return: %s", r)
   return r
@@ -479,7 +494,7 @@ def ResolveExpr(includepath_map_index,
         Debug(DEBUG_TRACE, "ResolveExpr: %s, %s, %s",
               expr, searchdir_idx, angle_dirs)
   resolved_files = []
-  symbols = []
+  symbols = set()
   statistics.resolve_expr_counter += 1
   is_probe = isinstance(expr, parse_file.ProbeExpression)
   if is_probe:
@@ -516,21 +531,22 @@ def ResolveExpr(includepath_map_index,
                 if candidate not in seen and candidate not in queued and pattern.fullmatch(candidate):
                   queued.add(candidate)
                   pending.append(candidate)
-    symbols.extend(seen)
+    symbols.update(seen)
     if not has_probe:
       return ([], seen)
-  for val in EvalExpression(expr, symbol_table, preserve_functions=is_probe):
+  for val in EvalExpression(expr, symbol_table, preserve_functions=is_probe, symbols=symbols):
     if is_probe:
       # Keep symbol support even for currently unresolved aliases. A later
       # definition must invalidate this graph node and discover its probes.
-      symbols.extend(SYMBOL_RE.findall(val))
+      symbols.update(SYMBOL_RE.findall(val))
       try:
         probes = parse_file.clang_scan.include_probes(val.encode('latin-1'))
       except ValueError as error:
         raise basics.NotCoveredError(str(error)) from error
       for is_next, operand in probes:
         matches = [parse_file.INCLUDE_STRING_RE.fullmatch(value.strip())
-                   for value in EvalExpression(operand, symbol_table, preserve_functions=True)]
+                   for value in EvalExpression(operand, symbol_table, preserve_functions=True,
+                                               symbols=symbols)]
         matches = [match for match in matches if match]
         if not matches:
           raise basics.NotCoveredError('Unresolved header existence operand: ' + operand)
@@ -554,7 +570,7 @@ def ResolveExpr(includepath_map_index,
         resolved = resolve(includepath_map_index(match_result.group('angle')), currdir_idx, None, angle_dirs)
         resolved_files.append(resolved)
     else:
-      symbols.extend(SYMBOL_RE.findall(val))
+      symbols.update(SYMBOL_RE.findall(val))
   if __debug__:
       Debug(DEBUG_TRACE, "ResolveExpr: return: %s", resolved_files)
-  return (resolved_files, set(symbols))
+  return (resolved_files, symbols)

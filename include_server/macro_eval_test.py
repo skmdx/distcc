@@ -369,5 +369,40 @@ class MacroEvalTest(unittest.TestCase):
         0, 0, (), (), table)
     self.assertIn('new.h', resolved)
 
+  def test_nested_build_flags_do_not_expand_partial_call_products(self):
+    table = {'CAT_IMPL': [(['a', 'b'], 'a##b')],
+             'CAT': [(['a', 'b'], 'CAT_IMPL(a, b)')],
+             'FLAG': [(['flag'], '(CAT(FLAG_, flag)())')],
+             'CONFIG': [(['flag'], '(CONFIG_##flag())')],
+             'CONFIG_ATFORK': [([''], '(FLAG(APPLE) || FLAG(LINUX) || FLAG(OS))')],
+             'CONFIG_MOVE': [([''], '1'), ([''], '0')],
+             'FLAG_ENABLED': [([''], '(0)')]}
+    for name in ('APPLE', 'LINUX', 'OS'):
+      table['FLAG_' + name] = [([''], '(1)'), ([''], '(0)')]
+    expr = parse_file.ProbeExpression('FLAG(ENABLED) && CONFIG(ATFORK) || CONFIG(MOVE)')
+    files, symbols = macro_eval.ResolveExpr(None, None, expr, 0, 0, (), (), table)
+    self.assertEqual(files, [])
+    self.assertIn('FLAG_LINUX', symbols)
+    table['FLAG_LINUX'].append(([''], '__has_include("found.h")'))
+    resolved = []
+    macro_eval.ResolveExpr(lambda value: value, lambda *args: resolved.append(args[0]),
+                          expr, 0, 0, (), (), table)
+    self.assertIn('found.h', resolved)
+
+  def test_probe_functions_keep_fallbacks_and_function_arguments(self):
+    table = {'__has_include': [(['h'], '0')],
+             'CALL': [(['f', 'h'], 'f(h)')],
+             'CHECK': [(['h'], '__has_include(h)')],
+             'ID': [(['x'], 'x')],
+             'NOT_CALLED': [(['x'], '0')]}
+    for expr in ('CALL(CHECK, "found.h")', 'ID(__has_include)("found.h")',
+                 'NOT_CALLED || CHECK("found.h")'):
+      with self.subTest(expr=expr):
+        resolved = []
+        macro_eval.ResolveExpr(lambda value: value,
+            lambda *args: resolved.append(args[0]), parse_file.ProbeExpression(expr),
+            0, 0, (), (), table)
+        self.assertIn('found.h', resolved)
+
 
 unittest.main()
