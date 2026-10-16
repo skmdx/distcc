@@ -3,7 +3,9 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 import gcc_scan
 
@@ -85,6 +87,44 @@ class GccScanTest(unittest.TestCase):
     result = self.scan()
     self.assertNotIn(str(directory), result['dependencies'])
     self.assertIsNone(result['lookups'][str(directory)])
+
+  def test_lookup_cache_replaces_the_manifest_after_namespace_change(self):
+    lookup = (os.environ.get('DISTCC_CPP_LOOKUP_LIBRARY') or
+              str(Path(__file__).resolve().parents[1] / 'cpp_lookup.so'))
+    if not os.path.isfile(lookup):
+      self.skipTest('GCC lookup cache is required')
+    work, headers = self.root/'build', self.root/'headers'
+    work.mkdir()
+    headers.mkdir()
+    search = []
+    for i in range(300):
+      directory = self.root/('empty-' + str(i))
+      directory.mkdir()
+      search.append('-I' + str(directory))
+    gate = headers/'gate.h'
+    os.mkfifo(gate)
+    self.source.write_text('#if __has_include("appeared.h")\n'
+                           '#include "appeared.h"\n#endif\n#include "gate.h"\n')
+    errors = []
+    def change_inputs():
+      try:
+        with gate.open('w') as writer:
+          gate.unlink()
+          gate.write_text('\n')
+          (headers/'appeared.h').write_text('int appeared;\n')
+          writer.write('\n')
+      except Exception as error:
+        errors.append(error)
+    thread = threading.Thread(target=change_inputs, daemon=True)
+    thread.start()
+    with mock.patch.dict(os.environ, DISTCC_CPP_LOOKUP_LIBRARY=lookup, DISTCC_CPP_LOOKUP='1'):
+      result = gcc_scan.scan([self.compiler, *search, '-I' + str(headers), str(self.source)],
+                             str(work), self.library)
+    thread.join(timeout=5)
+    self.assertFalse(thread.is_alive())
+    self.assertFalse(errors, errors)
+    self.assertIn(str(headers/'appeared.h'), result['dependencies'])
+    self.assertIn(str(gate), result['dependencies'])
 
 
 if __name__ == '__main__':

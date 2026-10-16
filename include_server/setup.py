@@ -128,6 +128,9 @@ else:
     sys.exit("""Could not cd to SRCDIR '%s'.""" % srcdir)
   srcdir_include_server = os.path.join(srcdir, 'include_server')
 
+libdir = next(flag.partition('=')[2] for flag in shlex.split(cpp_flags_env)
+              if flag.startswith('-DLIBDIR='))
+
 # Specify extension.
 ext = setuptools.Extension(
     name='include_server.distcc_pump_c_extensions',
@@ -162,7 +165,8 @@ ext = setuptools.Extension(
              ]],
     include_dirs=cpp_flags_includes,
     depends=[__file__, *glob.glob(os.path.join(srcdir, 'src', '*.h'))],
-    define_macros=[('_GNU_SOURCE', '1')],
+    define_macros=[('_GNU_SOURCE', '1'),
+                   ('DCC_CPP_LOOKUP_LIBRARY', '"' + libdir + '/distcc/cpp_lookup.so"')],
     library_dirs=[],
     libraries=['lz4', 'xxhash'],
     runtime_library_dirs=[],
@@ -190,8 +194,6 @@ llvm_runtime_lib = llvm_lib
 sysroot = os.environ.get('SYSROOT', '').rstrip('/')
 if sysroot and llvm_lib.startswith(sysroot + '/'):
   llvm_runtime_lib = llvm_lib[len(sysroot):]
-libdir = next(flag.partition('=')[2] for flag in shlex.split(cpp_flags_env)
-              if flag.startswith('-DLIBDIR='))
 scanner = setuptools.Extension(
     name='include_server.clang_scan',
     sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_scan.cpp')],

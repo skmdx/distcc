@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import stat
+import distcc_pump_c_extensions
 
 
 def scan(command, cwd, library):
@@ -10,6 +11,12 @@ def scan(command, cwd, library):
   env = dict(os.environ, LC_ALL='C', _DISTCC_SAFEGUARD='1', CCACHE_DISABLE='1')
   with os.fdopen(os.memfd_create('distcc-gcc-inputs', os.MFD_CLOEXEC), 'w+b') as output:
     fd = output.fileno()
+    lookup = (env.get('DISTCC_CPP_LOOKUP_LIBRARY') or
+              distcc_pump_c_extensions.cpp_lookup_library)
+    if env.get('DISTCC_CPP_LOOKUP', '1') == '1' and os.access(lookup, os.R_OK):
+      env['LD_PRELOAD'] = lookup + (':' + env['LD_PRELOAD'] if env.get('LD_PRELOAD') else '')
+      env['DISTCC_CPP_LOOKUP'] = '1'
+      env['DISTCC_CPP_LOOKUP_OUTPUT_FD'] = str(fd)
     invocation = [*command, '-E', '-M', '-MF', '/dev/null',
                   '-fplugin=' + library,
                   '-fplugin-arg-' + Path(library).stem + '-output-fd=' + str(fd)]

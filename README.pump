@@ -58,6 +58,11 @@ the module's version/ABI before loading it. DISTCC_GCC_SCAN_LIBRARY overrides th
 module path for development tests. A missing or incompatible module produces an
 analysis failure; it does not silently switch to another parser.
 
+Native GCC scans also use the request-local negative lookup cache. Directory
+changes discard the input manifest and repeat the same frontend without that
+cache. DISTCC_CPP_LOOKUP=0 disables this optimization; DISTCC_CPP_LOOKUP_LIBRARY
+overrides the installed cache library for development tests.
+
 Compressed source/header files are cached. The compiler scans every request and
 its observed input identities are checked before publishing the manifest. On supported local Linux
 filesystems, directory notifications select which negative lookups and ancestor

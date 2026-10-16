@@ -446,26 +446,19 @@ static struct PyModuleDef moduledef = {
 PyObject *
 PyInit_distcc_pump_c_extensions(void) {
   PyObject *module = PyModule_Create(&moduledef);
-  PyObject *py_str;
-  distcc_pump_c_extensionsError = PyErr_NewException(
-      (char *)"distcc_pump_c_extensions.Error", NULL, NULL);
-
   if (module == NULL)
     return NULL;
 
   struct module_state *st = GETSTATE(module);
-  st->error = distcc_pump_c_extensionsError;
-  if (st->error == NULL) {
+  st->error = PyErr_NewException("distcc_pump_c_extensions.Error", NULL, NULL);
+  if (st->error == NULL ||
+      PyModule_AddObjectRef(module, "Error", st->error) < 0 ||
+      PyModule_AddStringConstant(module, "__author__", "Nils Klarlund") < 0 ||
+      PyModule_AddStringConstant(module, "__version__", version) < 0 ||
+      PyModule_AddStringConstant(module, "cpp_lookup_library", DCC_CPP_LOOKUP_LIBRARY) < 0) {
     Py_DECREF(module);
     return NULL;
   }
-
-  py_str = PyUnicode_FromString("Nils Klarlund");
-  py_str = PyUnicode_FromString(version);
-  PyModule_AddObject(module, "__author__", py_str);
-  PyModule_AddObject(module, "__version__", py_str);
-  /* Make the exception class accessible */
-  PyModule_AddObject(module, "Error",
-                     distcc_pump_c_extensionsError);
+  distcc_pump_c_extensionsError = st->error;
   return module;
 }

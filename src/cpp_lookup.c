@@ -3,8 +3,8 @@
  *
  * Only absent names are answered here; existing files still use libc open.
  * Directory identities/timestamps are checked before accepting the output.
- * A changed namespace discards stdout and re-execs the same frontend without
- * caching. No snapshot survives a preprocessing request.
+ * A changed namespace discards the output and re-execs the same frontend
+ * without caching. No snapshot survives a preprocessing request.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -38,6 +39,8 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int enabled;
 static _Atomic unsigned failed_lookups;
 static int saved_output = -1;
+static int saved_stdout = -1;
+static int output_fd = STDOUT_FILENO;
 static char *working_directory, *command;
 static char **arguments;
 static int (*next_open)(const char *, int, ...);
@@ -210,16 +213,25 @@ __attribute__((constructor)) static void initialize(void)
     pthread_once(&bindings, bind_libc);
     const char *setting = getenv("DISTCC_CPP_LOOKUP");
     if (!setting || strcmp(setting, "1")) return;
-    /* The driver and unrelated children remain untouched. Plugins can change
-     * the namespace or run threads; they are deliberately outside this path. */
+    /* The driver and unrelated children remain untouched. Only the native
+     * input collector is allowed; other plugins may mutate state or use threads. */
     char exe[4096];
     ssize_t size = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     if (size < 0) return;
     exe[size] = 0;
     const char *name = strrchr(exe, '/');
     if (!name || (strcmp(name + 1, "cc1") && strcmp(name + 1, "cc1plus"))) return;
+    /* Native dependency scans publish into their manifest descriptor instead
+     * of stdout. A replay must replace that manifest before the caller sees it. */
+    const char *descriptor = getenv("DISTCC_CPP_LOOKUP_OUTPUT_FD");
+    if (descriptor) {
+        char *end;
+        long value = strtol(descriptor, &end, 10);
+        if (!*descriptor || *end || value < 3 || value > INT_MAX) return;
+        output_fd = (int)value;
+    }
     struct stat output;
-    if (fstat(STDOUT_FILENO, &output) || !S_ISREG(output.st_mode) || lseek(STDOUT_FILENO, 0, SEEK_CUR) != 0) return;
+    if (fstat(output_fd, &output) || !S_ISREG(output.st_mode) || lseek(output_fd, 0, SEEK_CUR) != 0) return;
     FILE *stream = fopen("/proc/self/cmdline", "rb");
     if (!stream) return;
     size_t capacity = 0;
@@ -230,17 +242,30 @@ __attribute__((constructor)) static void initialize(void)
     for (ssize_t i = 0; i < used; ++i) if (!command[i]) count++;
     arguments = calloc(count + 1, sizeof(*arguments));
     if (!arguments) return;
-    int preprocess = 0;
+    int preprocess = 0, native_scan = 0;
     char *p = command;
     for (size_t i = 0; i < count; ++i) {
         arguments[i] = p;
         if (!strcmp(p, "-E")) preprocess = 1;
-        if (!strncmp(p, "-fplugin", 8)) return;
+        if (!strncmp(p, "-fplugin", 8)) {
+            if (!descriptor) return;
+            if (!strncmp(p, "-fplugin=", 9)) {
+                const char *base = strrchr(p + 9, '/');
+                if (strcmp(base ? base + 1 : p + 9, "distcc_gcc_scan.so")) return;
+                native_scan = 1;
+            }
+        }
         p += strlen(p) + 1;
     }
+    if (descriptor && !native_scan) return;
     working_directory = getcwd(NULL, 0);
-    if (preprocess && working_directory) saved_output = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
-    enabled = saved_output >= 0;
+    if (preprocess && working_directory) {
+        saved_output = fcntl(output_fd, F_DUPFD_CLOEXEC, 3);
+        /* GCC closes stdout before destructors run, even in dependency mode. */
+        if (output_fd != STDOUT_FILENO)
+            saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
+    }
+    enabled = saved_output >= 0 && (output_fd == STDOUT_FILENO || saved_stdout >= 0);
 }
 
 __attribute__((destructor)) static void validate(void)
@@ -256,12 +281,13 @@ __attribute__((destructor)) static void validate(void)
     }
     pthread_mutex_unlock(&lock);
     if (!changed) return;
-    /* The caller has not consumed stdout yet. The original cc1 arguments
+    /* The caller has not consumed the output yet. The original cc1 arguments
      * also replace its depfile on retry. Keep the same PID and exit status. */
     enabled = 0;
     if (setenv("DISTCC_CPP_LOOKUP", "0", 1) || next_chdir(working_directory) ||
         fflush(NULL) || ftruncate(saved_output, 0) || lseek(saved_output, 0, SEEK_SET) != 0 ||
-        dup2(saved_output, STDOUT_FILENO) < 0) _exit(75);
+        dup2(saved_output, output_fd) < 0 ||
+        (saved_stdout >= 0 && dup2(saved_stdout, STDOUT_FILENO) < 0)) _exit(75);
     execv("/proc/self/exe", arguments);
     _exit(75);
 }
