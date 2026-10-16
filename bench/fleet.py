@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+import measure as measurement
 
 spec = importlib.util.spec_from_file_location('deploy', Path(__file__).resolve().parents[1] / 'packaging/gentoo/deploy.py')
 assert spec is not None and spec.loader is not None
@@ -45,17 +46,28 @@ def resource_usage(after, before=None):
     return result
 
 
+def memory_limited(before, after):
+    events = [dict((k, int(v)) for k, v in (line.split() for line in row['memory.events'].splitlines()))
+              for row in (before, after)]
+    return any(events[1][key] != events[0][key] for key in ('max', 'oom', 'oom_kill'))
+
+
+def release_artifacts(directory):
+    """Keep completed repetitions' received logs out of the collector's cache budget."""
+    for path in directory.rglob('*'):
+        if path.is_file() and not path.is_symlink():
+            with path.open('rb') as stream:
+                os.fsync(stream.fileno())
+                os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+
+
 def worker_changes(before, after):
     changes = {}
     for name, first in before.items():
         last = after[name]
         if first['boot'] != last['boot'] or first['service']['MainPID'] != last['service']['MainPID']:
             raise RuntimeError(f'{name}: worker restarted during measurement')
-        events = []
-        for row in (first, last):
-            events.append(dict((k, int(v)) for k, v in
-                               (line.split() for line in row['metrics']['memory.events'].splitlines())))
-        if any(events[1][key] != events[0][key] for key in ('max', 'oom', 'oom_kill')):
+        if memory_limited(first['metrics'], last['metrics']):
             raise RuntimeError(f'{name}: memory limit reached; measurement incomplete')
         delta = [b - a for a, b in zip(first['cpu'], last['cpu'])]
         changes[name] = {'cpu_busy_percent': 100 * (sum(delta) - delta[3] - delta[4]) / sum(delta)
@@ -149,6 +161,10 @@ def main():
         resume = json.loads(resume_path.read_text()) if resume_path.exists() else {}
         runs = []
         result: dict = dict(id=run_id, success=False)
+        controller_group = measurement.cgroup()
+        controller_before = measurement.metrics(controller_group)
+        if controller_before['memory.events'] is None:
+            raise RuntimeError('result collector memory accounting is unavailable')
         owns_unit = False
         def interrupted(signum, frame):
             raise InterruptedError(f'benchmark interrupted by signal {signum}')
@@ -192,6 +208,9 @@ def main():
                 rsync = ['rsync', '-rt', '--rsync-path=sudo -n rsync'] if client.get('ssh') else ['sudo', '-n', 'rsync', '-rt']
                 deploy.run([*rsync, '--exclude=/build/', '--exclude=/config/',
                             '--exclude=/runtime/.distcc/', source, str(out / f'run-{index}') + '/'])
+                release_artifacts(out / f'run-{index}')
+                if memory_limited(controller_before, measurement.metrics(controller_group)):
+                    raise RuntimeError('result collection reached its memory limit; measurement incomplete')
                 path = out / f'run-{index}/result.json'
                 if not path.exists():
                     raise RuntimeError('measurement did not finish; see unit log and saved artifacts')
@@ -210,6 +229,10 @@ def main():
         except (Exception, KeyboardInterrupt) as error:
             result.update(success=False, error=str(error))
         finally:
+            result['controller'] = dict(before=controller_before,
+                                        after=measurement.metrics(controller_group))
+            if memory_limited(controller_before, result['controller']['after']):
+                result.update(success=False, error='result collection reached its memory limit; measurement incomplete')
             # systemd owns all descendants, including after SSH interruption.
             try:
                 if owns_unit:

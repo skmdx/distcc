@@ -1,6 +1,5 @@
 """Do not promote incomplete or incomparable measurements to speedup evidence."""
 import copy
-import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,16 +9,10 @@ import subprocess
 import sys
 
 
-def load(name):
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / 'bench' / (name + '.py'))
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-fleet = load('fleet')
-measure = load('measure')
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bench'))
+import fleet
+import measure
+sys.path.pop(0)
 
 
 class ComparisonTest(unittest.TestCase):
@@ -54,6 +47,26 @@ class ComparisonTest(unittest.TestCase):
 
 
 class StatisticsTest(unittest.TestCase):
+    def test_collection_memory_limits_are_not_hidden_by_successful_commands(self):
+        before = {'memory.events': 'max 0\noom 0\noom_kill 0\n'}
+        self.assertFalse(fleet.memory_limited(before, before))
+        for key in ('max', 'oom', 'oom_kill'):
+            with self.subTest(key=key):
+                after = {'memory.events': before['memory.events'].replace(key + ' 0', key + ' 1')}
+                self.assertTrue(fleet.memory_limited(before, after))
+
+    def test_release_artifacts_preserves_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'nested').mkdir()
+            data = bytes(range(256)) * 4096
+            path = root / 'nested' / 'data'
+            path.write_bytes(data)
+            (root / 'link').symlink_to(path)
+            fleet.release_artifacts(root)
+            self.assertEqual(path.read_bytes(), data)
+            self.assertTrue((root / 'link').is_symlink())
+
     def test_corrupt_profile_is_rejected_even_when_perf_exits_successfully(self):
         self.assertFalse(measure.profile_valid('', "failed to process sample\n# Samples: 100 of event 'cpu-clock'\n"))
         self.assertFalse(measure.profile_valid('failed to write perf data, error: bad address', '# Samples: 100\n'))
