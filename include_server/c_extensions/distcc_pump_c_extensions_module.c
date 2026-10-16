@@ -413,7 +413,14 @@ static int module_clear(PyObject *m) {
     return 0;
 }
 
+PyObject *dcc_py_parse_gcc_inputs(PyObject *, PyObject *);
+PyObject *dcc_py_input_changes(PyObject *, PyObject *);
+
 static PyMethodDef module_methods[] = {
+  {"ParseGccInputs", dcc_py_parse_gcc_inputs, METH_VARARGS,
+   "Decode the selected GCC frontend's bounded input identity manifest."},
+  {"InputChanges", dcc_py_input_changes, METH_VARARGS,
+   "Return current positive paths and observations requiring cache validation."},
   {"OsPathExists",  (PyCFunction)OsPathExists, METH_VARARGS,
    OsPathExists_doc__},
   {"OsPathIsFile",  (PyCFunction)OsPathIsFile, METH_VARARGS,

@@ -161,6 +161,7 @@ ext = setuptools.Extension(
               'src/netutil.c',
               'lzo/minilzo.c',
               'include_server/c_extensions/distcc_pump_c_extensions_module.c',
+              'include_server/c_extensions/input_metadata.c',
              ]],
     include_dirs=cpp_flags_includes,
     depends=[__file__, *glob.glob(os.path.join(srcdir, 'src', '*.h'))],

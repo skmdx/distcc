@@ -273,9 +273,8 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
                   for path, data in result['files'].items()})
     paths = set(result['dependencies'])
     stamps = self.build_stat_cache.file_stamps
-    self.current_input_paths = tuple(path for path, expected in result['lookups'].items()
-                                     if expected is not None)
-    for path, expected in result['lookups'].items():
+    self.current_input_paths, changes = stamps.InputChanges(result['lookups'])
+    for path, expected in changes.items():
       observed = stamps.Observe(path)
       # Failed header candidates include directories. Reuse their observed
       # absence: Changed below checks creation/replacement notifications (or

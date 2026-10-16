@@ -190,6 +190,7 @@ include_server_PY = \
 
 include_server_SRC = \
 	include_server/c_extensions/distcc_pump_c_extensions_module.c \
+	include_server/c_extensions/input_metadata.c \
 	include_server/c_extensions/clang_scan.cpp
 
 update_distcc_symlinks_PY = update-distcc-symlinks.py

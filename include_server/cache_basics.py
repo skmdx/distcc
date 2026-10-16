@@ -199,6 +199,7 @@ import sys
 import basics
 import scan_statistics as statistics
 import compiler_defaults
+import distcc_pump_c_extensions
 
 DIR_ARRAY_SIZE = 500
 
@@ -207,18 +208,9 @@ DIR_ARRAY_SIZE = 500
 # Python counterparts, even when called through the Python/C
 # interface.
 
-try:
-  import distcc_pump_c_extensions
-  _OsPathExists = distcc_pump_c_extensions.OsPathExists
-  _OsPathIsFile = distcc_pump_c_extensions.OsPathIsFile
-  _PathRealpath = distcc_pump_c_extensions.Realpath
-  _path_realpath_works = True
-except ImportError:
-  _OsPathExists = os.path.exists
-  _OsPathIsFile = os.path.isfile
-  _PathRealpath = os.path.realpath
-  # os.path.realpath might have some bugs.  TODO(csilvers): check that here
-  _path_realpath_works = False
+_OsPathExists = distcc_pump_c_extensions.OsPathExists
+_OsPathIsFile = distcc_pump_c_extensions.OsPathIsFile
+_PathRealpath = distcc_pump_c_extensions.Realpath
 
 Debug = basics.Debug
 DEBUG_TRACE = basics.DEBUG_TRACE
@@ -248,47 +240,14 @@ class CanonicalPath(object):
     Returns:
       the realpath of filepath (string)
 
-    The following is irrelevant if we always use the distcc_pump_c_extensions
-    realpath function.
-    ---
-    Apparently, in some versions of Python 2.4 at least, realpath does
-    *not* resolve the last component of a filepath if it is a link:
-       https://sourceforge.net/tracker/?func=detail&atid=105470&aid=1213894&group_id=5470
-    Make up for that: follow that final link until a real realpath has
-    been found.
-
-    Also, realpath is not idempotent.
-
-    Solution (?): turn filepath into abspath before applying realpath;
-    then we can cache results as well (without worring about value of
-    current directory).
-
-    The final problem -- that os.path.realpath is very slow, at least
-    an order of magnitude slower than the gnu libc one --- is solved
-    through caching all uses through an object of the present class.
+    The required native extension resolves paths through libc.
     """
     assert isinstance(filepath, str)
     try:
       return self.cache[filepath]
     except KeyError:
-      if _path_realpath_works:
-        r = _PathRealpath(filepath)
-        self.cache[filepath] = r
-        return r
-      # Fix for os.path.realpath idempotencey bug (Python 2.4).
-      filepath_ = os.path.abspath(filepath)
-      filepath_ = _PathRealpath(filepath_)
-      # Fix for os.path.realpath bug (Python 2.4): symlinks at end not
-      # resolved.
-      for unused_i in range(10):
-        if not os.path.islink(filepath_):
-          break
-        filepath_ = os.path.join(os.path.dirname(filepath_),
-                                 os.readlink(filepath_))
-      else:
-        raise NotCoveredError("Too many symlinks in '%s'." % filepath)
-      self.cache[filepath] = filepath_
-      return filepath_
+      result = self.cache[filepath] = _PathRealpath(filepath)
+      return result
 
 class DirnameCache(object):
   """Cache the mapping from filepath pairs to index of their directory names.
@@ -691,6 +650,10 @@ class FileStampCache(object):
       if stamp is not None:
         self.files[original] = stamp
     return self.paths[key]
+
+  def InputChanges(self, lookups):
+    """Select observations needing validation without duplicating cached state."""
+    return distcc_pump_c_extensions.InputChanges(lookups, self.paths)
 
   def Changed(self, files=None):
     if self.watch_fd < 0:

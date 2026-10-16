@@ -9,6 +9,51 @@ import unittest
 from unittest import mock
 
 import gcc_scan
+import distcc_pump_c_extensions as native
+
+
+class InputMetadataTest(unittest.TestCase):
+  def manifest(self, *records):
+    return b'DCGS2\0' + b''.join(path + b'\0' + metadata + b'\0'
+                                for path, metadata in records) + b'\0'
+
+  def test_paths_identities_and_directory_classes(self):
+    metadata = b'1 2 33188 13 -7 11'
+    data = self.manifest((b'source\xff.c', metadata), (b'source\xff.c', metadata),
+                         (b'/missing.h', b'-'), (b'headers', b'D1'),
+                         (b'directory', b'1 3 16877 4096 17 19'))
+    result = native.ParseGccInputs(data, '/working/')
+    source = os.fsdecode(b'/working/source\xff.c')
+    self.assertEqual(result, dict(files=None, dependencies=[source],
+        lookups={source: (1, 2, 33188, 13, -7, 11), '/missing.h': None,
+                 '/working/directory': (1, 3, 16877)}, directories={'/working/headers': 1}))
+
+  def test_rejects_truncation_conflicting_identities_and_oversized_inputs(self):
+    good = self.manifest((b'source.c', b'1 2 33188 13 7 11'))
+    for end in range(len(good)):
+      with self.subTest(end=end), self.assertRaises(ValueError):
+        native.ParseGccInputs(good[:end], '/working')
+    for records in (((b'source.c', b'-'),),
+                    ((b'source.c', b'1 2 33188 13 7'),),
+                    ((b'source.c', b'1 2 33188 13 7 11 extra'),),
+                    ((b'source.c', b'1 2 33188 67108865 7 11'),),
+                    ((b'source.c', b'1 2 33188 13 7 11'), (b'source.c', b'-'))):
+      with self.subTest(records=records), self.assertRaises(ValueError):
+        native.ParseGccInputs(self.manifest(*records), '/working')
+
+  def test_batch_validation_keeps_unknown_changed_and_positive_inputs(self):
+    regular = (1, 2, 33188, 13, 7, 11)
+    changed = (1, 2, 33188, 13, 7, 12)
+    directory = (1, 3, 16877)
+    observed = {('unchanged', False): regular, ('updated', False): regular,
+                ('absent', False): None, ('directory', False): directory,
+                ('removed', False): regular, ('created', False): None}
+    lookups = dict(unchanged=regular, updated=changed, absent=None,
+                   directory=None, removed=None, created=regular, unknown=None)
+    positive, pending = native.InputChanges(lookups, observed)
+    self.assertEqual(positive, ['unchanged', 'updated', 'created'])
+    self.assertEqual(pending, dict(updated=changed, removed=None, created=regular, unknown=None))
+    self.assertEqual(observed[('updated', False)], regular)
 
 
 class GccScanTest(unittest.TestCase):
