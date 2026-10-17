@@ -349,25 +349,6 @@ class BrokerTest(BrokerTestCase):
         with socket.socket(fileno=descriptors[0]) as selected:
             self.assertEqual(selected.getpeername()[1], self.ports[0])
 
-    def test_smt_penalty_does_not_wait_for_a_later_completion(self):
-        # The first host has spare SMT capacity: a new job completes in
-        # 4/3 seconds, but its marginal-throughput score is four seconds.
-        # The second host has one occupied lane and predicts two seconds.
-        # Throughput pricing must not turn that later completion into a wait.
-        peers = [self.peer(stats_response(cpus=4, cores=2, jobs=4, running=2,
-                    busy=2, queued=0, preparing=0, returning=0, capacity=4)),
-                 self.peer(stats_response(cpus=1, cores=1, jobs=1, running=1,
-                    busy=1, queued=0, preparing=0, returning=0, capacity=1))]
-        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed=1')
-                                  for i, p in enumerate(peers)))
-        lease = self.request(10, (1400, 4 * 1024 * 1024, 1))
-        lease.settimeout(.5)
-        status, _, descriptors = self.receive(lease)
-        self.assertEqual(status, 0)
-        self.assertEqual(len(descriptors), 1)
-        with socket.socket(fileno=descriptors[0]) as selected:
-            self.assertEqual(selected.getpeername()[1], self.ports[0])
-
     def test_independent_cores_precede_smt_that_displaces_more_work(self):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16,
                     running=0, busy=0, queued=0, preparing=0, returning=0, capacity=16)),

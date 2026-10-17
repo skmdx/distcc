@@ -107,7 +107,7 @@ def log_summary(paths):
                 counts['analysis_warnings'] += 'include server gave up analyzing' in line
                 counts['io_timeouts'] += 'ERROR: IO timeout' in line
                 counts['sandbox_denials'] += 'ACCESS DENIED' in line
-                counts['broker_waits'] += 'waiting for hosts' in line
+                counts['broker_waits'] += 'waiting for host' in line
                 if 'job cost:' in line:
                     fields = dict(re.findall(r'(\w+)=([^ ]+)', line))
                     timings.append({key: float(fields[key]) for key in ('prepare', 'queue', 'execute')})
