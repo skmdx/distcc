@@ -172,7 +172,9 @@ p=Path('/etc/systemd/system/distccd.service.d')
 p.mkdir(parents=True,exist_ok=True)
 if AUTO:
     # Apply the finite bound before removing the old setting on a live service.
-    subprocess.run(['python3','/usr/lib/distcc/distccd-memory.py','--apply','distccd.service'],check=True)
+    # Stopped services get their cgroup and bound through ExecStartPre instead.
+    if subprocess.run(['systemctl','is-active','--quiet','distccd.service']).returncode == 0:
+        subprocess.run(['python3','/usr/lib/distcc/distccd-memory.py','--apply','distccd.service'],check=True)
     old=p/'adaptive.conf'
     if old.exists():
         old.write_text(''.join(s for s in old.read_text().splitlines(keepends=True) if not s.startswith('MemoryMax=')))
