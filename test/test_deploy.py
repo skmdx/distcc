@@ -15,6 +15,24 @@ spec.loader.exec_module(deploy)
 
 
 class TransportTest(unittest.TestCase):
+    def test_package_mirror_removes_retired_ebuild_without_touching_siblings(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            source, destination = root / 'source', root / 'destination'
+            source.mkdir()
+            destination.mkdir()
+            (source / 'current.ebuild').write_text('current')
+            (destination / 'retired.ebuild').write_text('retired')
+            sibling = root / 'other-package'
+            sibling.write_text('preserve')
+            self.addCleanup(subprocess.run, ['sudo', '-n', 'rm', '-rf', str(destination)])
+            deploy.transfer([str(source) + '/'], str(destination), mirror=True)
+            self.assertEqual(sorted(p.name for p in destination.iterdir()), ['current.ebuild'])
+            self.assertEqual(sibling.read_text(), 'preserve')
+            (destination / 'keep.distfile').write_text('cached')
+            deploy.transfer([str(source / 'current.ebuild')], str(destination))
+            self.assertEqual((destination / 'keep.distfile').read_text(), 'cached')
+
     @unittest.skipUnless(shutil.which('zsh'), 'zsh required')
     def test_remote_arguments_do_not_undergo_login_shell_expansion(self):
         values = ['=category/package-1', 'a b; $(false)', "a'b"]

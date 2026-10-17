@@ -54,12 +54,14 @@ def release(overlay):
     return version, ebuild
 
 
-def transfer(paths, destination, target=None):
+def transfer(paths, destination, target=None, *, mirror=False):
     run(['sudo', '-n', 'mkdir', '-p', destination], target)
     dest = f"{target['ssh']}:{destination}/" if target and target.get('ssh') else destination + '/'
     args = ['rsync', '-rt', '--rsync-path=sudo -n rsync']
     if not target or not target.get('ssh'):
         args = ['sudo', '-n', 'rsync', '-rt']
+    if mirror:
+        args.append('--delete-delay')
     run([*args, *paths, dest])
 
 
@@ -93,7 +95,7 @@ def builds_to_pause(target):
 
 def distribute_sources(settings, version, ebuild, targets, work):
     import portage
-    transfer([str(ebuild.parent) + '/'], settings['local_repository'] + '/sys-devel/distcc')
+    transfer([str(ebuild.parent) + '/'], settings['local_repository'] + '/sys-devel/distcc', mirror=True)
     fetcher = dict(targets[0], check_limits=targets[0]['build_limits'])
     with (work / 'fetch.log').open('w') as log:
         bounded(['ebuild', str(ebuild), 'fetch'], fetcher, 'fetch', log, cross=True)
@@ -138,7 +140,7 @@ def install(target, version, ebuild, work, cross):
     name = target['name']
     print(f'{name}: building/installing {version}', flush=True)
     with (work / (name + '-install.log')).open('w') as log:
-        transfer([str(ebuild.parent) + '/'], target['repository'] + '/sys-devel/distcc', target)
+        transfer([str(ebuild.parent) + '/'], target['repository'] + '/sys-devel/distcc', target, mirror=True)
         if run(['portageq', 'best_version', '/', 'sys-devel/distcc'], target) == 'sys-devel/' + version:
             print(f'{name}: release already installed', flush=True)
             return
