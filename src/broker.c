@@ -766,10 +766,13 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         }
         return 0;
     }
-    int i, slots, best = -1, available = 0, best_probe = 0, best_wait = 0, best_idle = 0;
-    double best_score = 0, best_fill = 0;
+    struct choice {
+        int peer, probe, wait, idle;
+        double score, fill;
+        struct prediction prediction;
+    } best = {.peer = -1}, immediate = {.peer = -1};
+    int i, slots, available = 0;
     double cost = dcc_work_predict(&broker->model, &client->hint);
-    struct prediction best_prediction = {0};
     int link = client->command == ACQUIRE_LINK;
     int local_cpp = !link && client->command != ACQUIRE_CPP && client->command != ACQUIRE_READY;
     int recent[MAX_HOSTS] = {0}, recent_links[MAX_HOSTS] = {0};
@@ -902,18 +905,24 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             /* Without any input description there is no completion estimate
              * with which to justify waiting instead of using an idle CPU. */
             int idle = !cost && staged && cap && !blocked && work < dcc_capacity_jobs(p->host, cap);
-            if (best < 0 || idle > best_idle || (idle == best_idle &&
-                (score < best_score || (score == best_score && fill < best_fill)))) {
-                best = i;
-                best_idle = idle;
-                best_probe = probe;
-                best_wait = wait;
-                best_prediction = forecast;
-                best_score = score;
-                best_fill = fill;
-            }
+            struct choice candidate = {i, probe, wait, idle, score, fill, forecast};
+            if (best.peer < 0 || idle > best.idle || (idle == best.idle &&
+                (score < best.score || (score == best.score && fill < best.fill))))
+                best = candidate;
+            if (predicted && !wait && (immediate.peer < 0 ||
+                forecast.finish < immediate.prediction.finish ||
+                (forecast.finish == immediate.prediction.finish && score < immediate.score)))
+                immediate = candidate;
         }
     }
+    /* Marginal throughput prices the work displaced on an SMT core, not
+     * this job's completion time. It can rank immediate assignments, but
+     * cannot justify waiting for a completion later than an available lane.
+     * Keep beneficial waits for fast busy workers; otherwise use the actual
+     * earliest completion, with its original contention estimate intact. */
+    if (best.wait && immediate.peer >= 0 &&
+        best.prediction.finish >= immediate.prediction.finish)
+        best = immediate;
     if (client->command == JOBS || !available) {
         if (!available && client->command != JOBS) {
             for (i = 0; i < broker->count; i++) {
@@ -927,23 +936,23 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         reply.status = available ? 0 : EXIT_CONNECT_FAILED;
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
-    } else if (best >= 0 && best_wait) {
-        rs_trace("waiting for host=%s cost=%.3f score=%.3f", broker->peers[best].host->hostname, cost, best_score);
+    } else if (best.peer >= 0 && best.wait) {
+        rs_trace("waiting for host=%s cost=%.3f score=%.3f", broker->peers[best.peer].host->hostname, cost, best.score);
         unsigned index = batch->count++;
-        batch->planned[index].peer = best;
+        batch->planned[index].peer = best.peer;
         batch->planned[index].cost = cost;
-        batch->planned[index].prepare = best_prediction.prepare;
-        double delay = best_prediction.start - best_prediction.prepare - .02;
+        batch->planned[index].prepare = best.prediction.prepare;
+        double delay = best.prediction.start - best.prediction.prepare - .02;
         if (delay < .05) delay = .05;
         if (delay > 1) delay = 1;
         client->deadline = now + delay;
-    } else if (best >= 0 && (!local_cpp || broker->cpp_busy < broker->cpp_limit)) {
-        struct peer *p = &broker->peers[best];
+    } else if (best.peer >= 0 && (!local_cpp || broker->cpp_busy < broker->cpp_limit)) {
+        struct peer *p = &broker->peers[best.peer];
         rs_trace("assigning host=%s cost=%.3f score=%.3f broker_wait=%.6f",
-                 p->host->hostname, cost, best_score, now - client->waiting_since);
+                 p->host->hostname, cost, best.score, now - client->waiting_since);
         client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
                             p->admission_supported && p->pool_supported >= 0;
-        client->net = client->command != ACQUIRE ? pool_take(broker, best, now) : -1;
+        client->net = client->command != ACQUIRE ? pool_take(broker, best.peer, now) : -1;
         client->pooled = client->net >= 0;
         client->reused = client->pooled;
         if (p->host->tcp_jobs) client->pooled = 1;
@@ -953,12 +962,12 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             p->retry_at = now + 5;
             return 1;
         }
-        client->peer = best;
+        client->peer = best.peer;
         client->cost = cost;
-        client->factor = best_prediction.factor;
-        client->ready_at = now + best_prediction.prepare;
-        client->run_at = now + best_prediction.start;
-        if (best_probe) p->probe_after = now + 10;
+        client->factor = best.prediction.factor;
+        client->ready_at = now + best.prediction.prepare;
+        client->run_at = now + best.prediction.start;
+        if (best.probe) p->probe_after = now + 10;
         client->serial = ++p->serial;
         client->state = CONNECTING;
         client->deadline = now + 3;
