@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""One-shot Clang worker preserving the original source's profile identity."""
+import subprocess
+import sys
+
+from include_server import clang_scan
+
+
+def main():
+    root, original, *command = sys.argv[1:]
+    # Executing a different compiler silently would corrupt distributed builds.
+    # The scanner applies the same version contract on the client; check again
+    # on the worker, including the preprocessed (non-pump) path.
+    version = subprocess.check_output([command[0], '--version'], text=True).split()
+    if ('version' not in version or
+            version[version.index('version') + 1] != clang_scan.version):
+        sys.stderr.write('distcc: worker libclang-cpp does not match the requested compiler\n')
+        return 1
+    return clang_scan.compile(command, original, root)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

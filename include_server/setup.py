@@ -182,11 +182,11 @@ if not llvm_config:
   if clang:
     llvm_config = os.path.join(os.path.dirname(os.path.realpath(clang)), 'llvm-config')
 if not llvm_config or not os.path.isfile(llvm_config):
-  sys.exit('libclang-cpp header analysis requires LLVM_CONFIG pointing to llvm-config (LLVM 19, 22 or 23).')
+  sys.exit('libclang-cpp requires LLVM_CONFIG pointing to llvm-config (LLVM 22 or 23).')
 def llvm_option(option):
   return subprocess.check_output([llvm_config, option], text=True).strip()
-if llvm_option('--version').split('.')[0] not in ('19', '22', '23'):
-  sys.exit('libclang-cpp header analysis requires LLVM 19, 22 or 23 headers and libraries.')
+if llvm_option('--version').split('.')[0] not in ('22', '23'):
+  sys.exit('libclang-cpp requires LLVM 22 or 23 headers and libraries.')
 llvm_lib = llvm_option('--libdir')
 # Search the target sysroot while linking, but retain its installed path in
 # the extension so a cross-built package does not depend on the build machine.
@@ -196,7 +196,8 @@ if sysroot and llvm_lib.startswith(sysroot + '/'):
   llvm_runtime_lib = llvm_lib[len(sysroot):]
 scanner = setuptools.Extension(
     name='include_server.clang_scan',
-    sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_scan.cpp')],
+    sources=[os.path.join(srcdir_include_server, 'c_extensions', name)
+             for name in ('clang_scan.cpp', 'clang_compile.cpp')],
     language='c++', include_dirs=[llvm_option('--includedir')],
     library_dirs=[llvm_lib], runtime_library_dirs=[llvm_runtime_lib],
     libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],

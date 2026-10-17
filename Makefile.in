@@ -191,13 +191,15 @@ include_server_PY = \
 include_server_SRC = \
 	include_server/c_extensions/distcc_pump_c_extensions_module.c \
 	include_server/c_extensions/input_metadata.c \
-	include_server/c_extensions/clang_scan.cpp
+	include_server/c_extensions/clang_scan.cpp \
+	include_server/c_extensions/clang_compile.cpp
 
 update_distcc_symlinks_PY = update-distcc-symlinks.py
 
 # These are included in the distribution but not installed anywhere.
 dist_extra =							\
 	distcc-link \
+	distcc-clang \
 	README.packaging ChangeLog \
 	packaging/RedHat/rpm.spec \
 	packaging/RedHat/logrotate.d/distcc \
@@ -1112,6 +1114,7 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET)
 	$(mkinstalldirs) "$(DESTDIR)$(bindir)"
 	$(mkinstalldirs) "$(DESTDIR)$(sbindir)"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-link" "$(DESTDIR)$(bindir)/distcc-link"
+	$(INSTALL_SCRIPT) "$(srcdir)/distcc-clang" "$(DESTDIR)$(bindir)/distcc-clang"
 	for p in $(bin_PROGRAMS); do \
 	  $(INSTALL_PROGRAM) "$$p" "$(DESTDIR)$(bindir)" || exit 1; \
 	done
@@ -1240,6 +1243,7 @@ uninstall: uninstall-man uninstall-programs @UNINSTALL_GNOME@ \
 uninstall-programs:
 	rm -f "$(DESTDIR)$(libdir)/distcc/cpp_lookup.so"
 	rm -f "$(DESTDIR)$(bindir)/distcc-link"
+	rm -f "$(DESTDIR)$(bindir)/distcc-clang"
 	for p in $(bin_PROGRAMS) pump; do			\
 	  file="$(DESTDIR)$(bindir)/`basename $$p`";            \
 	  if [ -e "$$file" ]; then rm -fv "$$file"; fi          \

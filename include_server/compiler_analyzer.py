@@ -25,7 +25,9 @@ def dependency_command(command, source):
   result = [command[0]]
   args = iter(command[1:])
   for arg in args:
-    if arg in ('-o', '-MF', '-MT', '-MQ', '-MJ'):
+    if arg == '-Xclang':
+      result.extend((arg, next(args)))
+    elif arg in ('-o', '-MF', '-MT', '-MQ', '-MJ'):
       next(args)
     elif arg in ('-c', '-S', '-E', '-M', '-MM', '-MD', '-MMD', '-MP', '-MG', '-dM', '-dD', '-P'):
       continue
@@ -119,6 +121,11 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     probe = []
     args = iter(command[1:])
     for arg in args:
+      if arg == '-Xclang':
+        # This operand belongs to cc1. In particular -xop is a target
+        # feature, not the driver's joined language option -x<language>.
+        probe.extend((arg, next(args)))
+        continue
       if arg == source:
         continue
       if arg == '-x':

@@ -36,13 +36,21 @@ and retains their published input snapshots until pump shuts down, so an
 in-progress transfer cannot lose its inputs during recovery.
 
 The include server calls libclang-cpp directly through a resident Python C++
-extension. Building pump requires LLVM 19, 22 or 23 development headers, libclang-cpp,
+extension. Building pump requires LLVM 22 or 23 development headers, libclang-cpp,
 libLLVM and a C++17 compiler; set LLVM_CONFIG to the matching llvm-config if it
 is not on PATH or beside clang. Clang jobs must match the library's version.
 The Clang and LLVM libraries must also use the same assertion/debug ABI settings.
 For Clang jobs, the canonical preprocessor discovers includes and existence probes without
 building an AST or generating code. Its input buffers are reused for transfer.
 Each request gets a fresh FileManager to avoid stale negative lookup caches.
+
+Clang IR profile generation (`-fprofile-generate`) uses the installed
+`distcc-clang` worker helper. It runs Clang's frontend against the transferred
+files while preserving the original main-file identity, including static-function
+profile names. The worker library must match the requested compiler version.
+This also applies to locally preprocessed input. GCC profile generation and
+`-fprofile-use` remain local because their additional file contracts are not
+part of the compilation RPC.
 
 GCC jobs invoke the selected GCC frontend with a dependency-collection plugin.
 The module accesses GCC's own libcpp input state, including existence-only probes

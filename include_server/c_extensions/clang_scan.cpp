@@ -13,6 +13,8 @@
 #include <map>
 #include <set>
 
+PyObject *dcc_clang_compile(PyObject *, PyObject *);
+
 namespace {
 using namespace clang;
 
@@ -261,6 +263,7 @@ PyObject *scan(PyObject *, PyObject *arguments) {
 }
 
 PyMethodDef methods[] = {
+    {"compile", dcc_clang_compile, METH_VARARGS, "Compile once with the client's source identity."},
     {"scan", scan, METH_VARARGS, "Scan using libclang-cpp; return immutable inputs and lookup paths."},
     {nullptr, nullptr, 0, nullptr}};
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_scan", nullptr, -1, methods, nullptr, nullptr, nullptr, nullptr};

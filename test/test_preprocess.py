@@ -30,7 +30,8 @@ class PumpTestCase(BrokerTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.daemon_env = {}
+        cls.daemon_env = {'DISTCC_CLANG_DRIVER': str(Path.cwd() / 'distcc-clang')}
+        cls.daemon_env['PYTHONPATH'] = str(next(Path.cwd().glob('_include_server/lib.*')))
         module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
         if module:
             cls.daemon_env['DISTCC_GCC_SCAN_LIBRARY'] = module
@@ -296,6 +297,65 @@ class AnalyzerPoolTest(PumpTestCase):
 
 
 class PreprocessTest(PumpTestCase):
+    def test_clang_profile_generation_matches_native(self):
+        self.check_clang_profile_generation(self.source)
+
+    def test_clang_relative_profile_generation_matches_native(self):
+        self.check_clang_profile_generation(Path(self.source.name))
+
+    def test_clang_raw_profile_generation_matches_native(self):
+        self.addCleanup(self.env.__setitem__, 'INCLUDE_SERVER_PORT',
+                        self.env.pop('INCLUDE_SERVER_PORT'))
+        self.check_clang_profile_generation(self.source)
+
+    def test_clang_raw_relative_profile_generation_matches_native(self):
+        self.addCleanup(self.env.__setitem__, 'INCLUDE_SERVER_PORT',
+                        self.env.pop('INCLUDE_SERVER_PORT'))
+        self.check_clang_profile_generation(Path(self.source.name))
+
+    def check_clang_profile_generation(self, source):
+        compiler, profdata = shutil.which('clang'), shutil.which('llvm-profdata')
+        if not compiler or not profdata:
+            self.skipTest('Clang and llvm-profdata are required')
+        (self.work / 'profile.h').write_text('static int classify(int n) { return n > 2 ? 7 : 3; }\n')
+        self.source.write_text('#include "profile.h"\n'
+                               'const char *source_name = __FILE__, *base_name = __BASE_FILE__;\n'
+                               'int main(int n, char **v) { return classify(n) != 3; }\n')
+        for option in ('-fprofile-generate', '-fprofile-generate=relative profiles',
+                       '-fprofile-instr-generate',
+                       '-fprofile-instr-generate=' + str(self.work / 'named.profraw')):
+            with self.subTest(option=option):
+                match = re.search(r'dcc_compile_ok (\d+)', self.get_stats(self.stats_ports[0]))
+                assert match is not None
+                before = int(match.group(1))
+                objects, counts = [], []
+                for remote in (False, True):
+                    result = self.run_cc(compiler, ['-O1', '-g', '-fno-inline', '-march=native', option,
+                                                   '-c', source, '-o', 'profile.o'], remote)
+                    self.assertEqual(result.returncode, 0, result.stderr.decode())
+                    # Preprocessed input cannot reproduce source checksums in
+                    # DWARF. Compare all code/data/profile sections on raw RPC;
+                    # pump must reproduce the entire object, including DWARF.
+                    if 'INCLUDE_SERVER_PORT' not in self.env:
+                        subprocess.run(['objcopy', '--strip-debug', 'profile.o', 'stripped.o'],
+                                       cwd=self.work, check=True, capture_output=True, timeout=5)
+                        objects.append((self.work / 'stripped.o').read_bytes())
+                    else:
+                        objects.append((self.work / 'profile.o').read_bytes())
+                    subprocess.run([compiler, option, 'profile.o', '-o', 'profile'],
+                                   cwd=self.work, check=True, capture_output=True, timeout=15)
+                    raw = self.work / ('remote.profraw' if remote else 'native.profraw')
+                    subprocess.run([str(self.work / 'profile')], cwd=self.work,
+                                   env=dict(self.env, LLVM_PROFILE_FILE=str(raw)),
+                                   check=True, capture_output=True, timeout=5)
+                    counts.append(subprocess.check_output(
+                        [profdata, 'show', '--all-functions', '--counts', str(raw)], timeout=5))
+                self.assertEqual(counts[0], counts[1])
+                self.assertEqual(objects[0], objects[1])
+                self.assertIn(f'dcc_compile_ok {before + 1}\n',
+                              self.get_stats(self.stats_ports[0]))
+        self.assertNotIn('gave up analyzing', (self.work / 'client.log').read_text())
+
     def test_unused_include_directories_exist_on_worker(self):
         # Build generators pass directories for whole dependency sets, even
         # when this translation unit does not read any of their headers.

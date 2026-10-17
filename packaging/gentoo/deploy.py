@@ -49,7 +49,8 @@ def release(overlay):
                 '.' if tree == ROOT else 'sys-devel/distcc']):
             raise RuntimeError(f'uncommitted deployment inputs: {tree}')
     run(['git', '-C', ROOT, 'diff', '--exit-code', match[1], '--', 'src', 'include_server',
-         'configure.ac', 'pump.in', 'distcc-link', 'packaging/systemd', 'packaging/gentoo/*.bashrc'])
+         'configure.ac', 'Makefile.in', 'pump.in', 'distcc-link', 'distcc-clang',
+         'packaging/systemd', 'packaging/gentoo/*.bashrc'])
     return version, ebuild
 
 

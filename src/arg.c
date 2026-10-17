@@ -221,7 +221,9 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
             } else if (!strcmp(a, "-fprofile-arcs")
                        || !strcmp(a, "-ftest-coverage")
 		       || !strcmp(a, "--coverage")
-		       || !strncmp(a, "-fprofile-generate", 18) /* it also has an -fprofile-generate=<path> form */
+		       || ((!strcmp(a, "-fprofile-generate") ||
+                            str_startswith("-fprofile-generate=", a)) &&
+                           !strstr(dcc_find_basename(argv[0]), "clang"))
 		       || !strncmp(a, "-fprofile-use", 13)
 		       || !strncmp(a, "-fauto-profile", 14)
 		       || !strcmp(a, "-fprofile-correction")) {

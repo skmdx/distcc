@@ -1206,6 +1206,31 @@ static int dcc_run_job(int in_fd,
         goto report_result;
     }
 
+    /* LLVM's IR PGO names contain the main input path. Prefix-map options do
+     * not affect these names: use Clang's frontend with the client identity. */
+    if (strstr(dcc_find_basename(argv[0]), "clang")) {
+        int profile = 0, argc = dcc_argv_len(argv);
+        for (i = 1; i < argc; ++i)
+            if (!strcmp(argv[i], "-fprofile-generate") ||
+                !strncmp(argv[i], "-fprofile-generate=", 19)) profile = 1;
+        if (profile) {
+            const char *helper = getenv("DISTCC_CLANG_DRIVER");
+            char **wrapped = calloc(argc + 4, sizeof(char *));
+            if (!wrapped) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
+            wrapped[0] = strdup(helper && *helper ? helper : "distcc-clang");
+            wrapped[1] = strdup(cpp_where == DCC_CPP_ON_SERVER ? temp_dir : "");
+            wrapped[2] = strdup(orig_input);
+            if (!wrapped[0] || !wrapped[1] || !wrapped[2]) {
+                free(wrapped[0]); free(wrapped[1]); free(wrapped[2]); free(wrapped);
+                ret = EXIT_OUT_OF_MEMORY;
+                goto out_cleanup;
+            }
+            memcpy(wrapped + 3, argv, (argc + 1) * sizeof(char *));
+            free(argv);
+            argv = wrapped;
+        }
+    }
+
     if ((compile_ret = dcc_spawn_child(argv, &cc_pid,
                                        "/dev/null", out_fname, err_fname))
         || (compile_ret = dcc_collect_child("cc", cc_pid, &status, in_fd,

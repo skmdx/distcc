@@ -418,6 +418,8 @@ class ClangScanTest(unittest.TestCase):
         [self.compiler, '-Xclang', '-target-cpu', '-Xclang', 'haswell',
          '-Xclang', '-tune-cpu', '-Xclang', 'haswell',
          '-Xclang', '-target-feature', '-Xclang', '+avx2',
+         '-Xclang', '-target-feature', '-Xclang', '-xop',
+         '-Xclang', '-target-feature', '-Xclang', '-ospke',
          '-c', str(self.source)], str(self.root), keeper, 'lz4s')
     self.assertTrue(any('/.distcc-system/' in path for path in files))
 
