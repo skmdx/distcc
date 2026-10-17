@@ -52,7 +52,9 @@ One full GCC preprocessing process runs per request. Dependency-only mode is
 insufficient: ordinary macro expansion can affect later include conditions
 through __COUNTER__. Collected records use bounded buffered output; diagnostic
 macro-expansion provenance is disabled during collection only.
-PCH, modules and embed directives require local preprocessing. GCC workers use
+PCH and embed directives require local preprocessing. Compiler module and
+dependency-scanner flags require local compilation because their sidecar outputs
+are not part of the remote job protocol. GCC workers use
 the same module's libcpp search callback to resolve absolute include operands
 and existence probes inside the transferred input tree. Absolute operands with
 parent-directory traversal and Clang absolute operands still require local
