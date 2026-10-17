@@ -71,8 +71,9 @@ static unsigned history_slot(const struct dcc_work_model *model, uint64_t key)
 
 static double initial_rate(unsigned kind)
 {
-    double rate = kind % 3 == 1 ? 1 : kind % 3 == 2 ? .0625 : .25;
-    return kind >= 3 ? rate * 16 : rate;
+    /* Pump now measures the whole uncompressed tree, so a source-only
+     * expansion multiplier would count the headers twice. */
+    return kind % 3 == 1 ? 1 : kind % 3 == 2 ? .0625 : .25;
 }
 
 static double source_size(const struct dcc_work_hint *hint)
@@ -128,7 +129,7 @@ double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_wor
         return model->history[i].seconds * ratio;
     }
     /* Cold estimates only bridge the first completed jobs in each class.
-     * Raw sources and preprocessed inputs have independent learned rates. */
+     * Source trees and preprocessed inputs have independent learned rates. */
     const struct dcc_work_class *c = &model->classes[kind];
     double seconds = hint->bytes / 1048576.0 * (c->xx ? c->input_rate : initial_rate(kind))
                    + source_size(hint) * c->source_rate;

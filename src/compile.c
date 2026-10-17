@@ -46,6 +46,8 @@
 #include <assert.h>
 
 #include "distcc.h"
+#include "job.h"
+#include "resource.h"
 #include "trace.h"
 #include "exitcode.h"
 #include "util.h"
@@ -710,6 +712,7 @@ dcc_build_somewhere(char *argv[],
     char *input_fname = NULL, *output_fname, *cpp_fname = NULL, *deps_fname = NULL;
     int cpp_fd = -1;
     char **files = NULL;
+    struct dcc_job *prepared_job = NULL;
     char **server_side_argv = NULL;
     char **localcpp_server_argv = NULL;
     char **remotecpp_server_argv = NULL;
@@ -811,6 +814,10 @@ dcc_build_somewhere(char *argv[],
         if (count && same_format) {
             ret = dcc_talk_to_include_server(argv, &files, compr);
         }
+        if (!ret && files && compr == DCC_COMPRESS_LZ4_STREAM) {
+            prepared_job = dcc_job_describe(argv, NULL, -1, files);
+            if (!prepared_job) { ret = EXIT_IO_ERROR; goto fallback; }
+        }
         if (count && same_format && ret) {
             rs_log_warning("failed to get includes from include server, "
                            "preprocessing locally before worker selection");
@@ -848,6 +855,10 @@ dcc_build_somewhere(char *argv[],
 
     if (getenv("DISTCC_BROKER"))
         dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready);
+    if (prepared_job && work.key)
+        work.bytes = dcc_resource_input_bytes(prepared_job);
+    else if (!cpp_ready)
+        work = (struct dcc_work_hint){0};
 
     /* Lock ordering invariant: always acquire the lock for the
      * remote host (if any) first. */
@@ -921,6 +932,8 @@ dcc_build_somewhere(char *argv[],
             goto fallback;
         }
         files = NULL;
+        dcc_job_free(prepared_job);
+        prepared_job = NULL;
 
         /* Include analysis may have fallen back after host selection. */
         if (!cpp_ready && local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
@@ -961,6 +974,7 @@ dcc_build_somewhere(char *argv[],
                                   cpp_fname,
                                   cpp_fd,
                                   files,
+                                  prepared_job,
                                   output_fname,
                                   needs_dotd ? deps_fname : NULL,
                                   &server_stderr,
@@ -1140,6 +1154,7 @@ dcc_build_somewhere(char *argv[],
     }
 
   clean_up:
+    dcc_job_free(prepared_job);
     if (cpp_fd >= 0) { close(cpp_fd); free(cpp_fname); }
     dcc_free_argv(argv);
     if (remotecpp_server_argv != NULL) {

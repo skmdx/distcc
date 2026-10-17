@@ -112,9 +112,12 @@ class StatisticsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'broker.log'
             path.write_text('job cost: key=ab execute=2.000 prepare=0.250 queue=0.125 host=worker\n'
+                            'assigning host=worker cost=2.000 score=2.005 broker_wait=0.375\n'
                             'include server gave up analyzing\nninja -v -j8\n')
             result = measure.log_summary([path])
             self.assertEqual(result['phases']['prepare']['total_seconds'], .25)
+            self.assertEqual(result['phases']['broker_wait']['total_seconds'], .375)
+            self.assertEqual(result['assignments'], {'worker': 1})
             self.assertEqual(result['analysis_warnings'], 1)
             self.assertEqual(result['ninja_jobs'], [8])
 

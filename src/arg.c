@@ -230,6 +230,12 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
             } else if (!strcmp(a, "-frepo")) {
                 rs_log_info("compiler will emit .rpo files; must be local");
                 return EXIT_DISTCC_FAILED;
+            } else if (!strcmp(a, "-fmodules-ts") || !strcmp(a, "-fmodules") ||
+                       str_startswith("-fmodule-", a) || str_startswith("-fdeps-", a)) {
+                /* Module scans and compilation exchange local mapper, BMI and
+                 * dependency files beyond the object/depfile RPC contract. */
+                rs_trace("%s requires local module artifacts", a);
+                return EXIT_DISTCC_FAILED;
             } else if (str_startswith("-x", a)
                        && argv[i+1]
                        && !str_startswith("c", argv[i+1])

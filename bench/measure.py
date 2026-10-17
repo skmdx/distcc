@@ -94,6 +94,8 @@ def summarize_samples(samples, names):
 def log_summary(paths):
     counts = dict(analysis_warnings=0, io_timeouts=0, sandbox_denials=0, broker_waits=0)
     timings = []
+    waits = []
+    assignments = {}
     jobs = set()
     for path in paths:
         if not path.exists():
@@ -107,12 +109,20 @@ def log_summary(paths):
                 if 'job cost:' in line:
                     fields = dict(re.findall(r'(\w+)=([^ ]+)', line))
                     timings.append({key: float(fields[key]) for key in ('prepare', 'queue', 'execute')})
+                if 'assigning host=' in line and 'broker_wait=' in line:
+                    fields = dict(re.findall(r'(\w+)=([^ ]+)', line))
+                    waits.append(float(fields['broker_wait']))
+                    host = fields['host']
+                    assignments[host] = assignments.get(host, 0) + 1
                 if 'ninja ' in line:
                     jobs.update(map(int, re.findall(r'(?:^|\s)-j\s*(\d+)', line)))
     phases = {key: dict(total_seconds=sum(t[key] for t in timings),
                         mean_seconds=sum(t[key] for t in timings) / len(timings))
               for key in ('prepare', 'queue', 'execute')} if timings else {}
-    return dict(**counts, feedback_jobs=len(timings), phases=phases, ninja_jobs=sorted(jobs))
+    if waits:
+        phases['broker_wait'] = dict(total_seconds=sum(waits), mean_seconds=sum(waits) / len(waits))
+    return dict(**counts, feedback_jobs=len(timings), assignments=assignments,
+                phases=phases, ninja_jobs=sorted(jobs))
 
 
 def fingerprint(tree):

@@ -47,6 +47,8 @@
 #include "fcntl.h"
 #include "daemon.h"
 #include "resource.h"
+#include "adaptive.h"
+#include "job.h"
 #include "cpuperf.h"
 #include <poll.h>
 #ifdef __linux__
@@ -362,8 +364,9 @@ static void dcc_service_stats_request(int http_fd) {
     int *ct;
     size_t reply_len;
     char challenge[1024];
-    char reply[4096];
+    char reply[DCC_STATS_SIZE];
     char compile_capacity[DCC_MEMORY_BUCKETS * 12];
+    char pump_capacity[DCC_MEMORY_BUCKETS * 12];
     struct dcc_sockaddr_storage cli_addr;
     socklen_t cli_len = sizeof(cli_addr);
     double loadavg[3];
@@ -429,6 +432,7 @@ dcc_job_memory_samples %u\n\
 dcc_job_peak_bytes %llu\n\
 dcc_memory_spare_bytes %llu\n\
 dcc_compile_capacity %s\n\
+dcc_pump_capacity %s\n\
 dcc_local_input_jobs %llu\n\
 dcc_local_input_bytes %llu\n\
 dcc_tcp_ready_idle_ns %llu\n\
@@ -454,11 +458,15 @@ dcc_free_mem %d MB\n\
     dcc_cpu_topology(&ncpus, &ncores, &core_scale, &smt_gain);
     dcc_cpu_perf_get(&perf);
     int cpu_limit = dcc_cpu_perf_limit(dcc_max_kids);
-    size_t capacity_length = 0;
-    for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i)
+    size_t capacity_length = 0, pump_length = 0;
+    for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
         capacity_length += snprintf(compile_capacity + capacity_length,
             sizeof(compile_capacity) - capacity_length, "%s%d", i ? "," : "",
-            dcc_resource_compile_slots(cpu_limit, i));
+            dcc_resource_class_slots(cpu_limit, 1 + DCC_JOB_COMPILE * DCC_MEMORY_BUCKETS + i));
+        pump_length += snprintf(pump_capacity + pump_length,
+            sizeof(pump_capacity) - pump_length, "%s%d", i ? "," : "",
+            dcc_resource_class_slots(cpu_limit, 1 + DCC_JOB_PUMP * DCC_MEMORY_BUCKETS + i));
+    }
 #ifdef __linux__
     admission = dcc_prefork_status(&load);
     capacity = dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids));
@@ -508,7 +516,7 @@ dcc_free_mem %d MB\n\
                                running, load.busy, load.queued, load.preparing, load.returning,
                                capacity, dcc_resource_job_bytes(), dcc_resource_samples(),
                                dcc_resource_peak_bytes(), dcc_resource_spare_bytes(),
-                               compile_capacity,
+                               compile_capacity, pump_capacity,
                                (unsigned long long)dcc_tcp_local_input_jobs(),
                                (unsigned long long)dcc_tcp_local_input_bytes(),
                                ready_idle_ns, parallel_tasks, parallel_peak,

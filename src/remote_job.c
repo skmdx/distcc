@@ -61,7 +61,7 @@ static int snapshot_size(const char *name, uint64_t wire, uint64_t *plain)
     return ret;
 }
 
-static struct dcc_job *describe(char **argv, const char *cpp, int cpp_fd, char **files)
+struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char **files)
 {
     struct dcc_job *job = calloc(1, sizeof(*job));
     struct dcc_input_digest *digests = NULL;
@@ -181,14 +181,21 @@ static int publish(int *source, struct dcc_job_result *result, unsigned index, c
     *source = -1;
     return failed || rename(result->temporary[index], path) ? EXIT_IO_ERROR : 0;
 }
-int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, int cpp_fd, char **files,
+int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char **argv, const char *cpp, int cpp_fd, char **files,
                        const char *output, const char *deps, struct dcc_buffer *err,
                        struct dcc_buffer *out, int *status)
 {
-    struct dcc_job *job = describe(argv, cpp, cpp_fd, files);
+    struct dcc_job *job = prepared ? prepared : dcc_job_describe(argv, cpp, cpp_fd, files);
     struct dcc_job_result result;
     int ret = EXIT_IO_ERROR, transport_complete = 0, need_cpp = 0;
     dcc_job_result_init(&result);
+    /* Input metadata survives worker selection and retries. Final driver
+     * arguments can add dependency targets after selection. */
+    if (prepared) {
+        dcc_free_argv(job->argv);
+        job->argv = NULL;
+        if (dcc_copy_argv(argv, &job->argv, 0)) goto done;
+    }
     if (!job || (ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result))) goto done;
     need_cpp = files && WIFEXITED(result.status) && WEXITSTATUS(result.status) == EXIT_LOCAL_CPP;
     /* No compiler ran: do not train the scheduler on header verification. */
@@ -209,6 +216,6 @@ int dcc_compile_direct(struct dcc_hostdef *host, char **argv, const char *cpp, i
     }
 done:
     dcc_job_result_free(&result);
-    dcc_job_free(job);
+    if (!prepared) dcc_job_free(job);
     return transport_complete && ret ? DCC_REMOTE_LOCAL_ERROR : ret;
 }

@@ -349,7 +349,7 @@ class BrokerTest(BrokerTestCase):
         with socket.socket(fileno=descriptors[0]) as selected:
             self.assertEqual(selected.getpeername()[1], self.ports[0])
 
-    def test_fast_smt_and_independent_cores_compare_completion_time(self):
+    def test_independent_cores_precede_smt_that_displaces_more_work(self):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16,
                     running=0, busy=0, queued=0, preparing=0, returning=0, capacity=16)),
                  self.peer(stats_response(cpus=4, cores=2, jobs=4,
@@ -358,7 +358,9 @@ class BrokerTest(BrokerTestCase):
                                   slots=16 if i == 0 else 4)
                          for i, p in enumerate(peers))
         self.start_broker(hosts)
-        for index, expected in enumerate([0] * 10 + [1] * 2 + [0]):
+        # Independent cores add .8 units of throughput. Another sibling on
+        # the faster host adds only .25, despite a lower individual latency.
+        for index, expected in enumerate([0] * 8 + [1] * 2 + [0] * 3):
             _, net = self.acquire_reserved(10, (1000 + index, 4 * 1024 * 1024, 1))
             self.assertEqual(net.getpeername()[1], self.ports[expected], index)
 
@@ -392,6 +394,21 @@ class BrokerTest(BrokerTestCase):
         self.receive(self.request(13))  # This broker owns an active input producer.
         _, selected = self.acquire_reserved(10, (1100, 4 * 1024 * 1024, 1))
         self.assertEqual(selected.getpeername()[1], self.ports[1])
+
+    def test_remote_compilers_do_not_hide_idle_physical_cores(self):
+        peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                    running=8, busy=8, queued=0, preparing=0, returning=0)),
+                 self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                    running=0, busy=0, queued=0, preparing=0, returning=0))]
+        hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={1 if i == 0 else .49}',
+                                  slots=16 if i == 0 else 4)
+                         for i, p in enumerate(peers))
+        self.start_broker(hosts)
+        # No local preprocessing lease: contention belongs to remote workers.
+        # Pump hints and preprocessed hints must obey the same CPU contract.
+        for index, kind in enumerate((4, 1)):
+            _, selected = self.acquire_reserved(10, (1200 + index, 4 * 1024 * 1024, kind))
+            self.assertEqual(selected.getpeername()[1], self.ports[1])
 
     def test_job_cost_overrun_does_not_starve_idle_worker(self):
         peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
@@ -566,6 +583,24 @@ class BrokerTest(BrokerTestCase):
         self.assertEqual(first_net.getpeername()[1], self.ports[0])
         _, next_net = self.acquire_reserved(10, (91, 4 * 1024 * 1024, 1))
         self.assertEqual(next_net.getpeername()[1], self.ports[1])
+
+    def test_pump_uses_header_tree_capacity_instead_of_small_compile_capacity(self):
+        for capacity in (-1, 1):
+            with self.subTest(capacity=capacity):
+                capacities = [4] * 64
+                capacities[22] = capacity
+                peers = [self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
+                             queued=0, preparing=0, returning=0, running=0,
+                             pump_capacity=capacities)),
+                         self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
+                             queued=0, preparing=0, returning=0, running=0))]
+                hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={1.5 if i == 0 else 1}')
+                                 for i, p in enumerate(peers))
+                self.start_broker(hosts, name=f'pump-class-{capacity}')
+                _, first = self.acquire_reserved(10, (990, 4 * 1024 * 1024, 5))
+                _, second = self.acquire_reserved(10, (991, 4 * 1024 * 1024, 5))
+                self.assertEqual(first.getpeername()[1], self.ports[0])
+                self.assertEqual(second.getpeername()[1], self.ports[1])
 
     def test_tcp_global_pipeline_and_resource_limits(self):
         for name, metrics in (

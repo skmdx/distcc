@@ -187,14 +187,20 @@ unsigned dcc_resource_bucket(unsigned long long bytes)
     return bucket;
 }
 
-unsigned dcc_resource_class(const struct dcc_job *job)
+unsigned long long dcc_resource_input_bytes(const struct dcc_job *job)
 {
     unsigned long long bytes = 0;
     for (unsigned i = 0; i < job->count; ++i) {
         unsigned long long size = job->inputs[i].plain_size;
         bytes = size <= ULLONG_MAX - bytes ? bytes + size : ULLONG_MAX;
     }
-    return 1 + job->kind * DCC_MEMORY_BUCKETS + dcc_resource_bucket(bytes);
+    return bytes;
+}
+
+unsigned dcc_resource_class(const struct dcc_job *job)
+{
+    return 1 + job->kind * DCC_MEMORY_BUCKETS +
+           dcc_resource_bucket(dcc_resource_input_bytes(job));
 }
 
 int dcc_resource_known(unsigned memory_class)
@@ -295,9 +301,8 @@ int dcc_resource_slots(int maximum)
     return resource_slots(maximum, dcc_resource_job_bytes(), dcc_resource_spare_bytes(), 1);
 }
 
-int dcc_resource_compile_slots(int maximum, unsigned bucket)
+int dcc_resource_class_slots(int maximum, unsigned memory_class)
 {
-    unsigned memory_class = 1 + DCC_JOB_COMPILE * DCC_MEMORY_BUCKETS + bucket;
     unsigned long long job = dcc_resource_estimate(memory_class);
     if (!dcc_resource_known(memory_class))
         return resource_slots(1, job, 0, 0) ? -1 : 0;

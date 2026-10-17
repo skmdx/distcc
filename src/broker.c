@@ -61,7 +61,7 @@ struct peer {
     int admission_supported;
     int local;
     size_t used;
-    char stats[4096];
+    char stats[DCC_STATS_SIZE];
     /* Seconds/byte for prepared network input; seconds/job otherwise. */
     double prepare_cost[DCC_WORK_CLASSES];
     double mean_cost;
@@ -650,8 +650,8 @@ struct dispatch_batch {
 };
 static int bulk_input(const struct peer *peer, const struct dcc_work_hint *hint)
 {
-    /* Local inputs normally pass a sealed FD. A raw source's size does not
-     * describe its include tree, so neither predicts uploaded byte volume. */
+    /* Local inputs normally pass a sealed FD. Pump's logical tree includes
+     * cached headers, so its size does not predict uploaded byte volume. */
     return !peer->local && hint->kind <= 3;
 }
 
@@ -783,9 +783,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         const struct dcc_capacity *cap = p->valid_until > now ? &p->metrics : NULL;
         struct dcc_capacity projected;
         int cold = 0;
-        if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= 3) {
+        if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= 6) {
             projected = *cap;
-            int limit = cap->compile_capacity[dcc_resource_bucket(client->hint.bytes)];
+            const int *capacities = client->hint.kind > 3 ? cap->pump_capacity : cap->compile_capacity;
+            int limit = capacities[dcc_resource_bucket(client->hint.bytes)];
             cold = limit < 0;
             projected.capacity = cold ? 1 : limit;
             cap = &projected;
@@ -845,7 +846,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             projected.queued = 0;
             cap = &projected;
         }
-        /* Let an unfamiliar prepared-input size obtain a real memory sample
+        /* Let an unfamiliar input class obtain a real memory sample
          * before reserving more work there. Otherwise a fast input burst can
          * strand a queue behind the worker's single calibration job. */
         if (cold && work) continue;
@@ -871,12 +872,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 wait = blocked || work >= lanes || p->busy >= inflight ||
                        forecast.start > forecast.prepare + .02;
             } else if (cost > 0) score *= cost;
-            /* Protect this build's input producers when compilation shares
-             * their machine. Otherwise compare actual completion estimates:
-             * an idle slow core is not intrinsically better than a fast queue.
-             * Without a cost hint, marginal throughput remains the estimate. */
+            /* Charge the throughput displaced by another compiler on every
+             * worker, including existing compiles on a remote SMT core.
+             * Minimizing this job's latency alone packs the fastest worker's
+             * SMT lanes while independent physical cores remain unused. */
             if (staged && cap && !link && !blocked &&
-                (!predicted || (p->local && broker->cpp_busy > 0)) &&
                 work < dcc_capacity_jobs(p->host, cap)) {
                 const struct dcc_capacity *observed = &p->metrics;
                 double external = (observed->running >= 0 ? observed->running : observed->load)
@@ -936,7 +936,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         client->deadline = now + delay;
     } else if (best >= 0 && (!local_cpp || broker->cpp_busy < broker->cpp_limit)) {
         struct peer *p = &broker->peers[best];
-        rs_trace("assigning host=%s cost=%.3f score=%.3f", p->host->hostname, cost, best_score);
+        rs_trace("assigning host=%s cost=%.3f score=%.3f broker_wait=%.6f",
+                 p->host->hostname, cost, best_score, now - client->waiting_since);
         client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
                             p->admission_supported && p->pool_supported >= 0;
         client->net = client->command != ACQUIRE ? pool_take(broker, best, now) : -1;

@@ -15,6 +15,7 @@ import signal
 import struct
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import unittest
@@ -81,6 +82,92 @@ class AnalyzerPoolTest(PumpTestCase):
     cpp_slots = 2
     compression = 'lz4'
     transport = ',tcp'
+
+    def test_broker_and_worker_classify_the_same_pump_input_tree(self):
+        source = self.work / 'tiny.c'
+        source.write_text('#include "large.h"\nint value = ANSWER;\n')
+        (self.work / 'large.h').write_text('/*' + ' ' * (2 * 1024 * 1024) + '*/\n#define ANSWER 42\n')
+        saved = self.env.copy()
+        self.base_env['DISTCC_VERBOSE'] = '1'
+        self.addCleanup(self.base_env.pop, 'DISTCC_VERBOSE', None)
+        self.start_broker(self.host(0, f',lz4,tcp,stats={self.stats_ports[0]}'), name='tree-capacity')
+        saved.update(DISTCC_BROKER=self.env['DISTCC_BROKER'], DISTCC_HOSTS=self.env['DISTCC_HOSTS'])
+        self.env = saved
+        remote = self.run_cc('gcc', ['-c', source, '-o', 'tree.o'])
+        self.assertEqual(remote.returncode, 0, remote.stderr.decode())
+        output = (self.work / 'tree.o').read_bytes()
+        local = self.run_cc('gcc', ['-c', source, '-o', 'tree.o'], remote=False)
+        self.assertEqual(local.returncode, 0, local.stderr.decode())
+        self.assertEqual(output, (self.work / 'tree.o').read_bytes())
+        feedback = (self.work / 'tree-capacity.log').read_text()
+        match = re.search(r'job cost:.*kind=4 bytes=(\d+) source=(\d+)', feedback)
+        self.assertIsNotNone(match, feedback)
+        size, raw = map(int, match.groups())
+        self.assertGreater(size, 2 * 1024 * 1024)
+        self.assertEqual(raw, source.stat().st_size)
+        stats = self.get_stats(self.stats_ports[0])
+        vector = re.search(r'dcc_pump_capacity ([^\n]+)', stats).group(1)
+        self.assertGreater(int(vector.split(',')[size.bit_length() - 1]), 0)
+
+    def test_module_scan_and_compile_are_local_without_analysis_fallback(self):
+        source = self.work / 'module.cc'
+        source.write_text('export module example;\nexport int answer() { return 42; }\n')
+        commands = [(['-std=c++20', '-fmodules-ts', '-E', source, '-o', 'module.i',
+                      '-MD', '-MF', 'module.d',
+                      '-fdeps-file=module.ddi', '-fdeps-format=p1689r5',
+                      '-fdeps-target=module.o'], ['module.i', 'module.ddi']),
+                    (['-std=c++20', '-fmodules-ts', '-c', source, '-o', 'module.o'],
+                     ['module.o', 'gcm.cache/example.gcm'])]
+        log = self.work / 'client.log'
+        log.write_text('')
+        for args, outputs in commands:
+            local = self.run_cc('g++', args, remote=False)
+            self.assertEqual(local.returncode, 0, local.stderr.decode())
+            expected = {name: (self.work / name).read_bytes() for name in outputs}
+            for name in outputs:
+                (self.work / name).unlink()
+            wrapped = self.run_cc('g++', args)
+            self.assertEqual(wrapped.returncode, 0, wrapped.stderr.decode())
+            self.assertEqual(expected, {name: (self.work / name).read_bytes() for name in outputs})
+        self.assertNotIn('send CDIR', log.read_text())
+        self.assertNotIn('gave up analyzing', log.read_text())
+
+    def test_shutdown_finishes_before_supervisor_is_reaped(self):
+        # A service supervisor may reap adopted daemons only after its shutdown
+        # command returns. Exercise that lifecycle with a real include server.
+        script = textwrap.dedent('''\
+            import ctypes, os, shlex, signal, subprocess, sys
+            assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith('INCLUDE_SERVER_')}
+            env['INCLUDE_SERVER_ARGS'] = '--workers=1'
+            startup = subprocess.run([sys.argv[1], '--startup'], env=env,
+                                     capture_output=True, text=True, timeout=15, check=True)
+            for line in startup.stdout.splitlines():
+                words = shlex.split(line)
+                if len(words) == 2 and words[0] == 'export':
+                    key, value = words[1].split('=', 1)
+                    env[key] = value
+            pid = int(env['INCLUDE_SERVER_PID'])
+            try:
+                subprocess.run([sys.argv[1], '--shutdown'], env=env,
+                               capture_output=True, timeout=5, check=True)
+                # waitid with WNOWAIT proves the dead supervisor is still ours
+                # to reap; shutdown did not depend on this parent doing so.
+                status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+                assert status is not None and status.si_pid == pid
+                assert not os.path.exists(env['INCLUDE_SERVER_PORT'])
+            finally:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(pid, 0)
+            ''')
+        result = subprocess.run([sys.executable, '-c', script, str(self.build / 'pump')],
+                                cwd=self.work, env=self.env, capture_output=True,
+                                text=True, timeout=25)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_cpu_capacity_obeys_affinity(self):
         allowed = os.sched_getaffinity(0)

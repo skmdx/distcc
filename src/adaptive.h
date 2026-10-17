@@ -1,5 +1,6 @@
 /* Adaptive host selection.  SPDX-License-Identifier: GPL-2.0-or-later */
 #include "resource.h"
+#define DCC_STATS_SIZE 8192
 struct dcc_hostdef;
 struct dcc_capacity {
     int cpus, cores, jobs;
@@ -11,6 +12,7 @@ struct dcc_capacity {
     int running, busy, queued, links, admission, available;
     int preparing, returning, capacity;
     int compile_capacity[DCC_MEMORY_BUCKETS];
+    int pump_capacity[DCC_MEMORY_BUCKETS];
 };
 int dcc_parse_capacity(char *buf, struct dcc_capacity *cap);
 int dcc_capacity_slots(const struct dcc_hostdef *host, const struct dcc_capacity *cap);

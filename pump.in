@@ -364,18 +364,33 @@ ReportDiscrepancies() {
 ShutDown() {
   ReportDiscrepancies
   # Always -- at exit -- shut down include_server and remove $socket_dir
-  if [ -n "$include_server_pid" ] && \
-    ps -p "$include_server_pid" > /dev/null; then
+  if [ -n "$include_server_pid" ]; then
     if [ "$verbose" = 1 ]; then
       echo '__________Shutting down distcc-pump include server'
     fi
-    kill $include_server_pid
-    # Wait until it's really dead.  We need to do this because the
-    # include server may produce output after receiving SIGTERM.
-    # Note that while 'sleep 0.01' is relying on a feature of GNU sleep,
-    # that's OK; on systems that don't support it, it's effectively the
-    # same as 'sleep 0', i.e. we'll just busy-wait rather than sleeping.
-    while kill -0 $include_server_pid; do sleep 0.01; done >/dev/null 2>&1
+    # A build supervisor may adopt the daemon and reap it only after this
+    # command returns. kill -0 treats that zombie as alive and deadlocks.
+    # A pidfd observes exit independently of reaping, without spawning a sleep
+    # process on every poll or signalling a PID which has been reused.
+    "$PYTHON" - "$include_server_pid" <<'PY'
+import os
+import select
+import signal
+import sys
+
+try:
+    fd = os.pidfd_open(int(sys.argv[1]))
+except ProcessLookupError:
+    sys.exit(0)
+try:
+    signal.pidfd_send_signal(fd, signal.SIGTERM)
+except ProcessLookupError:
+    pass
+poll = select.poll()
+poll.register(fd, select.POLLIN)
+poll.poll()
+os.close(fd)
+PY
   fi
 
   if [ -f "$include_server_stdout" ]; then

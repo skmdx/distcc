@@ -39,6 +39,7 @@ struct dcc_job_result {
     char *temporary[DCC_JOB_RESULT_COUNT];
 };
 void dcc_job_free(struct dcc_job *);
+struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char **files);
 void dcc_job_result_init(struct dcc_job_result *);
 void dcc_job_result_free(struct dcc_job_result *);
 /* No file payload is copied into metadata. */
@@ -52,7 +53,7 @@ struct dcc_buffer;
  * Results own open FDs before the worker removes temporary pathnames. */
 int dcc_execute_job(struct dcc_job *, const char *root, int cancel_fd, struct dcc_job_result *);
 struct dcc_hostdef;
-int dcc_compile_direct(struct dcc_hostdef *, char **argv, const char *cpp, int cpp_fd, char **files,
+int dcc_compile_direct(struct dcc_hostdef *, struct dcc_job *, char **argv, const char *cpp, int cpp_fd, char **files,
                        const char *output, const char *deps, struct dcc_buffer *err,
                        struct dcc_buffer *out, int *status);
 #endif

@@ -32,16 +32,20 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
                    core_scale: float | str = 1, smt_gain: float | str = .25,
                    cpu_scale: float | str = -1, cpu_age: float | str = -1,
                    cpu_probe: float | str = 0,
-                   compile_capacity=None, **metrics):
+                   compile_capacity=None, pump_capacity=None, **metrics):
     if compile_capacity is None:
         compile_capacity = [metrics.get('capacity', jobs)] * 64
     capacities = compile_capacity if isinstance(compile_capacity, str) else ','.join(map(str, compile_capacity))
+    if pump_capacity is None:
+        pump_capacity = [metrics.get('capacity', jobs)] * 64
+    pump = pump_capacity if isinstance(pump_capacity, str) else ','.join(map(str, pump_capacity))
     return ("HTTP/1.0 200 OK\n\n<distccstats>\n"
             f"dcc_cpus {cpus}\ndcc_max_kids {jobs}\ndcc_load1 {load}\n"
             f"dcc_cores {cpus if cores is None else cores}\ndcc_smt_gain {smt_gain}\n"
             f"dcc_core_scale {core_scale}\n"
             f"dcc_cpu_scale {cpu_scale}\ndcc_cpu_age {cpu_age}\ndcc_cpu_probe {cpu_probe}\n"
             f"dcc_compile_capacity {capacities}\n"
+            f"dcc_pump_capacity {pump}\n"
             + ''.join(f'dcc_{name} {value}\n' for name, value in metrics.items())
             + "</distccstats>\n").encode()
 
@@ -505,7 +509,9 @@ int main(void) {
     assert(dcc_resource_bucket(0) == 0);
     assert(dcc_resource_bucket(ULLONG_MAX) == 63);
     assert(!dcc_resource_known(small));
-    assert(dcc_resource_compile_slots(16, 10) == -1);
+    assert(dcc_resource_class_slots(16, small) == -1);
+    assert(dcc_resource_class_slots(16, pump) == -1);
+    assert(dcc_resource_input_bytes(&job) == 2048);
     assert(dcc_resource_estimate(small) == 512*M);
     assert(!dcc_resource_admit(small, 0, 1));
     dcc_resource_observe(small, 64*M, 1);
@@ -513,7 +519,7 @@ int main(void) {
     assert(dcc_resource_known(small));
     assert(!dcc_resource_known(large));
     assert(dcc_resource_estimate(large) == 512*M);
-    int small_slots = dcc_resource_compile_slots(16, 10);
+    int small_slots = dcc_resource_class_slots(16, small);
     assert(small_slots > 0);
     dcc_resource_observe(large, 896*M, 1);
     assert(dcc_resource_job_bytes() == 1184*M);
@@ -521,8 +527,8 @@ int main(void) {
     assert(dcc_resource_estimate(large) == 1184*M);
     assert(dcc_resource_estimate(pump) == 1184*M);
     assert(!dcc_resource_known(pump));
-    assert(dcc_resource_compile_slots(16, 11) < small_slots);
-    assert(dcc_resource_compile_slots(16, 10) == small_slots);
+    assert(dcc_resource_class_slots(16, large) < small_slots);
+    assert(dcc_resource_class_slots(16, small) == small_slots);
     /* Later smaller successes must not erase the class's observed demand. */
     dcc_resource_observe(large, 64*M, 1);
     assert(dcc_resource_estimate(large) == 1184*M);
@@ -535,7 +541,7 @@ int main(void) {
     dcc_resource_observe(large, ULLONG_MAX, 1);
     assert(dcc_resource_job_bytes() == ULLONG_MAX);
     assert(dcc_resource_estimate(large) == ULLONG_MAX);
-    assert(dcc_resource_compile_slots(16, 11) == 0);
+    assert(dcc_resource_class_slots(16, large) == 0);
     assert(!dcc_resource_admit(large, 0, 0));
     assert(dcc_resource_estimate(small) == 256*M);
     unsetenv("DISTCC_MEMORY_LEARNING");
@@ -543,7 +549,7 @@ int main(void) {
     assert(dcc_resource_spare_bytes() == 128*M);
     assert(dcc_resource_estimate(large) == 512*M);
     assert(dcc_resource_known(pump));
-    assert(dcc_resource_compile_slots(16, 63) > 0);
+    assert(dcc_resource_class_slots(16, 1 + 63) > 0);
     return 0;
 }''')
             executable=root/'memory'

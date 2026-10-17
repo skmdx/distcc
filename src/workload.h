@@ -8,7 +8,7 @@
 #define DCC_WORK_WAYS 4
 struct dcc_work_hint {
     uint64_t key, bytes;
-    uint32_t kind, source_bytes; /* 1..3: preprocessed C/C++/asm; 4..6: source. */
+    uint32_t kind, source_bytes; /* 1..3: preprocessed C/C++/asm; 4..6: source + headers. */
 };
 struct dcc_work_class {
     double xx, xy, yy, xz, yz;
