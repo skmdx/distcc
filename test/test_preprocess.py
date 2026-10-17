@@ -92,7 +92,8 @@ class AnalyzerPoolTest(PumpTestCase):
                 env = dict(self.env, T=str(self.root), DISTCC_PUMP='1', FEATURES='distcc',
                            PATH=str(self.build) + ':' + self.env['PATH'])
                 for key in ('INCLUDE_SERVER_PID', 'INCLUDE_SERVER_DIR', 'INCLUDE_SERVER_PORT',
-                            'DISTCC_CLIENT_TMP', 'DISTCC_PUMP_ACTIVE', 'DISTCC_PUMP_CLIENT_TMP'):
+                            'DISTCC_CLIENT_TMP', 'DISTCC_PUMP_ACTIVE', 'DISTCC_PUMP_CLIENT_TMP',
+                            'DISTCC_PUMP_CLIENT_FD'):
                     env.pop(key, None)
                 if directory is not None:
                     env['DISTCC_CLIENT_TMP'] = directory
@@ -129,7 +130,7 @@ done
                 self.assertIn(f'dcc_compile_ok {int(counter[1]) + 2}\n',
                               self.get_stats(self.stats_ports[0]))
 
-    def test_portage_tmpfs_cleanup_isolates_pid_namespaces(self):
+    def portage_namespace_command(self):
         probe = subprocess.run(['unshare', '-Urpf', '--mount-proc', 'true'],
                                capture_output=True, timeout=5)
         if probe.returncode:
@@ -138,12 +139,19 @@ done
         env = dict(self.env, T=str(self.root), DISTCC_PUMP='1', FEATURES='distcc',
                    PATH=str(self.build) + ':' + self.env['PATH'])
         for key in ('INCLUDE_SERVER_PID', 'INCLUDE_SERVER_DIR', 'INCLUDE_SERVER_PORT',
-                    'DISTCC_CLIENT_TMP', 'DISTCC_PUMP_ACTIVE', 'DISTCC_PUMP_CLIENT_TMP'):
+                    'DISTCC_CLIENT_TMP', 'DISTCC_PUMP_ACTIVE', 'DISTCC_PUMP_CLIENT_TMP',
+                    'DISTCC_PUMP_CLIENT_FD'):
             env.pop(key, None)
-        command = ['unshare', '-Urpf', '--mount-proc', 'bash', '-c', '''
+        command = ['unshare', '-Urpf', '--kill-child', '--mount-proc', 'bash', '-c', '''
 has() { local word=$1; shift; [[ " $* " == *" $word "* ]]; }
 register_die_hook() { :; }
 die() { echo "$*" >&2; exit 1; }
+pump() {
+    if [[ $1 == --startup ]]; then
+        echo 1000 > /proc/sys/kernel/ns_last_pid || exit 1
+    fi
+    command pump "$@"
+}
 source "$1"
 trap distcc_pump_stop EXIT
 distcc_pump_start
@@ -153,33 +161,56 @@ read -r proceed || exit 1
 "$2" gcc -c "$3" -o "$DISTCC_CLIENT_TMP/result.o"
 ''', 'portage-namespace-test', str(self.build / 'packaging/gentoo/pump.bashrc'),
                    str(self.build / 'distcc'), str(self.source)]
-        processes = []
-        roots = []
-        pids = []
-        try:
-            for _ in range(2):
-                process = subprocess.Popen(command, cwd=self.work, env=env, text=True,
-                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE)
-                processes.append(process)
-                assert process.stdout is not None
-                self.assertTrue(select.select([process.stdout], [], [], 10)[0])
-                values = process.stdout.readline().strip().split('\t')
-                self.assertEqual(len(values), 2, 'The namespace must start and compile successfully')
-                roots.append(Path(values[0]))
-                pids.append(values[1])
-            self.assertEqual(pids[0], pids[1], 'Exercise the same PID in separate namespaces')
-            self.assertNotEqual(roots[0], roots[1])
-            for index, process in enumerate(processes):
-                _, stderr = process.communicate('\n', timeout=15)
-                self.assertEqual(process.returncode, 0, stderr)
-                self.assertFalse(roots[index].exists())
-                for remaining in roots[index + 1:]:
-                    self.assertTrue(remaining.exists(), 'Peer shutdown must preserve live storage')
-        finally:
-            for process in processes:
-                if process.poll() is None:
-                    process.communicate('\n', timeout=15)
+        return command, env
+
+    def start_portage_namespace(self, command, env):
+        process = subprocess.Popen(command, cwd=self.work, env=env, text=True,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        def cleanup():
+            process.communicate('\n' if process.poll() is None else None, timeout=15)
+        self.addCleanup(cleanup)
+        assert process.stdout is not None
+        self.assertTrue(select.select([process.stdout], [], [], 10)[0])
+        values = process.stdout.readline().strip().split('\t')
+        self.assertEqual(len(values), 2, 'The namespace must start and compile successfully')
+        return process, Path(values[0]), values[1]
+
+    def test_portage_tmpfs_cleanup_isolates_pid_namespaces(self):
+        command, env = self.portage_namespace_command()
+        first = self.start_portage_namespace(command, env)
+        second = self.start_portage_namespace(command, env)
+        self.assertEqual(first[2], second[2], 'Exercise the same PID in separate namespaces')
+        self.assertNotEqual(first[1], second[1])
+        for index, (process, root, _) in enumerate((first, second)):
+            _, stderr = process.communicate('\n', timeout=15)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertFalse(root.exists())
+            if index == 0:
+                self.assertTrue(second[1].exists(), 'Peer shutdown must preserve live storage')
+
+    def test_portage_tmpfs_recovers_after_namespace_kill(self):
+        command, env = self.portage_namespace_command()
+        process, root, _ = self.start_portage_namespace(command, env)
+        process.kill()
+        process.communicate(timeout=5)
+        self.assertTrue(root.exists(), 'SIGKILL must exercise abandoned storage')
+        # Wait for the kernel to finish killing namespace descendants, not just
+        # the outer unshare process, before testing collection of a dead lease.
+        with (root / 'lease').open('r+') as lease:
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+        replacement, new_root, _ = self.start_portage_namespace(command, env)
+        self.assertFalse(root.exists(), 'The next startup must collect abandoned storage')
+        _, stderr = replacement.communicate('\n', timeout=15)
+        self.assertEqual(replacement.returncode, 0, stderr)
+        self.assertFalse(new_root.exists())
 
     def test_startup_preserves_multiline_host_configuration(self):
         self.shutdown_pump()
