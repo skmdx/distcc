@@ -424,6 +424,40 @@ class BrokerTest(BrokerTestCase):
         with socket.socket(fileno=descriptors[0]) as selected:
             self.assertEqual(selected.getpeername()[1], self.ports[1])
 
+    def test_running_job_progress_survives_reduced_contention(self):
+        peers = [self.peer(stats_response(cpus=1, jobs=1, running=3, busy=0,
+                    queued=0, preparing=0, returning=0, capacity=1)),
+                 self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
+                    queued=0, preparing=0, returning=0, capacity=0))]
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={1 if i == 0 else 1/3}')
+                                  for i, p in enumerate(peers)))
+        first, net = self.acquire_reserved(10, (1300, 8 * 1024 * 1024, 1))
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+        # Two normalized seconds initially cost eight wall-clock seconds.
+        # Removing the competing work must not retrospectively count those
+        # first seconds at the newly available, four-times faster rate.
+        time.sleep(2.1)
+        peers[0].response = stats_response(cpus=1, jobs=1, running=1, busy=1,
+            queued=0, preparing=0, returning=0, capacity=1)
+        peers[1].response = stats_response(cpus=1, jobs=1, running=0, busy=0,
+            queued=0, preparing=0, returning=0, capacity=1)
+        deadline = time.monotonic() + 2
+        while self.receive(self.request(2))[1] != 2:
+            self.assertLess(time.monotonic(), deadline, 'updated capacities were not observed')
+            time.sleep(.01)
+        waiting = self.request(10, (1301, 4 * 1024 * 1024, 1))
+        waiting.settimeout(.1)
+        with self.assertRaises(socket.timeout):
+            waiting.recv(1032)
+        first.close()
+        peers[0].response = stats_response(cpus=1, jobs=1, running=0, busy=0,
+            queued=0, preparing=0, returning=0, capacity=1)
+        waiting.settimeout(3)
+        status, _, descriptors = self.receive(waiting)
+        self.assertEqual(status, 0)
+        with socket.socket(fileno=descriptors[0]) as selected:
+            self.assertEqual(selected.getpeername()[1], self.ports[0])
+
     def test_job_cost_prioritizes_heavy_waiter_on_fast_cpu(self):
         peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
                     queued=0, preparing=0, returning=0, capacity=1)) for _ in range(2)]

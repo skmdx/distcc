@@ -690,9 +690,12 @@ static struct prediction predict(struct broker *broker, const struct client *cli
         free_at[i] = (rounds + (i < unknown % lanes)) * average;
     for (int i = 0; i < count; ++i) {
         const struct client *c = assigned[i];
-        double duration = c->cost * result.factor;
         double elapsed = now > c->run_at ? now - c->run_at : 0;
-        double left = duration - elapsed;
+        /* Completed work belongs to the rate at which it was scheduled.
+         * Apply the new contention estimate only to the remaining work;
+         * repricing the past can falsely turn a recovering job into an
+         * overrun, or invent unfinished work when contention increases. */
+        double left = (c->cost - elapsed / c->factor) * result.factor;
         /* A missed forecast no longer establishes when this lane will free.
          * Use the observed service age as the conservative residual estimate;
          * it grows while the job overruns instead of promising an imminent
