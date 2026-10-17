@@ -220,6 +220,51 @@ class DistccTestCase(unittest.TestCase):
         return stream
 
 class AdaptiveTest(DistccTestCase):
+    def test_metadata_probes_bypass_occupied_local_slot(self):
+        locks = self.ddir / 'lock'
+        locks.mkdir()
+        with (locks / 'cpu_localhost_0').open('w') as held:
+            fcntl.lockf(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            env = dict(self.base_env, DISTCC_DIR=str(self.ddir),
+                       DISTCC_HOSTS='localhost/1 --localslots=1')
+            compilers = [self.cc, 'gcc']
+            clang = shutil.which('clang')
+            if clang:
+                compilers.extend([clang, 'clang'])
+            for compiler in compilers:
+                for flag in ('--version', '-dumpmachine', '-dumpversion', '-dumpfullversion'):
+                    with self.subTest(compiler=compiler, flag=flag):
+                        expected = subprocess.run([compiler, flag], env=env, capture_output=True, timeout=5)
+                        actual = subprocess.run([str(self.build / 'distcc'), compiler, flag],
+                                                env=env, capture_output=True, timeout=5)
+                        self.assertEqual(actual.returncode, expected.returncode, actual.stderr)
+                        self.assertEqual(actual.stdout, expected.stdout)
+
+    def test_local_link_still_waits_for_occupied_slot(self):
+        locks = self.ddir / 'lock'
+        locks.mkdir()
+        log = self.work / 'local.log'
+        with (locks / 'cpu_localhost_0').open('w') as held:
+            fcntl.lockf(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            env = dict(self.base_env, DISTCC_DIR=str(self.ddir),
+                       DISTCC_HOSTS='localhost/1 --localslots=1',
+                       DISTCC_VERBOSE='1', DISTCC_LOG=str(log))
+            proc = subprocess.Popen([str(self.build / 'distcc'), self.cc, str(self.source),
+                                     '-o', str(self.work / 'local')], env=env)
+            try:
+                deadline = time.monotonic() + 5
+                while not log.exists() or 'cpu_localhost_0 is busy' not in log.read_text():
+                    self.assertIsNone(proc.poll())
+                    self.assertLess(time.monotonic(), deadline, 'Local admission was not reached')
+                    time.sleep(.01)
+                self.assertIsNone(proc.poll())
+                fcntl.lockf(held, fcntl.LOCK_UN)
+                self.assertEqual(proc.wait(timeout=5), 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
+
     def test_topology_tracks_allowed_cpu_set(self):
         if not hasattr(os, 'sched_getaffinity'):
             self.skipTest('Linux CPU affinity is required')

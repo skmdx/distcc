@@ -763,6 +763,12 @@ dcc_build_somewhere(char *argv[],
             argv = new_argv;
         }
     }
+    /* Configure probes must not wait behind a build's local compilation
+     * backlog. Only standalone metadata queries bypass CPU admission. */
+    if (argv[1] && !argv[2] &&
+        (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-dumpmachine") ||
+         !strcmp(argv[1], "-dumpversion") || !strcmp(argv[1], "-dumpfullversion")))
+        goto run_local;
     if (!getenv("DISTCC_NO_REWRITE_CROSS")) {
 #ifdef HAVE_FSTATAT
         dcc_rewrite_generic_compiler(new_argv);
