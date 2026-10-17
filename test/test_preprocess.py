@@ -86,44 +86,100 @@ class AnalyzerPoolTest(PumpTestCase):
 
     def test_portage_hook_preserves_analyzer_storage_selection(self):
         hook = self.build / 'packaging/gentoo/pump.bashrc'
+        self.shutdown_pump()
         for directory in (None, str(self.work)):
             with self.subTest(directory=directory):
-                self.shutdown_pump()
-                for key in ('INCLUDE_SERVER_PID', 'INCLUDE_SERVER_DIR', 'INCLUDE_SERVER_PORT',
-                            'DISTCC_CLIENT_TMP'):
-                    self.env.pop(key, None)
-                if directory is not None:
-                    self.env['DISTCC_CLIENT_TMP'] = directory
                 env = dict(self.env, T=str(self.root), DISTCC_PUMP='1', FEATURES='distcc',
                            PATH=str(self.build) + ':' + self.env['PATH'])
-                startup = subprocess.run(['bash', '-c', '''
+                for key in ('INCLUDE_SERVER_PID', 'INCLUDE_SERVER_DIR', 'INCLUDE_SERVER_PORT',
+                            'DISTCC_CLIENT_TMP', 'DISTCC_PUMP_ACTIVE', 'DISTCC_PUMP_CLIENT_TMP'):
+                    env.pop(key, None)
+                if directory is not None:
+                    env['DISTCC_CLIENT_TMP'] = directory
+                counter = re.search(r'dcc_compile_ok (\d+)', self.get_stats(self.stats_ports[0]))
+                assert counter is not None
+                result = subprocess.run(['bash', '-c', '''
 has() { local word=$1; shift; [[ " $* " == *" $word "* ]]; }
 register_die_hook() { :; }
 die() { echo "$*" >&2; exit 1; }
 source "$1"
+trap distcc_pump_stop EXIT
 distcc_pump_start
-env -0
-''', 'portage-pump-test', str(hook)], cwd=self.work, env=env,
-                    capture_output=True, timeout=15)
-                self.assertEqual(startup.returncode, 0, startup.stderr.decode())
-                for entry in startup.stdout.decode().split('\0'):
-                    if entry:
-                        key, value = entry.split('=', 1)
-                        self.env[key] = value
-                self.assertEqual(self.env.get('DISTCC_CLIENT_TMP'), directory)
-                storage = Path(directory or '/dev/shm')
-                roots = list(storage.glob('*.include_server-' +
-                                          self.env['INCLUDE_SERVER_PID'] + '-*'))
-                self.assertTrue(roots, 'The real analyzer must create its roots in selected storage')
-                for compiler in ('gcc', 'clang'):
-                    before = self.get_stats(self.stats_ports[0])
-                    counter = re.search(r'dcc_compile_ok (\d+)', before)
-                    assert counter is not None
-                    result = self.run_cc(compiler, ['-c', self.source, '-o', 'portage-storage.o'])
-                    self.assertEqual(result.returncode, 0, result.stderr.decode() +
-                                     (Path(self.env['INCLUDE_SERVER_DIR']) / 'stderr').read_text())
-                    self.assertIn(f'dcc_compile_ok {int(counter[1]) + 1}\n',
-                                  self.get_stats(self.stats_ports[0]))
+printf '%s\n' "$DISTCC_CLIENT_TMP"
+shopt -s nullglob
+roots=( "$DISTCC_CLIENT_TMP"/*.include_server-"$INCLUDE_SERVER_PID"-* )
+(( ${#roots[@]} )) || exit 1
+for compiler in gcc clang; do
+    "$2" "$compiler" -c "$3" -o portage-storage.o || {
+        cat "$INCLUDE_SERVER_DIR/stderr" >&2
+        exit 1
+    }
+done
+''', 'portage-pump-test', str(hook), str(self.build / 'distcc'), str(self.source)],
+                    cwd=self.work, env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                storage = Path(result.stdout.strip())
+                if directory is None:
+                    self.assertEqual(storage.parent, Path('/dev/shm'))
+                    self.assertTrue(storage.name.startswith('distcc-pump.'))
+                    self.assertFalse(storage.exists(), 'The owned tmpfs root must be removed')
+                else:
+                    self.assertEqual(storage, Path(directory))
+                    self.assertTrue(self.source.exists(), 'User storage must survive shutdown')
+                self.assertIn(f'dcc_compile_ok {int(counter[1]) + 2}\n',
+                              self.get_stats(self.stats_ports[0]))
+
+    def test_portage_tmpfs_cleanup_isolates_pid_namespaces(self):
+        probe = subprocess.run(['unshare', '-Urpf', '--mount-proc', 'true'],
+                               capture_output=True, timeout=5)
+        if probe.returncode:
+            self.skipTest('Unprivileged PID namespaces are unavailable')
+        self.shutdown_pump()
+        env = dict(self.env, T=str(self.root), DISTCC_PUMP='1', FEATURES='distcc',
+                   PATH=str(self.build) + ':' + self.env['PATH'])
+        for key in ('INCLUDE_SERVER_PID', 'INCLUDE_SERVER_DIR', 'INCLUDE_SERVER_PORT',
+                    'DISTCC_CLIENT_TMP', 'DISTCC_PUMP_ACTIVE', 'DISTCC_PUMP_CLIENT_TMP'):
+            env.pop(key, None)
+        command = ['unshare', '-Urpf', '--mount-proc', 'bash', '-c', '''
+has() { local word=$1; shift; [[ " $* " == *" $word "* ]]; }
+register_die_hook() { :; }
+die() { echo "$*" >&2; exit 1; }
+source "$1"
+trap distcc_pump_stop EXIT
+distcc_pump_start
+"$2" gcc -c "$3" -o "$DISTCC_CLIENT_TMP/result.o" || exit 1
+printf '%s\t%s\n' "$DISTCC_CLIENT_TMP" "$INCLUDE_SERVER_PID"
+read -r proceed || exit 1
+"$2" gcc -c "$3" -o "$DISTCC_CLIENT_TMP/result.o"
+''', 'portage-namespace-test', str(self.build / 'packaging/gentoo/pump.bashrc'),
+                   str(self.build / 'distcc'), str(self.source)]
+        processes = []
+        roots = []
+        pids = []
+        try:
+            for _ in range(2):
+                process = subprocess.Popen(command, cwd=self.work, env=env, text=True,
+                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE)
+                processes.append(process)
+                assert process.stdout is not None
+                self.assertTrue(select.select([process.stdout], [], [], 10)[0])
+                values = process.stdout.readline().strip().split('\t')
+                self.assertEqual(len(values), 2, 'The namespace must start and compile successfully')
+                roots.append(Path(values[0]))
+                pids.append(values[1])
+            self.assertEqual(pids[0], pids[1], 'Exercise the same PID in separate namespaces')
+            self.assertNotEqual(roots[0], roots[1])
+            for index, process in enumerate(processes):
+                _, stderr = process.communicate('\n', timeout=15)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertFalse(roots[index].exists())
+                for remaining in roots[index + 1:]:
+                    self.assertTrue(remaining.exists(), 'Peer shutdown must preserve live storage')
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.communicate('\n', timeout=15)
 
     def test_startup_preserves_multiline_host_configuration(self):
         self.shutdown_pump()
