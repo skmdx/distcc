@@ -23,6 +23,15 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
     env.pop('DISTCC_GCC_SCAN_LIBRARY', None)
     results = {}
     for compiler, suffix, include in [('gcc', 'c', 'stdint.h'), ('g++', 'cc', 'cstdint')]:
+        # On x86-64, these pointer arguments exercise GOT stack-argument
+        # relocations across the worker assembler and client linker.
+        support = root/('support.'+suffix)
+        support.write_text('int a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8;\n'
+                           'int sum(int *a,int *b,int *c,int *d,int *e,int *f,int *g,int *h) '
+                           '{ return *a+*b+*c+*d+*e+*f+*g+*h; }\n')
+        support_obj = root/(compiler+'-support.o')
+        subprocess.run(['/usr/bin/'+compiler, '-O2', '-c', str(support), '-o', str(support_obj)],
+                       check=True, capture_output=True, timeout=30)
         source = root/('main.'+suffix)
         source.write_text('#include <'+include+'>\n'
                           + ('#include <clocale>\n' if suffix == 'cc' else '') +
@@ -32,12 +41,15 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                           '#if __COUNTER__ == 1\n#include "counter.h"\n#endif\n'
                           '#define CAT_(a,b) a##b\n#define CAT(a,b) CAT_(a,b)\n'
                           '#if !CAT(__has_,include)(<stddef.h>)\n#error probe failed\n#endif\n'
-                          'int main(void) { return sizeof(uint64_t) != 8 || COUNTER_HEADER_SEEN != 1 || ABSOLUTE_HEADER_SEEN != 1; }\n')
+                          'extern int a,b,c,d,e,f,g,h;\n'
+                          'int sum(int *,int *,int *,int *,int *,int *,int *,int *);\n'
+                          'int main(void) { return sum(&a,&b,&c,&d,&e,&f,&g,&h) != 36 || '
+                          'sizeof(uint64_t) != 8 || COUNTER_HEADER_SEEN != 1 || ABSOLUTE_HEADER_SEEN != 1; }\n')
         hashes = {}
         pp_hashes = {}
         for kind in ('native', 'remote'):
             obj = root/(compiler+'-'+kind+'.o')
-            args = ['-I'+str(root), '-O2', '-c', str(source), '-o', str(obj)]
+            args = ['-I'+str(root), '-O2', '-fPIC', '-c', str(source), '-o', str(obj)]
             command = ['/usr/bin/'+compiler, *args] if kind == 'native' else ['pump', '/usr/lib/distcc/'+compiler, *args]
             result = subprocess.run(command, env=env, capture_output=True, timeout=90)
             assert result.returncode == 0, (kind, compiler, result.returncode,
@@ -53,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                 pp_hashes[kind] = hashlib.sha256(preprocessed.read_bytes()).hexdigest()
             if kind == 'remote':
                 exe = root/('run-'+suffix)
-                subprocess.run(['/usr/bin/'+compiler, str(obj), '-o', str(exe)], check=True, timeout=30)
+                subprocess.run(['/usr/bin/'+compiler, str(obj), str(support_obj), '-o', str(exe)], check=True, timeout=30)
                 subprocess.run([str(exe)], check=True, timeout=5)
         if pp_hashes and pp_hashes['native'] != pp_hashes['remote']:
             raise AssertionError(pp_hashes)
@@ -63,7 +75,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             for kind in ('native', 'remote'):
                 output = root/(compiler+'-'+kind+'.s')
                 prefix = ['/usr/bin/'+compiler] if kind == 'native' else ['pump', '/usr/lib/distcc/'+compiler]
-                subprocess.run([*prefix, '-I'+str(root), '-O2', '-S', str(source), '-o', str(output)],
+                subprocess.run([*prefix, '-I'+str(root), '-O2', '-fPIC', '-S', str(source), '-o', str(output)],
                                env=env, check=True, capture_output=True, timeout=90)
                 assembly[kind] = output.read_bytes()
             assert assembly['native'] == assembly['remote'], 'Compiler assembly differs'
