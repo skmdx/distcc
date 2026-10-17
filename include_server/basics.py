@@ -24,8 +24,6 @@ __author__ = 'Nils Klarlund'
 
 import glob
 import os.path
-import resource
-import signal
 import shutil
 import sys
 import tempfile
@@ -172,23 +170,6 @@ MAX_EMAILS_TO_SEND = 3
 
 # TIME QUOTAS (SOLVING THE HALTING PROBLEM)
 
-# The maximum user time the include server is allowed handling one request. This
-# is a critical parameter because all caches are reset if this time is
-# exceeded. And if all caches are reset, then the next request may take much
-# longer time, possibly again exceeding the quota.  The parameter is also of
-# importance to builds that involve compilations that distcc-pump does not grok:
-# an amount of time roughly equal to this quota is wasted before CPP is invoked
-# instead.
-USER_TIME_QUOTA = 3.8  # seconds
-
-# How often the following question is answered: has too much user time been
-# spent in the include handler servicing the current request?
-#
-# FIXME(klarlund): SIGALRM should not be raised in code that has I/O. Fix
-# include server so that this is guaranteed not to happen. Until then, we are
-# careful to wait a full 4 s before issuing SIGALRM.
-USER_TIME_QUOTA_CHECK_INTERVAL_TIME = 4  # seconds, an integer
-
 # PYTHON TUNING
 
 # The default for the first parameter of gc.set_threshold is 700; see
@@ -333,53 +314,6 @@ class NotCoveredError(Error):
         message = """File: '%s': %s""" % (source_file, message)
     # Message, a string, becomes self.args[0]
     Error.__init__(self, message)
-
-
-class NotCoveredTimeOutError(NotCoveredError):
-  """Raised when spending too much time analyzing dependencies."""
-  pass
-
-
-class IncludeAnalyzerTimer(object):
-  """Start a timer limiting CPU time for servicing a single request.
-
-  We use user time so that a network hiccup will not entail a cache reset if,
-  say, we are using NFS.
-
-  An object of this class must be instantiated so that, no matter what, the
-  Cancel method is eventually called. This reinstates the original timer (if
-  present).
-  """
-
-  def __init__(self):
-    self.quota = USER_TIME_QUOTA
-    self.start_utime = resource.getrusage(resource.RUSAGE_SELF).ru_utime
-    self.old = signal.signal(signal.SIGALRM, self._TimeIsUp)
-    signal.alarm(USER_TIME_QUOTA_CHECK_INTERVAL_TIME)
-
-  def _TimeIsUp(self, unused_sig_number, unused_frame):
-    """Check CPU time spent and raise exception or reschedule."""
-    if (resource.getrusage(resource.RUSAGE_SELF).ru_utime
-        > self.start_utime + self.quota):
-      raise NotCoveredTimeOutError(('Bailing out because include server '
-                                    + 'spent more than %3.1fs user time '
-                                    + 'handling request') %
-                                   self.quota)
-    else:
-      # Reschedule ourselves.
-      signal.alarm(USER_TIME_QUOTA_CHECK_INTERVAL_TIME)
-
-  def Stop(self):
-    signal.alarm(0)
-
-  def Start(self):
-    signal.alarm(USER_TIME_QUOTA_CHECK_INTERVAL_TIME)
-
-  def Cancel(self):
-    """Must be called eventually. See class documentation."""
-    sys.stdout.flush()
-    signal.alarm(0)
-    signal.signal(signal.SIGALRM, self.old)
 
 
 class SignalSIGTERM(Error):

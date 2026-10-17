@@ -92,8 +92,6 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
           break
         except include_analyzer.CacheInvalidated:
           self.ClearStatCaches()
-          if self.timer:
-            self.timer.Start()
       else:
         raise basics.NotCoveredError('Inputs keep changing during dependency analysis',
                                      send_email=False)

@@ -53,7 +53,7 @@ class ParseCommandUnitTest(unittest.TestCase):
     mock_sysroot = '/usr/local/fake/sysroot'
     self.mock_sysroot = mock_sysroot
 
-    def Mock_SetSystemDirsDefaults(compiler, sysroot, language, timer=None):
+    def Mock_SetSystemDirsDefaults(compiler, sysroot, language):
       if compiler != mock_compiler:
         raise Exception("compiler: %s, mock_compiler: %s" % (
           compiler, mock_compiler))

@@ -92,7 +92,6 @@ class IncludeAnalyzer(object):
     self.client_root_keeper.ClientRootMakedir(self.generation)
     self.stat_reset_triggers = stat_reset_triggers
     self.translation_unit = "unknown translation unit"
-    self.timer = None
     self.current_input_paths = ()
     self.include_server_cwd = os.getcwd()
     self._InitializeAllCaches()
@@ -161,18 +160,13 @@ class IncludeAnalyzer(object):
                                        currdir,
                                        self.includepath_map,
                                        self.directory_map,
-                                       self.compiler_defaults,
-                                       self.timer))
+                                       self.compiler_defaults))
     (unused_quote_dirs, unused_angle_dirs, unused_include_files, source_file,
      result_file_prefix, unused_Dopts) = parsed_command
 
     # Do the real work.
     include_closure = (
       self.ProcessCompilationCommand(currdir, parsed_command))
-    # Pause the CPU timer during publication I/O. A generation retry resumes
-    # the same quota; the request owner cancels it when the request ends.
-    if self.timer:  # timer may not always exist when testing
-      self.timer.Stop()
     # Get name of the initial source file
     translation_unit = self.translation_unit
     # Links are accumulated intra-build (across different compilations in a

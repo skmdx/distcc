@@ -347,7 +347,7 @@ def CompilerLanguage(compiler, source, explicit='none'):
 
 
 def ParseCommandArgs(args, current_dir, includepath_map, dir_map,
-                     compiler_defaults, timer=None):
+                     compiler_defaults):
   """Parse arguments like -I to make include directory lists.
 
   Arguments:
@@ -356,7 +356,6 @@ def ParseCommandArgs(args, current_dir, includepath_map, dir_map,
     includepath_map: a MapToIndex object
     dir_map: a DirectoryMapToIndex object
     compiler_defaults: a CompilerDefaults object
-    timer: a basics.IncludeAnalyzerTimer object
   Returns:
     (quote_dirs, angle_dirs, files, source_file, source_file_prefix, dopts)
     where:
@@ -495,7 +494,7 @@ def ParseCommandArgs(args, current_dir, includepath_map, dir_map,
 
   sysroot = parse_state.include_sysroot()
   compiler_defaults.SetSystemDirsDefaults(compiler, sysroot,
-                                          parse_state.language, timer)
+                                          parse_state.language)
 
   def IndexDirs(dir_list):
     """Normalize directory names and index.

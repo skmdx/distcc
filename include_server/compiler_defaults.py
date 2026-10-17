@@ -173,17 +173,13 @@ class CompilerDefaults(object):
     self.system_dirs_default = {}
     self.missing_system_dirs = set()
 
-  def SetSystemDirsDefaults(self, compiler, sysroot, language, timer=None):
+  def SetSystemDirsDefaults(self, compiler, sysroot, language):
     """Cache default search directories for this compiler and target.
 
     Arguments:
       compiler: a filepath (the first argument on the distcc command line)
       sysroot: the --sysroot passed to the compiler ("" to disable)
       language: 'c' or 'c++' or other item in basics.LANGUAGES
-      timer: a basis.IncludeAnalyzerTimer or None
-
-    The timer will be disabled during this routine because the select involved
-    in Popen calls does not handle SIGALRM.
 
     See also the class documentation for this class.
     """
@@ -200,23 +196,12 @@ class CompilerDefaults(object):
         self.system_dirs_default[compiler][sysroot] = {}
     else:
       self.system_dirs_default[compiler] = {sysroot: {}}
-    try:
-      if timer:
-        # We have to disable the timer because the select system call that is
-        # executed when calling the compiler through Popen gives up if presented
-        # with a SIGALRM.
-        timer.Stop()
-      directories, missing = _SystemSearchdirsGCC(compiler, sysroot, language,
-                                                 self.canonical_lookup)
-      self.system_dirs_default[compiler][sysroot][language] = directories
-      self.missing_system_dirs.update(missing)
-      Debug(DEBUG_DATA,
-            "system_dirs_default[%s][%s][%s]: %s" %
-            (compiler, sysroot, language,
-             self.system_dirs_default[compiler][sysroot][language]))
-      # Now summarize what we know and add to system_dirs_default_all.
-      self.system_dirs_default_all |= (
-          set(self.system_dirs_default[compiler][sysroot][language]))
-    finally:
-      if timer:
-        timer.Start()
+    directories, missing = _SystemSearchdirsGCC(compiler, sysroot, language,
+                                               self.canonical_lookup)
+    self.system_dirs_default[compiler][sysroot][language] = directories
+    self.missing_system_dirs.update(missing)
+    Debug(DEBUG_DATA,
+          "system_dirs_default[%s][%s][%s]: %s" %
+          (compiler, sysroot, language,
+           self.system_dirs_default[compiler][sysroot][language]))
+    self.system_dirs_default_all |= set(directories)

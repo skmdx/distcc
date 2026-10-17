@@ -360,37 +360,8 @@ def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
       cmd, compression = distcc_pump_c_extensions.RArgv(self.rfile.fileno(), True)
 
       try:
-        try:
-          # We do timeout the include_analyzer using the crude mechanism of
-          # SIGALRM. This signal is problematic if raised while Python is doing
-          # I/O in the C extensions and during use of the subprocess
-          # module.
-          #
-          # TODO(klarlund) The Python library manual states: "When a signal
-          # arrives during an I/O operation, it is possible that the I/O
-          # operation raises an exception after the signal handler returns. This
-          # is dependent on the underlying Unix system's semantics regarding
-          # interrupted system calls."  We must clarify this. Currently, there
-          # is I/O during DoCompilationCommand:
-          #
-          #  - when a link is created in mirror_path.py
-          #  - module compress_files is used
-          #
-          # TODO(klarlund): Modify mirror_path so that is accumulates symbolic
-          # link operations instead of actually executing them on the spot. The
-          # accumulated operations can be executed after DoCompilationCommand
-          # when the timer has been cancelled.
-          include_analyzer.timer = basics.IncludeAnalyzerTimer()
-          files_and_links = (
-              include_analyzer.
-                  DoCompilationCommand(cmd, currdir,
-                                       include_analyzer.client_root_keeper,
-                                       compression))
-        finally:
-          # The timer should normally be cancelled during normal execution
-          # flow. Still, we want to make sure that this is indeed the case in
-          # all circumstances.
-          include_analyzer.timer.Cancel()
+        files_and_links = include_analyzer.DoCompilationCommand(
+            cmd, currdir, include_analyzer.client_root_keeper, compression)
 
       except NotCoveredError as inst:
         # Warn user. The 'Preprocessing locally' message is meant to
@@ -407,9 +378,8 @@ def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
         # information back to the distcc client, so that it can fall
         # back to preprocessing on the client.
         distcc_pump_c_extensions.XArgv(self.wfile.fileno(), [])
-        # FindNode publishes nodes before visiting their children to handle
-        # cycles. Any aborted traversal leaves incomplete nodes, not only a
-        # timeout. Never reuse those nodes for the next translation unit.
+        # A failed scan may have partially populated the input generation.
+        # Never publish that state for the next translation unit.
         include_analyzer.ClearStatCaches()
 
       except SignalSIGTERM:
@@ -565,7 +535,7 @@ def _PrintTimes(times_at_start, times_at_fork, times_child):
 class AnalyzerPool:
   """Persistent, process-isolated analyzers sharing one listening socket.
 
-  Each worker has its own cwd, compiler contexts, timers and input generations.
+  Each worker has its own cwd, compiler contexts and input generations.
   All published roots belong to the supervisor, so replacing a failed worker
   cannot invalidate inputs a distcc client is still transmitting.
   """
