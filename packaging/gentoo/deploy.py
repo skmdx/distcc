@@ -78,6 +78,19 @@ def parallel(targets, action):
         raise RuntimeError('\n'.join(errors))
 
 
+def builds_to_pause(target):
+    names = set()
+    for pattern in target.get('quiesce_units', []):
+        active = run(['systemctl', 'list-units', '--type=service', '--state=active',
+                      '--plain', '--no-legend', pattern], target)
+        names.update(line.split()[0] for line in active.splitlines())
+    for name in sorted(names):
+        if run(['systemctl', 'show', name, '-p', 'Transient', '--value'], target) == 'yes':
+            raise RuntimeError('Cannot resume transient build unit after stopping: ' + name +
+                               '; provide a persistent service definition first')
+    return sorted(names)
+
+
 def distribute_sources(settings, version, ebuild, targets, work):
     import portage
     transfer([str(ebuild.parent) + '/'], settings['local_repository'] + '/sys-devel/distcc')
@@ -246,16 +259,14 @@ def main():
             # Check all access before modifying any installed host.
             for target in targets:
                 run(['sudo', '-n', 'true'], target)
+            paused = {target['name']: builds_to_pause(target) for target in targets}
             distribute_sources(settings, version, ebuild, targets, work)
             for target in targets:
-                for pattern in target.get('quiesce_units', []):
-                    units = run(['systemctl', 'list-units', '--type=service', '--state=active',
-                                 '--plain', '--no-legend', pattern], target)
-                    names = [line.split()[0] for line in units.splitlines()]
-                    if names:
-                        resume[target['name']] = sorted(set(resume.get(target['name'], []) + names))
-                        resume_path.write_text(json.dumps(resume))
-                        run(['sudo', '-n', 'systemctl', 'stop', *names], target)
+                names = paused[target['name']]
+                if names:
+                    resume[target['name']] = sorted(set(resume.get(target['name'], []) + names))
+                    resume_path.write_text(json.dumps(resume))
+                    run(['sudo', '-n', 'systemctl', 'stop', *names], target)
             parallel(targets, lambda target: install(target, version, ebuild, work, settings['cross']))
             for target in targets:
                 configure(target, work)

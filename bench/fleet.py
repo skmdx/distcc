@@ -178,15 +178,13 @@ def main():
             snapshots(workers, targets, script)
             if deploy.run(['systemctl', 'show', unit, '-p', 'ActiveState', '--value'], client) in ('active', 'activating'):
                 raise RuntimeError('another measurement is still running on the client')
+            paused = {name: deploy.builds_to_pause(target) for name, target in targets.items()}
             for name, target in targets.items():
-                for pattern in target.get('quiesce_units', []):
-                    active = deploy.run(['systemctl', 'list-units', '--type=service', '--state=active',
-                                         '--plain', '--no-legend', pattern], target)
-                    units = [line.split()[0] for line in active.splitlines()]
-                    if units:
-                        resume[name] = sorted(set(resume.get(name, []) + units))
-                        resume_path.write_text(json.dumps(resume))
-                        deploy.run(['sudo', '-n', 'systemctl', 'stop', *units], target)
+                units = paused[name]
+                if units:
+                    resume[name] = sorted(set(resume.get(name, []) + units))
+                    resume_path.write_text(json.dumps(resume))
+                    deploy.run(['sudo', '-n', 'systemctl', 'stop', *units], target)
             for index in range(1, config['repetitions'] + 1):
                 print(f'Build {index}/{config["repetitions"]}; results: {out}', flush=True)
                 before = snapshots(workers, targets, script)

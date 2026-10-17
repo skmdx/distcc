@@ -4,6 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 import shutil
+import os
+import subprocess
 
 spec = importlib.util.spec_from_file_location('deploy', Path(__file__).resolve().parents[1] /
                                             'packaging/gentoo/deploy.py')
@@ -19,6 +21,45 @@ class TransportTest(unittest.TestCase):
         cmd = deploy.command(['python3', '-c', 'import sys; print(repr(sys.argv[1:]))', *values],
                              {'ssh': 'unused'})
         self.assertEqual(deploy.run(['zsh', '-c', cmd[-1]]), repr(values))
+
+
+@unittest.skipUnless(shutil.which('systemd-run') and shutil.which('sudo'), 'systemd and sudo required')
+class BuildLifecycleTest(unittest.TestCase):
+    def setUp(self):
+        if subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode:
+            self.skipTest('passwordless sudo required')
+
+    def test_persistent_build_can_be_stopped_and_resumed(self):
+        unit = f'distcc-deploy-persistent-test-{os.getpid()}.service'
+        path = '/run/systemd/system/' + unit
+        deploy.run(['sudo', '-n', 'tee', path], input=(
+            '[Service]\nType=exec\nExecStart=/bin/sleep 60\n'
+            'MemoryMax=32M\nMemorySwapMax=0\nIOAccounting=yes\n'))
+        def cleanup():
+            deploy.run(['sudo', '-n', 'systemctl', 'stop', unit])
+            deploy.run(['sudo', '-n', 'rm', '--', path])
+            deploy.run(['sudo', '-n', 'systemctl', 'daemon-reload'])
+        self.addCleanup(cleanup)
+        deploy.run(['sudo', '-n', 'systemctl', 'daemon-reload'])
+        deploy.run(['sudo', '-n', 'systemctl', 'start', unit])
+        self.assertEqual(deploy.builds_to_pause({'quiesce_units': [unit]}), [unit])
+        deploy.run(['sudo', '-n', 'systemctl', 'stop', unit])
+        deploy.run(['sudo', '-n', 'systemctl', 'start', unit])
+        self.assertEqual(deploy.run(['systemctl', 'is-active', unit]), 'active')
+        print(deploy.run(['systemctl', 'show', unit, '-p', 'CPUUsageNSec',
+                          '-p', 'IOReadBytes', '-p', 'IOWriteBytes']))
+
+    def test_transient_build_is_rejected_before_it_is_stopped(self):
+        unit = f'distcc-deploy-transient-test-{os.getpid()}.service'
+        deploy.run(['sudo', '-n', 'systemd-run', '--unit=' + unit,
+                    '-p', 'MemoryMax=32M', '-p', 'MemorySwapMax=0',
+                    '-p', 'IOAccounting=yes', '/bin/sleep', '60'])
+        self.addCleanup(deploy.run, ['sudo', '-n', 'systemctl', 'stop', unit])
+        with self.assertRaisesRegex(RuntimeError, 'Cannot resume transient build unit'):
+            deploy.builds_to_pause({'quiesce_units': [unit]})
+        self.assertEqual(deploy.run(['systemctl', 'is-active', unit]), 'active')
+        print(deploy.run(['systemctl', 'show', unit, '-p', 'CPUUsageNSec',
+                          '-p', 'IOReadBytes', '-p', 'IOWriteBytes']))
 
 
 @unittest.skipUnless(importlib.util.find_spec('portage'), 'Gentoo Portage required')
