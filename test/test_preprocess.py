@@ -84,6 +84,47 @@ class AnalyzerPoolTest(PumpTestCase):
     compression = 'lz4'
     transport = ',tcp'
 
+    def test_portage_hook_preserves_analyzer_storage_selection(self):
+        hook = self.build / 'packaging/gentoo/pump.bashrc'
+        for directory in (None, str(self.work)):
+            with self.subTest(directory=directory):
+                self.shutdown_pump()
+                for key in ('INCLUDE_SERVER_PID', 'INCLUDE_SERVER_DIR', 'INCLUDE_SERVER_PORT',
+                            'DISTCC_CLIENT_TMP'):
+                    self.env.pop(key, None)
+                if directory is not None:
+                    self.env['DISTCC_CLIENT_TMP'] = directory
+                env = dict(self.env, T=str(self.root), DISTCC_PUMP='1', FEATURES='distcc',
+                           PATH=str(self.build) + ':' + self.env['PATH'])
+                startup = subprocess.run(['bash', '-c', '''
+has() { local word=$1; shift; [[ " $* " == *" $word "* ]]; }
+register_die_hook() { :; }
+die() { echo "$*" >&2; exit 1; }
+source "$1"
+distcc_pump_start
+env -0
+''', 'portage-pump-test', str(hook)], cwd=self.work, env=env,
+                    capture_output=True, timeout=15)
+                self.assertEqual(startup.returncode, 0, startup.stderr.decode())
+                for entry in startup.stdout.decode().split('\0'):
+                    if entry:
+                        key, value = entry.split('=', 1)
+                        self.env[key] = value
+                self.assertEqual(self.env.get('DISTCC_CLIENT_TMP'), directory)
+                storage = Path(directory or '/dev/shm')
+                roots = list(storage.glob('*.include_server-' +
+                                          self.env['INCLUDE_SERVER_PID'] + '-*'))
+                self.assertTrue(roots, 'The real analyzer must create its roots in selected storage')
+                for compiler in ('gcc', 'clang'):
+                    before = self.get_stats(self.stats_ports[0])
+                    counter = re.search(r'dcc_compile_ok (\d+)', before)
+                    assert counter is not None
+                    result = self.run_cc(compiler, ['-c', self.source, '-o', 'portage-storage.o'])
+                    self.assertEqual(result.returncode, 0, result.stderr.decode() +
+                                     (Path(self.env['INCLUDE_SERVER_DIR']) / 'stderr').read_text())
+                    self.assertIn(f'dcc_compile_ok {int(counter[1]) + 1}\n',
+                                  self.get_stats(self.stats_ports[0]))
+
     def test_startup_preserves_multiline_host_configuration(self):
         self.shutdown_pump()
         for key in ('INCLUDE_SERVER_PID', 'INCLUDE_SERVER_DIR', 'INCLUDE_SERVER_PORT'):

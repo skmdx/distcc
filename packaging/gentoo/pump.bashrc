@@ -7,8 +7,8 @@ distcc_pump_start() {
     has distcc ${FEATURES} || die "DISTCC_PUMP requires FEATURES=distcc"
     register_die_hook distcc_pump_stop
     local settings original_path=${PATH}
-    export DISTCC_CLIENT_TMP=${T}/distcc-pump
-    mkdir -p "${DISTCC_CLIENT_TMP}" || die
+    # Keep the analyzer's tmpfs default (or an explicit user override).
+    # Only the control socket and diagnostic logs belong in Portage's T.
     settings=$(TMPDIR="${T}" pump --startup) || die "Cannot start distcc-pump"
     eval "${settings}" || die "Cannot configure distcc-pump"
     # Keep Portage's compiler wrappers ahead of the real compiler directory.
