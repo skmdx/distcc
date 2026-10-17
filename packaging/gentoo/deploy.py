@@ -167,7 +167,15 @@ def emerge_command(features):
 
 def configure(target, work):
     script = '''from pathlib import Path
+import os
 import subprocess
+if COMPILERS:
+    for compiler in COMPILERS:
+        if not Path(compiler).is_absolute() or '\\n' in compiler or not os.access(compiler, os.X_OK):
+            raise RuntimeError('Configured compiler is not executable: ' + compiler)
+    commands = Path('/etc/distcc/compilers')
+    existing = commands.read_text().splitlines() if commands.exists() else []
+    commands.write_text('\\n'.join(dict.fromkeys(existing + COMPILERS)) + '\\n')
 p=Path('/etc/systemd/system/distccd.service.d')
 p.mkdir(parents=True,exist_ok=True)
 if AUTO:
@@ -188,7 +196,8 @@ for line in brokers.splitlines():
 '''
     with (work / (target['name'] + '-services.log')).open('w') as log:
         run(['sudo', '-n', 'python3', '-'], target, log=log,
-            input='AUTO=' + repr(target.get('auto_memory', False)) + '\n' + script)
+            input='AUTO=' + repr(target.get('auto_memory', False)) + '\nCOMPILERS=' +
+                  repr(target.get('compiler_paths', [])) + '\n' + script)
 
 
 def validate(target, work):
@@ -196,11 +205,14 @@ def validate(target, work):
     transfer([str(ROOT / 'packaging/gentoo/validate-installed.py')], remote, target)
     args = ['env', 'TMPDIR=' + target['temporary'],
             'VALIDATE_DISTCC_HOSTS=' + target['validation_hosts'],
+            'VALIDATE_DISTCC_COMPILERS=' + json.dumps(target.get('compiler_paths', [])),
             'python3', remote + '/validate-installed.py']
     if target.get('assembly_comparison'):
         args += ['--assembly']
     with (work / (target['name'] + '-validation.log')).open('w') as log:
-        bounded(args, target, 'check', log)
+        for hosts in dict.fromkeys([target['server_hosts'], target['validation_hosts']]):
+            args[2] = 'VALIDATE_DISTCC_HOSTS=' + hosts
+            bounded(args, target, 'check', log)
     run(['sudo', '-n', 'rm', '-f', remote + '/validate-installed.py'], target)
     run(['sudo', '-n', 'rmdir', remote], target)
     print(f"{target['name']}: C/C++ remote compilation and execution passed", flush=True)
@@ -220,6 +232,8 @@ def main():
         for target in targets:
             if not re.fullmatch(r'[a-z0-9_-]+', target['name']):
                 raise RuntimeError('target names must be safe systemd unit suffixes')
+            if not target.get('server_hosts'):
+                raise RuntimeError('server_hosts must select the target worker for inbound validation')
             limits = settings['cross']['limits'] if target.get('binary') else target['build_limits']
             if 'MemorySwapMax=0' not in limits or not any(
                     p.startswith('MemoryMax=') and p.split('=', 1)[1] not in ('0', 'infinity') for p in limits):
