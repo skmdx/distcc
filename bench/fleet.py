@@ -93,7 +93,8 @@ def summarize(run_id, runs, config):
     conditions = []
     for run in runs:
         workers = {name: {'memory_max': row['before']['metrics']['memory.max'],
-                          'compiler': row['before']['compiler']}
+                          'compiler': row['before']['compiler'],
+                          'assembler': row['before']['assembler']}
                    for name, row in run['workers'].items()}
         conditions.append(dict(build=run['conditions'], workers=workers))
     stable = all(c == conditions[0] for c in conditions)

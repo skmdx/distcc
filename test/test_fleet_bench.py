@@ -39,9 +39,15 @@ class ComparisonTest(unittest.TestCase):
                                 logs={'ninja_jobs': [24, 25]}),
                            dict(conditions={'makeopts': 'auto'}, workers={}, elapsed=8, success=True,
                                 logs={'ninja_jobs': [24]})]
+        for run in runs:
+            run['workers'] = {'worker': {'before': dict(metrics={'memory.max': '4294967296'},
+                                                     compiler='15.3.0', assembler='GNU as 2.46')}}
         summary = fleet.summarize('repeat', runs, {'repetitions': 2})
         self.assertTrue(summary['success'])
         self.assertEqual(summary['seconds']['mean'], 9)
+        runs[1]['workers']['worker']['before']['assembler'] = 'GNU as 2.45'
+        self.assertFalse(fleet.summarize('repeat', runs, {'repetitions': 2})['success'])
+        runs[1]['workers']['worker']['before']['assembler'] = 'GNU as 2.46'
         runs[1]['conditions']['makeopts'] = '-j25'
         self.assertFalse(fleet.summarize('repeat', runs, {'repetitions': 2})['success'])
 

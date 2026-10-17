@@ -45,9 +45,11 @@ def snapshot():
             data['memory.max'].strip() in ('max', '0') or data['memory.swap.max'].strip() != '0':
         raise RuntimeError('worker requires a finite cgroup memory ceiling and no swap')
     return dict(service=properties, metrics=data,
+                distccd_sha256=hashlib.sha256(Path('/proc', properties['MainPID'], 'exe').read_bytes()).hexdigest(),
                 cpu=list(map(int, Path('/proc/stat').read_text().splitlines()[0].split()[1:9])),
                 boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                 compiler=execute(['gcc', '-dumpfullversion']),
+                assembler=execute([execute(['gcc', '-print-prog-name=as']), '--version']).splitlines()[0],
                 distcc=execute(['portageq', 'best_version', '/', 'sys-devel/distcc']))
 
 
