@@ -16,6 +16,21 @@ sys.path.pop(0)
 
 
 class ComparisonTest(unittest.TestCase):
+    def test_repository_identity_supports_rsync_and_git(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'metadata').mkdir()
+            timestamp = 'Thu, 15 Oct 2026 00:30:47 +0000'
+            (root / 'metadata/timestamp.chk').write_text(timestamp + '\n')
+            ebuild = root / 'category/package/package-1.ebuild'
+            self.assertEqual(measure.repository_revision(ebuild), {'rsync': timestamp})
+            subprocess.run(['git', '-C', str(root), 'init', '-q'], check=True)
+            subprocess.run(['git', '-C', str(root), '-c', 'user.name=Test', '-c',
+                            'user.email=test@example.invalid', 'commit', '--allow-empty',
+                            '-qm', 'Fixture'], check=True)
+            revision = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
+            self.assertEqual(measure.repository_revision(ebuild), {'git': revision})
+
     def setUp(self):
         self.before = dict(id='before', success=True, condition_key='same', seconds={'mean': 10})
         self.after = dict(id='after', success=True, condition_key='same', seconds={'mean': 8})

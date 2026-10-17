@@ -127,6 +127,13 @@ def log_summary(paths):
                 phases=phases, ninja_jobs=sorted(jobs))
 
 
+def repository_revision(ebuild):
+    repository = Path(ebuild).parents[2]
+    if (repository / '.git').exists():
+        return {'git': execute(['git', '-C', str(repository), 'rev-parse', 'HEAD'])}
+    return {'rsync': (repository / 'metadata/timestamp.chk').read_text().strip()}
+
+
 def fingerprint(tree):
     digest = hashlib.sha256()
     for path in sorted(tree.rglob('*')):
@@ -225,7 +232,7 @@ def measure(config, out, buildroot):
                       package=config['package'], memory_max=(group / 'memory.max').read_text().strip(),
                       perf=config['perf'], sample_seconds=config['sample_seconds'])
     conditions['collector'] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    conditions['repository'] = execute(['git', '-C', str(Path(config['ebuild']).parents[2]), 'rev-parse', 'HEAD'])
+    conditions['repository'] = repository_revision(config['ebuild'])
     hosts = host_list(conditions['hosts'])
     execute(['distcc', '--show-hosts'], env=dict(os.environ, DISTCC_HOSTS=hosts))
     mapping = private / 'package.env'
