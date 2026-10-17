@@ -55,7 +55,6 @@ class Inputs : public llvm::vfs::ProxyFileSystem {
 public:
     std::map<std::string, Stamp> stamps;
     std::map<std::string, std::string> contents;
-    std::set<std::string> probes;
     bool changed = false;
     std::error_code cwd_error;
     explicit Inputs(const std::string &cwd)
@@ -110,10 +109,9 @@ struct Result {
 
 struct Callbacks : PPCallbacks {
     SourceManager &sources;
-    Inputs &inputs;
     Result &result;
-    Callbacks(SourceManager &sources, Inputs &inputs, Result &result)
-        : sources(sources), inputs(inputs), result(result) {}
+    Callbacks(SourceManager &sources, Result &result)
+        : sources(sources), result(result) {}
     void FileChanged(SourceLocation loc, FileChangeReason reason,
                      SrcMgr::CharacteristicKind, FileID) override {
         if (reason != EnterFile) return;
@@ -123,12 +121,13 @@ struct Callbacks : PPCallbacks {
     void HasInclude(SourceLocation, llvm::StringRef name, bool, OptionalFileEntryRef file,
                     SrcMgr::CharacteristicKind) override {
         if (name.starts_with("/")) result.unsupported = true;
-        if (file) inputs.probes.insert(file->getName().str());
+        if (file) result.dependencies.insert(file->getName().str());
     }
     void InclusionDirective(SourceLocation loc, const Token &, llvm::StringRef name,
-                            bool, CharSourceRange, OptionalFileEntryRef,
+                            bool, CharSourceRange, OptionalFileEntryRef file,
                             llvm::StringRef, llvm::StringRef, const Module *, bool imported,
                             SrcMgr::CharacteristicKind) override {
+        if (file) result.dependencies.insert(file->getName().str());
         // The existing GCC-compatible transfer rewrites command-line paths,
         // but cannot rewrite absolute include operands inside source files.
         if ((name.starts_with("/") && sources.getFileEntryRefForID(sources.getFileID(loc))) || imported)
@@ -139,12 +138,11 @@ struct Callbacks : PPCallbacks {
 };
 
 struct Action : PreprocessOnlyAction {
-    Inputs &inputs;
     Result &result;
-    Action(Inputs &inputs, Result &result) : inputs(inputs), result(result) {}
+    explicit Action(Result &result) : result(result) {}
     bool BeginSourceFileAction(CompilerInstance &instance) override {
         instance.getPreprocessor().addPPCallbacks(
-            std::make_unique<Callbacks>(instance.getSourceManager(), inputs, result));
+            std::make_unique<Callbacks>(instance.getSourceManager(), result));
         return true;
     }
 };
@@ -203,15 +201,15 @@ PyObject *scan(PyObject *, PyObject *arguments) {
         FileSystemOptions options;
         options.WorkingDir = cwd;
         llvm::IntrusiveRefCntPtr<FileManager> manager(new FileManager(options, inputs));
-        tooling::ToolInvocation invocation(command, std::make_unique<Action>(*inputs, result), manager.get());
+        tooling::ToolInvocation invocation(command, std::make_unique<Action>(result), manager.get());
         invocation.setDiagnosticConsumer(&diagnostics);
         invocation.run();
         ok = !diagnostics.unsafe && !result.dependencies.empty();
-        // Existence probes can succeed without opening a header. Transfer those
-        // files too, so __has_include has the same answer on the worker.
-        for (const auto &path : inputs->probes)
-            if (!inputs->openFileForRead(path)) ok = false;
-        result.dependencies.insert(inputs->probes.begin(), inputs->probes.end());
+        // Probes and guarded aliases can resolve without opening the file.
+        // Preserve those names and bytes so the worker can repeat every lookup.
+        for (const auto &path : result.dependencies)
+            if (!inputs->contents.count(inputs->path(path)) &&
+                !inputs->openFileForRead(path)) ok = false;
         for (const auto &path : result.dependencies) {
             auto it = inputs->contents.find(inputs->path(path));
             if (it != inputs->contents.end() && requiresModules(it->second))

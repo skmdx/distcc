@@ -34,6 +34,23 @@ class ClangScanTest(unittest.TestCase):
     return clang_scan.scan([self.compiler, '-c', str(self.source), '-I', str(self.root),
                             '-o', str(self.root / 'never.o')], str(self.root))
 
+  def test_guarded_header_aliases_remain_dependencies(self):
+    header, alias = self.root/'real.h', self.root/'alias.h'
+    for guard in ('#pragma once\nint value;\n',
+                  '#ifndef INCLUDED\n#define INCLUDED\nint value;\n#endif\n'):
+      for link in ('symlink', 'hardlink'):
+        with self.subTest(guard=guard, link=link):
+          alias.unlink(missing_ok=True)
+          header.write_text(guard)
+          if link == 'symlink':
+            alias.symlink_to(header.name)
+          else:
+            os.link(header, alias)
+          self.source.write_text('#include "real.h"\n#include "alias.h"\n')
+          result = self.scan()
+          self.assertTrue({str(header), str(alias)} <= set(result['dependencies']))
+          self.assertEqual(result['files'][str(alias)], header.read_bytes())
+
   def test_system_search_probe_does_not_initialize_ccache(self):
     ccache, gcc = shutil.which('ccache'), shutil.which('gcc')
     if not ccache or not gcc:

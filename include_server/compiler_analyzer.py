@@ -311,6 +311,15 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       if snapshots is not None and canonical not in snapshots:
         raise basics.NotCoveredError('Dependency has no input snapshot: ' + path)
       self.mirror_path.DoPath(absolute, self.currdir_idx, self.client_root_keeper.client_root)
+      stamp = stamps.Observe(canonical)
+      if stamp is None:
+        raise basics.NotCoveredError('Dependency disappeared: ' + path)
+      target = self.mirror_path.FileIdentity(
+          canonical, stamp[:2], self.client_root_keeper.client_root)
+      if target != canonical:
+        if snapshots is not None:
+          snapshots[target] = snapshots[canonical]
+        real_idx = self.realpath_map.Index(target)
       closure[real_idx] = ()
     self.snapshots = snapshots
     # Explicit search paths remain in argv even when no header is read from

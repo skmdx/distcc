@@ -52,6 +52,7 @@ class MirrorPath(object):
     assert isinstance(canonical_path, cache_basics.CanonicalPath)
     # All links encountered so far.
     self.links = []
+    self.file_identities = {}
     # We cache tuples (filepath, current_dir_idx) for which we've already fixed
     # up the symbolic links.
     self.link_stat = set([])
@@ -66,6 +67,16 @@ class MirrorPath(object):
 
   def MustExistDirs(self):
     return self.must_exist_dirs
+
+  def FileIdentity(self, canonical, identity, root):
+    """Keep aliases of one inode identical in the worker's input tree."""
+    target = self.file_identities.setdefault(identity, canonical)
+    if canonical != target:
+      link = root + canonical
+      if not os.path.lexists(link):
+        os.symlink(target, link)
+        self.links.append(link)
+    return target
 
   def DoPath(self, filepath, current_dir_idx, root):
     """Mirror the parts of filepath not yet created under root.

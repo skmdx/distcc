@@ -84,6 +84,31 @@ class AnalyzerPoolTest(PumpTestCase):
     compression = 'lz4'
     transport = ',tcp'
 
+    def test_startup_preserves_multiline_host_configuration(self):
+        self.shutdown_pump()
+        for key in ('INCLUDE_SERVER_PID', 'INCLUDE_SERVER_DIR', 'INCLUDE_SERVER_PORT'):
+            self.env.pop(key, None)
+        hosts = "# worker's configuration\n" + self.env['DISTCC_HOSTS'] + '\n'
+        self.env['DISTCC_HOSTS'] = hosts
+        self.env['PATH'] += ":/nonexistent/quoted' path"
+        startup = subprocess.run([str(self.build / 'pump'), '--startup'],
+                                 cwd=self.work, env=self.env, capture_output=True,
+                                 text=True, timeout=15, check=True)
+        restored = subprocess.run(['/bin/sh', '-c', startup.stdout + '\nexec env -0'],
+                                  env=self.env, capture_output=True, timeout=5, check=True)
+        for entry in restored.stdout.decode().split('\0'):
+            if entry:
+                key, value = entry.split('=', 1)
+                self.env[key] = value
+        self.assertEqual(self.env['DISTCC_HOSTS'], hosts)
+        self.assertTrue(self.env['PATH'].endswith(":/nonexistent/quoted' path"))
+        counter = re.search(r'dcc_compile_ok (\d+)', self.get_stats(self.stats_ports[0]))
+        assert counter is not None
+        before = int(counter[1])
+        result = self.run_cc('gcc', ['-c', self.source, '-o', 'environment.o'])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn(f'dcc_compile_ok {before + 1}\n', self.get_stats(self.stats_ports[0]))
+
     def test_broker_and_worker_classify_the_same_pump_input_tree(self):
         source = self.work / 'tiny.c'
         source.write_text('#include "large.h"\nint value = ANSWER;\n')
@@ -297,6 +322,30 @@ class AnalyzerPoolTest(PumpTestCase):
 
 
 class PreprocessTest(PumpTestCase):
+    def test_guarded_header_aliases_compile_remotely(self):
+        header, alias = self.work / 'real.h', self.work / 'alias.h'
+        declarations = 'struct Once { int member; };\nint value;\nconst char *path = __FILE__;\n'
+        for guard in ('#pragma once\n' + declarations,
+                      '#ifndef INCLUDED\n#define INCLUDED\n' + declarations + '#endif\n'):
+            for link in ('symlink', 'hardlink'):
+                alias.unlink(missing_ok=True)
+                header.write_text(guard)
+                if link == 'symlink':
+                    alias.symlink_to(header.name)
+                else:
+                    os.link(header, alias)
+                self.source.write_text('#include "real.h"\n#include "alias.h"\n'
+                                       'int main(void) { return value; }\n')
+                for compiler in ('gcc', 'clang'):
+                    with self.subTest(guard=guard, link=link, compiler=compiler):
+                        objects = []
+                        for remote in (False, True):
+                            result = self.run_cc(compiler, ['-O1', '-c', self.source, '-o', 'alias.o'], remote)
+                            self.assertEqual(result.returncode, 0, result.stderr.decode())
+                            objects.append((self.work / 'alias.o').read_bytes())
+                        self.assertEqual(objects[0], objects[1])
+        self.assertNotIn('gave up analyzing', (self.work / 'client.log').read_text())
+
     def test_clang_profile_generation_matches_native(self):
         self.check_clang_profile_generation(self.source)
 

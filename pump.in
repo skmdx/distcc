@@ -515,19 +515,32 @@ StartIncludeServerAndDetermineHosts() {
 }
 
 # Prints out environment variable settings, for the --startup option.
+ExportEnvironmentVariable() {
+  printf "export %s='" "$1"
+  while :; do
+    case "$2" in
+      *"'"*)
+        printf '%s' "${2%%\'*}" "'\\''"
+        set -- "$1" "${2#*\'}"
+        ;;
+      *) printf "%s'\n" "$2"; return ;;
+    esac
+  done
+}
+
 DumpEnvironmentVariables() {
   # Variables used by "pump --shutdown"
-  echo export INCLUDE_SERVER_PID=\'$include_server_pid\'
-  echo export INCLUDE_SERVER_DIR=\'$socket_dir\'
+  ExportEnvironmentVariable INCLUDE_SERVER_PID "$include_server_pid"
+  ExportEnvironmentVariable INCLUDE_SERVER_DIR "$socket_dir"
   # Variables used by the distcc client
-  echo export INCLUDE_SERVER_PORT=\'$INCLUDE_SERVER_PORT\'
+  ExportEnvironmentVariable INCLUDE_SERVER_PORT "$INCLUDE_SERVER_PORT"
   if [ -n "$DISTCC_CLIENT_TMP" ]; then
-    echo export DISTCC_CLIENT_TMP=\'$DISTCC_CLIENT_TMP\'
+    ExportEnvironmentVariable DISTCC_CLIENT_TMP "$DISTCC_CLIENT_TMP"
   fi
   if [ -n "$DISTCC_HOSTS" ]; then
-    echo export DISTCC_HOSTS=\'$DISTCC_HOSTS\'
+    ExportEnvironmentVariable DISTCC_HOSTS "$DISTCC_HOSTS"
   fi
-  echo export PATH=\'$distcc_location:$PATH\'
+  ExportEnvironmentVariable PATH "$distcc_location:$PATH"
 }
 
 Main() {
