@@ -209,6 +209,53 @@ class AnalyzerPoolTest(PumpTestCase):
 
 
 class PreprocessTest(PumpTestCase):
+    def test_unused_include_directories_exist_on_worker(self):
+        # Build generators pass directories for whole dependency sets, even
+        # when this translation unit does not read any of their headers.
+        empty = self.work / 'unused headers'
+        empty.mkdir()
+        (empty / 'child').mkdir()
+        (self.work / 'include-link').symlink_to(empty, target_is_directory=True)
+        options = ['-I', str(empty), '-Iinclude-link/child/..',
+                   '-iquote', str(empty / 'child'), '-isystem', 'include-link',
+                   '-idirafter', str(empty / 'child')]
+        for compiler in ('gcc', 'g++', 'clang', 'clang++'):
+            if not shutil.which(compiler):
+                continue
+            with self.subTest(compiler=compiler):
+                args = ['-x', 'c++' if '++' in compiler else 'c',
+                        '-Werror=missing-include-dirs', *options,
+                        '-c', self.source, '-o', 'directories.o']
+                local = self.run_cc(compiler, args, False)
+                self.assertEqual(local.returncode, 0, local.stderr.decode())
+                expected = (self.work / 'directories.o').read_bytes()
+                (self.work / 'directories.o').unlink()
+                remote = self.run_cc(compiler, args)
+                self.assertEqual(remote.returncode, 0, remote.stderr.decode())
+                self.assertEqual(remote.stderr, b'')
+                self.assertEqual((self.work / 'directories.o').read_bytes(), expected)
+                self.assertNotIn('preprocessing locally',
+                                 (self.work / 'client.log').read_text())
+
+    def test_unused_include_directory_changes_are_not_cached(self):
+        directory = self.work / 'generated-headers'
+        # Reuse one analyzer and command through absence, creation and removal.
+        # A real missing path must still produce the compiler's diagnostic.
+        for exists in (False, True, False, True):
+            if exists:
+                directory.mkdir()
+            elif directory.exists():
+                directory.rmdir()
+            args = ['-Wmissing-include-dirs', '-I', str(directory),
+                    '-c', self.source, '-o', 'generated.o']
+            local = self.run_cc('gcc', args, False)
+            remote = self.run_cc('gcc', args)
+            self.assertEqual(remote.returncode, local.returncode, remote.stderr.decode())
+            self.assertEqual(b'-Wmissing-include-dirs' in remote.stderr, not exists)
+            self.assertEqual(b'-Wmissing-include-dirs' in local.stderr, not exists)
+            self.assertNotIn('preprocessing locally',
+                             (self.work / 'client.log').read_text())
+
     def test_analysis_holds_cpp_capacity_without_reserving_remote_worker(self):
         workers = self.analyzer_pids()
         self.assertEqual(len(workers), 1)

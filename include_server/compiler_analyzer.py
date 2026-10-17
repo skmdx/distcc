@@ -306,8 +306,17 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       self.mirror_path.DoPath(absolute, self.currdir_idx, self.client_root_keeper.client_root)
       closure[real_idx] = ()
     self.snapshots = snapshots
-    for kind, path in self.system_includes:
-      if kind not in (3, 4):
+    # Explicit search paths remain in argv even when no header is read from
+    # them. Mirror their directory/link structure too, otherwise the worker
+    # invents -Wmissing-include-dirs diagnostics (fatal under -Werror).
+    # Observe absent paths as well so generated/removed directories invalidate
+    # the mirror, but never manufacture directories missing on the client.
+    directories = {os.path.join(currdir, self.directory_map.string[index]).rstrip('/') or '/'
+                   for index in self.quote_dirs}
+    directories.update(path for kind, path in self.system_includes if kind not in (3, 4))
+    for path in directories:
+      observed = stamps.Observe(path)
+      if observed is not None and stat.S_ISDIR(observed[2]):
         self.mirror_path.DoPath(os.path.join(path, 'forcing_technique_271828'),
                                self.currdir_idx, self.client_root_keeper.client_root)
     basics.Debug(basics.DEBUG_TRACE, 'Compiler dependency analysis (%s): %d inputs',

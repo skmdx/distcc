@@ -103,8 +103,10 @@ headers, runs the compiler's preprocessor and compiles the result. Default
 include paths are sent in compiler order, including Clang's system-header class
 and GCC's implicit headers. The worker disables its own default search paths
 and reads the client's private input tree. Explicit include options retain
-their search order and header classification. Missing probes stay missing
-even when a worker has additional headers installed.
+their search order and header classification. Existing search directories and
+their symlinks are recreated even when the job reads no headers from them, so
+the worker does not introduce missing-directory warnings. Missing directories
+and probes stay missing even when a worker has additional headers installed.
 
 System headers use the same compression and immutable input cache as application
 headers. They do not need to match the worker installation or be retransmitted
