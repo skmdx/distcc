@@ -133,6 +133,32 @@ class LinkTestCase(BrokerTestCase):
         return output, result
 
 class LinkTest(LinkTestCase):
+    def test_refresh_skips_unchanged_and_publishes_changed_or_missing_cache(self):
+        snapshot = self.work / 'snapshot'
+        subprocess.run(['cp', '-a', '--reflink=auto', str(self.snapshot), str(snapshot)], check=True)
+        path = self.work / 'refresh.json'
+        command = [str(self.helper), '--refresh', str(snapshot), 'gcc', str(path), str(self.cache)]
+        subprocess.run(command, env=self.link_env, check=True, capture_output=True, timeout=30)
+        original = path.read_bytes()
+        stamp = path.stat().st_mtime_ns
+        result = subprocess.run(command, env=self.link_env, check=True, capture_output=True,
+                                text=True, timeout=30)
+        self.assertIn('unchanged', result.stdout)
+        self.assertEqual(path.stat().st_mtime_ns, stamp)
+        extra = self.work / 'extra-cache'
+        subprocess.run([*command, str(extra)], env=self.link_env, check=True,
+                       capture_output=True, timeout=30)
+        self.assertTrue((extra / json.loads(original)['key'] / '.distcc-link.json').is_file())
+        with (snapshot / self.profile['gccdir'] / 'crtbegin.o').open('ab') as stream:
+            stream.write(b'\0')
+        subprocess.run(command, env=self.link_env, check=True, capture_output=True, timeout=30)
+        self.assertNotEqual(json.loads(path.read_text())['key'], json.loads(original)['key'])
+        self.env.update(DISTCC_LINK_SOURCE=str(snapshot), DISTCC_LINK_SYSROOT=str(path))
+        output, result = self.link()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-link: linked on ', result.stderr)
+        self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
+
     @unittest.skipUnless(shutil.which('strace'), 'strace is required')
     def test_link_without_archive_spool(self):
         spool = self.work / 'spool'

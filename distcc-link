@@ -425,8 +425,8 @@ def file_state(path):
             None if stat.S_ISDIR(info.st_mode) else info.st_size]
 
 
-def check_source(profile):
-    root = Path(os.environ.get('DISTCC_LINK_SOURCE', '/'))
+def check_source(profile, root=None):
+    root = Path(root if root is not None else os.environ.get('DISTCC_LINK_SOURCE', '/'))
     for name, expected in profile['state'].items():
         if Path(name).is_absolute() or '..' in Path(name).parts:
             raise ValueError('invalid sysroot state path')
@@ -1074,9 +1074,24 @@ def describe_sysroot(root, compiler):
     return {'profile': sysroot_profile(root, profile, files), 'files': files}
 
 
-def sync_sysroot(root, compiler, profile_path, destinations):
+def sync_sysroot(root, compiler, profile_path, destinations, *, refresh=False):
     source_host, source_path = destination(root)
     targets = [destination(dest) for dest in destinations]
+    profile_path = Path(profile_path).absolute()
+    if refresh and profile_path.is_file():
+        profile = json.loads(profile_path.read_text())
+        key = profile['key']
+        if not KEY.fullmatch(key):
+            raise ValueError('invalid cached sysroot key')
+        helper = 'distcc-link' if source_host else str(Path(__file__).resolve())
+        check = subprocess.run(remote_command(source_host,
+            [helper, '--check', source_path, compiler]),
+            input=json.dumps(profile), text=True)
+        if check.returncode == 0 and all(subprocess.run(remote_command(host,
+                ['test', '-f', base + '/' + key + '/.distcc-link.json'])).returncode == 0
+                for host, base in targets):
+            print('sysroot ' + key + ' unchanged')
+            return
     if source_host:
         local = next((dest for dest in targets if dest[0] is None), None)
         if local is None:
@@ -1102,7 +1117,6 @@ def sync_sysroot(root, compiler, profile_path, destinations):
             targets.remove(local)
         for host, base in targets:
             transfer_generation(source_path, listing, metadata, key, host, base)
-    profile_path = Path(profile_path).absolute()
     with tempfile.NamedTemporaryFile(mode='w', dir=profile_path.parent,
                                      prefix='.distcc-sysroot-', delete=False) as stream:
         temporary = Path(stream.name)
@@ -1118,12 +1132,22 @@ def sync_sysroot(root, compiler, profile_path, destinations):
 
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == '--check':
+        profile = json.load(sys.stdin)
+        try:
+            check_source(profile, sys.argv[2])
+            identity = compiler_identity(sys.argv[3])
+            return int(any(identity[key] != profile[key] for key in identity) or
+                       compiler_family(sys.argv[3]) != profile.get('family', 'gcc'))
+        except LocalOnly:
+            return 1
     if len(sys.argv) == 4 and sys.argv[1] == '--describe':
         print(json.dumps(describe_sysroot(sys.argv[2], sys.argv[3]), sort_keys=True))
         return 0
-    if len(sys.argv) >= 6 and sys.argv[1] == '--sync':
+    if len(sys.argv) >= 6 and sys.argv[1] in ('--sync', '--refresh'):
         try:
-            sync_sysroot(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:])
+            sync_sysroot(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:],
+                         refresh=sys.argv[1] == '--refresh')
             return 0
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             print('distcc-link: ' + str(error), file=sys.stderr)
@@ -1140,7 +1164,7 @@ def main():
     command = sys.argv[1:]
     if not command:
         print('usage: distcc-link COMPILER [link options]\n'
-              '       distcc-link --sync SNAPSHOT COMPILER PROFILE CACHE_DIRECTORY...', file=sys.stderr)
+              '       distcc-link --sync|--refresh SNAPSHOT COMPILER PROFILE CACHE_DIRECTORY...', file=sys.stderr)
         return 1
     try:
         path = Path(os.environ['DISTCC_LINK_SYSROOT'])

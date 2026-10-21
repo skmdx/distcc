@@ -746,6 +746,14 @@ publication; the profile is replaced only after every destination is ready.
 Published generations remain available to active jobs. Remove unused generations
 only when no link jobs or client profiles refer to them.
 .PP
+Use --refresh with the same arguments as --sync before a build to skip hashing
+and transfer when the source metadata and compiler identity still match and
+every destination has the published generation. Changed sources or missing
+destinations take the normal synchronization path. The source must remain
+stable during synchronization; a package setup hook can run this before
+compilation when package installation is serialized. Synchronize every worker
+that advertises remote link support before publishing the client profile.
+.PP
 Before linking, the client checks file type, size, modification/change times
 and library directory metadata against the profile. A changed sysroot stays
 local until a new snapshot is synchronized; synchronization is an explicit
