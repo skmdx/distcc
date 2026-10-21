@@ -389,6 +389,8 @@ def map_link_job(compiler, args, profile, identity, source_root=None):
                 mapped.extend((arg, value))
             elif arg in SAFE_LINKER_FLAGS or arg in ('-pie', '-shared', '-static', '-s', '-EL', '-EB') or re.fullmatch(
                     r'(?:-l[A-Za-z0-9_+.:-]+|-O[0-3]|--hash-style=(?:gnu|sysv|both)'
+                    r'|--?(?:icf=(?:none|safe|all)|(?:no-)?undefined-version)'
+                    r'|--(?:threads=[1-9][0-9]*|lto-O[0-3])'
                     r'|--build-id(?:=[A-Za-z0-9]+)?|-plugin-opt=(?:O[0-3]|thinlto|-enable-tlsdesc|mcpu=[A-Za-z0-9_.+-]+))', arg):
                 mapped.append(arg)
             else:

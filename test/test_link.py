@@ -332,6 +332,21 @@ class ClangLinkTest(LinkTestCase):
         self.assertIn('distcc-link: linked on ', result.stderr)
         self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
 
+    def test_lld_optimization_options(self):
+        subprocess.run([self.compiler, '-flto=thin', '-c', str(self.cpp), '-o', str(self.obj)],
+                       check=True, capture_output=True)
+        for dash in ('-', '--'):
+            flags = ['-flto=thin', '-Wl,--threads=2,--lto-O3,' + ','.join(
+                     dash + option for option in ('icf=all', 'undefined-version'))]
+            output, result = self.link(flags)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('distcc-link: linked on ', result.stderr)
+            local = self.work / 'local-optimized'
+            subprocess.run([self.compiler, '-fuse-ld=lld', *flags, str(self.obj), '-o', str(local)],
+                           check=True, capture_output=True)
+            self.assertEqual(local.read_bytes(), output.read_bytes())
+            self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
+
     def test_profile_directory_selects_clang(self):
         profiles = self.work / 'profiles'
         profiles.mkdir()
