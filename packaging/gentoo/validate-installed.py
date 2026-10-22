@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import sys
 import time
+import portage
 
 wrapper = Path('/usr/lib/distcc/gcc')
 assert wrapper.samefile('/usr/bin/distcc'), 'GCC masquerade wrapper is missing'
@@ -43,8 +44,11 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
     # explicitly listed for the server. CMDLIST matches the requested basename.
     search_path = ':'.join(dict.fromkeys([*(str(Path(p).parent) for p in compilers),
                                           *os.get_exec_path()]))
+    settings = getattr(portage, 'settings')
     for variable in ('CC', 'CXX'):
-        value = subprocess.check_output(['portageq', 'envvar', variable], text=True).strip()
+        # Unset variables select the default GCC pair already in compilers.
+        # portageq reports this normal state with a nonzero exit status.
+        value = settings.get(variable, '').strip()
         if not value:
             continue
         command = shlex.split(value)
