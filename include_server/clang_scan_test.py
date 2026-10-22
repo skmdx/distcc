@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -20,6 +21,40 @@ import compress_files
 
 
 class ClangScanTest(unittest.TestCase):
+  def test_file_stamps_with_repeated_root_separators(self):
+    # Run separately so a regression cannot hang the test runner or grow its
+    # ancestor list without bound.
+    code = r'''
+import os, shutil, tempfile
+from pathlib import Path
+from cache_basics import FileStampCache
+import basics, compiler_analyzer
+with tempfile.TemporaryDirectory() as directory:
+    header = Path(directory) / 'header.h'
+    header.write_text('first')
+    for prefix in ('/', '//', '///', '////'):
+        cache = FileStampCache()
+        spelling = prefix + str(header).lstrip('/')
+        assert cache.Observe(spelling) == cache.Stamp(str(header))
+        assert cache.Observe(prefix) == cache.Stamp(prefix)
+        assert cache.Observe(prefix + directory.lstrip('/') + '/missing.h') is None
+        assert len(cache.paths) < 100
+    source = Path(directory) / 'source.c'
+    source.write_text('#include <header.h>\nint value;\n')
+    header.write_text('/* header */\n')
+    keeper = basics.ClientRootKeeper()
+    try:
+        for compiler in ('gcc', 'clang'):
+            analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+            files = analyzer.DoCompilationCommand(
+                [shutil.which(compiler), '-I///' + directory.lstrip('/'),
+                 '-c', str(source)], directory, keeper, 'lz4s')
+            assert files
+    finally:
+        keeper.CleanOutClientRoots()
+'''
+    subprocess.run([sys.executable, '-c', code], check=True, timeout=5)
+
   def setUp(self):
     self.storage = tempfile.TemporaryDirectory()
     self.addCleanup(self.storage.cleanup)

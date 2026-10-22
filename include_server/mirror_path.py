@@ -97,7 +97,7 @@ class MirrorPath(object):
     # Working from the end (in the hope that a cache lookup will reveal
     # the futility of further work), make sure that intermediate
     # destinations exist, and replicate symbolic links where necessary.
-    while filepath and filepath != '/':
+    while filepath and os.path.dirname(filepath) != filepath:
       if (filepath, current_dir_idx) in link_stat:
         # Filepath is already mirrored
         return

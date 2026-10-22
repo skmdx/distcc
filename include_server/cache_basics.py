@@ -626,12 +626,15 @@ class FileStampCache(object):
       path = os.path.join(os.getcwd(), path)
     original = path
     ancestors = []
-    while path != '/':
+    while True:
+      parent = os.path.dirname(path)
+      if parent == path:
+        break
       key = (path, True)
       if key in self.paths:
         break
       ancestors.append(path)
-      path = os.path.dirname(path)
+      path = parent
     # Watch ancestors before taking the lookup snapshot, including nonexistent
     # ancestors whose creation can make a formerly missing header visible.
     for path in reversed(ancestors):
