@@ -14,5 +14,4 @@ ExecStart=/usr/bin/distccd --broker /run/distcc-broker-%i.socket
 Environment=DISTCC_DIR=/var/cache/distcc-broker-%i
 CacheDirectory=distcc-broker-%i
 MemoryMax=64M
-MemorySwapMax=0
 NoNewPrivileges=yes

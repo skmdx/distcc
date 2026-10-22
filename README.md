@@ -264,11 +264,14 @@ hard per-job limits or a common scheduler for unrelated build processes.
 For an already configured Gentoo fleet, run `./deploy` without arguments.
 The launcher can also be symlinked into `PATH` as `distcc-deploy`.
 It reads the private `~/.config/distcc/deploy.json` (or `$XDG_CONFIG_HOME`),
-selects the latest committed overlay ebuild, installs it on all targets,
-applies service settings, and verifies native versus remote C/C++ compilation,
-preprocessing and execution. Source archives are fetched and verified locally,
-then synchronized to targets; remote internet access is not required. Source builds use distcc and explicit finite
-cgroup memory limits with swap disabled. A configured cross sysroot builds the
+selects the latest committed overlay ebuild, and installs and validates the first
+configured target before upgrading the remaining targets in parallel. Each target
+gets service settings and native versus remote C/C++ compilation, preprocessing
+and execution checks. Source archives are fetched and verified locally,
+then synchronized to targets; remote internet access is not required. Source
+builds use distcc. Cgroup resource limits are optional explicit configuration;
+the deployment command does not impose a memory cap or disable swap.
+A configured cross sysroot builds the
 binary package for targets without native build capacity. See
 `packaging/gentoo/deploy.example.json` for configuration fields; keep actual
 host identities and filesystem paths outside the repository.
@@ -326,7 +329,7 @@ this policy. Before worker startup it sets `MemoryMax` to the smaller of:
 * Each parent cgroup's limit minus the usage outside this service. Parent cache
   is counted conservatively as used.
 
-The result is rounded down to whole pages and swap is disabled. The helper
+The result is rounded down to whole pages. Swap remains available. The helper
 prints the measured operands and resulting limit to the service journal;
 invoking it with the unit name but without `--apply` prints a dry run. A
 root-owned ceiling in `/run/distccd-memory` prevents restarts, including OOM

@@ -66,6 +66,8 @@ def transfer(paths, destination, target=None, *, mirror=False):
 
 
 def parallel(targets, action):
+    if not targets:
+        return
     errors = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
         pending = {pool.submit(action, target): target['name'] for target in targets}
@@ -78,6 +80,13 @@ def parallel(targets, action):
                 errors.append(message)
     if errors:
         raise RuntimeError('\n'.join(errors))
+
+
+def rollout(targets, action):
+    # The first target must pass installed-path validation before any other
+    # target is upgraded. A failed canary leaves the remaining workers intact.
+    action(targets[0])
+    parallel(targets[1:], action)
 
 
 def builds_to_pause(target):
@@ -96,7 +105,7 @@ def builds_to_pause(target):
 def distribute_sources(settings, version, ebuild, targets, work):
     import portage
     transfer([str(ebuild.parent) + '/'], settings['local_repository'] + '/sys-devel/distcc', mirror=True)
-    fetcher = dict(targets[0], check_limits=targets[0]['build_limits'])
+    fetcher = dict(targets[0], check_limits=targets[0].get('build_limits', []))
     with (work / 'fetch.log').open('w') as log:
         bounded(['ebuild', str(ebuild), 'fetch'], fetcher, 'fetch', log, cross=True)
     directory = Path(run(['portageq', 'envvar', 'DISTDIR']))
@@ -116,7 +125,7 @@ def distribute_sources(settings, version, ebuild, targets, work):
 
 
 def bounded(args, target, stage, log, *, cross=False):
-    limits = target['build_limits'] if stage == 'build' else target['check_limits']
+    limits = target.get('build_limits' if stage == 'build' else 'check_limits', [])
     unit = 'distcc-deploy-' + stage + '-' + target['name']
     # Deterministic unit names reject duplicate runs whose SSH connection was lost.
     properties = [*limits, 'IOAccounting=yes', 'RuntimeMaxSec=2700' if stage == 'build' else 'RuntimeMaxSec=240']
@@ -125,14 +134,6 @@ def bounded(args, target, stage, log, *, cross=False):
     cmd = ['sudo', '-n', 'systemd-run', '--wait', '--pipe', '--collect', '--unit=' + unit]
     for prop in properties:
         cmd += ['-p', prop]
-    if any(p.startswith('MemoryMax=') for p in limits):
-        guard = ('from pathlib import Path; import os,sys; '
-                 'p=next(s[3:] for s in Path("/proc/self/cgroup").read_text().splitlines() if s.startswith("0::/")); '
-                 'g=Path("/sys/fs/cgroup")/p.lstrip("/"); '
-                 'assert (g/"memory.max").read_text().strip() not in ("max","0"); '
-                 'assert (g/"memory.swap.max").read_text().strip()=="0"; '
-                 'os.execvp(sys.argv[1],sys.argv[1:])')
-        args = ['python3', '-c', guard, *args]
     run([*cmd, *args], target if not cross else None, log=log)
 
 
@@ -152,7 +153,7 @@ def install(target, version, ebuild, work, cross):
             args = ['env', *env, 'DISTCC_PUMP=0',
                     'MAKEOPTS=-j' + str(cross['jobs']), *emerge_command('distcc buildpkg -ccache'), '--buildpkgonly',
                     '--oneshot', '--nodeps', '--usepkg=n', '--quiet-build=y', '=sys-devel/' + version]
-            builder = dict(target, build_limits=cross['limits'])
+            builder = dict(target, build_limits=cross.get('limits', []))
             bounded(args, builder, 'build', log, cross=True)
             remote_packages = target['temporary'] + '/distcc-deploy-binpkgs/' + version
             transfer([str(packages) + '/'], remote_packages, target)
@@ -228,7 +229,7 @@ def validate(target, work):
         for hosts in dict.fromkeys([target['server_hosts'], target['validation_hosts']]):
             args[2] = 'VALIDATE_DISTCC_HOSTS=' + hosts
             bounded(args, target, 'check', log)
-    run(['sudo', '-n', 'rm', '-f', remote + '/validate-installed.py'], target)
+    run(['sudo', '-n', 'rm', '--', remote + '/validate-installed.py'], target)
     run(['sudo', '-n', 'rmdir', remote], target)
     print(f"{target['name']}: C/C++ remote compilation and execution passed", flush=True)
 
@@ -249,10 +250,6 @@ def main():
                 raise RuntimeError('target names must be safe systemd unit suffixes')
             if not target.get('server_hosts'):
                 raise RuntimeError('server_hosts must select the target worker for inbound validation')
-            limits = settings['cross']['limits'] if target.get('binary') else target['build_limits']
-            if 'MemorySwapMax=0' not in limits or not any(
-                    p.startswith('MemoryMax=') and p.split('=', 1)[1] not in ('0', 'infinity') for p in limits):
-                raise RuntimeError('every source build needs a finite memory limit with swap disabled')
         work = Path(tempfile.mkdtemp(prefix='distcc-deploy-', dir=settings['temporary']))
         print(f'{version}: logs in {work}', flush=True)
         resume_path = config.with_suffix('.resume.json')
@@ -269,20 +266,22 @@ def main():
                     resume[target['name']] = sorted(set(resume.get(target['name'], []) + names))
                     resume_path.write_text(json.dumps(resume))
                     run(['sudo', '-n', 'systemctl', 'stop', *names], target)
-            parallel(targets, lambda target: install(target, version, ebuild, work, settings['cross']))
-            for target in targets:
+            def deploy_target(target):
+                install(target, version, ebuild, work, settings['cross'])
                 configure(target, work)
-            parallel(targets, lambda target: validate(target, work))
+                validate(target, work)
+            rollout(targets, deploy_target)
             for target in targets:
                 if target['name'] in resume:
                     run(['sudo', '-n', 'systemctl', 'start', *resume[target['name']]], target)
             resume_path.unlink(missing_ok=True)
             for target in targets:
                 if target.get('binary'):
-                    run(['sudo', '-n', 'rm', '-rf', target['temporary'] + '/distcc-deploy-binpkgs/' + version], target)
+                    run(['sudo', '-n', 'rm', '-r', '--', target['temporary'] + '/distcc-deploy-binpkgs/' + version], target)
             # Cross builds create root-owned package subdirectories. Failure to
             # remove them must not be hidden before moving logs across devices.
-            run(['sudo', '-n', 'rm', '-rf', '--', work / 'binpkgs'])
+            if (work / 'binpkgs').exists():
+                run(['sudo', '-n', 'rm', '-r', '--', work / 'binpkgs'])
             (work / 'result.json').write_text(json.dumps({'version': version, 'success': True,
                                                         'targets': [t['name'] for t in targets]}))
             results = Path(settings['results'])

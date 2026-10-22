@@ -25,7 +25,6 @@ class TransportTest(unittest.TestCase):
             (destination / 'retired.ebuild').write_text('retired')
             sibling = root / 'other-package'
             sibling.write_text('preserve')
-            self.addCleanup(subprocess.run, ['sudo', '-n', 'rm', '-rf', str(destination)])
             deploy.transfer([str(source) + '/'], str(destination), mirror=True)
             self.assertEqual(sorted(p.name for p in destination.iterdir()), ['current.ebuild'])
             self.assertEqual(sibling.read_text(), 'preserve')
@@ -41,11 +40,42 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(deploy.run(['zsh', '-c', cmd[-1]]), repr(values))
 
 
+class RolloutTest(unittest.TestCase):
+    def test_failed_canary_does_not_upgrade_other_targets(self):
+        visited = []
+        def action(target):
+            visited.append(target)
+            raise RuntimeError('installed validation failed')
+        with self.assertRaisesRegex(RuntimeError, 'installed validation failed'):
+            deploy.rollout([{'name': 'canary'}, {'name': 'worker'}], action)
+        self.assertEqual(visited, [{'name': 'canary'}])
+
+    def test_other_targets_start_after_canary_succeeds(self):
+        visited = []
+        def action(target):
+            if target['name'] != 'canary':
+                self.assertIn('canary', visited)
+            visited.append(target['name'])
+        deploy.rollout([{'name': name} for name in ('canary', 'first', 'second')], action)
+        self.assertCountEqual(visited, ['canary', 'first', 'second'])
+        deploy.rollout([{'name': 'canary'}], action)
+
+
 @unittest.skipUnless(shutil.which('systemd-run') and shutil.which('sudo'), 'systemd and sudo required')
 class BuildLifecycleTest(unittest.TestCase):
     def setUp(self):
         if subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode:
             self.skipTest('passwordless sudo required')
+
+    def test_build_does_not_impose_memory_or_swap_limits(self):
+        probe = ('from pathlib import Path; '
+                 'p=Path("/proc/self/cgroup").read_text().strip().split("::",1)[1]; '
+                 'g=Path("/sys/fs/cgroup")/p.lstrip("/"); '
+                 'assert (g/"memory.max").read_text().strip()=="max"; '
+                 'assert (g/"memory.swap.max").read_text().strip()=="max"')
+        with tempfile.TemporaryFile(mode='w+') as log:
+            deploy.bounded(['python3', '-c', probe],
+                           {'name': f'limits-test-{os.getpid()}'}, 'build', log)
 
     def test_persistent_build_can_be_stopped_and_resumed(self):
         unit = f'distcc-deploy-persistent-test-{os.getpid()}.service'

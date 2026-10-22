@@ -69,9 +69,9 @@ def main():
         temporary.write_text(str(result['limit']) + '\n')
         temporary.replace(state)
         subprocess.run(['systemctl', 'set-property', '--runtime', args.unit,
-                        'MemoryMax=' + str(result['limit']), 'MemorySwapMax=0'], check=True)
+                        'MemoryMax=' + str(result['limit']), 'MemorySwapMax=infinity'], check=True)
         actual = int((group / 'memory.max').read_text())
-        if actual != result['limit'] or (group / 'memory.swap.max').read_text().strip() != '0':
+        if actual != result['limit'] or (group / 'memory.swap.max').read_text().strip() != 'max':
             raise RuntimeError('systemd did not apply the calculated memory limits')
     print(json.dumps(result, sort_keys=True), flush=True)
 

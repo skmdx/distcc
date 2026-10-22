@@ -5,7 +5,7 @@
   "results": "/path/to/workspace/note/distcc/deployments",
   "cross": {
     "root": "/path/to/prepared/target-sysroot",
-    "limits": ["MemoryMax=4G", "MemorySwapMax=0"],
+    "limits": [],
     "jobs": 4
   },
   "targets": [
@@ -15,8 +15,8 @@
       "repository": "/var/db/repos/overlay",
       "temporary": "/path/to/remote/workspace/tmp",
       "jobs": 4,
-      "build_limits": ["MemoryMax=4G", "MemorySwapMax=0"],
-      "check_limits": ["MemoryMax=512M", "MemorySwapMax=0"],
+      "build_limits": [],
+      "check_limits": [],
       "auto_memory": true,
       "compiler_paths": ["/usr/lib/llvm/22/bin/x86_64-pc-linux-gnu-clang-22", "/usr/lib/llvm/22/bin/x86_64-pc-linux-gnu-clang++-22"],
       "validation_hosts": "worker-ssh-alias,cpp,lz4",
