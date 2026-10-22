@@ -1,7 +1,10 @@
 import hashlib
 import contextlib
+import difflib
 import json
 import os
+import shlex
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -36,6 +39,21 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
     env.pop('DISTCC_GCC_SCAN_LIBRARY', None)
     results = {}
     compilers = ['/usr/bin/gcc', '/usr/bin/g++'] + json.loads(os.environ.get('VALIDATE_DISTCC_COMPILERS', '[]'))
+    # Test the names Portage actually invokes, not only target-prefixed aliases
+    # explicitly listed for the server. CMDLIST matches the requested basename.
+    search_path = ':'.join(dict.fromkeys([*(str(Path(p).parent) for p in compilers),
+                                          *os.get_exec_path()]))
+    for variable in ('CC', 'CXX'):
+        value = subprocess.check_output(['portageq', 'envvar', variable], text=True).strip()
+        if not value:
+            continue
+        command = shlex.split(value)
+        if len(command) != 1:
+            raise RuntimeError('Cannot validate compound Portage ' + variable + ': ' + value)
+        compiler = shutil.which(command[0], path=search_path)
+        if not compiler or Path(compiler).samefile('/usr/bin/distcc'):
+            raise RuntimeError('Cannot resolve real Portage ' + variable + ': ' + value)
+        compilers.append(compiler)
     env['PATH'] = ':'.join(dict.fromkeys(['/usr/lib/distcc',
                                         *(str(Path(p).parent) for p in compilers), '/bin']))
     for compiler_path in dict.fromkeys(compilers):
@@ -79,7 +97,9 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             if suffix == 'cc':
                 preprocessed = root/(kind+'.ii')
                 prefix = [compiler_path] if kind == 'native' else ['pump', 'distcc', compiler]
-                subprocess.run([*prefix, '-I'+str(root), '-O2', '-E', str(source), '-o', str(preprocessed)],
+                # GCC translates synthetic line markers using the worker's
+                # locale. Compare preprocessing output without those markers.
+                subprocess.run([*prefix, '-I'+str(root), '-O2', '-E', '-P', str(source), '-o', str(preprocessed)],
                                env=env, check=True, capture_output=True, timeout=90)
                 pp_hashes[kind] = hashlib.sha256(preprocessed.read_bytes()).hexdigest()
             if kind == 'remote':
@@ -87,7 +107,11 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                 subprocess.run([compiler_path, str(obj), str(support_obj), '-o', str(exe)], check=True, timeout=30)
                 subprocess.run([str(exe)], check=True, timeout=5)
         if pp_hashes and pp_hashes['native'] != pp_hashes['remote']:
-            raise AssertionError(pp_hashes)
+            difference = list(difflib.unified_diff(
+                (root/'native.ii').read_text().splitlines(),
+                (root/'remote.ii').read_text().splitlines(),
+                fromfile='native', tofile='remote'))
+            raise AssertionError(compiler + '\n' + '\n'.join(difference[:80]))
         if hashes['native'] != hashes['remote']:
             assert '--assembly' in sys.argv, hashes
             assembly = {}
