@@ -550,7 +550,7 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.job('after-cancel')
 
     def wire_job(self, body, cached=True, paths=(b'/src/source.c',), identity=1, receive_buffer=None,
-                 verification: bytes | None = b'DCSI\0\0\0\0'):
+                 verification: bytes | None = b'DCSI\0\0\0\0', net=None):
         def string(value):
             return struct.pack('!Q', len(value)) + value
         args = [b'gcc', b'-c', paths[0], b'-o', b'/src/result.o']
@@ -566,7 +566,9 @@ ssize_t write(int fd, const void *data, size_t size) {
             manifest += (struct.pack('!5Q', 0, 0, 0, len(verification), len(verification)) +
                          xxhash.xxh3_64(verification).digest() +
                          string(b'/.distcc-system/check') + string(b''))
-        net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
+        if net is None:
+            net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
+        net.settimeout(5)
         if receive_buffer:
             net.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
         self.addCleanup(net.close)
@@ -778,6 +780,56 @@ Path(args[args.index('-o') + 1]).write_bytes(random.Random(543).randbytes(4 * 10
             self.job('while-results-stalled')
         finally:
             for net in stalled:
+                net.close()
+
+    @unittest.skipUnless(shutil.which('objcopy'), 'objcopy is required')
+    def test_hinted_broker_leases_release_cpu_during_real_result_transfer(self):
+        wrapper = self.root / 'bin' / 'gcc'
+        original = wrapper.read_text()
+        self.addCleanup(wrapper.write_text, original)
+        noise = self.work / 'noise'
+        noise.write_bytes(random.Random(543).randbytes(6 * 1024 * 1024))
+        wrapper.write_text(f'''#!/usr/bin/python3
+import subprocess, sys
+args = sys.argv[1:]
+subprocess.run([{self.cc!r}, *args], check=True)
+subprocess.run(['objcopy', '--add-section', {'noise=' + str(noise)!r}, args[args.index('-o') + 1]], check=True)
+''')
+        self.start_tcp()
+        held = []
+        try:
+            for index in range(4):
+                lease, net = self.acquire_reserved(10, (990 + index, 4 * 1024 * 1024, 1))
+                body = f'int answer_{index}(void) {{ return {index}; }}\n'.encode()
+                self.wire_job(body, cached=False, receive_buffer=65536, net=net)
+                self.upload(net, body)
+                held.append((lease, net, body))
+            deadline = time.monotonic() + 10
+            while 'dcc_returning 4\n' not in self.get_stats(self.stats_ports[0]):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+            wrapper.write_text(original)
+            # Include a fresh broker snapshot. All four leases still exist,
+            # but the actual worker has completed their GCC compilations.
+            time.sleep(1.1)
+            self.assertIn('dcc_busy 0\n', self.get_stats(self.stats_ports[0]))
+            started = time.monotonic()
+            self.job('while-hinted-results-stalled')
+            self.assertLess(time.monotonic() - started, 5)
+            for index, (lease, net, body) in enumerate(held):
+                net.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                outputs = self.result(net)
+                actual, expected = self.work / 'returned.o', self.work / 'native.o'
+                source = self.work / 'source.c'
+                actual.write_bytes(outputs[2])
+                subprocess.run(['objcopy', '--remove-section', 'noise', str(actual)], check=True)
+                source.write_bytes(body)
+                subprocess.run([self.cc, '-c', str(source), '-o', str(expected)], check=True)
+                self.assertEqual(actual.read_bytes(), expected.read_bytes())
+                lease.close()
+        finally:
+            for lease, net, _ in held:
+                lease.close()
                 net.close()
 
     def test_daemon_shutdown_reclaims_preparing_and_running_jobs(self):

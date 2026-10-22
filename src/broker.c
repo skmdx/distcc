@@ -624,6 +624,7 @@ static double execution_factor(const struct peer *peer, int work, int recovering
         cap.running -= cap.busy > 0 ? cap.busy : 0;
         if (cap.running < 0) cap.running = 0;
         cap.running += executing - 1;
+        if (cap.running < 0) cap.running = 0;
     } else {
         cap.load -= cap.busy > 0 ? cap.busy : 0;
         if (cap.load < 0) cap.load = 0;
@@ -639,6 +640,21 @@ static int assigned_order(const void *a, const void *b)
     const struct client *left = *(const struct client *const *)a;
     const struct client *right = *(const struct client *const *)b;
     return (left->serial > right->serial) - (left->serial < right->serial);
+}
+
+static int time_order(const void *a, const void *b)
+{
+    double left = *(const double *)a, right = *(const double *)b;
+    return (left > right) - (left < right);
+}
+
+/* A client lease and a worker CPU are separate resources. Waiting jobs must
+ * forecast both gates, without treating a client /LIMIT as global CPU capacity. */
+static double lease_ready(double *releases, int count, int inflight)
+{
+    if (count < inflight) return 0;
+    qsort(releases, count, sizeof(*releases), time_order);
+    return releases[count - inflight];
 }
 
 struct prediction { double start, prepare, factor, finish; };
@@ -657,7 +673,7 @@ static int bulk_input(const struct peer *peer, const struct dcc_work_hint *hint)
 
 static struct prediction predict(struct broker *broker, const struct client *client,
                                   int peer_index, int work, double cost, double now,
-                                  const struct dispatch_batch *batch, int recovering, int capacity)
+                                  const struct dispatch_batch *batch, int recovering, int capacity, int inflight)
 {
     struct peer *peer = &broker->peers[peer_index];
     const struct dcc_capacity *cap = &peer->metrics;
@@ -686,6 +702,8 @@ static struct prediction predict(struct broker *broker, const struct client *cli
     int rounds = unknown / lanes;
     double average = (peer->mean_cost > 0 ? peer->mean_cost : 1) * result.factor;
     double free_at[MAX_CLIENTS];
+    double remaining[MAX_CLIENTS], ready_at[MAX_CLIENTS], releases[MAX_CLIENTS];
+    int leases = 0;
     for (int i = 0; i < lanes; ++i)
         free_at[i] = (rounds + (i < unknown % lanes)) * average;
     for (int i = 0; i < count; ++i) {
@@ -701,22 +719,40 @@ static struct prediction predict(struct broker *broker, const struct client *cli
          * it grows while the job overruns instead of promising an imminent
          * finish forever and starving an idle worker. */
         if (left <= 0) left = elapsed;
+        remaining[i] = left;
+        ready_at[i] = c->ready_at > now ? c->ready_at - now : 0;
+        releases[leases++] = ready_at[i] + left;
+    }
+    for (int i = 0; i < count; ++i) {
+        /* Statistics identify execution counts, not individual returning
+         * leases. Retain the longest possible residuals up to that count;
+         * never invent extra CPU work from results still being transferred. */
+        int rank = 0;
+        if (count > work)
+            for (int j = 0; j < count && rank < work; ++j)
+                rank += remaining[j] > remaining[i] ||
+                        (remaining[j] == remaining[i] && j < i);
+        if (rank >= work) continue;
         int first = 0;
         for (int j = 1; j < lanes; ++j) if (free_at[j] < free_at[first]) first = j;
-        double ready = c->ready_at > now ? c->ready_at - now : 0;
-        if (free_at[first] < ready) free_at[first] = ready;
-        free_at[first] += left;
+        if (free_at[first] < ready_at[i]) free_at[first] = ready_at[i];
+        free_at[first] += remaining[i];
+        releases[i] = free_at[first];
     }
+    while (leases < peer->busy && leases < MAX_CLIENTS) releases[leases++] = average;
     for (unsigned i = 0; i < batch->count; ++i) {
         if (batch->planned[i].peer != peer_index) continue;
         int first = 0;
         for (int j = 1; j < lanes; ++j) if (free_at[j] < free_at[first]) first = j;
-        if (free_at[first] < batch->planned[i].prepare) free_at[first] = batch->planned[i].prepare;
+        double ready = lease_ready(releases, leases, inflight) + batch->planned[i].prepare;
+        if (free_at[first] < ready) free_at[first] = ready;
         free_at[first] += batch->planned[i].cost * result.factor;
+        releases[leases++] = free_at[first];
     }
     result.start = free_at[0];
     for (int i = 1; i < lanes; ++i) if (free_at[i] < result.start) result.start = free_at[i];
-    if (result.start < result.prepare) result.start = result.prepare;
+    double ready = lease_ready(releases, leases, inflight) + result.prepare;
+    if (result.start < ready) result.start = ready;
     result.finish = result.start + cost * result.factor;
     return result;
 }
@@ -834,7 +870,9 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             /* A lease can precede the worker's first input byte. A fresh idle
              * snapshot must not erase that work and repeatedly refill the
              * same worker while the client prepares its request. */
-            int leased = p->busy - (cap->returning > 0 ? cap->returning : 0);
+            int returning = cap->returning - p->completed;
+            if (returning < 0) returning = 0;
+            int leased = p->busy - returning;
             if (link && (cap->links > 0 || recent_links[i])) continue;
             blocked = work + preparing >= limit + pipeline || leased >= limit + pipeline;
             if (blocked && !predicted) continue;
@@ -842,8 +880,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * beyond the bounded pipeline adds CPU queueing delay. */
             if (preparing > pipeline) work += preparing - pipeline;
             if (leased > work) work = leased;
-            if (cap->returning > 0)
-                inflight += cap->returning < slots ? cap->returning : slots;
+            if (returning > 0)
+                inflight += returning < slots ? returning : slots;
             projected = *cap;
             projected.busy = cpu;
             projected.queued = 0;
@@ -863,7 +901,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             struct prediction forecast = {0};
             int wait = 0;
             if (predicted) {
-                forecast = predict(broker, client, i, work, cost, now, batch, probe, cap->capacity);
+                forecast = predict(broker, client, i, work, cost, now, batch, probe, cap->capacity, inflight);
                 score = forecast.finish;
                 /* Keep a ready job movable until an execution lane is actually
                  * available. Near-zero predicted residuals are not completion
@@ -889,10 +927,14 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                  * client preprocessing on a machine that also runs a worker. */
                 double before = demand ? demand / execution_factor(p, work - 1, probe, cap->capacity) : 0;
                 double gain = (demand + 1) / execution_factor(p, work, probe, cap->capacity) - before;
-                if (gain > 0) {
-                    double throughput = forecast.prepare + (cost > 0 ? cost : 1) / gain;
-                    if (!predicted || throughput > score) score = throughput;
-                }
+                /* At saturation there is no positive marginal throughput.
+                 * Charge aggregate service demand instead of dropping the
+                 * penalty or dividing by numerical noise. This finite bound
+                 * also lets the least costly host progress when all are busy. */
+                double penalty = (demand + 1) * execution_factor(p, work, probe, cap->capacity);
+                if (gain > 0 && gain * penalty > 1) penalty = 1 / gain;
+                double throughput = forecast.prepare + (cost > 0 ? cost : 1) * penalty;
+                if (!predicted || throughput > score) score = throughput;
             }
             double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;

@@ -86,6 +86,18 @@ class BrokerTestCase(DistccTestCase):
             descriptors.extend(array.array("i", data))
         return status, slots, descriptors
 
+    def acquire_reserved(self, command=6, work=(0, 0, 0), source_bytes=0):
+        lease = self.request(command, work, source_bytes)
+        status, capabilities, fds = self.receive(lease)
+        self.assertEqual(status, 0)
+        self.assertTrue(capabilities & (1 << 30))
+        self.assertEqual(len(fds), 1)
+        net = socket.socket(fileno=fds[0])
+        self.addCleanup(net.close)
+        lease.sendall(struct.pack('=II', 2, 3))
+        return lease, net
+
+
     def job(self, index, language="c", prefix=()):
         source = self.work / f"source-{index}.{language}"
         source.write_text("int main() { return 0; }\n")
@@ -102,6 +114,72 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerTest(BrokerTestCase):
+    def test_saturated_external_cpu_does_not_drop_displacement_penalty(self):
+        for running, smt in ((3, .25), (4, .25), (5, .25), (4, 1e-15), (4, 0), (4, -.1)):
+            with self.subTest(running=running, smt=smt):
+                peers = [self.peer(stats_response(cpus=4, cores=2, jobs=4,
+                             running=running, smt_gain=smt, busy=0, queued=0,
+                             preparing=0, returning=0, capacity=4)),
+                         self.peer(stats_response(cpus=4, cores=4, jobs=4,
+                             running=0, busy=0, queued=0, preparing=0, returning=0, capacity=4))]
+                hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={1 if i == 0 else .5}')
+                                 for i, p in enumerate(peers))
+                self.start_broker(hosts, name=f'saturation-{running}-{smt}')
+                _, net = self.acquire_reserved(10, (99, 4 * 1024 * 1024, 1))
+                self.assertEqual(net.getpeername()[1], self.ports[1])
+
+    def test_all_saturated_workers_still_make_progress(self):
+        peers = [self.peer(stats_response(cpus=4, cores=2, jobs=4,
+                         running=8, busy=0, queued=0, preparing=0, returning=0, capacity=4))
+                 for _ in range(2)]
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else 1}')
+                                  for i, p in enumerate(peers)))
+        _, net = self.acquire_reserved(10, (99, 4 * 1024 * 1024, 1))
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+
+    def test_returning_hinted_lease_does_not_predict_cpu_work(self):
+        peer = self.peer(stats_response(cpus=1, cores=1, jobs=1, running=0,
+                        busy=0, queued=0, preparing=0, returning=0, capacity=1))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
+        self.acquire_reserved(10, (99, 4 * 1024 * 1024, 1))
+        peer.response = stats_response(cpus=1, cores=1, jobs=1, running=0,
+                            busy=0, queued=0, preparing=0, returning=1, capacity=1)
+        time.sleep(1.1)
+        lease = self.request(10, (100, 4 * 1024 * 1024, 1))
+        lease.settimeout(.5)
+        status, _, fds = self.receive(lease)
+        for fd in fds: os.close(fd)
+        self.assertEqual(status, 0)
+
+    def test_client_limit_wait_is_included_in_completion_forecast(self):
+        peers = [self.peer(stats_response(cpus=4, cores=4, jobs=4, running=0,
+                         busy=0, queued=0, preparing=0, returning=0, capacity=4)) for _ in range(2)]
+        self.start_broker(self.host(0, f',tcp,stats={peers[0].port},speed=2', slots=1) + ' ' +
+                          self.host(1, f',tcp,stats={peers[1].port}'))
+        for index in range(2):
+            _, net = self.acquire_reserved(10, (80 + index, 64 * 1024 * 1024, 1))
+            self.assertEqual(net.getpeername()[1], self.ports[0])
+        lease = self.request(10, (99, 4 * 1024 * 1024, 1))
+        lease.settimeout(.5)
+        status, _, fds = self.receive(lease)
+        self.assertEqual(status, 0)
+        with socket.socket(fileno=fds[0]) as net:
+            self.assertEqual(net.getpeername()[1], self.ports[1])
+
+    def test_other_broker_return_does_not_erase_running_work(self):
+        peer = self.peer(stats_response(cpus=1, cores=1, jobs=1, running=0,
+                        busy=0, queued=0, preparing=0, returning=0, capacity=1))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
+        self.acquire_reserved(10, (99, 4 * 1024 * 1024, 1))
+        # Our job is still executing; the returning result belongs to another
+        # broker. Global CPU work must survive the local-lease reconciliation.
+        peer.response = stats_response(cpus=1, cores=1, jobs=1, running=1,
+                            busy=1, queued=0, preparing=0, returning=1, capacity=1)
+        time.sleep(1.1)
+        lease = self.request(10, (100, 4 * 1024 * 1024, 1))
+        import select
+        self.assertFalse(select.select([lease], [], [], .2)[0])
+
     def test_analysis_shares_occupancy_without_cpp_head_of_line_blocking(self):
         self.start_broker(self.host(0) + ' --localslots_cpp=1')
         capacity = int(subprocess.check_output([str(self.build / 'distcc'), '--show-analyzer-slots'],
@@ -240,16 +318,6 @@ class BrokerTest(BrokerTestCase):
         waiter.close()
         self.assertEqual(self.receive(self.request(12)), (0, 1, []))
 
-    def acquire_reserved(self, command=6, work=(0, 0, 0), source_bytes=0):
-        lease = self.request(command, work, source_bytes)
-        status, capabilities, fds = self.receive(lease)
-        self.assertEqual(status, 0)
-        self.assertTrue(capabilities & (1 << 30))
-        self.assertEqual(len(fds), 1)
-        net = socket.socket(fileno=fds[0])
-        self.addCleanup(net.close)
-        lease.sendall(struct.pack('=II', 2, 3))
-        return lease, net
 
     def admission_hosts(self):
         # Intentionally stale, idle metrics: admission must still prevent
