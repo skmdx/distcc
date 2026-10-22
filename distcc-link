@@ -7,6 +7,7 @@ the existing local compiler behavior.
 """
 import array
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import io
@@ -1115,8 +1116,15 @@ def sync_sysroot(root, compiler, profile_path, destinations, *, refresh=False):
             # No credentials need to be forwarded or installed on the source.
             source_path = transfer_generation(root, listing, metadata, key, *local)
             targets.remove(local)
-        for host, base in targets:
-            transfer_generation(source_path, listing, metadata, key, host, base)
+        if targets:
+            # Destinations are independent after source preparation.
+            # Join every transfer before publishing the profile or
+            # removing its temporary metadata, including on failure.
+            with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+                transfers = [pool.submit(transfer_generation, source_path,
+                    listing, metadata, key, host, base) for host, base in targets]
+                for transfer in transfers:
+                    transfer.result()
     with tempfile.NamedTemporaryFile(mode='w', dir=profile_path.parent,
                                      prefix='.distcc-sysroot-', delete=False) as stream:
         temporary = Path(stream.name)

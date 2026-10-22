@@ -151,7 +151,20 @@ class LinkTest(LinkTestCase):
         self.assertTrue((extra / json.loads(original)['key'] / '.distcc-link.json').is_file())
         with (snapshot / self.profile['gccdir'] / 'crtbegin.o').open('ab') as stream:
             stream.write(b'\0')
-        subprocess.run(command, env=self.link_env, check=True, capture_output=True, timeout=30)
+        blocked = self.work / 'blocked-cache'
+        blocked.write_text('not a directory')
+        result = subprocess.run([*command, str(extra), str(blocked)], env=self.link_env,
+                                capture_output=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(path.read_bytes(), original)
+        # A failed destination must not publish a partial client profile, and
+        # other transfers must have finished before their metadata is removed.
+        self.assertTrue((extra / 'current' / '.distcc-link.json').is_file())
+        updated = json.loads((extra / 'current' / '.distcc-link.json').read_text())
+        self.assertNotEqual(updated['key'], json.loads(original)['key'])
+        self.assertEqual(list(extra.glob('.incoming-*')), [])
+        subprocess.run([*command, str(extra)], env=self.link_env, check=True,
+                       capture_output=True, timeout=30)
         self.assertNotEqual(json.loads(path.read_text())['key'], json.loads(original)['key'])
         self.env.update(DISTCC_LINK_SOURCE=str(snapshot), DISTCC_LINK_SYSROOT=str(path))
         output, result = self.link()
