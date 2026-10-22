@@ -277,7 +277,9 @@ def main():
             resume_path.unlink(missing_ok=True)
             for target in targets:
                 if target.get('binary'):
-                    run(['sudo', '-n', 'rm', '-r', '--', target['temporary'] + '/distcc-deploy-binpkgs/' + version], target)
+                    run(['sudo', '-n', 'sh', '-c',
+                         'if test -d "$1"; then rm -r -- "$1"; fi', 'sh',
+                         target['temporary'] + '/distcc-deploy-binpkgs/' + version], target)
             # Cross builds create root-owned package subdirectories. Failure to
             # remove them must not be hidden before moving logs across devices.
             if (work / 'binpkgs').exists():
