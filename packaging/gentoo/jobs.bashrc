@@ -1,7 +1,47 @@
 # Source from /etc/portage/bashrc. Discover parallelism when MAKEOPTS has no
 # job option; package.env can still provide an explicit job limit.
+distcc_compiler_is_distributed() {
+    local compiler=${1%%[[:space:]]*} resolved configured prefix search directory candidate
+    local -a directories
+    # Bare compiler names use Portage's distcc PATH wrappers.
+    [[ ${compiler} == */* ]] || return 0
+    resolved=$(readlink -f -- "${compiler}") || return 1
+    [[ ${resolved##*/} == distcc ]] && return 0
+    [[ ${resolved##*/} == ccache && ${compiler##*/} != ccache ]] || return 1
+
+    # An absolute ccache masquerade link still searches for its compiler.
+    # Ask ccache for effective settings so config files and environment
+    # overrides follow the same route as the actual compilation.
+    configured=$("${resolved}" --get-config compiler 2>/dev/null) || return 1
+    prefix=$("${resolved}" --get-config prefix_command 2>/dev/null) || return 1
+    if [[ -n ${prefix} ]]; then
+        prefix=${prefix%%[[:space:]]*}
+        candidate=$(type -P -- "${prefix}") || return 1
+        candidate=$(readlink -f -- "${candidate}") || return 1
+        [[ ${candidate##*/} == distcc ]]
+        return
+    fi
+    compiler=${configured:-${compiler##*/}}
+    if [[ ${compiler} == */* ]]; then
+        candidate=$(readlink -f -- "${compiler}") || return 1
+        [[ ${candidate##*/} == distcc ]]
+        return
+    fi
+    search=$("${resolved}" --get-config path 2>/dev/null) || return 1
+    IFS=: read -r -a directories <<< "${search:-${PATH}}:"
+    for directory in "${directories[@]}"; do
+        candidate=${directory:-.}/${compiler}
+        [[ -f ${candidate} && -x ${candidate} ]] || continue
+        candidate=$(readlink -f -- "${candidate}") || return 1
+        [[ ${candidate} == "${resolved}" ]] && continue
+        [[ ${candidate##*/} == distcc ]]
+        return
+    done
+    return 1
+}
+
 distcc_configure_jobs() {
-    local jobs variable marker compiler resolved distributed
+    local jobs variable marker compiler distributed
     # Portage saves the phase environment. Refresh only values we generated;
     # package.env and ebuild overrides remain authoritative. Portage removes
     # DISTCC_* when saving phases, so keep provenance outside that namespace.
@@ -22,14 +62,8 @@ distcc_configure_jobs() {
     if [[ ! ${MAKEOPTS} =~ (^|[[:space:]])(-j([[:space:]]|[0-9]|$)|--jobs([=[:space:]]|$)) ]]; then
         if has distcc ${FEATURES} && ! has distcc ${RESTRICT}; then
             distributed=1
-            # Absolute compiler paths bypass Portage's PATH wrappers. Only an
-            # explicit distcc executable (or a symlink to it) opts back in.
             for compiler in "${CC}" "${CXX}"; do
-                compiler=${compiler%%[[:space:]]*}
-                if [[ ${compiler} == */* ]]; then
-                    resolved=$(readlink -f -- "${compiler}") || resolved=
-                    [[ ${resolved##*/} == distcc ]] || distributed=0
-                fi
+                distcc_compiler_is_distributed "${compiler}" || distributed=0
             done
         fi
         if [[ ${distributed} == 1 ]]; then

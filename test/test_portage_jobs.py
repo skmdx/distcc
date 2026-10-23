@@ -1,6 +1,8 @@
 """Portage phase inheritance and explicit parallelism overrides."""
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -32,7 +34,7 @@ echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
         hook = Path(__file__).resolve().parents[1] / 'packaging/gentoo/jobs.bashrc'
         env = {key: value for key, value in os.environ.items()
                if key not in ('CC', 'CXX') and
-               not key.startswith(('DISTCC_', 'MAKE', 'NINJA', 'CMAKE_'))}
+               not key.startswith(('DISTCC_', 'CCACHE_', 'MAKE', 'NINJA', 'CMAKE_'))}
         env['JOBS_HOOK'] = str(hook)
         result = subprocess.run(['bash', '-c', '''
 has() { local word=$1; shift; [[ " $* " == *" $word "* ]]; }
@@ -111,6 +113,44 @@ echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
 source "$JOBS_HOOK"
 echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
 '''), ['-j12 -j12 12'])
+
+    def test_ccache_masquerade_uses_effective_compiler_route(self):
+        ccache = shutil.which('ccache')
+        if not ccache:
+            self.skipTest('ccache is not installed')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache, remote, local = (root / name for name in ('cache', 'remote', 'local'))
+            for path in (cache, remote, local):
+                path.mkdir()
+            (cache / 'cc').symlink_to(ccache)
+            for path, target in ((remote, 'distcc'), (local, 'real-cc')):
+                (path / target).write_text('#!/bin/sh\nexit 0\n')
+                (path / target).chmod(0o755)
+                (path / 'cc').symlink_to(target)
+            config = root / 'ccache.conf'
+            config.touch()
+            cases = (
+                ('', '', 12),
+                ('path = ' + str(local), '', 3),
+                ('compiler = ' + str(local / 'real-cc'), '', 3),
+                ('compiler = ' + str(remote / 'distcc'), '', 12),
+                ('path = ' + str(local) + '\nprefix_command = ' + str(remote / 'distcc'), '', 12),
+                ('', 'export CCACHE_PATH=' + shlex.quote(str(local)), 3),
+                ('', 'export CCACHE_COMPILER=' + shlex.quote(str(local / 'real-cc')), 3),
+                ('path = ' + str(local), 'export CCACHE_PREFIX=' + shlex.quote(str(remote / 'distcc')), 12),
+            )
+            for settings, environment, jobs in cases:
+                with self.subTest(settings=settings, environment=environment):
+                    config.write_text(settings + '\n')
+                    self.assertEqual(self.run_hook('''
+export CCACHE_CONFIGPATH=''' + shlex.quote(str(config)) + '''
+export PATH=''' + shlex.quote(f'{cache}:{remote}:{local}:') + '''"$PATH"
+CC=''' + shlex.quote(str(cache / 'cc')) + '''
+''' + environment + '''
+source "$JOBS_HOOK"
+echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
+'''), [f'-j{jobs} -j{jobs} {jobs}'])
 
 
 if __name__ == '__main__':
