@@ -14,6 +14,8 @@ class PortageJobsTest(unittest.TestCase):
         self.assertEqual(self.run_hook('''
 PORTAGE_BIN_PATH="''' + str(helpers[-1].parent) + '''"
 EAPI=8
+MAKEOPTS='--output-sync=line'
+source "$JOBS_HOOK"
 source "$PORTAGE_BIN_PATH/eapi.sh"
 source "$PORTAGE_BIN_PATH/phase-functions.sh"
 source "$PORTAGE_BIN_PATH/save-ebuild-env.sh"
@@ -24,7 +26,7 @@ eval "$saved" || exit 1
 workers=6
 source "$JOBS_HOOK"
 echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
-'''), ['-j6 -j6 6'])
+'''), ['--output-sync=line -j6 -j6 6'])
 
     def run_hook(self, script):
         hook = Path(__file__).resolve().parents[1] / 'packaging/gentoo/jobs.bashrc'
@@ -53,6 +55,26 @@ MAKEOPTS='-j2' NINJAOPTS='-j1' CMAKE_BUILD_PARALLEL_LEVEL=1
 source "$JOBS_HOOK"
 echo "$MAKEOPTS $NINJAOPTS $NINJAFLAGS $CMAKE_BUILD_PARALLEL_LEVEL"
 '''), ['-j12 -j12 -j12 12', '-j6 -j6 -j6 6', '-j2 -j1 -j2 1'])
+
+    def test_non_parallel_make_options_keep_automatic_jobs_across_phases(self):
+        self.assertEqual(self.run_hook('''
+MAKEOPTS='--output-sync=line --keep-going'
+source "$JOBS_HOOK"
+echo "$MAKEOPTS $NINJAOPTS"
+workers=6
+source "$JOBS_HOOK"
+echo "$MAKEOPTS $NINJAOPTS"
+'''), ['--output-sync=line --keep-going -j12 -j12',
+       '--output-sync=line --keep-going -j6 -j6'])
+
+    def test_explicit_make_jobs_survive_other_options(self):
+        for option in ('-j1', '-j 2', '--jobs=3', '--jobs 4', '-j', '--jobs'):
+            with self.subTest(option=option):
+                self.assertEqual(self.run_hook('''
+MAKEOPTS='--output-sync=line ''' + option + ''''
+source "$JOBS_HOOK"
+echo "$MAKEOPTS"
+'''), ['--output-sync=line ' + option])
 
     def test_disabled_restricted_or_unreachable(self):
         for settings in ('FEATURES=', 'RESTRICT=distcc', 'failed=1'):

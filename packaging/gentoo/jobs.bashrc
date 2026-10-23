@@ -1,5 +1,5 @@
-# Source from /etc/portage/bashrc. Leave MAKEOPTS empty in make.conf to
-# discover parallelism; package.env can still provide an explicit job limit.
+# Source from /etc/portage/bashrc. Discover parallelism when MAKEOPTS has no
+# job option; package.env can still provide an explicit job limit.
 distcc_configure_jobs() {
     local jobs variable marker compiler resolved distributed
     # Portage saves the phase environment. Refresh only values we generated;
@@ -8,11 +8,18 @@ distcc_configure_jobs() {
     for variable in MAKEOPTS NINJAOPTS NINJAFLAGS CMAKE_BUILD_PARALLEL_LEVEL; do
         marker=distcc_auto_${variable}
         if [[ -n ${!marker} && ${!variable} == "${!marker}" ]]; then
-            unset "${variable}"
+            if [[ ${variable} == MAKEOPTS ]]; then
+                MAKEOPTS=${distcc_auto_make_options}
+            else
+                unset "${variable}"
+            fi
         fi
         unset "${marker}"
     done
-    if [[ -z ${MAKEOPTS} ]]; then
+    unset distcc_auto_make_options
+    # GCC adds --output-sync before phases run. Such options do not specify
+    # concurrency; a bare -j/--jobs, however, is an explicit unlimited choice.
+    if [[ ! ${MAKEOPTS} =~ (^|[[:space:]])(-j([[:space:]]|[0-9]|$)|--jobs([=[:space:]]|$)) ]]; then
         if has distcc ${FEATURES} && ! has distcc ${RESTRICT}; then
             distributed=1
             # Absolute compiler paths bypass Portage's PATH wrappers. Only an
@@ -32,7 +39,8 @@ distcc_configure_jobs() {
             [[ ${jobs} == 0 ]] && jobs=1
         fi
         [[ ${jobs} =~ ^[1-9][0-9]*$ ]] || jobs=$(nproc)
-        export MAKEOPTS="-j${jobs}"
+        distcc_auto_make_options=${MAKEOPTS}
+        export MAKEOPTS="${MAKEOPTS:+${MAKEOPTS} }-j${jobs}"
         distcc_auto_MAKEOPTS=${MAKEOPTS}
     fi
     if [[ ${MAKEOPTS} =~ (^|[[:space:]])(-j[[:space:]]*|--jobs[=[:space:]]+)([1-9][0-9]*)([[:space:]]|$) ]]; then
