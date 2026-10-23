@@ -89,7 +89,9 @@ class AnalyzerPoolTest(PumpTestCase):
         self.shutdown_pump()
         for directory in (None, str(self.work)):
             with self.subTest(directory=directory):
-                env = dict(self.env, T=str(self.root), DISTCC_PUMP='1', FEATURES='distcc',
+                temporary = self.root / ('long-package-work-path-' * 6) if directory is None else self.root
+                temporary.mkdir(exist_ok=True)
+                env = dict(self.env, T=str(temporary), DISTCC_PUMP='1', FEATURES='distcc',
                            PATH=str(self.build) + ':' + self.env['PATH'])
                 for key in ('INCLUDE_SERVER_PID', 'INCLUDE_SERVER_DIR', 'INCLUDE_SERVER_PORT',
                             'DISTCC_CLIENT_TMP', 'DISTCC_PUMP_ACTIVE', 'DISTCC_PUMP_CLIENT_TMP',

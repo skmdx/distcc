@@ -35,7 +35,9 @@ distcc_pump_start() {
         mv -- "${DISTCC_PUMP_CLIENT_TMP}/.lease" "${DISTCC_PUMP_CLIENT_TMP}/lease" || die
         export DISTCC_CLIENT_TMP=${DISTCC_PUMP_CLIENT_TMP}
     fi
-    settings=$(TMPDIR="${T}" pump --startup) || die "Cannot start distcc-pump"
+    # Package work paths can exceed the UNIX socket path limit. Reuse the
+    # private, lifetime-managed tmpfs root when automatic storage is active.
+    settings=$(TMPDIR="${DISTCC_PUMP_CLIENT_TMP:-${T}}" pump --startup) || die "Cannot start distcc-pump"
     eval "${settings}" || die "Cannot configure distcc-pump"
     # Keep Portage's compiler wrappers ahead of the real compiler directory.
     export PATH=${original_path}
