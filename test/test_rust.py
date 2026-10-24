@@ -18,6 +18,21 @@ from test_broker import BrokerTestCase
 
 @unittest.skipUnless(shutil.which('rustc') and shutil.which('bwrap'), 'rustc and bubblewrap required')
 class RustTest(BrokerTestCase):
+    def test_memory_refusal_reschedules_rust_without_fallback(self):
+        self.start_memory_refusal()
+        source = self.work / 'rescheduled.rs'
+        source.write_text('pub fn answer() -> i32 { 42 }')
+        output = self.work / 'librescheduled.rlib'
+        result = self.rust('--crate-type=rlib', source, '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('rescheduling unstarted job', (self.work / 'memory-refusal.log').read_text())
+        main = self.work / 'main.rs'
+        main.write_text('fn main() { assert_eq!(rescheduled::answer(), 42); }')
+        executable = self.work / 'rescheduled'
+        result = self.rust(main, '--extern', 'rescheduled=' + str(output), '-o', executable, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([executable], check=True, timeout=5)
+
     @classmethod
     def setUpClass(cls):
         rustc = shutil.which('rustc')

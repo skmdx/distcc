@@ -41,7 +41,7 @@
 #define MAX_CLIENTS 256
 enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3, MEMO_GET = 4, MEMO_PUT = 5,
        ACQUIRE_POOL = 6, RETURN = 7, ACQUIRE_LINK = 8, ACQUIRE_CPP = 9,
-       ACQUIRE_READY = 10, FAILED = 11, LOCAL_CPP = 12, LOCAL_ANALYSIS = 13 };
+       ACQUIRE_READY = 10, FAILED = 11, LOCAL_CPP = 12, LOCAL_ANALYSIS = 13, DEFER = 14 };
 #define MAX_MEMOS 32
 struct request { uint32_t version, command; };
 struct feedback { uint64_t prepare_ns, queue_ns, execute_ns; };
@@ -357,6 +357,13 @@ void dcc_broker_failed(const struct dcc_hostdef *host)
     struct request request = { BROKER_VERSION, FAILED };
     if (host->broker_managed)
         send(host->broker_lease, &request, sizeof(request), MSG_NOSIGNAL);
+}
+
+void dcc_broker_defer(const struct dcc_hostdef *host)
+{
+    struct request request = { BROKER_VERSION, DEFER };
+    if (host->broker_pooled)
+        dcc_send_fd(host->broker_lease, &request, sizeof(request), host->broker_fd);
 }
 
 int dcc_broker_jobs(void)
@@ -879,6 +886,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             reply.slots += dcc_capacity_jobs(p->host, cap);
             continue;
         }
+        if (p->valid_until < 0) continue; /* Admission was refused: refresh first. */
         int staged = p->host->tcp_jobs;
         int predicted = staged && cap && cost > 0 && !link;
         int blocked = 0;
@@ -1497,7 +1505,20 @@ int dcc_broker_serve(const char *path)
                     continue;
                 }
                 if (returned >= 0) {
-                    if (length == sizeof(request) + sizeof(struct feedback) && request.version == BROKER_VERSION &&
+                    if (length == sizeof(request) && request.version == BROKER_VERSION &&
+                        request.command == DEFER && c->state == ACTIVE && c->pooled) {
+                        struct peer *p = &broker->peers[c->peer];
+                        /* This socket completed no CPU work. Reuse it without
+                         * training execution cost or quarantining the worker,
+                         * and discard any capacity probe from before refusal. */
+                        if (p->stats_fd >= 0) close(p->stats_fd);
+                        p->stats_fd = -1;
+                        if (p->host->stats_port) p->valid_until = -1;
+                        else p->full_until = now + 1;
+                        broker->refresh_at = 0;
+                        rs_trace("rescheduling unstarted job from host=%s", p->host->hostname);
+                        pool_store(broker, c, returned, now);
+                    } else if (length == sizeof(request) + sizeof(struct feedback) && request.version == BROKER_VERSION &&
                         request.command == RETURN && c->state == ACTIVE && c->pooled) {
                         struct peer *p = &broker->peers[c->peer];
                         struct feedback timing;
@@ -1589,6 +1610,7 @@ int dcc_broker_local_cpp(int *lease, int *occupied, int analysis)
     return EXIT_CONNECT_FAILED;
 }
 void dcc_broker_failed(const struct dcc_hostdef *host) { (void)host; }
+void dcc_broker_defer(const struct dcc_hostdef *host) { (void)host; }
 void dcc_broker_return(const struct dcc_hostdef *host, int fd, const struct dcc_job_result *result)
 {
     (void)host;

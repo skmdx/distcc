@@ -230,6 +230,10 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                         if (received[index] != result->size[index]) goto done;
                         finals |= 1U << index;
                     }
+                } else if (type == DCC_TCP_RETRY && !have_result && incoming.size == 8 &&
+                           dcc_tcp_get64(incoming.data) == id &&
+                           !outgoing && stream.fd < 0 && read_request == count) {
+                    ret = EXIT_BUSY; goto done;
                 } else if (type == DCC_TCP_COMPLETE && have_result && incoming.size == 8 &&
                            dcc_tcp_get64(incoming.data) == id && finals == (1U << DCC_JOB_RESULT_COUNT) - 1 &&
                            !outgoing && stream.fd < 0 && read_request == count) {

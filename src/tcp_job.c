@@ -79,7 +79,7 @@ int dcc_tcp_frame_read(int fd, struct dcc_tcp_frame *f, size_t available)
                 f->type = dcc_tcp_get32(f->header);
                 f->size = dcc_tcp_get32(f->header + 4);
                 kind = f->type & ~DCC_TCP_FLAGS;
-                if (kind < DCC_TCP_BEGIN || kind > DCC_TCP_RESULT_FD ||
+                if (kind < DCC_TCP_BEGIN || kind > DCC_TCP_RETRY ||
                     f->size > available ||
                     f->size > (kind == DCC_TCP_BEGIN ? DCC_JOB_METADATA_MAX + 8U :
                                kind == DCC_TCP_NEED ? DCC_JOB_INPUT_MAX * 4U : DCC_TCP_CHUNK + 8U) ||

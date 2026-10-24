@@ -18,6 +18,7 @@
 #include <netinet/tcp.h>
 #include <xxhash.h>
 #include "distcc.h"
+#include "exitcode.h"
 #include "trace.h"
 #include "file_cache.h"
 #include "resource.h"
@@ -1100,6 +1101,16 @@ void dcc_tcp_dispatch_ready(void)
             int input = s->job->kind == DCC_JOB_COMPILE && s->job->count == 1 ? s->job->inputs[0].fd : -1;
             int ret = s->dispatch->start(s, &s->run, s->metadata, input, s->job);
             if (ret < 0) { s->failed = 1; dequeue(s); }
+            else if (ret == EXIT_BUSY) {
+                /* All inputs arrived, but the measured reservation no longer
+                 * fits. Keep unstarted work movable instead of pinning it
+                 * behind an unrelated long compiler. RETRY is a reusable
+                 * transaction boundary; no compiler or output has run. */
+                unsigned char id[8];
+                dcc_tcp_put64(id, s->run.id);
+                reset_job(s);
+                if (queue(s, DCC_TCP_RETRY, id, sizeof(id))) s->failed = 1;
+            }
             else if (ret) {
                 dequeue(s); s->phase = RUNNING; s->started_at = monotonic_ns();
                 if (!--slots) break;

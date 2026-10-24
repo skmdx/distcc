@@ -24,6 +24,35 @@ from test_adaptive import free_port
 
 
 class TcpJobsTest(BrokerTestCase):
+    def test_memory_refusal_is_a_reusable_unstarted_boundary(self):
+        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='1048576')
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        body = b'int value(void) { return 7; }\n'
+        net = None
+        for identity in (37, 38):
+            net = self.wire_job(body, cached=False, identity=identity, net=net)
+            self.upload(net, body)
+            self.assertEqual(self.frame(net), (0x54000207, struct.pack('!Q', identity)))
+        stats = self.get_stats(self.stats_ports[0])
+        self.assertIn('dcc_compile_ok 0\n', stats)
+        self.assertIn('dcc_busy 0\n', stats)
+        self.assertIn('dcc_queued 0\n', stats)
+        deadline = time.monotonic() + 5
+        while list(self.root.glob('distcc-tcp-*')):
+            self.assertLess(time.monotonic(), deadline, 'refused input tree was not reclaimed')
+            time.sleep(.01)
+
+    def test_memory_refusal_reschedules_without_fallback(self):
+        self.start_memory_refusal()
+        before = self.get_stats(self.stats_ports[1])
+        self.job('memory-rescheduled')
+        log = (self.work / 'memory-refusal.log').read_text()
+        self.assertIn('rescheduling unstarted job', log)
+        after = self.get_stats(self.stats_ports[1])
+        count = lambda text: int(re.search(r'dcc_compile_ok (\d+)', text)[1])
+        self.assertEqual(count(after) - count(before), 1)
+        self.assertNotIn('job cost:', log.split('rescheduling unstarted job', 1)[0])
+
     def start_tcp(self):
         return self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
 

@@ -14,7 +14,7 @@
  * One framing layer; flags never introduce an inner RPC stream. */
 enum dcc_tcp_type {
     DCC_TCP_BEGIN = 0x54000200, DCC_TCP_NEED, DCC_TCP_INPUT,
-    DCC_TCP_RESULT, DCC_TCP_OUTPUT, DCC_TCP_COMPLETE, DCC_TCP_RESULT_FD
+    DCC_TCP_RESULT, DCC_TCP_OUTPUT, DCC_TCP_COMPLETE, DCC_TCP_RESULT_FD, DCC_TCP_RETRY
 };
 #define DCC_TCP_COMPRESSED 0x10000U
 #define DCC_TCP_FINAL      0x20000U
@@ -58,6 +58,7 @@ int dcc_tcp_worker(int, const struct dcc_tcp_run *, int, int, int);
 
 struct dcc_tcp_server;
 struct dcc_tcp_dispatch {
+    /* 1 started, 0 CPU lane busy, EXIT_BUSY memory admission changed, -1 failed. */
     int (*start)(struct dcc_tcp_server *, const struct dcc_tcp_run *, int, int, const struct dcc_job *);
     void (*cancel)(struct dcc_tcp_server *);
 };

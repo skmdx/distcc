@@ -231,7 +231,9 @@ int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char 
         if (dcc_copy_argv(argv, &job->argv, 0)) goto done;
     }
     if (!job || auxiliary_inputs(job, auxiliary)) goto done;
-    if ((ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result))) goto done;
+    ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result);
+    if (ret == EXIT_BUSY) dcc_broker_defer(host);
+    if (ret) goto done;
     need_cpp = files && WIFEXITED(result.status) && WEXITSTATUS(result.status) == EXIT_LOCAL_CPP;
     /* No compiler ran: do not train the scheduler on header verification. */
     if (need_cpp) result.execute_ns = 0;
@@ -292,18 +294,24 @@ int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *o
             files[i] = NULL; ret = EXIT_OUT_OF_MEMORY; goto done;
         }
     }
-    for (unsigned attempt = 0;; ++attempt) {
+    unsigned failures = 0;
+    for (;;) {
         if ((ret = dcc_broker_acquire(&host, &lease, 1, &hint))) goto done;
         if (!host->tcp_jobs) { ret = EXIT_PROTOCOL_ERROR; goto done; }
         dcc_broker_cpp_done(host);
         ret = dcc_tcp_exchange(host, job, files, NULL, output, NULL, &result);
         if (!ret) break;
-        dcc_broker_failed(host);
         /* A pooled connection can close between acquisition and BEGIN. Rust
          * inputs are immutable and no result has been published: retry once
          * through a fresh reservation, including when local fallback is off. */
-        if (attempt || ret != EXIT_IO_ERROR) goto done;
-        rs_log_warning("retrying Rust job on a fresh connection");
+        if (ret == EXIT_BUSY) dcc_broker_defer(host);
+        else {
+            dcc_broker_failed(host);
+            if (failures++ || ret != EXIT_IO_ERROR) goto done;
+            rs_log_warning("retrying Rust job on a fresh connection");
+        }
+        dcc_job_result_free(&result);
+        dcc_job_result_init(&result);
         dcc_free_hostdef(host); host = NULL;
         if (lease >= 0) close(lease);
         lease = -1;

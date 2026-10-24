@@ -424,8 +424,11 @@ plus 25% and 64 MiB, with a 256 MiB minimum, until daemon restart. Unseen classe
 use the larger of the configured estimate and the daemon's observed peak with
 headroom. They run concurrently when those reservations fit the measured memory
 budget; an unfamiliar size alone does not serialize work. Small completed jobs
-cannot lower the estimate for unmeasured jobs. The server continues past
-memory-blocked jobs to run other jobs that fit. It keeps link
+cannot lower the estimate for unmeasured jobs. If memory admission changes after
+input transfer, the server returns the unstarted job for reselection. The broker
+refreshes that worker's capacity before assigning it again, retaining the pooled
+connection and prepared inputs without counting a compiler failure or training
+execution cost. Other jobs that fit continue to run. The server keeps link
 ordering and stops scanning once all CPU execution lanes are occupied.
 
 The daemon sums reservations for active jobs and excludes actual shared-memory

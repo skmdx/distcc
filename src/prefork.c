@@ -106,9 +106,8 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
     dcc_prefork_status(&load);
     int link = description->kind == DCC_JOB_LINK;
     unsigned memory_class = dcc_resource_class(description);
-    if (load.busy >= dcc_cpu_perf_limit(dcc_max_kids) ||
-        !dcc_resource_admit(memory_class, load.reserved) ||
-        (link && load.links)) return 0;
+    if (load.busy >= dcc_cpu_perf_limit(dcc_max_kids) || (link && load.links)) return 0;
+    if (!dcc_resource_admit(memory_class, load.reserved)) return EXIT_BUSY;
     for (int i = 0; i < worker_count; ++i) {
         struct worker *w = &workers[i];
         if (w->fd < 0 || w->busy) continue;

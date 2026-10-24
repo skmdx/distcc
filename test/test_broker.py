@@ -18,6 +18,22 @@ from test_adaptive import DistccTestCase, free_port, stats_response
 
 
 class BrokerTestCase(DistccTestCase):
+    def start_memory_refusal(self):
+        # The first snapshot fits; before execution the real daemon's memory
+        # estimate no longer does. No memory is allocated by this fixture.
+        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='1048576')
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        actual = self.get_stats(self.stats_ports[0]).encode()
+        initial = stats_response(cpus=4, cores=4, jobs=4, capacity=4,
+                                 busy=0, queued=0, preparing=0, returning=0, running=0)
+        replies = iter((initial,))
+        peer = self.peer(lambda: next(replies, actual))
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1',
+                             PATH=str(self.build) + os.pathsep + os.environ['PATH'])
+        self.start_broker(self.host(0, f',tcp,stats={peer.port},speed=100') + ' ' +
+                          self.host(1, f',tcp,stats={self.stats_ports[1]}'), name='memory-refusal')
+        return peer
+
     def restart_server(self, binary, **settings):
         old = self.daemons[0]
         os.killpg(old.pid, signal.SIGTERM)

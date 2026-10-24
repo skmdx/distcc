@@ -92,7 +92,7 @@ class StatsPeer:
                     conn.recv(1024)
                     self.requests += 1
                     if not self.stop.wait(self.delay):
-                        conn.sendall(self.response)
+                        conn.sendall(self.response() if callable(self.response) else self.response)
                 except OSError:
                     pass
 
