@@ -572,7 +572,8 @@ int main(void) {
     assert(dcc_resource_estimate(large) == 1184*M);
     assert(dcc_resource_estimate(pump) == 1184*M);
     assert(!dcc_resource_known(pump));
-    assert(dcc_resource_class_slots(16, large) < small_slots);
+    /* Both may still fit all CPU slots on a high-memory test host. */
+    assert(dcc_resource_class_slots(16, large) <= small_slots);
     assert(dcc_resource_class_slots(16, small) == small_slots);
     /* Later smaller successes must not erase the class's observed demand. */
     dcc_resource_observe(large, 64*M, 1);
@@ -583,6 +584,17 @@ int main(void) {
     assert(dcc_resource_samples() == 3);
     assert(dcc_resource_peak_bytes() == 1536*M);
     assert(!dcc_resource_admit(small, ULLONG_MAX, 0));
+    /* Every job kind must retain calibration, including the last bucket.
+     * Otherwise that kind remains an unknown, serialized probe forever. */
+    input.plain_size = ULLONG_MAX;
+    for (unsigned kind = 0; kind < DCC_JOB_KIND_COUNT; ++kind) {
+        job.kind = kind;
+        unsigned memory_class = dcc_resource_class(&job);
+        assert(!dcc_resource_known(memory_class));
+        dcc_resource_observe(memory_class, 64*M, 1);
+        assert(dcc_resource_known(memory_class));
+        assert(dcc_resource_estimate(memory_class) == 256*M);
+    }
     dcc_resource_observe(large, ULLONG_MAX, 1);
     assert(dcc_resource_job_bytes() == ULLONG_MAX);
     assert(dcc_resource_estimate(large) == ULLONG_MAX);

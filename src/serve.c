@@ -944,7 +944,8 @@ static int dcc_run_helper_job(int in_fd, int out_fd,
     argv[3] = output;
     argv[4] = NULL;
     if ((ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname)) ||
-        (ret = dcc_collect_child("link", pid, status, in_fd, NULL)))
+        (ret = dcc_collect_child(rust ? "rust" : "link", pid, status, in_fd,
+                                 result ? &result->peak_bytes : NULL)))
         *status = W_EXITCODE(ret, 0);
     if (!*status && stat(output, &st))
         *status = W_EXITCODE(EXIT_IO_ERROR, 0);

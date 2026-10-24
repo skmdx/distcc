@@ -172,7 +172,7 @@ static unsigned samples;
 static unsigned long long learned_job;
 /* Input kind and binary size interval distinguish materially different work.
  * Class zero is reserved for legacy sessions without prepared metadata. */
-static unsigned long long class_peak[1 + (DCC_JOB_LINK + 1) * DCC_MEMORY_BUCKETS];
+static unsigned long long class_peak[1 + DCC_JOB_KIND_COUNT * DCC_MEMORY_BUCKETS];
 
 static int memory_learning(void)
 {

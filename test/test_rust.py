@@ -405,8 +405,11 @@ class RustTest(BrokerTestCase):
 
     def test_cached_inputs_and_parallel_crates(self):
         import concurrent.futures
+        self.restart_server(self.build / 'distccd', DISTCC_MEMORY_LEARNING='1')
         source = self.work / 'cache.rs'
-        source.write_text('pub fn answer() -> usize { include_bytes!("data.bin").len() }')
+        source.write_text('pub fn answer() -> usize { include_bytes!("data.bin").len() }\n' +
+                          '\n'.join(f'pub fn value_{i}(x: usize) -> usize {{ x.wrapping_add({i}) }}'
+                                    for i in range(1000)))
         (self.work / 'data.bin').write_bytes(b'abcde' * (1024 * 1024))
         def build(index):
             return self.rust('--crate-name=cache', '--crate-type=rlib', source,
@@ -416,8 +419,21 @@ class RustTest(BrokerTestCase):
         counts = re.search(r'input cache: (\d+) of', first.stderr)
         assert counts is not None, first.stderr
         cold = int(counts[1])
+        peak_busy = 0
+        peak_queued = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-            results = list(pool.map(build, range(1, 6)))
+            futures = [pool.submit(build, i) for i in range(1, 6)]
+            while not all(future.done() for future in futures):
+                stats = self.get_stats(self.stats_ports[0])
+                busy = re.search(r'dcc_busy (\d+)', stats)
+                assert busy is not None, stats
+                peak_busy = max(peak_busy, int(busy[1]))
+                queued = re.search(r'dcc_queued (\d+)', stats)
+                assert queued is not None, stats
+                peak_queued = max(peak_queued, int(queued[1]))
+                time.sleep(.01)
+            results = [future.result() for future in futures]
+        self.assertGreaterEqual(peak_busy, 2, f'calibrated Rust jobs must overlap; peak queued={peak_queued}')
         for result in results:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('distcc-rust: compiled on', result.stderr)
