@@ -12,6 +12,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <sys/stat.h>
 #include <map>
+#include <memory>
 #include <set>
 
 PyObject *dcc_clang_compile(PyObject *, PyObject *);
@@ -35,6 +36,21 @@ struct Stamp {
     }
 };
 
+bool requiresModules(llvm::StringRef source);
+
+struct Image {
+    Stamp stamp;
+    llvm::vfs::Status info;
+    std::string bytes;
+    bool modules;
+    Image(const Stamp &stamp, llvm::vfs::Status info, std::string bytes)
+        : stamp(stamp), info(info), bytes(std::move(bytes)), modules(requiresModules(this->bytes)) {}
+};
+using Images = std::map<std::string, std::shared_ptr<const Image>>;
+// Retain only the previous request's bytes, not its lookup results. Each scan
+// rechecks identities and negative lookups; threads do not share mutable state.
+thread_local Images previous_inputs;
+
 class SnapshotFile : public llvm::vfs::File {
     llvm::vfs::Status info;
     const std::string &bytes;
@@ -55,7 +71,7 @@ class Inputs : public llvm::vfs::ProxyFileSystem {
     size_t bytes = 0;
 public:
     std::map<std::string, Stamp> stamps;
-    std::map<std::string, std::string> contents;
+    Images contents;
     bool changed = false;
     std::error_code cwd_error;
     explicit Inputs(const std::string &cwd)
@@ -79,22 +95,31 @@ public:
     llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(const llvm::Twine &name) override {
         auto key = path(name);
         observe(key);
-        auto file = getUnderlyingFS().openFileForRead(name);
-        if (!file) return file.getError();
-        auto info = (*file)->status();
-        if (!info) return info.getError();
         auto it = contents.find(key);
         if (it == contents.end()) {
+            auto previous = previous_inputs.find(key);
+            std::shared_ptr<const Image> image;
+            if (previous != previous_inputs.end() && stamps.at(key) == previous->second->stamp)
+                image = previous->second;
             // Bound a single request independently of the surrounding build.
-            if (info->getSize() > 64 * 1024 * 1024 - bytes)
+            if (image && image->bytes.size() > 64 * 1024 * 1024 - bytes)
                 return std::make_error_code(std::errc::file_too_large);
-            auto buffer = (*file)->getBuffer(name);
-            if (!buffer) return buffer.getError();
-            bytes += (*buffer)->getBufferSize();
-            it = contents.emplace(key, (*buffer)->getBuffer().str()).first;
-            observe(key);
+            if (!image) {
+                auto file = getUnderlyingFS().openFileForRead(name);
+                if (!file) return file.getError();
+                auto info = (*file)->status();
+                if (!info) return info.getError();
+                if (info->getSize() > 64 * 1024 * 1024 - bytes)
+                    return std::make_error_code(std::errc::file_too_large);
+                auto buffer = (*file)->getBuffer(name);
+                if (!buffer) return buffer.getError();
+                image = std::make_shared<Image>(stamps.at(key), *info, (*buffer)->getBuffer().str());
+                observe(key);
+            }
+            bytes += image->bytes.size();
+            it = contents.emplace(key, std::move(image)).first;
         }
-        return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(*info, it->second));
+        return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(it->second->info, it->second->bytes));
     }
     bool validate() {
         for (const auto &entry : stamps)
@@ -211,12 +236,13 @@ PyObject *scan(PyObject *, PyObject *arguments) {
                 !inputs->openFileForRead(path)) ok = false;
         for (const auto &path : result.dependencies) {
             auto it = inputs->contents.find(inputs->path(path));
-            if (it != inputs->contents.end() && requiresModules(it->second))
+            if (it != inputs->contents.end() && it->second->modules)
                 result.unsupported = true;
         }
         ok = inputs->validate() && ok && !result.unsupported;
     }
     Py_END_ALLOW_THREADS
+    previous_inputs = ok ? inputs->contents : Images{};
     if (PyErr_CheckSignals() < 0) return nullptr;
     if (!ok) return PyErr_Format(PyExc_RuntimeError, "Clang dependency scan: %s",
         inputs->changed ? "input changed" : result.unsupported ? "unsupported preprocessor input" :
@@ -226,7 +252,7 @@ PyObject *scan(PyObject *, PyObject *arguments) {
     bool success = true;
     for (const auto &entry : inputs->contents) {
         PyObject *key = PyUnicode_DecodeFSDefault(entry.first.c_str());
-        PyObject *data = PyBytes_FromStringAndSize(entry.second.data(), entry.second.size());
+        PyObject *data = PyBytes_FromStringAndSize(entry.second->bytes.data(), entry.second->bytes.size());
         if (!key || !data || PyDict_SetItem(files, key, data) < 0) success = false;
         Py_XDECREF(key); Py_XDECREF(data);
         if (!success) break;

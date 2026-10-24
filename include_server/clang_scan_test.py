@@ -119,7 +119,7 @@ with tempfile.TemporaryDirectory() as directory:
     output = self.root / 'result.o'
     status = clang_scan.compile(
         [self.compiler, '--no-default-config', '-nostdinc', '-c', str(copied_source),
-         '-o', str(output)], str(original), str(server))
+         '-o', str(output)], str(original), str(server), str(self.root), True)
     self.assertEqual(status, 0)
     self.assertTrue(output.is_file())
 
@@ -147,8 +147,8 @@ with tempfile.TemporaryDirectory() as directory:
                                 capture_output=True, check=True)
         output = self.root / 'target.i'
         subprocess.run([sys.executable, '-c',
-            'import clang_scan,json,sys; sys.exit(clang_scan.compile('
-            'json.loads(sys.argv[1]), sys.argv[2], ""))',
+            'import clang_scan,json,sys,os; sys.exit(clang_scan.compile('
+            'json.loads(sys.argv[1]), sys.argv[2], "", os.getcwd(), False))',
             json.dumps([*command, '-E', str(self.source), '-o', str(output)]),
             str(self.source)], check=True)
         self.assertEqual(output.read_bytes(), native.stdout)
@@ -568,7 +568,7 @@ with tempfile.TemporaryDirectory() as directory:
     # installed package. Do not shadow that package with include_server.py.
     env = dict(os.environ)
     env.pop('PYTHONPATH', None)
-    result = subprocess.run([sys.executable, helper, worker, self.source, compiler,
+    result = subprocess.run([sys.executable, helper, worker, self.source, self.root, 'pump', compiler,
                              '-c', self.source, '-o', obj], env=env, capture_output=True, text=True)
     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
     subprocess.run([compiler, obj, '-o', executable], check=True, capture_output=True)

@@ -476,10 +476,12 @@ def client(compiler, args):
                 raise LocalOnly('worker compilation failed; retrying locally')
             if result.returncode >= 100 or result.returncode < 0:
                 raise OSError(result.stderr.decode(errors='replace').strip() or 'Rust worker failed')
-            for data, stream in ((result.stdout, sys.stdout.buffer), (result.stderr, sys.stderr.buffer)):
-                stream.write(data.replace(os.fsencode(job['output']), os.fsencode(outdir)))
             if not result.returncode:
                 install_outputs(work / 'result.tar', job, outdir, outputs, work)
+            # Cargo starts dependent crates as soon as it reads rustc's JSON
+            # artifact notifications, before this wrapper exits.
+            for data, stream in ((result.stdout, sys.stdout.buffer), (result.stderr, sys.stderr.buffer)):
+                stream.write(data.replace(os.fsencode(job['output']), os.fsencode(outdir)))
             return result.returncode
     except LocalOnly as error:
         if os.environ.get('DISTCC_VERBOSE') == '1':

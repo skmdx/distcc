@@ -97,6 +97,39 @@ class RustTest(BrokerTestCase):
                                  fallback == '1')
                 self.assertEqual(output.read_bytes(), b'previous artifact')
 
+    def test_json_artifacts_exist_when_cargo_is_notified(self):
+        import concurrent.futures
+        source = self.work / 'published.rs'
+        source.write_text('pub static DATA: [u8; 16777216] = [1; 16777216];\n' +
+                          ''.join(f'pub const bad_name_{i}: usize = {i};\n' for i in range(128)))
+        artifacts = []
+        diagnostics = []
+        def consume(stream):
+            for line in stream:
+                diagnostics.append(line)
+                if line.startswith('{'):
+                    message = json.loads(line)
+                    if message.get('$message_type') == 'artifact':
+                        path = Path(message['artifact'])
+                        artifacts.append((path.name, path.is_file()))
+        with subprocess.Popen([str(self.build / 'distcc'), self.rustc, source,
+                               '--crate-type=rlib', '--emit=metadata,link', '--out-dir', self.work,
+                               '--error-format=json', '--json=artifacts'], env=self.env,
+                              cwd=self.work, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              text=True, pipesize=4096) as child:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                reader = pool.submit(consume, child.stderr)
+                try:
+                    code = child.wait(timeout=90)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                reader.result(timeout=5)
+        self.assertEqual(code, 0, ''.join(diagnostics))
+        self.assertIn('distcc-rust: compiled on', ''.join(diagnostics))
+        self.assertEqual({name for name, _ in artifacts}, {'libpublished.rmeta', 'libpublished.rlib'})
+        self.assertTrue(all(exists for _, exists in artifacts), artifacts)
+
     def test_disconnected_transport_retries_without_local_fallback(self):
         import concurrent.futures
         import select

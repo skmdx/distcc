@@ -44,6 +44,9 @@ The Clang and LLVM libraries must also use the same assertion/debug ABI settings
 For Clang jobs, the canonical preprocessor discovers includes and existence probes without
 building an AST or generating code. Its input buffers are reused for transfer.
 Each request gets a fresh FileManager to avoid stale negative lookup caches.
+Each analyzer retains only the preceding request's input bytes and module-syntax
+checks. Unchanged file identities and timestamps allow reuse; every request still
+validates its lookups and checks for changes before publishing its inputs.
 
 Clang pump jobs use the installed `distcc-clang` worker helper. Its virtual
 filesystem resolves absolute include operands and existence probes against the

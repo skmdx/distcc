@@ -51,6 +51,8 @@ transport and content cache. Large inputs use bounded cache chunks. The worker
 compiles in a private namespace with original client paths and returns all
 artifacts, including Cargo metadata and dependency files. Local incremental
 state is not sent or updated by remote jobs.
+Artifacts are installed before forwarding rustc's JSON notifications, so Cargo
+can immediately start dependent crates when metadata becomes visible.
 Rust `-Cprofile-use` data is transferred with the other read-only inputs.
 Rust also reports snapshot and source sizes to the broker. Memory admission uses
 the Rust workload class, while execution-time predictions learn from completed
