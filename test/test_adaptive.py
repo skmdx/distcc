@@ -563,6 +563,18 @@ int main(void) {
     assert(dcc_resource_class_slots(16, small, 0, 1) == 0);
     assert(dcc_resource_class_slots(16, pump, 0, 0) == -1);
     assert(dcc_resource_input_bytes(&job) == 2048);
+    struct dcc_job_input profiled_inputs[] = {
+        {.plain_size = 2048}, {.kind = DCC_JOB_READONLY, .plain_size = 80*M}
+    };
+    struct dcc_job profiled = {.kind = DCC_JOB_PUMP, .count = 2, .inputs = profiled_inputs};
+    assert(dcc_resource_class(&profiled) == pump);
+    assert(dcc_resource_input_bytes(&profiled) == 2048);
+    profiled.kind = DCC_JOB_COMPILE;
+    assert(dcc_resource_class(&profiled) == large);
+    profiled.kind = DCC_JOB_RUST;
+    assert(dcc_resource_input_bytes(&profiled) == 80*M + 2048);
+    profiled.kind = DCC_JOB_LINK;
+    assert(dcc_resource_input_bytes(&profiled) == 80*M + 2048);
     assert(dcc_resource_estimate(small) == 512*M);
     assert(!dcc_resource_admit(small, 0, 1));
     dcc_resource_observe(small, 64*M, 1);

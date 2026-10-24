@@ -408,7 +408,10 @@ accounting. It does not remove the uncertainty of an unseen job's memory demand.
 On Linux, `DISTCC_MEMORY_LEARNING=1` on the daemon uses compiler peak RSS
 reported by `wait4` for prepared jobs. `DISTCC_JOB_MEMORY` is the cold-start
 estimate. Prepared jobs are classified by operation and the binary size interval
-of their uncompressed inputs. Each class reserves its largest successful RSS
+of their uncompressed inputs. C/C++ classes omit shared code-generation inputs
+such as PGO profiles so a common large profile does not hide source complexity;
+their storage remains part of actual cgroup usage. Each class reserves its
+largest successful RSS
 plus 25% and 64 MiB, with a 256 MiB minimum, until daemon restart. Unseen classes
 use the larger of the configured estimate and the daemon's observed peak with
 headroom; only one unseen-class calibration runs at a time. Small jobs therefore

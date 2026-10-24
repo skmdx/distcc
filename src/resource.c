@@ -191,6 +191,12 @@ unsigned long long dcc_resource_input_bytes(const struct dcc_job *job)
 {
     unsigned long long bytes = 0;
     for (unsigned i = 0; i < job->count; ++i) {
+        /* Shared code-generation data (for example PGO profiles) does not
+         * describe source complexity. Including one large common profile
+         * collapses tiny and expensive compilations into the same class.
+         * Storage remains charged through the cgroup's actual backing pages. */
+        if ((job->kind == DCC_JOB_COMPILE || job->kind == DCC_JOB_PUMP) &&
+            job->inputs[i].kind == DCC_JOB_READONLY) continue;
         unsigned long long size = job->inputs[i].plain_size;
         bytes = size <= ULLONG_MAX - bytes ? bytes + size : ULLONG_MAX;
     }
