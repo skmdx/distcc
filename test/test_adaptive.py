@@ -104,6 +104,7 @@ class DistccTestCase(unittest.TestCase):
         # These fixtures compile tiny C units; do not reserve the production
         # C++ budget for every test worker sharing the runner's cgroup.
         cls.base_env['DISTCC_JOB_MEMORY'] = '64'
+        cls.base_env['DISTCCD_RUST_TMPDIR'] = str(cls.root)
         cls.base_env['DISTCC_CLANG_LIBRARY'] = str(cls.build / 'clang_driver.so')
         cls.daemons = []
         cls.ports = []
@@ -225,6 +226,35 @@ class DistccTestCase(unittest.TestCase):
         return stream
 
 class AdaptiveTest(DistccTestCase):
+    def test_temporary_file_failure_returns_instead_of_retrying_forever(self):
+        source = self.work / 'fail-open.c'
+        library = self.work / 'fail-open.so'
+        source.write_text('''#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <string.h>
+int open(const char *path, int flags, ...) {
+    if (strstr(path, "/distcc_")) { errno = ENOSPC; return -1; }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args; va_start(args, flags); mode = va_arg(args, mode_t); va_end(args);
+    }
+    int (*real_open)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
+    return real_open(path, flags, mode);
+}''')
+        subprocess.run([self.cc, '-shared', '-fPIC', str(source), '-o', str(library), '-ldl'],
+                       check=True, capture_output=True)
+        env = dict(self.base_env, DISTCC_HOSTS=self.host(0), DISTCC_DIR=str(self.ddir),
+                   DISTCC_FALLBACK='0', DISTCC_SKIP_LOCAL_RETRY='1',
+                   TMPDIR=str(self.work), LD_PRELOAD=str(library))
+        result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(self.source),
+                                 '-o', str(self.work / 'failed.o')], env=env,
+                                capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('No space left on device', result.stderr)
+
     def test_metadata_probes_bypass_occupied_local_slot(self):
         locks = self.ddir / 'lock'
         locks.mkdir()
@@ -559,9 +589,8 @@ int main(void) {
     assert(dcc_resource_bucket(0) == 0);
     assert(dcc_resource_bucket(ULLONG_MAX) == 63);
     assert(!dcc_resource_known(small));
-    assert(dcc_resource_class_slots(16, small, 0, 0) == -1);
-    assert(dcc_resource_class_slots(16, small, 0, 1) == 0);
-    assert(dcc_resource_class_slots(16, pump, 0, 0) == -1);
+    assert(dcc_resource_class_slots(16, small, 0) >= 2);
+    assert(dcc_resource_class_slots(16, pump, 0) >= 2);
     assert(dcc_resource_input_bytes(&job) == 2048);
     struct dcc_job_input profiled_inputs[] = {
         {.plain_size = 2048}, {.kind = DCC_JOB_READONLY, .plain_size = 80*M}
@@ -576,13 +605,13 @@ int main(void) {
     profiled.kind = DCC_JOB_LINK;
     assert(dcc_resource_input_bytes(&profiled) == 80*M + 2048);
     assert(dcc_resource_estimate(small) == 512*M);
-    assert(!dcc_resource_admit(small, 0, 1));
+    assert(dcc_resource_admit(small, 512*M));
     dcc_resource_observe(small, 64*M, 1);
     assert(dcc_resource_job_bytes() == 256*M);
     assert(dcc_resource_known(small));
     assert(!dcc_resource_known(large));
     assert(dcc_resource_estimate(large) == 512*M);
-    int small_slots = dcc_resource_class_slots(16, small, 0, 0);
+    int small_slots = dcc_resource_class_slots(16, small, 0);
     assert(small_slots > 0);
     dcc_resource_observe(large, 896*M, 1);
     assert(dcc_resource_job_bytes() == 1184*M);
@@ -591,8 +620,8 @@ int main(void) {
     assert(dcc_resource_estimate(pump) == 1184*M);
     assert(!dcc_resource_known(pump));
     /* Both may still fit all CPU slots on a high-memory test host. */
-    assert(dcc_resource_class_slots(16, large, 0, 0) <= small_slots);
-    assert(dcc_resource_class_slots(16, small, 0, 0) == small_slots);
+    assert(dcc_resource_class_slots(16, large, 0) <= small_slots);
+    assert(dcc_resource_class_slots(16, small, 0) == small_slots);
     /* Later smaller successes must not erase the class's observed demand. */
     dcc_resource_observe(large, 64*M, 1);
     assert(dcc_resource_estimate(large) == 1184*M);
@@ -601,14 +630,14 @@ int main(void) {
     assert(dcc_resource_estimate(pump) == 1984*M);
     assert(dcc_resource_samples() == 3);
     assert(dcc_resource_peak_bytes() == 1536*M);
-    assert(!dcc_resource_admit(small, ULLONG_MAX, 0));
-    assert(dcc_resource_class_slots(16, small, ULLONG_MAX, 0) == 0);
+    assert(!dcc_resource_admit(small, ULLONG_MAX));
+    assert(dcc_resource_class_slots(16, small, ULLONG_MAX) == 0);
     unsigned long long light = dcc_resource_estimate(small);
     unsigned long long heavy = dcc_resource_estimate(large);
-    assert(dcc_resource_class_slots(16, large, 2*light, 0) >=
-           dcc_resource_class_slots(16, large, 2*heavy, 0));
-    /* Every job kind must retain calibration, including the last bucket.
-     * Otherwise that kind remains an unknown, serialized probe forever. */
+    assert(dcc_resource_class_slots(16, large, 2*light) >=
+           dcc_resource_class_slots(16, large, 2*heavy));
+    /* Every job kind must learn its own memory estimate, including the last
+     * bucket, instead of permanently inheriting unrelated job peaks. */
     input.plain_size = ULLONG_MAX;
     for (unsigned kind = 0; kind < DCC_JOB_KIND_COUNT; ++kind) {
         job.kind = kind;
@@ -621,15 +650,15 @@ int main(void) {
     dcc_resource_observe(large, ULLONG_MAX, 1);
     assert(dcc_resource_job_bytes() == ULLONG_MAX);
     assert(dcc_resource_estimate(large) == ULLONG_MAX);
-    assert(dcc_resource_class_slots(16, large, 0, 0) == 0);
-    assert(!dcc_resource_admit(large, 0, 0));
+    assert(dcc_resource_class_slots(16, large, 0) == 0);
+    assert(!dcc_resource_admit(large, 0));
     assert(dcc_resource_estimate(small) == 256*M);
     unsetenv("DISTCC_MEMORY_LEARNING");
     assert(dcc_resource_job_bytes() == 512*M);
     assert(dcc_resource_spare_bytes() == 128*M);
     assert(dcc_resource_estimate(large) == 512*M);
     assert(dcc_resource_known(pump));
-    assert(dcc_resource_class_slots(16, 1 + 63, 0, 0) > 0);
+    assert(dcc_resource_class_slots(16, 1 + 63, 0) > 0);
     return 0;
 }''')
             executable=root/'memory'

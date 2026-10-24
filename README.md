@@ -417,11 +417,10 @@ their storage remains part of actual cgroup usage. Each class reserves its
 largest successful RSS
 plus 25% and 64 MiB, with a 256 MiB minimum, until daemon restart. Unseen classes
 use the larger of the configured estimate and the daemon's observed peak with
-headroom; only one unseen-class calibration runs at a time. Small jobs therefore
-cannot authorize a burst of larger, unmeasured jobs. The broker also avoids
-queueing prepared input behind an occupied worker that has not measured its size.
-If such jobs nevertheless arrive from a stale capacity snapshot, the server
-continues past memory-blocked jobs to run known jobs that fit. It keeps link
+headroom. They run concurrently when those reservations fit the measured memory
+budget; an unfamiliar size alone does not serialize work. Small completed jobs
+cannot lower the estimate for unmeasured jobs. The server continues past
+memory-blocked jobs to run other jobs that fit. It keeps link
 ordering and stops scanning once all CPU execution lanes are occupied.
 
 The daemon sums reservations for active jobs and excludes actual shared-memory
@@ -523,8 +522,12 @@ standard and dependency libraries, share verified whole-file inodes between
 jobs. The compiler sees a read-only input tree and private writable outputs;
 job links keep inputs alive through cache eviction and cancellation. Large
 entries are reclaimed when their last job releases them, while small idle
-entries remain in the bounded cache. Compiler working memory is separate. Set the daemon's
-`TMPDIR` to suitable tmpfs storage when available.
+entries remain in the bounded cache. Compiler working memory is separate.
+C/C++ job trees use the daemon's `TMPDIR`, which can be tmpfs. Rust job trees and
+their shared cache use `DISTCCD_RUST_TMPDIR` (default `/var/tmp`): large dependency
+libraries, LTO intermediates and result archives must not exhaust a small runtime
+tmpfs. Use a disk filesystem with enough space for concurrent Rust jobs. The
+parent removes these trees after completion or cancellation.
 Up to two background threads handle large compressed chunks, cache lookup and
 registration, shared-input snapshots, and detached input-tree cleanup.
 Each connection can receive one chunk while decoding its predecessor,

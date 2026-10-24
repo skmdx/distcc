@@ -67,6 +67,7 @@ struct dcc_tcp_server {
     uint64_t input_offset, output_offset, reserved, input_bytes, result_bytes;
     uint64_t input_pending; /* File bytes not yet materialized in the private tree. */
     int storage_reserved;
+    unsigned storage_group;
     int result_pending;
     XXH3_state_t *hash;
     struct dcc_job_result result;
@@ -84,7 +85,7 @@ struct dcc_tcp_server {
 /* The parent event loop alone owns these. Children abandon inherited FDs. */
 static struct upload *uploads[256];
 static uint64_t retained;
-static uint64_t storage_pending;
+static uint64_t storage_pending[2];
 static uint64_t returning_bytes;
 static unsigned waiting_results;
 static struct dcc_tcp_server *ready_head, **ready_tail = &ready_head;
@@ -107,7 +108,7 @@ static void reserve_input(struct input *in)
     uint64_t size = s->job->inputs[in->index].plain_size;
     in->storage_needed = 1;
     s->input_pending += size;
-    if (s->storage_reserved) storage_pending += size;
+    if (s->storage_reserved) storage_pending[s->storage_group] += size;
 }
 
 static uint64_t monotonic_ns(void)
@@ -285,7 +286,7 @@ static void prune_inputs(const struct dcc_job *job)
         uint64_t shard = UINT64_C(1) << (job->inputs[i].digest[0] % DCC_FILE_CACHE_SHARDS);
         if (dcc_job_shared(job, i) && job->inputs[i].cached && !(seen & shard)) {
             seen |= shard;
-            dcc_file_cache_prune(job->inputs[i].digest);
+            dcc_file_cache_prune(job->inputs[i].digest, dcc_job_tmp_top(job));
         }
     }
 }
@@ -304,8 +305,9 @@ static void cleanup_complete(void *argument)
 }
 static void release_inputs(struct dcc_tcp_server *s)
 {
-    if (s->storage_reserved) storage_pending -= s->input_pending;
+    if (s->storage_reserved) storage_pending[s->storage_group] -= s->input_pending;
     s->storage_reserved = 0;
+    s->storage_group = 0;
     if (s->job) for (unsigned i = 0; i < s->job->count; ++i) {
         if (s->inputs) {
             detach(&s->inputs[i]);
@@ -469,8 +471,8 @@ static void copy_complete(void *argument)
 static int prepare(struct dcc_tcp_server *s)
 {
     char **paths = calloc(s->job->count ? s->job->count : 1, sizeof(*paths));
-    const char *tmp;
-    if (!paths || dcc_get_tmp_top(&tmp)) { free(paths); return -1; }
+    const char *tmp = dcc_job_tmp_top(s->job);
+    if (!paths || !tmp) { free(paths); return -1; }
     int length = snprintf(s->run.root, sizeof(s->run.root), "%s/distcc-tcp-XXXXXX", tmp);
     if (length < 0 || (size_t)length >= sizeof(s->run.root) || !mkdtemp(s->run.root)) {
         s->run.root[0] = 0; free(paths); return -1;
@@ -478,10 +480,17 @@ static int prepare(struct dcc_tcp_server *s)
     char *canonical = realpath(s->run.root, NULL);
     if (!canonical || strlen(canonical) >= sizeof(s->run.root)) { free(canonical); free(paths); return -1; }
     strcpy(s->run.root, canonical); free(canonical);
+    const char *regular;
+    struct stat location, normal;
+    if (dcc_get_tmp_top(&regular) || stat(regular, &normal) || stat(s->run.root, &location)) {
+        free(paths); return -1;
+    }
+    /* The two work roots share reservations when they share a filesystem. */
+    s->storage_group = location.st_dev != normal.st_dev;
     s->inputs = calloc(s->job->count ? s->job->count : 1, sizeof(*s->inputs));
     if (!s->inputs) { free(paths); return -1; }
     if (s->job->kind != DCC_JOB_RUST) {
-        storage_pending += s->input_pending;
+        storage_pending[s->storage_group] += s->input_pending;
         s->storage_reserved = 1;
     }
     for (unsigned i = 0; i < s->job->count; ++i) paths[i] = s->job->inputs[i].path;
@@ -508,11 +517,12 @@ static int prepare(struct dcc_tcp_server *s)
 static int input_space(const struct dcc_tcp_server *s)
 {
     if (!s->input_pending) return 1;
-    const char *directory;
+    const char *directory = dcc_job_tmp_top(s->job);
     struct statvfs space;
-    if (dcc_get_tmp_top(&directory) || statvfs(directory, &space)) return -1;
+    if (!directory || statvfs(directory, &space)) return -1;
     uint64_t available = (uint64_t)space.f_bavail * space.f_frsize;
-    return storage_pending <= available && s->input_pending <= available - storage_pending;
+    uint64_t pending = storage_pending[s->storage_group];
+    return pending <= available && s->input_pending <= available - pending;
 }
 static int prepare_available(struct dcc_tcp_server *s)
 {
@@ -527,7 +537,7 @@ static void input_stored(struct input *in)
     if (!in->storage_needed) return;
     uint64_t size = in->server->job->inputs[in->index].plain_size;
     in->server->input_pending -= size;
-    if (in->server->storage_reserved) storage_pending -= size;
+    if (in->server->storage_reserved) storage_pending[in->server->storage_group] -= size;
     in->storage_needed = 0;
 }
 static int input_missing(struct dcc_tcp_server *s, unsigned i)
@@ -548,7 +558,8 @@ static int input_missing(struct dcc_tcp_server *s, unsigned i)
         in->wanted = 1;
     } else { in->next = u->waiters; u->waiters = in; }
     in->upload = u;
-    if (u->owner == in || !dcc_job_shared(s->job, i) ||
+    if (u->owner == in || s->storage_group != u->owner->server->storage_group ||
+        !dcc_job_shared(s->job, i) ||
         !dcc_job_shared(u->owner->server->job, u->owner->index)) reserve_input(in);
     return 0;
 }
@@ -557,7 +568,8 @@ static void lookup_input(void *argument)
     struct dcc_tcp_server *s = argument;
     const struct dcc_job_input *in = &s->job->inputs[s->prepared];
     const char *path = s->inputs[s->prepared].path;
-    s->cache_hit = dcc_file_cache_get(in->digest, path, dcc_job_shared(s->job, s->prepared));
+    s->cache_hit = dcc_file_cache_get(in->digest, path, dcc_job_shared(s->job, s->prepared),
+                                     dcc_job_tmp_top(s->job));
     if (s->cache_hit) {
         struct stat st;
         if (stat(path, &st) || (uint64_t)st.st_size != in->plain_size) s->cache_hit = -1;
@@ -601,7 +613,7 @@ static int prepare_inputs(struct dcc_tcp_server *s)
     if (!s->storage_reserved) {
         int available = input_space(s);
         if (available <= 0) return available < 0 ? -1 : 0;
-        storage_pending += s->input_pending;
+        storage_pending[s->storage_group] += s->input_pending;
         s->storage_reserved = 1;
     }
     unsigned char *wanted = malloc(s->job->count * 4U + 1);
@@ -678,7 +690,7 @@ static void decode_input(void *argument)
         if (s->input_offset + length != s->job->inputs[index].plain_size ||
             memcmp(digest.digest, s->job->inputs[index].digest, 8)) s->input_error = -1;
         else dcc_file_cache_put(s->job->inputs[index].digest, s->inputs[index].path,
-                               dcc_job_shared(s->job, index));
+                               dcc_job_shared(s->job, index), dcc_job_tmp_top(s->job));
     }
 }
 static int finish_input(struct dcc_tcp_server *s)

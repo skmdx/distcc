@@ -18,8 +18,8 @@ struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count);
  * inputs (such as profile data). Otherwise return a
  * private inode. NULL hash requires an already verified, immutable source. */
 int dcc_file_cache_copy(const unsigned char *hash, const char *source, const char *destination, int shared);
-int dcc_file_cache_get(const unsigned char *hash, const char *destination, int shared);
-void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared);
-void dcc_file_cache_prune(const unsigned char *hash);
+int dcc_file_cache_get(const unsigned char *hash, const char *destination, int shared, const char *tmp);
+void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared, const char *tmp);
+void dcc_file_cache_prune(const unsigned char *hash, const char *tmp);
 
 #endif

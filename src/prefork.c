@@ -107,7 +107,7 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
     int link = description->kind == DCC_JOB_LINK;
     unsigned memory_class = dcc_resource_class(description);
     if (load.busy >= dcc_cpu_perf_limit(dcc_max_kids) ||
-        !dcc_resource_admit(memory_class, load.reserved, load.probing) ||
+        !dcc_resource_admit(memory_class, load.reserved) ||
         (link && load.links)) return 0;
     for (int i = 0; i < worker_count; ++i) {
         struct worker *w = &workers[i];
@@ -187,7 +187,6 @@ int dcc_prefork_status(struct dcc_server_load *load)
         if (w->tcp) {
             unsigned long long estimate = dcc_resource_estimate(w->memory_class);
             if (estimate > charge) charge = estimate;
-            load->probing |= !dcc_resource_known(w->memory_class);
         }
         load->reserved = charge <= ULLONG_MAX - load->reserved ? load->reserved + charge : ULLONG_MAX;
     }

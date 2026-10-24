@@ -55,6 +55,38 @@ class RustTest(BrokerTestCase):
         stats = self.get_stats(self.stats_ports[0])
         self.assertIn('dcc_rust_capacity ', stats)
 
+    def test_large_rust_artifacts_do_not_use_small_runtime_tmpfs(self):
+        runtime = self.work / 'runtime'
+        storage = self.work / 'rust-storage'
+        runtime.mkdir()
+        storage.mkdir()
+        launcher = self.work / 'bounded-worker'
+        command = ['bwrap', '--die-with-parent', '--unshare-user', '--uid', str(os.getuid()),
+                   '--gid', str(os.getgid()), '--bind', '/', '/', '--dev', '/dev',
+                   '--size', str(1024 * 1024), '--tmpfs', str(runtime),
+                   str(self.build / 'distccd')]
+        launcher.write_text('#!/bin/sh\nexec ' + shlex.join(command) + ' "$@"\n')
+        launcher.chmod(0o755)
+        self.restart_server(launcher, TMPDIR=str(runtime), DISTCCD_RUST_TMPDIR=str(storage))
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        source = self.work / 'large.rs'
+        source.write_text('pub static DATA: [u8; 16777216] = [7; 16777216];')
+        output = self.work / 'liblarge.rlib'
+        result = self.rust('--crate-type=rlib', source, '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        self.assertGreater(output.stat().st_size, 16 * 1024 * 1024)
+        main = self.work / 'large-main.rs'
+        main.write_text('fn main() { assert_eq!(large::DATA[16777215], 7); }')
+        result = self.rust(main, '--extern', 'large=' + str(output),
+                           '-o', self.work / 'large-check', remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([self.work / 'large-check'], check=True)
+        deadline = time.monotonic() + 5
+        while list(storage.glob('distcc-tcp-*')):
+            self.assertLess(time.monotonic(), deadline, 'Rust job tree was not cleaned')
+            time.sleep(.01)
+
     def test_library_inputs_env_and_dependency_artifacts(self):
         source = self.work / 'library space.rs'
         nested = self.work / 'module.rs'

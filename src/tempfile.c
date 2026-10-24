@@ -427,6 +427,11 @@ int dcc_make_tmpnam(const char *prefix,
          * and our children should do anything with it. */
         fd = open(s, O_WRONLY | O_CREAT | O_EXCL, 0600);
         if (fd == -1) {
+            if (errno != EEXIST) {
+                rs_log_error("failed to create %s: %s", s, strerror(errno));
+                free(s);
+                return EXIT_IO_ERROR;
+            }
             /* try again */
             rs_trace("failed to create %s: %s", s, strerror(errno));
             random_bits += 7777; /* fairly prime */

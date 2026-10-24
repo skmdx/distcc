@@ -737,9 +737,9 @@ class BrokerTest(BrokerTestCase):
                 _, first = self.acquire_reserved(10, (990, 4 * 1024 * 1024, 5))
                 _, second = self.acquire_reserved(10, (991, 4 * 1024 * 1024, 5))
                 self.assertEqual(first.getpeername()[1], self.ports[0])
-                self.assertEqual(second.getpeername()[1], self.ports[1])
+                self.assertEqual(second.getpeername()[1], self.ports[0 if capacity < 0 else 1])
 
-    def test_rust_calibration_does_not_queue_behind_other_work(self):
+    def test_missing_class_capacity_uses_aggregate_memory_capacity(self):
         for busy in (0, 2):
             with self.subTest(busy=busy):
                 peers = [self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=busy,
@@ -754,7 +754,7 @@ class BrokerTest(BrokerTestCase):
                 _, first = self.acquire_reserved(10, (1990, 2 * 1024**3, 7))
                 _, second = self.acquire_reserved(10, (1991, 2 * 1024**3, 7))
                 self.assertEqual(first.getpeername()[1], self.ports[0])
-                self.assertEqual(second.getpeername()[1], self.ports[1])
+                self.assertEqual(second.getpeername()[1], self.ports[0])
 
     def test_tcp_global_pipeline_and_resource_limits(self):
         for name, metrics in (

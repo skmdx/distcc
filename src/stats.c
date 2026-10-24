@@ -362,10 +362,10 @@ static void format_capacity(char *buffer, size_t size, unsigned kind,
     size_t length = 0;
     for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
         int slots = dcc_resource_class_slots(cpu_limit - active,
-            1 + kind * DCC_MEMORY_BUCKETS + i, load->reserved, load->probing);
+            1 + kind * DCC_MEMORY_BUCKETS + i, load->reserved);
         /* Advertise total occupancy: existing jobs retain their own class
          * reservations, and only additional jobs use the requested class. */
-        if (slots >= 0) slots += active;
+        slots += active;
         if (slots > cpu_limit) slots = cpu_limit;
         length += snprintf(buffer + length, size - length, "%s%d", i ? "," : "", slots);
     }

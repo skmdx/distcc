@@ -38,14 +38,14 @@ static int private_directory(int parent, const char *name)
     return fd;
 }
 
-static int cache_root(void)
+static int cache_root(const char *tmp)
 {
-    const char *setting = getenv("DISTCCD_FILE_CACHE"), *tmp;
+    const char *setting = getenv("DISTCCD_FILE_CACHE");
     char *path = NULL;
     int root;
     if (setting && !*setting) return -1;
     if (!setting) {
-        if (dcc_get_tmp_top(&tmp) ||
+        if (!tmp ||
             asprintf(&path, "%s/distcc-cache-%lu", tmp, (unsigned long)geteuid()) < 0)
             return -1;
         setting = path;
@@ -55,10 +55,10 @@ static int cache_root(void)
     return root;
 }
 
-static int cache_shard(const unsigned char *hash, char key[17])
+static int cache_shard(const unsigned char *hash, char key[17], const char *tmp)
 {
     char shard[3];
-    int root = cache_root(), fd, i;
+    int root = cache_root(tmp), fd, i;
     if (root < 0) return -1;
     snprintf(shard, sizeof(shard), "%02x", hash[0] % CACHE_SHARDS);
     fd = private_directory(root, shard);
@@ -128,11 +128,11 @@ int dcc_file_cache_copy(const unsigned char *hash, const char *source, const cha
     return ok;
 }
 
-int dcc_file_cache_get(const unsigned char *hash, const char *destination, int shared)
+int dcc_file_cache_get(const unsigned char *hash, const char *destination, int shared, const char *tmp)
 {
     char key[17];
     struct stat st;
-    int shard = cache_shard(hash, key), from = -1, ok = 0;
+    int shard = cache_shard(hash, key, tmp), from = -1, ok = 0;
     if (shard < 0) return 0;
     from = openat(shard, key, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (from < 0 || fstat(from, &st) || !S_ISREG(st.st_mode))
@@ -190,7 +190,7 @@ static int make_room(int shard, off_t size, const char *replaced)
     return 0;
 }
 
-void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared)
+void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared, const char *tmp)
 {
     char key[17], temporary[40];
     struct stat st;
@@ -198,7 +198,7 @@ void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared)
     from = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (from < 0 || fstat(from, &st) || !S_ISREG(st.st_mode) || (!shared && st.st_size > CACHE_BYTES))
         goto done;
-    shard = cache_shard(hash, key);
+    shard = cache_shard(hash, key, tmp);
     if (shard < 0) goto done;
     lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     /* Publish shared inputs reliably; private cache insertion is best effort. */
@@ -234,10 +234,10 @@ done:
     if (shard >= 0) close(shard);
 }
 
-void dcc_file_cache_prune(const unsigned char *hash)
+void dcc_file_cache_prune(const unsigned char *hash, const char *tmp)
 {
     char key[17];
-    int shard = cache_shard(hash, key), lock;
+    int shard = cache_shard(hash, key, tmp), lock;
     if (shard < 0) return;
     lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (lock >= 0 && !flock(lock, LOCK_EX)) make_room(shard, 0, "");

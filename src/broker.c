@@ -825,14 +825,12 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         struct peer *p = &broker->peers[i];
         const struct dcc_capacity *cap = p->valid_until > now ? &p->metrics : NULL;
         struct dcc_capacity projected;
-        int cold = 0;
         if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= DCC_WORK_CLASSES) {
             projected = *cap;
             const int *capacities = client->hint.kind == DCC_WORK_RUST ? cap->rust_capacity :
                                     client->hint.kind > 3 ? cap->pump_capacity : cap->compile_capacity;
             int limit = capacities[dcc_resource_bucket(client->hint.bytes)];
-            cold = limit < 0;
-            projected.capacity = cold ? (cap->busy > 0 ? cap->busy : 0) + 1 : limit;
+            if (limit >= 0) projected.capacity = limit;
             cap = &projected;
         }
         slots = dcc_capacity_slots(p->host, cap);
@@ -892,9 +890,6 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             projected.queued = 0;
             cap = &projected;
         }
-        /* An unfamiliar class has one additional calibration lane, provided
-         * the worker's existing reservations leave room for it. */
-        if (cold && work >= cap->capacity) continue;
         if (p->busy < inflight || predicted) {
             /* A recovery trial uses the host's calibrated speed, not a zero
              * completion time. An uncompetitive host need not delay this job

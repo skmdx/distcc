@@ -17,6 +17,16 @@ struct metadata {
     size_t size, offset, capacity;
     int error;
 };
+const char *dcc_job_tmp_top(const struct dcc_job *job)
+{
+    const char *tmp;
+    if (job->kind == DCC_JOB_RUST) {
+        tmp = getenv("DISTCCD_RUST_TMPDIR");
+        return tmp && *tmp ? tmp : "/var/tmp";
+    }
+    return dcc_get_tmp_top(&tmp) ? NULL : tmp;
+}
+
 int dcc_job_memfd(const char *name)
 {
     return memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);

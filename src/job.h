@@ -62,6 +62,7 @@ struct dcc_buffer;
 /* Server compiler execution consumes an already materialized private tree.
  * Results own open FDs before the worker removes temporary pathnames. */
 int dcc_execute_job(struct dcc_job *, const char *root, int cancel_fd, struct dcc_job_result *);
+const char *dcc_job_tmp_top(const struct dcc_job *);
 int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *output);
 struct dcc_hostdef;
 int dcc_compile_direct(struct dcc_hostdef *, struct dcc_job *, char **argv, const char *cpp, int cpp_fd, char **files, char **auxiliary,

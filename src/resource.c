@@ -259,8 +259,7 @@ unsigned long long dcc_resource_job_bytes(void)
 
 unsigned long long dcc_resource_estimate(unsigned memory_class)
 {
-    if (memory_learning() && memory_class < sizeof(class_peak) / sizeof(*class_peak) &&
-        class_peak[memory_class]) {
+    if (memory_learning() && dcc_resource_known(memory_class)) {
         unsigned long long estimate = measured_job_bytes(class_peak[memory_class]);
         return estimate < 256ULL * 1024 * 1024 ? 256ULL * 1024 * 1024 : estimate;
     }
@@ -308,10 +307,9 @@ int dcc_resource_slots(int maximum)
 }
 
 int dcc_resource_class_slots(int maximum, unsigned memory_class,
-                             unsigned long long reserved, int probing)
+                             unsigned long long reserved)
 {
-    if (maximum <= 0 || !dcc_resource_admit(memory_class, reserved, probing)) return 0;
-    if (!dcc_resource_known(memory_class)) return -1;
+    if (maximum <= 0 || !dcc_resource_admit(memory_class, reserved)) return 0;
     unsigned long long job = dcc_resource_estimate(memory_class);
     unsigned long long spare = reserved ? dcc_resource_spare_bytes() : 0;
     unsigned long long free = budget - reserved;
@@ -320,9 +318,8 @@ int dcc_resource_class_slots(int maximum, unsigned memory_class,
     return slots < (unsigned)maximum ? (int)slots : maximum;
 }
 
-int dcc_resource_admit(unsigned memory_class, unsigned long long reserved, int probing)
+int dcc_resource_admit(unsigned memory_class, unsigned long long reserved)
 {
-    if (probing && !dcc_resource_known(memory_class)) return 0;
     unsigned long long job = dcc_resource_estimate(memory_class);
     /* One calibrated job already includes its own measurement headroom. An
      * extra host reserve must not prevent an otherwise fitting idle probe. */

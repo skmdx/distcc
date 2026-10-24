@@ -276,7 +276,7 @@ int ioctl(int fd, unsigned long request, ...) {
         self.assertLess(estimate, 512 * 1024 * 1024)
         self.assertIn('dcc_job_memory_samples 8\n', after)
 
-    def test_server_calibrates_unseen_size_despite_cached_client_capacity(self):
+    def test_unseen_size_uses_available_memory_in_parallel(self):
         def metric(text, name):
             match = re.search(rf'^{name} (\d+)$', text, re.M)
             assert match is not None, (name, text)
@@ -293,10 +293,10 @@ int ioctl(int fd, unsigned long request, ...) {
             row = next(line for line in text.splitlines() if line.startswith('dcc_compile_capacity '))
             return list(map(int, row.split(' ', 1)[1].split(',')))[bucket]
         before = self.get_stats(self.stats_ports[0])
-        self.assertEqual(capacity(before), -1)
+        self.assertGreaterEqual(capacity(before), 2)
         completed = metric(before, 'dcc_compile_ok')
-        # Expose cached client capacity to force a burst onto the real daemon;
-        # the broker's own cold-class gate must not hide missing server leases.
+        # Expose cached client capacity to exercise the real daemon's
+        # reservation accounting rather than client-side serialization.
         advertised = re.sub(r'dcc_compile_capacity [^\n]+',
                             'dcc_compile_capacity ' + ','.join(['4'] * 64), before)
         peer = self.peer(advertised.encode())
@@ -321,15 +321,14 @@ int ioctl(int fd, unsigned long request, ...) {
             outputs = [job.result() for job in jobs]
         cold = [busy for done, busy in rows if done == completed]
         self.assertTrue(cold)
-        self.assertEqual(max(cold), 1)
-        self.assertGreaterEqual(max(busy for done, busy in rows if done > completed), 2)
+        self.assertGreaterEqual(max(cold), 2)
         native = self.work / 'native.o'
         subprocess.run([self.cc, '-c', str(source), '-o', str(native)], check=True)
         self.assertTrue(all(output == native.read_bytes() for output in outputs))
         after = self.get_stats(self.stats_ports[0])
         self.assertGreater(capacity(after), 0)
 
-    def test_known_job_bypasses_blocked_memory_calibration(self):
+    def test_known_job_runs_alongside_unmeasured_work(self):
         self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='512', DISTCC_MEMORY_LEARNING='1')
         self.addCleanup(self.restart_server, self.build / 'distccd')
         self.start_tcp()
@@ -366,11 +365,11 @@ os.execv({self.cc!r}, [{self.cc!r}, *sys.argv[1:]])
                     self.assertLess(time.monotonic(), deadline)
                     time.sleep(.01)
                 large.append(pool.submit(compile_large, 1))
-                while 'dcc_queued 1\n' not in self.get_stats(self.stats_ports[0]):
+                while 'dcc_busy 2\n' not in self.get_stats(self.stats_ports[0]):
                     self.assertLess(time.monotonic(), deadline)
                     time.sleep(.01)
-                # The first unknown job remains held, and the second cannot
-                # run yet. A known small compile must pass both immediately.
+                # Both unmeasured jobs remain held. A known small compile
+                # must also run while their memory reservations fit.
                 small = pool.submit(self.job, 'bypass-calibration')
                 small.result(timeout=3)
                 self.assertFalse(any(job.done() for job in large))
