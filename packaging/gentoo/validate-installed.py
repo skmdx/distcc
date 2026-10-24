@@ -10,6 +10,8 @@ import tempfile
 import sys
 import time
 
+REMOTE_TIMEOUT = 180
+
 wrapper = Path('/usr/lib/distcc/gcc')
 assert wrapper.samefile('/usr/bin/distcc'), 'GCC masquerade wrapper is missing'
 with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR']) as temporary, contextlib.ExitStack() as resources:
@@ -23,6 +25,9 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                DISTCC_HOSTS=os.environ['VALIDATE_DISTCC_HOSTS'], DISTCC_FALLBACK='0',
                DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_TESTING_INCLUDE_SERVER='1',
                DISTCC_VERBOSE='1', DISTCC_LOG=str(root/'client.log'), CCACHE_DISABLE='1')
+    # This validator owns the broker. Input discovery must not outlive its
+    # listener while the remote command itself is still within its deadline.
+    env['DISTCC_BROKER_IDLE'] = str(REMOTE_TIMEOUT)
     env['DISTCC_BROKER'] = str(root/'broker.sock')
     def report_failure(error_type, error, traceback):
         if error_type is not None:
@@ -133,7 +138,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         rust = subprocess.run(['distcc', 'rustc', '--crate-name=rust_test', '--crate-type=rlib',
                                '-Ctarget-cpu=native', '--emit=link=' + str(library) +
                                ',dep-info=' + str(root / 'rust.d') + ',llvm-ir=' + str(remote_ir), str(source)],
-                              env=rust_env, text=True, capture_output=True, timeout=180)
+                              env=rust_env, text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
         assert rust.returncode == 0, (rust.stdout + rust.stderr,
             (root/'client.log').read_text()[-6000:] if (root/'client.log').exists() else '')
         assert 'distcc-rust: compiled on ' in rust.stderr, rust.stderr
