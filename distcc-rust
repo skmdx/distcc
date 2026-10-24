@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""Cargo/rustc wrapper: plan with rustc, execute through distcc's pooled jobs.
+
+Rust libraries are the distribution unit. Executable links and procedural
+macros stay on the client, where native libraries and arbitrary macro inputs
+are available. No Rust syntax is interpreted by this planner.
+"""
+import fcntl
+import glob
+import json
+import mmap
+import os
+from pathlib import Path
+import shutil
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+
+class LocalOnly(Exception):
+    pass
+
+
+VALUES = {'--cap-lints', '--cfg', '--check-cfg', '--crate-name', '--crate-type',
+          '--edition', '--error-format', '--extern', '--json', '--remap-path-prefix',
+          '--target', '--sysroot', '--emit', '--out-dir', '-o', '-C', '-L', '-l',
+          '-A', '-W', '-D', '-F', '--diagnostic-width', '--color'}
+CODEGEN = {'opt-level', 'lto', 'linker', 'link-arg', 'link-args', 'link-self-contained',
+           'debuginfo', 'debug-assertions', 'overflow-checks', 'metadata', 'extra-filename',
+           'panic', 'codegen-units', 'embed-bitcode', 'target-cpu', 'target-feature',
+           'strip', 'force-unwind-tables', 'relocation-model', 'prefer-dynamic',
+           'split-debuginfo', 'incremental', 'force-frame-pointers'}
+RUNTIME = ('/lib', '/lib64', '/usr/lib64', '/usr/lib/gcc', '/usr/lib/llvm',
+           '/etc/ld.so.cache')
+CONTROL = '/__distcc_rust'
+
+
+def absolute(value):
+    return Path(os.path.abspath(value))
+
+
+def options(args):
+    """Parse rustc's option grammar, never the source language."""
+    result = []
+    words = iter(args)
+    for word in words:
+        if word == '--':
+            result.extend(('', value) for value in words)
+            break
+        name, equal, value = word.partition('=')
+        if name in VALUES:
+            if not equal:
+                try:
+                    value = next(words)
+                except StopIteration:
+                    raise LocalOnly('missing option value') from None
+            result.append((name, value))
+        elif word[:2] in {'-C', '-L', '-l', '-A', '-W', '-D', '-F', '-o'} and len(word) > 2:
+            result.append((word[:2], word[2:]))
+        elif word in ('-g', '-O'):
+            result.append((word, None))
+        elif word.startswith(('-', '@')):
+            raise LocalOnly('unsupported rustc action or option: ' + word)
+        else:
+            result.append(('', word))
+    return result
+
+
+def flatten(opts):
+    return [part for key, value in opts for part in
+            ([key, value] if key and value is not None else [key or value])]
+
+
+def identity(compiler):
+    lines = subprocess.check_output([compiler, '-vV'], text=True).splitlines()
+    fields = dict(line.split(': ', 1) for line in lines[1:] if ': ' in line)
+    return {'version': lines[0], 'commit': fields['commit-hash'],
+            'llvm': fields['LLVM version']}, fields['host']
+
+
+def dependencies(path):
+    # Our dep-info-only probe emits one target followed by one phony rule per
+    # input. Read those records instead of applying shell/Make escaping rules:
+    # rustc escapes spaces, but leaves dollars, quotes and backslashes literal.
+    # env-dep records name the variables observed by env!/option_env!.
+    text = path.read_text()
+    files = []
+    _, separator, records = text.partition('\n\n')
+    if not separator:
+        raise LocalOnly('rustc did not produce dependency records')
+    for record in records.splitlines():
+        if not record or record.startswith('# env-dep:'):
+            continue
+        if not record.endswith(':'):
+            raise LocalOnly('unsupported dependency record')
+        files.append(absolute(record[:-1].replace('\\ ', ' ')))
+    if not files:
+        raise LocalOnly('rustc did not produce dependency records')
+    environment = {}
+    for line in text.splitlines():
+        if line.startswith('# env-dep:'):
+            name = line[len('# env-dep:'):].partition('=')[0]
+            if name in os.environ:
+                environment[name] = os.environ[name]
+    return files, environment
+
+
+def plan(compiler, args, work):
+    opts = options(args)
+    values = dict(opts)
+    sources = [v for k, v in opts if not k]
+    if len(sources) != 1 or not sources[0].endswith('.rs'):
+        raise LocalOnly('not a Rust source compilation')
+    emits = values.get('--emit', 'link').split(',')
+    types = set(values.get('--crate-type', 'bin').split(','))
+    if 'proc-macro' in types or (any(e.split('=')[0] == 'link' for e in emits)
+                                and not types <= {'lib', 'rlib'}):
+        raise LocalOnly('executable/native linking or procedural macro')
+    if not set(e.split('=')[0] for e in emits) <= {'link', 'metadata', 'obj', 'asm', 'llvm-ir', 'llvm-bc', 'dep-info'}:
+        raise LocalOnly('unsupported output kind')
+    if all(e.split('=')[0] == 'dep-info' for e in emits):
+        raise LocalOnly('dependency query')
+    compiler_id, host = identity(compiler)
+    target = values.get('--target', host)
+    if '/' in target or target.endswith('.json'):
+        raise LocalOnly('custom target specification')
+    root = absolute(values.get('--sysroot') or subprocess.check_output(
+        [compiler, '--print=sysroot'], text=True).strip())
+    inputs = set()
+    for key, value in opts:
+        if key == '-C':
+            name, _, setting = value.partition('=')
+            if name not in CODEGEN or (name == 'target-cpu' and setting == 'native'):
+                raise LocalOnly('host-specific or unsupported codegen option: ' + value)
+        elif key == '--extern':
+            _, equal, file = value.partition('=')
+            if equal:
+                inputs.add(absolute(file))
+        elif key == '-L':
+            kind, equal, directory = value.partition('=')
+            directory = absolute(directory if equal else kind)
+            if directory.is_dir():
+                inputs.update(p for p in directory.iterdir()
+                              if p.suffix in ('.rlib', '.rmeta', '.so', '.a'))
+    if any(p.suffix == '.so' for p in inputs):
+        raise LocalOnly('procedural macro or dynamic Rust dependency')
+    # A client dep-info pass expands modules/includes using the actual compiler
+    # and caller environment. A failure goes back through the original command.
+    base = [(k, v) for k, v in opts if k not in ('--emit', '--out-dir', '-o')
+            and not (k == '-C' and v.partition('=')[0] == 'incremental')]
+    start = time.time_ns()
+    probe = subprocess.run([compiler, *flatten(base), '--emit=dep-info=' + str(work / 'probe.d')],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if probe.returncode:
+        raise LocalOnly('dependency expansion failed')
+    source_files, environment = dependencies(work / 'probe.d')
+    inputs.update(source_files)
+    if 'RUSTC_BOOTSTRAP' in os.environ:
+        environment['RUSTC_BOOTSTRAP'] = os.environ['RUSTC_BOOTSTRAP']
+    libdir = root / 'lib/rustlib' / target / 'lib'
+    if not libdir.is_dir():
+        raise LocalOnly('missing target standard library')
+    inputs.update(p for p in libdir.rglob('*') if p.is_file())
+    outdir = absolute(values.get('--out-dir', '.'))
+    output = work / 'out'
+    output.mkdir()
+    mapped = list(base)
+    if '--sysroot' not in values:
+        mapped.append(('--sysroot', str(root)))
+    if '--target' not in values:
+        mapped.append(('--target', target))
+    outputs = {}
+    mapped_emits = []
+    for emit in emits:
+        kind, equal, path = emit.partition('=')
+        if equal:
+            destination = absolute(path)
+            if path == '-' or not destination.parent.is_dir():
+                raise LocalOnly('non-file output')
+            name = destination.name
+            if name in outputs and outputs[name] != str(destination):
+                raise LocalOnly('colliding output filenames')
+            outputs[name] = str(destination)
+            mapped_emits.append(kind + '=' + str(output / name))
+        else:
+            mapped_emits.append(kind)
+    mapped.append(('--emit', ','.join(mapped_emits)))
+    if '-o' not in values or '--out-dir' in values:
+        mapped.append(('--out-dir', str(output)))
+    if '-o' in values:
+        dest = absolute(values['-o'])
+        if values['-o'] == '-' or str(dest).startswith('/dev/'):
+            raise LocalOnly('non-file output')
+        mapped.append(('-o', str(output / dest.name)))
+        outdir = dest.parent
+    job = dict(compiler=compiler_id, cwd=os.getcwd(), args=flatten(mapped),
+               environment=environment, output=str(output))
+    # Files that changed during dependency discovery require a new invocation;
+    # never combine one dependency graph with another generation's contents.
+    states = {}
+    for path in inputs:
+        info = path.stat()
+        if not path.is_file() or max(info.st_mtime_ns, info.st_ctime_ns) > start:
+            raise LocalOnly('input changed during dependency discovery')
+        if path == Path(CONTROL) or str(path).startswith(CONTROL + '/') or any(
+                path == Path(p) or path.is_relative_to(p) for p in (*RUNTIME, '/dev', '/proc', '/sys')):
+            raise LocalOnly('input overlaps the worker runtime')
+        states[path] = stamp(info)
+    return job, states, outdir, outputs
+
+
+def stamp(info):
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def snapshot(source, destination, expected=None):
+    with open(source, 'rb') as src, open(destination, 'xb') as dst:
+        before = stamp(os.fstat(src.fileno()))
+        if expected is not None and expected != before:
+            raise LocalOnly('input changed after dependency discovery')
+        try:
+            fcntl.ioctl(dst.fileno(), 0x40049409, src.fileno())  # FICLONE
+        except OSError:
+            shutil.copyfileobj(src, dst, 256 * 1024)
+        if before != stamp(os.fstat(src.fileno())):
+            raise LocalOnly('input changed during snapshot')
+
+
+def metadata(job, inputs, work):
+    import xxhash
+    data = bytearray()
+
+    def number(value):
+        data.extend(struct.pack('!Q', value))
+
+    def string(value):
+        encoded = os.fsencode(value)
+        number(len(encoded))
+        data.extend(encoded)
+
+    snapshots = work / 'inputs'
+    snapshots.mkdir()
+    entries = []
+
+    def add(name, dest):
+        size = dest.stat().st_size
+        if size:
+            with dest.open('rb') as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as content:
+                digest = xxhash.xxh3_64_digest(content)
+        else:
+            digest = xxhash.xxh3_64_digest(b'')
+        entries.append((name, size, digest))
+
+    # Large Rust metadata files exceed the existing per-entry cache budget.
+    # Chunk them into ordinary cache entries; reassemble only inside the private
+    # worker tree. This keeps the cache's global bound and the RPC unchanged.
+    job['chunks'] = []
+    limit = 4 * 1024 * 1024
+    for name, expected in sorted(inputs.items()):
+        if expected[2] <= limit:
+            dest = snapshots / str(len(entries))
+            snapshot(name, dest, expected)
+            add(str(name), dest)
+        else:
+            parts = []
+            with name.open('rb') as source:
+                if stamp(os.fstat(source.fileno())) != expected:
+                    raise LocalOnly('input changed after dependency discovery')
+                while content := source.read(limit):
+                    index = len(entries)
+                    dest = snapshots / str(index)
+                    dest.write_bytes(content)
+                    chunk = CONTROL + '/chunks/' + str(index)
+                    parts.append(chunk)
+                    add(chunk, dest)
+                if stamp(os.fstat(source.fileno())) != expected:
+                    raise LocalOnly('input changed during snapshot')
+            job['chunks'].append((str(name), parts))
+    manifest = snapshots / str(len(entries))
+    manifest.write_text(json.dumps(job))
+    add(CONTROL + '/job.json', manifest)
+    if len(entries) > 65536:
+        raise LocalOnly('too many Rust inputs')
+    for value in (3, 1, len(entries)):
+        number(value)
+    string(job['cwd'])
+    string('distcc-rust')
+    for name, size, digest in entries:
+        for value in (0, 0, 1, size, size):
+            number(value)
+        data.extend(digest)
+        string(str(name))
+        string('')
+    if len(data) > 16 * 1024 * 1024:
+        raise LocalOnly('Rust job metadata is too large')
+    (work / 'job').write_bytes(data)
+    return work / 'job', snapshots
+
+
+def worker(root, archive):
+    root = Path(root)
+    job = json.loads((root / CONTROL.lstrip('/') / 'job.json').read_text())
+    def rooted(name):
+        path = Path(name)
+        if not path.is_absolute() or '..' in path.parts:
+            raise LocalOnly('invalid input path')
+        return root / str(path).lstrip('/')
+
+    for name, parts in job['chunks']:
+        destination = rooted(name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open('xb') as output:
+            for part in parts:
+                if not part.startswith(CONTROL + '/chunks/'):
+                    raise LocalOnly('invalid input chunk')
+                path = rooted(part)
+                with path.open('rb') as source:
+                    shutil.copyfileobj(source, output, 256 * 1024)
+                path.unlink()
+    # Select only administrator-installed compilers, never an executable path
+    # supplied by a remote client. Exact compiler build identity is mandatory.
+    candidates = [shutil.which('rustc')]
+    candidates += glob.glob('/usr/lib/rust/*/bin/rustc') + glob.glob('/opt/rust-bin-*/bin/rustc')
+    compiler = None
+    for candidate in dict.fromkeys(filter(None, candidates)):
+        try:
+            if identity(candidate)[0] == job['compiler']:
+                compiler = Path(candidate).resolve()
+                break
+        except (OSError, subprocess.CalledProcessError):
+            continue
+    if compiler is None:
+        raise LocalOnly('no worker compiler matches the client Rust build')
+    # Revalidate the action on the server: the only executable is our installed
+    # compiler. Proc-macros, linker plugins and custom codegen backends may not
+    # turn the compiler service into a command runner.
+    opts = options(job['args'])
+    vals = dict(opts)
+    types = set(vals.get('--crate-type', 'bin').split(','))
+    emits = vals.get('--emit', 'link').split(',')
+    if 'proc-macro' in types or (any(e.split('=')[0] == 'link' for e in emits)
+                                and not types <= {'lib', 'rlib'}):
+        raise LocalOnly('unsupported worker action')
+    for key, value in opts:
+        if key == '-C' and value.partition('=')[0] not in CODEGEN - {'incremental'}:
+            raise LocalOnly('unsupported worker codegen option')
+    output = Path(job['output'])
+    cwd = Path(job['cwd'])
+    for path in (output, cwd):
+        if not path.is_absolute() or '..' in path.parts or str(path) == '/':
+            raise LocalOnly('invalid worker path')
+        (root / str(path).lstrip('/')).mkdir(parents=True, exist_ok=True)
+    # Bypass user PATH wrappers: namespace isolation and separate diagnostic
+    # streams are part of the worker contract.
+    sandbox = [shutil.which('bwrap', path=os.defpath) or '/usr/bin/bwrap',
+               '--unshare-all', '--die-with-parent', '--bind', str(root), '/']
+    for path in RUNTIME:
+        if Path(path).exists():
+            sandbox.extend(['--ro-bind', path, path])
+    sandbox.extend(['--ro-bind', str(compiler.parent.parent), CONTROL + '/compiler',
+                    '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+                    '--chdir', str(cwd), '--clearenv'])
+    for name, value in job['environment'].items():
+        if name.startswith(('LD_', 'DYLD_')) or name in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
+            raise LocalOnly('unsafe worker environment')
+        sandbox.extend(['--setenv', name, value])
+    result = subprocess.run([*sandbox, CONTROL + '/compiler/bin/rustc', *job['args']])
+    if result.returncode:
+        return result.returncode if result.returncode > 0 else 128 - result.returncode
+    directory = root / str(output).lstrip('/')
+    with tarfile.open(archive, 'w') as tar:
+        for path in sorted(directory.iterdir()):
+            if not path.is_file() or path.is_symlink():
+                raise LocalOnly('unexpected Rust output')
+            tar.add(path, arcname=path.name, recursive=False)
+    return 0
+
+
+def install_outputs(archive, job, outdir, outputs, work):
+    staged = work / 'received'
+    staged.mkdir()
+    # Validate every member before publishing any result. No extractall and no
+    # paths/symlinks controlled by a worker are ever applied to the client tree.
+    planned = []
+    seen = set()
+    with tarfile.open(archive) as tar:
+        for member in tar:
+            if not member.isfile() or '/' in member.name or member.name in ('', '.', '..') or member.name in seen:
+                raise OSError('invalid Rust result archive')
+            seen.add(member.name)
+            dest = Path(outputs.get(member.name, str(outdir / member.name)))
+            if not dest.parent.is_dir():
+                raise OSError('Rust output directory does not exist')
+            file = staged / member.name
+            with tar.extractfile(member) as src, file.open('wb') as dst:
+                shutil.copyfileobj(src, dst, 256 * 1024)
+            if file.suffix == '.d':
+                text = file.read_text()
+                for name, path in outputs.items():
+                    text = text.replace(job['output'] + '/' + name, path)
+                file.write_text(text.replace(job['output'], str(outdir)))
+            planned.append((file, dest, member.mode))
+    if not planned:
+        raise OSError('empty Rust result archive')
+    for file, dest, mode in planned:
+        with tempfile.NamedTemporaryFile(dir=dest.parent, prefix='.distcc-rust-', delete=False) as tmp:
+            temporary = Path(tmp.name)
+            try:
+                with file.open('rb') as source:
+                    shutil.copyfileobj(source, tmp, 256 * 1024)
+                mask = os.umask(0)
+                os.umask(mask)
+                os.fchmod(tmp.fileno(), mode & 0o777 & ~mask)
+                tmp.flush()
+                os.replace(temporary, dest)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+
+def client(compiler, args):
+    try:
+        if not os.environ.get('DISTCC_BROKER'):
+            raise LocalOnly('Rust distribution requires DISTCC_BROKER')
+        with tempfile.TemporaryDirectory(prefix='distcc-rust-') as directory:
+            work = Path(directory)
+            job, inputs, outdir, outputs = plan(compiler, args, work)
+            description, snapshots = metadata(job, inputs, work)
+            env = dict(os.environ)
+            env.pop('INCLUDE_SERVER_PORT', None)
+            transport = str(Path(__file__).resolve().with_name('distcc'))
+            result = subprocess.run([transport, '--rust-job', str(description), str(snapshots),
+                                     str(work / 'result.tar')], env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode >= 100 or result.returncode < 0:
+                raise OSError(result.stderr.decode(errors='replace').strip() or 'Rust worker failed')
+            for data, stream in ((result.stdout, sys.stdout.buffer), (result.stderr, sys.stderr.buffer)):
+                stream.write(data.replace(os.fsencode(job['output']), os.fsencode(outdir)))
+            if not result.returncode:
+                install_outputs(work / 'result.tar', job, outdir, outputs, work)
+            return result.returncode
+    except LocalOnly as error:
+        if os.environ.get('DISTCC_VERBOSE') == '1':
+            print('distcc-rust: local: ' + str(error), file=sys.stderr)
+    except (OSError, ValueError, subprocess.CalledProcessError, tarfile.TarError) as error:
+        print('distcc-rust: ' + str(error), file=sys.stderr)
+        if os.environ.get('DISTCC_FALLBACK') == '0':
+            return 100
+    os.execvp(compiler, [compiler, *args])
+
+
+def main():
+    if len(sys.argv) == 4 and sys.argv[1] == '--worker':
+        try:
+            return worker(sys.argv[2], sys.argv[3])
+        except (LocalOnly, OSError, ValueError, KeyError) as error:
+            print('distcc-rust: worker: ' + str(error), file=sys.stderr)
+            return 100
+    if len(sys.argv) < 2:
+        print('usage: distcc-rust RUSTC [arguments] (or RUSTC_WRAPPER=distcc-rust cargo build)', file=sys.stderr)
+        return 1
+    return client(sys.argv[1], sys.argv[2:])
+
+
+if __name__ == '__main__':
+    sys.exit(main())

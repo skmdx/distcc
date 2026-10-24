@@ -42,6 +42,16 @@ distcc_compiler_is_distributed() {
 
 distcc_configure_jobs() {
     local jobs variable marker compiler distributed
+    # Cargo uses an explicit compiler wrapper, not the C/C++ masquerade PATH.
+    # Preserve user/package wrappers and clear only our saved-phase value when
+    # a package restricts distribution.
+    if [[ ${distcc_auto_RUSTC_WRAPPER} && ${RUSTC_WRAPPER} == "${distcc_auto_RUSTC_WRAPPER}" ]]; then
+        unset RUSTC_WRAPPER distcc_auto_RUSTC_WRAPPER
+    fi
+    if has distcc ${FEATURES} && ! has distcc ${RESTRICT} && [[ ! ${RUSTC_WRAPPER+x} ]]; then
+        export RUSTC_WRAPPER=distcc
+        distcc_auto_RUSTC_WRAPPER=${RUSTC_WRAPPER}
+    fi
     # Portage saves the phase environment. Refresh only values we generated;
     # package.env and ebuild overrides remain authoritative. Portage removes
     # DISTCC_* when saving phases, so keep provenance outside that namespace.

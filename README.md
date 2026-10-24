@@ -1,4 +1,4 @@
-# distcc -- a free distributed C/C++ compiler system
+# distcc -- a free distributed C/C++ and Rust compiler system
 
 by Martin Pool
 
@@ -26,6 +26,37 @@ is that they be running the distccd daemon, and that they have an
 appropriate compiler installed.
 Clang retains macros until remote compilation to preserve diagnostics;
 see README.pump for preprocessing behavior and toolchain requirements.
+
+Rust builds use Cargo's compiler wrapper interface:
+
+```
+RUSTC_WRAPPER=distcc cargo build --release
+distcc rustc --crate-type=rlib library.rs
+```
+
+Rust requires the local `DISTCC_BROKER` socket and workers configured with
+`,tcp`. Install the same Rust compiler build on each worker (version, commit,
+and LLVM version must match), plus Python xxhash and bubblewrap. Linux workers
+must permit unprivileged user namespaces. The client supplies its target
+standard library, so workers can compile for another architecture with the
+matching Rust compiler. Rust does not need an include server.
+
+Distribution operates on library crates and explicit metadata/object emissions.
+The real client rustc discovers modules, included data, and observed environment
+variables. Input snapshots and dependency crates use the existing LZ4 TCP
+transport and content cache. Large inputs use bounded cache chunks. The worker
+compiles in a private namespace with original client paths and returns all
+artifacts, including Cargo metadata and dependency files. Local incremental
+state is not sent or updated by remote jobs.
+
+Final executable/native links, build scripts, procedural macro crates and their
+consumers, dynamic Rust dependencies, `target-cpu=native`, custom targets,
+response files, and unsupported compiler options run locally. Local linking
+preserves access to native system libraries. Transport or toolchain failures
+retry locally unless `DISTCC_FALLBACK=0`; ordinary compiler errors keep their
+exit status and diagnostics. `DISTCC_VERBOSE=1` reports the selected worker or
+the reason for local execution. The Gentoo jobs hook enables the Cargo wrapper
+when `FEATURES=distcc`, respecting package restrictions and existing wrappers.
 
 The distcc "pump" functionality, added in distcc 3.0, improves on
 distcc by distributing not only compilation but also preprocessing to

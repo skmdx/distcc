@@ -130,7 +130,7 @@ unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
 {
     struct metadata m = {0};
     unsigned argc = 0, i;
-    if (!job || job->kind > DCC_JOB_LINK || job->count > DCC_JOB_INPUT_MAX ||
+    if (!job || job->kind > DCC_JOB_RUST || job->count > DCC_JOB_INPUT_MAX ||
         (job->count && !job->inputs) || !job->argv || !job->cwd) return NULL;
     while (job->argv[argc]) if (++argc > DCC_JOB_INPUT_MAX) return NULL;
     number(&m, job->kind);
@@ -170,7 +170,7 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
     kind = get_number(&m);
     argc = get_number(&m);
     count = get_number(&m);
-    if (m.error || kind > DCC_JOB_LINK || !argc || argc > DCC_JOB_INPUT_MAX ||
+    if (m.error || kind > DCC_JOB_RUST || !argc || argc > DCC_JOB_INPUT_MAX ||
         count > DCC_JOB_INPUT_MAX || !(job = calloc(1, sizeof(*job)))) goto failed;
     job->kind = kind;
     if (!(job->argv = calloc(argc + 1, sizeof(*job->argv))) ||

@@ -218,7 +218,7 @@ int dcc_execute_job(struct dcc_job *job, const char *root, int cancel_fd,
     enum dcc_protover version;
     int ret;
     dcc_job_result_init(result);
-    if (job->kind == DCC_JOB_LINK) version = DCC_VER_LINK;
+    if (job->kind == DCC_JOB_LINK || job->kind == DCC_JOB_RUST) version = DCC_VER_LINK;
     else dcc_get_protover_from_features(DCC_COMPRESS_LZ4_STREAM,
             job->kind == DCC_JOB_PUMP ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT, &version);
     dcc_job_summary_clear();
@@ -916,10 +916,10 @@ static int retain_artifact(struct dcc_job_result *result, unsigned index, const 
 }
 
 /* Protocol 4 delegates only object linking to the sysroot-aware helper. */
-static int dcc_run_link_job(int in_fd, int out_fd,
+static int dcc_run_helper_job(int in_fd, int out_fd,
                             const char *out_fname, const char *err_fname, int *status,
                             enum dcc_protover protover, const char *input_archive,
-                            struct dcc_job_result *result)
+                            struct dcc_job_result *result, int rust)
 {
     char *archive = NULL, *output = NULL;
     char *argv[5];
@@ -927,7 +927,7 @@ static int dcc_run_link_job(int in_fd, int out_fd,
     pid_t pid;
     int ret;
     enum dcc_compress compr = protover == DCC_VER_STREAM_LINK ? DCC_COMPRESS_LZ4_STREAM : DCC_COMPRESS_NONE;
-    if (!getenv("DISTCCD_LINK_ROOT")) {
+    if (!rust && !getenv("DISTCCD_LINK_ROOT")) {
         rs_log_error("remote linking requires DISTCCD_LINK_ROOT");
         return EXIT_PROTOCOL_ERROR;
     }
@@ -938,7 +938,7 @@ static int dcc_run_link_job(int in_fd, int out_fd,
         goto done;
     if ((ret = dcc_make_tmpnam("distcc-link", ".out", &output)))
         goto done;
-    argv[0] = (char *)"distcc-link";
+    argv[0] = (char *)(rust ? "distcc-rust" : "distcc-link");
     argv[1] = (char *)"--worker";
     argv[2] = archive;
     argv[3] = output;
@@ -1062,20 +1062,25 @@ static int dcc_run_job(int in_fd,
     if (!job) tcp_cork_sock(out_fd, 1);
 
     if (protover == DCC_VER_LINK || protover == DCC_VER_STREAM_LINK) {
+        int rust = job && job->kind == DCC_JOB_RUST;
         argv = calloc(2, sizeof(*argv));
-        orig_input = strdup("link");
-        if (!argv || !(argv[0] = strdup("distcc-link")) || !orig_input) {
+        orig_input = strdup(rust ? "rust" : "link");
+        if (!argv || !(argv[0] = strdup(rust ? "distcc-rust" : "distcc-link")) || !orig_input) {
             ret = EXIT_OUT_OF_MEMORY;
             goto out_cleanup;
         }
         char *input_archive = NULL;
-        if (job && (job->count != 1 ||
+        if (rust && !(input_archive = strdup(root))) {
+            ret = EXIT_OUT_OF_MEMORY;
+            goto out_cleanup;
+        }
+        if (job && !rust && (job->count != 1 ||
             asprintf(&input_archive, "%s%s", root, job->inputs[0].path) < 0)) {
             ret = EXIT_PROTOCOL_ERROR;
             goto out_cleanup;
         }
-        ret = dcc_run_link_job(in_fd, out_fd, out_fname, err_fname, &status,
-                              protover, input_archive, result);
+        ret = dcc_run_helper_job(in_fd, out_fd, out_fname, err_fname, &status,
+                              protover, input_archive, result, rust);
         free(input_archive);
         job_result = ret || status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
         goto out_cleanup;

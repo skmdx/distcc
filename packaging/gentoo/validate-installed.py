@@ -61,6 +61,9 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         compilers.append(compiler)
     env['PATH'] = ':'.join(dict.fromkeys(['/usr/lib/distcc',
                                         *(str(Path(p).parent) for p in compilers), '/bin']))
+    if '--rust-only' in sys.argv:
+        assert ',tcp' in env['DISTCC_HOSTS'], 'Rust validation requires the TCP job protocol'
+        compilers = []
     for compiler_path in dict.fromkeys(compilers):
         compiler = Path(compiler_path).name
         suffix, include = ('cc', 'cstdint') if '++' in compiler else ('c', 'stdint.h')
@@ -132,9 +135,32 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             results[compiler] = hashes['remote']
         if pp_hashes:
             results[compiler] = {'object': results[compiler], 'preprocessed': pp_hashes}
-    log = (root/'client.log').read_text()
-    assert 'gave up' not in log
-    marker = ('pooled TCP job completed' if ',tcp' in env['DISTCC_HOSTS'] else
-              'client finished sending request to server')
-    assert log.count(marker) >= len(set(compilers)), log[-6000:]
+    if compilers:
+        log = (root/'client.log').read_text()
+        assert 'gave up' not in log
+        marker = ('pooled TCP job completed' if ',tcp' in env['DISTCC_HOSTS'] else
+                  'client finished sending request to server')
+        assert log.count(marker) >= len(set(compilers)), log[-6000:]
+    # The Rust wrapper shares this broker and must really reach the TCP worker.
+    # Legacy C/C++ validation also runs; Rust is exercised on the TCP pass.
+    if ',tcp' in env['DISTCC_HOSTS']:
+        source = root / 'rust_library.rs'
+        included = root / 'rust_value.rs'
+        included.write_text('pub const VALUE: u32 = 42;')
+        source.write_text('include!(concat!(env!("DISTCC_RUST_INPUT"), "/rust_value.rs"));\n'
+                          'pub fn value() -> u32 { VALUE }\n')
+        rust_env = dict(env, DISTCC_RUST_INPUT=str(root))
+        library = root / 'librust_test.rlib'
+        rust = subprocess.run(['distcc', 'rustc', '--crate-name=rust_test', '--crate-type=rlib',
+                               '--emit=link,dep-info', str(source), '-o', str(library)],
+                              env=rust_env, text=True, capture_output=True, timeout=180)
+        assert rust.returncode == 0, rust.stdout + rust.stderr
+        assert 'distcc-rust: compiled on ' in rust.stderr, rust.stderr
+        source.write_text('fn main() { assert_eq!(rust_test::value(), 42); }')
+        executable = root / 'rust-run'
+        subprocess.run(['rustc', str(source), '--extern', 'rust_test=' + str(library),
+                        '-o', str(executable)], env=rust_env, check=True, capture_output=True, timeout=90)
+        subprocess.run([executable], check=True, timeout=10)
+        results['rustc'] = {'version': subprocess.check_output(['rustc', '-V'], text=True).strip(),
+                           'distributed': True, 'executed': True}
     print(json.dumps({'compilers': results, 'wrapper': str(wrapper.resolve()), 'fallback': False}))

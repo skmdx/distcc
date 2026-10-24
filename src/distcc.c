@@ -53,6 +53,7 @@
 #include "bulk.h"
 #include "implicit.h"
 #include "compile.h"
+#include "job.h"
 #include "emaillog.h"
 
 
@@ -254,6 +255,21 @@ int main(int argc, char **argv)
     /* Ignore SIGPIPE; we consistently check error codes and will
      * see the EPIPE. */
     dcc_ignore_sigpipe(1);
+
+    /* Private transport entry point used by the Rust input planner. */
+    if (argc == 5 && !strcmp(argv[1], "--rust-job"))
+        dcc_exit(dcc_rust_transfer(argv[2], argv[3], argv[4]));
+
+    if (argc > 1 && (!strcmp(dcc_find_basename(argv[1]), "rustc") ||
+                    !strncmp(dcc_find_basename(argv[1]), "rustc-", 6))) {
+        char **args = calloc(argc + 1, sizeof(*args));
+        if (!args) dcc_exit(EXIT_OUT_OF_MEMORY);
+        args[0] = "distcc-rust";
+        for (int i = 1; i < argc; ++i) args[i] = argv[i];
+        execvp(args[0], args);
+        rs_log_error("cannot execute distcc-rust: %s", strerror(errno));
+        dcc_exit(EXIT_COMPILER_MISSING);
+    }
 
     sg_level = dcc_recursion_safeguard();
 

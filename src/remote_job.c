@@ -21,6 +21,7 @@
 #include "include_server_if.h"
 #include "exitcode.h"
 #include "trace.h"
+#include "workload.h"
 
 /* Cache hashes are optional. Recover the expansion size from chunk headers
  * when their sidecar has disappeared, without decompressing the snapshot. */
@@ -218,4 +219,57 @@ done:
     dcc_job_result_free(&result);
     if (!prepared) dcc_job_free(job);
     return transport_complete && ret ? DCC_REMOTE_LOCAL_ERROR : ret;
+}
+
+/* The Rust planner owns immutable numbered snapshots. Scheduling, caching,
+ * compression, cancellation and connection reuse stay on the ordinary path. */
+int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *output)
+{
+    struct dcc_job *job = NULL;
+    struct dcc_hostdef *host = NULL;
+    struct dcc_job_result result;
+    struct dcc_work_hint hint = {0};
+    char **files = NULL;
+    int lease = -1, ret = EXIT_IO_ERROR;
+    int fd = open(metadata, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    dcc_job_result_init(&result);
+    if (fd < 0) goto done;
+    ret = dcc_job_decode(fd, &job);
+    close(fd);
+    if (ret || job->kind != DCC_JOB_RUST || !job->count) { ret = EXIT_PROTOCOL_ERROR; goto done; }
+    files = calloc(job->count + 1, sizeof(*files));
+    if (!files) { ret = EXIT_OUT_OF_MEMORY; goto done; }
+    for (unsigned i = 0; i < job->count; ++i) {
+        if (asprintf(&files[i], "%s/%u", snapshots, i) < 0) {
+            files[i] = NULL; ret = EXIT_OUT_OF_MEMORY; goto done;
+        }
+    }
+    if ((ret = dcc_broker_acquire(&host, &lease, 1, &hint))) goto done;
+    if (!host->tcp_jobs) { ret = EXIT_PROTOCOL_ERROR; goto done; }
+    dcc_broker_cpp_done(host);
+    if ((ret = dcc_tcp_exchange(host, job, files, NULL, output, NULL, &result))) {
+        dcc_broker_failed(host);
+        goto done;
+    }
+    dcc_broker_return(host, host->broker_fd, &result);
+    for (unsigned i = DCC_JOB_STDERR; i <= DCC_JOB_STDOUT; ++i) {
+        struct dcc_buffer buffer = {0};
+        if ((ret = buffer_result(result.fd[i], &result, i, &buffer))) goto done;
+        ret = dcc_writex(i == DCC_JOB_STDERR ? STDERR_FILENO : STDOUT_FILENO,
+                        buffer.data, buffer.size);
+        dcc_free_buffer(&buffer);
+        if (ret) goto done;
+    }
+    if (!result.status && (ret = publish(&result.fd[DCC_JOB_OBJECT], &result,
+                                         DCC_JOB_OBJECT, output))) goto done;
+    ret = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
+    if (!ret && getenv("DISTCC_VERBOSE") && !strcmp(getenv("DISTCC_VERBOSE"), "1"))
+        fprintf(stderr, "distcc-rust: compiled on %s\n", host->hostname);
+done:
+    dcc_job_result_free(&result);
+    if (host) dcc_free_hostdef(host);
+    if (lease >= 0) close(lease);
+    if (files) { for (unsigned i = 0; job && i < job->count; ++i) free(files[i]); free(files); }
+    dcc_job_free(job);
+    return ret < 0 ? EXIT_PROTOCOL_ERROR : ret;
 }

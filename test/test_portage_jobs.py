@@ -9,6 +9,22 @@ import unittest
 
 
 class PortageJobsTest(unittest.TestCase):
+    def test_rust_wrapper_respects_package_policy_and_user_override(self):
+        self.assertEqual(self.run_hook('''
+unset RUSTC_WRAPPER distcc_auto_RUSTC_WRAPPER
+source "$JOBS_HOOK"
+echo "$RUSTC_WRAPPER"
+RESTRICT=distcc
+source "$JOBS_HOOK"
+echo "${RUSTC_WRAPPER-unset}"
+RESTRICT= RUSTC_WRAPPER=custom-wrapper
+source "$JOBS_HOOK"
+echo "$RUSTC_WRAPPER"
+RUSTC_WRAPPER=
+source "$JOBS_HOOK"
+echo "value:${RUSTC_WRAPPER}"
+'''), ['distcc', 'unset', 'custom-wrapper', 'value:'])
+
     def test_portage_saved_phase_environment(self):
         helpers = list(Path('/usr/lib/portage').glob('*/save-ebuild-env.sh'))
         if not helpers:

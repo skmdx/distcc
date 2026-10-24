@@ -49,7 +49,7 @@ def release(overlay):
                 '.' if tree == ROOT else 'sys-devel/distcc']):
             raise RuntimeError(f'uncommitted deployment inputs: {tree}')
     run(['git', '-C', ROOT, 'diff', '--exit-code', match[1], '--', 'src', 'include_server',
-         'configure.ac', 'Makefile.in', 'pump.in', 'distcc-link', 'distcc-clang',
+         'configure.ac', 'Makefile.in', 'pump.in', 'distcc-link', 'distcc-clang', 'distcc-rust',
          'packaging/systemd', 'packaging/gentoo/*.bashrc'])
     return version, ebuild
 
@@ -231,7 +231,7 @@ def validate(target, work):
             bounded(args, target, 'check', log)
     run(['sudo', '-n', 'rm', '--', remote + '/validate-installed.py'], target)
     run(['sudo', '-n', 'rmdir', remote], target)
-    print(f"{target['name']}: C/C++ remote compilation and execution passed", flush=True)
+    print(f"{target['name']}: C/C++ and Rust remote compilation and execution passed", flush=True)
 
 
 def main():
