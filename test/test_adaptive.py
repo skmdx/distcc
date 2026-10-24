@@ -124,7 +124,7 @@ class DistccTestCase(unittest.TestCase):
                 (wrappers / name).symlink_to(compiler_path)
         target = subprocess.check_output([cls.cc, "-dumpmachine"], text=True).strip()
         (wrappers / (target + "-gcc")).symlink_to("gcc")
-        for i in range(2):
+        for i in range(getattr(cls, 'worker_count', 2)):
             port, stats = free_port(), free_port()
             log = open(cls.root / f"daemon-{i}.log", "w+")
             cls.logs.append(log)

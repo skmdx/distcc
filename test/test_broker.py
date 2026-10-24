@@ -113,6 +113,28 @@ class BrokerTestCase(DistccTestCase):
         subprocess.run([str(exe)], check=True, timeout=5)
         return obj.read_bytes()
 
+class BrokerPlacementTest(BrokerTestCase):
+    worker_count = 3
+
+    def test_rejected_wait_preserves_available_throughput_ranking(self):
+        peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                    running=26, busy=14, queued=0, preparing=0, returning=0)),
+                 self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                    running=2, busy=2, queued=0, preparing=0, returning=0)),
+                 self.peer(stats_response(cpus=8, cores=4, jobs=8, capacity=8,
+                    running=8, busy=8, queued=0, preparing=0, returning=0))]
+        speeds = (1, .49, .56)
+        slots = (16, 4, 8)
+        hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={speeds[i]}',
+                                  slots=slots[i]) for i, p in enumerate(peers))
+        self.start_broker(hosts)
+        # The busy third worker has an attractive queued latency, but waiting
+        # loses to available work. Keep the available workers' throughput
+        # ranking rather than crowding the fastest, CPU-saturated worker.
+        _, net = self.acquire_reserved(10, (1500, 4 * 1024 * 1024, 2))
+        self.assertEqual(net.getpeername()[1], self.ports[1])
+
+
 class BrokerTest(BrokerTestCase):
     def test_wait_cannot_outscore_faster_available_execution(self):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,

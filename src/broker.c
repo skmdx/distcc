@@ -809,6 +809,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         struct prediction forecast;
     } best = {.peer = -1}, ready = {.peer = -1};
     double cost = dcc_work_predict(&broker->model, &client->hint);
+    double ready_finish = 0;
     int link = client->command == ACQUIRE_LINK;
     int local_cpp = !link && client->command != ACQUIRE_CPP && client->command != ACQUIRE_READY;
     int recent[MAX_HOSTS] = {0}, recent_links[MAX_HOSTS] = {0};
@@ -952,15 +953,21 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             struct selection candidate = {i, probe, wait, idle, score, fill, forecast};
             if (best.peer < 0 || idle > best.idle || (idle == best.idle &&
                 (score < best.score || (score == best.score && fill < best.fill)))) best = candidate;
-            if (predicted && !wait &&
-                (ready.peer < 0 || forecast.finish < ready.forecast.finish)) ready = candidate;
+            if (predicted && !wait) {
+                if (ready.peer < 0 || forecast.finish < ready_finish)
+                    ready_finish = forecast.finish;
+                if (ready.peer < 0 || score < ready.score ||
+                    (score == ready.score && fill < ready.fill)) ready = candidate;
+            }
         }
     }
     /* Throughput displacement ranks immediate placements, but is not elapsed
      * time. Waiting must actually finish sooner than an available placement;
      * comparing a queued latency with an immediate throughput penalty can
-     * otherwise strand idle CPUs for an entire running job. */
-    if (best.wait && ready.peer >= 0 && best.forecast.finish >= ready.forecast.finish)
+     * otherwise strand idle CPUs for an entire running job. Once waiting is
+     * rejected, preserve throughput ranking among the available workers;
+     * choosing their lowest latency again would discard the contention cost. */
+    if (best.wait && ready.peer >= 0 && best.forecast.finish >= ready_finish)
         best = ready;
     if (client->command == JOBS || !available) {
         if (!available && client->command != JOBS) {

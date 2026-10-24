@@ -277,7 +277,10 @@ source size does not describe its include tree. Fast samples are included and
 sub-chunk inputs do not train bandwidth, preventing a delayed small request
 from dominating later estimates. Uploads are deferred while predicted CPU wait
 exceeds preparation time by more than 20ms, retaining work at the broker so it
-can choose another host. Completion notifications and bounded timed wakes
+can choose another host. Waiting must finish sooner than every immediately
+available placement. Otherwise, available workers retain their throughput
+ranking, including the CPU work displaced by another compiler.
+Completion notifications and bounded timed wakes
 reconsider waiting jobs. Each pass prioritizes larger estimated jobs, which pay
 the greatest execution penalty on slower hosts. Jobs waiting at least one second
 take precedence by arrival time. A dispatch pass accounts for earlier waiting jobs
