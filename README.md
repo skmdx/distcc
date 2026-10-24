@@ -35,11 +35,13 @@ distcc rustc --crate-type=rlib library.rs
 ```
 
 Rust requires the local `DISTCC_BROKER` socket and workers configured with
-`,tcp`. Install the same Rust compiler build on each worker (version, commit,
-and LLVM version must match), plus Python xxhash and bubblewrap. Linux workers
+`,tcp`, plus worker Rust, Python xxhash and bubblewrap. Workers prefer a matching
+Rust build but do not reject differing version, commit or LLVM metadata.
+Compatibility is determined by rustc accepting the inputs and the client
+successfully linking the artifacts. Linux workers
 must permit unprivileged user namespaces. The client supplies its target
 standard library, so workers can compile for another architecture with the
-matching Rust compiler. Rust does not need an include server.
+compatible Rust compiler. Rust does not need an include server.
 
 Distribution operates on library crates and explicit metadata/object emissions.
 The real client rustc discovers modules, included data, and observed environment
@@ -53,10 +55,14 @@ Final executable/native links, build scripts, procedural macro crates and their
 consumers, dynamic Rust dependencies, `target-cpu=native`, custom targets,
 response files, and unsupported compiler options run locally. Local linking
 preserves access to native system libraries. Transport or toolchain failures
-retry locally unless `DISTCC_FALLBACK=0`; ordinary compiler errors keep their
-exit status and diagnostics. `DISTCC_VERBOSE=1` reports the selected worker or
+retry locally unless `DISTCC_FALLBACK=0`. Failed remote compilations also retry
+locally unless `DISTCC_SKIP_LOCAL_RETRY=1`, so an incompatible worker does not
+block a toolchain update. `DISTCC_VERBOSE=1` reports the selected worker or
 the reason for local execution. The Gentoo jobs hook enables the Cargo wrapper
 when `FEATURES=distcc`, respecting package restrictions and existing wrappers.
+Gentoo's Rust eclass selects its compiler independently of `eselect` and prefers
+source-built Rust. A fleet using `rust-bin` can select that package type with
+`ERUST_TYPE_OVERRIDE=binary` in `package.env`, without pinning a Rust version.
 
 The distcc "pump" functionality, added in distcc 3.0, improves on
 distcc by distributing not only compilation but also preprocessing to
@@ -300,7 +306,7 @@ configured target before upgrading the remaining targets in parallel. Each targe
 gets service settings and native versus remote C/C++ compilation, preprocessing
 and execution checks. After rollout, every client compiles a Rust library on
 every worker, links it locally and executes the result with fallback disabled.
-Rust checks require matching rustc builds and worker addresses reachable from
+Rust checks require compatible toolchains and worker addresses reachable from
 all clients in `server_hosts`. Source archives are fetched and verified locally,
 then synchronized to targets; remote internet access is not required. Source
 builds use distcc. Cgroup resource limits are optional explicit configuration;

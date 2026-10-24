@@ -67,10 +67,15 @@ class RustTest(BrokerTestCase):
         source, output = self.work / 'bad.rs', self.work / 'libbad.rlib'
         source.write_text('pub fn bad() -> u32 { "not a number" }')
         output.write_bytes(b'previous artifact')
-        result = self.rust('--crate-type=rlib', source, '-o', output)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('mismatched types', result.stderr)
-        self.assertEqual(output.read_bytes(), b'previous artifact')
+        for fallback in ('0', '1'):
+            with self.subTest(fallback=fallback):
+                env = dict(self.env, DISTCC_FALLBACK=fallback, DISTCC_SKIP_LOCAL_RETRY='0')
+                result = self.rust('--crate-type=rlib', source, '-o', output, env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('mismatched types', result.stderr)
+                self.assertEqual('worker compilation failed; retrying locally' in result.stderr,
+                                 fallback == '1')
+                self.assertEqual(output.read_bytes(), b'previous artifact')
 
     def test_client_working_directory_is_filesystem_root(self):
         source = self.work / 'root_cwd.rs'
@@ -222,21 +227,28 @@ class RustTest(BrokerTestCase):
         with self.assertRaises(helper['LocalOnly']):
             helper['metadata'](job, inputs, self.work)
 
-    def test_worker_rejects_wrong_compiler_without_output(self):
+    def test_worker_accepts_different_build_metadata_when_artifact_links(self):
         helper = runpy.run_path(str(self.build / 'distcc-rust'))
         source = self.work / 'version.rs'
         source.write_text('pub fn answer() -> u32 { 1 }')
-        job, inputs, _, _ = helper['plan'](self.rustc, ['--crate-type=rlib', str(source)], self.work)
-        job['compiler']['commit'] = 'wrong-build'
+        output = self.work / 'libversion.rlib'
+        job, inputs, outdir, outputs = helper['plan'](self.rustc,
+            ['--crate-name=version', '--crate-type=rlib', str(source), '-o', str(output)], self.work)
+        job['compiler'] = dict(version='rustc 0.0.0 (different build)', commit='different', llvm='0.0.0')
         metadata, snapshots = helper['metadata'](job, inputs, self.work)
         artifact = self.work / 'result.tar'
-        artifact.write_bytes(b'old result')
         result = subprocess.run([str(self.build / 'distcc'), '--rust-job', str(metadata),
                                  str(snapshots), str(artifact)], env=self.env,
                                 capture_output=True, text=True, timeout=90)
-        self.assertEqual(result.returncode, 100, result.stderr)
-        self.assertIn('no worker compiler matches', result.stderr)
-        self.assertEqual(artifact.read_bytes(), b'old result')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        helper['install_outputs'](artifact, job, outdir, outputs, self.work)
+        main = self.work / 'main.rs'
+        main.write_text('fn main() { assert_eq!(version::answer(), 1); }')
+        executable = self.work / 'linked'
+        result = self.rust(main, '--extern', 'version=' + str(output), '-o', executable, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([executable], check=True)
 
 
 if __name__ == '__main__':

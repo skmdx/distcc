@@ -320,20 +320,27 @@ def worker(root, archive):
                 with path.open('rb') as source:
                     shutil.copyfileobj(source, output, 256 * 1024)
                 path.unlink()
-    # Select only administrator-installed compilers, never an executable path
-    # supplied by a remote client. Exact compiler build identity is mandatory.
+    # Prefer the client's build, but let rustc and the eventual client link
+    # decide compatibility. Version/LLVM differences are not rejection gates.
+    # Executables still come from administrator-installed toolchains.
     candidates = [shutil.which('rustc')]
     candidates += glob.glob('/usr/lib/rust/*/bin/rustc') + glob.glob('/opt/rust-bin-*/bin/rustc')
-    compiler = None
-    for candidate in dict.fromkeys(filter(None, candidates)):
+    compiler, best = None, ()
+    requested = job['compiler']
+    for candidate in dict.fromkeys(Path(p).resolve() for p in candidates if p):
         try:
-            if identity(candidate)[0] == job['compiler']:
-                compiler = Path(candidate).resolve()
+            actual = identity(candidate)[0]
+            score = (actual == requested, actual['commit'] == requested['commit'],
+                     actual['version'].split()[1] == requested['version'].split()[1],
+                     actual['llvm'] == requested['llvm'])
+            if score > best:
+                compiler, best = candidate, score
+            if actual == requested:
                 break
         except (OSError, subprocess.CalledProcessError):
             continue
     if compiler is None:
-        raise LocalOnly('no worker compiler matches the client Rust build')
+        raise LocalOnly('no worker Rust compiler is installed')
     # Revalidate the action on the server: the only executable is our installed
     # compiler. Proc-macros, linker plugins and custom codegen backends may not
     # turn the compiler service into a command runner.
@@ -434,6 +441,9 @@ def client(compiler, args):
             result = subprocess.run([transport, '--rust-job', str(description), str(snapshots),
                                      str(work / 'result.tar')], env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if (result.returncode and os.environ.get('DISTCC_FALLBACK') != '0'
+                    and os.environ.get('DISTCC_SKIP_LOCAL_RETRY') != '1'):
+                raise LocalOnly('worker compilation failed; retrying locally')
             if result.returncode >= 100 or result.returncode < 0:
                 raise OSError(result.stderr.decode(errors='replace').strip() or 'Rust worker failed')
             for data, stream in ((result.stdout, sys.stdout.buffer), (result.stderr, sys.stderr.buffer)):
