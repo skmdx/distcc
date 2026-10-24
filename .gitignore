@@ -30,6 +30,7 @@ __pycache__/
 /h_*
 /cpp_lookup.so
 /distcc-rust-native.so
+/clang_driver.so
 
 # `make dist` products
 distcc-*.tar.*

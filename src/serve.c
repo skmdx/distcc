@@ -1151,7 +1151,7 @@ static int dcc_run_job(int in_fd,
         tweaked_argv = NULL;
     } else {
         if (job) {
-            if (job->count != 1 || asprintf(&temp_i, "%s%s", root, job->inputs[0].path) < 0) {
+            if (!job->count || asprintf(&temp_i, "%s%s", root, job->inputs[0].path) < 0) {
                 ret = EXIT_PROTOCOL_ERROR;
                 goto out_cleanup;
             }
@@ -1229,23 +1229,27 @@ static int dcc_run_job(int in_fd,
      * __has_include probes. The frontend also preserves source identity for
      * LLVM IR PGO names, which prefix-map options do not affect. */
     if (strstr(dcc_find_basename(argv[0]), "clang")) {
-        int frontend = cpp_where == DCC_CPP_ON_SERVER, argc = dcc_argv_len(argv);
+        int frontend = cpp_where == DCC_CPP_ON_SERVER || (job && job->count > 1);
+        int argc = dcc_argv_len(argv);
         for (i = 1; i < argc; ++i)
             if (!strcmp(argv[i], "-fprofile-generate") ||
                 !strncmp(argv[i], "-fprofile-generate=", 19)) frontend = 1;
         if (frontend) {
             const char *helper = getenv("DISTCC_CLANG_DRIVER");
-            char **wrapped = calloc(argc + 4, sizeof(char *));
+            char **wrapped = calloc(argc + 6, sizeof(char *));
             if (!wrapped) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
             wrapped[0] = strdup(helper && *helper ? helper : "distcc-clang");
-            wrapped[1] = strdup(cpp_where == DCC_CPP_ON_SERVER ? temp_dir : "");
+            wrapped[1] = strdup(job ? root : cpp_where == DCC_CPP_ON_SERVER ? temp_dir : "");
             wrapped[2] = strdup(orig_input);
-            if (!wrapped[0] || !wrapped[1] || !wrapped[2]) {
-                free(wrapped[0]); free(wrapped[1]); free(wrapped[2]); free(wrapped);
+            wrapped[3] = strdup(job ? job->cwd : client_cwd ? client_cwd : "");
+            wrapped[4] = strdup(cpp_where == DCC_CPP_ON_SERVER ? "pump" : "preprocessed");
+            if (!wrapped[0] || !wrapped[1] || !wrapped[2] || !wrapped[3] || !wrapped[4]) {
+                for (int k = 0; k < 5; ++k) free(wrapped[k]);
+                free(wrapped);
                 ret = EXIT_OUT_OF_MEMORY;
                 goto out_cleanup;
             }
-            memcpy(wrapped + 3, argv, (argc + 1) * sizeof(char *));
+            memcpy(wrapped + 5, argv, (argc + 1) * sizeof(char *));
             free(argv);
             argv = wrapped;
         }

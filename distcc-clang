@@ -7,11 +7,11 @@ from include_server import clang_scan
 
 
 def main():
-    root, original, *command = sys.argv[1:]
+    root, original, cwd, mode, *command = sys.argv[1:]
     # LibTooling locates resources relative to argv[0], without PATH lookup.
     # Preserve the driver name: resolving symlinks would lose target and mode.
     command[0] = shutil.which(command[0]) or command[0]
-    return clang_scan.compile(command, original, root)
+    return clang_scan.compile(command, original, root, cwd, mode == 'pump')
 
 
 if __name__ == '__main__':

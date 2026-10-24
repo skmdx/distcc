@@ -227,6 +227,28 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         subprocess.run([executable], check=True)
 
+    def test_profile_use_is_transferred_and_linkable(self):
+        profdata = shutil.which('llvm-profdata')
+        if not profdata:
+            self.skipTest('llvm-profdata required')
+        source = self.work / 'pgo.rs'
+        source.write_text('pub fn answer() -> u32 { 42 }\nfn main() { assert_eq!(answer(), 42); }')
+        result = self.rust(source, '-Cprofile-generate', '-o', self.work / 'training', remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([self.work / 'training'], check=True,
+                       env=dict(self.env, LLVM_PROFILE_FILE=str(self.work / 'training.profraw')))
+        subprocess.run([profdata, 'merge', str(self.work / 'training.profraw'),
+                        '-o', str(self.work / 'training.profdata')], check=True, capture_output=True)
+        library = self.work / 'libpgo.rlib'
+        result = self.rust('--crate-type=rlib', source, '-Cprofile-use=training.profdata', '-o', library)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        main = self.work / 'main.rs'
+        main.write_text('fn main() { assert_eq!(pgo::answer(), 42); }')
+        result = self.rust(main, '--extern', 'pgo=' + str(library), '-o', self.work / 'check', remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([self.work / 'check'], check=True)
+
     def test_new_options_outputs_and_unrelated_proc_macro_allow_distribution(self):
         macro = self.work / 'macro.rs'
         macro.write_text('extern crate proc_macro;')

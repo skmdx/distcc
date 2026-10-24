@@ -80,6 +80,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <assert.h>
+#include <dlfcn.h>
 
 #include <sys/stat.h>
 
@@ -88,6 +89,31 @@
 #include "util.h"
 #include "exitcode.h"
 #include "snprintf.h"
+
+/* Consult the compiler only for commands whose non-source inputs need its
+ * semantics. Ordinary compilation keeps the lightweight client path. */
+int dcc_prepare_clang(char ***argv, char ***files)
+{
+    int needed = 0;
+    if (!strstr(dcc_find_basename((*argv)[0]), "clang")) return 0;
+    for (char **p = *argv + 1; *p; ++p)
+        if (str_endswith(".a", *p) ||
+            (str_startswith("-fprofile", *p) && !str_startswith("-fprofile-generate", *p)) ||
+            str_startswith("-fauto-profile", *p) ||
+            str_startswith("-fmemory-profile-use", *p)) needed = 1;
+    if (!needed) return 0;
+    const char *library = getenv("DISTCC_CLANG_LIBRARY");
+    void *handle = dlopen(library && *library ? library : LIBDIR "/distcc/clang_driver.so", RTLD_NOW | RTLD_LOCAL);
+    if (!handle) { rs_log_warning("cannot load Clang driver: %s", dlerror()); return EXIT_DISTCC_FAILED; }
+    int (*inputs)(char **, char ***, char ***) = dlsym(handle, "dcc_clang_inputs");
+    char **normalized = NULL;
+    int ret = inputs ? inputs(*argv, &normalized, files) : -1;
+    dlclose(handle);
+    if (ret) return EXIT_DISTCC_FAILED;
+    dcc_free_argv(*argv);
+    *argv = normalized;
+    return 0;
+}
 
 
 int dcc_argv_append(char **argv, char *toadd)
@@ -223,8 +249,9 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
 		       || ((!strcmp(a, "-fprofile-generate") ||
                             str_startswith("-fprofile-generate=", a)) &&
                            !strstr(dcc_find_basename(argv[0]), "clang"))
-		       || !strncmp(a, "-fprofile-use", 13)
-		       || !strncmp(a, "-fauto-profile", 14)
+		       || ((!strncmp(a, "-fprofile-use", 13) ||
+                            !strncmp(a, "-fauto-profile", 14)) &&
+                           !strstr(dcc_find_basename(argv[0]), "clang"))
 		       || !strcmp(a, "-fprofile-correction")) {
                 rs_log_info("compiler will emit/use profile info; must be local");
                 return EXIT_DISTCC_FAILED;

@@ -186,7 +186,7 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
         in->wire_size = get_number(&m);
         in->plain_size = get_number(&m);
         digest = take(&m, sizeof(in->digest));
-        if (m.error || type > DCC_JOB_EMPTY || encoding > DCC_JOB_LZ4 || cached > 1 ||
+        if (m.error || type > DCC_JOB_READONLY || encoding > DCC_JOB_LZ4 || cached > 1 ||
             in->wire_size > INT64_MAX || in->plain_size > INT64_MAX) goto failed;
         in->kind = type;
         in->encoding = encoding;
@@ -197,9 +197,9 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
         if (!absolute_path(in->path) || !strcmp(in->path, "/") ||
             in->path[strlen(in->path) - 1] == '/' || !in->target ||
             (in->kind != DCC_JOB_SYMLINK && *in->target) ||
-            (in->kind != DCC_JOB_FILE && (in->cached || in->wire_size || in->plain_size)) ||
+            (!dcc_job_file(in) && (in->cached || in->wire_size || in->plain_size)) ||
             (in->kind == DCC_JOB_SYMLINK && !*in->target) ||
-            (in->kind == DCC_JOB_FILE && in->encoding == DCC_JOB_RAW && in->wire_size != in->plain_size)) goto failed;
+            (dcc_job_file(in) && in->encoding == DCC_JOB_RAW && in->wire_size != in->plain_size)) goto failed;
     }
     if (m.error || m.offset != m.size) goto failed;
     *out = job;

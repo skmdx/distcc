@@ -10,6 +10,8 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/sendfile.h>
+#include <sys/mman.h>
+#include <xxhash.h>
 #include <arpa/inet.h>
 #include "distcc.h"
 #include "hosts.h"
@@ -182,7 +184,37 @@ static int publish(int *source, struct dcc_job_result *result, unsigned index, c
     *source = -1;
     return failed || rename(result->temporary[index], path) ? EXIT_IO_ERROR : 0;
 }
-int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char **argv, const char *cpp, int cpp_fd, char **files,
+/* Auxiliary files are read by code generation after preprocessing. Hold the
+ * opened generation through retries; the receiver verifies the content hash. */
+static int auxiliary_inputs(struct dcc_job *job, char **paths)
+{
+    for (char **p = paths; p && *p; ++p) {
+        unsigned i;
+        for (i = 0; i < job->count; ++i)
+            if (!strcmp(job->inputs[i].path, *p)) break;
+        if (i < job->count) continue;
+        if (job->count == DCC_JOB_INPUT_MAX) return -1;
+        void *allocation = realloc(job->inputs, (job->count + 1) * sizeof(*job->inputs));
+        if (!allocation) return -1;
+        job->inputs = allocation;
+        struct dcc_job_input *in = &job->inputs[job->count++];
+        *in = (struct dcc_job_input){ .kind = DCC_JOB_READONLY, .fd = -1 };
+        struct stat st;
+        in->path = strdup(*p);
+        in->fd = open(*p, O_RDONLY | O_CLOEXEC);
+        if (!in->path || in->fd < 0 || fstat(in->fd, &st) || !S_ISREG(st.st_mode)) return -1;
+        in->wire_size = in->plain_size = st.st_size;
+        void *data = st.st_size ? mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, in->fd, 0) : NULL;
+        if (data == MAP_FAILED) return -1;
+        XXH64_canonical_t hash;
+        XXH64_canonicalFromHash(&hash, XXH3_64bits(data, st.st_size));
+        if (st.st_size) munmap(data, st.st_size);
+        memcpy(in->digest, hash.digest, sizeof(in->digest));
+        in->cached = 1;
+    }
+    return 0;
+}
+int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char **argv, const char *cpp, int cpp_fd, char **files, char **auxiliary,
                        const char *output, const char *deps, struct dcc_buffer *err,
                        struct dcc_buffer *out, int *status)
 {
@@ -197,7 +229,8 @@ int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char 
         job->argv = NULL;
         if (dcc_copy_argv(argv, &job->argv, 0)) goto done;
     }
-    if (!job || (ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result))) goto done;
+    if (!job || auxiliary_inputs(job, auxiliary)) goto done;
+    if ((ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result))) goto done;
     need_cpp = files && WIFEXITED(result.status) && WEXITSTATUS(result.status) == EXIT_LOCAL_CPP;
     /* No compiler ran: do not train the scheduler on header verification. */
     if (need_cpp) result.execute_ns = 0;

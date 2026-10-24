@@ -51,6 +51,7 @@ transport and content cache. Large inputs use bounded cache chunks. The worker
 compiles in a private namespace with original client paths and returns all
 artifacts, including Cargo metadata and dependency files. Local incremental
 state is not sent or updated by remote jobs.
+Rust `-Cprofile-use` data is transferred with the other read-only inputs.
 
 `-C target-cpu=native` uses the client's CPU even on a different worker CPU or
 architecture. The installed `distcc-rust-native.so` records the client's actual

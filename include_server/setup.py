@@ -198,6 +198,7 @@ scanner = setuptools.Extension(
     name='include_server.clang_scan',
     sources=[os.path.join(srcdir_include_server, 'c_extensions', name)
              for name in ('clang_scan.cpp', 'clang_compile.cpp')],
+    depends=[os.path.join(srcdir, 'src', 'clang_inputs.h')],
     language='c++', include_dirs=[llvm_option('--includedir')],
     library_dirs=[llvm_lib], runtime_library_dirs=[llvm_runtime_lib],
     libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],

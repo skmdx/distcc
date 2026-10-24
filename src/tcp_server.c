@@ -281,9 +281,9 @@ struct tree_cleanup {
 static void prune_inputs(const struct dcc_job *job)
 {
     uint64_t seen = 0;
-    if (job && job->kind == DCC_JOB_RUST) for (unsigned i = 0; i < job->count; ++i) {
+    if (job) for (unsigned i = 0; i < job->count; ++i) {
         uint64_t shard = UINT64_C(1) << (job->inputs[i].digest[0] % DCC_FILE_CACHE_SHARDS);
-        if (job->inputs[i].cached && !(seen & shard)) {
+        if (dcc_job_shared(job, i) && job->inputs[i].cached && !(seen & shard)) {
             seen |= shard;
             dcc_file_cache_prune(job->inputs[i].digest);
         }
@@ -449,7 +449,8 @@ static int path_order(const void *a, const void *b)
 static void copy_input(void *argument)
 {
     struct dcc_tcp_server *s = argument;
-    int shared = s->job->kind == DCC_JOB_RUST && s->copy_source->server->job->kind == DCC_JOB_RUST;
+    int shared = dcc_job_shared(s->job, s->cache_index) &&
+                 dcc_job_shared(s->copy_source->server->job, s->copy_source->index);
     s->cache_hit = dcc_file_cache_copy(NULL, s->copy_source->path, s->inputs[s->cache_index].path, shared);
 }
 static void copy_complete(void *argument)
@@ -547,8 +548,8 @@ static int input_missing(struct dcc_tcp_server *s, unsigned i)
         in->wanted = 1;
     } else { in->next = u->waiters; u->waiters = in; }
     in->upload = u;
-    if (u->owner == in || s->job->kind != DCC_JOB_RUST ||
-        u->owner->server->job->kind != DCC_JOB_RUST) reserve_input(in);
+    if (u->owner == in || !dcc_job_shared(s->job, i) ||
+        !dcc_job_shared(u->owner->server->job, u->owner->index)) reserve_input(in);
     return 0;
 }
 static void lookup_input(void *argument)
@@ -556,7 +557,7 @@ static void lookup_input(void *argument)
     struct dcc_tcp_server *s = argument;
     const struct dcc_job_input *in = &s->job->inputs[s->prepared];
     const char *path = s->inputs[s->prepared].path;
-    s->cache_hit = dcc_file_cache_get(in->digest, path, s->job->kind == DCC_JOB_RUST);
+    s->cache_hit = dcc_file_cache_get(in->digest, path, dcc_job_shared(s->job, s->prepared));
     if (s->cache_hit) {
         struct stat st;
         if (stat(path, &st) || (uint64_t)st.st_size != in->plain_size) s->cache_hit = -1;
@@ -589,9 +590,9 @@ static int prepare_inputs(struct dcc_tcp_server *s)
             *p = '/';
             if (ret && errno != EEXIST) return -1;
         }
-        if (description->kind != DCC_JOB_FILE) continue;
+        if (!dcc_job_file(description)) continue;
         if (description->fd >= 0) continue;
-        in->storage_needed = s->job->kind != DCC_JOB_RUST;
+        in->storage_needed = !dcc_job_shared(s->job, i);
         if (description->cached)
             return dcc_tcp_async_submit(&s->work, lookup_input, lookup_complete, s) ? -1 : 0;
         if (input_missing(s, i)) return -1;
@@ -644,7 +645,7 @@ static int begin(struct dcc_tcp_server *s, struct dcc_tcp_frame *f)
     uint64_t metadata_bytes = 3 * f->size + s->job->count * sizeof(struct input);
     uint64_t amount = 0;
     for (unsigned i = 0; i < s->job->count; ++i) {
-        if (s->job->inputs[i].fd >= 0) continue;
+        if (s->job->inputs[i].fd >= 0 || dcc_job_shared(s->job, i)) continue;
         uint64_t size = s->job->inputs[i].plain_size;
         if (size > UINT64_MAX - amount) return -1;
         amount += size;
@@ -677,7 +678,7 @@ static void decode_input(void *argument)
         if (s->input_offset + length != s->job->inputs[index].plain_size ||
             memcmp(digest.digest, s->job->inputs[index].digest, 8)) s->input_error = -1;
         else dcc_file_cache_put(s->job->inputs[index].digest, s->inputs[index].path,
-                               s->job->kind == DCC_JOB_RUST);
+                               dcc_job_shared(s->job, index));
     }
 }
 static int finish_input(struct dcc_tcp_server *s)
@@ -740,7 +741,7 @@ static int install_links(struct dcc_tcp_server *s)
     for (unsigned i = 0; i < s->job->count; ++i) {
         struct input *in = &s->inputs[i];
         const struct dcc_job_input *d = &s->job->inputs[i];
-        if (d->kind == DCC_JOB_FILE) continue;
+        if (dcc_job_file(d)) continue;
         if (d->kind == DCC_JOB_EMPTY) {
             int fd = open(in->path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
             if (fd < 0) return -1;

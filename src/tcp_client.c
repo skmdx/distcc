@@ -137,7 +137,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     free(manifest);
     if (!outgoing) goto done;
     for (unsigned i = 0; i < job->count; ++i)
-        if (!local_input && job->inputs[i].kind == DCC_JOB_FILE && !job->inputs[i].cached) {
+        if (!local_input && dcc_job_file(&job->inputs[i]) && !job->inputs[i].cached) {
             requested[i] = 1; requests[count++] = i;
         }
     for (;;) {
@@ -172,7 +172,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     for (size_t i = 0; i < incoming.size; i += 4) {
                         unsigned index = dcc_tcp_get32(incoming.data + i);
                         if (index >= job->count || requested[index] ||
-                            job->inputs[index].kind != DCC_JOB_FILE || count == job->count) goto done;
+                            !dcc_job_file(&job->inputs[index]) || count == job->count) goto done;
                         requested[index] = 1; requests[count++] = index;
                     }
                 } else if (type == DCC_TCP_RESULT && !have_result && incoming.size == 64) {

@@ -1,4 +1,4 @@
-/* Verified input snapshots; shared compiler inputs must be mounted read-only.
+/* Verified snapshots; shared inputs have a compiler read-only contract.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
 #include <dirent.h>

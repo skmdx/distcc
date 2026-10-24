@@ -251,6 +251,7 @@ int dcc_compile_remote(char **argv,
                        char *cpp_fname,
                        int cpp_fd,
                        char **files,
+                       char **auxiliary,
                        struct dcc_job *prepared_job,
                        char *output_fname,
                        char *deps_fname,
@@ -291,10 +292,11 @@ int dcc_compile_remote(char **argv,
             dcc_broker_cpp_done(host);
             if (ret || *status) goto out;
         } else dcc_broker_cpp_done(host);
-        ret = dcc_compile_direct(host, prepared_job, argv, cpp_fname, cpp_fd, files, output_fname, deps_fname,
+        ret = dcc_compile_direct(host, prepared_job, argv, cpp_fname, cpp_fd, files, auxiliary, output_fname, deps_fname,
                                  server_stderr, server_stdout, status);
         goto out;
     }
+    if (auxiliary && auxiliary[0]) { ret = EXIT_DISTCC_FAILED; goto out; }
     if ((ret = dcc_remote_connect(host, &to_net_fd, &from_net_fd, &ssh_pid)))
         goto out;
 

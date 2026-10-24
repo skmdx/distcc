@@ -100,6 +100,7 @@ class DistccTestCase(unittest.TestCase):
         # These fixtures compile tiny C units; do not reserve the production
         # C++ budget for every test worker sharing the runner's cgroup.
         cls.base_env['DISTCC_JOB_MEMORY'] = '64'
+        cls.base_env['DISTCC_CLANG_LIBRARY'] = str(cls.build / 'clang_driver.so')
         cls.daemons = []
         cls.ports = []
         cls.stats_ports = []

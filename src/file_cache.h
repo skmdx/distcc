@@ -14,7 +14,8 @@ struct dcc_input_digest {
 };
 
 struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count);
-/* Shared snapshots require read-only compiler mounts. Otherwise return a
+/* Shared snapshots require read-only mounts or compiler-owned read-only
+ * inputs (such as profile data). Otherwise return a
  * private inode. NULL hash requires an already verified, immutable source. */
 int dcc_file_cache_copy(const unsigned char *hash, const char *source, const char *destination, int shared);
 int dcc_file_cache_get(const unsigned char *hash, const char *destination, int shared);

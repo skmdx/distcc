@@ -760,12 +760,17 @@ class PreprocessTest(PumpTestCase):
         target = subprocess.check_output([native, '-dumpmachine'], text=True).strip()
         name = compiler if compiler.startswith('clang') else target + '-gcc'
         wrapper = wrappers / name
+        worker = str(self.build / 'distcc-clang') if compiler.startswith('clang') else native
         wrapper.write_text('#!/bin/sh\n' +
             "printf '%s\\n' '#error worker header must not be used' > " + shlex.quote(str(header)) + '\n' +
             ': > ' + shlex.quote(str(includes / 'worker-only.h')) + '\n' +
-            'exec ' + shlex.quote(native) + ' "$@"\n')
+            'exec ' + shlex.quote(worker) + ' "$@"\n')
         wrapper.chmod(0o755)
         settings = {'DISTCCD_PATH': str(wrappers) + os.pathsep + os.defpath}
+        if compiler.startswith('clang'):
+            # The Clang worker uses libTooling directly. Intercept that actual
+            # execution boundary; a compiler-binary wrapper is never invoked.
+            settings['DISTCC_CLANG_DRIVER'] = str(wrapper)
         if 'DISTCC_LOCAL_SOCKET' in self.env:
             settings['DISTCC_LOCAL_SOCKET'] = self.env['DISTCC_LOCAL_SOCKET']
         self.restart_server(self.build / 'distccd', **settings)
@@ -1354,6 +1359,83 @@ class Lz4PreprocessTest(PreprocessTest):
 
 
 class TcpPreprocessTest(PreprocessTest):
+    def test_clang_unused_link_inputs_preserve_compile_semantics(self):
+        compiler = shutil.which('clang')
+        if not compiler:
+            self.skipTest('Clang is required')
+        archive = self.work / 'unused.a'
+        subprocess.run(['ar', 'rcs', archive], check=True)
+        before = self.get_stats(self.stats_ports[0])
+        for pump in (False, True):
+            with self.subTest(pump=pump):
+                port = self.env.pop('INCLUDE_SERVER_PORT') if not pump else None
+                try:
+                    objects = []
+                    for remote in (False, True):
+                        result = self.run_cc(compiler, ['-c', self.source, archive, '-o', 'result.a'], remote)
+                        self.assertEqual(result.returncode, 0, result.stderr.decode())
+                        objects.append((self.work / 'result.a').read_bytes())
+                    self.assertEqual(*objects)
+                finally:
+                    if port: self.env['INCLUDE_SERVER_PORT'] = port
+        after = self.get_stats(self.stats_ports[0])
+        self.assertEqual(int(re.search(r'dcc_compile_ok (\d+)', after)[1]) -
+                         int(re.search(r'dcc_compile_ok (\d+)', before)[1]), 2)
+        # Explicit language makes an archive another frontend input. The
+        # driver's original error must not turn into a successful compilation.
+        for remote in (False, True):
+            result = self.run_cc(compiler, ['-x', 'c', '-c', self.source, archive, '-o', 'bad.o'], remote)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b'multiple output files', result.stderr)
+
+    def test_clang_profile_use_transfers_auxiliary_inputs(self):
+        compiler, profdata = shutil.which('clang'), shutil.which('llvm-profdata')
+        if not compiler or not profdata:
+            self.skipTest('Clang and llvm-profdata are required')
+        self.source.write_text('static int value(int n) { return n > 2 ? 7 : 3; }\n'
+                               'int main(int n, char **v) { return value(n) != 3; }\n')
+        subprocess.run([compiler, '-O2', '-fprofile-generate', str(self.source), '-o', 'training'],
+                       cwd=self.work, check=True, capture_output=True)
+        subprocess.run([str(self.work / 'training')], cwd=self.work, check=True,
+                       env=dict(self.env, LLVM_PROFILE_FILE=str(self.work / 'training.profraw')))
+        subprocess.run([profdata, 'merge', 'training.profraw', '-o', 'training.profdata'],
+                       cwd=self.work, check=True, capture_output=True)
+        records, worker = self.work / 'profile-inodes', self.work / 'clang-worker'
+        worker.write_text('#!/usr/bin/python3\nimport os, sys\nfrom pathlib import Path\n' +
+            'profile = Path(sys.argv[1]) / ' + repr(str(self.work).lstrip('/')) + ' / "training.profdata"\n' +
+            'st = profile.stat()\n' +
+            'with open(' + repr(str(records)) + ', "a") as out:\n' +
+            '    out.write(f"{st.st_ino} {st.st_nlink} {st.st_mode & 0o777}\\n")\n' +
+            'os.execv(' + repr(str(self.build / 'distcc-clang')) + ', [' +
+            repr(str(self.build / 'distcc-clang')) + ', *sys.argv[1:]])\n')
+        worker.chmod(0o755)
+        self.restart_server(self.build / 'distccd', DISTCC_CLANG_DRIVER=str(worker))
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        before = self.get_stats(self.stats_ports[0])
+        for pump in (False, True):
+            port = self.env.pop('INCLUDE_SERVER_PORT') if not pump else None
+            try:
+                for profile in ('training.profdata', str(self.work / 'training.profdata')):
+                    objects = []
+                    for remote in (False, True):
+                        result = self.run_cc(compiler, ['-O2', '-fprofile-use=' + profile,
+                                                       '-c', self.source, '-o', 'optimized.o'], remote)
+                        self.assertEqual(result.returncode, 0, result.stderr.decode())
+                        self.assertNotIn(b'profile data may be out of date', result.stderr)
+                        objects.append((self.work / 'optimized.o').read_bytes())
+                    self.assertEqual(*objects)
+                    subprocess.run([compiler, 'optimized.o', '-o', 'optimized'], cwd=self.work, check=True)
+                    subprocess.run([str(self.work / 'optimized')], check=True)
+            finally:
+                if port: self.env['INCLUDE_SERVER_PORT'] = port
+        after = self.get_stats(self.stats_ports[0])
+        self.assertEqual(int(re.search(r'dcc_compile_ok (\d+)', after)[1]) -
+                         int(re.search(r'dcc_compile_ok (\d+)', before)[1]), 4)
+        inodes = [tuple(map(int, row.split())) for row in records.read_text().splitlines()]
+        self.assertEqual(len(inodes), 4)
+        self.assertEqual(len({row[0] for row in inodes}), 1, 'profile was copied between jobs')
+        self.assertTrue(all(links >= 2 and mode == 0o400 for _, links, mode in inodes))
+
     compression = 'lz4s'
     transport = ',tcp'
 

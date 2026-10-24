@@ -167,7 +167,9 @@ def plan(compiler, args, work):
     if target.endswith('.json'):
         inputs.add(absolute(target))
     for key, value in opts:
-        if key == '--extern':
+        if key == '-C' and value.startswith('profile-use='):
+            inputs.add(absolute(value.partition('=')[2]))
+        elif key == '--extern':
             _, equal, file = value.partition('=')
             if equal:
                 if Path(file).suffix == '.so':

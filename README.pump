@@ -51,8 +51,14 @@ transferred files while preserving the original main-file identity, including
 static-function profile names. Target and language defaults are inferred from
 the requested driver name. The worker library executes the requested compilation
 without requiring identical driver release metadata. Clang IR profile generation (`-fprofile-generate`) also uses this helper
-for locally preprocessed input. GCC profile generation and
-`-fprofile-use` remain local because their additional file contracts are not
+for locally preprocessed input. Prepared TCP jobs transfer Clang profile-use,
+sample-profile, memory-profile and profile-remapping inputs. The compiler driver
+in `clang_driver.so` discovers these files and discards unused linker inputs
+before preprocessing changes the command's language. Profile files share verified,
+read-only cache inodes across jobs; relative paths resolve against the client
+working directory. Build the helper with the selected `LLVM_CONFIG` and install
+it on clients together with the updated worker helper.
+GCC profile generation and profile use remain local because their additional file contracts are not
 part of the compilation RPC.
 
 GCC jobs invoke the selected GCC frontend with a dependency-collection plugin.

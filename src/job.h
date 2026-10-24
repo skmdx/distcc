@@ -10,7 +10,8 @@
 #define DCC_SYSTEM_HEADERS ".distcc-system"
 enum dcc_job_kind { DCC_JOB_COMPILE, DCC_JOB_PUMP, DCC_JOB_LINK, DCC_JOB_RUST,
                     DCC_JOB_KIND_COUNT };
-enum dcc_job_input_kind { DCC_JOB_FILE, DCC_JOB_SYMLINK, DCC_JOB_EMPTY };
+enum dcc_job_input_kind { DCC_JOB_FILE, DCC_JOB_SYMLINK, DCC_JOB_EMPTY,
+                         DCC_JOB_READONLY };
 enum dcc_job_encoding { DCC_JOB_RAW, DCC_JOB_LZ4 };
 enum dcc_job_artifact { DCC_JOB_STDERR, DCC_JOB_STDOUT, DCC_JOB_OBJECT, DCC_JOB_DEPS };
 struct dcc_job_input {
@@ -30,6 +31,14 @@ struct dcc_job {
     unsigned count;
     struct dcc_job_input *inputs;
 };
+static inline int dcc_job_file(const struct dcc_job_input *in)
+{
+    return in->kind == DCC_JOB_FILE || in->kind == DCC_JOB_READONLY;
+}
+static inline int dcc_job_shared(const struct dcc_job *job, unsigned index)
+{
+    return job->kind == DCC_JOB_RUST || job->inputs[index].kind == DCC_JOB_READONLY;
+}
 struct dcc_job_result {
     int status, mode;
     uint64_t prepare_ns, queue_ns, execute_ns; /* Server monotonic phase durations. */
@@ -55,7 +64,7 @@ struct dcc_buffer;
 int dcc_execute_job(struct dcc_job *, const char *root, int cancel_fd, struct dcc_job_result *);
 int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *output);
 struct dcc_hostdef;
-int dcc_compile_direct(struct dcc_hostdef *, struct dcc_job *, char **argv, const char *cpp, int cpp_fd, char **files,
+int dcc_compile_direct(struct dcc_hostdef *, struct dcc_job *, char **argv, const char *cpp, int cpp_fd, char **files, char **auxiliary,
                        const char *output, const char *deps, struct dcc_buffer *err,
                        struct dcc_buffer *out, int *status);
 #endif

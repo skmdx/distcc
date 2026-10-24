@@ -712,6 +712,7 @@ dcc_build_somewhere(char *argv[],
     char *input_fname = NULL, *output_fname, *cpp_fname = NULL, *deps_fname = NULL;
     int cpp_fd = -1;
     char **files = NULL;
+    char **auxiliary = NULL;
     struct dcc_job *prepared_job = NULL;
     char **server_side_argv = NULL;
     char **localcpp_server_argv = NULL;
@@ -748,6 +749,8 @@ dcc_build_somewhere(char *argv[],
 
     /* Classify before probing: preprocessing and local links need no native
      * expansion. A successful expansion invalidates the scanner's pointers. */
+    ret = dcc_prepare_clang(&argv, &auxiliary);
+    if (ret) goto lock_local;
     ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 1);
     dcc_free_argv(argv);
     argv = new_argv;
@@ -980,6 +983,7 @@ dcc_build_somewhere(char *argv[],
                                   cpp_fname,
                                   cpp_fd,
                                   files,
+                                  auxiliary,
                                   prepared_job,
                                   output_fname,
                                   needs_dotd ? deps_fname : NULL,
@@ -1161,6 +1165,7 @@ dcc_build_somewhere(char *argv[],
 
   clean_up:
     dcc_job_free(prepared_job);
+    if (auxiliary) dcc_free_argv(auxiliary);
     if (cpp_fd >= 0) { close(cpp_fd); free(cpp_fname); }
     dcc_free_argv(argv);
     if (remotecpp_server_argv != NULL) {
