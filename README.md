@@ -439,9 +439,12 @@ configured. Statistics expose `dcc_job_memory_bytes`, `dcc_job_memory_samples`,
 64 capacities indexed by the binary input-size bucket. Pump and Rust construct
 input metadata before selection and reuse it for transfer. Existing jobs retain
 their own class reservations; each capacity adds the incoming class's available
-slots to the current occupancy, subject to memory and CPU limits. A value of -1
-permits one additional unmeasured calibration, including alongside known jobs;
-the broker never pipelines more unmeasured jobs behind it. Selection and queue bounds
+slots to the current occupancy, subject to memory and CPU limits. Statistics also
+report `dcc_memory_headroom_bytes`, `dcc_memory_reserved_bytes` and per-class byte estimates in
+`dcc_compile_memory`, `dcc_pump_memory` and `dcc_rust_memory`. The broker subtracts
+the memory cost of leases not yet represented by the worker's reservations before
+placing more work, including input preparation across snapshot refreshes. A large
+in-flight job can consume several small-job memory slots. Selection and queue bounds
 use the incoming job's capacity, not the last completed job's memory estimate.
 Leave learning unset to keep a fixed estimate.
 

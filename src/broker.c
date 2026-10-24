@@ -785,6 +785,14 @@ static void observe(struct broker *broker, struct client *client, const struct f
              timing->prepare_ns / 1e9, timing->queue_ns / 1e9, cost, peer->host->hostname);
 }
 
+static unsigned long long memory_estimate(const struct dcc_capacity *cap,
+                                         const struct dcc_work_hint *hint)
+{
+    if (hint->kind < 1 || hint->kind > DCC_WORK_CLASSES) return cap->job_memory;
+    unsigned kind = hint->kind == DCC_WORK_RUST ? 2 : hint->kind > 3 ? 1 : 0;
+    return cap->memory_estimates[kind][dcc_resource_bucket(hint->bytes)];
+}
+
 static int dispatch(struct broker *broker, struct client *client, double now, struct dispatch_batch *batch)
 {
     struct reply reply = {0};
@@ -813,13 +821,30 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     int link = client->command == ACQUIRE_LINK;
     int local_cpp = !link && client->command != ACQUIRE_CPP && client->command != ACQUIRE_READY;
     int recent[MAX_HOSTS] = {0}, recent_links[MAX_HOSTS] = {0};
+    unsigned long long headroom[MAX_HOSTS], pending[MAX_HOSTS] = {0}, new_memory[MAX_HOSTS] = {0};
     for (i = 0; i < MAX_CLIENTS; ++i) {
         const struct client *c = &broker->clients[i];
-        if (c->fd >= 0 && c->peer >= 0 &&
-            c->serial > broker->peers[c->peer].observed_serial) {
+        if (c->fd < 0 || c->peer < 0) continue;
+        unsigned long long bytes = memory_estimate(&broker->peers[c->peer].metrics, &c->hint);
+        pending[c->peer] = bytes > UINT64_MAX - pending[c->peer] ? UINT64_MAX : pending[c->peer] + bytes;
+        if (c->serial > broker->peers[c->peer].observed_serial) {
             recent[c->peer]++;
             recent_links[c->peer] += c->command == ACQUIRE_LINK;
+            new_memory[c->peer] = bytes > UINT64_MAX - new_memory[c->peer] ? UINT64_MAX : new_memory[c->peer] + bytes;
         }
+    }
+    for (i = 0; i < broker->count; ++i) {
+        const struct peer *p = &broker->peers[i];
+        const struct dcc_capacity *cap = &p->metrics;
+        /* A refreshed idle snapshot must not erase leases whose upload has
+         * not arrived yet. Running jobs already have server reservations;
+         * returning jobs no longer need a compiler working set. */
+        unsigned long long unseen = 0;
+        if (cap->busy >= 0 && cap->returning >= 0 && p->busy > cap->busy + cap->returning &&
+            pending[i] > cap->memory_reserved)
+            unseen = pending[i] - cap->memory_reserved;
+        if (new_memory[i] > unseen) unseen = new_memory[i];
+        headroom[i] = cap->memory_headroom > unseen ? cap->memory_headroom - unseen : 0;
     }
     for (i = 0; i < broker->count; i++) {
         struct peer *p = &broker->peers[i];
@@ -830,6 +855,19 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             const int *capacities = client->hint.kind == DCC_WORK_RUST ? cap->rust_capacity :
                                     client->hint.kind > 3 ? cap->pump_capacity : cap->compile_capacity;
             int limit = capacities[dcc_resource_bucket(client->hint.bytes)];
+            /* The snapshot's class capacity assumes no subsequent jobs have
+             * reserved memory. Charge their own measured classes: one large
+             * lease can consume several small-job memory slots. CPU counts
+             * alone otherwise admit a burst that stalls after upload. */
+            if (headroom[i] < cap->memory_headroom && cap->busy >= 0 && limit >= 0) {
+                int occupied = cap->busy + recent[i];
+                int leased = p->busy - (cap->returning > 0 ? cap->returning : 0);
+                if (leased > occupied) occupied = leased;
+                unsigned long long estimate = memory_estimate(cap, &client->hint);
+                unsigned long long extra = headroom[i] / estimate;
+                if (limit > occupied && extra < (unsigned)(limit - occupied))
+                    limit = occupied + (int)extra;
+            }
             if (limit >= 0) projected.capacity = limit;
             cap = &projected;
         }

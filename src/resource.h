@@ -21,4 +21,5 @@ unsigned long long dcc_resource_job_bytes(void);
 unsigned dcc_resource_samples(void);
 unsigned long long dcc_resource_peak_bytes(void);
 unsigned long long dcc_resource_spare_bytes(void);
+unsigned long long dcc_resource_headroom(unsigned long long reserved);
 #endif

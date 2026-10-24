@@ -318,6 +318,17 @@ int dcc_resource_class_slots(int maximum, unsigned memory_class,
     return slots < (unsigned)maximum ? (int)slots : maximum;
 }
 
+unsigned long long dcc_resource_headroom(unsigned long long reserved)
+{
+    sample_resources();
+    unsigned long long free = budget > reserved ? budget - reserved : 0;
+    if (available < free) free = available;
+    /* Brokers use this only after projecting additional reservations, when
+     * the host spare applies even if the observed worker was idle. */
+    unsigned long long spare = dcc_resource_spare_bytes();
+    return free > spare ? free - spare : 0;
+}
+
 int dcc_resource_admit(unsigned memory_class, unsigned long long reserved)
 {
     unsigned long long job = dcc_resource_estimate(memory_class);

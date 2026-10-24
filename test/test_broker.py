@@ -136,6 +136,33 @@ class BrokerPlacementTest(BrokerTestCase):
 
 
 class BrokerTest(BrokerTestCase):
+    def test_inflight_large_job_consumes_small_job_memory_slots(self):
+        small = 64 * 1024**2
+        estimates = [small] * 64
+        estimates[22] = 7 * small
+        first = self.peer(stats_response(cpus=4, cores=4, jobs=4, capacity=4,
+                         busy=0, queued=0, preparing=0, returning=0, running=0,
+                         memory_headroom_bytes=8 * small, compile_memory=estimates))
+        second = self.peer(stats_response(cpus=4, cores=4, jobs=4, capacity=4,
+                          busy=0, queued=0, preparing=0, returning=0, running=0))
+        self.start_broker(self.host(0, f',tcp,stats={first.port},speed=10') + ' ' +
+                          self.host(1, f',tcp,stats={second.port}'))
+        _, large = self.acquire_reserved(10, (1600, 4 * 1024**2, 2))
+        self.assertEqual(large.getpeername()[1], self.ports[0])
+        _, fitting = self.acquire_reserved(10, (1601, 4096, 2))
+        self.assertEqual(fitting.getpeername()[1], self.ports[0])
+        # A lease may still be preparing input after the next idle snapshot.
+        # That refresh must not erase its outstanding memory requirement.
+        requests = first.requests
+        deadline = time.monotonic() + 3
+        while first.requests == requests:
+            self.receive(self.request(2))
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+        self.receive(self.request(2))
+        _, next_job = self.acquire_reserved(10, (1602, 4096, 2))
+        self.assertEqual(next_job.getpeername()[1], self.ports[1])
+
     def test_wait_cannot_outscore_faster_available_execution(self):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
                     running=16, busy=13, queued=0, preparing=0, returning=0)),
