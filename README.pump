@@ -44,11 +44,13 @@ For Clang jobs, the canonical preprocessor discovers includes and existence prob
 building an AST or generating code. Its input buffers are reused for transfer.
 Each request gets a fresh FileManager to avoid stale negative lookup caches.
 
-Clang IR profile generation (`-fprofile-generate`) uses the installed
-`distcc-clang` worker helper. It runs Clang's frontend against the transferred
-files while preserving the original main-file identity, including static-function
-profile names. The worker library must match the requested compiler version.
-This also applies to locally preprocessed input. GCC profile generation and
+Clang pump jobs use the installed `distcc-clang` worker helper. Its virtual
+filesystem resolves absolute include operands and existence probes against the
+transferred files while preserving the original main-file identity, including
+static-function profile names. Target and language defaults are inferred from
+the requested driver name. The worker library must match the requested compiler
+version. Clang IR profile generation (`-fprofile-generate`) also uses this helper
+for locally preprocessed input. GCC profile generation and
 `-fprofile-use` remain local because their additional file contracts are not
 part of the compilation RPC.
 
@@ -64,9 +66,8 @@ PCH and embed directives require local preprocessing. Compiler module and
 dependency-scanner flags require local compilation because their sidecar outputs
 are not part of the remote job protocol. GCC workers use
 the same module's libcpp search callback to resolve absolute include operands
-and existence probes inside the transferred input tree. Absolute operands with
-parent-directory traversal and Clang absolute operands still require local
-preprocessing; they are never resolved against unrelated worker files.
+and existence probes inside the transferred input tree. GCC absolute operands
+with parent-directory traversal still require local preprocessing.
 GCC also reports each search directory's native system-header class. Workers
 preserve ordinary, C++ system and extern-C system directories rather than
 converting all paths to -isystem, which changes C++ header attributes.
@@ -138,8 +139,8 @@ is staged until the response finishes, so a dropped connection followed by a
 local retry does not duplicate output. Upgrade clients and workers together to
 use remote `-E`.
 
-Stdin input, dependency-only `-M`/`-MM`, `-E -MD` without explicit `-MF`, absolute
-include directives, PCH/modules, frontend overrides and `#embed` remain local.
+Stdin input, dependency-only `-M`/`-MM`, `-E -MD` without explicit `-MF`,
+PCH/modules, frontend overrides and `#embed` remain local.
 Computed `__has_include` and `__has_include_next` operands are supported.
 Existence probes participate in include lookup invalidation even
 when no include directive follows. Other include-analysis failures fall back to
