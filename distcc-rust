@@ -32,6 +32,7 @@ VALUES = {'--cap-lints', '--cfg', '--check-cfg', '--crate-name', '--crate-type',
 RUNTIME = ('/lib', '/lib64', '/usr/lib64', '/usr/lib/gcc', '/usr/lib/llvm',
            '/etc/ld.so.cache')
 CONTROL = '/__distcc_rust'
+NATIVE_LIBRARY = str(Path(__file__).with_name('distcc-rust-native.so'))
 
 
 def absolute(value):
@@ -77,6 +78,42 @@ def identity(compiler):
     fields = dict(line.split(': ', 1) for line in lines[1:] if ': ' in line)
     return {'version': lines[0], 'commit': fields.get('commit-hash', ''),
             'llvm': fields.get('LLVM version', '')}, fields['host']
+
+
+def native_profile(compiler, compiler_id, work):
+    """Ask this rustc's LLVM once per compiler/CPU configuration, without
+    translating LLVM features into Rust's different target-feature vocabulary.
+    """
+    executable = Path(shutil.which(compiler) or compiler).resolve()
+    library = Path(NATIVE_LIBRARY).resolve()
+    key = json.dumps([str(executable), stamp(executable.stat()), compiler_id,
+                      str(library), stamp(library.stat()),
+                      Path('/proc/sys/kernel/random/boot_id').read_text(),
+                      sorted(os.sched_getaffinity(0))])
+    directory = Path(os.environ.get('DISTCC_DIR', Path.home() / '.distcc'))
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / 'rust-native.json').open('a+') as cache:
+        fcntl.flock(cache, fcntl.LOCK_EX)
+        cache.seek(0)
+        try:
+            saved = json.load(cache)
+        except json.JSONDecodeError:
+            saved = {}
+        if saved.get('key') == key:
+            return saved['profile']
+        capture = work / 'native'
+        capture.mkdir()
+        env = dict(os.environ, LD_PRELOAD=str(library),
+                   DISTCC_RUST_NATIVE=str(capture), DISTCC_RUST_NATIVE_CAPTURE='1')
+        probe = subprocess.run([compiler, '-Ctarget-cpu=native', '--print=cfg'],
+                               env=env, capture_output=True)
+        if probe.returncode:
+            raise LocalOnly('native CPU discovery failed: ' + probe.stderr.decode(errors='replace'))
+        profile = {name: (capture / name).read_text() for name in ('cpu', 'features')}
+        cache.seek(0)
+        cache.truncate()
+        json.dump(dict(key=key, profile=profile), cache)
+        return profile
 
 
 def dependencies(path):
@@ -126,11 +163,7 @@ def plan(compiler, args, work):
     if target.endswith('.json'):
         inputs.add(absolute(target))
     for key, value in opts:
-        if key == '-C':
-            name, _, setting = value.partition('=')
-            if name == 'target-cpu' and setting == 'native':
-                raise LocalOnly('host-specific codegen option: ' + value)
-        elif key == '--extern':
+        if key == '--extern':
             _, equal, file = value.partition('=')
             if equal:
                 if Path(file).suffix == '.so':
@@ -192,6 +225,9 @@ def plan(compiler, args, work):
         outdir = dest.parent
     job = dict(compiler=compiler_id, cwd=os.getcwd(), args=flatten(mapped),
                environment=environment, output=str(output))
+    codegen = dict(v.split('=', 1) for k, v in opts if k == '-C' and '=' in v)
+    if codegen.get('target-cpu') == 'native':
+        job['native'] = native_profile(compiler, compiler_id, work)
     # Files that changed during dependency discovery require a new invocation;
     # never combine one dependency graph with another generation's contents.
     states = {}
@@ -364,9 +400,25 @@ def worker(root, archive):
         if name.startswith(('LD_', 'DYLD_')) or name in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
             raise LocalOnly('unsafe worker environment')
         sandbox.extend(['--setenv', name, value])
+    native = job.get('native')
+    if native is not None:
+        profile = rooted(CONTROL + '/native')
+        profile.mkdir()
+        for name in ('cpu', 'features'):
+            value = native[name]
+            if not isinstance(value, str) or '\0' in value:
+                raise LocalOnly('invalid native CPU profile')
+            (profile / name).write_text(value)
+        sandbox.extend(['--ro-bind', NATIVE_LIBRARY, CONTROL + '/native.so',
+                        '--setenv', 'LD_PRELOAD', CONTROL + '/native.so',
+                        '--setenv', 'DISTCC_RUST_NATIVE', CONTROL + '/native',
+                        '--setenv', 'DISTCC_RUST_NATIVE_CAPTURE', '0'])
     result = subprocess.run([*sandbox, CONTROL + '/compiler/bin/rustc', *job['args']])
     if result.returncode:
         return result.returncode if result.returncode > 0 else 128 - result.returncode
+    if native is not None and not all((profile / (name + '-used')).exists()
+                                      for name in ('cpu', 'features')):
+        raise LocalOnly('worker rustc did not consume the client native CPU profile')
     directory = root / str(output).lstrip('/')
     with tarfile.open(archive, 'w') as tar:
         for path in sorted(directory.iterdir()):

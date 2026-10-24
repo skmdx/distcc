@@ -29,6 +29,7 @@ _testtmp/
 __pycache__/
 /h_*
 /cpp_lookup.so
+/distcc-rust-native.so
 
 # `make dist` products
 distcc-*.tar.*

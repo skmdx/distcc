@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 from pathlib import Path
@@ -118,17 +119,26 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                           'pub fn value() -> u32 { VALUE }\n')
         rust_env = dict(env, DISTCC_RUST_INPUT=str(root))
         library = root / 'librust_test.rlib'
+        remote_ir, local_ir = root / 'rust-remote.ll', root / 'rust-local.ll'
         rust = subprocess.run(['distcc', 'rustc', '--crate-name=rust_test', '--crate-type=rlib',
-                               '--emit=link,dep-info', str(source), '-o', str(library)],
+                               '-Ctarget-cpu=native', '--emit=link=' + str(library) +
+                               ',dep-info=' + str(root / 'rust.d') + ',llvm-ir=' + str(remote_ir), str(source)],
                               env=rust_env, text=True, capture_output=True, timeout=180)
         assert rust.returncode == 0, (rust.stdout + rust.stderr,
             (root/'client.log').read_text()[-6000:] if (root/'client.log').exists() else '')
         assert 'distcc-rust: compiled on ' in rust.stderr, rust.stderr
+        subprocess.run(['rustc', '--crate-name=rust_test', '--crate-type=rlib', '-Ctarget-cpu=native',
+                        '--emit=llvm-ir=' + str(local_ir), str(source)],
+                       env=rust_env, check=True, capture_output=True, timeout=90)
+        def cpu_attributes(path):
+            return re.findall(r'"target-(?:cpu|features)"="[^"]*"', path.read_text())
+        assert cpu_attributes(local_ir), 'local Rust native CPU attributes missing'
+        assert cpu_attributes(remote_ir) == cpu_attributes(local_ir), 'remote Rust CPU attributes differ'
         source.write_text('fn main() { assert_eq!(rust_test::value(), 42); }')
         executable = root / 'rust-run'
         subprocess.run(['rustc', str(source), '--extern', 'rust_test=' + str(library),
                         '-o', str(executable)], env=rust_env, check=True, capture_output=True, timeout=90)
         subprocess.run([executable], check=True, timeout=10)
         results['rustc'] = {'version': subprocess.check_output(['rustc', '-V'], text=True).strip(),
-                           'distributed': True, 'executed': True}
+                           'distributed': True, 'executed': True, 'native_cpu_matched': True}
     print(json.dumps({'compilers': results, 'wrapper': str(wrapper.resolve()), 'fallback': False}))

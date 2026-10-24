@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import runpy
 import re
+import shlex
 import shutil
 import subprocess
 import socket
@@ -76,6 +77,85 @@ class RustTest(BrokerTestCase):
                 self.assertEqual('worker compilation failed; retrying locally' in result.stderr,
                                  fallback == '1')
                 self.assertEqual(output.read_bytes(), b'previous artifact')
+
+    def test_native_cpu_features_and_overrides_match_local_compiler(self):
+        source = self.work / 'native.rs'
+        source.write_text('#[no_mangle] pub extern "C" fn answer() -> u32 { 42 }')
+        settings: list[tuple[str, ...]] = [('-Ctarget-cpu=native',)]
+        cfg = subprocess.check_output([self.rustc, '-Ctarget-cpu=native', '--print=cfg'], text=True)
+        features = re.findall(r'target_feature="([^"]+)"', cfg)
+        source.write_text(source.read_text() + '\npub fn features() -> &\'static [&\'static str] { &[\n' +
+                          ''.join(f'#[cfg(target_feature="{feature}")] "{feature}",\n' for feature in features) + '] }')
+        if 'target_feature="avx2"' in cfg:
+            settings.append(('--codegen=target-cpu=native', '-Ctarget-feature=-avx2'))
+        for flags in settings:
+            with self.subTest(flags=flags):
+                artifacts = {}
+                for remote in (False, True):
+                    ir = self.work / f'native-{remote}.ll'
+                    library = self.work / f'libnative-{remote}.rlib'
+                    result = self.rust('--crate-name=native', '--crate-type=rlib', '-Dwarnings',
+                                       *flags, '--emit=link=' + str(library) + ',llvm-ir=' + str(ir), source,
+                                       remote=remote)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn('warning:', result.stderr)
+                    if remote:
+                        self.assertIn('distcc-rust: compiled on', result.stderr)
+                    attributes = re.findall(r'"target-(?:cpu|features)"="[^"]*"', ir.read_text())
+                    self.assertGreaterEqual(len(attributes), 2)
+                    artifacts[remote] = attributes
+                self.assertEqual(artifacts[False], artifacts[True])
+                main = self.work / 'main.rs'
+                expected_cfg = subprocess.check_output([self.rustc, *flags, '--print=cfg'], text=True)
+                expected = [f for f in features if f'target_feature="{f}"' in expected_cfg]
+                main.write_text('fn main() { assert_eq!(native::answer(), 42); '
+                                'assert_eq!(native::features(), &' + json.dumps(expected) + '); }')
+                result = self.rust(main, '--extern', 'native=' + str(library),
+                                   '-o', self.work / 'check-native', remote=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                subprocess.run([self.work / 'check-native'], check=True)
+
+    def test_native_cache_reused_and_last_cpu_option_wins(self):
+        source = self.work / 'native_cache.rs'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        args = ('--crate-type=rlib', '-Ctarget-cpu=native', source)
+        result = self.rust(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        cache = self.ddir / 'rust-native.json'
+        before = cache.stat().st_mtime_ns
+        result = self.rust(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(cache.stat().st_mtime_ns, before)
+        cache.unlink()
+        # An earlier native is overridden by the last explicit CPU setting.
+        result = self.rust(*args, '-Ctarget-cpu=generic')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        self.assertFalse(cache.exists())
+
+    def test_native_discovery_serializes_and_refreshes_after_compiler_change(self):
+        import concurrent.futures
+        original = self.rustc
+        compiler, calls = self.work / 'rustc', self.work / 'probes'
+        compiler.write_text('#!/bin/sh\nif [ "$2" = "--print=cfg" ]; then echo probe >> ' +
+                            shlex.quote(str(calls)) + '; fi\nexec ' + shlex.quote(original) + ' "$@"\n')
+        compiler.chmod(0o755)
+        self.rustc = str(compiler)
+        self.addCleanup(setattr, self, 'rustc', original)
+        source = self.work / 'profile.rs'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        def build(index):
+            result = self.rust('--crate-type=rlib', '-Ctarget-cpu=native', source,
+                               '-o', self.work / f'libprofile{index}.rlib')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('distcc-rust: compiled on', result.stderr)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            list(pool.map(build, range(3)))
+        self.assertEqual(calls.read_text().splitlines(), ['probe'])
+        compiler.write_text(compiler.read_text() + '# compiler updated\n')
+        build(3)
+        self.assertEqual(calls.read_text().splitlines(), ['probe', 'probe'])
 
     def test_client_working_directory_is_filesystem_root(self):
         source = self.work / 'root_cwd.rs'
@@ -187,7 +267,8 @@ class RustTest(BrokerTestCase):
         (self.work / 'Cargo.toml').write_text('[package]\nname="app"\nversion="0.1.0"\nedition="2024"\n'
             '[[bin]]\nname="app"\npath="main.rs"\n[dependencies]\nhelper={path="library"}\n')
         (self.work / 'main.rs').write_text('fn main() { assert_eq!(helper::value(), 42); println!("rust-distcc-ok"); }')
-        env = dict(self.env, RUSTC_WRAPPER=str(self.build / 'distcc'), RUSTC=self.rustc)
+        env = dict(self.env, RUSTC_WRAPPER=str(self.build / 'distcc'), RUSTC=self.rustc,
+                   RUSTFLAGS='-Ctarget-cpu=native')
         result = subprocess.run(['cargo', 'run', '--offline'], cwd=self.work, env=env,
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)

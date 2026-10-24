@@ -52,8 +52,18 @@ compiles in a private namespace with original client paths and returns all
 artifacts, including Cargo metadata and dependency files. Local incremental
 state is not sent or updated by remote jobs.
 
+`-C target-cpu=native` uses the client's CPU even on a different worker CPU or
+architecture. The installed `distcc-rust-native.so` records the client's actual
+LLVM CPU name and enabled/disabled features, cached by compiler, boot and CPU
+affinity. It supplies those answers to the worker compiler's native discovery;
+rustc still handles target defaults, `cfg` and explicit codegen overrides.
+This avoids translating LLVM features into Rust's different option vocabulary.
+LLVM development headers (`LLVM_CONFIG`) build the helper without linking an
+LLVM version. Install it on clients and workers before using distributed native
+jobs. A worker verifies that rustc consumed the profile before returning results.
+
 Final executable/native links, build scripts, procedural macro crates,
-explicit dynamic Rust dependencies, `target-cpu=native` and response files
+explicit dynamic Rust dependencies and response files
 run locally. Unrelated procedural macros in a dependency search directory do
 not prevent distribution. Local linking
 preserves access to native system libraries. Transport or toolchain failures
