@@ -9,6 +9,20 @@ import unittest
 
 
 class PortageJobsTest(unittest.TestCase):
+    def test_prepare_exports_jobs_before_ebuild_derives_cargo_parallelism(self):
+        self.assertEqual(self.run_hook('''
+unset MAKEOPTS CARGO_BUILD_JOBS ${!distcc_auto_@}
+EBUILD_PHASE=prepare
+source "$JOBS_HOOK"
+# Firefox derives Cargo's parallelism in src_prepare and saves it for later
+# phases. An unset MAKEOPTS would become an explicit single-job override.
+export CARGO_BUILD_JOBS=${MAKEOPTS#-j}
+echo "$MAKEOPTS $CARGO_BUILD_JOBS"
+EBUILD_PHASE=compile workers=6
+source "$JOBS_HOOK"
+echo "$MAKEOPTS $CARGO_BUILD_JOBS"
+'''), ['-j12 12', '-j6 6'])
+
     def test_cargo_parallelism_refreshes_and_preserves_user_override(self):
         self.assertEqual(self.run_hook('''
 echo "$CARGO_BUILD_JOBS"

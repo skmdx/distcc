@@ -107,6 +107,7 @@ distcc_configure_jobs() {
     fi
 }
 
+# Ebuilds may derive and persist Cargo/build-system settings in src_prepare.
 case ${EBUILD_PHASE} in
-    configure|compile|test|install) distcc_configure_jobs ;;
+    prepare|configure|compile|test|install) distcc_configure_jobs ;;
 esac
