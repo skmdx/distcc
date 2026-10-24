@@ -125,6 +125,34 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         subprocess.run([executable], check=True)
 
+    def test_transitive_macro_metadata_is_available_to_remote_rustc(self):
+        deps = self.work / 'deps'
+        deps.mkdir()
+        macro, facade = self.work / 'derive.rs', self.work / 'facade.rs'
+        macro.write_text('extern crate proc_macro;\n'
+                         '#[proc_macro_derive(Marker)]\n'
+                         'pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream { "".parse().unwrap() }')
+        shared = deps / 'libderive.so'
+        result = self.rust('--crate-type=proc-macro', macro, '-o', shared, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        facade.write_text('extern crate derive; pub use derive::Marker; pub struct Value(pub u32);')
+        rlib = deps / 'libfacade.rlib'
+        result = self.rust('--crate-type=rlib', facade, '--extern', 'derive=' + str(shared),
+                           '-o', rlib, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source, library = self.work / 'consumer.rs', self.work / 'libconsumer.rlib'
+        source.write_text('extern crate facade; pub fn answer() -> u32 { facade::Value(42).0 }')
+        result = self.rust('--crate-type=rlib', source, '--extern', 'facade=' + str(rlib),
+                           '-L', 'dependency=' + str(deps), '-o', library)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        main, executable = self.work / 'main.rs', self.work / 'transitive'
+        main.write_text('fn main() { assert_eq!(consumer::answer(), 42); }')
+        result = self.rust(main, '--extern', 'consumer=' + str(library),
+                           '-L', 'dependency=' + str(deps), '-o', executable, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([executable], check=True)
+
     def test_stdin_is_not_consumed_by_dependency_discovery(self):
         output = self.work / 'libstdin.rlib'
         result = subprocess.run([str(self.build / 'distcc'), self.rustc, '--crate-type=rlib',

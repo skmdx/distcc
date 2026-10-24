@@ -141,7 +141,7 @@ def plan(compiler, args, work):
             directory = absolute(directory if equal else kind)
             if directory.is_dir():
                 inputs.update(p for p in directory.iterdir()
-                              if p.suffix in ('.rlib', '.rmeta', '.a'))
+                              if p.suffix in ('.rlib', '.rmeta', '.so', '.a'))
     # A client dep-info pass expands modules/includes using the actual compiler
     # and caller environment. A failure goes back through the original command.
     base = [(k, v) for k, v in opts if k not in ('--emit', '--out-dir', '-o')

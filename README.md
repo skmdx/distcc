@@ -52,8 +52,8 @@ compiles in a private namespace with original client paths and returns all
 artifacts, including Cargo metadata and dependency files. Local incremental
 state is not sent or updated by remote jobs.
 
-Final executable/native links, build scripts, procedural macro crates and their
-consumers, dynamic Rust dependencies, `target-cpu=native` and response files
+Final executable/native links, build scripts, procedural macro crates,
+explicit dynamic Rust dependencies, `target-cpu=native` and response files
 run locally. Unrelated procedural macros in a dependency search directory do
 not prevent distribution. Local linking
 preserves access to native system libraries. Transport or toolchain failures
