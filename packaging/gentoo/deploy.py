@@ -234,6 +234,29 @@ def validate(target, work):
     print(f"{target['name']}: C/C++ and Rust remote compilation and execution passed", flush=True)
 
 
+def validate_rust_cluster(targets, work):
+    def path(target):
+        return target['temporary'] + '/distcc-rust-cluster-check'
+
+    try:
+        parallel(targets, lambda target: transfer(
+            [str(ROOT / 'packaging/gentoo/validate-installed.py')], path(target), target))
+        # Exercise every client against each worker concurrently. Self tests
+        # alone miss cross-architecture, access-control and input-budget errors.
+        for worker in targets:
+            def validate_client(client):
+                name = client['name'] + '-to-' + worker['name']
+                with (work / ('rust-' + name + '.log')).open('w') as log:
+                    bounded(['env', 'TMPDIR=' + client['temporary'],
+                             'VALIDATE_DISTCC_HOSTS=' + worker['server_hosts'],
+                             'python3', path(client) + '/validate-installed.py', '--rust-only'],
+                            client, 'rust-' + worker['name'], log)
+                print(f'Rust {name}: distributed compilation and execution passed', flush=True)
+            parallel(targets, validate_client)
+    finally:
+        parallel(targets, lambda target: run(['sudo', '-n', 'rm', '-rf', '--', path(target)], target))
+
+
 def main():
     if len(sys.argv) != 1:
         raise SystemExit('deploy takes no arguments; configure ~/.config/distcc/deploy.json')
@@ -271,6 +294,7 @@ def main():
                 configure(target, work)
                 validate(target, work)
             rollout(targets, deploy_target)
+            validate_rust_cluster(targets, work)
             for target in targets:
                 if target['name'] in resume:
                     run(['sudo', '-n', 'systemctl', 'start', *resume[target['name']]], target)
@@ -285,6 +309,7 @@ def main():
             if (work / 'binpkgs').exists():
                 run(['sudo', '-n', 'rm', '-r', '--', work / 'binpkgs'])
             (work / 'result.json').write_text(json.dumps({'version': version, 'success': True,
+                                                        'rust_pairs': len(targets) ** 2,
                                                         'targets': [t['name'] for t in targets]}))
             results = Path(settings['results'])
             results.mkdir(parents=True, exist_ok=True)

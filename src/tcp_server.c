@@ -17,6 +17,7 @@
 #include <netinet/tcp.h>
 #include <xxhash.h>
 #include "distcc.h"
+#include "trace.h"
 #include "file_cache.h"
 #include "resource.h"
 #include "cpuperf.h"
@@ -63,6 +64,8 @@ struct dcc_tcp_server {
     struct input *inputs;
     unsigned remaining, input_index, output_index, prepared;
     uint64_t input_offset, output_offset, reserved, input_bytes, result_bytes;
+    uint64_t input_pending; /* Payload not yet charged to the shared input budget. */
+    int result_pending;
     XXH3_state_t *hash;
     struct dcc_job_result result;
     unsigned char *buffer;
@@ -80,6 +83,7 @@ struct dcc_tcp_server {
 static struct upload *uploads[256];
 static uint64_t retained;
 static uint64_t returning_bytes;
+static unsigned waiting_results;
 static struct dcc_tcp_server *ready_head, **ready_tail = &ready_head;
 static uint64_t idle_ns, idle_at;
 static unsigned idle_slots;
@@ -293,6 +297,7 @@ static void release_inputs(struct dcc_tcp_server *s)
     retained -= bytes;
     s->reserved -= s->input_bytes;
     s->input_bytes = 0;
+    s->input_pending = 0;
 }
 static void reset_job(struct dcc_tcp_server *s)
 {
@@ -302,6 +307,8 @@ static void reset_job(struct dcc_tcp_server *s)
     dcc_job_result_free(&s->result);
     retained -= s->reserved;
     returning_bytes -= s->result_bytes;
+    if (s->result_pending) --waiting_results;
+    s->result_pending = 0;
     s->result_bytes = 0;
     s->reserved = 0;
     s->remaining = s->output_index = s->prepared = 0;
@@ -445,6 +452,20 @@ static int prepare(struct dcc_tcp_server *s)
     free(paths);
     return 0;
 }
+
+/* A valid job can exceed the currently free budget without exceeding the
+ * per-job bound. Keep its small metadata and stop reading its socket until
+ * another tree is reclaimed; a busy worker must not truncate the request. */
+static int prepare_available(struct dcc_tcp_server *s)
+{
+    size_t drain = returning_bytes ? DCC_TCP_CHUNK + 16U : 0;
+    if (waiting_results || s->input_pending + drain > DCC_TCP_BYTES - retained) return 0;
+    retained += s->input_pending;
+    s->reserved += s->input_pending;
+    s->input_bytes += s->input_pending;
+    s->input_pending = 0;
+    return prepare(s) ? -1 : 1;
+}
 static int input_missing(struct dcc_tcp_server *s, unsigned i)
 {
     struct input *in = &s->inputs[i];
@@ -479,7 +500,10 @@ static void lookup_input(void *argument)
 static void lookup_complete(void *argument)
 {
     struct dcc_tcp_server *s = argument;
-    if (s->cache_hit < 0 || (!s->cache_hit && input_missing(s, s->prepared))) s->failed = 1;
+    if (s->cache_hit < 0 || (!s->cache_hit && input_missing(s, s->prepared))) {
+        rs_trace("TCP input %u cache lookup failed", s->prepared);
+        s->failed = 1;
+    }
     ++s->prepared;
     if (s->prepared == s->job->count && prepare_inputs(s)) s->failed = 1;
     if (s->socket < 0) dcc_tcp_server_free(s);
@@ -544,15 +568,18 @@ static int begin(struct dcc_tcp_server *s, struct dcc_tcp_frame *f)
     }
     /* Include the encoded manifest, decoded strings and input bookkeeping,
      * in addition to the incoming frame already charged by the parser. */
-    uint64_t amount = 3 * f->size + s->job->count * sizeof(struct input);
+    uint64_t metadata_bytes = 3 * f->size + s->job->count * sizeof(struct input);
+    uint64_t amount = metadata_bytes;
     for (unsigned i = 0; i < s->job->count; ++i) {
         uint64_t size = s->job->inputs[i].plain_size;
         if (size > DCC_TCP_BYTES - amount) return -1;
         amount += size;
     }
-    if (amount > DCC_TCP_BYTES - retained) return -1;
-    retained += amount; s->reserved = s->input_bytes = amount;
-    return prepare(s);
+    if (metadata_bytes > DCC_TCP_BYTES - retained) return -1;
+    retained += metadata_bytes;
+    s->reserved = s->input_bytes = metadata_bytes;
+    s->input_pending = amount - metadata_bytes;
+    return prepare_available(s) < 0 ? -1 : 0;
 }
 static void completed_input(struct input *in)
 {
@@ -692,24 +719,39 @@ void dcc_tcp_server_finished(struct dcc_tcp_server *s, const struct dcc_tcp_fini
     /* Result FDs now own the output inodes. Input lifetime ends here, not
      * when a slow receiver eventually consumes the last result byte. */
     release_inputs(s);
-    if (bytes > DCC_TCP_BYTES - retained) goto fail;
-    retained += bytes; s->reserved += bytes;
+    /* A result exists already. Keep its FDs while asynchronous input cleanup
+     * frees the budget; never discard completed work for transient pressure.
+     * One connection buffer, the result header and one output chunk must fit. */
+    if (bytes > DCC_TCP_BYTES - 2 * DCC_TCP_CHUNK - 88U) goto fail;
     returning_bytes += bytes; s->result_bytes = bytes;
     s->result.status = r->status; s->result.mode = r->mode;
-    unsigned char description[64];
-    dcc_tcp_put32(description, r->status); dcc_tcp_put32(description + 4, r->mode);
-    for (unsigned i = 0; i < DCC_JOB_RESULT_COUNT; ++i)
-        dcc_tcp_put64(description + 8 + i * 8, r->size[i]);
-    dcc_tcp_put64(description + 40, s->ready_at - s->begun_at);
-    dcc_tcp_put64(description + 48, s->started_at - s->ready_at);
-    dcc_tcp_put64(description + 56, monotonic_ns() - s->started_at);
+    s->result.prepare_ns = s->ready_at - s->begun_at;
+    s->result.queue_ns = s->started_at - s->ready_at;
+    s->result.execute_ns = monotonic_ns() - s->started_at;
+    s->result_pending = 1; ++waiting_results;
     s->phase = RETURNING;
     s->active = time(NULL);
-    queue(s, DCC_TCP_RESULT, description, sizeof(description));
     return;
 fail:
     for (unsigned i = 0; i < count; ++i) if (fds[i] >= 0) close(fds[i]);
     dcc_tcp_server_lost(s);
+}
+static int result_available(struct dcc_tcp_server *s)
+{
+    return s->result_bytes + DCC_TCP_CHUNK + 88U <= DCC_TCP_BYTES - retained;
+}
+static int publish_result(struct dcc_tcp_server *s)
+{
+    retained += s->result_bytes; s->reserved += s->result_bytes;
+    s->result_pending = 0; --waiting_results;
+    unsigned char description[64];
+    dcc_tcp_put32(description, s->result.status); dcc_tcp_put32(description + 4, s->result.mode);
+    for (unsigned i = 0; i < DCC_JOB_RESULT_COUNT; ++i)
+        dcc_tcp_put64(description + 8 + i * 8, s->result.size[i]);
+    dcc_tcp_put64(description + 40, s->result.prepare_ns);
+    dcc_tcp_put64(description + 48, s->result.queue_ns);
+    dcc_tcp_put64(description + 56, s->result.execute_ns);
+    return queue(s, DCC_TCP_RESULT, description, sizeof(description));
 }
 static void encode_output(void *argument)
 {
@@ -752,10 +794,21 @@ static void output_complete(void *argument)
     if (accept_output(s)) s->failed = 1;
     if (s->socket < 0) dcc_tcp_server_free(s);
 }
+static int output_available(struct dcc_tcp_server *s)
+{
+    for (unsigned i = s->output_index; i < DCC_JOB_RESULT_COUNT; ++i) {
+        uint64_t left = s->result.size[i] - (i == s->output_index ? s->output_offset : 0);
+        if (!left) continue;
+        size_t amount = s->local ? 12 : (left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK) + 16;
+        return amount <= DCC_TCP_BYTES - retained;
+    }
+    return 1;
+}
 static int output(struct dcc_tcp_server *s)
 {
     if (s->work.run) return 0;
     if (s->head && s->head->next) return 0;
+    if (!output_available(s)) return 0;
     while (s->output_index < DCC_JOB_RESULT_COUNT) {
         unsigned i = s->output_index;
         uint64_t left = s->result.size[i] - s->output_offset;
@@ -771,7 +824,6 @@ static int output(struct dcc_tcp_server *s)
             return 0;
         }
         size_t amount = left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK;
-        if (amount + 16 > DCC_TCP_BYTES - retained) return -1;
         s->encoding_bytes = amount + 16; retained += s->encoding_bytes;
         if (amount >= 65536) {
             if (dcc_tcp_async_submit(&s->work, encode_output, output_complete, s)) return -1;
@@ -795,6 +847,17 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
 {
     p->fd = s->socket;
     int pending = s->work.run != NULL;
+    if (s->job && s->phase == PREPARING && !s->inputs) {
+        p->events = POLLRDHUP;
+        p->revents = 0;
+        size_t drain = returning_bytes ? DCC_TCP_CHUNK + 16U : 0;
+        return !waiting_results && s->input_pending + drain <= DCC_TCP_BYTES - retained;
+    }
+    if (s->result_pending) {
+        p->events = POLLRDHUP;
+        p->revents = 0;
+        return result_available(s);
+    }
     p->events = POLLIN | (s->head ? POLLOUT : 0);
     if (pending && s->work.run != encode_output) p->events = POLLRDHUP;
     if (pending && s->work.run == decode_input) {
@@ -806,7 +869,7 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
     p->revents = 0;
     int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
     return !pending && (preparing || buffered ||
-        (s->phase == RETURNING && (!s->head ||
+        (s->phase == RETURNING && output_available(s) && (!s->head ||
             (s->output_index < DCC_JOB_RESULT_COUNT && !s->head->next))));
 }
 int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
@@ -830,6 +893,16 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
     }
     if (s->work.run && s->work.run != encode_output)
         return events & (POLLHUP | POLLERR | POLLRDHUP) ? -1 : 0;
+    if (s->result_pending) {
+        if (events & (POLLHUP | POLLERR | POLLRDHUP)) return -1;
+        if (!result_available(s)) return 0;
+        if (publish_result(s)) return -1;
+    }
+    if (s->job && s->phase == PREPARING && !s->inputs) {
+        if (events & (POLLHUP | POLLERR | POLLRDHUP)) return -1;
+        int admitted = prepare_available(s);
+        if (admitted <= 0) return admitted;
+    }
     /* Bounded turns interleave other connections and worker completions. */
     if (s->job && s->phase == PREPARING && s->prepared < s->job->count) {
         if (prepare_inputs(s)) return -1;
@@ -843,7 +916,13 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         int ret = dcc_tcp_frame_read(s->socket, &s->frame, DCC_TCP_BYTES - retained);
         if (!allocated && s->frame.data) retained += s->frame.size;
         if (s->frame.used != before) s->active = now;
-        if (ret <= 0) { if (ret < 0) return -1; break; }
+        if (ret <= 0) {
+            if (ret < 0) {
+                rs_trace("TCP frame read failed with %llu bytes retained", (unsigned long long)retained);
+                return -1;
+            }
+            break;
+        }
         uint32_t type = s->frame.type & ~DCC_TCP_FLAGS;
         if (s->frame.fd_plus_one && type != DCC_TCP_BEGIN) return -1;
         if (type == DCC_TCP_BEGIN) {
@@ -854,10 +933,13 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         if (ret == 1) break; /* The task borrows this frame until completion. */
         retained -= s->frame.size;
         dcc_tcp_frame_clear(&s->frame);
-        if (ret) return -1;
+        if (ret) {
+            rs_trace("TCP frame %x rejected with %llu bytes retained", type, (unsigned long long)retained);
+            return -1;
+        }
         if (s->job && s->phase == PREPARING && s->prepared < s->job->count) break;
     }
-    if (s->job && s->phase == PREPARING && s->prepared == s->job->count && !s->remaining) {
+    if (s->job && s->inputs && s->phase == PREPARING && s->prepared == s->job->count && !s->remaining) {
         if (!s->enqueued) {
             if (install_links(s)) return -1;
             s->ready_at = monotonic_ns();
@@ -904,6 +986,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
 
 void dcc_tcp_dispatch_ready(void)
 {
+    if (waiting_results) return;
     if (returning_bytes && retained > DCC_TCP_BYTES * 3 / 4) return;
     /* Once per parent poll turn, in ready order. A blocked link may be
      * bypassed by ordinary compiles, but never by a later link. */

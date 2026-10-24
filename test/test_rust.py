@@ -7,6 +7,9 @@ import runpy
 import re
 import shutil
 import subprocess
+import socket
+import struct
+import time
 import unittest
 
 from test_broker import BrokerTestCase
@@ -137,8 +140,8 @@ class RustTest(BrokerTestCase):
         counts = re.search(r'input cache: (\d+) of', first.stderr)
         assert counts is not None, first.stderr
         cold = int(counts[1])
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            results = list(pool.map(build, range(1, 4)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            results = list(pool.map(build, range(1, 6)))
         for result in results:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('distcc-rust: compiled on', result.stderr)
@@ -146,13 +149,69 @@ class RustTest(BrokerTestCase):
             assert counts is not None, result.stderr
             warm = int(counts[1])
             self.assertLess(warm, cold)
-        for i in range(1, 4):
+        for i in range(1, 6):
             path = self.work / f'libcache{i}.rlib'
             actual = path.read_bytes()
             result = self.rust('--crate-name=cache', '--crate-type=rlib', source,
                                '-o', path, remote=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(actual, path.read_bytes())
+
+    def test_input_budget_waits_then_compiles_and_reclaims_cancelled_jobs(self):
+        import concurrent.futures
+
+        # Reserve most of the real worker budget without sending a large file.
+        # The NEED response proves admission; the real Rust job must then wait
+        # for that reservation to be released instead of losing its connection.
+        def reserve(identity):
+            def string(value):
+                return struct.pack('!Q', len(value)) + value
+            args = [b'gcc', b'-c', b'/src/held.c', b'-o', b'/src/held.o']
+            size = 500 * 1024 * 1024
+            manifest = struct.pack('!4Q', identity, 1, len(args), 2) + string(b'/src')
+            manifest += b''.join(map(string, args))
+            manifest += (struct.pack('!6Q', 0, 0, 0, size, size, identity) +
+                         string(b'/src/held.c') + string(b''))
+            manifest += (struct.pack('!6Q', 0, 0, 1, 1, 1, identity) +
+                         string(b'/src/marker') + string(b''))
+            net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
+            self.addCleanup(net.close)
+            net.sendall(struct.pack('!II', 0x54000200, len(manifest)) + manifest)
+            return net
+
+        def preparing(count):
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    if f'dcc_preparing {count}\n' in self.get_stats(self.stats_ports[0]):
+                        return
+                except ConnectionResetError:
+                    pass  # Retry a reset within the same bounded progress check.
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+
+        held = reserve(101)
+        self.assertEqual(held.recv(12, socket.MSG_WAITALL), struct.pack('!3I', 0x54000201, 4, 1))
+        cancelled = reserve(102)
+        preparing(2)
+        cancelled.close()
+        preparing(1)
+        source = self.work / 'budget.rs'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.rust, '--crate-type=rlib', source,
+                                 '-o', self.work / 'libbudget.rlib')
+            try:
+                preparing(2)
+                self.assertFalse(future.done(), 'Rust job did not wait for input capacity')
+            finally:
+                held.close()
+            result = future.result(timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        result = self.rust('--crate-type=rlib', source, '-o', self.work / 'libafter.rlib')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
 
     def test_changed_snapshot_is_rejected(self):
         helper = runpy.run_path(str(self.build / 'distcc-rust'))

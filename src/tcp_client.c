@@ -275,6 +275,9 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         }
     }
 done:
+    if (ret)
+        rs_trace("TCP exchange failed: inputs %u/%u, result %d, received frame %x (%zu bytes), pending write %zu/%zu",
+                 read_request, count, have_result, incoming.type, incoming.used, sent, length);
     if (shared_input >= 0) close(shared_input);
     if (!ret) {
         unsigned cached = 0, transferred = 0;

@@ -298,7 +298,10 @@ It reads the private `~/.config/distcc/deploy.json` (or `$XDG_CONFIG_HOME`),
 selects the latest committed overlay ebuild, and installs and validates the first
 configured target before upgrading the remaining targets in parallel. Each target
 gets service settings and native versus remote C/C++ compilation, preprocessing
-and execution checks. Source archives are fetched and verified locally,
+and execution checks. After rollout, every client compiles a Rust library on
+every worker, links it locally and executes the result with fallback disabled.
+Rust checks require matching rustc builds and worker addresses reachable from
+all clients in `server_hosts`. Source archives are fetched and verified locally,
 then synchronized to targets; remote internet access is not required. Source
 builds use distcc. Cgroup resource limits are optional explicit configuration;
 the deployment command does not impose a memory cap or disable swap.
