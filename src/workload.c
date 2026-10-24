@@ -50,6 +50,9 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
 
 int dcc_work_valid(const struct dcc_work_hint *hint)
 {
+    /* Rust snapshots include dependency artifacts and the compiler sysroot;
+     * their size is not bounded by the C/C++ preprocessor input limit. */
+    if (hint->kind == DCC_WORK_RUST) return hint->key && hint->bytes;
     return hint->source_bytes <= 512U * 1024 * 1024 &&
            ((!hint->key && !hint->bytes && !hint->kind && !hint->source_bytes) ||
            (hint->key && hint->bytes && hint->bytes <= 512ULL * 1024 * 1024 &&
@@ -71,6 +74,7 @@ static unsigned history_slot(const struct dcc_work_model *model, uint64_t key)
 
 static double initial_rate(unsigned kind)
 {
+    if (kind + 1 == DCC_WORK_RUST) return 0;
     /* Pump now measures the whole uncompressed tree, so a source-only
      * expansion multiplier would count the headers twice. */
     return kind % 3 == 1 ? 1 : kind % 3 == 2 ? .0625 : .25;
@@ -131,6 +135,9 @@ double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_wor
     /* Cold estimates only bridge the first completed jobs in each class.
      * Source trees and preprocessed inputs have independent learned rates. */
     const struct dcc_work_class *c = &model->classes[kind];
+    /* Start Rust with occupancy-based placement and learn from execution,
+     * rather than treating precompiled dependencies as C++ parsing work. */
+    if (hint->kind == DCC_WORK_RUST && !c->xx) return 0;
     double seconds = hint->bytes / 1048576.0 * (c->xx ? c->input_rate : initial_rate(kind))
                    + source_size(hint) * c->source_rate;
     return seconds > .01 ? seconds : .01;

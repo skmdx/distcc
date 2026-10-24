@@ -107,11 +107,13 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
             cap->load = value;
             fields |= 4;
         } else if (!strncmp(line, "dcc_compile_capacity ", 21) ||
-                   !strncmp(line, "dcc_pump_capacity ", 18)) {
+                   !strncmp(line, "dcc_pump_capacity ", 18) ||
+                   !strncmp(line, "dcc_rust_capacity ", 18)) {
             int pump = !strncmp(line, "dcc_pump_capacity ", 18);
-            int field = pump ? 1048576 : 524288;
-            int *capacity = pump ? cap->pump_capacity : cap->compile_capacity;
-            char *item = line + (pump ? 18 : 21), *end;
+            int rust = !strncmp(line, "dcc_rust_capacity ", 18);
+            int field = rust ? 2097152 : pump ? 1048576 : 524288;
+            int *capacity = rust ? cap->rust_capacity : pump ? cap->pump_capacity : cap->compile_capacity;
+            char *item = line + (pump || rust ? 18 : 21), *end;
             if (fields & field) return -1;
             for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
                 if ((*item < '0' || *item > '9') && strncmp(item, "-1", 2)) return -1;
@@ -147,7 +149,7 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
             }
         }
     }
-    const int required = 7 | 8192 | 16384 | 32768 | 65536 | 131072 | 262144 | 524288 | 1048576;
+    const int required = 7 | 8192 | 16384 | 32768 | 65536 | 131072 | 262144 | 524288 | 1048576 | 2097152;
     return (fields & required) == required && cap->cores <= cap->cpus &&
            ((cap->cpu_scale == -1 && cap->cpu_age == -1 && !cap->cpu_probe) ||
             (cap->cpu_scale > 0 && cap->cpu_age >= 0)) ? 0 : -1;

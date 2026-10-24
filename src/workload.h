@@ -3,12 +3,13 @@
 #define DCC_WORKLOAD_H
 #include <stdint.h>
 
-#define DCC_WORK_CLASSES 6
+#define DCC_WORK_RUST 7
+#define DCC_WORK_CLASSES DCC_WORK_RUST
 #define DCC_WORK_HISTORY 4096
 #define DCC_WORK_WAYS 4
 struct dcc_work_hint {
     uint64_t key, bytes;
-    uint32_t kind, source_bytes; /* 1..3: preprocessed C/C++/asm; 4..6: source + headers. */
+    uint32_t kind, source_bytes; /* 1..3: preprocessed C/C++/asm; 4..6: source + headers; 7: Rust. */
 };
 struct dcc_work_class {
     double xx, xy, yy, xz, yz;

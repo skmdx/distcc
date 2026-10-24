@@ -52,6 +52,10 @@ compiles in a private namespace with original client paths and returns all
 artifacts, including Cargo metadata and dependency files. Local incremental
 state is not sent or updated by remote jobs.
 Rust `-Cprofile-use` data is transferred with the other read-only inputs.
+Rust also reports snapshot and source sizes to the broker. Memory admission uses
+the Rust workload class, while execution-time predictions learn from completed
+Rust jobs. Before that first sample, placement uses available capacity without
+assuming that precompiled dependencies cost the same as C++ source to compile.
 
 `-C target-cpu=native` uses the client's CPU even on a different worker CPU or
 architecture. The installed `distcc-rust-native.so` records the client's actual
@@ -234,6 +238,8 @@ The existing contention curve accounts for SMT, frequency and external CPU
 load; memory capacity continues to bound execution. An idle slow core does not
 override a sooner finish on a busy fast host. The estimate also accounts for
 throughput displaced by contention on every worker, including remote SMT lanes.
+Waiting must still predict an earlier finish than every available placement;
+an immediate placement's throughput penalty is not treated as elapsed time.
 Without an input hint, selection uses marginal throughput and prefers available
 execution capacity. A missed completion forecast uses the running job's service
 age as a conservative residual estimate, so an overdue job cannot indefinitely
@@ -413,13 +419,14 @@ other jobs are active. Cgroup limits, available headroom, PSI and `--jobs` remai
 in force. RSS and input size are estimates: different compiler options or source
 complexity within a class can demand more memory. Keep the service memory limit
 configured. Statistics expose `dcc_job_memory_bytes`, `dcc_job_memory_samples`,
-`dcc_job_peak_bytes`, `dcc_memory_spare_bytes`, `dcc_compile_capacity` and
-`dcc_pump_capacity`. The last two are separate lists of 64 capacities indexed by
-the binary input-size bucket. Pump constructs its input metadata before selection,
-using the total uncompressed source and header size, and reuses it for transfer.
-Each capacity applies
-that class's reservation, available memory and CPU recovery limit; -1 permits one
-unmeasured calibration and zero disallows admission. Selection and queue bounds
+`dcc_job_peak_bytes`, `dcc_memory_spare_bytes`, `dcc_compile_capacity`,
+`dcc_pump_capacity` and `dcc_rust_capacity`. The last three are separate lists of
+64 capacities indexed by the binary input-size bucket. Pump and Rust construct
+input metadata before selection and reuse it for transfer. Existing jobs retain
+their own class reservations; each capacity adds the incoming class's available
+slots to the current occupancy, subject to memory and CPU limits. A value of -1
+permits one additional unmeasured calibration, including alongside known jobs;
+the broker never pipelines more unmeasured jobs behind it. Selection and queue bounds
 use the incoming job's capacity, not the last completed job's memory estimate.
 Leave learning unset to keep a fixed estimate.
 

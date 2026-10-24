@@ -13,6 +13,7 @@ struct dcc_capacity {
     int preparing, returning, capacity;
     int compile_capacity[DCC_MEMORY_BUCKETS];
     int pump_capacity[DCC_MEMORY_BUCKETS];
+    int rust_capacity[DCC_MEMORY_BUCKETS];
 };
 int dcc_parse_capacity(char *buf, struct dcc_capacity *cap);
 int dcc_capacity_slots(const struct dcc_hostdef *host, const struct dcc_capacity *cap);

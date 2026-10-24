@@ -717,6 +717,23 @@ class BrokerTest(BrokerTestCase):
                 self.assertEqual(first.getpeername()[1], self.ports[0])
                 self.assertEqual(second.getpeername()[1], self.ports[1])
 
+    def test_rust_calibration_does_not_queue_behind_other_work(self):
+        for busy in (0, 2):
+            with self.subTest(busy=busy):
+                peers = [self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=busy,
+                             queued=0, preparing=0, returning=0, running=busy,
+                             rust_capacity=[-1] * 64)),
+                         self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
+                             queued=0, preparing=0, returning=0, running=0))]
+                hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={10 if i == 0 else 1}')
+                                 for i, p in enumerate(peers))
+                self.start_broker(hosts, name=f'rust-calibration-{busy}')
+                # Sysroots can exceed the preprocessed C input limit.
+                _, first = self.acquire_reserved(10, (1990, 2 * 1024**3, 7))
+                _, second = self.acquire_reserved(10, (1991, 2 * 1024**3, 7))
+                self.assertEqual(first.getpeername()[1], self.ports[0])
+                self.assertEqual(second.getpeername()[1], self.ports[1])
+
     def test_tcp_global_pipeline_and_resource_limits(self):
         for name, metrics in (
                 ('memory', dict(capacity=0)),

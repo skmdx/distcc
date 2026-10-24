@@ -28,13 +28,32 @@ class RustTest(BrokerTestCase):
 
     def setUp(self):
         super().setUp()
-        self.start_broker(self.host(0, ',tcp'))
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
         self.env.update(DISTCC_VERBOSE='1', PATH=str(self.build) + os.pathsep + os.environ['PATH'])
 
     def rust(self, *args, remote=True, env=None):
         cmd = ([str(self.build / 'distcc'), self.rustc] if remote else [self.rustc])
         return subprocess.run([*cmd, *map(str, args)], env=env or self.env,
                               cwd=self.work, capture_output=True, text=True, timeout=90)
+
+    def test_rust_uses_measured_workload_feedback(self):
+        self.source = self.work / 'library.rs'
+        self.source.write_text('pub fn value() -> u32 { 42 }')
+        for index in range(2):
+            result = self.rust('--crate-type=rlib', self.source, '-o', self.work / f'libsample{index}.rlib')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('distcc-rust: compiled on', result.stderr)
+        records = [dict(re.findall(r'(\w+)=([^ ]+)', line))
+                   for line in (self.work / 'broker.log').read_text().splitlines()
+                   if 'job cost:' in line and 'kind=7 ' in line]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(float(records[0]['predicted']), 0)
+        self.assertGreater(float(records[1]['predicted']), 0)
+        self.assertGreater(int(records[0]['source']), 0)
+        self.assertGreater(int(records[0]['bytes']), int(records[0]['source']))
+        stats = self.get_stats(self.stats_ports[0])
+        self.assertIn('dcc_rust_capacity ', stats)
 
     def test_library_inputs_env_and_dependency_artifacts(self):
         source = self.work / 'library space.rs'

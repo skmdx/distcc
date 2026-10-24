@@ -32,13 +32,16 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
                    core_scale: float | str = 1, smt_gain: float | str = .25,
                    cpu_scale: float | str = -1, cpu_age: float | str = -1,
                    cpu_probe: float | str = 0,
-                   compile_capacity=None, pump_capacity=None, **metrics):
+                   compile_capacity=None, pump_capacity=None, rust_capacity=None, **metrics):
     if compile_capacity is None:
         compile_capacity = [metrics.get('capacity', jobs)] * 64
     capacities = compile_capacity if isinstance(compile_capacity, str) else ','.join(map(str, compile_capacity))
     if pump_capacity is None:
         pump_capacity = [metrics.get('capacity', jobs)] * 64
     pump = pump_capacity if isinstance(pump_capacity, str) else ','.join(map(str, pump_capacity))
+    if rust_capacity is None:
+        rust_capacity = [metrics.get('capacity', jobs)] * 64
+    rust = rust_capacity if isinstance(rust_capacity, str) else ','.join(map(str, rust_capacity))
     return ("HTTP/1.0 200 OK\n\n<distccstats>\n"
             f"dcc_cpus {cpus}\ndcc_max_kids {jobs}\ndcc_load1 {load}\n"
             f"dcc_cores {cpus if cores is None else cores}\ndcc_smt_gain {smt_gain}\n"
@@ -46,6 +49,7 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
             f"dcc_cpu_scale {cpu_scale}\ndcc_cpu_age {cpu_age}\ndcc_cpu_probe {cpu_probe}\n"
             f"dcc_compile_capacity {capacities}\n"
             f"dcc_pump_capacity {pump}\n"
+            f"dcc_rust_capacity {rust}\n"
             + ''.join(f'dcc_{name} {value}\n' for name, value in metrics.items())
             + "</distccstats>\n").encode()
 

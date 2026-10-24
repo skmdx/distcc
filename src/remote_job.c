@@ -24,6 +24,7 @@
 #include "exitcode.h"
 #include "trace.h"
 #include "workload.h"
+#include "resource.h"
 
 /* Cache hashes are optional. Recover the expansion size from chunk headers
  * when their sidecar has disappeared, without decompressing the snapshot. */
@@ -270,6 +271,20 @@ int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *o
     ret = dcc_job_decode(fd, &job);
     close(fd);
     if (ret || job->kind != DCC_JOB_RUST || !job->count) { ret = EXIT_PROTOCOL_ERROR; goto done; }
+    hint.kind = DCC_WORK_RUST;
+    hint.bytes = dcc_resource_input_bytes(job);
+    uint64_t key = XXH3_64bits(job->cwd, strlen(job->cwd));
+    for (unsigned i = 0; i < job->count; ++i) {
+        const struct dcc_job_input *input = &job->inputs[i];
+        key = XXH3_64bits_withSeed(input->path, strlen(input->path) + 1, key);
+        key = XXH3_64bits_withSeed(input->digest, sizeof(input->digest), key);
+        const char *extension = strrchr(input->path, '.');
+        if (extension && !strcmp(extension, ".rs")) {
+            uint64_t room = UINT32_MAX - hint.source_bytes;
+            hint.source_bytes += input->plain_size < room ? input->plain_size : room;
+        }
+    }
+    hint.key = key ? key : 1;
     files = calloc(job->count + 1, sizeof(*files));
     if (!files) { ret = EXIT_OUT_OF_MEMORY; goto done; }
     for (unsigned i = 0; i < job->count; ++i) {

@@ -355,10 +355,23 @@ static long dcc_get_tmpdirinfo(void) {
         return (buf.f_bavail * buf.f_bsize) / (1024 * 1024);
 }
 
-/**
- * Accept a connection on the stats port and send the reply, regardless of data
- * that the client sends us.
- **/
+static void format_capacity(char *buffer, size_t size, unsigned kind,
+                            int cpu_limit, const struct dcc_server_load *load)
+{
+    int active = load->busy > 0 ? load->busy : 0;
+    size_t length = 0;
+    for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
+        int slots = dcc_resource_class_slots(cpu_limit - active,
+            1 + kind * DCC_MEMORY_BUCKETS + i, load->reserved, load->probing);
+        /* Advertise total occupancy: existing jobs retain their own class
+         * reservations, and only additional jobs use the requested class. */
+        if (slots >= 0) slots += active;
+        if (slots > cpu_limit) slots = cpu_limit;
+        length += snprintf(buffer + length, size - length, "%s%d", i ? "," : "", slots);
+    }
+}
+
+/** Accept a connection and send statistics, including to request-less peers. */
 static void dcc_service_stats_request(int http_fd) {
     int acc_fd;
     int *ct;
@@ -367,6 +380,7 @@ static void dcc_service_stats_request(int http_fd) {
     char reply[DCC_STATS_SIZE];
     char compile_capacity[DCC_MEMORY_BUCKETS * 12];
     char pump_capacity[DCC_MEMORY_BUCKETS * 12];
+    char rust_capacity[DCC_MEMORY_BUCKETS * 12];
     struct dcc_sockaddr_storage cli_addr;
     socklen_t cli_len = sizeof(cli_addr);
     double loadavg[3];
@@ -433,6 +447,7 @@ dcc_job_peak_bytes %llu\n\
 dcc_memory_spare_bytes %llu\n\
 dcc_compile_capacity %s\n\
 dcc_pump_capacity %s\n\
+dcc_rust_capacity %s\n\
 dcc_local_input_jobs %llu\n\
 dcc_local_input_bytes %llu\n\
 dcc_tcp_ready_idle_ns %llu\n\
@@ -461,26 +476,9 @@ dcc_free_mem %d MB\n\
 #ifdef __linux__
     admission = dcc_prefork_status(&load);
 #endif
-    int active = load.busy > 0 ? load.busy : 0;
-    size_t capacity_length = 0, pump_length = 0;
-    for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
-        int compile = dcc_resource_class_slots(cpu_limit - active,
-            1 + DCC_JOB_COMPILE * DCC_MEMORY_BUCKETS + i, load.reserved, load.probing);
-        int pump = dcc_resource_class_slots(cpu_limit - active,
-            1 + DCC_JOB_PUMP * DCC_MEMORY_BUCKETS + i, load.reserved, load.probing);
-        /* The broker compares total occupancy against this limit. Charge
-         * running jobs by their own classes, then add incoming-class slots. */
-        if (compile >= 0) compile += active;
-        if (pump >= 0) pump += active;
-        if (compile > cpu_limit) compile = cpu_limit;
-        if (pump > cpu_limit) pump = cpu_limit;
-        capacity_length += snprintf(compile_capacity + capacity_length,
-            sizeof(compile_capacity) - capacity_length, "%s%d", i ? "," : "",
-            compile);
-        pump_length += snprintf(pump_capacity + pump_length,
-            sizeof(pump_capacity) - pump_length, "%s%d", i ? "," : "",
-            pump);
-    }
+    format_capacity(compile_capacity, sizeof(compile_capacity), DCC_JOB_COMPILE, cpu_limit, &load);
+    format_capacity(pump_capacity, sizeof(pump_capacity), DCC_JOB_PUMP, cpu_limit, &load);
+    format_capacity(rust_capacity, sizeof(rust_capacity), DCC_JOB_RUST, cpu_limit, &load);
 #ifdef __linux__
     capacity = dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids));
     available = capacity - load.busy;
@@ -530,7 +528,7 @@ dcc_free_mem %d MB\n\
                                running, load.busy, load.queued, load.preparing, load.returning,
                                capacity, dcc_resource_job_bytes(), dcc_resource_samples(),
                                dcc_resource_peak_bytes(), dcc_resource_spare_bytes(),
-                               compile_capacity, pump_capacity,
+                               compile_capacity, pump_capacity, rust_capacity,
                                (unsigned long long)dcc_tcp_local_input_jobs(),
                                (unsigned long long)dcc_tcp_local_input_bytes(),
                                ready_idle_ns, parallel_tasks, parallel_peak,

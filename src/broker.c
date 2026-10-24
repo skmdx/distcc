@@ -825,9 +825,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         const struct dcc_capacity *cap = p->valid_until > now ? &p->metrics : NULL;
         struct dcc_capacity projected;
         int cold = 0;
-        if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= 6) {
+        if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= DCC_WORK_CLASSES) {
             projected = *cap;
-            const int *capacities = client->hint.kind > 3 ? cap->pump_capacity : cap->compile_capacity;
+            const int *capacities = client->hint.kind == DCC_WORK_RUST ? cap->rust_capacity :
+                                    client->hint.kind > 3 ? cap->pump_capacity : cap->compile_capacity;
             int limit = capacities[dcc_resource_bucket(client->hint.bytes)];
             cold = limit < 0;
             projected.capacity = cold ? (cap->busy > 0 ? cap->busy : 0) + 1 : limit;
@@ -892,6 +893,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         }
         /* An unfamiliar class has one additional calibration lane, provided
          * the worker's existing reservations leave room for it. */
+        if (cold && work >= cap->capacity) continue;
         if (p->busy < inflight || predicted) {
             /* A recovery trial uses the host's calibrated speed, not a zero
              * completion time. An uncompetitive host need not delay this job
@@ -900,6 +902,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             double score = probe ? execution_factor(p, work, 1, cap->capacity) :
                                    dcc_capacity_score(p->host, cap, work);
             struct prediction forecast = {0};
+            if (client->hint.key && cap)
+                forecast.factor = execution_factor(p, work, probe, cap->capacity);
             int wait = 0;
             if (predicted) {
                 forecast = predict(broker, client, i, work, cost, now, batch, probe, cap->capacity, inflight);
