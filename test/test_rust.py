@@ -69,6 +69,15 @@ class RustTest(BrokerTestCase):
         self.assertIn('mismatched types', result.stderr)
         self.assertEqual(output.read_bytes(), b'previous artifact')
 
+    def test_client_working_directory_is_filesystem_root(self):
+        source = self.work / 'root_cwd.rs'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        result = subprocess.run([str(self.build / 'distcc'), self.rustc, '--crate-type=rlib',
+                                 str(source), '-o', str(self.work / 'libroot.rlib')],
+                                cwd='/', env=self.env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+
     def test_rust_dependency_filename_escaping(self):
         names = ['a space', 'a$$b', 'a#b', "a'b", 'a\\b', 'a: b', 'a\\ b']
         for name in names:

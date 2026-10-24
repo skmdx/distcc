@@ -350,7 +350,7 @@ def worker(root, archive):
     output = Path(job['output'])
     cwd = Path(job['cwd'])
     for path in (output, cwd):
-        if not path.is_absolute() or '..' in path.parts or str(path) == '/':
+        if not path.is_absolute() or '..' in path.parts or (path == output and str(path) == '/'):
             raise LocalOnly('invalid worker path')
         (root / str(path).lstrip('/')).mkdir(parents=True, exist_ok=True)
     # Bypass user PATH wrappers: namespace isolation and separate diagnostic
