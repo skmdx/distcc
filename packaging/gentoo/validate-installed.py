@@ -154,7 +154,8 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         rust = subprocess.run(['distcc', 'rustc', '--crate-name=rust_test', '--crate-type=rlib',
                                '--emit=link,dep-info', str(source), '-o', str(library)],
                               env=rust_env, text=True, capture_output=True, timeout=180)
-        assert rust.returncode == 0, rust.stdout + rust.stderr
+        assert rust.returncode == 0, (rust.stdout + rust.stderr,
+            (root/'client.log').read_text()[-6000:] if (root/'client.log').exists() else '')
         assert 'distcc-rust: compiled on ' in rust.stderr, rust.stderr
         source.write_text('fn main() { assert_eq!(rust_test::value(), 42); }')
         executable = root / 'rust-run'
