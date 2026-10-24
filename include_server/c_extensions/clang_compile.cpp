@@ -91,10 +91,10 @@ PyObject *dcc_clang_compile(PyObject *, PyObject *arguments) {
     Py_DECREF(sequence);
     if (command.empty() || !*original)
         return PyErr_Format(PyExc_ValueError, "missing compiler command or source identity");
+    const std::string invoked_as = command.front();
+    clang::tooling::addTargetAndModeForProgramName(command, invoked_as);
     bool ok;
     Py_BEGIN_ALLOW_THREADS
-    llvm::InitializeAllTargetInfos();
-    llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
     llvm::InitializeAllAsmParsers();
     llvm::InitializeAllAsmPrinters();

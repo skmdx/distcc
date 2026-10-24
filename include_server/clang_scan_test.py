@@ -1,5 +1,6 @@
 """Exercise the actual libclang-cpp extension and its filesystem contract."""
 import os
+import json
 import mmap
 from pathlib import Path
 import shutil
@@ -121,6 +122,36 @@ with tempfile.TemporaryDirectory() as directory:
          '-o', str(output)], str(original), str(server))
     self.assertEqual(status, 0)
     self.assertTrue(output.is_file())
+
+  def test_driver_name_target_and_language_match_native(self):
+    assert self.compiler is not None
+    driver = self.root / 'aarch64-unknown-linux-gnu-clang++'
+    driver.symlink_to(self.compiler)
+    for name in ('arm', 'x86', 'c', 'cxx'):
+      (self.root / (name + '.h')).write_text('int %s_selected;\n' % name)
+    self.source.write_text(
+        '#ifdef __aarch64__\n#include "arm.h"\n#else\n#include "x86.h"\n#endif\n'
+        '#ifdef __cplusplus\n#include "cxx.h"\n#else\n#include "c.h"\n#endif\n')
+    for target, flags in (('arm', []), ('x86', ['--target=x86_64-unknown-linux-gnu'])):
+      with self.subTest(target=target):
+        command = [str(driver), '--no-default-config', '-nostdinc', *flags]
+        # Each operation must infer the target before any previous invocation
+        # has initialized LLVM's target registry in the same process.
+        scan = json.loads(subprocess.check_output([sys.executable, '-c',
+            'import clang_scan,json,sys; print(json.dumps(clang_scan.scan('
+            'json.loads(sys.argv[1]), sys.argv[2])["dependencies"]))',
+            json.dumps([*command, '-c', str(self.source)]), str(self.root)]))
+        headers = {Path(path).name for path in scan if path.endswith('.h')}
+        self.assertEqual(headers, {target + '.h', 'cxx.h'})
+        native = subprocess.run([*command, '-E', str(self.source)],
+                                capture_output=True, check=True)
+        output = self.root / 'target.i'
+        subprocess.run([sys.executable, '-c',
+            'import clang_scan,json,sys; sys.exit(clang_scan.compile('
+            'json.loads(sys.argv[1]), sys.argv[2], ""))',
+            json.dumps([*command, '-E', str(self.source), '-o', str(output)]),
+            str(self.source)], check=True)
+        self.assertEqual(output.read_bytes(), native.stdout)
 
   def test_system_search_probe_does_not_initialize_ccache(self):
     ccache, gcc = shutil.which('ccache'), shutil.which('gcc')

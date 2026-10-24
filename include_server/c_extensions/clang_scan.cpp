@@ -9,6 +9,7 @@
 #include <clang/Tooling/Tooling.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/TargetSelect.h>
 #include <sys/stat.h>
 #include <map>
 #include <set>
@@ -183,6 +184,8 @@ PyObject *scan(PyObject *, PyObject *arguments) {
     }
     Py_DECREF(sequence);
     if (command.empty()) return PyErr_Format(PyExc_ValueError, "empty compiler command");
+    const std::string invoked_as = command.front();
+    tooling::addTargetAndModeForProgramName(command, invoked_as);
     llvm::IntrusiveRefCntPtr<Inputs> inputs(new Inputs(cwd));
     if (inputs->cwd_error)
         return PyErr_Format(PyExc_ValueError, "invalid working directory: %s", inputs->cwd_error.message().c_str());
@@ -264,6 +267,10 @@ PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_scan", nullptr, -1, methods,
 }
 
 PyMODINIT_FUNC PyInit_clang_scan() {
+    // Program-name target inference consults LLVM's registered targets,
+    // including on the first scan in a fresh include-server process.
+    llvm::InitializeAllTargetInfos();
+    llvm::InitializeAllTargets();
     PyObject *result = PyModule_Create(&module);
     if (result) {
         PyModule_AddStringConstant(result, "version", CLANG_VERSION_STRING);
