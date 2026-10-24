@@ -89,7 +89,8 @@ def native_profile(compiler, compiler_id, work):
     key = json.dumps([str(executable), stamp(executable.stat()), compiler_id,
                       str(library), stamp(library.stat()),
                       Path('/proc/sys/kernel/random/boot_id').read_text(),
-                      sorted(os.sched_getaffinity(0))])
+                      sorted(os.sched_getaffinity(0)), os.environ.get('LD_PRELOAD', ''),
+                      os.environ.get('LD_LIBRARY_PATH', '')])
     directory = Path(os.environ.get('DISTCC_DIR', Path.home() / '.distcc'))
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / 'rust-native.json').open('a+') as cache:
@@ -103,7 +104,8 @@ def native_profile(compiler, compiler_id, work):
             return saved['profile']
         capture = work / 'native'
         capture.mkdir()
-        env = dict(os.environ, LD_PRELOAD=str(library),
+        preload = ' '.join(filter(None, (str(library), os.environ.get('LD_PRELOAD'))))
+        env = dict(os.environ, LD_PRELOAD=preload,
                    DISTCC_RUST_NATIVE=str(capture), DISTCC_RUST_NATIVE_CAPTURE='1')
         probe = subprocess.run([compiler, '-Ctarget-cpu=native', '--print=cfg'],
                                env=env, capture_output=True)

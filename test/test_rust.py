@@ -138,10 +138,13 @@ class RustTest(BrokerTestCase):
         import concurrent.futures
         original = self.rustc
         compiler, calls = self.work / 'rustc', self.work / 'probes'
+        preload = self.work / 'preload'
         compiler.write_text('#!/bin/sh\nif [ "$2" = "--print=cfg" ]; then echo probe >> ' +
-                            shlex.quote(str(calls)) + '; fi\nexec ' + shlex.quote(original) + ' "$@"\n')
+                            shlex.quote(str(calls)) + '; printf "%s\\n" "$LD_PRELOAD" > ' +
+                            shlex.quote(str(preload)) + '; fi\nexec ' + shlex.quote(original) + ' "$@"\n')
         compiler.chmod(0o755)
         self.rustc = str(compiler)
+        self.env['LD_PRELOAD'] = 'libm.so.6'
         self.addCleanup(setattr, self, 'rustc', original)
         source = self.work / 'profile.rs'
         source.write_text('pub fn answer() -> u32 { 42 }')
@@ -153,6 +156,7 @@ class RustTest(BrokerTestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             list(pool.map(build, range(3)))
         self.assertEqual(calls.read_text().splitlines(), ['probe'])
+        self.assertIn('libm.so.6', preload.read_text().split())
         compiler.write_text(compiler.read_text() + '# compiler updated\n')
         build(3)
         self.assertEqual(calls.read_text().splitlines(), ['probe', 'probe'])
