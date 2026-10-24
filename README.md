@@ -45,8 +45,13 @@ standard library, so workers can compile for another architecture with the
 compatible Rust compiler. Rust does not need an include server.
 
 Distribution operates on library crates and explicit metadata/object emissions.
-The real client rustc discovers modules, included data, and observed environment
-variables. Input snapshots and dependency crates use the existing LZ4 TCP
+The real client rustc discovers modules, included data, binary dependencies and
+observed environment variables. Its dependency-only probe uses
+`-Zbinary-dep-depinfo` with `RUSTC_BOOTSTRAP=1`; actual compilation keeps the
+caller's feature policy. Only the reported Rust dependency closure is sent,
+instead of all crates in dependency search directories. Native archives from
+library search directories are also included. Input snapshots and dependency
+crates use the existing LZ4 TCP
 transport and content cache. Large inputs use bounded cache chunks. The worker
 compiles in a private namespace with original client paths and returns all
 artifacts, including Cargo metadata and dependency files. Local incremental

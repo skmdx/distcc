@@ -115,6 +115,70 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         subprocess.run([self.work / 'check'], check=True)
 
+    def test_binary_dependency_closure_excludes_unrelated_crates(self):
+        deps = self.work / 'deps'
+        deps.mkdir()
+        for name, body, args in (
+            ('leaf', 'pub fn n<T: From<u8>>() -> T { 42.into() }', []),
+            ('middle', 'pub fn n() -> u32 { leaf::n() }',
+             ['--extern', 'leaf=' + str(deps / 'libleaf.rlib')]),
+        ):
+            source = self.work / (name + '.rs')
+            source.write_text(body)
+            result = self.rust('--edition=2021', '--crate-type=rlib', source,
+                               *args, '-o', deps / ('lib' + name + '.rlib'), remote=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        unrelated = deps / 'libunused.rlib'
+        with unrelated.open('wb') as stream:
+            stream.truncate(128 * 1024 * 1024)
+        unused_archive = deps / 'libunused.a'
+        unused_archive.write_bytes(b'unrelated native archive in a Rust-only search path')
+        native = self.work / 'native'
+        native.mkdir()
+        (native / 'answer.c').write_text('unsigned answer(void) { return 1; }')
+        subprocess.run(['gcc', '-c', native / 'answer.c', '-o', native / 'answer.o'], check=True)
+        subprocess.run(['ar', 'rcs', native / 'libanswer.a', native / 'answer.o'], check=True)
+        source = self.work / 'sample.rs'
+        source.write_text('#[link(name="answer", kind="static")]\n'
+                          'extern "C" { fn answer() -> u32; }\n'
+                          'pub fn n() -> u32 { middle::n() + unsafe { answer() } }')
+        output = self.work / 'libsample.rlib'
+        args = ['--edition=2021', '--crate-type=rlib', str(source),
+                '--extern', 'middle=' + str(deps / 'libmiddle.rlib'),
+                '-Ldependency=' + str(deps), '-Lnative=' + str(native), '-Clto', '-o', str(output)]
+        helper = runpy.run_path(str(self.build / 'distcc-rust'))
+        discovery = self.work / 'discovery'
+        discovery.mkdir()
+        _, inputs, _, _ = helper['plan'](self.rustc, args, discovery)
+        self.assertIn(deps / 'libleaf.rlib', inputs)
+        self.assertIn(deps / 'libmiddle.rlib', inputs)
+        self.assertNotIn(unrelated, inputs)
+        self.assertNotIn(unused_archive, inputs)
+        self.assertIn(native / 'libanswer.a', inputs)
+        result = self.rust(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        main = self.work / 'main.rs'
+        main.write_text('fn main() { assert_eq!(sample::n(), 43); }')
+        executable = self.work / 'linked'
+        result = self.rust(main, '--extern', 'sample=' + str(output),
+                           '-Ldependency=' + str(deps), '-o', executable, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([executable], check=True)
+
+    def test_dependency_probe_does_not_enable_unstable_compilation(self):
+        source = self.work / 'unstable.rs'
+        source.write_text('#![feature(rustc_private)]\npub fn n() -> u32 { 42 }')
+        output = self.work / 'libunstable.rlib'
+        env = dict(self.env, RUSTC_BOOTSTRAP='-1')
+        args = ('--crate-type=rlib', source, '-o', output)
+        local = self.rust(*args, remote=False, env=env)
+        remote = self.rust(*args, env=env)
+        self.assertNotEqual(local.returncode, 0, local.stderr)
+        self.assertEqual(remote.returncode, local.returncode, remote.stderr)
+        self.assertIn('E0554', remote.stderr)
+        self.assertFalse(output.exists())
+
     def test_compiler_error_does_not_replace_output(self):
         source, output = self.work / 'bad.rs', self.work / 'libbad.rlib'
         source.write_text('pub fn bad() -> u32 { "not a number" }')

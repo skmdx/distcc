@@ -164,6 +164,7 @@ def plan(compiler, args, work):
     root = absolute(values.get('--sysroot') or subprocess.check_output(
         [compiler, '--print=sysroot'], text=True, close_fds=False).strip())
     inputs = set()
+    libraries = set()
     if target.endswith('.json'):
         inputs.add(absolute(target))
     for key, value in opts:
@@ -179,8 +180,13 @@ def plan(compiler, args, work):
             kind, equal, directory = value.partition('=')
             directory = absolute(directory if equal else kind)
             if directory.is_dir():
-                inputs.update(p for p in directory.iterdir()
-                              if p.suffix in ('.rlib', '.rmeta', '.so', '.a'))
+                # rustc names the actual Rust dependency closure below. Search
+                # directories can contain every crate built so far; copying all
+                # of them makes a small crate transfer gigabytes of unrelated
+                # input. Native archives are not part of binary dep-info.
+                if not equal or kind not in ('dependency', 'crate'):
+                    inputs.update(p for p in directory.iterdir() if p.suffix == '.a')
+                libraries.update(p.resolve() for p in directory.iterdir() if p.suffix == '.so')
     # A client dep-info pass expands modules/includes using the actual compiler
     # and caller environment. A failure goes back through the original command.
     base = [(k, v) for k, v in opts if k not in ('--emit', '--out-dir', '-o')
@@ -190,22 +196,21 @@ def plan(compiler, args, work):
     start = time.time_ns()
     with loaded.open('ab') as trace:
         os.set_inheritable(trace.fileno(), True)
-        probe_env = dict(os.environ, DISTCC_RUST_LOADS_FD=str(trace.fileno()),
+        probe_env = dict(os.environ, RUSTC_BOOTSTRAP='1', DISTCC_RUST_LOADS_FD=str(trace.fileno()),
                          LD_PRELOAD=NATIVE_LIBRARY + ' ' + os.environ.get('LD_PRELOAD', ''))
-        probe = subprocess.run([compiler, *flatten(base), '--emit=dep-info=' + str(work / 'probe.d')],
+        # Bootstrap is scoped to dependency discovery; the actual compilation
+        # retains the caller's feature policy and options.
+        probe = subprocess.run([compiler, *flatten(base), '-Zbinary-dep-depinfo',
+                                '--emit=dep-info=' + str(work / 'probe.d')],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=False, env=probe_env)
     if probe.returncode:
         raise LocalOnly('dependency expansion failed')
-    libraries = {p.resolve() for p in inputs if p.suffix == '.so'}
     if any(Path(os.fsdecode(name)).resolve() in libraries for name in loaded.read_bytes().split(b'\0') if name):
         raise LocalOnly('procedural macro executed through a transitive dependency')
     source_files, environment = dependencies(work / 'probe.d')
     inputs.update(source_files)
     if 'RUSTC_BOOTSTRAP' in os.environ:
         environment['RUSTC_BOOTSTRAP'] = os.environ['RUSTC_BOOTSTRAP']
-    libdir = Path(subprocess.check_output(
-        [compiler, *flatten(base), '--print=target-libdir'], text=True, close_fds=False).strip())
-    inputs.update(p for p in libdir.rglob('*') if p.is_file())
     outdir = absolute(values.get('--out-dir', '.'))
     output = work / 'out'
     output.mkdir()
