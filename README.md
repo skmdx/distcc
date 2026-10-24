@@ -396,12 +396,12 @@ this policy. Before worker startup it sets `MemoryMax` to the smaller of:
 
 The result is rounded down to whole pages. Swap remains available. The helper
 prints the measured operands and resulting limit to the service journal;
-invoking it with the unit name but without `--apply` prints a dry run. A
-root-owned ceiling in `/run/distccd-memory` prevents restarts, including OOM
-recovery, from increasing the bound during the same boot. This ceiling is a
-startup guard, not a continuously growing allowance: the admission checks above
-continue to reduce concurrency when other processes consume memory. Missing
-accounting or a proposed limit below current usage prevents application/startup.
+invoking it with the unit name but without `--apply` prints a dry run. Each
+application uses current accounting so temporary pressure during a previous
+startup does not permanently reduce capacity after that memory is released.
+The admission checks above continue to reduce concurrency when other processes
+consume memory. Missing accounting or a proposed limit below current usage
+prevents application/startup.
 This policy requires a writable system systemd manager and cgroup v2 memory
 accounting. It does not remove the uncertainty of an unseen job's memory demand.
 

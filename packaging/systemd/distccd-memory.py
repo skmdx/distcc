@@ -29,20 +29,12 @@ def snapshot(group, root=Path('/sys/fs/cgroup'), meminfo=Path('/proc/meminfo')):
             budget = min(budget, remaining)
         parent = parent.parent
     page = os.sysconf('SC_PAGESIZE')
+    limit = budget // page * page
+    if limit <= current:
+        raise RuntimeError('calculated memory limit has no headroom; refusing to lower it onto live workers')
     return {'mem_available': memory['MemAvailable'], 'resident': resident,
             'current': current, 'host_budget': host_budget,
-            'ancestors': ancestors, 'limit': budget // page * page}
-
-
-def constrain(measurement, previous=None):
-    limit = measurement['limit']
-    if previous is not None:
-        # A restart, including recovery after OOM, must not enlarge the hard
-        # bound. /run is cleared at boot; live admission follows free memory.
-        limit = min(limit, previous)
-    if limit <= measurement['current']:
-        raise RuntimeError('calculated memory limit has no headroom; refusing to lower it onto live workers')
-    return dict(measurement, limit=limit, previous=previous)
+            'ancestors': ancestors, 'limit': limit}
 
 
 def main():
@@ -58,16 +50,8 @@ def main():
     group = (root / control.lstrip('/')).resolve()
     if not control.startswith('/') or group == root or root not in group.parents:
         raise RuntimeError('service must have a cgroup v2 with memory accounting')
-    state = Path('/run/distccd-memory') / args.unit
-    previous = int(state.read_text()) if state.exists() else None
-    result = constrain(snapshot(group, root), previous)
+    result = snapshot(group, root)
     if args.apply:
-        state.parent.mkdir(mode=0o755, exist_ok=True)
-        # Commit the ceiling before applying it so a failed start cannot retry
-        # with a larger budget. Only this root-owned helper writes the state.
-        temporary = state.with_suffix('.new')
-        temporary.write_text(str(result['limit']) + '\n')
-        temporary.replace(state)
         subprocess.run(['systemctl', 'set-property', '--runtime', args.unit,
                         'MemoryMax=' + str(result['limit']), 'MemorySwapMax=infinity'], check=True)
         actual = int((group / 'memory.max').read_text())
