@@ -329,6 +329,56 @@ int ioctl(int fd, unsigned long request, ...) {
         after = self.get_stats(self.stats_ports[0])
         self.assertGreater(capacity(after), 0)
 
+    def test_known_job_bypasses_blocked_memory_calibration(self):
+        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='512', DISTCC_MEMORY_LEARNING='1')
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.start_tcp()
+        self.job('warm-small')
+        before = self.get_stats(self.stats_ports[0])
+        advertised = re.sub(r'dcc_compile_capacity [^\n]+',
+                            'dcc_compile_capacity ' + ','.join(['4'] * 64), before)
+        peer = self.peer(advertised.encode())
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name='mixed-memory')
+        source = self.work / 'unmeasured.i'
+        source.write_text('/*' + ' ' * 8192 + '*/\nint main(void) { return 0; }\n')
+        entered, release = self.work / 'entered', self.work / 'release'
+        wrapper = self.root / 'bin/gcc'
+        original = wrapper.read_bytes()
+        self.addCleanup(wrapper.write_bytes, original)
+        wrapper.write_text(f'''#!/usr/bin/python3
+import os, sys, time
+from pathlib import Path
+if any(os.path.isfile(arg) and os.stat(arg).st_size >= 8192 for arg in sys.argv[1:]):
+    Path({str(entered)!r}).touch()
+    while not Path({str(release)!r}).exists(): time.sleep(.01)
+os.execv({self.cc!r}, [{self.cc!r}, *sys.argv[1:]])
+''')
+        def compile_large(index):
+            result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(source),
+                                     '-o', str(self.work / f'large-{index}.o')], env=self.env,
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            large = [pool.submit(compile_large, 0)]
+            try:
+                deadline = time.monotonic() + 5
+                while not entered.exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                large.append(pool.submit(compile_large, 1))
+                while 'dcc_queued 1\n' not in self.get_stats(self.stats_ports[0]):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                # The first unknown job remains held, and the second cannot
+                # run yet. A known small compile must pass both immediately.
+                small = pool.submit(self.job, 'bypass-calibration')
+                small.result(timeout=3)
+                self.assertFalse(any(job.done() for job in large))
+            finally:
+                release.touch()
+            for job in large:
+                job.result()
+
     def test_compile_and_pool_reuse(self):
         self.start_tcp()
         before = int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])

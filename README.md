@@ -412,6 +412,9 @@ use the larger of the configured estimate and the daemon's observed peak with
 headroom; only one unseen-class calibration runs at a time. Small jobs therefore
 cannot authorize a burst of larger, unmeasured jobs. The broker also avoids
 queueing prepared input behind an occupied worker that has not measured its size.
+If such jobs nevertheless arrive from a stale capacity snapshot, the server
+continues past memory-blocked jobs to run known jobs that fit. It keeps link
+ordering and stops scanning once all CPU execution lanes are occupied.
 
 The daemon sums reservations for active jobs and excludes actual shared-memory
 input/output storage from the compiler budget. A quarter-job spare applies when

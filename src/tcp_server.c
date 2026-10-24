@@ -1072,8 +1072,13 @@ void dcc_tcp_dispatch_ready(void)
 {
     if (waiting_results) return;
     if (returning_bytes && retained > DCC_TCP_BYTES * 3 / 4) return;
-    /* Once per parent poll turn, in ready order. A blocked link may be
-     * bypassed by ordinary compiles, but never by a later link. */
+    struct dcc_server_load load;
+    dcc_prefork_status(&load);
+    int slots = dcc_cpu_perf_limit(dcc_max_kids) - load.busy;
+    if (slots <= 0) return;
+    /* Once per parent poll turn. Admission is workload-specific: a memory
+     * calibration or large reservation must not block smaller known jobs.
+     * Preserve ordering between links, which share one execution lane. */
     int link_waiting = 0;
     for (struct dcc_tcp_server *s = ready_head; s;) {
         struct dcc_tcp_server *next = s->ready_next;
@@ -1083,9 +1088,11 @@ void dcc_tcp_dispatch_ready(void)
             int input = s->job->kind == DCC_JOB_COMPILE && s->job->count == 1 ? s->job->inputs[0].fd : -1;
             int ret = s->dispatch->start(s, &s->run, s->metadata, input, s->job);
             if (ret < 0) { s->failed = 1; dequeue(s); }
-            else if (ret) { dequeue(s); s->phase = RUNNING; s->started_at = monotonic_ns(); }
-            else if (!link) break;
-            else link_waiting = 1;
+            else if (ret) {
+                dequeue(s); s->phase = RUNNING; s->started_at = monotonic_ns();
+                if (!--slots) break;
+            }
+            else if (link) link_waiting = 1;
         }
         s = next;
     }
