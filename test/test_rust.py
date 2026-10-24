@@ -86,6 +86,22 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('distcc-rust: compiled on', result.stderr)
 
+    def test_long_lint_and_codegen_options_are_decided_by_rustc(self):
+        source, library = self.work / 'options.rs', self.work / 'liboptions.rlib'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        result = self.rust('--crate-name=options', '--crate-type=rlib',
+                           '--warn=unused_variables', '--allow', 'clippy::all',
+                           '--deny=unused_imports', '--forbid', 'unsafe_code',
+                           '--force-warn=dead_code', '-C', 'default-linker-libraries=yes',
+                           source, '-o', library)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        main, executable = self.work / 'main.rs', self.work / 'options'
+        main.write_text('fn main() { assert_eq!(options::answer(), 42); }')
+        result = self.rust(main, '--extern', 'options=' + str(library), '-o', executable, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([executable], check=True)
+
     def test_rust_dependency_filename_escaping(self):
         names = ['a space', 'a$$b', 'a#b', "a'b", 'a\\b', 'a: b', 'a\\ b']
         for name in names:

@@ -27,12 +27,8 @@ class LocalOnly(Exception):
 VALUES = {'--cap-lints', '--cfg', '--check-cfg', '--crate-name', '--crate-type',
           '--edition', '--error-format', '--extern', '--json', '--remap-path-prefix',
           '--target', '--sysroot', '--emit', '--out-dir', '-o', '-C', '-L', '-l',
-          '-A', '-W', '-D', '-F', '--diagnostic-width', '--color'}
-CODEGEN = {'opt-level', 'lto', 'linker', 'link-arg', 'link-args', 'link-self-contained',
-           'debuginfo', 'debug-assertions', 'overflow-checks', 'metadata', 'extra-filename',
-           'panic', 'codegen-units', 'embed-bitcode', 'target-cpu', 'target-feature',
-           'strip', 'force-unwind-tables', 'relocation-model', 'prefer-dynamic',
-           'split-debuginfo', 'incremental', 'force-frame-pointers'}
+          '-A', '-W', '-D', '-F', '--allow', '--warn', '--deny', '--forbid',
+          '--force-warn', '--diagnostic-width', '--color'}
 RUNTIME = ('/lib', '/lib64', '/usr/lib64', '/usr/lib/gcc', '/usr/lib/llvm',
            '/etc/ld.so.cache')
 CONTROL = '/__distcc_rust'
@@ -133,8 +129,8 @@ def plan(compiler, args, work):
     for key, value in opts:
         if key == '-C':
             name, _, setting = value.partition('=')
-            if name not in CODEGEN or (name == 'target-cpu' and setting == 'native'):
-                raise LocalOnly('host-specific or unsupported codegen option: ' + value)
+            if name == 'target-cpu' and setting == 'native':
+                raise LocalOnly('host-specific codegen option: ' + value)
         elif key == '--extern':
             _, equal, file = value.partition('=')
             if equal:
@@ -341,9 +337,8 @@ def worker(root, archive):
             continue
     if compiler is None:
         raise LocalOnly('no worker Rust compiler is installed')
-    # Revalidate the action on the server: the only executable is our installed
-    # compiler. Proc-macros, linker plugins and custom codegen backends may not
-    # turn the compiler service into a command runner.
+    # Revalidate the compilation action. Codegen option validity belongs to
+    # rustc, so compiler updates do not require a second option allowlist here.
     opts = options(job['args'])
     vals = dict(opts)
     types = set(vals.get('--crate-type', 'bin').split(','))
@@ -351,9 +346,6 @@ def worker(root, archive):
     if 'proc-macro' in types or (any(e.split('=')[0] == 'link' for e in emits)
                                 and not types <= {'lib', 'rlib'}):
         raise LocalOnly('unsupported worker action')
-    for key, value in opts:
-        if key == '-C' and value.partition('=')[0] not in CODEGEN - {'incremental'}:
-            raise LocalOnly('unsupported worker codegen option')
     output = Path(job['output'])
     cwd = Path(job['cwd'])
     for path in (output, cwd):

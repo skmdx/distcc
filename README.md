@@ -38,7 +38,8 @@ Rust requires the local `DISTCC_BROKER` socket and workers configured with
 `,tcp`, plus worker Rust, Python xxhash and bubblewrap. Workers prefer a matching
 Rust build but do not reject differing version, commit or LLVM metadata.
 Compatibility is determined by rustc accepting the inputs and the client
-successfully linking the artifacts. Linux workers
+successfully linking the artifacts. Codegen options are passed to rustc rather
+than filtered through a version-specific allowlist. Linux workers
 must permit unprivileged user namespaces. The client supplies its target
 standard library, so workers can compile for another architecture with the
 compatible Rust compiler. Rust does not need an include server.
