@@ -86,6 +86,42 @@ with tempfile.TemporaryDirectory() as directory:
           self.assertTrue({str(header), str(alias)} <= set(result['dependencies']))
           self.assertEqual(result['files'][str(alias)], header.read_bytes())
 
+  def test_absolute_forwarders_and_include_probes(self):
+    header, missing = self.root / 'body.h', self.root / 'missing.h'
+    header.write_text('int value;\n')
+    for operand in ('"%s"' % header, 'HEADER'):
+      with self.subTest(operand=operand):
+        self.source.write_text(
+            '#define HEADER "%s"\n#if __has_include(HEADER)\n#include %s\n#endif\n'
+            '#if __has_include("%s")\n#error unexpected header\n#endif\n' %
+            (header, operand, missing))
+        result = self.scan()
+        self.assertIn(str(header), result['dependencies'])
+        self.assertEqual(result['files'][str(header)], header.read_bytes())
+        self.assertIsNone(result['lookups'][str(missing)])
+
+  def test_compile_absolute_paths_use_only_client_snapshots(self):
+    assert self.compiler is not None
+    server = self.root / 'worker'
+    original = self.root / 'original.c'
+    header, host_only = self.root / 'header.h', self.root / 'host-only.h'
+    header.write_text('#error worker host header must not be used\n')
+    host_only.write_text('#error worker host probe must not be visible\n')
+    copied_source = server / str(original).lstrip('/')
+    copied_header = server / str(header).lstrip('/')
+    copied_source.parent.mkdir(parents=True)
+    copied_header.write_text('#define VALUE 42\n')
+    copied_source.write_text(
+        '#define HEADER "%s"\n#if !__has_include(HEADER)\n#error missing snapshot\n#endif\n'
+        '#include HEADER\n#if __has_include("%s")\n#error leaked host lookup\n#endif\n'
+        '_Static_assert(VALUE == 42, "snapshot value");\n' % (header, host_only))
+    output = self.root / 'result.o'
+    status = clang_scan.compile(
+        [self.compiler, '--no-default-config', '-nostdinc', '-c', str(copied_source),
+         '-o', str(output)], str(original), str(server))
+    self.assertEqual(status, 0)
+    self.assertTrue(output.is_file())
+
   def test_system_search_probe_does_not_initialize_ccache(self):
     ccache, gcc = shutil.which('ccache'), shutil.which('gcc')
     if not ccache or not gcc:

@@ -118,20 +118,16 @@ struct Callbacks : PPCallbacks {
         if (auto file = sources.getFileEntryRefForID(sources.getFileID(loc)))
             result.dependencies.insert(file->getName().str());
     }
-    void HasInclude(SourceLocation, llvm::StringRef name, bool, OptionalFileEntryRef file,
+    void HasInclude(SourceLocation, llvm::StringRef, bool, OptionalFileEntryRef file,
                     SrcMgr::CharacteristicKind) override {
-        if (name.starts_with("/")) result.unsupported = true;
         if (file) result.dependencies.insert(file->getName().str());
     }
-    void InclusionDirective(SourceLocation loc, const Token &, llvm::StringRef name,
+    void InclusionDirective(SourceLocation, const Token &, llvm::StringRef,
                             bool, CharSourceRange, OptionalFileEntryRef file,
                             llvm::StringRef, llvm::StringRef, const Module *, bool imported,
                             SrcMgr::CharacteristicKind) override {
         if (file) result.dependencies.insert(file->getName().str());
-        // The existing GCC-compatible transfer rewrites command-line paths,
-        // but cannot rewrite absolute include operands inside source files.
-        if ((name.starts_with("/") && sources.getFileEntryRefForID(sources.getFileID(loc))) || imported)
-            result.unsupported = true;
+        if (imported) result.unsupported = true;
     }
     void EmbedDirective(SourceLocation, llvm::StringRef, bool, OptionalFileEntryRef,
                         const LexEmbedParametersResult &) override { result.unsupported = true; }

@@ -785,9 +785,14 @@ static int tweak_arguments_for_server(char **argv,
                                       char ***tweaked_argv)
 {
     int ret;
-    char *debug_map;
-    int argc = dcc_argv_len(argv), i;
+    char *debug_map, *macro_map;
+    int argc = dcc_argv_len(argv), i, client_maps = 0;
     int preserve_spelling = strstr(dcc_find_basename(argv[0]), "clang") != NULL;
+    for (i = 1; argv[i]; i++)
+        if (str_startswith("-fdebug-prefix-map=/", argv[i]) ||
+            str_startswith("-fmacro-prefix-map=/", argv[i]) ||
+            str_startswith("-ffile-prefix-map=/", argv[i]))
+            client_maps++;
     for (i = 1; preserve_spelling && argv[i]; i++)
         if (str_startswith("-ffile-prefix-map=", argv[i]) ||
             str_startswith("-fmacro-prefix-map=", argv[i]) ||
@@ -795,25 +800,30 @@ static int tweak_arguments_for_server(char **argv,
             !strcmp(argv[i], "-fno-file-reproducible"))
             preserve_spelling = 0;
     *dotd_target = 0;
-    if ((ret = dcc_copy_argv(argv, tweaked_argv, 4 + preserve_spelling)))
+    if ((ret = dcc_copy_argv(argv, tweaked_argv, 5 + preserve_spelling + client_maps)))
       return 1;
 
     /* Remap absolute input names and DWARF in the compiler, preserving relative
      * __FILE__/__BASE_FILE__ spellings and user mappings. A #line prefix cannot
      * represent the same header reached through different include spellings. */
-    checked_asprintf(&debug_map, "-ffile-prefix-map=%s=", root_dir);
+    /* GCC gives file-prefix maps priority over explicit macro-prefix maps.
+     * Use separate defaults so the user's mappings can override each class. */
+    checked_asprintf(&debug_map, "-fdebug-prefix-map=%s=", root_dir);
     if (!debug_map) return EXIT_OUT_OF_MEMORY;
-    memmove(*tweaked_argv + 2 + preserve_spelling, *tweaked_argv + 1, argc * sizeof(char *));
+    checked_asprintf(&macro_map, "-fmacro-prefix-map=%s=", root_dir);
+    if (!macro_map) { free(debug_map); return EXIT_OUT_OF_MEMORY; }
+    memmove(*tweaked_argv + 3 + preserve_spelling, *tweaked_argv + 1, argc * sizeof(char *));
     (*tweaked_argv)[1] = debug_map;
+    (*tweaked_argv)[2] = macro_map;
     /* Clang's prefix map implicitly normalizes './' even for unmatched paths.
      * Restore its default only when the user did not request that behavior. */
     if (preserve_spelling &&
-        !((*tweaked_argv)[2] = strdup("-fno-file-reproducible")))
+        !((*tweaked_argv)[3] = strdup("-fno-file-reproducible")))
         return EXIT_OUT_OF_MEMORY;
 
     /* Preserve user mappings after relocating absolute input paths. Keep the
      * user's order and let their mappings take precedence over our default. */
-    for (i = 2 + preserve_spelling; (*tweaked_argv)[i]; ++i) {
+    for (i = 3 + preserve_spelling; i < argc + 2 + preserve_spelling; ++i) {
         char *arg = (*tweaked_argv)[i];
         if (str_startswith("-fdebug-prefix-map=/", arg) ||
             str_startswith("-fmacro-prefix-map=/", arg) ||
@@ -823,7 +833,10 @@ static int tweak_arguments_for_server(char **argv,
             if (!strchr(value, '=')) continue;
             checked_asprintf(&mapped, "%.*s%s%s", (int)(value - arg), arg, root_dir, value);
             if (!mapped) return EXIT_OUT_OF_MEMORY;
-            free(arg);
+            /* Native frontends also expose original client names, including
+             * absolute include operands. Preserve mappings for those names
+             * as well as the relocated worker paths. */
+            dcc_argv_append(*tweaked_argv, arg);
             (*tweaked_argv)[i] = mapped;
         }
     }
@@ -1206,14 +1219,15 @@ static int dcc_run_job(int in_fd,
         goto report_result;
     }
 
-    /* LLVM's IR PGO names contain the main input path. Prefix-map options do
-     * not affect these names: use Clang's frontend with the client identity. */
+    /* Pump inputs need Clang's rooted filesystem for absolute includes and
+     * __has_include probes. The frontend also preserves source identity for
+     * LLVM IR PGO names, which prefix-map options do not affect. */
     if (strstr(dcc_find_basename(argv[0]), "clang")) {
-        int profile = 0, argc = dcc_argv_len(argv);
+        int frontend = cpp_where == DCC_CPP_ON_SERVER, argc = dcc_argv_len(argv);
         for (i = 1; i < argc; ++i)
             if (!strcmp(argv[i], "-fprofile-generate") ||
-                !strncmp(argv[i], "-fprofile-generate=", 19)) profile = 1;
-        if (profile) {
+                !strncmp(argv[i], "-fprofile-generate=", 19)) frontend = 1;
+        if (frontend) {
             const char *helper = getenv("DISTCC_CLANG_DRIVER");
             char **wrapped = calloc(argc + 4, sizeof(char *));
             if (!wrapped) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }

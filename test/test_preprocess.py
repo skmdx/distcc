@@ -879,12 +879,23 @@ class PreprocessTest(PumpTestCase):
         self.assertIn('pooled TCP job completed' if self.transport == ',tcp' else
                       'client finished sending request to server', log)
 
-    def test_gcc_absolute_includes_probes_and_dependencies(self):
+    def test_absolute_includes_probes_and_dependencies(self):
         header = self.work / 'absolute.h'
+        missing = self.work / 'missing.h'
         header.write_text('int absolute_value;\nconst char *header_file = __FILE__;\n')
         self.source.write_text('#define HEADER "%s"\n#if __has_include(HEADER)\n'
-                               '#include HEADER\n#else\n#error missing\n#endif\n' % header)
-        self.compare(args=['-MD', '-MF', 'dep.d'])
+                               '#include HEADER\n#else\n#error missing\n#endif\n'
+                               '#if __has_include("%s")\n#error unexpected\n#endif\n'
+                               'const char *source_file = __FILE__;\n' %
+                               (header, missing))
+        for compiler in ('gcc', 'clang'):
+            with self.subTest(compiler=compiler):
+                self.compare(compiler, args=['-MD', '-MF', 'dep.d'])
+                for mapping in (f'-ffile-prefix-map={self.work}=/mapped',
+                                '-ffile-prefix-map=/=/mapped/',
+                                f'-fmacro-prefix-map={self.work}=/mapped'):
+                    with self.subTest(mapping=mapping):
+                        self.compare(compiler, args=[mapping, '-MD', '-MF', 'dep.d'])
         self.assertNotIn('preprocessing locally', (self.work/'client.log').read_text())
 
     def test_gcc_cxx_system_header_attributes(self):
