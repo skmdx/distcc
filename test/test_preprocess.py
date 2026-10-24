@@ -1400,9 +1400,10 @@ class TcpPreprocessTest(PreprocessTest):
                        env=dict(self.env, LLVM_PROFILE_FILE=str(self.work / 'training.profraw')))
         subprocess.run([profdata, 'merge', 'training.profraw', '-o', 'training.profdata'],
                        cwd=self.work, check=True, capture_output=True)
+        (self.work / 'default.profdata').hardlink_to(self.work / 'training.profdata')
         records, worker = self.work / 'profile-inodes', self.work / 'clang-worker'
         worker.write_text('#!/usr/bin/python3\nimport os, sys\nfrom pathlib import Path\n' +
-            'profile = Path(sys.argv[1]) / ' + repr(str(self.work).lstrip('/')) + ' / "training.profdata"\n' +
+            'profile = next(Path(sys.argv[1]).rglob("*.profdata"))\n' +
             'st = profile.stat()\n' +
             'with open(' + repr(str(records)) + ', "a") as out:\n' +
             '    out.write(f"{st.st_ino} {st.st_nlink} {st.st_mode & 0o777}\\n")\n' +
@@ -1415,10 +1416,11 @@ class TcpPreprocessTest(PreprocessTest):
         for pump in (False, True):
             port = self.env.pop('INCLUDE_SERVER_PORT') if not pump else None
             try:
-                for profile in ('training.profdata', str(self.work / 'training.profdata')):
+                for profile in ('training.profdata', str(self.work / 'training.profdata'), '.', None):
                     objects = []
                     for remote in (False, True):
-                        result = self.run_cc(compiler, ['-O2', '-fprofile-use=' + profile,
+                        option = '-fprofile-use' if profile is None else '-fprofile-use=' + profile
+                        result = self.run_cc(compiler, ['-O2', option,
                                                        '-c', self.source, '-o', 'optimized.o'], remote)
                         self.assertEqual(result.returncode, 0, result.stderr.decode())
                         self.assertNotIn(b'profile data may be out of date', result.stderr)
@@ -1430,9 +1432,9 @@ class TcpPreprocessTest(PreprocessTest):
                 if port: self.env['INCLUDE_SERVER_PORT'] = port
         after = self.get_stats(self.stats_ports[0])
         self.assertEqual(int(re.search(r'dcc_compile_ok (\d+)', after)[1]) -
-                         int(re.search(r'dcc_compile_ok (\d+)', before)[1]), 4)
+                         int(re.search(r'dcc_compile_ok (\d+)', before)[1]), 8)
         inodes = [tuple(map(int, row.split())) for row in records.read_text().splitlines()]
-        self.assertEqual(len(inodes), 4)
+        self.assertEqual(len(inodes), 8)
         self.assertEqual(len({row[0] for row in inodes}), 1, 'profile was copied between jobs')
         self.assertTrue(all(links >= 2 and mode == 0o400 for _, links, mode in inodes))
 

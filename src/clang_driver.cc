@@ -79,9 +79,19 @@ extern "C" int dcc_clang_inputs(char **argv, char ***normalized, char ***files) 
     std::set<unsigned> unused;
     for (const auto *arg : args.filtered(clang::options::OPT_INPUT))
         if (!used.count(absolute(arg->getValue()))) unused.insert(arg->getIndex() + 1);
+    // Resolve directory/default profile selection on the client. The driver
+    // otherwise tests the worker's physical directory before consulting VFS.
+    const auto *profile = args.getLastArg(clang::options::OPT_fprofile_use,
+        clang::options::OPT_fprofile_use_EQ, clang::options::OPT_fprofile_instr_use,
+        clang::options::OPT_fprofile_instr_use_EQ);
+    auto profile_path = action.compiler->getCodeGenOpts().ProfileInstrumentUsePath;
     std::vector<std::string> result, inputs;
-    for (unsigned i = 0; argv[i]; ++i)
-        if (!unused.count(i)) result.emplace_back(argv[i]);
+    for (unsigned i = 0; argv[i]; ++i) {
+        if (unused.count(i)) continue;
+        if (profile && !profile_path.empty() && i == profile->getIndex() + 1)
+            result.emplace_back("-fprofile-instr-use=" + absolute(profile_path));
+        else result.emplace_back(argv[i]);
+    }
     bool valid = true;
     dcc_clang_profile_inputs(action.compiler->getCodeGenOpts(), [&](std::string &path) {
         auto name = absolute(path);
