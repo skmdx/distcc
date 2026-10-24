@@ -114,6 +114,19 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerTest(BrokerTestCase):
+    def test_wait_cannot_outscore_faster_available_execution(self):
+        peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                    running=16, busy=13, queued=0, preparing=0, returning=0)),
+                 self.peer(stats_response(cpus=8, cores=4, jobs=8, capacity=2,
+                    running=3, busy=3, queued=0, preparing=0, returning=0))]
+        hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={1 if i == 0 else .56}',
+                                  slots=16 if i == 0 else 8) for i, p in enumerate(peers))
+        self.start_broker(hosts)
+        # A mixed-memory worker cannot start now. Its queued latency must not
+        # compete against the available worker's larger throughput penalty.
+        _, net = self.acquire_reserved(10, (1400, 64 * 1024 * 1024, 2))
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+
     def test_saturated_external_cpu_does_not_drop_displacement_penalty(self):
         for running, smt in ((3, .25), (4, .25), (5, .25), (4, 1e-15), (4, 0), (4, -.1)):
             with self.subTest(running=running, smt=smt):

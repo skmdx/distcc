@@ -104,22 +104,10 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
 {
     struct dcc_server_load load;
     dcc_prefork_status(&load);
-    int link = description->kind == DCC_JOB_LINK, probing = 0;
+    int link = description->kind == DCC_JOB_LINK;
     unsigned memory_class = dcc_resource_class(description);
-    unsigned long long reserved = 0;
-    for (int i = 0; i < worker_count; ++i) {
-        struct worker *w = &workers[i];
-        if (!w->busy || !w->reservation) continue;
-        unsigned long long charge = w->reservation;
-        if (w->tcp) {
-            unsigned long long estimate = dcc_resource_estimate(w->memory_class);
-            if (estimate > charge) charge = estimate;
-            probing |= !dcc_resource_known(w->memory_class);
-        }
-        reserved = charge <= ULLONG_MAX - reserved ? reserved + charge : ULLONG_MAX;
-    }
     if (load.busy >= dcc_cpu_perf_limit(dcc_max_kids) ||
-        !dcc_resource_admit(memory_class, reserved, probing) ||
+        !dcc_resource_admit(memory_class, load.reserved, load.probing) ||
         (link && load.links)) return 0;
     for (int i = 0; i < worker_count; ++i) {
         struct worker *w = &workers[i];
@@ -193,6 +181,15 @@ int dcc_prefork_status(struct dcc_server_load *load)
     for (i = 0; i < worker_count; ++i) {
         load->busy += workers[i].fd >= 0 && workers[i].busy == EXECUTING;
         load->links += workers[i].fd >= 0 && workers[i].busy == EXECUTING && workers[i].link;
+        struct worker *w = &workers[i];
+        if (!w->busy || !w->reservation) continue;
+        unsigned long long charge = w->reservation;
+        if (w->tcp) {
+            unsigned long long estimate = dcc_resource_estimate(w->memory_class);
+            if (estimate > charge) charge = estimate;
+            load->probing |= !dcc_resource_known(w->memory_class);
+        }
+        load->reserved = charge <= ULLONG_MAX - load->reserved ? load->reserved + charge : ULLONG_MAX;
     }
     for (i = 0; i < MAX_PENDING; ++i)
         load->queued += pending[i].fd >= 0 && pending[i].ready;

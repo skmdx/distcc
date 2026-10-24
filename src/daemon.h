@@ -46,6 +46,8 @@ void dcc_reap_kids(int must_reap);
 int dcc_preforking_parent(int listen_fd);
 struct dcc_server_load {
     int busy, queued, links, preparing, returning;
+    int probing;
+    unsigned long long reserved;
 };
 #ifdef __linux__
 struct pollfd;

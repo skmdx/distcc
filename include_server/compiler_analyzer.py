@@ -76,6 +76,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
     self.contexts = collections.OrderedDict()
+    self.frontends = {}
     self.command = None
     self.snapshots = None
     self.system_includes = ()
@@ -154,14 +155,22 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     if len(sections) != 2:
       raise basics.NotCoveredError('Compiler did not report implicit headers')
     _, implicit = sections
-    # Driver-provided macros identify its frontend independently of branding
-    # and release strings. The scanner decides whether the input is supported.
-    clang = '#define __clang__ ' in output
+    # Identify the selected frontend independently of job macro overrides.
+    # Shader preprocessing commonly uses -undef; -U/-D can also change the
+    # compiler's predefined names without changing the compiler itself.
+    identity_key = (compiler, identity.st_ino, identity.st_mtime_ns)
+    if identity_key not in self.frontends:
+      macros = run([compiler, '-x', 'c', '-E', '-dM', '/dev/null']).stdout.decode()
+      if '#define __clang__ ' in macros:
+        self.frontends[identity_key] = True
+      elif '#define __GNUC__ ' in macros:
+        self.frontends[identity_key] = False
+      else:
+        raise basics.NotCoveredError('Unsupported compiler for header analysis')
+    clang = self.frontends[identity_key]
     if clang:
       options = []
     else:
-      if '#define __GNUC__ ' not in output:
-        raise basics.NotCoveredError('Unsupported compiler for header analysis')
       options = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
       if not options:
         target = run([compiler, '-dumpmachine']).stdout.decode().strip()

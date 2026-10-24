@@ -555,8 +555,9 @@ int main(void) {
     assert(dcc_resource_bucket(0) == 0);
     assert(dcc_resource_bucket(ULLONG_MAX) == 63);
     assert(!dcc_resource_known(small));
-    assert(dcc_resource_class_slots(16, small) == -1);
-    assert(dcc_resource_class_slots(16, pump) == -1);
+    assert(dcc_resource_class_slots(16, small, 0, 0) == -1);
+    assert(dcc_resource_class_slots(16, small, 0, 1) == 0);
+    assert(dcc_resource_class_slots(16, pump, 0, 0) == -1);
     assert(dcc_resource_input_bytes(&job) == 2048);
     assert(dcc_resource_estimate(small) == 512*M);
     assert(!dcc_resource_admit(small, 0, 1));
@@ -565,7 +566,7 @@ int main(void) {
     assert(dcc_resource_known(small));
     assert(!dcc_resource_known(large));
     assert(dcc_resource_estimate(large) == 512*M);
-    int small_slots = dcc_resource_class_slots(16, small);
+    int small_slots = dcc_resource_class_slots(16, small, 0, 0);
     assert(small_slots > 0);
     dcc_resource_observe(large, 896*M, 1);
     assert(dcc_resource_job_bytes() == 1184*M);
@@ -574,8 +575,8 @@ int main(void) {
     assert(dcc_resource_estimate(pump) == 1184*M);
     assert(!dcc_resource_known(pump));
     /* Both may still fit all CPU slots on a high-memory test host. */
-    assert(dcc_resource_class_slots(16, large) <= small_slots);
-    assert(dcc_resource_class_slots(16, small) == small_slots);
+    assert(dcc_resource_class_slots(16, large, 0, 0) <= small_slots);
+    assert(dcc_resource_class_slots(16, small, 0, 0) == small_slots);
     /* Later smaller successes must not erase the class's observed demand. */
     dcc_resource_observe(large, 64*M, 1);
     assert(dcc_resource_estimate(large) == 1184*M);
@@ -585,6 +586,11 @@ int main(void) {
     assert(dcc_resource_samples() == 3);
     assert(dcc_resource_peak_bytes() == 1536*M);
     assert(!dcc_resource_admit(small, ULLONG_MAX, 0));
+    assert(dcc_resource_class_slots(16, small, ULLONG_MAX, 0) == 0);
+    unsigned long long light = dcc_resource_estimate(small);
+    unsigned long long heavy = dcc_resource_estimate(large);
+    assert(dcc_resource_class_slots(16, large, 2*light, 0) >=
+           dcc_resource_class_slots(16, large, 2*heavy, 0));
     /* Every job kind must retain calibration, including the last bucket.
      * Otherwise that kind remains an unknown, serialized probe forever. */
     input.plain_size = ULLONG_MAX;
@@ -599,7 +605,7 @@ int main(void) {
     dcc_resource_observe(large, ULLONG_MAX, 1);
     assert(dcc_resource_job_bytes() == ULLONG_MAX);
     assert(dcc_resource_estimate(large) == ULLONG_MAX);
-    assert(dcc_resource_class_slots(16, large) == 0);
+    assert(dcc_resource_class_slots(16, large, 0, 0) == 0);
     assert(!dcc_resource_admit(large, 0, 0));
     assert(dcc_resource_estimate(small) == 256*M);
     unsetenv("DISTCC_MEMORY_LEARNING");
@@ -607,7 +613,7 @@ int main(void) {
     assert(dcc_resource_spare_bytes() == 128*M);
     assert(dcc_resource_estimate(large) == 512*M);
     assert(dcc_resource_known(pump));
-    assert(dcc_resource_class_slots(16, 1 + 63) > 0);
+    assert(dcc_resource_class_slots(16, 1 + 63, 0, 0) > 0);
     return 0;
 }''')
             executable=root/'memory'
@@ -622,6 +628,17 @@ class CpuPerfTest(DistccTestCase):
     # Deliberately above hardware frequency, making a measurable reduction
     # without changing the machine's governor or frequency limits.
     daemon_env = {'DISTCC_CPU_FREQ_REF': '10000000,10000000,10000000'}
+
+    def test_stats_eof_when_request_arrives_after_response(self):
+        for unused in range(50):
+            with socket.create_connection(('127.0.0.1', self.stats_ports[0]), timeout=1) as sock:
+                # The stats endpoint also serves clients that send no request.
+                # Race a late request against closing the response socket.
+                response = sock.recv(4096)
+                sock.sendall(b'GET / HTTP/1.0\r\n\r\n')
+                while chunk := sock.recv(4096):
+                    response += chunk
+                self.assertIn(b'</distccstats>', response)
 
     def test_live_sampling_idle_and_global_recovery(self):
         if not list(Path('/sys/devices/system/cpu/cpufreq').glob('policy*/cpuinfo_avg_freq')):

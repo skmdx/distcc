@@ -452,6 +452,16 @@ read -r proceed || exit 1
 
 
 class PreprocessTest(PumpTestCase):
+    def test_shader_preprocessing_and_frontend_macro_overrides(self):
+        self.source.write_text('#ifdef WR_VERTEX_SHADER\n'
+                               'layout(location=0) in vec4 position;\n'
+                               'void main() { gl_Position = position; }\n#endif\n')
+        for compiler in ('gcc', 'clang'):
+            for options in (['-undef'], ['-U__clang__', '-U__GNUC__'],
+                            ['-D__clang__=1'] if compiler == 'gcc' else ['-U__clang__']):
+                with self.subTest(compiler=compiler, options=options):
+                    self.compare(compiler, ['-xc', '-P', '-DWR_VERTEX_SHADER=1', *options])
+
     def test_guarded_header_aliases_compile_remotely(self):
         header, alias = self.work / 'real.h', self.work / 'alias.h'
         declarations = 'struct Once { int member; };\nint value;\nconst char *path = __FILE__;\n'

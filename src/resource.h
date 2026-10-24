@@ -12,8 +12,9 @@ unsigned dcc_resource_class(const struct dcc_job *);
 unsigned long long dcc_resource_input_bytes(const struct dcc_job *);
 int dcc_resource_known(unsigned memory_class);
 unsigned long long dcc_resource_estimate(unsigned memory_class);
-/* -1 requires one calibration; zero denies work; positive values are slots. */
-int dcc_resource_class_slots(int maximum, unsigned memory_class);
+/* Additional slots after existing reservations; -1 allows one calibration. */
+int dcc_resource_class_slots(int maximum, unsigned memory_class,
+                             unsigned long long reserved, int probing);
 int dcc_resource_admit(unsigned memory_class, unsigned long long reserved, int probing);
 void dcc_resource_observe(unsigned memory_class, unsigned long long peak_bytes, int success);
 unsigned long long dcc_resource_job_bytes(void);

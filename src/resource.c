@@ -301,12 +301,17 @@ int dcc_resource_slots(int maximum)
     return resource_slots(maximum, dcc_resource_job_bytes(), dcc_resource_spare_bytes(), 1);
 }
 
-int dcc_resource_class_slots(int maximum, unsigned memory_class)
+int dcc_resource_class_slots(int maximum, unsigned memory_class,
+                             unsigned long long reserved, int probing)
 {
+    if (maximum <= 0 || !dcc_resource_admit(memory_class, reserved, probing)) return 0;
+    if (!dcc_resource_known(memory_class)) return -1;
     unsigned long long job = dcc_resource_estimate(memory_class);
-    if (!dcc_resource_known(memory_class))
-        return resource_slots(1, job, 0, 0) ? -1 : 0;
-    return resource_slots(maximum, job, job / 4, 1);
+    unsigned long long spare = reserved ? dcc_resource_spare_bytes() : 0;
+    unsigned long long free = budget - reserved;
+    if (available < free) free = available;
+    unsigned long long slots = (free - spare) / job;
+    return slots < (unsigned)maximum ? (int)slots : maximum;
 }
 
 int dcc_resource_admit(unsigned memory_class, unsigned long long reserved, int probing)

@@ -458,17 +458,30 @@ dcc_free_mem %d MB\n\
     dcc_cpu_topology(&ncpus, &ncores, &core_scale, &smt_gain);
     dcc_cpu_perf_get(&perf);
     int cpu_limit = dcc_cpu_perf_limit(dcc_max_kids);
-    size_t capacity_length = 0, pump_length = 0;
-    for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
-        capacity_length += snprintf(compile_capacity + capacity_length,
-            sizeof(compile_capacity) - capacity_length, "%s%d", i ? "," : "",
-            dcc_resource_class_slots(cpu_limit, 1 + DCC_JOB_COMPILE * DCC_MEMORY_BUCKETS + i));
-        pump_length += snprintf(pump_capacity + pump_length,
-            sizeof(pump_capacity) - pump_length, "%s%d", i ? "," : "",
-            dcc_resource_class_slots(cpu_limit, 1 + DCC_JOB_PUMP * DCC_MEMORY_BUCKETS + i));
-    }
 #ifdef __linux__
     admission = dcc_prefork_status(&load);
+#endif
+    int active = load.busy > 0 ? load.busy : 0;
+    size_t capacity_length = 0, pump_length = 0;
+    for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
+        int compile = dcc_resource_class_slots(cpu_limit - active,
+            1 + DCC_JOB_COMPILE * DCC_MEMORY_BUCKETS + i, load.reserved, load.probing);
+        int pump = dcc_resource_class_slots(cpu_limit - active,
+            1 + DCC_JOB_PUMP * DCC_MEMORY_BUCKETS + i, load.reserved, load.probing);
+        /* The broker compares total occupancy against this limit. Charge
+         * running jobs by their own classes, then add incoming-class slots. */
+        if (compile >= 0) compile += active;
+        if (pump >= 0) pump += active;
+        if (compile > cpu_limit) compile = cpu_limit;
+        if (pump > cpu_limit) pump = cpu_limit;
+        capacity_length += snprintf(compile_capacity + capacity_length,
+            sizeof(compile_capacity) - capacity_length, "%s%d", i ? "," : "",
+            compile);
+        pump_length += snprintf(pump_capacity + pump_length,
+            sizeof(pump_capacity) - pump_length, "%s%d", i ? "," : "",
+            pump);
+    }
+#ifdef __linux__
     capacity = dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids));
     available = capacity - load.busy;
     if (available < 0) available = 0;
@@ -488,6 +501,7 @@ dcc_free_mem %d MB\n\
         strcpy(dcc_stats.longest_job_compiler, "none");
 
     acc_fd = accept(http_fd, (struct sockaddr *) &cli_addr, &cli_len);
+    if (acc_fd < 0) return;
     if (dcc_check_client((struct sockaddr *)&cli_addr,
                          (int) cli_len,
                          opt_allowed) == 0) {
@@ -538,10 +552,9 @@ dcc_free_mem %d MB\n\
         dcc_writex(acc_fd, reply, reply_len);
     }
 
-    /* Don't think we need this to prevent RST anymore, since we read() now */
-#if 0
-    shutdown(acc_fd, SHUT_WR); /* prevent connection reset */
-#endif
+    /* A request can arrive after the nonblocking drain. Send EOF after the
+     * response before close can reset a socket with unread incoming bytes. */
+    shutdown(acc_fd, SHUT_WR);
     dcc_close(acc_fd);
 }
 
