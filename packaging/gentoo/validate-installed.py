@@ -24,6 +24,16 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_TESTING_INCLUDE_SERVER='1',
                DISTCC_VERBOSE='1', DISTCC_LOG=str(root/'client.log'), CCACHE_DISABLE='1')
     env['DISTCC_BROKER'] = str(root/'broker.sock')
+    def report_failure(error_type, error, traceback):
+        if error_type is not None:
+            for name in ('client.log', 'broker.log'):
+                path = root / name
+                if path.exists():
+                    with path.open('rb') as log:
+                        log.seek(max(0, path.stat().st_size - 16384))
+                        print(f'Validation failure: {name}\n' + log.read().decode(errors='replace'),
+                              file=sys.stderr)
+    resources.push(report_failure)
     broker_log = resources.enter_context((root/'broker.log').open('w'))
     broker = subprocess.Popen(['/usr/bin/distccd', '--broker', env['DISTCC_BROKER']],
                               env=env, stdout=broker_log, stderr=broker_log)

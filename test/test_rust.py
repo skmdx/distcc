@@ -444,6 +444,34 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         subprocess.run([self.work / 'sandbox-check'], check=True)
 
+    def test_independent_clients_share_cold_inputs(self):
+        import concurrent.futures
+        import threading
+        source = self.work / 'cold.rs'
+        source.write_text('pub fn size() -> usize { include_bytes!("cold.bin").len() }')
+        (self.work / 'cold.bin').write_bytes(b'cold shared input\n' * (256 * 1024))
+        path = self.env['PATH']
+        clients = []
+        for index in range(5):
+            self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name=f'cold-{index}')
+            state = self.work / f'client-{index}'
+            state.mkdir()
+            clients.append(dict(self.env, PATH=path, DISTCC_DIR=str(state), DISTCC_VERBOSE='1'))
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        for attempt in range(3):
+            self.restart_server(self.build / 'distccd', DISTCC_MEMORY_LEARNING='1',
+                                DISTCCD_FILE_CACHE=str(self.work / f'cold-cache-{attempt}'))
+            start = threading.Barrier(len(clients))
+            def build(index):
+                start.wait(timeout=5)
+                return self.rust('--crate-name=cold', '--crate-type=rlib', '-Ctarget-cpu=native', source,
+                                 '-o', self.work / f'libcold-{attempt}-{index}.rlib', env=clients[index])
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(clients)) as pool:
+                results = list(pool.map(build, range(len(clients))))
+            for result in results:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-rust: compiled on', result.stderr)
+
     def test_cached_inputs_and_parallel_crates(self):
         import concurrent.futures
         self.restart_server(self.build / 'distccd', DISTCC_MEMORY_LEARNING='1')
