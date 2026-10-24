@@ -369,14 +369,15 @@ class RustTest(BrokerTestCase):
     def test_input_budget_waits_then_compiles_and_reclaims_cancelled_jobs(self):
         import concurrent.futures
 
-        # Reserve most of the real worker budget without sending a large file.
+        # Reserve most of the real input filesystem without sending a large file.
         # The NEED response proves admission; the real Rust job must then wait
         # for that reservation to be released instead of losing its connection.
         def reserve(identity):
             def string(value):
                 return struct.pack('!Q', len(value)) + value
             args = [b'gcc', b'-c', b'/src/held.c', b'-o', b'/src/held.o']
-            size = 500 * 1024 * 1024
+            space = os.statvfs(self.root)
+            size = space.f_bavail * space.f_frsize - 8 * 1024 * 1024
             manifest = struct.pack('!4Q', identity, 1, len(args), 2) + string(b'/src')
             manifest += b''.join(map(string, args))
             manifest += (struct.pack('!6Q', 0, 0, 0, size, size, identity) +

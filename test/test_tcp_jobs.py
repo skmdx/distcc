@@ -651,6 +651,28 @@ ssize_t write(int fd, const void *data, size_t size) {
         hit = self.wire_job(body)
         self.result(hit)  # No NEED on the warm cache path.
 
+    def test_owner_disconnect_during_waiter_lookup_requests_input_once(self):
+        body = b'int cancel_during_lookup(void) { return 903; }\n'
+        owner = self.wire_job(body)
+        self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
+        paths = [b'/anchor/source.c', b'/progress/source.c']
+        paths += [f'/remaining_{i}/source.c'.encode() for i in range(3000)]
+        paths += [b'/done/source.c']
+        waiter = self.wire_job(body, paths=paths)
+        deadline = time.monotonic() + 5
+        while not (roots := list(self.root.glob('distcc-tcp-*/progress'))):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.001)
+        # The second directory appears after the first cache miss registered
+        # this job as a waiter. Later lookups are still pending.
+        self.assertFalse((roots[0].parent / 'done').exists())
+        owner.close()
+        kind, requested = self.frame(waiter)
+        self.assertEqual(kind, 0x54000201)
+        self.assertEqual(len(requested), 4)
+        self.upload(waiter, body, struct.unpack('!I', requested)[0])
+        self.result(waiter)  # A duplicate NEED is a protocol error here.
+
     def test_parallel_cache_waiters_share_upload(self):
         body = b'int single_upload_for_all(void) { return 902; }\n'
         owner = self.wire_job(body)

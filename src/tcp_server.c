@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <xxhash.h>
@@ -64,7 +65,7 @@ struct dcc_tcp_server {
     struct input *inputs;
     unsigned remaining, input_index, output_index, prepared;
     uint64_t input_offset, output_offset, reserved, input_bytes, result_bytes;
-    uint64_t input_pending; /* Payload not yet charged to the shared input budget. */
+    uint64_t input_pending; /* File bytes not yet materialized in the private tree. */
     int result_pending;
     XXH3_state_t *hash;
     struct dcc_job_result result;
@@ -82,6 +83,7 @@ struct dcc_tcp_server {
 /* The parent event loop alone owns these. Children abandon inherited FDs. */
 static struct upload *uploads[256];
 static uint64_t retained;
+static uint64_t storage_pending;
 static uint64_t returning_bytes;
 static unsigned waiting_results;
 static struct dcc_tcp_server *ready_head, **ready_tail = &ready_head;
@@ -206,6 +208,9 @@ static void need(struct input *in)
 {
     unsigned char index[4];
     in->wanted = 1;
+    /* Preparation batches all wanted inputs. A promoted waiter must not
+     * also send an early NEED that the final batch would repeat. */
+    if (in->server->prepared < in->server->job->count) return;
     dcc_tcp_put32(index, in->index);
     queue(in->server, DCC_TCP_NEED, index, sizeof(index));
 }
@@ -269,6 +274,7 @@ static void cleanup_complete(void *argument)
 }
 static void release_inputs(struct dcc_tcp_server *s)
 {
+    if (s->inputs) storage_pending -= s->input_pending;
     if (s->job) for (unsigned i = 0; i < s->job->count; ++i) {
         if (s->inputs) {
             detach(&s->inputs[i]);
@@ -434,6 +440,7 @@ static int prepare(struct dcc_tcp_server *s)
     strcpy(s->run.root, canonical); free(canonical);
     s->inputs = calloc(s->job->count ? s->job->count : 1, sizeof(*s->inputs));
     if (!s->inputs) { free(paths); return -1; }
+    storage_pending += s->input_pending;
     for (unsigned i = 0; i < s->job->count; ++i) paths[i] = s->job->inputs[i].path;
     qsort(paths, s->job->count, sizeof(*paths), path_order);
     /* Check all ancestors, not merely adjacent lexicographic entries. */
@@ -453,18 +460,29 @@ static int prepare(struct dcc_tcp_server *s)
     return 0;
 }
 
-/* A valid job can exceed the currently free budget without exceeding the
- * per-job bound. Keep its small metadata and stop reading its socket until
- * another tree is reclaimed; a busy worker must not truncate the request. */
+/* Keep metadata while waiting for file space; a busy worker must not
+ * truncate a valid request merely because another input tree is live. */
+static int input_space(const struct dcc_tcp_server *s)
+{
+    const char *directory;
+    struct statvfs space;
+    if (dcc_get_tmp_top(&directory) || statvfs(directory, &space)) return -1;
+    uint64_t available = (uint64_t)space.f_bavail * space.f_frsize;
+    return storage_pending <= available && s->input_pending <= available - storage_pending;
+}
 static int prepare_available(struct dcc_tcp_server *s)
 {
-    size_t drain = returning_bytes ? DCC_TCP_CHUNK + 16U : 0;
-    if (waiting_results || s->input_pending + drain > DCC_TCP_BYTES - retained) return 0;
-    retained += s->input_pending;
-    s->reserved += s->input_pending;
-    s->input_bytes += s->input_pending;
-    s->input_pending = 0;
+    int available = input_space(s);
+    if (available <= 0 || waiting_results) return available < 0 ? -1 : 0;
+    /* Inputs live in files, not the framing heap. Reserve unwritten bytes
+     * against their filesystem; completed files are reflected by statvfs. */
     return prepare(s) ? -1 : 1;
+}
+static void input_stored(struct input *in)
+{
+    uint64_t size = in->server->job->inputs[in->index].plain_size;
+    in->server->input_pending -= size;
+    storage_pending -= size;
 }
 static int input_missing(struct dcc_tcp_server *s, unsigned i)
 {
@@ -504,6 +522,7 @@ static void lookup_complete(void *argument)
         rs_trace("TCP input %u cache lookup failed", s->prepared);
         s->failed = 1;
     }
+    if (s->cache_hit > 0) input_stored(&s->inputs[s->prepared]);
     ++s->prepared;
     if (s->prepared == s->job->count && prepare_inputs(s)) s->failed = 1;
     if (s->socket < 0) dcc_tcp_server_free(s);
@@ -569,20 +588,22 @@ static int begin(struct dcc_tcp_server *s, struct dcc_tcp_frame *f)
     /* Include the encoded manifest, decoded strings and input bookkeeping,
      * in addition to the incoming frame already charged by the parser. */
     uint64_t metadata_bytes = 3 * f->size + s->job->count * sizeof(struct input);
-    uint64_t amount = metadata_bytes;
+    uint64_t amount = 0;
     for (unsigned i = 0; i < s->job->count; ++i) {
+        if (s->job->inputs[i].fd >= 0) continue;
         uint64_t size = s->job->inputs[i].plain_size;
-        if (size > DCC_TCP_BYTES - amount) return -1;
+        if (size > UINT64_MAX - amount) return -1;
         amount += size;
     }
     if (metadata_bytes > DCC_TCP_BYTES - retained) return -1;
     retained += metadata_bytes;
     s->reserved = s->input_bytes = metadata_bytes;
-    s->input_pending = amount - metadata_bytes;
+    s->input_pending = amount;
     return prepare_available(s) < 0 ? -1 : 0;
 }
 static void completed_input(struct input *in)
 {
+    input_stored(in);
     in->wanted = 0; --in->server->remaining;
 }
 static void decode_input(void *argument)
@@ -850,8 +871,7 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
     if (s->job && s->phase == PREPARING && !s->inputs) {
         p->events = POLLRDHUP;
         p->revents = 0;
-        size_t drain = returning_bytes ? DCC_TCP_CHUNK + 16U : 0;
-        return !waiting_results && s->input_pending + drain <= DCC_TCP_BYTES - retained;
+        return !waiting_results && input_space(s) != 0;
     }
     if (s->result_pending) {
         p->events = POLLRDHUP;
