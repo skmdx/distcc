@@ -26,6 +26,11 @@ public:
     std::string translate(const llvm::Twine &path) const {
         auto name = path.str();
         if (!original.empty() && name == original) return physical;
+        // FileManager resolves the main file's directory before opening it.
+        // A preprocessed job carries only the source image, not that tree.
+        if (!pump && !original.empty() &&
+            name == llvm::sys::path::parent_path(original))
+            return llvm::sys::path::parent_path(physical).str();
         if (!root.empty() && name != root && !llvm::StringRef(name).starts_with(root + "/")) {
             std::string absolute = llvm::sys::path::is_absolute(name) ? name : cwd + "/" + name;
             llvm::SmallString<256> normalized(absolute);

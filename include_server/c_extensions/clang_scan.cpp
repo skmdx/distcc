@@ -1,5 +1,6 @@
 /* Compiler-backed include discovery. SPDX-License-Identifier: GPL-2.0-or-later */
 #include <Python.h>
+#include <optional>
 #include <clang/Basic/Version.h>
 #include <clang/Basic/DiagnosticLex.h>
 #include <clang/Frontend/CompilerInstance.h>
@@ -42,9 +43,13 @@ struct Image {
     Stamp stamp;
     llvm::vfs::Status info;
     std::string bytes;
-    bool modules;
+    mutable std::optional<bool> modules;
     Image(const Stamp &stamp, llvm::vfs::Status info, std::string bytes)
-        : stamp(stamp), info(info), bytes(std::move(bytes)), modules(requiresModules(this->bytes)) {}
+        : stamp(stamp), info(info), bytes(std::move(bytes)) {}
+    bool hasModules() const {
+        if (!modules) modules = requiresModules(bytes);
+        return *modules;
+    }
 };
 using Images = std::map<std::string, std::shared_ptr<const Image>>;
 // Retain only the previous request's bytes, not its lookup results. Each scan
@@ -68,7 +73,6 @@ public:
 
 class Inputs : public llvm::vfs::ProxyFileSystem {
     std::string cwd;
-    size_t bytes = 0;
 public:
     std::map<std::string, Stamp> stamps;
     Images contents;
@@ -101,22 +105,16 @@ public:
             std::shared_ptr<const Image> image;
             if (previous != previous_inputs.end() && stamps.at(key) == previous->second->stamp)
                 image = previous->second;
-            // Bound a single request independently of the surrounding build.
-            if (image && image->bytes.size() > 64 * 1024 * 1024 - bytes)
-                return std::make_error_code(std::errc::file_too_large);
             if (!image) {
                 auto file = getUnderlyingFS().openFileForRead(name);
                 if (!file) return file.getError();
                 auto info = (*file)->status();
                 if (!info) return info.getError();
-                if (info->getSize() > 64 * 1024 * 1024 - bytes)
-                    return std::make_error_code(std::errc::file_too_large);
                 auto buffer = (*file)->getBuffer(name);
                 if (!buffer) return buffer.getError();
                 image = std::make_shared<Image>(stamps.at(key), *info, (*buffer)->getBuffer().str());
                 observe(key);
             }
-            bytes += image->bytes.size();
             it = contents.emplace(key, std::move(image)).first;
         }
         return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(it->second->info, it->second->bytes));
@@ -236,7 +234,7 @@ PyObject *scan(PyObject *, PyObject *arguments) {
                 !inputs->openFileForRead(path)) ok = false;
         for (const auto &path : result.dependencies) {
             auto it = inputs->contents.find(inputs->path(path));
-            if (it != inputs->contents.end() && it->second->modules)
+            if (it != inputs->contents.end() && it->second->hasModules())
                 result.unsupported = true;
         }
         ok = inputs->validate() && ok && !result.unsupported;
@@ -250,7 +248,11 @@ PyObject *scan(PyObject *, PyObject *arguments) {
     PyObject *files = PyDict_New(), *paths = PyDict_New(), *deps = PyList_New(0);
     if (!files || !paths || !deps) { Py_XDECREF(files); Py_XDECREF(paths); Py_XDECREF(deps); return nullptr; }
     bool success = true;
-    for (const auto &entry : inputs->contents) {
+    // Clang also opens code-generation data such as indexed PGO profiles.
+    // Their transfer is owned by the job's auxiliary-input handling; only
+    // preprocessor dependencies need Python snapshots or module scanning.
+    for (const auto &path : result.dependencies) {
+        const auto &entry = *inputs->contents.find(inputs->path(path));
         PyObject *key = PyUnicode_DecodeFSDefault(entry.first.c_str());
         PyObject *data = PyBytes_FromStringAndSize(entry.second->bytes.data(), entry.second->bytes.size());
         if (!key || !data || PyDict_SetItem(files, key, data) < 0) success = false;

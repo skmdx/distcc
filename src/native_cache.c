@@ -170,7 +170,7 @@ char *dcc_native_cache_key(char *argv[], const char *input, const char *output)
         if (*arg == '@' || !strncmp(arg, "-B", 2) || strstr(arg, "specs") ||
             strstr(arg, "--config") || strstr(arg, "toolchain") ||
             strstr(arg, "--sysroot") || strstr(arg, "-isysroot") ||
-            !strcmp(arg, "-Xclang") || strstr(arg, "plugin")) key->failed = 1;
+            !strcmp(arg, "-Xclang") || !strncmp(arg, "-fplugin", 8)) key->failed = 1;
         /* Dependency destinations and make targets do not affect native CPU
          * options. Keep them in the real command, not the probe identity. */
         if (!strncmp(arg, "-MF", 3) || !strncmp(arg, "-MT", 3) ||

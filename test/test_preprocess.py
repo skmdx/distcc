@@ -1412,11 +1412,16 @@ class TcpPreprocessTest(PreprocessTest):
                        cwd=self.work, check=True, capture_output=True)
         (self.work / 'default.profdata').hardlink_to(self.work / 'training.profdata')
         records, worker = self.work / 'profile-inodes', self.work / 'clang-worker'
-        worker.write_text('#!/usr/bin/python3\nimport os, sys\nfrom pathlib import Path\n' +
+        worker.write_text('#!/usr/bin/python3\nimport os, sys, time\nfrom pathlib import Path\n' +
             'profile = next(Path(sys.argv[1]).rglob("*.profdata"))\n' +
             'st = profile.stat()\n' +
             'with open(' + repr(str(records)) + ', "a") as out:\n' +
             '    out.write(f"{st.st_ino} {st.st_nlink} {st.st_mode & 0o777}\\n")\n' +
+            'if st.st_size > 64 * 1024 * 1024:\n' +
+            '    deadline = time.monotonic() + 10\n' +
+            '    while len(Path(' + repr(str(records)) + ').read_text().splitlines()) < 10:\n' +
+            '        if time.monotonic() > deadline: raise RuntimeError("second profile reader did not arrive")\n' +
+            '        time.sleep(.01)\n' +
             'os.execv(' + repr(str(self.build / 'distcc-clang')) + ', [' +
             repr(str(self.build / 'distcc-clang')) + ', *sys.argv[1:]])\n')
         worker.chmod(0o755)
@@ -1443,10 +1448,27 @@ class TcpPreprocessTest(PreprocessTest):
         after = self.get_stats(self.stats_ports[0])
         self.assertEqual(int(re.search(r'dcc_compile_ok (\d+)', after)[1]) -
                          int(re.search(r'dcc_compile_ok (\d+)', before)[1]), 8)
+        self.assertNotIn('include server gave up analyzing', (self.work / 'client.log').read_text())
         inodes = [tuple(map(int, row.split())) for row in records.read_text().splitlines()]
         self.assertEqual(len(inodes), 8)
         self.assertEqual(len({row[0] for row in inodes}), 1, 'profile was copied between jobs')
         self.assertTrue(all(links >= 2 and mode == 0o400 for _, links, mode in inodes))
+        # Large idle inputs are reclaimed; concurrent consumers must still pin
+        # one shared inode, including profiles larger than the old scan limit.
+        with (self.work / 'training.profdata').open('ab') as profile:
+            profile.truncate(65 * 1024 * 1024)
+        def compile_large(index):
+            return self.run_cc(compiler, ['-O2', '-fprofile-use=training.profdata',
+                                         '-c', self.source, '-o', f'large{index}.o'])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(compile_large, range(2)))
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertNotIn('include server gave up analyzing', (self.work / 'client.log').read_text())
+        large = [tuple(map(int, row.split())) for row in records.read_text().splitlines()[8:]]
+        self.assertEqual(len(large), 2)
+        self.assertEqual(large[0][0], large[1][0], 'concurrent large profiles were copied')
+        self.assertTrue(all(links >= 2 and mode == 0o400 for _, links, mode in large))
 
     compression = 'lz4s'
     transport = ',tcp'

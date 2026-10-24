@@ -123,6 +123,41 @@ with tempfile.TemporaryDirectory() as directory:
     self.assertEqual(status, 0)
     self.assertTrue(output.is_file())
 
+  def test_preprocessed_source_identity_without_client_directory(self):
+    assert self.compiler is not None
+    original = self.root / 'absent-client' / 'nested' / 'source.c'
+    self.assertFalse(original.parent.exists())
+    self.source.write_text('const char *identity = __FILE__;\nint main(void) { return 0; }\n')
+    output, executable = self.root / 'result.o', self.root / 'result'
+    status = clang_scan.compile(
+        [self.compiler, '-x', 'c', '-c', str(self.source), '-o', str(output)],
+        str(original), str(self.root), str(original.parent), False)
+    self.assertEqual(status, 0)
+    self.assertIn(os.fsencode(original), output.read_bytes())
+    subprocess.run([self.compiler, output, '-o', executable], check=True)
+    subprocess.run([executable], check=True)
+
+  def test_large_profile_is_not_a_header_snapshot(self):
+    assert self.compiler is not None
+    profdata = shutil.which('llvm-profdata')
+    if not profdata:
+      self.skipTest('llvm-profdata is required')
+    training, raw, profile = (self.root / name for name in ('training', 'data.profraw', 'data.profdata'))
+    self.source.write_text('int main(void) { return 0; }\n')
+    subprocess.run([self.compiler, '-fprofile-instr-generate', self.source, '-o', training], check=True)
+    subprocess.run([training], env=dict(os.environ, LLVM_PROFILE_FILE=str(raw)), check=True)
+    subprocess.run([profdata, 'merge', raw, '-o', profile], check=True)
+    # LLVM's indexed reader accepts trailing storage. Exercise the old request
+    # cutoff with real, valid profile data without generating millions of TUs.
+    with profile.open('ab') as stream:
+      stream.truncate(65 * 1024 * 1024)
+    for _ in range(2):
+      result = clang_scan.scan([self.compiler, '-fprofile-instr-use=' + str(profile),
+                               '-c', str(self.source)], str(self.root))
+      self.assertEqual(result['files'][str(self.source)], self.source.read_bytes())
+      self.assertNotIn(str(profile), result['files'])
+      self.assertIn(str(profile), result['lookups'])
+
   def test_driver_name_target_and_language_match_native(self):
     assert self.compiler is not None
     driver = self.root / 'aarch64-unknown-linux-gnu-clang++'

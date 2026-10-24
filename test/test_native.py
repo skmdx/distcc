@@ -107,6 +107,14 @@ int main(void) { float a[128] = {0}, b[128] = {3};
                 self.assertNotIn('native expansion cache hit', self.compare(compiler, ['-march=native', '-O2']))
                 self.assertIn('native expansion cache hit', self.compare(compiler, ['-march=native', '-O2']))
 
+    def test_backend_plugin_warning_does_not_disable_native_cache(self):
+        compiler = shutil.which('clang')
+        if not compiler:
+            self.skipTest('Clang is not installed')
+        flags = ['-march=native', '-Wno-error=backend-plugin']
+        self.compare(compiler, flags)
+        self.assertIn('native expansion cache hit', self.compare(compiler, flags))
+
     def test_cache_invalidates_configuration_and_environment(self):
         compiler = shutil.which('clang')
         if not compiler:
