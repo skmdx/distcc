@@ -158,7 +158,7 @@ char *dcc_native_cache_key(char *argv[], const char *input, const char *output)
     key = calloc(1, sizeof(*key));
     if (!key) return NULL;
     key->hash = ((__uint128_t)0x6c62272e07bb0142ULL << 64) | 0x62b821756295c58dULL;
-    append(key, "native-v2");
+    append(key, "native-v3");
     stamp(key, resolved);
     stamp(key, "/proc/self/ns/mnt");
     stamp(key, "/");
@@ -171,6 +171,15 @@ char *dcc_native_cache_key(char *argv[], const char *input, const char *output)
             strstr(arg, "--config") || strstr(arg, "toolchain") ||
             strstr(arg, "--sysroot") || strstr(arg, "-isysroot") ||
             !strcmp(arg, "-Xclang") || strstr(arg, "plugin")) key->failed = 1;
+        /* Dependency destinations and make targets do not affect native CPU
+         * options. Keep them in the real command, not the probe identity. */
+        if (!strncmp(arg, "-MF", 3) || !strncmp(arg, "-MT", 3) ||
+            !strncmp(arg, "-MQ", 3)) {
+            char option[] = {arg[0], arg[1], arg[2], 0};
+            if (!arg[3] && argv[i + 1]) i++;
+            append(key, option);
+            continue;
+        }
         if (!strcmp(arg, "-o") && argv[i + 1]) { i++; append(key, "-o"); continue; }
         if (input && !strcmp(arg, input)) arg = dcc_find_extension_const(input);
         else if (output && !strncmp(arg, "-o", 2) && !strcmp(arg + 2, output)) arg = "-o";

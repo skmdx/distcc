@@ -160,6 +160,25 @@ int main(void) { float a[128] = {0}, b[128] = {3};
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('native expansion cache hit', result.stderr)
 
+    def test_cache_shared_across_dependency_output_paths(self):
+        for compiler in ('gcc', shutil.which('clang')):
+            if not compiler:
+                continue
+            for joined in (False, True):
+                with self.subTest(compiler=compiler, joined=joined):
+                    for index in range(2):
+                        dependency = self.work / f'{index}.d'
+                        target = f'target{index}.o'
+                        quoted = f'quoted{index}.o'
+                        options = [('-MF', str(dependency)), ('-MT', target), ('-MQ', quoted)]
+                        flags = [option + value for option, value in options] if joined else [
+                            arg for pair in options for arg in pair]
+                        log = self.compare(compiler, ['-march=native', '-MD', *flags])
+                        self.assertIn(target, dependency.read_text())
+                        self.assertIn(quoted, dependency.read_text())
+                        if index:
+                            self.assertIn('native expansion cache hit', log)
+
     def test_unrecognized_probe_keeps_original_command_local(self):
         directory = self.work / 'compiler tools'
         directory.mkdir()
