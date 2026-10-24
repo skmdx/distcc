@@ -250,13 +250,16 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         subprocess.run([executable], check=True)
 
-    def test_transitive_macro_metadata_is_available_to_remote_rustc(self):
+    def test_transitive_macro_initializers_execute_on_client(self):
         deps = self.work / 'deps'
         deps.mkdir()
         macro, facade = self.work / 'derive.rs', self.work / 'facade.rs'
+        marker = self.work / 'initialized'
         macro.write_text('extern crate proc_macro;\n'
                          '#[proc_macro_derive(Marker)]\n'
-                         'pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream { "".parse().unwrap() }')
+                         'pub fn marker(_: proc_macro::TokenStream) -> proc_macro::TokenStream { "".parse().unwrap() }\n'
+                         'extern "C" fn initialize() { std::fs::write(' + json.dumps(str(marker)) + ', "client").unwrap(); }\n'
+                         '#[used] #[unsafe(link_section=".init_array")] static INIT: extern "C" fn() = initialize;')
         shared = deps / 'libderive.so'
         result = self.rust('--crate-type=proc-macro', macro, '-o', shared, remote=False)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -265,12 +268,15 @@ class RustTest(BrokerTestCase):
         result = self.rust('--crate-type=rlib', facade, '--extern', 'derive=' + str(shared),
                            '-o', rlib, remote=False)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(marker.read_text(), 'client')
+        marker.unlink()
         source, library = self.work / 'consumer.rs', self.work / 'libconsumer.rlib'
         source.write_text('extern crate facade; pub fn answer() -> u32 { facade::Value(42).0 }')
         result = self.rust('--crate-type=rlib', source, '--extern', 'facade=' + str(rlib),
                            '-L', 'dependency=' + str(deps), '-o', library)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('distcc-rust: compiled on', result.stderr)
+        self.assertIn('procedural macro executed through a transitive dependency', result.stderr)
+        self.assertEqual(marker.read_text(), 'client')
         main, executable = self.work / 'main.rs', self.work / 'transitive'
         main.write_text('fn main() { assert_eq!(consumer::answer(), 42); }')
         result = self.rust(main, '--extern', 'consumer=' + str(library),
@@ -335,6 +341,37 @@ class RustTest(BrokerTestCase):
                            '-o', self.work / 'libconsumer.rlib')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('distcc-rust: local:', result.stderr)
+
+    def test_transitive_procedural_macro_executes_on_client(self):
+        macro = self.work / 'macros.rs'
+        macro.write_text('extern crate proc_macro; use proc_macro::TokenStream; '
+                         '#[proc_macro] pub fn answer(_: TokenStream) -> TokenStream { "42".parse().unwrap() }')
+        library = self.work / 'libmacros.so'
+        result = self.rust('--crate-type=proc-macro', '-Ctarget-cpu=native', macro, '-o', library, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bridge = self.work / 'bridge.rs'
+        bridge.write_text('extern crate macros; pub use macros::answer;')
+        result = self.rust('--crate-type=rlib', bridge, '--extern', 'macros=' + str(library),
+                           '-o', self.work / 'libbridge.rlib', remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source = self.work / 'consumer.rs'
+        source.write_text('extern crate bridge; pub fn value() -> u32 { bridge::answer!() }')
+        output = self.work / 'libconsumer.rlib'
+        search = ('-L', 'dependency=' + str(self.work))
+        result = self.rust('--crate-type=rlib', '-Ctarget-cpu=native', source,
+                           '--extern', 'bridge=' + str(self.work / 'libbridge.rlib'), *search, '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('procedural macro executed through a transitive dependency', result.stderr)
+        main = self.work / 'main.rs'
+        main.write_text('fn main() { assert_eq!(consumer::value(), 42); }')
+        result = self.rust(main, '--extern', 'consumer=' + str(output), *search,
+                           '-o', self.work / 'check', remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([self.work / 'check'], check=True)
+        source.write_text('pub fn value() -> u32 { 42 }')
+        result = self.rust('--crate-type=rlib', source, *search, '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
 
     def test_cached_inputs_and_parallel_crates(self):
         import concurrent.futures

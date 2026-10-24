@@ -183,11 +183,18 @@ def plan(compiler, args, work):
     # and caller environment. A failure goes back through the original command.
     base = [(k, v) for k, v in opts if k not in ('--emit', '--out-dir', '-o')
             and not (k == '-C' and v.partition('=')[0] == 'incremental')]
+    loaded = work / 'loaded-libraries'
+    loaded.write_bytes(b'')
+    probe_env = dict(os.environ, DISTCC_RUST_LOADS=str(loaded),
+                     LD_PRELOAD=NATIVE_LIBRARY + ' ' + os.environ.get('LD_PRELOAD', ''))
     start = time.time_ns()
     probe = subprocess.run([compiler, *flatten(base), '--emit=dep-info=' + str(work / 'probe.d')],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=False)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=False, env=probe_env)
     if probe.returncode:
         raise LocalOnly('dependency expansion failed')
+    libraries = {p.resolve() for p in inputs if p.suffix == '.so'}
+    if any(Path(os.fsdecode(name)).resolve() in libraries for name in loaded.read_bytes().split(b'\0') if name):
+        raise LocalOnly('procedural macro executed through a transitive dependency')
     source_files, environment = dependencies(work / 'probe.d')
     inputs.update(source_files)
     if 'RUSTC_BOOTSTRAP' in os.environ:

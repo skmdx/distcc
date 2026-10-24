@@ -7,9 +7,13 @@
 #include <llvm/ADT/StringRef.h>
 
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <link.h>
+#include <unistd.h>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -74,6 +78,8 @@ const Profile &profile()
 namespace llvm::sys {
 StringRef getHostCPUName()
 {
+    if (!std::getenv("DISTCC_RUST_NATIVE"))
+        return original<StringRef (*)()>("_ZN4llvm3sys14getHostCPUNameEv")();
     static const std::string cpu = [] {
         const auto &p = profile();
         if (p.capture) {
@@ -91,6 +97,8 @@ StringRef getHostCPUName()
 
 extern "C" char *LLVMGetHostCPUFeatures()
 {
+    if (!std::getenv("DISTCC_RUST_NATIVE"))
+        return original<char *(*)()>("LLVMGetHostCPUFeatures")();
     static const std::string features = [] {
         const auto &p = profile();
         if (p.capture) {
@@ -110,4 +118,31 @@ extern "C" char *LLVMGetHostCPUFeatures()
     if (!result)
         fail("cannot allocate native features");
     return result;
+}
+
+/* The real dependency pass expands transitive procedural macros. Record the
+ * libraries it executes rather than interpreting Rust crate metadata. */
+extern "C" void *dlopen(const char *name, int flags)
+{
+    void *handle = original<void *(*)(const char *, int)>("dlopen")(name, flags);
+    int saved_errno = errno;
+    const char *path = std::getenv("DISTCC_RUST_LOADS");
+    if (handle && path) {
+        struct link_map *map;
+        if (dlinfo(handle, RTLD_DI_LINKMAP, &map)) fail("cannot inspect loaded library");
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+        if (fd < 0) fail("cannot record loaded library");
+        const char *data = map->l_name;
+        size_t remaining = std::strlen(data) + 1;
+        while (remaining) {
+            ssize_t size = write(fd, data, remaining);
+            if (size < 0 && errno == EINTR) continue;
+            if (size <= 0) fail("cannot record loaded library");
+            data += size;
+            remaining -= size;
+        }
+        close(fd);
+    }
+    errno = saved_errno;
+    return handle;
 }

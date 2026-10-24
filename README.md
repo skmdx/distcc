@@ -63,8 +63,9 @@ LLVM version. Install it on clients and workers before using distributed native
 jobs. A worker verifies that rustc consumed the profile before returning results.
 
 Final executable/native links, build scripts, procedural macro crates,
-explicit dynamic Rust dependencies and response files
-run locally. Unrelated procedural macros in a dependency search directory do
+explicit dynamic Rust dependencies and response files run locally. The client
+also records libraries loaded by the real dependency pass, keeping transitive
+procedural macro execution on the client CPU. Unrelated procedural macros in a dependency search directory do
 not prevent distribution. Local linking
 preserves access to native system libraries. Transport or toolchain failures
 retry locally unless `DISTCC_FALLBACK=0`. Failed remote compilations also retry
