@@ -288,31 +288,10 @@ def metadata(job, inputs, work):
             digest = xxhash.xxh3_64_digest(b'')
         entries.append((name, size, digest))
 
-    # Large Rust metadata files exceed the existing per-entry cache budget.
-    # Chunk them into ordinary cache entries; reassemble only inside the private
-    # worker tree. This keeps the cache's global bound and the RPC unchanged.
-    job['chunks'] = []
-    limit = 4 * 1024 * 1024
     for name, expected in sorted(inputs.items()):
-        if expected[2] <= limit:
-            dest = snapshots / str(len(entries))
-            snapshot(name, dest, expected)
-            add(str(name), dest)
-        else:
-            parts = []
-            with name.open('rb') as source:
-                if stamp(os.fstat(source.fileno())) != expected:
-                    raise LocalOnly('input changed after dependency discovery')
-                while content := source.read(limit):
-                    index = len(entries)
-                    dest = snapshots / str(index)
-                    dest.write_bytes(content)
-                    chunk = CONTROL + '/chunks/' + str(index)
-                    parts.append(chunk)
-                    add(chunk, dest)
-                if stamp(os.fstat(source.fileno())) != expected:
-                    raise LocalOnly('input changed during snapshot')
-            job['chunks'].append((str(name), parts))
+        dest = snapshots / str(len(entries))
+        snapshot(name, dest, expected)
+        add(str(name), dest)
     manifest = snapshots / str(len(entries))
     manifest.write_text(json.dumps(job))
     add(CONTROL + '/job.json', manifest)
@@ -343,17 +322,6 @@ def worker(root, archive):
             raise LocalOnly('invalid input path')
         return root / str(path).lstrip('/')
 
-    for name, parts in job['chunks']:
-        destination = rooted(name)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open('xb') as output:
-            for part in parts:
-                if not part.startswith(CONTROL + '/chunks/'):
-                    raise LocalOnly('invalid input chunk')
-                path = rooted(part)
-                with path.open('rb') as source:
-                    shutil.copyfileobj(source, output, 256 * 1024)
-                path.unlink()
     # Prefer the client's build, but let rustc and the eventual client link
     # decide compatibility. Version/LLVM differences are not rejection gates.
     # Executables still come from administrator-installed toolchains.
@@ -393,7 +361,8 @@ def worker(root, archive):
     # Bypass user PATH wrappers: namespace isolation and separate diagnostic
     # streams are part of the worker contract.
     sandbox = [shutil.which('bwrap', path=os.defpath) or '/usr/bin/bwrap',
-               '--unshare-all', '--die-with-parent', '--bind', str(root), '/']
+               '--unshare-all', '--die-with-parent', '--bind', str(root), '/',
+               '--bind', str(rooted(str(output))), str(output)]
     for path in RUNTIME:
         if Path(path).exists():
             sandbox.extend(['--ro-bind', path, path])
@@ -414,9 +383,13 @@ def worker(root, archive):
                 raise LocalOnly('invalid native CPU profile')
             (profile / name).write_text(value)
         sandbox.extend(['--ro-bind', NATIVE_LIBRARY, CONTROL + '/native.so',
+                        '--bind', str(profile), CONTROL + '/native',
                         '--setenv', 'LD_PRELOAD', CONTROL + '/native.so',
                         '--setenv', 'DISTCC_RUST_NATIVE', CONTROL + '/native',
                         '--setenv', 'DISTCC_RUST_NATIVE_CAPTURE', '0'])
+    # Let bwrap create mount points, then protect shared input inodes. This
+    # remount is nonrecursive: output, /tmp and native markers stay writable.
+    sandbox.extend(['--remount-ro', '/'])
     result = subprocess.run([*sandbox, CONTROL + '/compiler/bin/rustc', *job['args']])
     if result.returncode:
         return result.returncode if result.returncode > 0 else 128 - result.returncode

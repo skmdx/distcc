@@ -366,29 +366,164 @@ class RustTest(BrokerTestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(actual, path.read_bytes())
 
+    def reserve_input_space(self, identity):
+        def string(value):
+            return struct.pack('!Q', len(value)) + value
+        args = [b'gcc', b'-c', b'/src/held.c', b'-o', b'/src/held.o']
+        space = os.statvfs(self.root)
+        size = space.f_bavail * space.f_frsize - 8 * 1024 * 1024
+        manifest = struct.pack('!4Q', identity, 1, len(args), 2) + string(b'/src')
+        manifest += b''.join(map(string, args))
+        manifest += (struct.pack('!6Q', 0, 0, 0, size, size, identity) +
+                     string(b'/src/held.c') + string(b''))
+        manifest += (struct.pack('!6Q', 0, 0, 1, 1, 1, identity) +
+                     string(b'/src/marker') + string(b''))
+        net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
+        self.addCleanup(net.close)
+        net.sendall(struct.pack('!II', 0x54000200, len(manifest)) + manifest)
+        return net
+
+    def test_shared_inputs_survive_cancel_and_eviction_and_are_read_only(self):
+        import select
+        import xxhash
+        helper = runpy.run_path(str(self.build / 'distcc-rust'))
+        source, payload = self.work / 'shared.rs', self.work / 'shared.bin'
+        source.write_text('pub fn size() -> usize { include_bytes!("shared.bin").len() }')
+        payload.write_bytes(b'abcde' * (1024 * 1024))
+        output = self.work / 'libshared.rlib'
+        job, inputs, outdir, outputs = helper['plan'](self.rustc,
+            ['--crate-name=shared', '--crate-type=rlib', str(source), '-o', str(output)], self.work)
+        # This worker fixture reads its own mount table, which deliberately
+        # cannot be supplied by the client's dependency scanner.
+        source.write_text(source.read_text() + '''
+pub fn read_only() -> bool {
+    include_str!("/proc/self/mountinfo").lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields[4] == "/" && fields[5].split(',').any(|flag| flag == "ro")
+    })
+}
+''')
+        inputs[source] = helper['stamp'](source.stat())
+        metadata, snapshots = helper['metadata'](job, inputs, self.work)
+        manifest_index = len(inputs)
+
+        def send(net, kind, data):
+            net.sendall(struct.pack('!II', kind, len(data)) + data)
+
+        def frame(net):
+            def read(size):
+                result = bytearray()
+                while len(result) < size:
+                    data = net.recv(size - len(result))
+                    self.assertTrue(data, 'unexpected connection EOF')
+                    result.extend(data)
+                return bytes(result)
+            kind, size = struct.unpack('!II', read(8))
+            return kind, read(size)
+
+        def upload(net, index):
+            data = (snapshots / str(index)).read_bytes()
+            for offset in range(0, len(data) or 1, 256 * 1024):
+                chunk = data[offset:offset + 256 * 1024]
+                final = offset + len(chunk) == len(data)
+                send(net, 0x54000202 | (0x20000 if final else 0),
+                     struct.pack('!II', index, len(chunk)) + chunk)
+
+        sockets = []
+        held = None
+        for identity in range(1, 4):
+            net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=15)
+            self.addCleanup(net.close)
+            sockets.append(net)
+            send(net, 0x54000200, struct.pack('!Q', identity) + metadata.read_bytes())
+            if identity == 1:
+                kind, requested = frame(net)
+                self.assertEqual(kind, 0x54000201)
+                for (index,) in struct.iter_unpack('!I', requested):
+                    if index != manifest_index:
+                        upload(net, index)
+                deadline = time.monotonic() + 10
+                while True:
+                    roots = list(self.root.glob('distcc-tcp-*'))
+                    if len(roots) == 1 and all(
+                            (p := roots[0] / str(path).lstrip('/')).exists() and p.stat().st_nlink >= 2
+                            for path in inputs):
+                        break
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                # Leave only 8 MiB of unreserved capacity. The other jobs fit
+                # only if admission counts shared files as already stored.
+                held = self.reserve_input_space(999)
+                self.assertEqual(frame(held), (0x54000201, struct.pack('!I', 1)))
+
+        deadline = time.monotonic() + 10
+        relative = str(payload).lstrip('/')
+        while True:
+            files = [root / relative for root in self.root.glob('distcc-tcp-*')
+                     if (root / relative).exists()]
+            roots = [root for root in self.root.glob('distcc-tcp-*') if (root / relative).exists()]
+            ready = len(roots) == 3 and all(
+                (root / str(path).lstrip('/')).exists() for root in roots for path in inputs)
+            if ready and len(files) == 3 and len({p.stat().st_ino for p in files}) == 1:
+                break
+            self.assertLess(time.monotonic(), deadline, 'jobs did not share their input inode')
+            time.sleep(.01)
+        self.assertEqual(files[0].stat().st_size, payload.stat().st_size)
+        self.assertGreaterEqual(files[0].stat().st_nlink, 4)
+        for path in inputs:
+            self.assertEqual(len({(root / str(path).lstrip('/')).stat().st_ino for root in roots}), 1,
+                             f'input was duplicated: {path.name}')
+        # Deleting the cache name and cancelling its uploading job must leave
+        # the other jobs' inode references intact, without a retransmission.
+        digest = xxhash.xxh3_64_digest(payload.read_bytes())
+        cache = self.root / f'distcc-cache-{os.getuid()}' / f'{digest[0] % 64:02x}' / digest.hex()
+        cache.unlink()
+        sockets[0].close()
+        promoted = select.select(sockets[1:], [], [], 5)[0]
+        self.assertEqual(len(promoted), 1)
+        self.assertEqual(frame(promoted[0]), (0x54000201, struct.pack('!I', manifest_index)))
+        upload(promoted[0], manifest_index)
+        codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
+        for identity, net in enumerate(sockets[1:], 2):
+            kind, description = frame(net)
+            self.assertEqual(kind, 0x54000203)
+            status, mode, *sizes = struct.unpack('!II4Q', description[:40])
+            buffers = [bytearray() for _ in sizes]
+            while True:
+                kind, data = frame(net)
+                if kind == 0x54000205:
+                    self.assertEqual(data, struct.pack('!Q', identity))
+                    break
+                self.assertEqual(kind & ~0x30000, 0x54000204)
+                index, plain = struct.unpack('!II', data[:8])
+                buffers[index].extend(codec.decode(data[8:], plain) if kind & 0x10000 else data[8:])
+            self.assertEqual(status, 0, buffers[0].decode(errors='replace'))
+            self.assertEqual(list(map(len, buffers)), sizes)
+            received = self.work / f'result-{identity}'
+            received.mkdir()
+            artifact = received / 'shared-result.tar'
+            artifact.write_bytes(buffers[2])
+            helper['install_outputs'](artifact, job, outdir, outputs, received)
+            main = self.work / 'shared-main.rs'
+            main.write_text(f'fn main() {{ assert!(shared::read_only()); assert_eq!(shared::size(), {payload.stat().st_size}); }}')
+            result = self.rust(main, '--extern', 'shared=' + str(output), '-o', self.work / 'shared-check', remote=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            subprocess.run([self.work / 'shared-check'], check=True)
+        assert held is not None
+        held.close()
+        deadline = time.monotonic() + 5
+        while list(self.root.glob('distcc-tcp-*')) or any(
+                p.stat().st_size > 4 * 1024 * 1024
+                for p in cache.parent.parent.glob('*/*') if len(p.name) == 16):
+            self.assertLess(time.monotonic(), deadline, 'released large inputs were retained')
+            time.sleep(.01)
+
     def test_input_budget_waits_then_compiles_and_reclaims_cancelled_jobs(self):
         import concurrent.futures
 
         # Reserve most of the real input filesystem without sending a large file.
         # The NEED response proves admission; the real Rust job must then wait
         # for that reservation to be released instead of losing its connection.
-        def reserve(identity):
-            def string(value):
-                return struct.pack('!Q', len(value)) + value
-            args = [b'gcc', b'-c', b'/src/held.c', b'-o', b'/src/held.o']
-            space = os.statvfs(self.root)
-            size = space.f_bavail * space.f_frsize - 8 * 1024 * 1024
-            manifest = struct.pack('!4Q', identity, 1, len(args), 2) + string(b'/src')
-            manifest += b''.join(map(string, args))
-            manifest += (struct.pack('!6Q', 0, 0, 0, size, size, identity) +
-                         string(b'/src/held.c') + string(b''))
-            manifest += (struct.pack('!6Q', 0, 0, 1, 1, 1, identity) +
-                         string(b'/src/marker') + string(b''))
-            net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
-            self.addCleanup(net.close)
-            net.sendall(struct.pack('!II', 0x54000200, len(manifest)) + manifest)
-            return net
-
         def preparing(count):
             deadline = time.monotonic() + 5
             while True:
@@ -400,9 +535,9 @@ class RustTest(BrokerTestCase):
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.01)
 
-        held = reserve(101)
+        held = self.reserve_input_space(101)
         self.assertEqual(held.recv(12, socket.MSG_WAITALL), struct.pack('!3I', 0x54000201, 4, 1))
-        cancelled = reserve(102)
+        cancelled = self.reserve_input_space(102)
         preparing(2)
         cancelled.close()
         preparing(1)

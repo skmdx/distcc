@@ -497,8 +497,13 @@ prepares inputs before reserving a compiler worker and releases the worker
 before returning results. LZ4 chunks, verified shared-input caching, remote
 preprocessing and GCC/Clang distributed linking are supported. Link execution
 retains the one-link-per-server limit. Preparing and returning jobs can exceed
-the compiler-slot count, but share a bounded 512 MiB storage budget; compiler
-working memory and the persistent input cache are separate. Set the daemon's
+the compiler-slot count. RPC buffers share a 512 MiB budget; file-backed inputs
+are admitted against available filesystem space. Rust inputs, including large
+standard and dependency libraries, share verified whole-file inodes between
+jobs. The compiler sees a read-only input tree and private writable outputs;
+job links keep inputs alive through cache eviction and cancellation. Large
+entries are reclaimed when their last job releases them, while small idle
+entries remain in the bounded cache. Compiler working memory is separate. Set the daemon's
 `TMPDIR` to suitable tmpfs storage when available.
 Up to two background threads handle large compressed chunks, cache lookup and
 registration, shared-input snapshots, and detached input-tree cleanup.

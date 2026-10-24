@@ -10,7 +10,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include "job.h"
-#include "file_cache.h"
 #include "distcc.h"
 
 struct metadata {
@@ -200,8 +199,7 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
             (in->kind != DCC_JOB_SYMLINK && *in->target) ||
             (in->kind != DCC_JOB_FILE && (in->cached || in->wire_size || in->plain_size)) ||
             (in->kind == DCC_JOB_SYMLINK && !*in->target) ||
-            (in->kind == DCC_JOB_FILE && in->encoding == DCC_JOB_RAW && in->wire_size != in->plain_size) ||
-            (in->cached && in->plain_size > DCC_FILE_CACHE_MAX)) goto failed;
+            (in->kind == DCC_JOB_FILE && in->encoding == DCC_JOB_RAW && in->wire_size != in->plain_size)) goto failed;
     }
     if (m.error || m.offset != m.size) goto failed;
     *out = job;

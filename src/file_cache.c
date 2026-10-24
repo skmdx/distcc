@@ -1,4 +1,4 @@
-/* Verified input snapshots; never share writable inodes with compiler jobs.
+/* Verified input snapshots; shared compiler inputs must be mounted read-only.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
 #include <dirent.h>
@@ -21,7 +21,7 @@
 
 /* Separate shard locks bound both directory scans and concurrent storage.
  * FIFO eviction avoids a metadata write on every cache hit. */
-#define CACHE_SHARDS 64
+#define CACHE_SHARDS DCC_FILE_CACHE_SHARDS
 #define CACHE_FILES 64
 #define CACHE_BYTES DCC_FILE_CACHE_MAX
 
@@ -98,10 +98,19 @@ done:
     return ret;
 }
 
-static int snapshot(int from, const char *destination, const unsigned char *hash)
+static int snapshot(int from, const char *destination, const unsigned char *hash, int shared)
 {
     int to, ok;
     if (dcc_mk_tmp_ancestor_dirs(destination)) return 0;
+    if (shared) {
+        char source[64];
+        if (hash && copy_snapshot(from, -1, hash)) return 0;
+        snprintf(source, sizeof(source), "/proc/self/fd/%d", from);
+        if (!linkat(AT_FDCWD, source, AT_FDCWD, destination, AT_SYMLINK_FOLLOW)) return 1;
+        /* A separately configured cache can be on another filesystem; an
+         * open entry also remains readable if eviction removed its last name. */
+        if (errno != EXDEV && errno != ENOENT) return 0;
+    }
     to = open(destination, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (to < 0) return 0;
     ok = !copy_snapshot(from, to, hash);
@@ -110,27 +119,27 @@ static int snapshot(int from, const char *destination, const unsigned char *hash
     return ok;
 }
 
-int dcc_file_cache_copy(const unsigned char *hash, const char *source, const char *destination)
+int dcc_file_cache_copy(const unsigned char *hash, const char *source, const char *destination, int shared)
 {
     int from = open(source, O_RDONLY | O_NOFOLLOW | O_CLOEXEC), ok;
     if (from < 0) return 0;
-    ok = snapshot(from, destination, hash);
+    ok = snapshot(from, destination, hash, shared);
     close(from);
     return ok;
 }
 
-int dcc_file_cache_get(const unsigned char *hash, const char *destination)
+int dcc_file_cache_get(const unsigned char *hash, const char *destination, int shared)
 {
     char key[17];
     struct stat st;
     int shard = cache_shard(hash, key), from = -1, ok = 0;
     if (shard < 0) return 0;
     from = openat(shard, key, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-    if (from < 0 || fstat(from, &st) || !S_ISREG(st.st_mode) || st.st_size > CACHE_BYTES)
+    if (from < 0 || fstat(from, &st) || !S_ISREG(st.st_mode))
         goto done;
     /* An open entry survives concurrent eviction. Verify the private snapshot
      * too, so a corrupt cache entry is a miss, never a wrong compilation. */
-    ok = snapshot(from, destination, hash);
+    ok = snapshot(from, destination, hash, shared);
 done:
     if (from >= 0) close(from);
     close(shard);
@@ -157,6 +166,9 @@ static int make_room(int shard, off_t size, const char *replaced)
             continue;
         if (!strcmp(de->d_name, replaced)) continue;
         if (fstatat(shard, de->d_name, &st, AT_SYMLINK_NOFOLLOW)) continue;
+        /* Active read-only jobs pin their entries with hard links. The idle
+         * cache bound must not evict and retransmit those same live inputs. */
+        if (S_ISREG(st.st_mode) && st.st_nlink > 1) continue;
         if (!S_ISREG(st.st_mode) || count == CACHE_FILES) {
             if (unlinkat(shard, de->d_name, 0)) { closedir(dir); return -1; }
             continue;
@@ -167,7 +179,7 @@ static int make_room(int shard, off_t size, const char *replaced)
         bytes += st.st_size;
     }
     closedir(dir);
-    while (count && (count >= CACHE_FILES || bytes + size > CACHE_BYTES)) {
+    while (count && (count + (*replaced != 0) > CACHE_FILES || bytes + size > CACHE_BYTES)) {
         oldest = 0;
         for (i = 1; i < count; ++i)
             if (entries[i].age < entries[oldest].age) oldest = i;
@@ -178,19 +190,19 @@ static int make_room(int shard, off_t size, const char *replaced)
     return 0;
 }
 
-void dcc_file_cache_put(const unsigned char *hash, const char *path)
+void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared)
 {
     char key[17], temporary[40];
     struct stat st;
     int shard = -1, lock = -1, from = -1, to = -1;
     from = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (from < 0 || fstat(from, &st) || !S_ISREG(st.st_mode) || st.st_size > CACHE_BYTES)
+    if (from < 0 || fstat(from, &st) || !S_ISREG(st.st_mode) || (!shared && st.st_size > CACHE_BYTES))
         goto done;
     shard = cache_shard(hash, key);
     if (shard < 0) goto done;
     lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
-    /* Directory maintenance never queues behind another shard insertion. */
-    if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB)) goto done;
+    /* Publish shared inputs reliably; private cache insertion is best effort. */
+    if (lock < 0 || flock(lock, LOCK_EX | (shared ? 0 : LOCK_NB))) goto done;
     to = openat(shard, key, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (to >= 0) {
         struct stat existing;
@@ -202,6 +214,14 @@ void dcc_file_cache_put(const unsigned char *hash, const char *path)
     }
     if (make_room(shard, st.st_size, key)) goto done;
     snprintf(temporary, sizeof(temporary), ".tmp-%lu", (unsigned long)getpid());
+    if (shared) {
+        if (!fchmod(from, 0400) && !linkat(AT_FDCWD, path, shard, temporary, 0)) {
+            renameat(shard, temporary, shard, key);
+            unlinkat(shard, temporary, 0);
+            goto done;
+        }
+        if (errno != EXDEV || st.st_size > CACHE_BYTES) goto done;
+    }
     to = openat(shard, temporary, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (to < 0) goto done;
     if (!copy_snapshot(from, to, NULL) && !fchmod(to, 0400))
@@ -212,4 +232,15 @@ done:
     if (from >= 0) close(from);
     if (lock >= 0) close(lock);
     if (shard >= 0) close(shard);
+}
+
+void dcc_file_cache_prune(const unsigned char *hash)
+{
+    char key[17];
+    int shard = cache_shard(hash, key), lock;
+    if (shard < 0) return;
+    lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (lock >= 0 && !flock(lock, LOCK_EX)) make_room(shard, 0, "");
+    if (lock >= 0) close(lock);
+    close(shard);
 }
