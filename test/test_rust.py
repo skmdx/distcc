@@ -78,6 +78,47 @@ class RustTest(BrokerTestCase):
                                  fallback == '1')
                 self.assertEqual(output.read_bytes(), b'previous artifact')
 
+    def test_disconnected_transport_retries_without_local_fallback(self):
+        import concurrent.futures
+        import select
+        import threading
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        listener.bind(('127.0.0.1', 0))
+        listener.listen()
+        listener.settimeout(10)
+        stopped = threading.Event()
+        def proxy():
+            # Drop an actual BEGIN after the broker has leased the connection.
+            first, _ = listener.accept()
+            with first:
+                first.settimeout(10)
+                self.assertEqual(first.recv(4, socket.MSG_WAITALL), struct.pack('!I', 0x54000200))
+            second, _ = listener.accept()
+            with second, socket.create_connection(('127.0.0.1', self.ports[0]), timeout=10) as worker:
+                peers = {second: worker, worker: second}
+                while not stopped.is_set():
+                    for source in select.select(list(peers), [], [], .1)[0]:
+                        data = source.recv(256 * 1024)
+                        if not data:
+                            return
+                        peers[source].sendall(data)
+        self.start_broker(f'127.0.0.1:{listener.getsockname()[1]}/1,tcp', name='retry', backoff=0)
+        self.env.update(DISTCC_VERBOSE='1', PATH=str(self.build) + os.pathsep + os.environ['PATH'])
+        source = self.work / 'retry.rs'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            future = pool.submit(proxy)
+            try:
+                result = self.rust('--crate-type=rlib', '-Ctarget-cpu=native', source)
+            finally:
+                stopped.set()
+            future.result(timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('retrying Rust job on a fresh connection', result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        self.assertTrue((self.work / 'libretry.rlib').is_file())
+
     def test_native_cpu_features_and_overrides_match_local_compiler(self):
         source = self.work / 'native.rs'
         source.write_text('#[no_mangle] pub extern "C" fn answer() -> u32 { 42 }')
@@ -278,6 +319,7 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('rust-distcc-ok', result.stdout)
         self.assertIn('distcc-rust: compiled on', result.stderr)
+        self.assertNotIn('failed to connect to jobserver', result.stderr)
 
     def test_proc_macro_stays_local(self):
         source = self.work / 'macros.rs'

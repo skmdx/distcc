@@ -55,7 +55,7 @@ distcc_configure_jobs() {
     # Portage saves the phase environment. Refresh only values we generated;
     # package.env and ebuild overrides remain authoritative. Portage removes
     # DISTCC_* when saving phases, so keep provenance outside that namespace.
-    for variable in MAKEOPTS NINJAOPTS NINJAFLAGS CMAKE_BUILD_PARALLEL_LEVEL; do
+    for variable in MAKEOPTS NINJAOPTS NINJAFLAGS CMAKE_BUILD_PARALLEL_LEVEL CARGO_BUILD_JOBS; do
         marker=distcc_auto_${variable}
         if [[ -n ${!marker} && ${!variable} == "${!marker}" ]]; then
             if [[ ${variable} == MAKEOPTS ]]; then
@@ -90,10 +90,12 @@ distcc_configure_jobs() {
     if [[ ${MAKEOPTS} =~ (^|[[:space:]])(-j[[:space:]]*|--jobs[=[:space:]]+)([1-9][0-9]*)([[:space:]]|$) ]]; then
         jobs=${BASH_REMATCH[3]}
         # Ninja otherwise synthesizes a load-average option from MAKEOPTS.
-        for variable in NINJAOPTS NINJAFLAGS CMAKE_BUILD_PARALLEL_LEVEL; do
+        # Cargo's config may have been generated in unpack, before MAKEOPTS
+        # was computed. The environment overrides that stale jobs = 1 value.
+        for variable in NINJAOPTS NINJAFLAGS CMAKE_BUILD_PARALLEL_LEVEL CARGO_BUILD_JOBS; do
             if [[ -z ${!variable} ]]; then
                 marker=distcc_auto_${variable}
-                if [[ ${variable} == CMAKE_BUILD_PARALLEL_LEVEL ]]; then
+                if [[ ${variable} == CMAKE_BUILD_PARALLEL_LEVEL || ${variable} == CARGO_BUILD_JOBS ]]; then
                     export "${variable}=${jobs}"
                     printf -v "${marker}" '%s' "${jobs}"
                 else

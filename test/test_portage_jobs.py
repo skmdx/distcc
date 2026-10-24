@@ -9,6 +9,17 @@ import unittest
 
 
 class PortageJobsTest(unittest.TestCase):
+    def test_cargo_parallelism_refreshes_and_preserves_user_override(self):
+        self.assertEqual(self.run_hook('''
+echo "$CARGO_BUILD_JOBS"
+workers=6
+source "$JOBS_HOOK"
+echo "$CARGO_BUILD_JOBS"
+CARGO_BUILD_JOBS=2
+source "$JOBS_HOOK"
+echo "$CARGO_BUILD_JOBS"
+'''), ['12', '6', '2'])
+
     def test_rust_wrapper_respects_package_policy_and_user_override(self):
         self.assertEqual(self.run_hook('''
 unset RUSTC_WRAPPER distcc_auto_RUSTC_WRAPPER
@@ -50,7 +61,7 @@ echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
         hook = Path(__file__).resolve().parents[1] / 'packaging/gentoo/jobs.bashrc'
         env = {key: value for key, value in os.environ.items()
                if key not in ('CC', 'CXX') and
-               not key.startswith(('DISTCC_', 'CCACHE_', 'MAKE', 'NINJA', 'CMAKE_'))}
+               not key.startswith(('DISTCC_', 'CCACHE_', 'MAKE', 'NINJA', 'CMAKE_', 'CARGO_'))}
         env['JOBS_HOOK'] = str(hook)
         result = subprocess.run(['bash', '-c', '''
 has() { local word=$1; shift; [[ " $* " == *" $word "* ]]; }

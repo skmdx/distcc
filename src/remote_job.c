@@ -244,12 +244,21 @@ int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *o
             files[i] = NULL; ret = EXIT_OUT_OF_MEMORY; goto done;
         }
     }
-    if ((ret = dcc_broker_acquire(&host, &lease, 1, &hint))) goto done;
-    if (!host->tcp_jobs) { ret = EXIT_PROTOCOL_ERROR; goto done; }
-    dcc_broker_cpp_done(host);
-    if ((ret = dcc_tcp_exchange(host, job, files, NULL, output, NULL, &result))) {
+    for (unsigned attempt = 0;; ++attempt) {
+        if ((ret = dcc_broker_acquire(&host, &lease, 1, &hint))) goto done;
+        if (!host->tcp_jobs) { ret = EXIT_PROTOCOL_ERROR; goto done; }
+        dcc_broker_cpp_done(host);
+        ret = dcc_tcp_exchange(host, job, files, NULL, output, NULL, &result);
+        if (!ret) break;
         dcc_broker_failed(host);
-        goto done;
+        /* A pooled connection can close between acquisition and BEGIN. Rust
+         * inputs are immutable and no result has been published: retry once
+         * through a fresh reservation, including when local fallback is off. */
+        if (attempt || ret != EXIT_IO_ERROR) goto done;
+        rs_log_warning("retrying Rust job on a fresh connection");
+        dcc_free_hostdef(host); host = NULL;
+        if (lease >= 0) close(lease);
+        lease = -1;
     }
     dcc_broker_return(host, host->broker_fd, &result);
     for (unsigned i = DCC_JOB_STDERR; i <= DCC_JOB_STDOUT; ++i) {
