@@ -11,8 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
-#include <fcntl.h>
 #include <link.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <fstream>
 #include <iterator>
@@ -126,22 +126,22 @@ extern "C" void *dlopen(const char *name, int flags)
 {
     void *handle = original<void *(*)(const char *, int)>("dlopen")(name, flags);
     int saved_errno = errno;
-    const char *path = std::getenv("DISTCC_RUST_LOADS");
-    if (handle && path) {
+    const char *descriptor = std::getenv("DISTCC_RUST_LOADS_FD");
+    if (handle && descriptor) {
         struct link_map *map;
         if (dlinfo(handle, RTLD_DI_LINKMAP, &map)) fail("cannot inspect loaded library");
-        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-        if (fd < 0) fail("cannot record loaded library");
+        int fd = std::atoi(descriptor);
         const char *data = map->l_name;
         size_t remaining = std::strlen(data) + 1;
         while (remaining) {
-            ssize_t size = write(fd, data, remaining);
+            /* The parent opened this permitted log before starting rustc.
+             * Loader callbacks must not reenter sandbox's filesystem hooks. */
+            ssize_t size = syscall(SYS_write, fd, data, remaining);
             if (size < 0 && errno == EINTR) continue;
             if (size <= 0) fail("cannot record loaded library");
             data += size;
             remaining -= size;
         }
-        close(fd);
     }
     errno = saved_errno;
     return handle;

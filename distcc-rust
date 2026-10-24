@@ -185,11 +185,13 @@ def plan(compiler, args, work):
             and not (k == '-C' and v.partition('=')[0] == 'incremental')]
     loaded = work / 'loaded-libraries'
     loaded.write_bytes(b'')
-    probe_env = dict(os.environ, DISTCC_RUST_LOADS=str(loaded),
-                     LD_PRELOAD=NATIVE_LIBRARY + ' ' + os.environ.get('LD_PRELOAD', ''))
     start = time.time_ns()
-    probe = subprocess.run([compiler, *flatten(base), '--emit=dep-info=' + str(work / 'probe.d')],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=False, env=probe_env)
+    with loaded.open('ab') as trace:
+        os.set_inheritable(trace.fileno(), True)
+        probe_env = dict(os.environ, DISTCC_RUST_LOADS_FD=str(trace.fileno()),
+                         LD_PRELOAD=NATIVE_LIBRARY + ' ' + os.environ.get('LD_PRELOAD', ''))
+        probe = subprocess.run([compiler, *flatten(base), '--emit=dep-info=' + str(work / 'probe.d')],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=False, env=probe_env)
     if probe.returncode:
         raise LocalOnly('dependency expansion failed')
     libraries = {p.resolve() for p in inputs if p.suffix == '.so'}

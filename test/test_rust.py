@@ -373,6 +373,36 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('distcc-rust: compiled on', result.stderr)
 
+    @unittest.skipUnless(shutil.which('sandbox'), 'Portage sandbox required')
+    def test_dependency_probe_with_portage_sandbox(self):
+        import signal
+        source, library = self.work / 'sandbox.rs', self.work / 'libsandbox_test.rlib'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        env = dict(self.env, SANDBOX_WRITE=str(self.root),
+                   SANDBOX_LOG=str(self.work / 'sandbox.log'),
+                   SANDBOX_DEBUG_LOG=str(self.work / 'sandbox.debug'))
+        process = subprocess.Popen(['sandbox', str(self.build / 'distcc'), self.rustc,
+                                    '--crate-name=sandbox_test', '--crate-type=rlib',
+                                    '-Ctarget-cpu=native', str(source), '-o', str(library)],
+                                   env=env, cwd=self.work, start_new_session=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, stderr = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+            self.assertIn('distcc-rust: compiled on', stderr)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        main = self.work / 'sandbox-main.rs'
+        main.write_text('fn main() { assert_eq!(sandbox_test::answer(), 42); }')
+        result = self.rust(main, '--extern', 'sandbox_test=' + str(library),
+                           '-o', self.work / 'sandbox-check', remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([self.work / 'sandbox-check'], check=True)
+
     def test_cached_inputs_and_parallel_crates(self):
         import concurrent.futures
         source = self.work / 'cache.rs'
