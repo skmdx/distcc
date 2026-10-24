@@ -710,8 +710,9 @@ by distcc-link --sync, and DISTCC_BROKER to the broker socket. The distcc-link
 helper requires Python 3.11 or later. Each worker must have a compatible
 toolchain and DISTCCD_LINK_ROOT pointing at its sysroot cache. GCC links apply
 the cached client GCC specs, preserving its default linker flags.
-Clang links require -fuse-ld=lld and matching Clang/LLD versions on the client
-and workers. The client's driver resolves its configuration, runtime libraries,
+Clang links require -fuse-ld=lld. Compiler, linker and sysroot release strings
+need not match; the linker determines whether it can consume the inputs.
+The client's driver resolves its configuration, runtime libraries,
 target and linker options; workers execute the resulting LLD command with
 cached startup objects and libraries. Full LLVM LTO and ThinLTO are supported.
 .PP
@@ -730,7 +731,7 @@ at it. DISTCC_LINK_SOURCE defaults to /; set it to another root when the
 client's intended sysroot is elsewhere.
 .PP
 For Clang, use the native client Clang driver instead of gcc in the sync command,
-for example clang-22, and write clang.json. To support both families, place
+for example clang, and write clang.json. To support both families, place
 gcc.json and clang.json in one directory and set DISTCC_LINK_SYSROOT to that
 directory. Each profile is synchronized and updated independently; the
 original single-profile setting remains supported.
@@ -1062,7 +1063,7 @@ and -mcpu=native using the client compiler's -### output before distribution.
 This preserves the client's detected CPU features, including disabled features,
 GCC cache parameters and explicit option overrides. The same resolved options
 are used for local preprocessing and worker compilation; workers do not detect
-their own CPU. Matching compiler versions and target support are required.
+their own CPU. Workers must support the resolved options and target ABI.
 Commands without native options and invocations classified as local-only do
 not run this extra driver query.
 If the expansion cannot be recognized, the original command runs locally.

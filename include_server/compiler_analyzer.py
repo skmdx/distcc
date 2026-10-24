@@ -154,15 +154,13 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     if len(sections) != 2:
       raise basics.NotCoveredError('Compiler did not report implicit headers')
     _, implicit = sections
-    banner = run([compiler, '--version']).stdout.decode(errors='replace')
-    version_match = re.search(r'clang version (\S+)', banner)
-    clang = version_match is not None
+    # Driver-provided macros identify its frontend independently of branding
+    # and release strings. The scanner decides whether the input is supported.
+    clang = '#define __clang__ ' in output
     if clang:
-      if version_match[1] != clang_scan.version:
-        raise basics.NotCoveredError('Clang compiler and libclang-cpp versions differ')
       options = []
     else:
-      if 'Free Software Foundation' not in banner:
+      if '#define __GNUC__ ' not in output:
         raise basics.NotCoveredError('Unsupported compiler for header analysis')
       options = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
       if not options:

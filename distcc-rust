@@ -28,7 +28,7 @@ VALUES = {'--cap-lints', '--cfg', '--check-cfg', '--crate-name', '--crate-type',
           '--edition', '--error-format', '--extern', '--json', '--remap-path-prefix',
           '--target', '--sysroot', '--emit', '--out-dir', '-o', '-C', '-L', '-l',
           '-A', '-W', '-D', '-F', '--allow', '--warn', '--deny', '--forbid',
-          '--force-warn', '--diagnostic-width', '--color'}
+          '--force-warn', '--diagnostic-width', '--color', '--codegen'}
 RUNTIME = ('/lib', '/lib64', '/usr/lib64', '/usr/lib/gcc', '/usr/lib/llvm',
            '/etc/ld.so.cache')
 CONTROL = '/__distcc_rust'
@@ -53,13 +53,15 @@ def options(args):
                     value = next(words)
                 except StopIteration:
                     raise LocalOnly('missing option value') from None
-            result.append((name, value))
+            result.append(('-C' if name == '--codegen' else name, value))
         elif word[:2] in {'-C', '-L', '-l', '-A', '-W', '-D', '-F', '-o'} and len(word) > 2:
             result.append((word[:2], word[2:]))
-        elif word in ('-g', '-O'):
+        elif word.startswith('-'):
+            # Only options whose operands we relocate need interpretation.
+            # rustc validates all remaining flags and their operands.
             result.append((word, None))
-        elif word.startswith(('-', '@')):
-            raise LocalOnly('unsupported rustc action or option: ' + word)
+        elif word.startswith('@'):
+            raise LocalOnly('response file must be expanded before distribution')
         else:
             result.append(('', word))
     return result
@@ -73,8 +75,8 @@ def flatten(opts):
 def identity(compiler):
     lines = subprocess.check_output([compiler, '-vV'], text=True).splitlines()
     fields = dict(line.split(': ', 1) for line in lines[1:] if ': ' in line)
-    return {'version': lines[0], 'commit': fields['commit-hash'],
-            'llvm': fields['LLVM version']}, fields['host']
+    return {'version': lines[0], 'commit': fields.get('commit-hash', ''),
+            'llvm': fields.get('LLVM version', '')}, fields['host']
 
 
 def dependencies(path):
@@ -106,26 +108,23 @@ def dependencies(path):
 
 def plan(compiler, args, work):
     opts = options(args)
+    if ('-', None) in opts or ('', '-') in opts:
+        raise LocalOnly('standard input requires local compilation')
     values = dict(opts)
-    sources = [v for k, v in opts if not k]
-    if len(sources) != 1 or not sources[0].endswith('.rs'):
-        raise LocalOnly('not a Rust source compilation')
     emits = values.get('--emit', 'link').split(',')
     types = set(values.get('--crate-type', 'bin').split(','))
     if 'proc-macro' in types or (any(e.split('=')[0] == 'link' for e in emits)
                                 and not types <= {'lib', 'rlib'}):
         raise LocalOnly('executable/native linking or procedural macro')
-    if not set(e.split('=')[0] for e in emits) <= {'link', 'metadata', 'obj', 'asm', 'llvm-ir', 'llvm-bc', 'dep-info'}:
-        raise LocalOnly('unsupported output kind')
     if all(e.split('=')[0] == 'dep-info' for e in emits):
         raise LocalOnly('dependency query')
     compiler_id, host = identity(compiler)
     target = values.get('--target', host)
-    if '/' in target or target.endswith('.json'):
-        raise LocalOnly('custom target specification')
     root = absolute(values.get('--sysroot') or subprocess.check_output(
         [compiler, '--print=sysroot'], text=True).strip())
     inputs = set()
+    if target.endswith('.json'):
+        inputs.add(absolute(target))
     for key, value in opts:
         if key == '-C':
             name, _, setting = value.partition('=')
@@ -134,15 +133,15 @@ def plan(compiler, args, work):
         elif key == '--extern':
             _, equal, file = value.partition('=')
             if equal:
+                if Path(file).suffix == '.so':
+                    raise LocalOnly('procedural macro or dynamic Rust dependency')
                 inputs.add(absolute(file))
         elif key == '-L':
             kind, equal, directory = value.partition('=')
             directory = absolute(directory if equal else kind)
             if directory.is_dir():
                 inputs.update(p for p in directory.iterdir()
-                              if p.suffix in ('.rlib', '.rmeta', '.so', '.a'))
-    if any(p.suffix == '.so' for p in inputs):
-        raise LocalOnly('procedural macro or dynamic Rust dependency')
+                              if p.suffix in ('.rlib', '.rmeta', '.a'))
     # A client dep-info pass expands modules/includes using the actual compiler
     # and caller environment. A failure goes back through the original command.
     base = [(k, v) for k, v in opts if k not in ('--emit', '--out-dir', '-o')
@@ -156,9 +155,8 @@ def plan(compiler, args, work):
     inputs.update(source_files)
     if 'RUSTC_BOOTSTRAP' in os.environ:
         environment['RUSTC_BOOTSTRAP'] = os.environ['RUSTC_BOOTSTRAP']
-    libdir = root / 'lib/rustlib' / target / 'lib'
-    if not libdir.is_dir():
-        raise LocalOnly('missing target standard library')
+    libdir = Path(subprocess.check_output(
+        [compiler, *flatten(base), '--print=target-libdir'], text=True).strip())
     inputs.update(p for p in libdir.rglob('*') if p.is_file())
     outdir = absolute(values.get('--out-dir', '.'))
     output = work / 'out'
@@ -327,7 +325,7 @@ def worker(root, archive):
         try:
             actual = identity(candidate)[0]
             score = (actual == requested, actual['commit'] == requested['commit'],
-                     actual['version'].split()[1] == requested['version'].split()[1],
+                     actual['version'] == requested['version'],
                      actual['llvm'] == requested['llvm'])
             if score > best:
                 compiler, best = candidate, score

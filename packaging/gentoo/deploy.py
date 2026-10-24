@@ -181,7 +181,22 @@ def emerge_command(features):
             'os.execvpe("emerge",["emerge",*sys.argv[2:]],env)', features]
 
 
+def resolve_compilers(target):
+    # Resolve before sudo changes PATH; preserve names such as clang++ whose
+    # driver mode depends on argv[0]. Explicit toolchain paths remain supported.
+    return json.loads(run(['python3', '-c', '''import json, shutil, sys
+paths = []
+for name in sys.argv[1:]:
+    path = shutil.which(name)
+    if not path:
+        raise SystemExit('Configured compiler is not executable: ' + name)
+    paths.append(path)
+print(json.dumps(paths))
+''', *target.get('compiler_paths', [])], target))
+
+
 def configure(target, work):
+    target['compiler_paths'] = resolve_compilers(target)
     script = '''from pathlib import Path
 import os
 import subprocess
@@ -191,6 +206,10 @@ if COMPILERS:
             raise RuntimeError('Configured compiler is not executable: ' + compiler)
     commands = Path('/etc/distcc/compilers')
     existing = commands.read_text().splitlines() if commands.exists() else []
+    names = {Path(compiler).name for compiler in COMPILERS}
+    # Retire vanished tools and replace earlier bindings of the selected names.
+    existing = [compiler for compiler in existing
+                if Path(compiler).name not in names and os.access(compiler, os.X_OK)]
     commands.write_text('\\n'.join(dict.fromkeys(existing + COMPILERS)) + '\\n')
 p=Path('/etc/systemd/system/distccd.service.d')
 p.mkdir(parents=True,exist_ok=True)
@@ -223,8 +242,6 @@ def validate(target, work):
             'VALIDATE_DISTCC_HOSTS=' + target['validation_hosts'],
             'VALIDATE_DISTCC_COMPILERS=' + json.dumps(target.get('compiler_paths', [])),
             'python3', remote + '/validate-installed.py']
-    if target.get('assembly_comparison'):
-        args += ['--assembly']
     with (work / (target['name'] + '-validation.log')).open('w') as log:
         for hosts in dict.fromkeys([target['server_hosts'], target['validation_hosts']]):
             args[2] = 'VALIDATE_DISTCC_HOSTS=' + hosts

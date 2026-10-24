@@ -79,7 +79,6 @@
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
-#include <errno.h>
 #include <assert.h>
 
 #include <sys/stat.h>
@@ -238,16 +237,15 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
                  * dependency files beyond the object/depfile RPC contract. */
                 rs_trace("%s requires local module artifacts", a);
                 return EXIT_DISTCC_FAILED;
-            } else if (str_startswith("-x", a)
-                       && argv[i+1]
-                       && !str_startswith("c", argv[i+1])
-                       && !str_startswith("c++", argv[i+1])
-                       && !str_startswith("objective-c", argv[i+1])
-                       && !str_startswith("objective-c++", argv[i+1])
-                       && !str_startswith("go", argv[i+1])
-                       ) {
-                rs_log_info("gcc's -x handling is complex; running locally for %s", argv[i+1] ? argv[i+1] : "empty");
-                return EXIT_DISTCC_FAILED;
+            } else if (str_startswith("-x", a)) {
+                const char *language = a[2] ? a + 2 : argv[++i];
+                if (!language ||
+                    (!str_startswith("c", language) &&
+                     !str_startswith("objective-c", language) &&
+                     !str_startswith("go", language))) {
+                    rs_log_info("unsupported distributed language: %s", language ? language : "empty");
+                    return EXIT_DISTCC_FAILED;
+                }
             } else if (str_startswith("-dr", a)) {
                 rs_log_info("gcc's debug option %s may write extra files; "
                             "running locally", a);

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """One-shot Clang worker preserving the original source's profile identity."""
-import subprocess
 import shutil
 import sys
 
@@ -12,14 +11,6 @@ def main():
     # LibTooling locates resources relative to argv[0], without PATH lookup.
     # Preserve the driver name: resolving symlinks would lose target and mode.
     command[0] = shutil.which(command[0]) or command[0]
-    # Executing a different compiler silently would corrupt distributed builds.
-    # The scanner applies the same version contract on the client; check again
-    # on the worker, including the preprocessed (non-pump) path.
-    version = subprocess.check_output([command[0], '--version'], text=True).split()
-    if ('version' not in version or
-            version[version.index('version') + 1] != clang_scan.version):
-        sys.stderr.write('distcc: worker libclang-cpp does not match the requested compiler\n')
-        return 1
     return clang_scan.compile(command, original, root)
 
 

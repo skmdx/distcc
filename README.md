@@ -38,8 +38,8 @@ Rust requires the local `DISTCC_BROKER` socket and workers configured with
 `,tcp`, plus worker Rust, Python xxhash and bubblewrap. Workers prefer a matching
 Rust build but do not reject differing version, commit or LLVM metadata.
 Compatibility is determined by rustc accepting the inputs and the client
-successfully linking the artifacts. Codegen options are passed to rustc rather
-than filtered through a version-specific allowlist. Linux workers
+successfully linking the artifacts. Options and output kinds are passed to rustc;
+the wrapper interprets only the operands needed for input/output transfer. Linux workers
 must permit unprivileged user namespaces. The client supplies its target
 standard library, so workers can compile for another architecture with the
 compatible Rust compiler. Rust does not need an include server.
@@ -53,8 +53,9 @@ artifacts, including Cargo metadata and dependency files. Local incremental
 state is not sent or updated by remote jobs.
 
 Final executable/native links, build scripts, procedural macro crates and their
-consumers, dynamic Rust dependencies, `target-cpu=native`, custom targets,
-response files, and unsupported compiler options run locally. Local linking
+consumers, dynamic Rust dependencies, `target-cpu=native` and response files
+run locally. Unrelated procedural macros in a dependency search directory do
+not prevent distribution. Local linking
 preserves access to native system libraries. Transport or toolchain failures
 retry locally unless `DISTCC_FALLBACK=0`. Failed remote compilations also retry
 locally unless `DISTCC_SKIP_LOCAL_RETRY=1`, so an incompatible worker does not
@@ -304,8 +305,11 @@ The launcher can also be symlinked into `PATH` as `distcc-deploy`.
 It reads the private `~/.config/distcc/deploy.json` (or `$XDG_CONFIG_HOME`),
 selects the latest committed overlay ebuild, and installs and validates the first
 configured target before upgrading the remaining targets in parallel. Each target
-gets service settings and native versus remote C/C++ compilation, preprocessing
-and execution checks. After rollout, every client compiles a Rust library on
+gets service settings and distributed C/C++ compilation with local-object linking
+and execution checks. Different object bytes do not reject compatible toolchains.
+Use names such as `clang` and `clang++` in `compiler_paths` to follow each target's
+selected toolchain; they are resolved before sudo changes the environment.
+Explicit paths select a specific installation. After rollout, every client compiles a Rust library on
 every worker, links it locally and executes the result with fallback disabled.
 Rust checks require compatible toolchains and worker addresses reachable from
 all clients in `server_hosts`. Source archives are fetched and verified locally,

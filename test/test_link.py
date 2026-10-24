@@ -56,9 +56,6 @@ class LinkTestCase(BrokerTestCase):
             linker = subprocess.check_output(['clang', '-print-prog-name=ld.lld'], text=True).strip()
             if not shutil.which(linker):
                 raise unittest.SkipTest('LLD is required for Clang remote links')
-            version = subprocess.check_output(['clang', '-dumpversion'], text=True).strip()
-            if ('LLD ' + version + ' ') not in subprocess.check_output([linker, '--version'], text=True):
-                raise unittest.SkipTest('matching Clang and LLD versions are required')
         cls.link_storage = tempfile.TemporaryDirectory(prefix='distcc-link-tests-')
         cls.addClassCleanup(cls.link_storage.cleanup)
         cls.link_root = Path(cls.link_storage.name)
@@ -131,6 +128,27 @@ class LinkTestCase(BrokerTestCase):
                                  *args, '-o', str(output)], env=self.env, capture_output=True,
                                 text=True, timeout=15)
         return output, result
+
+    def test_compatible_sysroot_metadata_and_missing_search_directory(self):
+        profile = dict(self.profile, version='0.0-compatible-build')
+        triple = profile['target'].split('-')
+        if len(triple) >= 3:
+            triple[1] = 'unknown'
+            profile['target'] = '-'.join(triple)
+        client_profile = self.work / 'compatible.json'
+        client_profile.write_text(json.dumps(profile))
+        self.env['DISTCC_LINK_SYSROOT'] = str(client_profile)
+        cached_profile = self.cache / profile['key'] / '.distcc-link.json'
+        original = cached_profile.read_bytes()
+        try:
+            cached_profile.write_text(json.dumps(profile))
+            output, result = self.link(['-L' + str(self.work / 'absent')])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('distcc-link: linked on ', result.stderr)
+            self.assertEqual(subprocess.check_output([output], text=True), 'linked\n')
+        finally:
+            cached_profile.write_bytes(original)
+
 
 class LinkTest(LinkTestCase):
     def test_refresh_skips_unchanged_and_publishes_changed_or_missing_cache(self):
@@ -363,6 +381,18 @@ class ClangLinkTest(LinkTestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('distcc-link: linked on ', result.stderr)
                 self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
+
+    def test_client_lld_can_differ_from_clang(self):
+        current = subprocess.check_output(['clang', '-dumpversion'], text=True).strip()
+        for linker in Path('/usr/lib/llvm').glob('*/bin/ld.lld'):
+            version = subprocess.check_output([linker, '--version'], text=True)
+            if 'LLD ' + current + ' ' not in version:
+                output, result = self.link(['-fuse-ld=' + str(linker)])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-link: linked on ', result.stderr)
+                self.assertEqual(subprocess.check_output([output], text=True), 'linked\n')
+                return
+        self.skipTest('an additional LLD release is required')
 
     def test_compiler_rt_from_cache(self):
         self.assertTrue(any('libclang_rt.builtins' in name for name in self.profile['state']))

@@ -527,6 +527,53 @@ with tempfile.TemporaryDirectory() as directory:
     files = analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], '/', keeper, 'lz4s')
     self.assertTrue(any('/.distcc-system/' in path for path in files))
 
+  def test_clang_release_metadata_is_not_an_analysis_gate(self):
+    header = self.root / 'versioned.h'
+    header.write_text('#define ANSWER 42\n')
+    self.source.write_text('#include "versioned.h"\nint value = ANSWER;\n')
+    self.addCleanup(os.chdir, os.getcwd())
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    with mock.patch.object(clang_scan, 'version', '0.0-compatible-build'):
+      files = analyzer.DoCompilationCommand(
+          [self.compiler, '-c', str(self.source)], str(self.root), keeper, 'lz4s')
+    self.assertTrue(files)
+    self.assertTrue(any(path.endswith(str(header) + '.lz4s') for path in files))
+
+  def test_compatible_other_clang_release_scans_compiles_and_links(self):
+    for compiler in Path('/usr/lib/llvm').glob('*/bin/clang'):
+      version = subprocess.check_output([compiler, '-dumpversion'], text=True).strip()
+      if version != clang_scan.version:
+        break
+    else:
+      self.skipTest('an additional Clang release is required')
+    self.source.write_text('int main(void) { return 0; }\n')
+    self.addCleanup(os.chdir, os.getcwd())
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    files = analyzer.DoCompilationCommand([str(compiler), '-c', str(self.source)],
+                                         str(self.root), keeper, 'lz4s')
+    self.assertTrue(files)
+    worker = self.root / 'worker'
+    snapshots = clang_scan.scan([str(compiler), '-c', str(self.source)], str(self.root))['files']
+    for path, data in snapshots.items():
+      copied = worker / path.lstrip('/')
+      copied.parent.mkdir(parents=True, exist_ok=True)
+      copied.write_bytes(data)
+    obj, executable = self.root / 'other.o', self.root / 'other'
+    helper = Path(__file__).resolve().parent.parent / 'distcc-clang'
+    # The test imports include_server's modules directly; the helper uses the
+    # installed package. Do not shadow that package with include_server.py.
+    env = dict(os.environ)
+    env.pop('PYTHONPATH', None)
+    result = subprocess.run([sys.executable, helper, worker, self.source, compiler,
+                             '-c', self.source, '-o', obj], env=env, capture_output=True, text=True)
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    subprocess.run([compiler, obj, '-o', executable], check=True, capture_output=True)
+    subprocess.run([executable], check=True)
+
   def test_clang_expanded_cpu_flags_reach_header_analysis(self):
     self.source.write_text('#ifndef __AVX2__\n#error missing CPU feature\n#endif\nint value;\n')
     self.addCleanup(os.chdir, os.getcwd())

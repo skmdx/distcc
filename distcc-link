@@ -206,7 +206,7 @@ def compiler_identity(compiler, target=None):
     }
 
 
-def clang_link_args(command, version):
+def clang_link_args(command):
     """Let the client's driver resolve configuration, runtimes and LTO flags.
 
     Only a single LLD invocation is distributable. Source compilation and
@@ -218,19 +218,11 @@ def clang_link_args(command, version):
     if (result.returncode or len(commands) != 1 or not commands[0] or
             not re.fullmatch(r'ld\.lld(?:-\d+)?', Path(commands[0][0]).name)):
         raise LocalOnly('Clang remote links require a single LLD invocation')
-    check_lld_version(commands[0][0], version)
     return commands[0][1:]
 
 
-def check_lld_version(linker, version):
-    description = compiler_query([str(linker), '--version'])
-    if not re.search(r'\bLLD\s+' + re.escape(version) + r'(?:\s|$)', description):
-        raise LocalOnly('Clang and LLD versions differ')
-
-
-def lld_for(compiler, version):
+def lld_for(compiler):
     linker = compiler_query([compiler, '-print-prog-name=ld.lld']).strip()
-    check_lld_version(linker, version)
     return str(linker)
 
 
@@ -292,8 +284,6 @@ def prepare_job(command, profile, identity=None):
         elif arg.startswith(('--target=', '-target=')):
             target = arg.split('=', 1)[1]
     identity = identity or compiler_identity(compiler, target)
-    if any(identity[k] != profile[k] for k in identity):
-        raise LocalOnly('compiler and sysroot profile differ')
     if compiler_family(compiler) != profile.get('family', 'gcc'):
         raise LocalOnly('compiler family and sysroot profile differ')
     if compiler_family(compiler) == 'gcc' and any(
@@ -302,7 +292,7 @@ def prepare_job(command, profile, identity=None):
     if not KEY.fullmatch(profile['key']):
         raise LocalOnly('invalid sysroot key')
     if compiler_family(compiler) == 'clang':
-        args = clang_link_args([compiler, *args], identity['version'])
+        args = clang_link_args([compiler, *args])
     return map_link_job(compiler, args, profile, identity)
 
 
@@ -363,9 +353,7 @@ def map_link_job(compiler, args, profile, identity, source_root=None):
                 directory = Path(value).absolute()
                 key = str(directory)
                 if not directory.is_dir():
-                    if clang:
-                        continue  # Driver search paths can include absent directories.
-                    raise LocalOnly('library search directory does not exist')
+                    continue  # Linkers ignore absent search directories.
                 if key not in library_dirs:
                     library_dirs[key] = 'library-' + str(len(library_dirs))
                     for file in sorted(directory.iterdir()):
@@ -381,11 +369,7 @@ def map_link_job(compiler, args, profile, identity, source_root=None):
                     raise LocalOnly('missing linker option value')
                 value = args[index]
                 index += 1
-                if arg == '-m':
-                    if value not in ('aarch64linux', 'aarch64linuxb', 'elf_x86_64', 'elf_i386',
-                                     'armelf_linux_eabi', 'elf64lriscv', 'elf64lppc', 'elf64ppc'):
-                        raise LocalOnly('unsupported linker emulation')
-                elif arg == '-z':
+                if arg == '-z':
                     linker_flags('-Wl,-z,' + value)
                 mapped.extend((arg, value))
             elif arg in SAFE_LINKER_FLAGS or arg in ('-pie', '-shared', '-static', '-s', '-EL', '-EB') or re.fullmatch(
@@ -833,8 +817,6 @@ def worker(archive, output):
         if compiler_family(compiler) != profile.get('family', 'gcc'):
             raise ValueError('compiler family does not match the sysroot')
         identity = compiler_identity(compiler, profile['target'])
-        if any(identity[k] != job[k] or identity[k] != profile[k] for k in identity):
-            raise ValueError('link compiler does not match the sysroot')
         gccdir = profile.get('gccdir', '')
         if not clang and not re.fullmatch(r'usr/lib(?:64)?/gcc/[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+', gccdir):
             raise ValueError('invalid GCC runtime directory')
@@ -872,7 +854,7 @@ def worker(archive, output):
         # Native client specs can have an empty sysroot_spec; pass the cache
         # to ld explicitly as well as to the GCC driver's library search.
         if clang:
-            command = [lld_for(compiler, identity['version']), *args,
+            command = [lld_for(compiler), *args,
                        '--sysroot=' + str(sysroot), '-o', output]
         else:
             command = [compiler, '--sysroot=' + str(sysroot), '-B' + str(sysroot / gccdir) + '/',
@@ -974,7 +956,7 @@ def sysroot_identity(root, compiler):
         runtime = subprocess.check_output([compiler, '-print-runtime-dir'], text=True).strip()
         profile.update(family='clang', runtime_dirs=[os.path.normpath(runtime).lstrip('/')],
                        cxx_dirs=[str(prefix / lib).lstrip('/') for lib in ('lib', 'lib64')])
-        lld_for(compiler, profile['version'])
+        lld_for(compiler)
     else:
         profile['specs'] = subprocess.check_output([compiler, '-dumpspecs'], text=True)
     return profile
@@ -1144,9 +1126,7 @@ def main():
         profile = json.load(sys.stdin)
         try:
             check_source(profile, sys.argv[2])
-            identity = compiler_identity(sys.argv[3])
-            return int(any(identity[key] != profile[key] for key in identity) or
-                       compiler_family(sys.argv[3]) != profile.get('family', 'gcc'))
+            return int(compiler_family(sys.argv[3]) != profile.get('family', 'gcc'))
         except LocalOnly:
             return 1
     if len(sys.argv) == 4 and sys.argv[1] == '--describe':

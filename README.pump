@@ -11,8 +11,8 @@ the command exits. It does not require build-system hooks or special handling of
 headers. Without pump, ordinary client-side preprocessing remains the default.
 For Clang C-family sources, the client rewrites includes while preserving macros
 and the worker finishes preprocessing. This preserves macro-sensitive diagnostics
-without requiring application headers on workers. Compiler versions, targets
-and default compiler configuration must still match. Dependency files are
+without requiring application headers on workers. The worker must support the
+requested target, options and source language. Dependency files are
 produced on the client.
 
 With DISTCC_BROKER set, clients request remote preprocessing through the existing
@@ -38,7 +38,8 @@ in-progress transfer cannot lose its inputs during recovery.
 The include server calls libclang-cpp directly through a resident Python C++
 extension. Building pump requires LLVM 22 or 23 development headers, libclang-cpp,
 libLLVM and a C++17 compiler; set LLVM_CONFIG to the matching llvm-config if it
-is not on PATH or beside clang. Clang jobs must match the library's version.
+is not on PATH or beside clang. Clang release strings do not gate analysis;
+the frontend reports unsupported inputs through its normal diagnostics.
 The Clang and LLVM libraries must also use the same assertion/debug ABI settings.
 For Clang jobs, the canonical preprocessor discovers includes and existence probes without
 building an AST or generating code. Its input buffers are reused for transfer.
@@ -48,8 +49,8 @@ Clang pump jobs use the installed `distcc-clang` worker helper. Its virtual
 filesystem resolves absolute include operands and existence probes against the
 transferred files while preserving the original main-file identity, including
 static-function profile names. Target and language defaults are inferred from
-the requested driver name. The worker library must match the requested compiler
-version. Clang IR profile generation (`-fprofile-generate`) also uses this helper
+the requested driver name. The worker library executes the requested compilation
+without requiring identical driver release metadata. Clang IR profile generation (`-fprofile-generate`) also uses this helper
 for locally preprocessed input. GCC profile generation and
 `-fprofile-use` remain local because their additional file contracts are not
 part of the compilation RPC.
@@ -121,7 +122,8 @@ and probes stay missing even when a worker has additional headers installed.
 
 System headers use the same compression and immutable input cache as application
 headers. They do not need to match the worker installation or be retransmitted
-on every job. Compiler versions and target ABI must still agree. This transfers
+on every job. The generated objects must be compatible with the client's target
+ABI and linker. This transfers
 the required header closure, not libraries or a complete sysroot for linking.
 
 For Gentoo, source `packaging/gentoo/pump.bashrc` (installed by the overlay as

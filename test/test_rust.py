@@ -102,6 +102,39 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         subprocess.run([executable], check=True)
 
+    def test_new_options_outputs_and_unrelated_proc_macro_allow_distribution(self):
+        macro = self.work / 'macro.rs'
+        macro.write_text('extern crate proc_macro;')
+        deps = self.work / 'deps'
+        deps.mkdir()
+        result = self.rust('--crate-type=proc-macro', macro, '-o', deps / 'libunused.so', remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source, library = self.work / 'source.input', self.work / 'liboptions.rlib'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        mir = self.work / 'options.mir'
+        result = self.rust('--crate-name=options', '--crate-type=rlib', '-Z', 'threads=2',
+                           '--codegen=default-linker-libraries=yes', '-L', 'dependency=' + str(deps),
+                           '--emit=link,mir=' + str(mir), source, '-o', library,
+                           env=dict(self.env, RUSTC_BOOTSTRAP='1'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        self.assertIn('fn answer', mir.read_text())
+        main, executable = self.work / 'main.rs', self.work / 'check-options'
+        main.write_text('fn main() { assert_eq!(options::answer(), 42); }')
+        result = self.rust(main, '--extern', 'options=' + str(library), '-o', executable, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([executable], check=True)
+
+    def test_stdin_is_not_consumed_by_dependency_discovery(self):
+        output = self.work / 'libstdin.rlib'
+        result = subprocess.run([str(self.build / 'distcc'), self.rustc, '--crate-type=rlib',
+                                 '--crate-name=stdin', '-', '-o', str(output)],
+                                input='pub fn answer() -> u32 { 42 }', env=self.env,
+                                cwd=self.work, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('standard input requires local compilation', result.stderr)
+        self.assertTrue(output.is_file())
+
     def test_rust_dependency_filename_escaping(self):
         names = ['a space', 'a$$b', 'a#b', "a'b", 'a\\b', 'a: b', 'a\\ b']
         for name in names:

@@ -6,6 +6,8 @@ import unittest
 import shutil
 import os
 import subprocess
+import sys
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('deploy', Path(__file__).resolve().parents[1] /
                                             'packaging/gentoo/deploy.py')
@@ -15,6 +17,19 @@ spec.loader.exec_module(deploy)
 
 
 class TransportTest(unittest.TestCase):
+    def test_selected_compiler_follows_path_without_version_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for selection in ('previous', 'updated'):
+                directory = Path(temporary) / selection
+                directory.mkdir()
+                compiler = directory / 'selected-compiler'
+                compiler.symlink_to(sys.executable)
+                with mock.patch.dict(os.environ, PATH=str(directory) + os.pathsep + os.environ['PATH']):
+                    self.assertEqual(deploy.resolve_compilers({'compiler_paths': ['selected-compiler']}),
+                                     [str(compiler)])
+            self.assertEqual(deploy.resolve_compilers({'compiler_paths': [str(compiler)]}),
+                             [str(compiler)])
+
     def test_package_mirror_removes_retired_ebuild_without_touching_siblings(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

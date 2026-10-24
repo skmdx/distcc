@@ -18,7 +18,7 @@
       "build_limits": [],
       "check_limits": [],
       "auto_memory": true,
-      "compiler_paths": ["/usr/lib/llvm/23/bin/x86_64-pc-linux-gnu-clang-23", "/usr/lib/llvm/23/bin/x86_64-pc-linux-gnu-clang++-23"],
+      "compiler_paths": ["clang", "clang++"],
       "validation_hosts": "worker-ssh-alias,cpp,lz4",
       "server_hosts": "worker-ssh-alias,cpp,lz4,tcp",
       "quiesce_units": ["distcc-build.service"],

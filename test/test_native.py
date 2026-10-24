@@ -54,6 +54,20 @@ int main(void) { float a[128] = {0}, b[128] = {3};
             self.assertNotIn(' on 127.0.0.1', result.stderr)
         return result.stderr
 
+    def test_joined_language_option_is_distributed(self):
+        self.source.write_text('int main(void) { return 0; }\n')
+        for compiler, language in (('gcc', 'c'), ('g++', 'c++')):
+            with self.subTest(compiler=compiler):
+                output = self.work / ('joined-' + language + '.o')
+                result = subprocess.run([str(self.build / 'distcc'), compiler,
+                                         '-x' + language, '-c', str(self.source), '-o', str(output)],
+                                        env=self.env, capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(' on 127.0.0.1', result.stderr)
+                executable = self.work / ('joined-' + language)
+                subprocess.run([compiler, output, '-o', executable], check=True)
+                subprocess.run([executable], check=True)
+
     def cases(self, compiler):
         target = subprocess.check_output([compiler, '-dumpmachine'], text=True).strip()
         if target.startswith(('x86_64', 'i686')):
@@ -151,6 +165,7 @@ int main(void) { float a[128] = {0}, b[128] = {3};
         directory.mkdir()
         compiler = directory / 'gcc'
         real = shutil.which('gcc')
+        assert real is not None
         compiler.write_text('#!/bin/sh\nfor arg do\n'
                             '  if [ "$arg" = "-###" ]; then exit 0; fi\ndone\n'
                             'exec ' + real + ' "$@"\n')
