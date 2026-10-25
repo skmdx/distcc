@@ -136,12 +136,15 @@ class StatisticsTest(unittest.TestCase):
                             'assigning host=worker cost=2.000 score=2.005 broker_wait=0.375\n'
                             'waiting for hosts\n'
                             'waiting for host=worker cost=2.000 score=4.000\n'
+                            'distcc[1] (dcc_lock_pause) nothing available, sleeping 250ms...\n'
                             'include server gave up analyzing\nninja -v -j8\n')
             result = measure.log_summary([path])
             self.assertEqual(result['phases']['prepare']['total_seconds'], .25)
             self.assertEqual(result['phases']['broker_wait']['total_seconds'], .375)
             self.assertEqual(result['assignments'], {'worker': 1})
             self.assertEqual(result['broker_waits'], 2)
+            self.assertEqual(result['local_slot_waits'], 1)
+            self.assertEqual(result['local_slot_wait_seconds'], .25)
             self.assertEqual(result['analysis_warnings'], 1)
             self.assertEqual(result['ninja_jobs'], [8])
 

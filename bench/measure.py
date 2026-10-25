@@ -91,7 +91,8 @@ def summarize_samples(samples, names):
 
 
 def log_summary(paths):
-    counts = dict(analysis_warnings=0, io_timeouts=0, sandbox_denials=0, broker_waits=0)
+    counts = dict(analysis_warnings=0, io_timeouts=0, sandbox_denials=0, broker_waits=0,
+                  local_slot_waits=0, local_slot_wait_seconds=0.0)
     timings = []
     waits = []
     assignments = {}
@@ -106,6 +107,10 @@ def log_summary(paths):
                 counts['io_timeouts'] += 'ERROR: IO timeout' in line
                 counts['sandbox_denials'] += 'ACCESS DENIED' in line
                 counts['broker_waits'] += 'waiting for host' in line
+                local_wait = re.search(r'\(dcc_lock_pause\) nothing available, sleeping (\d+)ms', line)
+                if local_wait:
+                    counts['local_slot_waits'] += 1
+                    counts['local_slot_wait_seconds'] += int(local_wait[1]) / 1000
                 if 'job cost:' in line:
                     fields = dict(re.findall(r'(\w+)=([^ ]+)', line))
                     timings.append({key: float(fields[key]) for key in ('prepare', 'queue', 'execute')})
