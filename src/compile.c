@@ -568,9 +568,10 @@ static void dcc_add_clang_target(char **argv)
 {
         /* defined by autoheader */
     const char *target = NATIVE_COMPILER_TRIPLE;
+    const char *compiler = dcc_find_basename(argv[0]);
 
-    if (strcmp(argv[0], "clang") == 0 || strncmp(argv[0], "clang-", strlen("clang-")) == 0 ||
-        strcmp(argv[0], "clang++") == 0 || strncmp(argv[0], "clang++-", strlen("clang++-")) == 0)
+    if (strcmp(compiler, "clang") == 0 || strncmp(compiler, "clang-", strlen("clang-")) == 0 ||
+        strcmp(compiler, "clang++") == 0 || strncmp(compiler, "clang++-", strlen("clang++-")) == 0)
         ;
     else
         return;

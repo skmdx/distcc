@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import unittest
 
@@ -72,6 +73,33 @@ class ThinLTOTest(BrokerTestCase):
 
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
+
+    def test_absolute_clang_preserves_client_target(self):
+        compiler = Path(shutil.which('clang')).resolve()
+        target = subprocess.check_output([compiler, '-dumpmachine'], text=True).strip()
+        other = 'x86_64-linux-gnu' if target.startswith('aarch64') else 'aarch64-linux-gnu'
+        wrappers = self.work / 'bin'
+        wrappers.mkdir()
+        wrapper = wrappers / compiler.name
+        wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(str(compiler)) +
+                           ' --target=' + other + ' "$@"\n')
+        wrapper.chmod(0o755)
+        self.restart_server(self.build / 'distccd', DISTCCD_PATH=str(wrappers) + os.pathsep + os.defpath)
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        saved = dict(self.env)
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='target')
+        saved['DISTCC_BROKER'] = self.env['DISTCC_BROKER']
+        self.env = saved
+        source = self.work / 'target.c'
+        source.write_text('int main(void) { return 0; }')
+        obj = self.work / 'target.o'
+        result = self.run_command([self.build / 'distcc', compiler, '-c', source, '-o', obj])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('pooled TCP job completed', result.stderr)
+        output = self.work / 'target'
+        result = self.run_command([compiler, obj, '-o', output])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_command([output]).returncode, 0)
 
     def test_archive_and_selected_compiler(self):
         compiler = '/usr/lib/llvm/22/bin/clang'

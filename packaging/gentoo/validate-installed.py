@@ -148,16 +148,16 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             source, obj = root / f'thin-{index}.c', root / f'thin-{index}.o'
             source.write_text(f'int part{index}(int n) {{ int v=0; '
                               f'for(int i=0;i<n;i++) v+=(i*{index+1})%101; return v; }}')
-            subprocess.run([clang, '-O2', '-flto=thin', '-c', source, '-o', obj],
-                           check=True, capture_output=True, timeout=30)
+            subprocess.run(['distcc', clang, '-O2', '-flto=thin', '-c', source, '-o', obj],
+                           env=env, check=True, capture_output=True, timeout=REMOTE_TIMEOUT)
             objects.append(obj)
         source, main = root / 'thin-main.c', root / 'thin-main.o'
         source.write_text('#include <stdio.h>\n' +
                           '\n'.join(f'int part{i}(int);' for i in range(12)) +
                           '\nint main(int n,char **v) { printf("%d\\n", ' +
                           '+'.join(f'part{i}(n*23)' for i in range(12)) + '); }')
-        subprocess.run([clang, '-O2', '-flto=thin', '-c', source, '-o', main],
-                       check=True, capture_output=True, timeout=30)
+        subprocess.run(['distcc', clang, '-O2', '-flto=thin', '-c', source, '-o', main],
+                       env=env, check=True, capture_output=True, timeout=REMOTE_TIMEOUT)
         executable, reference = root / 'thin-remote', root / 'thin-local'
         command = [clang, '-flto=thin', '-fuse-ld=lld', main, *objects]
         subprocess.run([*command, '-o', reference], check=True, capture_output=True, timeout=30)
