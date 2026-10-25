@@ -260,7 +260,7 @@ def main():
                         deploy.run(['sudo', '-n', 'rm', '-rf', '--', remote], targets[name])
                 except RuntimeError as error:
                     result.update(success=False, error='temporary cleanup failed: ' + str(error))
-                if result['success']:
+                if result['success'] and not result.get('incremental'):
                     (Path(config['results']) / 'latest.json').write_text(json.dumps(result, indent=2) + '\n')
             (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
             (out / 'summary.txt').write_text(report(result))
