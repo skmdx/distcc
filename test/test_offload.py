@@ -102,7 +102,7 @@ int main() { return 0; }
 ''')
         flags = ['-xhip', '--offload-arch=gfx900', '--offload-arch=gfx1030',
                  '--rocm-device-lib-path=' + libraries, '-O3', '-flto=thin',
-                 '-march=native', '-mtune=native', '-MD']
+                 '--offload-compress', '-march=native', '-mtune=native', '-MD']
         obj = self.distributed(flags, source)
         self.assertIn('kernel.cpp', obj.with_suffix('.d').read_text())
         exe = self.work / 'hip-linked'
