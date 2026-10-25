@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Distribute the independent images in Clang's HIP fat binary."""
+import asyncio
+import errno
+import os
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+
+def run(args, **kwargs):
+    return subprocess.run(args, check=True, **kwargs)
+
+
+def values(args, prefix):
+    return [arg[len(prefix):] for arg in args if arg.startswith(prefix)]
+
+
+async def child(args, env, descriptors=()):
+    process = await asyncio.create_subprocess_exec(
+        *args, env=env, pass_fds=descriptors,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await process.communicate()
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            await process.wait()
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, args, stdout, stderr)
+    sys.stdout.buffer.write(stdout)
+    sys.stderr.buffer.write(stderr)
+
+
+def publish(source, destination):
+    try:
+        os.replace(source, destination)
+        return
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+    fd, staging = tempfile.mkstemp(prefix='.distcc-', dir=Path(destination).parent)
+    os.close(fd)
+    try:
+        shutil.copyfile(source, staging)
+        os.replace(staging, destination)
+    finally:
+        Path(staging).unlink(missing_ok=True)
+
+
+def compile_images(prepared, source, output, args):
+    transport = str(Path(__file__).resolve().with_name('distcc'))
+    env = dict(os.environ)
+    # Each child is an independent job, bounded by the broker. A single GPU
+    # action or host-only action cannot recursively enter this coordinator.
+    env.pop('_DISTCC_SAFEGUARD', None)
+    env.pop('INCLUDE_SERVER_PORT', None)
+    with tempfile.TemporaryDirectory(prefix='distcc-offload-') as temporary, open(prepared, 'rb') as shared:
+        env['_DISTCC_CPP_FD'] = str(shared.fileno())
+        work = Path(temporary)
+        preprocessed = work / (Path(source).name + '.hipi')
+        preprocessed.symlink_to(prepared)
+        command = [str(preprocessed) if arg == source else arg for arg in args]
+        plan = run([*command, '-o', output, '-###'], capture_output=True, text=True, env=env)
+        commands = [shlex.split(line) for line in plan.stderr.splitlines() if line.startswith(' ')]
+        # The driver owns the image format, target IDs, alignment and bundle
+        # options. Substitute only the independently produced input images.
+        bundle = next(cmd for cmd in commands if cmd and
+                      'clang-offload-bundler' in Path(cmd[0]).name and '-input=/dev/null' in cmd)
+        targets = values(bundle, '-targets=')[0].split(',')
+        inputs = values(bundle, '-input=')
+        if len(targets) != len(inputs):
+            raise ValueError('Clang image bundle has mismatched targets and inputs')
+        devices = [(target, name) for target, name in zip(targets, inputs) if name != '/dev/null']
+        base = []
+        options = iter(command)
+        architectures = ('--offload-arch', '--cuda-gpu-arch', '--no-offload-arch', '--no-cuda-gpu-arch')
+        for arg in options:
+            if arg in ('-Xclang', '-mllvm', '-Xarch_host'):
+                base.extend((arg, next(options)))
+            elif arg in architectures:
+                next(options)
+            elif not any(arg.startswith(name + '=') for name in architectures):
+                base.append(arg)
+        device_only = '--offload-device-only' in base or '--cuda-device-only' in base
+        base = [arg for arg in base if arg not in ('--offload-device-only', '--cuda-device-only')]
+        slots = int(subprocess.check_output([transport, '-j'], text=True, env=env))
+
+        async def compile_device(item):
+            index, (target, original) = item
+            architecture = target.rsplit('--', 1)[1]
+            obj, image = work / f'{index}.o', work / f'{index}.out'
+            await child([transport, *base, '--offload-device-only',
+                          '--offload-arch=' + architecture, '-o', str(obj)],
+                        env, (shared.fileno(),))
+            await child([bundle[0], '-unbundle', '-type=o', '-targets=' + target,
+                         '-input=' + str(obj), '-output=' + str(image)], env)
+            return original, str(image)
+
+        async def compile_all():
+            available = asyncio.Semaphore(max(1, slots))
+            async def scheduled(item):
+                async with available:
+                    return await compile_device(item)
+            return dict(await asyncio.gather(*(scheduled(item) for item in enumerate(devices))))
+        # asyncio.run cancels and reaps sibling jobs on the first failure.
+        images = asyncio.run(compile_all())
+        fatbinary = work / 'images.hipfb'
+        assembled = [('-input=' + images.get(arg[7:], arg[7:])) if arg.startswith('-input=')
+                     else '-output=' + str(fatbinary) if arg.startswith('-output=')
+                     else arg for arg in bundle]
+        run(assembled, env=env)
+        if device_only:
+            publish(fatbinary, output)
+        else:
+            # The source and device images use the original driver's common
+            # compilation-unit ID. Compile the host exactly once.
+            result = work / 'host.o'
+            run([transport, *base, '--offload-host-only',
+                 '-Xclang', '-fcuda-include-gpubinary', '-Xclang', str(fatbinary),
+                 '-o', str(result)], env=env, pass_fds=(shared.fileno(),))
+            publish(result, output)
+    return 0
+
+
+if __name__ == '__main__':
+    def interrupted(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        sys.exit(compile_images(*sys.argv[1:4], sys.argv[4:]))
+    except subprocess.CalledProcessError as error:
+        if error.stdout:
+            sys.stdout.buffer.write(error.stdout if isinstance(error.stdout, bytes) else error.stdout.encode())
+        if error.stderr:
+            sys.stderr.buffer.write(error.stderr if isinstance(error.stderr, bytes) else error.stderr.encode())
+        sys.exit(error.returncode if error.returncode > 0 else 128 - error.returncode)
+    except (OSError, ValueError, IndexError, StopIteration) as error:
+        print('distcc-offload: ' + str(error), file=sys.stderr)
+        sys.exit(1)

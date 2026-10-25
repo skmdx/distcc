@@ -1232,9 +1232,18 @@ static int dcc_run_job(int in_fd,
      * LLVM IR PGO names, which prefix-map options do not affect. */
     if (dcc_offload_language(argv)) {
         for (i = 1; argv[i]; ++i) {
-            if (root && !strncmp(argv[i], "--rocm-device-lib-path=", 23)) {
+            if (root && (!strncmp(argv[i], "--rocm-device-lib-path=", 23) ||
+                (!strcmp(argv[i], "-fcuda-include-gpubinary") && argv[i + 1] &&
+                 !strcmp(argv[i + 1], "-Xclang") && argv[i + 2]))) {
+                const char *prefix = "--rocm-device-lib-path=";
+                int offset = 23;
+                if (!strcmp(argv[i], "-fcuda-include-gpubinary")) {
+                    i += 2;
+                    prefix = "";
+                    offset = 0;
+                }
                 char *path;
-                if (asprintf(&path, "--rocm-device-lib-path=%s%s", root, argv[i] + 23) < 0) {
+                if (asprintf(&path, "%s%s%s", prefix, root, argv[i] + offset) < 0) {
                     ret = EXIT_OUT_OF_MEMORY;
                     goto out_cleanup;
                 }

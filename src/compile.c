@@ -743,7 +743,7 @@ dcc_build_somewhere(char *argv[],
     char **localcpp_server_argv = NULL;
     char **remotecpp_server_argv = NULL;
     struct dcc_buffer server_stderr = {0}, server_stdout = {0};
-    int preprocess_only;
+    int preprocess_only, offload_targets = 0;
     int needs_dotd = 0;
     int sets_dotd_target = 0;
     pid_t cpp_pid = 0;
@@ -799,7 +799,7 @@ dcc_build_somewhere(char *argv[],
     if (preprocess_only && (ret || !getenv("INCLUDE_SERVER_PORT")))
         ret = EXIT_LOCAL_CPP;
     if (!ret && (dcc_offload_language(argv) || dcc_native_requested(argv))) {
-        if (dcc_offload_language(argv) ? dcc_prepare_offload(&argv, &auxiliary) :
+        if (dcc_offload_language(argv) ? dcc_prepare_offload(&argv, &auxiliary, &offload_targets) :
                                        dcc_expand_native(&argv, input_fname, output_fname)) {
             ret = EXIT_DISTCC_FAILED;
         } else {
@@ -870,7 +870,7 @@ dcc_build_somewhere(char *argv[],
     /* With a broker, finish local preprocessing before reserving a worker.
      * Release the local lock before requesting the remote lease; never wait
      * for a remote slot while holding a local slot. Reuse this input on retry. */
-    if (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER") &&
+    if ((offload_targets > 1 || (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER"))) &&
         !getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes) {
         dcc_read_localslots_configuration();
         if (local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
@@ -878,7 +878,7 @@ dcc_build_somewhere(char *argv[],
         ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid, &cpp_fd);
         if (!ret) ret = dcc_wait_for_cpp(cpp_pid, status, input_fname);
 #ifdef __linux__
-        if (!ret && !*status && cpp_fd >= 0 &&
+        if (!ret && !*status && cpp_pid > 0 && cpp_fd >= 0 &&
             (fchmod(cpp_fd, 0444) || fcntl(cpp_fd, F_ADD_SEALS,
                 F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)))
             ret = EXIT_IO_ERROR;
@@ -890,6 +890,14 @@ dcc_build_somewhere(char *argv[],
             ret = dcc_critique_status(*status, "cpp", input_fname, dcc_hostdef_local, 0);
         if (ret) goto unlock_and_clean_up;
         cpp_ready = 1;
+    }
+
+    if (offload_targets > 1 && cpp_ready) {
+        char **command = NULL;
+        ret = dcc_offload_command(argv, input_fname, output_fname, cpp_fname, cpp_fd, &command);
+        if (!ret) ret = dcc_compile_local(command, input_fname);
+        if (command) dcc_free_argv(command);
+        goto unlock_and_clean_up;
     }
 
     if (getenv("DISTCC_BROKER"))

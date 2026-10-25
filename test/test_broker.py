@@ -750,6 +750,12 @@ class BrokerTest(BrokerTestCase):
         self.assertEqual(net.getpeername()[1], self.ports[1])
 
     def test_prepared_input_uses_its_class_capacity_after_small_jobs(self):
+        self.check_prepared_class_capacity(1)
+
+    def test_gpu_uses_compile_memory_capacity(self):
+        self.check_prepared_class_capacity(9)
+
+    def check_prepared_class_capacity(self, kind):
         capacities = [4] * 64
         capacities[22] = 1
         first = self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
@@ -759,9 +765,9 @@ class BrokerTest(BrokerTestCase):
                           queued=0, preparing=0, returning=0, running=0))
         hosts = self.host(0, f',tcp,stats={first.port},speed=1.5') + ' ' + self.host(1, f',tcp,stats={second.port}')
         self.start_broker(hosts)
-        _, first_net = self.acquire_reserved(10, (90, 4 * 1024 * 1024, 1))
+        _, first_net = self.acquire_reserved(10, (90, 4 * 1024 * 1024, kind))
         self.assertEqual(first_net.getpeername()[1], self.ports[0])
-        _, next_net = self.acquire_reserved(10, (91, 4 * 1024 * 1024, 1))
+        _, next_net = self.acquire_reserved(10, (91, 4 * 1024 * 1024, kind))
         self.assertEqual(next_net.getpeername()[1], self.ports[1])
 
     def test_pump_uses_header_tree_capacity_instead_of_small_compile_capacity(self):

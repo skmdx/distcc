@@ -27,6 +27,21 @@ appropriate compiler installed.
 Clang retains macros until remote compilation to preserve diagnostics;
 see README.pump for preprocessing behavior and toolchain requirements.
 
+HIP compilation uses the client's Clang driver and the existing TCP input cache.
+When the driver produces an independent multi-target device-image bundle,
+`distcc-offload` submits one job per GPU target, assembles the images with the
+driver's bundler options, and compiles the host once. Preprocessing and dependency
+generation run once; child jobs share the immutable preprocessor input by file
+descriptor. The original compilation-unit ID is retained across host and device
+actions. A failed target cancels its siblings and does not publish a partial object.
+GPU frontends learn their own execution-cost model; host-only compilation uses
+the C++ model. New GPU work starts with capacity-based placement until measured
+execution times are available.
+This reduces the serial tail of multi-GPU-target compilation; it does not split
+a single target's compiler frontend. Other driver graphs keep their ordinary
+distcc route. The Clang 23 new-driver preprocessing limitation is tracked in
+[issue 13](https://github.com/skmdx/distcc/issues/13).
+
 ThinLTO links distribute individual optimization/code-generation backends:
 
 ```

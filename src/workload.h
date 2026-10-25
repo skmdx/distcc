@@ -5,12 +5,13 @@
 
 #define DCC_WORK_RUST 7
 #define DCC_WORK_THINLTO 8
-#define DCC_WORK_CLASSES DCC_WORK_THINLTO
+#define DCC_WORK_OFFLOAD 9
+#define DCC_WORK_CLASSES DCC_WORK_OFFLOAD
 #define DCC_WORK_HISTORY 4096
 #define DCC_WORK_WAYS 4
 struct dcc_work_hint {
     uint64_t key, bytes;
-    uint32_t kind, source_bytes; /* 1..3: preprocessed C/C++/asm; 4..6: source + headers; 7: Rust; 8: ThinLTO. */
+    uint32_t kind, source_bytes; /* 1..3: preprocessed C/C++/asm; 4..6: source + headers; 7: Rust; 8: ThinLTO; 9: GPU. */
 };
 struct dcc_work_class {
     double xx, xy, yy, xz, yz;

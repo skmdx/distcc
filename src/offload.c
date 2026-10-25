@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "distcc.h"
 #include "exitcode.h"
 #include "trace.h"
@@ -96,13 +97,15 @@ static int host_native(char ***args, char **host)
     return 0;
 }
 
-int dcc_prepare_offload(char ***argvp, char ***files)
+int dcc_prepare_offload(char ***argvp, char ***files, int *targets)
 {
     char **argv = *argvp, **expanded = NULL, **inputs = NULL, **host = NULL, **gpus = NULL;
     char *text = NULL, *directory = NULL, *compiler = NULL, *cuid = NULL, *line, *next;
     int ret = EXIT_DISTCC_FAILED, native = dcc_native_requested(argv);
     int hip = !strcmp(dcc_offload_language(argv), "hip-cpp-output");
     int gpu_native = dcc_argv_search(argv, "--offload-arch=native");
+    int devices = 0, image_bundle = 0;
+    *targets = 0;
     if (dcc_read_driver(argv, &text)) goto out;
     for (line = text; line && *line; line = next) {
         char **words;
@@ -111,6 +114,8 @@ int dcc_prepare_offload(char ***argvp, char ***files)
         if (next) *next++ = '\0';
         if (!isspace((unsigned char)*line)) continue;
         if (!(words = dcc_driver_words(line))) goto out;
+        if (words[0] && strstr(dcc_find_basename(words[0]), "clang-offload-bundler") &&
+            dcc_argv_search(words, "-input=/dev/null")) image_bundle = 1;
         if (!words[0] || !words[1] || strcmp(words[1], "-cc1")) { free(words); continue; }
         if (!compiler) compiler = realpath(words[0], NULL);
         for (int i = 2; hip && !cuid && words[i]; ++i)
@@ -119,6 +124,7 @@ int dcc_prepare_offload(char ***argvp, char ***files)
             }
         triple = option(words, "-triple");
         if (triple && !strncmp(triple, "amdgcn", 6)) {
+            ++devices;
             if (gpu_native) {
                 const char *cpu = option(words, "-target-cpu");
                 char *flag = NULL;
@@ -137,6 +143,11 @@ int dcc_prepare_offload(char ***argvp, char ***files)
             }
             free(words);
         } else {
+            const char *binary = option(words, "-fcuda-include-gpubinary");
+            if (binary && access(binary, R_OK) == 0 && append(&inputs, binary)) {
+                free(words);
+                goto out;
+            }
             free(host);
             host = words;
         }
@@ -187,6 +198,7 @@ int dcc_prepare_offload(char ***argvp, char ***files)
     dcc_free_argv(argv);
     *argvp = expanded;
     *files = inputs;
+    if (hip && image_bundle) *targets = devices;
     expanded = inputs = NULL;
     ret = 0;
 out:
@@ -198,5 +210,37 @@ out:
     free(cuid);
     free(directory);
     free(text);
+    return ret;
+}
+
+/* Keep the sealed preprocessor buffer alive in the parent. The coordinator
+ * and its ordinary distcc children share it without another preprocessing
+ * pass, dependency-file rewrite, or copy to disk. */
+int dcc_offload_command(char **argv, const char *input, const char *output,
+                        const char *prepared, int fd, char ***result)
+{
+    char **stripped = NULL, **command = NULL, **helper = NULL;
+    char *path = NULL;
+    int ret = EXIT_OUT_OF_MEMORY;
+    if (fd >= 0) {
+        if (asprintf(&path, "/proc/%ld/fd/%d", (long)getpid(), fd) < 0) return ret;
+    } else if (!(path = realpath(prepared, NULL))) return EXIT_IO_ERROR;
+    if ((ret = dcc_strip_local_args(argv, &stripped, input)) ||
+        (ret = dcc_strip_dasho(stripped, &command))) goto out;
+    if (append(&helper, "distcc-offload") || append(&helper, path) ||
+        append(&helper, input) || append(&helper, output)) {
+        ret = EXIT_OUT_OF_MEMORY;
+        goto out;
+    }
+    for (int i = 0; command[i]; ++i)
+        if (append(&helper, command[i])) { ret = EXIT_OUT_OF_MEMORY; goto out; }
+    *result = helper;
+    helper = NULL;
+    ret = 0;
+out:
+    free(path);
+    free(stripped);
+    free(command);
+    if (helper) dcc_free_argv(helper);
     return ret;
 }

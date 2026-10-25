@@ -27,6 +27,8 @@
  **/
 
 #include <config.h>
+#include <fcntl.h>
+#include <limits.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,6 +126,19 @@ int dcc_cpp_maybe(char **argv, char *input_fname, char **cpp_fname,
     *cpp_pid = 0;
 
     if (dcc_is_preprocessed(input_fname)) {
+        const char *descriptor = getenv("_DISTCC_CPP_FD");
+        if (descriptor) {
+            char *end;
+            long shared = strtol(descriptor, &end, 10);
+            if (*end || shared < 3 || shared > INT_MAX || !cpp_fd) return EXIT_IO_ERROR;
+            /* The offload coordinator lends the same immutable input to
+             * independent jobs. Own a close-on-exec descriptor, not a symlink
+             * that would be replayed as part of the worker's input tree. */
+            unsetenv("_DISTCC_CPP_FD");
+            *cpp_fd = fcntl(shared, F_DUPFD_CLOEXEC, 3);
+            close(shared);
+            if (*cpp_fd < 0) return EXIT_IO_ERROR;
+        }
         /* TODO: Perhaps also consider the option that says not to use cpp.
          * Would anyone do that? */
         rs_trace("input is already preprocessed");

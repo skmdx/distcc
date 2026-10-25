@@ -675,7 +675,7 @@ static int bulk_input(const struct peer *peer, const struct dcc_work_hint *hint)
 {
     /* Local inputs normally pass a sealed FD. Pump's logical tree includes
      * cached headers, so its size does not predict uploaded byte volume. */
-    return !peer->local && hint->kind <= 3;
+    return !peer->local && (hint->kind <= 3 || hint->kind == DCC_WORK_OFFLOAD);
 }
 
 static struct prediction predict(struct broker *broker, const struct client *client,
@@ -796,7 +796,8 @@ static unsigned long long memory_estimate(const struct dcc_capacity *cap,
                                          const struct dcc_work_hint *hint)
 {
     if (hint->kind < 1 || hint->kind > DCC_WORK_CLASSES) return cap->job_memory;
-    unsigned kind = hint->kind == DCC_WORK_THINLTO ? 3 : hint->kind == DCC_WORK_RUST ? 2 : hint->kind > 3 ? 1 : 0;
+    unsigned kind = hint->kind == DCC_WORK_THINLTO ? 3 : hint->kind == DCC_WORK_RUST ? 2 :
+                    hint->kind >= 4 && hint->kind <= 6 ? 1 : 0;
     return cap->memory_estimates[kind][dcc_resource_bucket(hint->bytes)];
 }
 
@@ -861,7 +862,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             projected = *cap;
             const int *capacities = client->hint.kind == DCC_WORK_THINLTO ? cap->thinlto_capacity :
                                     client->hint.kind == DCC_WORK_RUST ? cap->rust_capacity :
-                                    client->hint.kind > 3 ? cap->pump_capacity : cap->compile_capacity;
+                                    client->hint.kind >= 4 && client->hint.kind <= 6 ?
+                                    cap->pump_capacity : cap->compile_capacity;
             int limit = capacities[dcc_resource_bucket(client->hint.bytes)];
             /* The snapshot's class capacity assumes no subsequent jobs have
              * reserved memory. Charge their own measured classes: one large

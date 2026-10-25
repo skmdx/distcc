@@ -19,7 +19,11 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
         !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > 512LL * 1024 * 1024) return;
     unsigned kind = 1;
     const char *extension = strrchr(input, '.');
-    if (strstr(argv[0], "++") || (extension &&
+    int gpu = extension && (!strcmp(extension, ".hip") || !strcmp(extension, ".hipi"));
+    int host_only = 0, identity = 0;
+    for (int i = 1; argv[i]; ++i)
+        if (!strncmp(argv[i], "-cuid=", 6) && argv[i][6]) identity = 1;
+    if (gpu || strstr(argv[0], "++") || (extension &&
         (!strcmp(extension, ".cc") || !strcmp(extension, ".cpp") ||
          !strcmp(extension, ".cxx") || !strcmp(extension, ".C") || !strcmp(extension, ".ii")))) kind = 2;
     else if (extension && (!strcmp(extension, ".s") || !strcmp(extension, ".S"))) kind = 3;
@@ -29,12 +33,18 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
     key = XXH3_64bits(cwd, strlen(cwd));
     free(cwd);
     for (int i = 0; argv[i]; ++i) {
+        if (!strcmp(argv[i], "--offload-host-only") || !strcmp(argv[i], "--cuda-host-only")) host_only = 1;
+        /* The compiler's ID identifies a HIP unit across temporary bundles. */
+        if (identity && !strcmp(argv[i], input)) continue;
         /* Output paths do not change the cost of the translation unit. */
         if ((!strcmp(argv[i], "-o") || !strcmp(argv[i], "-MF") ||
              !strcmp(argv[i], "-MT") || !strcmp(argv[i], "-MQ")) && argv[i + 1]) { ++i; continue; }
-        if (!strcmp(argv[i], "-x") && argv[i + 1]) {
-            if (strstr(argv[i + 1], "++")) kind = 2;
-            else if (strstr(argv[i + 1], "assembler")) kind = 3;
+        const char *language = !strcmp(argv[i], "-x") ? argv[i + 1] :
+                               !strncmp(argv[i], "-x", 2) ? argv[i] + 2 : NULL;
+        if (language) {
+            gpu = !strcmp(language, "hip") || !strcmp(language, "hip-cpp-output");
+            if (gpu || strstr(language, "++")) kind = 2;
+            else if (strstr(language, "assembler")) kind = 3;
             else kind = 1;
         }
         key = XXH3_64bits_withSeed(argv[i], strlen(argv[i]) + 1, key);
@@ -43,7 +53,7 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
     if (!stat(input, &st) && S_ISREG(st.st_mode) && st.st_size > 0 &&
         st.st_size <= 512LL * 1024 * 1024)
         hint->source_bytes = st.st_size;
-    hint->kind = kind + (ready ? 0 : 3);
+    hint->kind = gpu && !host_only ? DCC_WORK_OFFLOAD : kind + (ready ? 0 : 3);
     key = XXH3_64bits_withSeed(&hint->kind, sizeof(hint->kind), key);
     hint->key = key ? key : 1;
 }
@@ -74,7 +84,7 @@ static unsigned history_slot(const struct dcc_work_model *model, uint64_t key)
 
 static double initial_rate(unsigned kind)
 {
-    if (kind + 1 == DCC_WORK_RUST || kind + 1 == DCC_WORK_THINLTO) return 0;
+    if (kind + 1 >= DCC_WORK_RUST) return 0;
     /* Pump now measures the whole uncompressed tree, so a source-only
      * expansion multiplier would count the headers twice. */
     return kind % 3 == 1 ? 1 : kind % 3 == 2 ? .0625 : .25;
@@ -137,7 +147,7 @@ double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_wor
     const struct dcc_work_class *c = &model->classes[kind];
     /* Start file-based backends with occupancy-based placement and learn from execution,
      * rather than treating precompiled dependencies as C++ parsing work. */
-    if ((hint->kind == DCC_WORK_RUST || hint->kind == DCC_WORK_THINLTO) && !c->xx) return 0;
+    if (hint->kind >= DCC_WORK_RUST && !c->xx) return 0;
     double seconds = hint->bytes / 1048576.0 * (c->xx ? c->input_rate : initial_rate(kind))
                    + source_size(hint) * c->source_rate;
     return seconds > .01 ? seconds : .01;

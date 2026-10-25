@@ -205,6 +205,7 @@ dist_extra =							\
 	distcc-link \
 	distcc-rust \
 	distcc-thinlto \
+	distcc-offload \
 	distcc_job.py \
 	src/rust_native.cc \
 	src/clang_driver.cc \
@@ -1141,6 +1142,7 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-link" "$(DESTDIR)$(bindir)/distcc-link"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-rust" "$(DESTDIR)$(bindir)/distcc-rust"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc-thinlto"
+	$(INSTALL_SCRIPT) "$(srcdir)/distcc-offload" "$(DESTDIR)$(bindir)/distcc-offload"
 	$(INSTALL_DATA) "$(srcdir)/distcc_job.py" "$(DESTDIR)$(bindir)/distcc_job.py"
 	if test -n "$(RUST_NATIVE_TARGET)"; then \
 	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
@@ -1284,6 +1286,7 @@ uninstall-programs:
 	rm -f "$(DESTDIR)$(bindir)/distcc-link"
 	rm -f "$(DESTDIR)$(bindir)/distcc-rust"
 	rm -f "$(DESTDIR)$(bindir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc_job.py"
+	rm -f "$(DESTDIR)$(bindir)/distcc-offload"
 	rm -f "$(DESTDIR)$(bindir)/distcc-clang"
 	for p in $(bin_PROGRAMS) pump; do			\
 	  file="$(DESTDIR)$(bindir)/`basename $$p`";            \

@@ -24,6 +24,7 @@ class OffloadTest(BrokerTestCase):
         self.start_broker(self.host(0, ',tcp'))
         # An offload job must bypass the single-frontend pump analyzer.
         self.env.update(DISTCC_VERBOSE='1', INCLUDE_SERVER_PORT=str(self.work / 'absent.sock'))
+        self.env['PATH'] = str(self.build) + os.pathsep + self.env.get('PATH', os.defpath)
 
     def distributed(self, flags, source):
         obj = source.with_suffix('.o')
@@ -84,6 +85,16 @@ class OffloadTest(BrokerTestCase):
         libraries = os.environ.get('ROCM_DEVICE_LIB_PATH')
         if not libraries:
             self.skipTest('Set ROCM_DEVICE_LIB_PATH to test the installed HIP toolchain')
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}', slots=1) + ' ' +
+                          self.host(1, f',tcp,stats={self.stats_ports[1]}', slots=1),
+                          name='gpu-targets')
+        self.env.update(DISTCC_VERBOSE='1', PATH=str(self.build) + os.pathsep + os.environ['PATH'])
+        def completed_jobs():
+            return [int(next(line.split()[1] for line in self.get_stats(port).splitlines()
+                             if line.startswith('dcc_compile_ok '))) for port in self.stats_ports]
+        before = completed_jobs()
+        positions = [os.fstat(log.fileno()).st_size for log in self.logs]
         source = self.work / 'kernel.cpp'
         source.write_text('''#include <hip/hip_runtime.h>
 __global__ void increment(int *p) { p[0] += 1; }
@@ -98,8 +109,50 @@ int main() { return 0; }
         subprocess.run([self.compiler, '-flto=thin', '--hip-link', str(obj),
                         '-lamdhip64', '-o', str(exe)], check=True, capture_output=True)
         subprocess.run([str(exe)], check=True, timeout=30)
+        after = completed_jobs()
+        self.assertEqual(sum(a - b for a, b in zip(after, before)), 3)
+        self.assertTrue(all(a > b for a, b in zip(after, before)), (before, after))
+        for log, position in zip(self.logs, positions):
+            with open(log.name) as worker:
+                worker.seek(position)
+                self.assertIn('--offload-device-only', worker.read())
+        feedback = [line for line in (self.work / 'gpu-targets.log').read_text().splitlines()
+                    if 'job cost:' in line]
+        self.assertEqual(sum('kind=9 ' in line for line in feedback), 2, feedback)
+        self.assertEqual(sum('kind=2 ' in line for line in feedback), 1)
         # A second job exercises the shared device-bitcode cache.
         self.distributed(flags, source)
+
+    def test_multi_gpu_device_only(self):
+        source = self.work / 'devices.hip'
+        source.write_text('__attribute__((global)) void increment(int *p) { p[0] += 1; }\n')
+        obj = self.distributed(['--offload-device-only', '--offload-arch=gfx900',
+                                '--offload-arch=gfx1030', '-nogpuinc', '-nogpulib', '-O2'], source)
+        bundler = str(Path(self.compiler).parent / 'clang-offload-bundler')
+        targets = subprocess.check_output([bundler, '-list', '-type=o', '-input=' + str(obj)], text=True)
+        self.assertIn('gfx900', targets)
+        self.assertIn('gfx1030', targets)
+
+    def test_gpu_failure_does_not_publish_partial_output(self):
+        source = self.work / 'failure.hip'
+        source.write_text('''__attribute__((global)) void kernel(int *p) {
+#ifdef __gfx900__
+    missing_symbol();
+#else
+    p[0] += 1;
+#endif
+}
+''')
+        obj = source.with_suffix('.o')
+        obj.write_bytes(b'previous output')
+        result = subprocess.run([str(self.build / 'distcc'), self.compiler,
+                                 '--offload-arch=gfx900', '--offload-arch=gfx1030',
+                                 '-nogpuinc', '-nogpulib', '-c', str(source), '-o', str(obj)],
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('missing_symbol', result.stderr)
+        self.assertEqual(obj.read_bytes(), b'previous output')
+        self.assertFalse(list(self.work.glob('distcc-offload-*')))
 
     def test_hip_compilation_unit_identity(self):
         libraries = os.environ.get('ROCM_DEVICE_LIB_PATH')
