@@ -46,6 +46,12 @@ class ComparisonTest(unittest.TestCase):
         self.after['condition_key'] = 'other jobs or compiler'
         self.assertFalse(fleet.comparison(self.after, self.before)['eligible'])
 
+    def test_incremental_recovery_never_establishes_speedup(self):
+        for run in (self.before, self.after):
+            run['incremental'] = True
+            self.assertFalse(fleet.comparison(self.after, self.before)['eligible'])
+            del run['incremental']
+
     def test_first_measurement_is_not_a_speedup(self):
         self.assertFalse(fleet.comparison(self.after, None)['eligible'])
 
@@ -120,7 +126,13 @@ class StatisticsTest(unittest.TestCase):
     def test_missing_statistics_not_zero_activity(self):
         rows = self.rows([10, 20])
         rows.insert(1, dict(hosts={'worker': {'error': 'timeout'}}))
-        self.assertEqual(measure.summarize_samples(rows, ['worker'])['worker']['failed_samples'], 1)
+        summary = measure.summarize_samples(rows, ['worker'])['worker']
+        self.assertEqual(summary['failed_samples'], 1)
+        self.assertTrue(summary['endpoints_valid'])
+        self.assertEqual(summary['counters']['dcc_compile_ok'], 10)
+        for partial in (rows[1:], rows[:-1]):
+            summary = measure.summarize_samples(partial, ['worker'])['worker']
+            self.assertFalse(summary['endpoints_valid'])
 
     def test_worker_restart_invalidates_measurement(self):
         before = {'worker': dict(boot='boot', service={'MainPID': '10'})}

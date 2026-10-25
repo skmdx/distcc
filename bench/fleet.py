@@ -78,6 +78,8 @@ def worker_changes(before, after):
 
 def comparison(current, previous):
     """Only full successful runs with identical workload conditions are comparable."""
+    if current.get('incremental') or (previous and previous.get('incremental')):
+        return {'eligible': False, 'reason': 'incremental recovery is not a complete build timing'}
     if not current['success'] or not previous or not previous['success']:
         return {'eligible': False, 'reason': 'no successful previous measurement'}
     if current['condition_key'] != previous['condition_key']:
@@ -99,7 +101,8 @@ def summarize(run_id, runs, config):
         conditions.append(dict(build=run['conditions'], workers=workers))
     stable = all(c == conditions[0] for c in conditions)
     seconds = [run['elapsed'] for run in runs]
-    return dict(id=run_id, success=stable and len(runs) == config['repetitions'] and
+    return dict(id=run_id, incremental=bool(config.get('build_root')),
+                success=stable and len(runs) == config['repetitions'] and
                 all(run['success'] for run in runs),
                 condition_key=hashlib.sha256(json.dumps(conditions[0], sort_keys=True).encode()).hexdigest(),
                 seconds=dict(mean=sum(seconds) / len(seconds), minimum=min(seconds), maximum=max(seconds)),
@@ -110,7 +113,8 @@ def report(result):
     lines = [f"Measurement: {result['id']}", f"Success: {result['success']}"]
     if 'seconds' in result:
         times = result['seconds']
-        lines.append(f"Complete build: mean {times['mean']:.3f} s ({times['minimum']:.3f}–{times['maximum']:.3f} s)")
+        label = 'Incremental build' if result.get('incremental') else 'Complete build'
+        lines.append(f"{label}: mean {times['mean']:.3f} s ({times['minimum']:.3f}–{times['maximum']:.3f} s)")
         for index, run in enumerate(result['runs'], 1):
             lines.append(f"Run {index}: {run['elapsed']:.3f} s, {run['compiled_objects']} objects")
             lines.append('  Client build/profile cgroup: ' + json.dumps(resource_usage(run['cgroup'])))
@@ -141,6 +145,8 @@ def main():
     limits = config.get('limits', [])
     if config['repetitions'] < 1 or config['sample_seconds'] <= 0:
         raise ValueError('at least one complete build and a positive sample interval are required')
+    if config.get('build_root') and config['repetitions'] != 1:
+        raise ValueError('incremental recovery requires one run')
     unit = 'distcc-bench.service'
     # Serialize against both deployment and other benchmark invocations.
     with (config_dir / 'deploy.lock').open('w') as lock:
@@ -186,8 +192,11 @@ def main():
                 print(f'Build {index}/{config["repetitions"]}; results: {out}', flush=True)
                 before = snapshots(workers, targets, script)
                 (out / f'run-{index}-workers-before.json').write_text(json.dumps(before, indent=2) + '\n')
-                buildroot = remote + f'/build-{index}'
-                deploy.run(['sudo', '-n', 'mkdir', '-p', buildroot], client)
+                buildroot = config.get('build_root') or remote + f'/build-{index}'
+                if config.get('build_root'):
+                    deploy.run(['test', '-d', buildroot + '/portage'], client)
+                else:
+                    deploy.run(['sudo', '-n', 'mkdir', '-p', buildroot], client)
                 cmd = ['sudo', '-n', 'systemd-run', '--wait', '--pipe', '--collect', '--unit=' + unit]
                 for prop in [*limits, 'IOAccounting=yes',
                              *client.get('mounts', []), 'BindPaths=' + buildroot + ':/var/tmp']:

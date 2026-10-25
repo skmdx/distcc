@@ -405,14 +405,21 @@ utilization includes unrelated host activity. Detailed logs and profiling have
 overhead; compare results collected with the same instrumentation. One build
 can verify distribution; use repeated builds to assess timing variation.
 For long builds, `perf.call_graph` and `perf.frequency` control profiling cost.
+To resume a failed build, set `build_root` to its retained `build-N` directory
+and `repetitions` to 1. Portage reuses its preserved work tree. Incremental
+recovery is labeled separately and is never used to claim a full-build speedup.
+Remove `build_root` to return to clean measurements.
 
 Each run saves `result.json`, `summary.txt` and its raw evidence under the
 configured results directory. A successful run updates `latest.json`; matching
 workload/compiler/configuration/resource conditions permit comparison with the
-previous successful invocation. Different conditions, missing statistics,
+previous successful invocation. Different conditions, missing endpoint statistics,
 worker restarts, incomplete object counts, analysis failures or memory-limit
 events prevent a valid comparison. The first invocation establishes a baseline;
 it does not establish a speedup. Failures exit nonzero and retain evidence.
+Interior sampling gaps are reported as `failed_samples`; cumulative counters
+remain usable when endpoints are present and the worker did not restart.
+Those gaps do not establish idle time or complete concurrency coverage.
 Interrupted resume state is retained for the next invocation. Deployment and
 measurement share a lock so they cannot modify the fleet simultaneously.
 Perf samples stay in a memory file charged to the build's cgroup. The command

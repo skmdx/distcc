@@ -85,6 +85,8 @@ def summarize_samples(samples, names):
                     for key in counters if key in a and key in b)
         result[name] = dict(counters=deltas, counter_reset=reset,
                             failed_samples=len(samples) - len(rows),
+                            endpoints_valid=bool(samples) and all(
+                                'error' not in sample['hosts'][name] for sample in (samples[0], samples[-1])),
                             peak_busy=max((int(r['dcc_busy']) for r in rows), default=None),
                             peak_queued=max((int(r['dcc_queued']) for r in rows), default=None))
     return result
@@ -239,6 +241,7 @@ def measure(config, out, buildroot):
                       package=config['package'], memory_max=(group / 'memory.max').read_text().strip(),
                       perf=config['perf'], sample_seconds=config['sample_seconds'])
     conditions['collector'] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    conditions['incremental'] = bool(config.get('build_root'))
     conditions['repository'] = repository_revision(config['ebuild'])
     hosts = host_list(conditions['hosts'])
     execute(['distcc', '--show-hosts'], env=dict(os.environ, DISTCC_HOSTS=hosts))
@@ -373,8 +376,8 @@ def measure(config, out, buildroot):
         error = error or 'build diagnostics failed validation'
     if not summary['feedback_jobs']:
         error = error or 'no measured broker feedback; distributed path not established'
-    if any(r['failed_samples'] or r['counter_reset'] for r in hosts.values()):
-        error = error or 'statistics missing or counters reset'
+    if any(not r['endpoints_valid'] or r['counter_reset'] for r in hosts.values()):
+        error = error or 'statistics endpoints missing or counters reset'
     if any(int(events[k]) for k in ('max', 'oom', 'oom_kill')):
         error = error or 'cgroup memory limit reached; measurement incomplete'
     # Automatic parallelism is an observed scheduler outcome. Explicit job
