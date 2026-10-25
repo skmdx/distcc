@@ -138,12 +138,9 @@ def main():
     targets = {t['name']: t for t in inventory['targets']}
     client = targets[config['client']]
     workers = config['workers']
-    limits = config['limits']
-    if config['repetitions'] < 2 or config['sample_seconds'] <= 0:
-        raise ValueError('at least two complete builds and a positive sample interval are required')
-    if 'MemorySwapMax=0' not in limits or not any(p.startswith('MemoryMax=') and
-            p.split('=', 1)[1] not in ('0', 'infinity') for p in limits):
-        raise ValueError('a finite memory limit with swap disabled is required')
+    limits = config.get('limits', [])
+    if config['repetitions'] < 1 or config['sample_seconds'] <= 0:
+        raise ValueError('at least one complete build and a positive sample interval are required')
     unit = 'distcc-bench.service'
     # Serialize against both deployment and other benchmark invocations.
     with (config_dir / 'deploy.lock').open('w') as lock:
@@ -192,7 +189,7 @@ def main():
                 buildroot = remote + f'/build-{index}'
                 deploy.run(['sudo', '-n', 'mkdir', '-p', buildroot], client)
                 cmd = ['sudo', '-n', 'systemd-run', '--wait', '--pipe', '--collect', '--unit=' + unit]
-                for prop in [*limits, 'IOAccounting=yes', 'RuntimeMaxSec=2700',
+                for prop in [*limits, 'IOAccounting=yes',
                              *client.get('mounts', []), 'BindPaths=' + buildroot + ':/var/tmp']:
                     cmd += ['-p', prop]
                 dest = remote + f'/run-{index}'

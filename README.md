@@ -387,21 +387,24 @@ Run `./benchmark` without arguments to measure the installed fleet. It can be
 symlinked into `PATH` as `distcc-bench`. The private
 `~/.config/distcc/bench.json` selects the build client and workers by their names
 in `deploy.json`; see `bench/fleet.example.json`. Configure a known complete
-Ninja build and its expected object count, finite memory limit with swap
-disabled, and an available `perf` executable. The example uses the previously
+Ninja build and an available `perf` executable. An expected object count and
+systemd resource limits are optional; the tool does not impose memory or swap
+limits. The example uses the previously
 validated media-driver workload. Parallelism comes from the normal Portage
 configuration, including distcc's automatic job calculation.
 Observed automatic job counts are recorded as scheduler outcomes; changing an
 explicit job limit changes the configuration and prevents comparison.
 
-The command pauses configured build services, runs at least two clean builds
+The command pauses configured build services, runs the configured number of clean builds
 with a private Portage configuration and ccache disabled, and resumes the
 services on success or failure. It records full build times, per-worker
 completion/concurrency/queue statistics, broker preparation/queue/execution
 feedback, TCP counters, cgroup CPU/memory/I/O, and a client CPU perf profile.
 Phase totals sum overlapping jobs and are not elapsed wall time. Worker CPU
 utilization includes unrelated host activity. Detailed logs and profiling have
-overhead; compare results collected with the same instrumentation.
+overhead; compare results collected with the same instrumentation. One build
+can verify distribution; use repeated builds to assess timing variation.
+For long builds, `perf.call_graph` and `perf.frequency` control profiling cost.
 
 Each run saves `result.json`, `summary.txt` and its raw evidence under the
 configured results directory. A successful run updates `latest.json`; matching
@@ -412,7 +415,7 @@ events prevent a valid comparison. The first invocation establishes a baseline;
 it does not establish a speedup. Failures exit nonzero and retain evidence.
 Interrupted resume state is retained for the next invocation. Deployment and
 measurement share a lock so they cannot modify the fleet simultaneously.
-Perf samples stay in a memory file within the build's cgroup limit. The command
+Perf samples stay in a memory file charged to the build's cgroup. The command
 checks that the report contains samples and no recording/decoding errors, then
 saves a verified `perf.data.zst` archive. Decompress it before reading it with
 perf. An exit code of zero alone does not establish a valid profile.

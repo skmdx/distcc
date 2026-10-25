@@ -41,9 +41,6 @@ def snapshot():
     if properties['ActiveState'] != 'active' or not properties['ControlGroup']:
         raise RuntimeError('distccd service is not active')
     data = metrics(Path('/sys/fs/cgroup') / properties['ControlGroup'].lstrip('/'))
-    if not data['memory.max'] or not data['memory.swap.max'] or \
-            data['memory.max'].strip() in ('max', '0') or data['memory.swap.max'].strip() != '0':
-        raise RuntimeError('worker requires a finite cgroup memory ceiling and no swap')
     return dict(service=properties, metrics=data,
                 distccd_sha256=hashlib.sha256(Path('/proc', properties['MainPID'], 'exe').read_bytes()).hexdigest(),
                 cpu=list(map(int, Path('/proc/stat').read_text().splitlines()[0].split()[1:9])),
@@ -98,6 +95,7 @@ def log_summary(paths):
     timings = []
     waits = []
     assignments = {}
+    completed = {}
     jobs = set()
     for path in paths:
         if not path.exists():
@@ -111,6 +109,10 @@ def log_summary(paths):
                 if 'job cost:' in line:
                     fields = dict(re.findall(r'(\w+)=([^ ]+)', line))
                     timings.append({key: float(fields[key]) for key in ('prepare', 'queue', 'execute')})
+                    host = fields['host'].strip()
+                    kinds = completed.setdefault(host, {})
+                    kind = fields.get('kind', 'unknown')
+                    kinds[kind] = kinds.get(kind, 0) + 1
                 if 'assigning host=' in line and 'broker_wait=' in line:
                     fields = dict(re.findall(r'(\w+)=([^ ]+)', line))
                     waits.append(float(fields['broker_wait']))
@@ -119,12 +121,14 @@ def log_summary(paths):
                 if 'ninja ' in line:
                     jobs.update(map(int, re.findall(r'(?:^|\s)-j\s*(\d+)', line)))
     phases = {key: dict(total_seconds=sum(t[key] for t in timings),
-                        mean_seconds=sum(t[key] for t in timings) / len(timings))
+                        mean_seconds=sum(t[key] for t in timings) / len(timings),
+                        max_seconds=max(t[key] for t in timings))
               for key in ('prepare', 'queue', 'execute')} if timings else {}
     if waits:
-        phases['broker_wait'] = dict(total_seconds=sum(waits), mean_seconds=sum(waits) / len(waits))
+        phases['broker_wait'] = dict(total_seconds=sum(waits), mean_seconds=sum(waits) / len(waits),
+                                    max_seconds=max(waits))
     return dict(**counts, feedback_jobs=len(timings), assignments=assignments,
-                phases=phases, ninja_jobs=sorted(jobs))
+                completed_by_host_kind=completed, phases=phases, ninja_jobs=sorted(jobs))
 
 
 def repository_revision(ebuild):
@@ -210,8 +214,6 @@ def finish_profile(config, out, descriptor):
 
 def measure(config, out, buildroot):
     group = cgroup()
-    assert (group / 'memory.max').read_text().strip() not in ('max', '0')
-    assert (group / 'memory.swap.max').read_text().strip() == '0'
     # Preserve Portage's short paths (pump uses Unix sockets under T), while all
     # temporary writes belong to the workspace directory mounted by fleet.py.
     assert os.path.samefile('/var/tmp', buildroot), 'private build mount is missing'
@@ -299,7 +301,7 @@ def measure(config, out, buildroot):
         with (out / 'perf-record.log').open('w') as log:
             perf = subprocess.Popen([config['perf']['executable'], 'record', '-e', 'cpu-clock',
                 '--buildid-mmap', '--no-buildid-cache',
-                '-F', str(config['perf']['frequency']), '--call-graph', 'dwarf,4096', '-m', '1024',
+                '-F', str(config['perf']['frequency']), '--call-graph', config['perf'].get('call_graph', 'dwarf,4096'), '-m', '1024',
                 '--proc-map-timeout', '50', '-a', '-G', str(group.relative_to('/sys/fs/cgroup')),
                 '-o', f'/proc/self/fd/{perf_fd}'], env=perf_env, pass_fds=(perf_fd,),
                 stdout=log, stderr=subprocess.STDOUT)
@@ -348,7 +350,7 @@ def measure(config, out, buildroot):
         shutil.copyfile(source, out / f'build-{index}.log')
     summary = log_summary([out / 'emerge.log', runtime / 'client.log', out / 'broker.log', *buildlogs])
     objects = set()
-    for index, source in enumerate(buildtree.glob('*/*/work/*/.ninja_log')):
+    for index, source in enumerate(sorted(buildtree.glob('*/*/work/**/.ninja_log'))):
         shutil.copyfile(source, out / f'ninja-{index}.log')
         for line in source.read_text().splitlines()[1:]:
             fields = line.split('\t')
@@ -360,7 +362,7 @@ def measure(config, out, buildroot):
     if memory_events is None:
         raise RuntimeError('cgroup memory counters disappeared')
     events = dict(line.split() for line in memory_events.splitlines())
-    if len(objects) != config['expected_objects']:
+    if config.get('expected_objects') is not None and len(objects) != config['expected_objects']:
         error = error or f"expected {config['expected_objects']} compiled objects, got {len(objects)}"
     if any(summary[k] for k in ('analysis_warnings', 'io_timeouts', 'sandbox_denials')):
         error = error or 'build diagnostics failed validation'
@@ -377,7 +379,7 @@ def measure(config, out, buildroot):
                   perf_returncode=perf_status, returncode=None if build is None else build.returncode)
     (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
     # Keep evidence; build trees and private Portage state are not results.
-    for path in (buildtree, configroot, runtime / '.distcc'):
+    for path in (() if error else (buildtree, configroot, runtime / '.distcc')):
         if path.exists():
             shutil.rmtree(path)
     print(json.dumps(result), flush=True)

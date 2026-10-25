@@ -145,6 +145,15 @@ class StatisticsTest(unittest.TestCase):
             self.assertEqual(result['analysis_warnings'], 1)
             self.assertEqual(result['ninja_jobs'], [8])
 
+    def test_link_backends_are_distinct_from_compilations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'broker.log'
+            path.write_text('job cost: kind=4 execute=2 prepare=.2 queue=.1 host=worker\n'
+                            'job cost: kind=8 execute=1 prepare=.1 queue=.3 host=worker\n')
+            result = measure.log_summary([path])
+            self.assertEqual(result['completed_by_host_kind'], {'worker': {'4': 1, '8': 1}})
+            self.assertEqual(result['phases']['queue']['max_seconds'], .3)
+
 
 class ConfigurationTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which('distcc'), 'distcc required')
