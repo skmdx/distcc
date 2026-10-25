@@ -48,6 +48,11 @@ the final link determine compatibility; version metadata is not a rejection gate
 Existing whole-link offload remains available for other links with
 `DISTCC_LINK_SYSROOT`. `DISTCC_VERBOSE=1` reports the worker for every completed
 backend; `DISTCC_FALLBACK=0` makes distribution failures fail the link.
+The Portage hook exports CMake's C/C++ linker launchers as well as compiler
+launchers, respecting `RESTRICT=distcc` and explicit user overrides. Existing
+CMake build directories must be reconfigured to populate these launcher values;
+new Portage builds receive them automatically. Outside Portage, set
+`CMAKE_C_LINKER_LAUNCHER=distcc` and `CMAKE_CXX_LINKER_LAUNCHER=distcc` when configuring.
 
 Rust builds use Cargo's compiler wrapper interface:
 
