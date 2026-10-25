@@ -74,6 +74,25 @@ class ThinLTOTest(BrokerTestCase):
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
 
+    def test_static_constructor_order(self):
+        objects = []
+        for index, name in enumerate(('z_first', 'a_second', 'm_third')):
+            source = self.work / (name + '.cpp')
+            source.write_text('#include <cstdio>\nnamespace { struct Init { Init() { std::puts("' +
+                              str(index) + '"); } }; Init init; }\n')
+            obj = source.with_suffix('.o')
+            result = self.run_command(['clang++', '-O2', '-flto=thin', '-c', source, '-o', obj])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            objects.append(obj)
+        main = self.work / 'main.cpp'
+        main.write_text('int main() {}\n')
+        args = ['clang++', '-O2', '-flto=thin', '-fuse-ld=lld', *objects, main]
+        for prefix, output in (([], 'reference'), ([self.build / 'distcc'], 'distributed')):
+            result = self.run_command([*prefix, *args, '-o', output])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            actual = self.run_command([self.work / output])
+            self.assertEqual(actual.stdout, '0\n1\n2\n')
+
     @unittest.skipUnless(shutil.which('cmake') and shutil.which('ninja'), 'CMake and Ninja required')
     def test_cmake_link_launcher(self):
         (self.work / 'part.c').write_text('int value(void) { return 42; }')
