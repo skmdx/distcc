@@ -843,7 +843,7 @@ pump-maintainer-check: pump include-server check_programs
 maintainer-check: distcc-maintainer-check include-server-maintainer-check preprocess-check \
 	pump-maintainer-check
 
-adaptive-check: distcc distccd h_hosts
+adaptive-check: distcc distccd h_hosts h_compile
 	$(PYTHON) "$(srcdir)/test/test_portage_jobs.py" -v
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v
 	$(PYTHON) "$(srcdir)/test/test_broker.py" -v
