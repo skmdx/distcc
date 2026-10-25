@@ -49,7 +49,8 @@
 "  COMMAND is dcc_fresh_dependency_exists,\n" \
 "    with ARGS being DOTD_FNAME EXCL_PAT REF_TIME\n" \
 "or\n" \
-"  COMMAND is dcc_discrepancy_filename\n"
+"  COMMAND is dcc_discrepancy_filename\n" \
+"or dcc_wait_for_cpp [CHILD_EXIT_CODE]\n"
 
 const char *rs_program_name = __FILE__;
 
@@ -99,6 +100,16 @@ int main(int argc, char *argv[])
             printf("h_compile.c: UNEXPECTED RETURN VALUE\n");
         else
             printf("%s", result ? result : "(NULL)");
+    } else if (strcmp(argv[1], "dcc_wait_for_cpp") == 0) {
+        pid_t pid = 0;
+        int status = 0x1234;
+        if (argc == 3) {
+            pid = fork();
+            if (pid < 0) return 1;
+            if (!pid) _exit(atoi(argv[2]));
+        }
+        int ret = dcc_wait_for_cpp(pid, &status, "test.i");
+        printf("%d %d\n", ret, status);
     } else {
         rs_log_error(USAGE);
         return 1;

@@ -68,6 +68,13 @@ int main(void) { float a[128] = {0}, b[128] = {3};
                 subprocess.run([compiler, output, '-o', executable], check=True)
                 subprocess.run([executable], check=True)
 
+    def test_preprocessor_status_is_defined_without_a_child(self):
+        for arguments, status in (([], 0), (['7'], 7 << 8)):
+            result = subprocess.run([str(self.build / 'h_compile'), 'dcc_wait_for_cpp', *arguments],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), f'0 {status}')
+
     def cases(self, compiler):
         target = subprocess.check_output([compiler, '-dumpmachine'], text=True).strip()
         if target.startswith(('x86_64', 'i686')):

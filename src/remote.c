@@ -114,6 +114,7 @@ int dcc_wait_for_cpp(pid_t cpp_pid,
 {
     int ret;
 
+    *status = 0;
     if (cpp_pid) {
         dcc_note_state(DCC_PHASE_CPP, NULL, NULL, DCC_LOCAL);
         /* Wait for cpp to finish (if not already done), check the
