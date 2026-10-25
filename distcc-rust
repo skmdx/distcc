@@ -8,11 +8,9 @@ are available. No Rust syntax is interpreted by this planner.
 import fcntl
 import glob
 import json
-import mmap
 import os
 from pathlib import Path
 import shutil
-import struct
 import subprocess
 import sys
 import tarfile
@@ -20,8 +18,7 @@ import tempfile
 import time
 
 
-class LocalOnly(Exception):
-    pass
+from distcc_job import LocalOnly, stamp, snapshot, fingerprint, write_metadata
 
 
 VALUES = {'--cap-lints', '--cfg', '--check-cfg', '--crate-name', '--crate-type',
@@ -262,47 +259,13 @@ def plan(compiler, args, work):
     return job, states, outdir, outputs
 
 
-def stamp(info):
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
-
-
-def snapshot(source, destination, expected=None):
-    with open(source, 'rb') as src, open(destination, 'xb') as dst:
-        before = stamp(os.fstat(src.fileno()))
-        if expected is not None and expected != before:
-            raise LocalOnly('input changed after dependency discovery')
-        try:
-            fcntl.ioctl(dst.fileno(), 0x40049409, src.fileno())  # FICLONE
-        except OSError:
-            shutil.copyfileobj(src, dst, 256 * 1024)
-        if before != stamp(os.fstat(src.fileno())):
-            raise LocalOnly('input changed during snapshot')
-
-
 def metadata(job, inputs, work):
-    import xxhash
-    data = bytearray()
-
-    def number(value):
-        data.extend(struct.pack('!Q', value))
-
-    def string(value):
-        encoded = os.fsencode(value)
-        number(len(encoded))
-        data.extend(encoded)
-
     snapshots = work / 'inputs'
     snapshots.mkdir()
     entries = []
 
     def add(name, dest):
-        size = dest.stat().st_size
-        if size:
-            with dest.open('rb') as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as content:
-                digest = xxhash.xxh3_64_digest(content)
-        else:
-            digest = xxhash.xxh3_64_digest(b'')
-        entries.append((name, size, digest))
+        entries.append((name, *fingerprint(dest)))
 
     for name, expected in sorted(inputs.items()):
         dest = snapshots / str(len(entries))
@@ -311,21 +274,7 @@ def metadata(job, inputs, work):
     manifest = snapshots / str(len(entries))
     manifest.write_text(json.dumps(job))
     add(CONTROL + '/job.json', manifest)
-    if len(entries) > 65536:
-        raise LocalOnly('too many Rust inputs')
-    for value in (3, 1, len(entries)):
-        number(value)
-    string(job['cwd'])
-    string('distcc-rust')
-    for name, size, digest in entries:
-        for value in (0, 0, 1, size, size):
-            number(value)
-        data.extend(digest)
-        string(str(name))
-        string('')
-    if len(data) > 16 * 1024 * 1024:
-        raise LocalOnly('Rust job metadata is too large')
-    (work / 'job').write_bytes(data)
+    write_metadata(3, job['cwd'], 'distcc-rust', entries, work / 'job')
     return work / 'job', snapshots
 
 
@@ -473,7 +422,7 @@ def client(compiler, args):
             env = dict(os.environ)
             env.pop('INCLUDE_SERVER_PORT', None)
             transport = str(Path(__file__).resolve().with_name('distcc'))
-            result = subprocess.run([transport, '--rust-job', str(description), str(snapshots),
+            result = subprocess.run([transport, '--file-job', str(description), str(snapshots),
                                      str(work / 'result.tar')], env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if (result.returncode and os.environ.get('DISTCC_FALLBACK') != '0'

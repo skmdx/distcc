@@ -10,10 +10,13 @@ import shutil
 import subprocess
 import socket
 import struct
+import sys
 import time
 import unittest
 
 from test_broker import BrokerTestCase
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 @unittest.skipUnless(shutil.which('rustc') and shutil.which('bwrap'), 'rustc and bubblewrap required')
@@ -278,7 +281,7 @@ class RustTest(BrokerTestCase):
                 stopped.set()
             future.result(timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('retrying Rust job on a fresh connection', result.stderr)
+        self.assertIn('retrying file job on a fresh connection', result.stderr)
         self.assertIn('distcc-rust: compiled on', result.stderr)
         self.assertTrue((self.work / 'libretry.rlib').is_file())
 
@@ -873,7 +876,7 @@ pub fn read_only() -> bool {
         job['compiler'] = dict(version='rustc 0.0.0 (different build)', commit='different', llvm='0.0.0')
         metadata, snapshots = helper['metadata'](job, inputs, self.work)
         artifact = self.work / 'result.tar'
-        result = subprocess.run([str(self.build / 'distcc'), '--rust-job', str(metadata),
+        result = subprocess.run([str(self.build / 'distcc'), '--file-job', str(metadata),
                                  str(snapshots), str(artifact)], env=self.env,
                                 capture_output=True, text=True, timeout=90)
         self.assertEqual(result.returncode, 0, result.stderr)

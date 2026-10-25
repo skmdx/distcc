@@ -108,11 +108,13 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
             fields |= 4;
         } else if (!strncmp(line, "dcc_compile_capacity ", 21) ||
                    !strncmp(line, "dcc_pump_capacity ", 18) ||
-                   !strncmp(line, "dcc_rust_capacity ", 18)) {
+                   !strncmp(line, "dcc_rust_capacity ", 18) ||
+                   !strncmp(line, "dcc_thinlto_capacity ", 21)) {
             int pump = !strncmp(line, "dcc_pump_capacity ", 18);
             int rust = !strncmp(line, "dcc_rust_capacity ", 18);
-            int field = rust ? 2097152 : pump ? 1048576 : 524288;
-            int *capacity = rust ? cap->rust_capacity : pump ? cap->pump_capacity : cap->compile_capacity;
+            int thinlto = !strncmp(line, "dcc_thinlto_capacity ", 21);
+            int field = thinlto ? 536870912 : rust ? 2097152 : pump ? 1048576 : 524288;
+            int *capacity = thinlto ? cap->thinlto_capacity : rust ? cap->rust_capacity : pump ? cap->pump_capacity : cap->compile_capacity;
             char *item = line + (pump || rust ? 18 : 21), *end;
             if (fields & field) return -1;
             for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
@@ -130,11 +132,12 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
                    !strncmp(line, "dcc_job_memory_bytes ", 21) ||
                    !strncmp(line, "dcc_compile_memory ", 19) ||
                    !strncmp(line, "dcc_pump_memory ", 16) ||
-                   !strncmp(line, "dcc_rust_memory ", 16)) {
+                   !strncmp(line, "dcc_rust_memory ", 16) ||
+                   !strncmp(line, "dcc_thinlto_memory ", 19)) {
             const char *names[] = {"dcc_memory_headroom_bytes", "dcc_memory_reserved_bytes", "dcc_job_memory_bytes",
-                                  "dcc_compile_memory", "dcc_pump_memory", "dcc_rust_memory"};
+                                  "dcc_compile_memory", "dcc_pump_memory", "dcc_rust_memory", "dcc_thinlto_memory"};
             unsigned long long *values[] = {&cap->memory_headroom, &cap->memory_reserved, &cap->job_memory,
-                cap->memory_estimates[0], cap->memory_estimates[1], cap->memory_estimates[2]};
+                cap->memory_estimates[0], cap->memory_estimates[1], cap->memory_estimates[2], cap->memory_estimates[3]};
             unsigned row = 0;
             while (strncmp(line, names[row], strlen(names[row]))) row++;
             unsigned count = row < 3 ? 1 : DCC_MEMORY_BUCKETS;
@@ -176,7 +179,7 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
         }
     }
     const int required = 7 | 8192 | 16384 | 32768 | 65536 | 131072 | 262144 |
-        524288 | 1048576 | 2097152 | (63 * 4194304);
+        524288 | 1048576 | 2097152 | 536870912 | (127 * 4194304);
     return (fields & required) == required && cap->cores <= cap->cpus &&
            ((cap->cpu_scale == -1 && cap->cpu_age == -1 && !cap->cpu_probe) ||
             (cap->cpu_scale > 0 && cap->cpu_age >= 0)) ? 0 : -1;

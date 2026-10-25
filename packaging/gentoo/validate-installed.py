@@ -75,8 +75,8 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         compilers.append(compiler)
     env['PATH'] = ':'.join(dict.fromkeys(['/usr/lib/distcc',
                                         *(str(Path(p).parent) for p in compilers), '/bin']))
-    if '--rust-only' in sys.argv:
-        assert ',tcp' in env['DISTCC_HOSTS'], 'Rust validation requires the TCP job protocol'
+    if '--rust-only' in sys.argv or '--thinlto-only' in sys.argv:
+        assert ',tcp' in env['DISTCC_HOSTS'], 'Validation requires the TCP job protocol'
         compilers = []
     for compiler_path in dict.fromkeys(compilers):
         compiler = Path(compiler_path).name
@@ -140,9 +140,42 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             header = subprocess.check_output(['readelf', '-h', str(obj)], text=True, env=dict(env, LC_ALL='C'))
             assert 'AMD GPU' in header, header
             results['amdgpu'] = {'distributed': True, 'object_machine': 'AMDGPU'}
+    if ',tcp' in env['DISTCC_HOSTS'] and '--rust-only' not in sys.argv:
+        clang = shutil.which('clang')
+        assert clang and not Path(clang).samefile('/usr/bin/distcc'), 'real Clang is required'
+        objects = []
+        for index in range(12):
+            source, obj = root / f'thin-{index}.c', root / f'thin-{index}.o'
+            source.write_text(f'int part{index}(int n) {{ int v=0; '
+                              f'for(int i=0;i<n;i++) v+=(i*{index+1})%101; return v; }}')
+            subprocess.run([clang, '-O2', '-flto=thin', '-c', source, '-o', obj],
+                           check=True, capture_output=True, timeout=30)
+            objects.append(obj)
+        source, main = root / 'thin-main.c', root / 'thin-main.o'
+        source.write_text('#include <stdio.h>\n' +
+                          '\n'.join(f'int part{i}(int);' for i in range(12)) +
+                          '\nint main(int n,char **v) { printf("%d\\n", ' +
+                          '+'.join(f'part{i}(n*23)' for i in range(12)) + '); }')
+        subprocess.run([clang, '-O2', '-flto=thin', '-c', source, '-o', main],
+                       check=True, capture_output=True, timeout=30)
+        executable, reference = root / 'thin-remote', root / 'thin-local'
+        command = [clang, '-flto=thin', '-fuse-ld=lld', main, *objects]
+        subprocess.run([*command, '-o', reference], check=True, capture_output=True, timeout=30)
+        started = time.monotonic()
+        result = subprocess.run(['distcc', *command, '-o', executable], env=env,
+                                text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+        assert result.returncode == 0, result.stderr
+        workers = re.findall(r'^distcc-thinlto: compiled on (.+)$', result.stderr, re.M)
+        assert len(workers) == len(objects) + 1, result.stderr
+        if len(env['DISTCC_HOSTS'].split()) > 1:
+            assert len(set(workers)) > 1, 'ThinLTO did not distribute across workers: ' + repr(workers)
+        for args in ([], ['one'], ['one', 'two']):
+            assert subprocess.check_output([executable, *args]) == subprocess.check_output([reference, *args])
+        results['thinlto'] = {'backends': len(workers), 'workers': {p: workers.count(p) for p in set(workers)},
+                              'seconds': time.monotonic() - started, 'executed': True}
     # The Rust wrapper shares this broker and must really reach the TCP worker.
     # Legacy C/C++ validation also runs; Rust is exercised on the TCP pass.
-    if ',tcp' in env['DISTCC_HOSTS']:
+    if ',tcp' in env['DISTCC_HOSTS'] and '--thinlto-only' not in sys.argv:
         source = root / 'rust_library.rs'
         included = root / 'rust_value.rs'
         included.write_text('pub const VALUE: u32 = 42;')

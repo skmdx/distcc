@@ -384,9 +384,11 @@ static void dcc_service_stats_request(int http_fd) {
     char compile_capacity[DCC_MEMORY_BUCKETS * 12];
     char pump_capacity[DCC_MEMORY_BUCKETS * 12];
     char rust_capacity[DCC_MEMORY_BUCKETS * 12];
+    char thinlto_capacity[DCC_MEMORY_BUCKETS * 12];
     char compile_memory[DCC_MEMORY_BUCKETS * 21];
     char pump_memory[DCC_MEMORY_BUCKETS * 21];
     char rust_memory[DCC_MEMORY_BUCKETS * 21];
+    char thinlto_memory[DCC_MEMORY_BUCKETS * 21];
     struct dcc_sockaddr_storage cli_addr;
     socklen_t cli_len = sizeof(cli_addr);
     double loadavg[3];
@@ -454,11 +456,13 @@ dcc_memory_spare_bytes %llu\n\
 dcc_compile_capacity %s\n\
 dcc_pump_capacity %s\n\
 dcc_rust_capacity %s\n\
+dcc_thinlto_capacity %s\n\
 dcc_memory_headroom_bytes %llu\n\
 dcc_memory_reserved_bytes %llu\n\
 dcc_compile_memory %s\n\
 dcc_pump_memory %s\n\
 dcc_rust_memory %s\n\
+dcc_thinlto_memory %s\n\
 dcc_local_input_jobs %llu\n\
 dcc_local_input_bytes %llu\n\
 dcc_tcp_ready_idle_ns %llu\n\
@@ -490,6 +494,7 @@ dcc_free_mem %d MB\n\
     format_capacity(compile_capacity, sizeof(compile_capacity), compile_memory, sizeof(compile_memory), DCC_JOB_COMPILE, cpu_limit, &load);
     format_capacity(pump_capacity, sizeof(pump_capacity), pump_memory, sizeof(pump_memory), DCC_JOB_PUMP, cpu_limit, &load);
     format_capacity(rust_capacity, sizeof(rust_capacity), rust_memory, sizeof(rust_memory), DCC_JOB_RUST, cpu_limit, &load);
+    format_capacity(thinlto_capacity, sizeof(thinlto_capacity), thinlto_memory, sizeof(thinlto_memory), DCC_JOB_THINLTO, cpu_limit, &load);
 #ifdef __linux__
     capacity = dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids));
     available = capacity - load.busy;
@@ -539,9 +544,9 @@ dcc_free_mem %d MB\n\
                                running, load.busy, load.queued, load.preparing, load.returning,
                                capacity, dcc_resource_job_bytes(), dcc_resource_samples(),
                                dcc_resource_peak_bytes(), dcc_resource_spare_bytes(),
-                               compile_capacity, pump_capacity, rust_capacity,
+                               compile_capacity, pump_capacity, rust_capacity, thinlto_capacity,
                                dcc_resource_headroom(load.reserved), load.reserved,
-                               compile_memory, pump_memory, rust_memory,
+                               compile_memory, pump_memory, rust_memory, thinlto_memory,
                                (unsigned long long)dcc_tcp_local_input_jobs(),
                                (unsigned long long)dcc_tcp_local_input_bytes(),
                                ready_idle_ns, parallel_tasks, parallel_peak,

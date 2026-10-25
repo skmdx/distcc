@@ -50,6 +50,7 @@ def release(overlay):
             raise RuntimeError(f'uncommitted deployment inputs: {tree}')
     run(['git', '-C', ROOT, 'diff', '--exit-code', match[1], '--', 'src', 'include_server',
          'configure.ac', 'Makefile.in', 'pump.in', 'distcc-link', 'distcc-clang', 'distcc-rust',
+         'distcc-thinlto', 'distcc_job.py',
          'packaging/systemd', 'packaging/gentoo/*.bashrc'])
     return version, ebuild
 
@@ -274,6 +275,23 @@ def validate_rust_cluster(targets, work):
         parallel(targets, lambda target: run(['sudo', '-n', 'rm', '-rf', '--', path(target)], target))
 
 
+def validate_thinlto_cluster(targets, work):
+    hosts = ' '.join(target['server_hosts'] for target in targets)
+    def validate_client(client):
+        directory = client['temporary'] + '/distcc-thinlto-cluster-check'
+        script = directory + '/validate-installed.py'
+        try:
+            transfer([str(ROOT / 'packaging/gentoo/validate-installed.py')], directory, client)
+            with (work / ('thinlto-' + client['name'] + '.log')).open('w') as log:
+                bounded(['env', 'TMPDIR=' + client['temporary'], 'VALIDATE_DISTCC_HOSTS=' + hosts,
+                         'python3', script, '--thinlto-only'], client, 'thinlto', log)
+            print(f"ThinLTO {client['name']}: multiple workers and executable results passed", flush=True)
+        finally:
+            run(['sudo', '-n', 'rm', '-f', '--', script], client)
+            run(['sudo', '-n', 'rmdir', '--', directory], client)
+    parallel(targets, validate_client)
+
+
 def main():
     if len(sys.argv) != 1:
         raise SystemExit('deploy takes no arguments; configure ~/.config/distcc/deploy.json')
@@ -312,6 +330,7 @@ def main():
                 validate(target, work)
             rollout(targets, deploy_target)
             validate_rust_cluster(targets, work)
+            validate_thinlto_cluster(targets, work)
             for target in targets:
                 if target['name'] in resume:
                     run(['sudo', '-n', 'systemctl', 'start', *resume[target['name']]], target)
@@ -327,6 +346,7 @@ def main():
                 run(['sudo', '-n', 'rm', '-r', '--', work / 'binpkgs'])
             (work / 'result.json').write_text(json.dumps({'version': version, 'success': True,
                                                         'rust_pairs': len(targets) ** 2,
+                                                        'thinlto_clients': len(targets),
                                                         'targets': [t['name'] for t in targets]}))
             results = Path(settings['results'])
             results.mkdir(parents=True, exist_ok=True)

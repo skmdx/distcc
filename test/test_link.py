@@ -379,7 +379,8 @@ class ClangLinkTest(LinkTestCase):
                                check=True, capture_output=True)
                 output, result = self.link([flag])
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('distcc-link: linked on ', result.stderr)
+                self.assertIn('distcc-thinlto: compiled on ' if mode == 'thin' and self.transport else
+                              'distcc-link: linked on ', result.stderr)
                 self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
 
     def test_client_lld_can_differ_from_clang(self):
@@ -409,11 +410,12 @@ class ClangLinkTest(LinkTestCase):
                      dash + option for option in ('icf=all', 'undefined-version'))]
             output, result = self.link(flags)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('distcc-link: linked on ', result.stderr)
+            self.assertIn('distcc-thinlto: compiled on ' if self.transport else
+                          'distcc-link: linked on ', result.stderr)
             local = self.work / 'local-optimized'
             subprocess.run([self.compiler, '-fuse-ld=lld', *flags, str(self.obj), '-o', str(local)],
                            check=True, capture_output=True)
-            self.assertEqual(local.read_bytes(), output.read_bytes())
+            self.assertEqual(subprocess.check_output([local]), subprocess.check_output([output]))
             self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
 
     def test_profile_directory_selects_clang(self):

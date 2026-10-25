@@ -204,6 +204,8 @@ update_distcc_symlinks_PY = update-distcc-symlinks.py
 dist_extra =							\
 	distcc-link \
 	distcc-rust \
+	distcc-thinlto \
+	distcc_job.py \
 	src/rust_native.cc \
 	src/clang_driver.cc \
 	src/clang_inputs.h \
@@ -238,6 +240,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_broker.py \
 	test/test_tcp_jobs.py \
 	test/test_rust.py \
+	test/test_thinlto.py \
 	test/test_link.py \
 	test/test_native.py \
 	test/test_offload.py \
@@ -845,6 +848,7 @@ adaptive-check: distcc distccd h_hosts
 	$(PYTHON) "$(srcdir)/test/test_broker.py" -v
 	$(PYTHON) "$(srcdir)/test/test_tcp_jobs.py" -v
 	$(PYTHON) "$(srcdir)/test/test_rust.py" -v
+	$(PYTHON) "$(srcdir)/test/test_thinlto.py" -v
 	$(PYTHON) "$(srcdir)/test/test_link.py" -v
 	$(PYTHON) "$(srcdir)/test/test_native.py" -v
 	$(PYTHON) "$(srcdir)/test/test_offload.py" -v
@@ -1136,6 +1140,8 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	$(mkinstalldirs) "$(DESTDIR)$(sbindir)"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-link" "$(DESTDIR)$(bindir)/distcc-link"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-rust" "$(DESTDIR)$(bindir)/distcc-rust"
+	$(INSTALL_SCRIPT) "$(srcdir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc-thinlto"
+	$(INSTALL_DATA) "$(srcdir)/distcc_job.py" "$(DESTDIR)$(bindir)/distcc_job.py"
 	if test -n "$(RUST_NATIVE_TARGET)"; then \
 	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
 	  $(INSTALL_PROGRAM) distcc-rust-native.so "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"; \
@@ -1277,6 +1283,7 @@ uninstall-programs:
 	rm -f "$(DESTDIR)$(libdir)/distcc/clang_driver.so"
 	rm -f "$(DESTDIR)$(bindir)/distcc-link"
 	rm -f "$(DESTDIR)$(bindir)/distcc-rust"
+	rm -f "$(DESTDIR)$(bindir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc_job.py"
 	rm -f "$(DESTDIR)$(bindir)/distcc-clang"
 	for p in $(bin_PROGRAMS) pump; do			\
 	  file="$(DESTDIR)$(bindir)/`basename $$p`";            \

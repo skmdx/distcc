@@ -27,6 +27,28 @@ appropriate compiler installed.
 Clang retains macros until remote compilation to preserve diagnostics;
 see README.pump for preprocessing behavior and toolchain requirements.
 
+ThinLTO links distribute individual optimization/code-generation backends:
+
+```
+distcc clang++ -flto=thin -fuse-ld=lld main.o library.a -o application
+```
+
+This requires `DISTCC_BROKER`, `,tcp` workers, Clang/LLD with the integrated
+DTLTO interface, Python xxhash and bubblewrap with unprivileged user namespaces.
+LLD performs the thin link, discovers imported modules and archive members, and
+invokes `distcc-thinlto` with its JSON job description. Each backend uses the
+broker's measured capacity and an independent learned ThinLTO workload class.
+Inputs are snapshotted and hashed once per link, shared across backend jobs,
+and transferred through the existing LZ4/content-cache path. Workers preserve
+LLVM's embedded import paths in a private namespace. The final native link
+runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache
+remains in use, so warm cache entries do not start backend jobs.
+Clang 22 and 23 are exercised by the integration tests. Compiler acceptance and
+the final link determine compatibility; version metadata is not a rejection gate.
+Existing whole-link offload remains available for other links with
+`DISTCC_LINK_SYSROOT`. `DISTCC_VERBOSE=1` reports the worker for every completed
+backend; `DISTCC_FALLBACK=0` makes distribution failures fail the link.
+
 Rust builds use Cargo's compiler wrapper interface:
 
 ```

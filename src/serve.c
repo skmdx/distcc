@@ -218,7 +218,7 @@ int dcc_execute_job(struct dcc_job *job, const char *root, int cancel_fd,
     enum dcc_protover version;
     int ret;
     dcc_job_result_init(result);
-    if (job->kind == DCC_JOB_LINK || job->kind == DCC_JOB_RUST) version = DCC_VER_LINK;
+    if (job->kind == DCC_JOB_LINK || dcc_job_tree(job)) version = DCC_VER_LINK;
     else dcc_get_protover_from_features(DCC_COMPRESS_LZ4_STREAM,
             job->kind == DCC_JOB_PUMP ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT, &version);
     dcc_job_summary_clear();
@@ -915,11 +915,11 @@ static int retain_artifact(struct dcc_job_result *result, unsigned index, const 
     return 0;
 }
 
-/* Protocol 4 delegates only object linking to the sysroot-aware helper. */
+/* Execute an isolated file-tree backend or a sysroot-aware whole link. */
 static int dcc_run_helper_job(int in_fd, int out_fd,
                             const char *out_fname, const char *err_fname, int *status,
                             enum dcc_protover protover, const char *input_archive,
-                            struct dcc_job_result *result, int rust)
+                            struct dcc_job_result *result, const char *helper)
 {
     char *archive = NULL, *output = NULL;
     char *argv[5];
@@ -927,7 +927,7 @@ static int dcc_run_helper_job(int in_fd, int out_fd,
     pid_t pid;
     int ret;
     enum dcc_compress compr = protover == DCC_VER_STREAM_LINK ? DCC_COMPRESS_LZ4_STREAM : DCC_COMPRESS_NONE;
-    if (!rust && !getenv("DISTCCD_LINK_ROOT")) {
+    if (!strcmp(helper, "distcc-link") && !getenv("DISTCCD_LINK_ROOT")) {
         rs_log_error("remote linking requires DISTCCD_LINK_ROOT");
         return EXIT_PROTOCOL_ERROR;
     }
@@ -938,13 +938,13 @@ static int dcc_run_helper_job(int in_fd, int out_fd,
         goto done;
     if ((ret = dcc_make_tmpnam("distcc-link", ".out", &output)))
         goto done;
-    argv[0] = (char *)(rust ? "distcc-rust" : "distcc-link");
+    argv[0] = (char *)helper;
     argv[1] = (char *)"--worker";
     argv[2] = archive;
     argv[3] = output;
     argv[4] = NULL;
     if ((ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname)) ||
-        (ret = dcc_collect_child(rust ? "rust" : "link", pid, status, in_fd,
+        (ret = dcc_collect_child(helper, pid, status, in_fd,
                                  result ? &result->peak_bytes : NULL)))
         *status = W_EXITCODE(ret, 0);
     if (!*status && stat(output, &st))
@@ -1063,25 +1063,27 @@ static int dcc_run_job(int in_fd,
     if (!job) tcp_cork_sock(out_fd, 1);
 
     if (protover == DCC_VER_LINK || protover == DCC_VER_STREAM_LINK) {
-        int rust = job && job->kind == DCC_JOB_RUST;
+        int tree = job && dcc_job_tree(job);
+        const char *helper = !tree ? "distcc-link" :
+            job->kind == DCC_JOB_RUST ? "distcc-rust" : "distcc-thinlto";
         argv = calloc(2, sizeof(*argv));
-        orig_input = strdup(rust ? "rust" : "link");
-        if (!argv || !(argv[0] = strdup(rust ? "distcc-rust" : "distcc-link")) || !orig_input) {
+        orig_input = strdup(helper);
+        if (!argv || !(argv[0] = strdup(helper)) || !orig_input) {
             ret = EXIT_OUT_OF_MEMORY;
             goto out_cleanup;
         }
         char *input_archive = NULL;
-        if (rust && !(input_archive = strdup(root))) {
+        if (tree && !(input_archive = strdup(root))) {
             ret = EXIT_OUT_OF_MEMORY;
             goto out_cleanup;
         }
-        if (job && !rust && (job->count != 1 ||
+        if (job && !tree && (job->count != 1 ||
             asprintf(&input_archive, "%s%s", root, job->inputs[0].path) < 0)) {
             ret = EXIT_PROTOCOL_ERROR;
             goto out_cleanup;
         }
         ret = dcc_run_helper_job(in_fd, out_fd, out_fname, err_fname, &status,
-                              protover, input_archive, result, rust);
+                              protover, input_archive, result, helper);
         free(input_archive);
         job_result = ret || status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
         goto out_cleanup;

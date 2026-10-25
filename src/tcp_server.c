@@ -490,7 +490,7 @@ static int prepare(struct dcc_tcp_server *s)
     s->storage_group = location.st_dev != normal.st_dev;
     s->inputs = calloc(s->job->count ? s->job->count : 1, sizeof(*s->inputs));
     if (!s->inputs) { free(paths); return -1; }
-    if (s->job->kind != DCC_JOB_RUST) {
+    if (!dcc_job_tree(s->job)) {
         storage_pending[s->storage_group] += s->input_pending;
         s->storage_reserved = 1;
     }
@@ -527,7 +527,7 @@ static int input_space(const struct dcc_tcp_server *s)
 }
 static int prepare_available(struct dcc_tcp_server *s)
 {
-    int available = s->job->kind == DCC_JOB_RUST ? 1 : input_space(s);
+    int available = dcc_job_tree(s->job) ? 1 : input_space(s);
     if (available <= 0 || waiting_results) return available < 0 ? -1 : 0;
     /* Inputs live in files, not the framing heap. Reserve unwritten bytes
      * against their filesystem; completed files are reflected by statvfs. */
@@ -666,7 +666,7 @@ static int begin(struct dcc_tcp_server *s, struct dcc_tcp_frame *f)
     if (metadata_bytes > DCC_TCP_BYTES - retained) return -1;
     retained += metadata_bytes;
     s->reserved = s->input_bytes = metadata_bytes;
-    s->input_pending = s->job->kind == DCC_JOB_RUST ? 0 : amount;
+    s->input_pending = dcc_job_tree(s->job) ? 0 : amount;
     return prepare_available(s) < 0 ? -1 : 0;
 }
 static void completed_input(struct input *in)
@@ -941,7 +941,7 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
     if (s->job && s->phase == PREPARING && !s->inputs) {
         p->events = POLLRDHUP;
         p->revents = 0;
-        return !waiting_results && (s->job->kind == DCC_JOB_RUST || input_space(s) != 0);
+        return !waiting_results && (dcc_job_tree(s->job) || input_space(s) != 0);
     }
     if (s->job && s->prepared == s->job->count && !s->storage_reserved && s->phase == PREPARING) {
         p->events = POLLRDHUP;

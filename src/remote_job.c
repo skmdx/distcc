@@ -259,7 +259,7 @@ done:
 
 /* The Rust planner owns immutable numbered snapshots. Scheduling, caching,
  * compression, cancellation and connection reuse stay on the ordinary path. */
-int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *output)
+int dcc_file_transfer(const char *metadata, const char *snapshots, const char *output)
 {
     struct dcc_job *job = NULL;
     struct dcc_hostdef *host = NULL;
@@ -272,8 +272,8 @@ int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *o
     if (fd < 0) goto done;
     ret = dcc_job_decode(fd, &job);
     close(fd);
-    if (ret || job->kind != DCC_JOB_RUST || !job->count) { ret = EXIT_PROTOCOL_ERROR; goto done; }
-    hint.kind = DCC_WORK_RUST;
+    if (ret || !dcc_job_tree(job) || !job->count) { ret = EXIT_PROTOCOL_ERROR; goto done; }
+    hint.kind = job->kind == DCC_JOB_RUST ? DCC_WORK_RUST : DCC_WORK_THINLTO;
     hint.bytes = dcc_resource_input_bytes(job);
     uint64_t key = XXH3_64bits(job->cwd, strlen(job->cwd));
     for (unsigned i = 0; i < job->count; ++i) {
@@ -281,7 +281,8 @@ int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *o
         key = XXH3_64bits_withSeed(input->path, strlen(input->path) + 1, key);
         key = XXH3_64bits_withSeed(input->digest, sizeof(input->digest), key);
         const char *extension = strrchr(input->path, '.');
-        if (extension && !strcmp(extension, ".rs")) {
+        if (extension && (!strcmp(extension, ".rs") ||
+            (job->kind == DCC_JOB_THINLTO && i == 0))) {
             uint64_t room = UINT32_MAX - hint.source_bytes;
             hint.source_bytes += input->plain_size < room ? input->plain_size : room;
         }
@@ -301,14 +302,14 @@ int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *o
         dcc_broker_cpp_done(host);
         ret = dcc_tcp_exchange(host, job, files, NULL, output, NULL, &result);
         if (!ret) break;
-        /* A pooled connection can close between acquisition and BEGIN. Rust
+        /* A pooled connection can close between acquisition and BEGIN. Job
          * inputs are immutable and no result has been published: retry once
          * through a fresh reservation, including when local fallback is off. */
         if (ret == EXIT_BUSY) dcc_broker_defer(host);
         else {
             dcc_broker_failed(host);
             if (failures++ || ret != EXIT_IO_ERROR) goto done;
-            rs_log_warning("retrying Rust job on a fresh connection");
+            rs_log_warning("retrying file job on a fresh connection");
         }
         dcc_job_result_free(&result);
         dcc_job_result_init(&result);
@@ -329,7 +330,8 @@ int dcc_rust_transfer(const char *metadata, const char *snapshots, const char *o
                                          DCC_JOB_OBJECT, output))) goto done;
     ret = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
     if (!ret && getenv("DISTCC_VERBOSE") && !strcmp(getenv("DISTCC_VERBOSE"), "1"))
-        fprintf(stderr, "distcc-rust: compiled on %s\n", host->hostname);
+        fprintf(stderr, "%s: compiled on %s\n",
+                job->kind == DCC_JOB_RUST ? "distcc-rust" : "distcc-thinlto", host->hostname);
 done:
     dcc_job_result_free(&result);
     if (host) dcc_free_hostdef(host);
