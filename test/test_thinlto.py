@@ -86,10 +86,14 @@ class ThinLTOTest(BrokerTestCase):
             objects.append(obj)
         main = self.work / 'main.cpp'
         main.write_text('int main() {}\n')
-        args = ['clang++', '-O2', '-flto=thin', '-fuse-ld=lld', *objects, main]
+        result = self.run_command(['clang++', '-O2', '-flto=thin', '-c', main, '-o', 'main.o'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = ['clang++', '-O2', '-flto=thin', '-fuse-ld=lld', *objects, 'main.o']
         for prefix, output in (([], 'reference'), ([self.build / 'distcc'], 'distributed')):
             result = self.run_command([*prefix, *args, '-o', output])
             self.assertEqual(result.returncode, 0, result.stderr)
+            if prefix:
+                self.assertEqual(result.stderr.count('distcc-thinlto: compiled on'), 4, result.stderr)
             actual = self.run_command([self.work / output])
             self.assertEqual(actual.stdout, '0\n1\n2\n')
 
