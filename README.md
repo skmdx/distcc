@@ -424,6 +424,8 @@ To resume a failed build, set `build_root` to its retained `build-N` directory
 and `repetitions` to 1. Portage reuses its preserved work tree. Incremental
 recovery is labeled separately and is never used to claim a full-build speedup.
 Remove `build_root` to return to clean measurements.
+Set `keep_build` to true when a successful build tree is needed for controlled
+compiler/linker comparisons. Its client-side run directory then requires cleanup.
 
 Each run saves `result.json`, `summary.txt` and its raw evidence under the
 configured results directory. A successful clean run updates `latest.json`; matching

@@ -257,6 +257,8 @@ def main():
             if result['success']:
                 try:
                     for name in {w['name'] for w in workers} | {config['client']}:
+                        if name == config['client'] and config.get('keep_build'):
+                            continue
                         deploy.run(['sudo', '-n', 'rm', '-rf', '--', remote], targets[name])
                 except RuntimeError as error:
                     result.update(success=False, error='temporary cleanup failed: ' + str(error))

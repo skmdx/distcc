@@ -392,7 +392,10 @@ def measure(config, out, buildroot):
                   perf_returncode=perf_status, returncode=None if build is None else build.returncode)
     (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
     # Keep evidence; build trees and private Portage state are not results.
-    for path in (() if error else (buildtree, configroot, runtime / '.distcc')):
+    cleanup = (configroot, runtime / '.distcc')
+    if not config.get('keep_build'):
+        cleanup += (buildtree,)
+    for path in (() if error else cleanup):
         if path.exists():
             shutil.rmtree(path)
     print(json.dumps(result), flush=True)
