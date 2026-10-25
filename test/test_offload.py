@@ -12,9 +12,10 @@ from test_broker import BrokerTestCase
 class OffloadTest(BrokerTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.compiler = shutil.which(os.environ.get('DISTCC_TEST_HIP_COMPILER', 'clang++'))
-        if not cls.compiler:
+        compiler = shutil.which(os.environ.get('DISTCC_TEST_HIP_COMPILER', 'clang++'))
+        if not compiler:
             raise unittest.SkipTest('Clang is required')
+        cls.compiler = compiler
         cls.daemon_env = {'DISTCCD_PATH': str(Path(cls.compiler).parent) + os.pathsep + os.defpath}
         super().setUpClass()
 
@@ -25,7 +26,7 @@ class OffloadTest(BrokerTestCase):
         self.env.update(DISTCC_VERBOSE='1', INCLUDE_SERVER_PORT=str(self.work / 'absent.sock'))
 
     def distributed(self, flags, source):
-        obj = self.work / 'offload.o'
+        obj = source.with_suffix('.o')
         args = [self.compiler, *flags, '-c', str(source), '-o', str(obj)]
         result = subprocess.run([str(self.build / 'distcc'), *args], env=self.env,
                                 capture_output=True, text=True, timeout=120)
@@ -99,6 +100,29 @@ int main() { return 0; }
         subprocess.run([str(exe)], check=True, timeout=30)
         # A second job exercises the shared device-bitcode cache.
         self.distributed(flags, source)
+
+    def test_hip_compilation_unit_identity(self):
+        libraries = os.environ.get('ROCM_DEVICE_LIB_PATH')
+        if not libraries:
+            self.skipTest('Set ROCM_DEVICE_LIB_PATH to test the installed HIP toolchain')
+        flags = ['-xhip', '--offload-arch=gfx900', '--offload-arch=gfx1030',
+                 '--rocm-device-lib-path=' + libraries, '-O2']
+        objects = []
+        for name in ('first', 'second'):
+            source = self.work / (name + '.hip')
+            source.write_text('''#include <hip/hip_runtime.h>
+static __device__ int state;
+__global__ void ''' + name + '''(int *p) { p[0] += ++state; }
+''')
+            objects.append(self.distributed(flags, source))
+        main = self.work / 'main.cpp'
+        main.write_text('int main() { return 0; }\n')
+        exe = self.work / 'hip-multiple-units'
+        result = subprocess.run([self.compiler, '--hip-link', *map(str, objects),
+                                 str(main), '-lamdhip64', '-o', str(exe)],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([str(exe)], check=True, timeout=30)
 
 
 if __name__ == '__main__':

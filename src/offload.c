@@ -99,7 +99,7 @@ static int host_native(char ***args, char **host)
 int dcc_prepare_offload(char ***argvp, char ***files)
 {
     char **argv = *argvp, **expanded = NULL, **inputs = NULL, **host = NULL, **gpus = NULL;
-    char *text = NULL, *directory = NULL, *compiler = NULL, *line, *next;
+    char *text = NULL, *directory = NULL, *compiler = NULL, *cuid = NULL, *line, *next;
     int ret = EXIT_DISTCC_FAILED, native = dcc_native_requested(argv);
     int hip = !strcmp(dcc_offload_language(argv), "hip-cpp-output");
     int gpu_native = dcc_argv_search(argv, "--offload-arch=native");
@@ -113,6 +113,10 @@ int dcc_prepare_offload(char ***argvp, char ***files)
         if (!(words = dcc_driver_words(line))) goto out;
         if (!words[0] || !words[1] || strcmp(words[1], "-cc1")) { free(words); continue; }
         if (!compiler) compiler = realpath(words[0], NULL);
+        for (int i = 2; hip && !cuid && words[i]; ++i)
+            if (!strncmp(words[i], "-cuid=", 6)) {
+                if (!(cuid = strdup(words[i]))) { free(words); goto out; }
+            }
         triple = option(words, "-triple");
         if (triple && !strncmp(triple, "amdgcn", 6)) {
             if (gpu_native) {
@@ -153,6 +157,10 @@ int dcc_prepare_offload(char ***argvp, char ***files)
     }
     for (int i = 0; gpus && gpus[i]; ++i)
         if (append(&expanded, gpus[i])) goto out;
+    /* A preprocessed HIP bundle no longer makes the driver generate a
+     * compilation-unit ID. Pass the original ID directly to both frontends,
+     * including device-only actions and externalized static symbols. */
+    if (cuid && (append(&expanded, "-Xclang") || append(&expanded, cuid))) goto out;
     if (hip && host) {
         const char *triple = option(host, "-triple");
         char *flag;
@@ -187,6 +195,7 @@ out:
     if (gpus) dcc_free_argv(gpus);
     free(host);
     free(compiler);
+    free(cuid);
     free(directory);
     free(text);
     return ret;
