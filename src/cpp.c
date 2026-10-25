@@ -78,7 +78,7 @@ const char *dcc_cpp_rewrite_language(char **argv, const char *input_fname)
     const char *clang = strstr(name, "clang");
     const char *ext, *language = NULL;
     int i;
-    if (!clang || (clang != name && clang[-1] != '-') ||
+    if (dcc_offload_language(argv) || !clang || (clang != name && clang[-1] != '-') ||
         (clang[5] && clang[5] != '-' && strcmp(clang + 5, "++") &&
          strncmp(clang + 5, "++-", 3)) || dcc_is_preprocessed(input_fname))
         return NULL;

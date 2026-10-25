@@ -90,11 +90,44 @@
 #include "exitcode.h"
 #include "snprintf.h"
 
-/* Consult the compiler only for commands whose non-source inputs need its
- * semantics. Ordinary compilation keeps the lightweight client path. */
+/* Offload preprocessing is a compiler-generated bundle of target-specific
+ * translation units. It must not go through the single-frontend pump scanner. */
+const char *dcc_offload_language(char *const argv[])
+{
+    const char *language = NULL;
+    int amdgpu = 0;
+    if (!strstr(dcc_find_basename(argv[0]), "clang")) return NULL;
+    for (int i = 1; argv[i]; ++i) {
+        if (!strcmp(argv[i], "-x") && argv[i + 1]) language = argv[++i];
+        else if (!strncmp(argv[i], "-x", 2) && argv[i][2]) language = argv[i] + 2;
+        else if ((!strcmp(argv[i], "-target") || !strcmp(argv[i], "--target")) && argv[i + 1])
+            amdgpu = !strncmp(argv[++i], "amdgcn", 6);
+        else if (!strncmp(argv[i], "--target=", 9)) amdgpu = !strncmp(argv[i] + 9, "amdgcn", 6);
+        else if (argv[i][0] != '-') {
+            const char *ext = dcc_find_extension_const(argv[i]);
+            if (!language && ext) {
+                if (!strcmp(ext, ".hip") || !strcmp(ext, ".hipi")) language = "hip";
+                else if (!strcmp(ext, ".cl") || !strcmp(ext, ".cli")) language = "cl";
+                else if (!strcmp(ext, ".clcpp") || !strcmp(ext, ".clii")) language = "clcpp";
+                else if (dcc_is_source(argv[i])) {
+                    const char *preprocessed = dcc_preproc_exten(ext);
+                    language = (strstr(dcc_find_basename(argv[0]), "++") ||
+                                (preprocessed && !strcmp(preprocessed, ".ii"))) ? "c++" : "c";
+                }
+            }
+        }
+    }
+    if (language && !strncmp(language, "hip", 3)) return "hip-cpp-output";
+    if (!amdgpu) return NULL;
+    if (language && !strncmp(language, "clcpp", 5)) return "clcpp-cpp-output";
+    if (language && !strncmp(language, "cl", 2)) return "cl-cpp-output";
+    return language && (!strncmp(language, "c++", 3)) ? "c++-cpp-output" : "cpp-output";
+}
+
 int dcc_prepare_clang(char ***argv, char ***files)
 {
     int needed = 0;
+    if (dcc_offload_language(*argv)) return 0;
     if (!strstr(dcc_find_basename((*argv)[0]), "clang")) return 0;
     for (char **p = *argv + 1; *p; ++p)
         if (str_endswith(".a", *p) ||
@@ -269,7 +302,8 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
                 if (!language ||
                     (!str_startswith("c", language) &&
                      !str_startswith("objective-c", language) &&
-                     !str_startswith("go", language))) {
+                     !str_startswith("go", language) &&
+                     !str_startswith("hip", language))) {
                     rs_log_info("unsupported distributed language: %s", language ? language : "empty");
                     return EXIT_DISTCC_FAILED;
                 }

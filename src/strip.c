@@ -68,9 +68,10 @@ int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname)
     int from_i, to_i;
     int from_len;
     const char *rewrite_language = input_fname ? dcc_cpp_rewrite_language(from, input_fname) : NULL;
+    const char *offload = dcc_offload_language(from);
 
     from_len = dcc_argv_len(from);
-    *out_argv = to = malloc((from_len + 3) * sizeof (char *));
+    *out_argv = to = malloc((from_len + 4) * sizeof (char *));
 
     if (!to) {
         rs_log_error("failed to allocate space for arguments");
@@ -80,15 +81,20 @@ int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname)
     /* skip through argv, copying all arguments but skipping ones that
      * ought to be omitted */
     to_i = 0;
-    to[to_i++] = from[0];
-    if (rewrite_language) {
+    to[to_i++] = offload ? (char *)dcc_find_basename(from[0]) : from[0];
+    if (rewrite_language || offload) {
         to[to_i++] = (char *)"-x";
-        to[to_i++] = (char *)rewrite_language;
+        to[to_i++] = (char *)(offload ? offload : rewrite_language);
+        if (offload && !strcmp(offload, "hip-cpp-output")) to[to_i++] = (char *)"-nogpuinc";
+        if (offload && !strncmp(offload, "cl", 2)) to[to_i++] = (char *)"-cl-no-stdinc";
     }
     for (from_i = 1; from[from_i]; from_i++) {
-        if (str_equal("-Xclang", from[from_i]) && from[from_i + 1]) {
+        if ((str_equal("-Xclang", from[from_i]) || str_equal("-Xarch_host", from[from_i])) && from[from_i + 1]) {
             to[to_i++] = from[from_i++];
             to[to_i++] = from[from_i];
+        }
+        else if (offload && str_startswith("-x", from[from_i])) {
+            if (!strcmp(from[from_i], "-x") && from[from_i + 1]) ++from_i;
         }
         else if (rewrite_language &&
                  (str_startswith("-D", from[from_i]) ||

@@ -1228,7 +1228,19 @@ static int dcc_run_job(int in_fd,
     /* Pump inputs need Clang's rooted filesystem for absolute includes and
      * __has_include probes. The frontend also preserves source identity for
      * LLVM IR PGO names, which prefix-map options do not affect. */
-    if (strstr(dcc_find_basename(argv[0]), "clang")) {
+    if (dcc_offload_language(argv)) {
+        for (i = 1; argv[i]; ++i) {
+            if (root && !strncmp(argv[i], "--rocm-device-lib-path=", 23)) {
+                char *path;
+                if (asprintf(&path, "--rocm-device-lib-path=%s%s", root, argv[i] + 23) < 0) {
+                    ret = EXIT_OUT_OF_MEMORY;
+                    goto out_cleanup;
+                }
+                free(argv[i]);
+                argv[i] = path;
+            }
+        }
+    } else if (strstr(dcc_find_basename(argv[0]), "clang")) {
         int frontend = cpp_where == DCC_CPP_ON_SERVER || (job && job->count > 1);
         int argc = dcc_argv_len(argv);
         for (i = 1; i < argc; ++i)

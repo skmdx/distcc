@@ -754,11 +754,13 @@ dcc_build_somewhere(char *argv[],
     ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 1);
     dcc_free_argv(argv);
     argv = new_argv;
+    if (dcc_offload_language(argv)) unsetenv("INCLUDE_SERVER_PORT");
     preprocess_only = dcc_argv_search(argv, "-E");
     if (preprocess_only && (ret || !getenv("INCLUDE_SERVER_PORT")))
         ret = EXIT_LOCAL_CPP;
-    if (!ret && dcc_native_requested(argv)) {
-        if (dcc_expand_native(&argv, input_fname, output_fname)) {
+    if (!ret && (dcc_offload_language(argv) || dcc_native_requested(argv))) {
+        if (dcc_offload_language(argv) ? dcc_prepare_offload(&argv, &auxiliary) :
+                                       dcc_expand_native(&argv, input_fname, output_fname)) {
             ret = EXIT_DISTCC_FAILED;
         } else {
             ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 0);

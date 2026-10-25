@@ -179,7 +179,13 @@ const char * dcc_preproc_exten(const char *e)
     if (e[0] != '.')
         return NULL;
     e++;
-    if (!strcmp(e, "i") || !strcmp(e, "c")) {
+    if (!strcmp(e, "hip") || !strcmp(e, "hipi")) {
+        return ".hipi";
+    } else if (!strcmp(e, "cl") || !strcmp(e, "cli")) {
+        return ".cli";
+    } else if (!strcmp(e, "clcpp") || !strcmp(e, "clii")) {
+        return ".clii";
+    } else if (!strcmp(e, "i") || !strcmp(e, "c")) {
         return ".i";
     } else if (!strcmp(e, "c") || !strcmp(e, "cc")
                || !strcmp(e, "cpp") || !strcmp(e, "cxx")
@@ -210,6 +216,8 @@ int dcc_is_preprocessed(const char *sfile)
     if (!dot)
         return 0;
     ext = dot+1;
+
+    if (!strcmp(ext, "hipi") || !strcmp(ext, "cli") || !strcmp(ext, "clii")) return 1;
 
     switch (ext[0]) {
 #ifdef ENABLE_REMOTE_ASSEMBLE
@@ -242,6 +250,10 @@ int dcc_is_source(const char *sfile)
 
     /* you could expand this out further into a RE-like set of case
      * statements, but i'm not sure it's that important. */
+
+    if (!strcmp(ext, "hip") || !strcmp(ext, "hipi") ||
+        !strcmp(ext, "cl") || !strcmp(ext, "cli") ||
+        !strcmp(ext, "clcpp") || !strcmp(ext, "clii")) return 1;
 
     switch (ext[0]) {
     case 'i':

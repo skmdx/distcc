@@ -289,6 +289,10 @@ int dcc_set_output(char **, char *);
 int dcc_set_input(char **, char *);
 int dcc_expand_native(char ***argv, const char *input, const char *output);
 int dcc_native_requested(char *argv[]);
+int dcc_read_driver(char **argv, char **text);
+char **dcc_driver_words(char *line);
+const char *dcc_offload_language(char *const argv[]);
+int dcc_prepare_offload(char ***argv, char ***files);
 char *dcc_native_cache_key(char *argv[], const char *input, const char *output);
 int dcc_scan_args(char *argv[], /*@out@*/ /*@relnull@*/ char **orig_o,
                   char **orig_i, char ***ret_newargv, int allow_native);

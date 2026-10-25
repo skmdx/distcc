@@ -124,6 +124,22 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         marker = ('pooled TCP job completed' if ',tcp' in env['DISTCC_HOSTS'] else
                   'client finished sending request to server')
         assert log.count(marker) >= len(set(compilers)), log[-6000:]
+    if ',tcp' in env['DISTCC_HOSTS']:
+        clang = next((p for p in compilers if 'clang' in Path(p).name), None)
+        if clang:
+            source = root / 'device.c'
+            source.write_text('int device_add(int a, int b) { return a + b; }\n')
+            obj = root / 'device.o'
+            before = (root / 'client.log').stat().st_size
+            result = subprocess.run(['distcc', clang, '--target=amdgcn-amd-amdhsa',
+                                     '-mcpu=gfx900', '-nogpulib', '-O2', '-x', 'c',
+                                     '-c', str(source), '-o', str(obj)],
+                                    env=env, capture_output=True, timeout=REMOTE_TIMEOUT)
+            assert result.returncode == 0, result.stderr.decode(errors='replace')
+            assert 'pooled TCP job completed' in (root / 'client.log').read_text()[before:]
+            header = subprocess.check_output(['readelf', '-h', str(obj)], text=True, env=dict(env, LC_ALL='C'))
+            assert 'AMD GPU' in header, header
+            results['amdgpu'] = {'distributed': True, 'object_machine': 'AMDGPU'}
     # The Rust wrapper shares this broker and must really reach the TCP worker.
     # Legacy C/C++ validation also runs; Rust is exercised on the TCP pass.
     if ',tcp' in env['DISTCC_HOSTS']:

@@ -31,7 +31,7 @@ int dcc_native_requested(char *argv[])
 /* Driver -### output is quoted argv, not shell code. Never execute it.
  * Decode a single command, rejecting incomplete quotes or escapes.
  */
-static char **driver_words(char *line)
+char **dcc_driver_words(char *line)
 {
     char **words = calloc(strlen(line) + 1, sizeof(char *));
     char *read = line, *write = line;
@@ -64,6 +64,28 @@ static char **driver_words(char *line)
 invalid:
     free(words);
     return NULL;
+}
+
+int dcc_read_driver(char **argv, char **text)
+{
+    char **probe = NULL, *file = NULL;
+    int argc = dcc_argv_len(argv), status, ret = EXIT_DISTCC_FAILED;
+    pid_t pid;
+    struct stat st;
+    *text = NULL;
+    if (dcc_copy_argv(argv, &probe, 1)) goto out;
+    probe[argc + 1] = NULL;
+    if (!(probe[argc] = strdup("-###")) ||
+        dcc_make_tmpnam("distcc_driver", ".txt", &file)) goto out;
+    if (dcc_spawn_child(probe, &pid, "/dev/null", "/dev/null", file) ||
+        dcc_collect_child("compiler driver discovery", pid, &status, timeout_null_fd, NULL) || status ||
+        stat(file, &st) || st.st_size > 1024 * 1024 || dcc_load_file_string(file, text)) goto out;
+    ret = 0;
+out:
+    if (probe) dcc_free_argv(probe);
+    if (file) unlink(file);
+    free(file);
+    return ret;
 }
 
 static int add_arg(char **args, int *count, const char *value)
@@ -153,14 +175,12 @@ invalid:
  */
 int dcc_expand_native(char ***argvp, const char *input, const char *output)
 {
-    char **argv = *argvp, **probe = NULL, **frontend = NULL, **expanded = NULL;
+    char **argv = *argvp, **frontend = NULL, **expanded = NULL;
     char **options = NULL;
-    char *file = NULL, *text = NULL, *line, *next, *key = NULL, *after = NULL;
+    char *text = NULL, *line, *next, *key = NULL, *after = NULL;
     int lease = -1;
-    int argc = dcc_argv_len(argv), ret = EXIT_DISTCC_FAILED, status;
+    int argc = dcc_argv_len(argv), ret = EXIT_DISTCC_FAILED;
     int i, n = 0, clang = 0, found = 0, cpu = 0, native = 0;
-    pid_t pid;
-    struct stat st;
 
     for (i = 1; argv[i]; i++) native |= native_option(argv[i]);
     if (!native) return 0;
@@ -172,15 +192,7 @@ int dcc_expand_native(char ***argvp, const char *input, const char *output)
         if (!options) goto out;
         goto expand;
     }
-    if (dcc_copy_argv(argv, &probe, 1)) goto out;
-    probe[argc + 1] = NULL;
-    if (!(probe[argc] = strdup("-###")) ||
-        dcc_make_tmpnam("distcc_native", ".txt", &file)) goto out;
-    if (dcc_spawn_child(probe, &pid, "/dev/null", "/dev/null", file) ||
-        dcc_collect_child("native option expansion", pid, &status, timeout_null_fd, NULL) || status ||
-        stat(file, &st) || st.st_size > 1024 * 1024 ||
-        dcc_load_file_string(file, &text))
-        goto out;
+    if (dcc_read_driver(argv, &text)) goto out;
 
     for (line = text; line && *line; line = next) {
         char **words;
@@ -188,7 +200,7 @@ int dcc_expand_native(char ***argvp, const char *input, const char *output)
         next = strchr(line, '\n');
         if (next) *next++ = '\0';
         if (!isspace((unsigned char)*line)) continue;
-        words = driver_words(line);
+        words = dcc_driver_words(line);
         if (!words) goto out;
         if (!words[0]) { free(words); continue; }
         base = strrchr(words[0], '/');
@@ -260,12 +272,9 @@ out:
     free(key);
     free(after);
     if (ret) rs_log_info("native option expansion unavailable; compiling locally");
-    if (probe) dcc_free_argv(probe);
     if (expanded) dcc_free_argv(expanded);
     if (options) dcc_free_argv(options);
     free(frontend);
     free(text);
-    if (file) unlink(file);
-    free(file);
     return ret;
 }

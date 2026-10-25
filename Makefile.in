@@ -240,6 +240,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_rust.py \
 	test/test_link.py \
 	test/test_native.py \
+	test/test_offload.py \
 	test/test_protocol.py \
 	test/test_pool.py \
 	test/test_retry.py \
@@ -296,7 +297,7 @@ common_obj = src/arg.o src/argutil.o					\
 
 distcc_obj = src/backoff.o						\
 	src/climasq.o src/clinet.o src/clirpc.o				\
-	src/compile.o src/native.o src/native_cache.o src/cpp.o					\
+	src/compile.o src/native.o src/native_cache.o src/offload.o src/cpp.o					\
 	src/distcc.o							\
 	src/remote.o							\
 	src/ssh.o src/state.o src/strip.o				\
@@ -352,7 +353,7 @@ h_sa2str_obj = src/h_sa2str.o $(common_obj) src/srvnet.o src/access.o
 h_ccvers_obj = src/h_ccvers.o $(common_obj)
 h_dotd_obj = src/h_dotd.o $(common_obj)
 h_fix_debug_info = src/h_fix_debug_info.o $(common_obj)
-h_compile_obj = src/h_compile.o $(common_obj) src/compile.o src/native.o src/native_cache.o src/timefile.o \
+h_compile_obj = src/h_compile.o $(common_obj) src/compile.o src/native.o src/native_cache.o src/offload.o src/timefile.o \
                 src/backoff.o src/emaillog.o src/remote.o src/clinet.o \
 	        src/clirpc.o src/include_server_if.o src/state.o src/where.o src/adaptive.o src/broker.o src/workload.o \
 		src/ssh.o src/strip.o src/cpp.o @AUTH_DISTCC_OBJS@
@@ -372,7 +373,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c src/workload.c	\
 	src/auth_common.c src/auth_distcc.c src/auth_distccd.c		\
 	src/backoff.c src/bulk.c src/compress_stream.c src/file_cache.c	\
 	src/cleanup.c							\
-	src/climasq.c src/clinet.c src/clirpc.c src/compile.c src/native.c \
+	src/climasq.c src/clinet.c src/clirpc.c src/compile.c src/native.c src/offload.c \
 	src/compress.c src/cpp.c src/cpp_lookup.c			\
 	src/daemon.c src/distcc.c src/dsignal.c				\
 	src/dopt.c src/dparent.c src/exec.c src/filename.c		\
@@ -846,6 +847,7 @@ adaptive-check: distcc distccd h_hosts
 	$(PYTHON) "$(srcdir)/test/test_rust.py" -v
 	$(PYTHON) "$(srcdir)/test/test_link.py" -v
 	$(PYTHON) "$(srcdir)/test/test_native.py" -v
+	$(PYTHON) "$(srcdir)/test/test_offload.py" -v
 	$(PYTHON) "$(srcdir)/test/test_protocol.py" -v
 	$(PYTHON) "$(srcdir)/test/test_pool.py" -v
 	$(PYTHON) "$(srcdir)/test/test_retry.py" -v
