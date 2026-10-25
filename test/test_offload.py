@@ -51,6 +51,21 @@ class OffloadTest(BrokerTestCase):
                                 '-nogpulib', '-O2', '-x', 'c'], source)
         self.assertIn('AMD GPU', subprocess.check_output(['readelf', '-h', obj], text=True))
 
+    def test_absolute_cmake_compiler_preserves_lto_version(self):
+        source = self.work / 'configure.cpp'
+        source.write_text('int main() { return 0; }\n')
+        obj = self.work / 'configure.o'
+        env = dict(self.env)
+        env.pop('INCLUDE_SERVER_PORT')
+        result = subprocess.run([str(self.build / 'distcc'), self.compiler, '-flto=thin',
+                                 '-c', str(source), '-o', str(obj)], env=env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('pooled TCP job completed', result.stderr)
+        exe = self.work / 'configure'
+        subprocess.run([self.compiler, '-flto=thin', str(obj), '-o', str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
+
     def test_hip_device_only(self):
         source = self.work / 'device.hip'
         source.write_text('__attribute__((global)) void increment(int *p) { p[0] += 1; }\n')

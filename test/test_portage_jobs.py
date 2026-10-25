@@ -23,6 +23,14 @@ source "$JOBS_HOOK"
 echo "value:${CMAKE_HIP_COMPILER_LAUNCHER}"
 '''), ['distcc', 'unset', 'custom-wrapper', 'value:'])
 
+    def test_cmake_cxx_launcher_covers_hip_in_cxx_mode(self):
+        self.assertEqual(self.run_hook('''
+echo "$CMAKE_C_COMPILER_LAUNCHER $CMAKE_CXX_COMPILER_LAUNCHER"
+FEATURES=
+source "$JOBS_HOOK"
+echo "${CMAKE_C_COMPILER_LAUNCHER-unset} ${CMAKE_CXX_COMPILER_LAUNCHER-unset}"
+'''), ['distcc distcc', 'unset unset'])
+
     def test_prepare_exports_jobs_before_ebuild_derives_cargo_parallelism(self):
         self.assertEqual(self.run_hook('''
 unset MAKEOPTS CARGO_BUILD_JOBS ${!distcc_auto_@}

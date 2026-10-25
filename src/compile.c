@@ -592,6 +592,30 @@ static void dcc_add_clang_target(char **argv)
 /*
  * Cross compilation for gcc
 */
+/* A shallow wire view owns its compiler name in the array allocation. Resolve
+ * an absolute Clang to the selected executable, not the worker's default LLVM
+ * slot. Both pump and locally preprocessed jobs use this same conversion. */
+static char **dcc_remote_argv(char **argv)
+{
+    int argc = dcc_argv_len(argv);
+    int clang = strstr(dcc_find_basename(argv[0]), "clang") != NULL;
+    char *resolved = clang && strchr(argv[0], '/') ? realpath(argv[0], NULL) : NULL;
+    const char *compiler = argv[0];
+    if (clang) {
+        /* Masquerade links resolve to distcc itself; retain their tool name. */
+        compiler = dcc_find_basename(resolved && strstr(dcc_find_basename(resolved), "clang") ? resolved : argv[0]);
+    }
+    char **view = malloc((argc + 2) * sizeof(*view) + strlen(compiler) + 1);
+    if (view) {
+        memcpy(view, argv, argc * sizeof(*view));
+        view[0] = strcpy((char *)(view + argc + 2), compiler);
+        if (clang && strstr(dcc_find_basename(argv[0]), "++")) view[argc++] = (char *)"--driver-mode=g++";
+        view[argc] = NULL;
+    }
+    free(resolved);
+    return view;
+}
+
 static int dcc_gcc_rewrite_fqn(char **argv)
 {
         /* defined by autoheader */
@@ -980,7 +1004,9 @@ dcc_build_somewhere(char *argv[],
         }
         server_side_argv = remotecpp_server_argv;
     }
-    if ((ret = dcc_compile_remote(server_side_argv,
+    char **wire_argv = dcc_remote_argv(server_side_argv);
+    if (!wire_argv) { ret = EXIT_OUT_OF_MEMORY; goto unlock_and_clean_up; }
+    ret = dcc_compile_remote(wire_argv,
                                   input_fname,
                                   cpp_fname,
                                   cpp_fd,
@@ -992,7 +1018,9 @@ dcc_build_somewhere(char *argv[],
                                   &server_stderr,
                                   &server_stdout,
                                   cpp_pid, local_cpu_lock_fd,
-                  host, status, &remote_unsupported)) != 0) {
+                  host, status, &remote_unsupported);
+    free(wire_argv);
+    if (ret != 0) {
         /* Returns zero if we successfully ran the compiler, even if
          * the compiler itself bombed out. */
 

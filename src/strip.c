@@ -59,8 +59,7 @@
  *
  * The value stored in '*out_argv' is malloc'd, but the arguments that
  * are pointed to by that array are aliased with the values pointed
- * to by 'from'.  The caller is responsible for calling free() on
- * '*out_argv'.
+ * to by 'from'. The caller frees '*out_argv'.
  **/
 int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname)
 {
@@ -81,7 +80,7 @@ int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname)
     /* skip through argv, copying all arguments but skipping ones that
      * ought to be omitted */
     to_i = 0;
-    to[to_i++] = offload ? (char *)dcc_find_basename(from[0]) : from[0];
+    to[to_i++] = from[0];
     if (rewrite_language || offload) {
         to[to_i++] = (char *)"-x";
         to[to_i++] = (char *)(offload ? offload : rewrite_language);
