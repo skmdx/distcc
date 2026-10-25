@@ -971,6 +971,15 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
 {
     time_t now = time(NULL);
     if (s->failed || now - s->active >= (s->job || s->phase == RETURNING ? dcc_get_io_timeout() : 30)) return -1;
+    /* Once inputs are owned, silence is compiler/queue time, not a stalled
+     * upload. Keep both transport deadlines alive without relaxing them for
+     * unresponsive peers. No heartbeat is queued behind pending output. */
+    if (s->job && (s->phase == RUNNING || s->enqueued) && !s->head &&
+        now - s->active >= (dcc_get_io_timeout() > 1 ? dcc_get_io_timeout() / 2 : 1)) {
+        unsigned char id[8];
+        dcc_tcp_put64(id, s->run.id);
+        if (queue(s, DCC_TCP_PROGRESS, id, sizeof(id))) return -1;
+    }
     if (s->work.run == decode_input) {
         if (events & (POLLHUP | POLLERR | POLLRDHUP)) return -1;
         if (events & POLLIN) {

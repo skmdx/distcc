@@ -23,6 +23,8 @@ bitcode is transferred through the shared input cache. Workers need Clang and
 its offload tools, but do not need the client's HIP headers or ROCm libraries.
 The selected Clang executable is preserved for LLVM bitcode/LTO compatibility;
 host `native` CPU options and `--offload-arch=native` are resolved on the client.
+TCP workers send progress frames while jobs run or await execution, so long
+GPU compilations do not expire solely because no result is ready yet.
 The Portage jobs hook sets the CMake C, C++ and HIP compiler launchers to `distcc`
 when distribution is enabled, unless the user or package supplies a launcher.
 This also covers projects compiling HIP through the C++ language with `-x hip`.

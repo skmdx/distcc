@@ -24,6 +24,25 @@ from test_adaptive import free_port
 
 
 class TcpJobsTest(BrokerTestCase):
+    def test_compiler_execution_outlives_transport_idle_timeout(self):
+        wrapper = self.work / 'slow-compiler'
+        wrapper.mkdir()
+        compiler = wrapper / 'gcc'
+        compiler.write_text('#!/bin/sh\nsleep 7\nexec ' + self.cc + ' "$@"\n')
+        compiler.chmod(0o755)
+        target = subprocess.check_output([self.cc, '-dumpmachine'], text=True).strip()
+        (wrapper / (target + '-gcc')).symlink_to('gcc')
+        self.restart_server(self.build / 'distccd', DISTCC_IO_TIMEOUT='3',
+                            DISTCCD_PATH=str(wrapper) + os.pathsep + os.defpath)
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.start_tcp()
+        self.env['DISTCC_IO_TIMEOUT'] = '3'
+        self.env['DISTCC_VERBOSE'] = '1'
+        self.job('long-running')
+        subprocess.run(['gcc', str(self.work / 'job-long-running.o'),
+                        '-o', str(self.work / 'long-running')], check=True)
+        subprocess.run([str(self.work / 'long-running')], check=True)
+
     def test_memory_refusal_is_a_reusable_unstarted_boundary(self):
         self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='1048576')
         self.addCleanup(self.restart_server, self.build / 'distccd')
