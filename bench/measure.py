@@ -319,6 +319,11 @@ def measure(config, out, buildroot):
             raise RuntimeError('perf could not start; see perf-record.log')
         sampler.start()
         build_started = time.monotonic()
+        if config.get('build_root'):
+            # emerge refreshes the saved environment during pre-clean, while
+            # keepwork preserves phase markers. Re-run package setup so eclass
+            # selections (for example EPYTHON) belong to this invocation.
+            (buildtree / config['package'] / '.setuped').unlink(missing_ok=True)
         with (out / 'emerge.log').open('w') as log:
             build = subprocess.Popen(['emerge', '--oneshot', '--nodeps', '--usepkg=n',
                                       '=' + config['package']], env=env, stdout=log, stderr=subprocess.STDOUT)
