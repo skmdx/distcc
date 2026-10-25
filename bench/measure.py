@@ -271,6 +271,7 @@ def measure(config, out, buildroot):
     samples: list[dict] = []
     done = threading.Event()
     broker = perf = build = None
+    verification = None
     perf_fd = os.memfd_create('distcc-bench-perf')
     perf_interrupted = False
     elapsed = None
@@ -331,6 +332,12 @@ def measure(config, out, buildroot):
         elapsed = time.monotonic() - build_started
         if rc:
             raise RuntimeError(f'build exited {rc}; see emerge.log')
+        if config.get('verify'):
+            with (out / 'verify.log').open('w') as log:
+                verification = subprocess.run(config['verify'], env=env, stdout=log,
+                                              stderr=subprocess.STDOUT).returncode
+            if verification:
+                raise RuntimeError(f'runtime verification exited {verification}; see verify.log')
     except Exception as failure:
         error = str(failure)
     finally:
@@ -389,7 +396,8 @@ def measure(config, out, buildroot):
     # settings are already covered by the Portage configuration fingerprint.
     result = dict(success=error is None, error=error, elapsed=elapsed, compiled_objects=len(objects),
                   conditions=conditions, hosts=hosts, logs=summary, cgroup=measured,
-                  perf_returncode=perf_status, returncode=None if build is None else build.returncode)
+                  perf_returncode=perf_status, verification_returncode=verification,
+                  returncode=None if build is None else build.returncode)
     (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
     # Keep evidence; build trees and private Portage state are not results.
     cleanup = (configroot, runtime / '.distcc')

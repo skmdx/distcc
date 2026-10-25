@@ -426,6 +426,8 @@ recovery is labeled separately and is never used to claim a full-build speedup.
 Remove `build_root` to return to clean measurements.
 Set `keep_build` to true when a successful build tree is needed for controlled
 compiler/linker comparisons. Its client-side run directory then requires cleanup.
+An optional `verify` argument array runs an installed-product check after the
+build; failure retains the inputs and prevents the run from becoming a baseline.
 
 Each run saves `result.json`, `summary.txt` and its raw evidence under the
 configured results directory. A successful clean run updates `latest.json`; matching
