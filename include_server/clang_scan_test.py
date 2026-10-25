@@ -1,5 +1,6 @@
 """Exercise the actual libclang-cpp extension and its filesystem contract."""
 import os
+import gc
 import json
 import mmap
 from pathlib import Path
@@ -704,6 +705,39 @@ with tempfile.TemporaryDirectory() as directory:
     assert stamp is not None and len(stamp) == 6
     self.assertNotEqual(stamp[4], os.stat(header).st_mtime_ns)
     self.assertFalse((self.root / 'never.o').exists())
+
+  def test_snapshot_views_outlive_cache_replacement(self):
+    header = self.root / 'header.h'
+    header.write_bytes(b'original contents\n')
+    self.source.write_text('#include "header.h"\n')
+    view = self.scan()['files'][str(header)]
+    assert isinstance(view, memoryview)
+    self.assertTrue(view.readonly)
+    with self.assertRaises(TypeError):
+      view[0] = 0
+    # Neither replacing nor dropping the native cache may invalidate a view
+    # already returned to the compression/transfer layer.
+    header.write_bytes(b'new contents\n')
+    self.assertEqual(self.scan()['files'][str(header)], b'new contents\n')
+    self.source.write_text('int other;\n')
+    self.scan()
+    header.unlink()
+    gc.collect()
+    self.assertEqual(view, b'original contents\n')
+    self.assertEqual(xxhash.xxh3_64(view).digest(),
+                     xxhash.xxh3_64(b'original contents\n').digest())
+
+  def test_ordinary_macro_expansion_affects_include_conditions(self):
+    (self.root / 'chosen.h').write_text('int chosen;\n')
+    (self.root / 'wrong.h').write_text('int wrong;\n')
+    self.source.write_text(
+        '#define FLAG 1\n#pragma push_macro("FLAG")\n#undef FLAG\n'
+        '#define RESTORE _Pragma("pop_macro(\\\"FLAG\\\")")\nRESTORE\n'
+        'int before = __COUNTER__;\n#if __COUNTER__ == 1 && FLAG == 1\n'
+        '#include "chosen.h"\n#else\n#include "wrong.h"\n#endif\n')
+    result = self.scan()
+    self.assertIn(str(self.root / 'chosen.h'), result['dependencies'])
+    self.assertNotIn(str(self.root / 'wrong.h'), result['dependencies'])
 
   def test_directory_stamps_survive_unrelated_outputs(self):
     self.source.write_text('#if __has_include("generated.h")\nint yes;\n#endif\n')

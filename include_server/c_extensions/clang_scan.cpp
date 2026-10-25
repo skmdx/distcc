@@ -1,5 +1,6 @@
 /* Compiler-backed include discovery. SPDX-License-Identifier: GPL-2.0-or-later */
 #include <Python.h>
+#include <cerrno>
 #include <optional>
 #include <clang/Basic/Version.h>
 #include <clang/Basic/DiagnosticLex.h>
@@ -24,7 +25,9 @@ using namespace clang;
 struct Stamp {
     struct stat value{};
     bool exists;
-    explicit Stamp(const std::string &path) : exists(::stat(path.c_str(), &value) == 0) {}
+    int error;
+    explicit Stamp(const std::string &path) : exists(::stat(path.c_str(), &value) == 0),
+                                            error(exists ? 0 : errno) {}
     bool operator==(const Stamp &other) const {
         return exists == other.exists && (!exists ||
             (value.st_dev == other.value.st_dev && value.st_ino == other.value.st_ino &&
@@ -56,6 +59,32 @@ using Images = std::map<std::string, std::shared_ptr<const Image>>;
 // rechecks identities and negative lookups; threads do not share mutable state.
 thread_local Images previous_inputs;
 
+// Python views retain their immutable image independently of the next scan's
+// cache. The native cache owns no Python objects and can die without the GIL.
+struct Snapshot {
+    PyObject_HEAD
+    std::shared_ptr<const Image> image;
+};
+PyTypeObject *snapshot_type;
+int snapshot_buffer(PyObject *object, Py_buffer *view, int flags) {
+    const auto &bytes = reinterpret_cast<Snapshot *>(object)->image->bytes;
+    return PyBuffer_FillInfo(view, object, const_cast<char *>(bytes.data()), bytes.size(), 1, flags);
+}
+void snapshot_free(PyObject *object) {
+    auto *type = Py_TYPE(object);
+    reinterpret_cast<Snapshot *>(object)->image.~shared_ptr();
+    type->tp_free(object);
+    Py_DECREF(type);
+}
+PyObject *snapshot_view(const std::shared_ptr<const Image> &image) {
+    auto *snapshot = reinterpret_cast<Snapshot *>(snapshot_type->tp_alloc(snapshot_type, 0));
+    if (!snapshot) return nullptr;
+    new (&snapshot->image) std::shared_ptr<const Image>(image);
+    PyObject *view = PyMemoryView_FromObject(reinterpret_cast<PyObject *>(snapshot));
+    Py_DECREF(snapshot);
+    return view;
+}
+
 class SnapshotFile : public llvm::vfs::File {
     llvm::vfs::Status info;
     const std::string &bytes;
@@ -86,15 +115,20 @@ public:
         auto result = name.str();
         return !result.empty() && result[0] == '/' ? result : cwd + '/' + result;
     }
-    void observe(const std::string &name) {
-        auto it = stamps.find(name);
-        if (it == stamps.end()) stamps.emplace(name, Stamp(name));
-        else if (!(it->second == Stamp(name))) changed = true;
+    const Stamp &observe(const std::string &name) {
+        // One observation per spelling and one validation at publication.
+        // Rechecking at every FileManager status/open adds syscalls without
+        // strengthening the final snapshot consistency check.
+        return stamps.try_emplace(name, name).first->second;
     }
     llvm::ErrorOr<llvm::vfs::Status> status(const llvm::Twine &name) override {
-        observe(path(name));
-        auto result = getUnderlyingFS().status(name);
-        return result;
+        auto key = path(name);
+        const auto &stamp = observe(key);
+        if (!stamp.exists) return std::error_code(stamp.error, std::generic_category());
+        auto previous = previous_inputs.find(key);
+        if (previous != previous_inputs.end() && stamp == previous->second->stamp)
+            return llvm::vfs::Status::copyWithNewName(previous->second->info, name);
+        return getUnderlyingFS().status(name);
     }
     llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(const llvm::Twine &name) override {
         auto key = path(name);
@@ -113,7 +147,6 @@ public:
                 auto buffer = (*file)->getBuffer(name);
                 if (!buffer) return buffer.getError();
                 image = std::make_shared<Image>(stamps.at(key), *info, (*buffer)->getBuffer().str());
-                observe(key);
             }
             it = contents.emplace(key, std::move(image)).first;
         }
@@ -254,7 +287,7 @@ PyObject *scan(PyObject *, PyObject *arguments) {
     for (const auto &path : result.dependencies) {
         const auto &entry = *inputs->contents.find(inputs->path(path));
         PyObject *key = PyUnicode_DecodeFSDefault(entry.first.c_str());
-        PyObject *data = PyBytes_FromStringAndSize(entry.second->bytes.data(), entry.second->bytes.size());
+        PyObject *data = snapshot_view(entry.second);
         if (!key || !data || PyDict_SetItem(files, key, data) < 0) success = false;
         Py_XDECREF(key); Py_XDECREF(data);
         if (!success) break;
@@ -301,6 +334,20 @@ PyMODINIT_FUNC PyInit_clang_scan() {
     llvm::InitializeAllTargets();
     PyObject *result = PyModule_Create(&module);
     if (result) {
+        PyType_Slot slots[] = {
+            {Py_bf_getbuffer, reinterpret_cast<void *>(snapshot_buffer)},
+            {Py_tp_dealloc, reinterpret_cast<void *>(snapshot_free)},
+            {0, nullptr}};
+        PyType_Spec spec = {"clang_scan._Snapshot", sizeof(Snapshot), 0,
+                           Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION, slots};
+        PyObject *type = PyType_FromSpec(&spec);
+        if (!type || PyModule_AddObjectRef(result, "_Snapshot", type) < 0) {
+            Py_XDECREF(type);
+            Py_DECREF(result);
+            return nullptr;
+        }
+        snapshot_type = reinterpret_cast<PyTypeObject *>(type);
+        Py_DECREF(type);
         PyModule_AddStringConstant(result, "version", CLANG_VERSION_STRING);
         PyModule_AddStringConstant(result, "gcc_scan_dir", DCC_GCC_SCAN_DIR);
     }

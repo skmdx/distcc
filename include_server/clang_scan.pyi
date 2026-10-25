@@ -4,7 +4,7 @@ version: str
 gcc_scan_dir: str
 
 class ScanResult(TypedDict):
-    files: dict[str, bytes]
+    files: dict[str, memoryview]
     lookups: dict[str, tuple[int, int, int] | tuple[int, int, int, int, int, int] | None]
     dependencies: list[str]
 
