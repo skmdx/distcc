@@ -9,6 +9,20 @@ import unittest
 
 
 class PortageJobsTest(unittest.TestCase):
+    def test_hip_launcher_respects_package_policy_and_user_override(self):
+        self.assertEqual(self.run_hook('''
+echo "$CMAKE_HIP_COMPILER_LAUNCHER"
+RESTRICT=distcc
+source "$JOBS_HOOK"
+echo "${CMAKE_HIP_COMPILER_LAUNCHER-unset}"
+RESTRICT= CMAKE_HIP_COMPILER_LAUNCHER=custom-wrapper
+source "$JOBS_HOOK"
+echo "$CMAKE_HIP_COMPILER_LAUNCHER"
+CMAKE_HIP_COMPILER_LAUNCHER=
+source "$JOBS_HOOK"
+echo "value:${CMAKE_HIP_COMPILER_LAUNCHER}"
+'''), ['distcc', 'unset', 'custom-wrapper', 'value:'])
+
     def test_prepare_exports_jobs_before_ebuild_derives_cargo_parallelism(self):
         self.assertEqual(self.run_hook('''
 unset MAKEOPTS CARGO_BUILD_JOBS ${!distcc_auto_@}

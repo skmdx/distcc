@@ -23,6 +23,9 @@ bitcode is transferred through the shared input cache. Workers need Clang and
 its offload tools, but do not need the client's HIP headers or ROCm libraries.
 The selected Clang executable is preserved for LLVM bitcode/LTO compatibility;
 host `native` CPU options and `--offload-arch=native` are resolved on the client.
+The Portage jobs hook sets `CMAKE_HIP_COMPILER_LAUNCHER=distcc` when distribution
+is enabled, unless the user or package supplies a launcher. Other CMake builds
+can set the same variable before configuring their HIP targets.
 
 With DISTCC_BROKER set, clients request remote preprocessing through the existing
 broker. Adaptive scheduling and the TCP connection pool are reused. These jobs
