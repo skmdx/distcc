@@ -2,6 +2,7 @@
 """Distribute the independent images in Clang's HIP fat binary."""
 import asyncio
 import errno
+import fcntl
 import os
 from pathlib import Path
 import shlex
@@ -120,9 +121,26 @@ def compile_images(prepared, source, output, args):
             # The source and device images use the original driver's common
             # compilation-unit ID. Compile the host exactly once.
             result = work / 'host.o'
-            run([transport, *base, '--offload-host-only',
-                 '-Xclang', '-fcuda-include-gpubinary', '-Xclang', str(fatbinary),
-                 '-o', str(result)], env=env, pass_fds=(shared.fileno(),))
+            unbundle = next(cmd for cmd in commands if cmd and '-unbundle' in cmd)
+            host_target = next(target for target in values(unbundle, '-targets=')[0].split(',')
+                               if target.startswith('host-'))
+            # The legacy HIP driver ignores host-only mode for bundled .hipi
+            # input and replaces the supplied images with a default GPU image.
+            # Give the new host-only driver the extracted host translation unit.
+            with os.fdopen(os.memfd_create('distcc-hip-host', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING),
+                           'w+b') as host:
+                run([unbundle[0], '-unbundle', next(a for a in unbundle if a.startswith('-type=')),
+                     '-targets=' + host_target, '-input=' + str(preprocessed),
+                     '-output=/proc/self/fd/' + str(host.fileno())], env=env, pass_fds=(host.fileno(),))
+                fcntl.fcntl(host, fcntl.F_ADD_SEALS,
+                            fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+                host_source = work / (Path(source).name + '.host.hipi')
+                host_source.symlink_to(f'/proc/{os.getpid()}/fd/{host.fileno()}')
+                host_args = [str(host_source) if arg == str(preprocessed) else arg for arg in base]
+                run([transport, *host_args, '--offload-host-only', '--offload-new-driver',
+                     '-Xclang', '-fcuda-include-gpubinary', '-Xclang', str(fatbinary),
+                     '-o', str(result)], env=dict(env, _DISTCC_CPP_FD=str(host.fileno())),
+                    pass_fds=(host.fileno(),))
             publish(result, output)
     return 0
 

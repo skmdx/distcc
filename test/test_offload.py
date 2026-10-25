@@ -109,6 +109,15 @@ int main() { return 0; }
         subprocess.run([self.compiler, '-flto=thin', '--hip-link', str(obj),
                         '-lamdhip64', '-o', str(exe)], check=True, capture_output=True)
         subprocess.run([str(exe)], check=True, timeout=30)
+        self.assertEqual(obj.read_bytes()[:4], b'BC\xc0\xde')
+        fatbinary = self.work / 'embedded.hipfb'
+        subprocess.run(['llvm-objcopy', '--dump-section', '.hip_fatbin=' + str(fatbinary),
+                        str(exe), '-'], stdout=subprocess.DEVNULL, check=True)
+        bundler = str(Path(self.compiler).parent / 'clang-offload-bundler')
+        targets = subprocess.check_output([bundler, '-list', '-type=o',
+                                           '-input=' + str(fatbinary)], text=True)
+        self.assertEqual({t.rsplit('--', 1)[-1] for t in targets.splitlines()
+                          if not t.startswith('host-')}, {'gfx900', 'gfx1030'})
         after = completed_jobs()
         self.assertEqual(sum(a - b for a, b in zip(after, before)), 3)
         self.assertTrue(all(a > b for a, b in zip(after, before)), (before, after))
