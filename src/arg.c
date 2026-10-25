@@ -168,6 +168,13 @@ static void dcc_note_compiled(const char *input_file, const char *output_file)
            "compile from %s to %s", input_base, output_base);
 }
 
+/* These operands are passed to another compiler layer. They must not be
+ * interpreted or rewritten as driver input, output or action options. */
+int dcc_is_forward_option(const char *arg)
+{
+    return !strcmp(arg, "-Xclang") || !strcmp(arg, "-mllvm");
+}
+
 /**
  * Parse arguments, extract ones we care about, and also work out
  * whether it will be possible to distribute this invocation remotely.
@@ -250,7 +257,7 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
                     to distribute it even if we could. */
                 rs_trace("%s implies -E (maybe) and must be local", a);
                 return EXIT_DISTCC_FAILED;
-            } else if (!strcmp(a, "-Xclang")) {
+            } else if (dcc_is_forward_option(a)) {
                 /* A frontend argument is not a driver option (e.g. -xop
                  * is a target feature, not the driver's -x language). */
                 if (!argv[++i]) return EXIT_DISTCC_FAILED;
@@ -424,7 +431,9 @@ int dcc_set_action_opt(char **a, const char *new_c)
     int gotone = 0;
 
     for (; *a; a++)
-        if (!strcmp(*a, "-c") || !strcmp(*a, "-S")) {
+        if (dcc_is_forward_option(*a) && a[1]) {
+            a++;
+        } else if (!strcmp(*a, "-c") || !strcmp(*a, "-S")) {
             *a = strdup(new_c);
             if (*a == NULL) {
                 rs_log_error("strdup failed");
@@ -458,7 +467,9 @@ int dcc_set_output(char **a, char *ofname)
     int i;
 
     for (i = 0; a[i]; i++)
-        if (0 == strcmp(a[i], "-o") && a[i+1] != NULL) {
+        if (dcc_is_forward_option(a[i]) && a[i+1]) {
+            i++;
+        } else if (0 == strcmp(a[i], "-o") && a[i+1] != NULL) {
             rs_trace("changed output from \"%s\" to \"%s\"", a[i+1], ofname);
             free(a[i+1]);
             a[i+1] = strdup(ofname);
@@ -499,7 +510,9 @@ int dcc_set_input(char **a, char *ifname)
     int i;
 
     for (i =0; a[i]; i++)
-        if (dcc_is_source(a[i])) {
+        if (dcc_is_forward_option(a[i]) && a[i+1]) {
+            i++;
+        } else if (dcc_is_source(a[i])) {
             rs_trace("changed input from \"%s\" to \"%s\"", a[i], ifname);
             free(a[i]);
             a[i] = strdup(ifname);

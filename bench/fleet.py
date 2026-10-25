@@ -201,7 +201,8 @@ def main():
                 (out / f'run-{index}-workers-after.json').write_text(json.dumps(after, indent=2) + '\n')
                 # Copy evidence even for failed/OOM builds; never retry with looser limits.
                 source = f'{client["ssh"]}:{dest}/' if client.get('ssh') else dest + '/'
-                rsync = ['rsync', '-rt', '--rsync-path=sudo -n rsync'] if client.get('ssh') else ['sudo', '-n', 'rsync', '-rt']
+                rsync = ['rsync', '-rt', '--rsync-path=sudo -n rsync'] if client.get('ssh') else [
+                    'sudo', '-n', 'rsync', '-rt', f'--chown={os.getuid()}:{os.getgid()}']
                 deploy.run([*rsync, '--exclude=/build/', '--exclude=/config/',
                             '--exclude=/runtime/.distcc/', source, str(out / f'run-{index}') + '/'])
                 release_artifacts(out / f'run-{index}')

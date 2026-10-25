@@ -152,6 +152,7 @@ CPP_OPTIONS_ALWAYS_TWO_WORDS = {
   '-Xassembler':    lambda ps, arg: None,
   '-Xlinker':       lambda ps, arg: None,
   '-Xclang':        lambda ps, arg: None,
+  '-mllvm':         lambda ps, arg: None,
   '-framework':     lambda ps, arg: None,
 }
 

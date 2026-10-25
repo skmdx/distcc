@@ -284,6 +284,7 @@ void dcc_calc_rate(off_t size_out,
                    double *rate);
 
 /* arg.c */
+int dcc_is_forward_option(const char *);
 int dcc_set_action_opt(char **, const char *);
 int dcc_set_output(char **, char *);
 int dcc_set_input(char **, char *);

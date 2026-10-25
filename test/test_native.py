@@ -90,6 +90,24 @@ int main(void) { float a[128] = {0}, b[128] = {3};
     def test_gcc(self):
         self.cases('gcc')
 
+    def test_llvm_option_is_not_a_driver_output(self):
+        compiler = shutil.which('clang')
+        if not compiler:
+            self.skipTest('Clang is not installed')
+        for mode in ('', ',tcp'):
+            with self.subTest(mode=mode):
+                self.start_broker(self.host(0, mode), name='llvm-option' + mode.replace(',', '-'))
+                env = dict(self.env, DISTCC_VERBOSE='1', DISTCC_SKIP_LOCAL_RETRY='1')
+                obj = self.work / 'llvm-option.o'
+                result = subprocess.run([str(self.build / 'distcc'), compiler,
+                    '-mllvm', '-openmp-opt-disable', '-O2', '-c', str(self.source), '-o', str(obj)],
+                    env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr + Path(self.logs[0].name).read_text())
+                self.assertIn(' on 127.0.0.1', result.stderr)
+                exe = self.work / 'llvm-option'
+                subprocess.run([compiler, str(obj), '-o', str(exe)], check=True)
+                subprocess.run([str(exe)], check=True)
+
     def test_clang(self):
         compiler = shutil.which('clang')
         if not compiler:

@@ -523,6 +523,7 @@ class ScanArgs_Case(SimpleDistCC_Case):
     '''Test understanding of gcc command lines.'''
     def runtest(self):
         cases = [("gcc -c hello.c", "distribute", "hello.c", "hello.o"),
+                 ("clang -mllvm -openmp-opt-disable -c hello.c -o hello.o", "distribute", "hello.c", "hello.o"),
                  ("gcc hello.c", "local"),
                  ("gcc -o /tmp/hello.o -c ../src/hello.c", "distribute", "../src/hello.c", "/tmp/hello.o"),
                  ("gcc -DMYNAME=quasibar.c bar.c -c -o bar.o", "distribute", "bar.c", "bar.o"),

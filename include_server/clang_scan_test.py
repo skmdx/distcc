@@ -617,7 +617,8 @@ with tempfile.TemporaryDirectory() as directory:
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
     files = analyzer.DoCompilationCommand(
-        [self.compiler, '-Xclang', '-target-cpu', '-Xclang', 'haswell',
+        [self.compiler, '-mllvm', '-openmp-opt-disable',
+         '-Xclang', '-target-cpu', '-Xclang', 'haswell',
          '-Xclang', '-tune-cpu', '-Xclang', 'haswell',
          '-Xclang', '-target-feature', '-Xclang', '+avx2',
          '-Xclang', '-target-feature', '-Xclang', '-xop',
