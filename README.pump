@@ -16,11 +16,12 @@ requested target, options and source language. Dependency files are
 produced on the client.
 
 Clang HIP and direct AMDGPU C/C++/OpenCL jobs use full client preprocessing,
-even under pump. HIP's native preprocessed bundle retains the separate host
-and GPU translation units. TCP workers perform code generation, device linking
-and bundling, returning objects for application linking. ROCm device
-bitcode is transferred through the shared input cache. Workers need Clang and
-its offload tools, but do not need the client's HIP headers or ROCm libraries.
+even under pump. HIP compilation follows the selected driver's action graph,
+preprocessing each host and GPU translation unit with its own frontend options.
+TCP workers perform code generation and device linking; LLVM assembles the
+images on the client. ROCm device bitcode and intermediate objects are shared
+through the input cache. Workers need Clang and its offload tools, but do not
+need the client's HIP headers or ROCm libraries.
 The selected Clang executable is preserved for LLVM bitcode/LTO compatibility;
 host `native` CPU options and `--offload-arch=native` are resolved on the client.
 TCP workers send progress frames while jobs run or await execution, so long
