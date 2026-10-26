@@ -813,7 +813,7 @@ static unsigned long long memory_estimate(const struct dcc_capacity *cap,
                                          const struct dcc_work_hint *hint)
 {
     if (hint->kind < 1 || hint->kind > DCC_WORK_CLASSES) return cap->job_memory;
-    unsigned kind = hint->kind == DCC_WORK_THINLTO ? 3 : hint->kind == DCC_WORK_RUST ? 2 :
+    unsigned kind = hint->kind == DCC_WORK_OFFLOAD_LINK ? 4 : hint->kind == DCC_WORK_THINLTO ? 3 : hint->kind == DCC_WORK_RUST ? 2 :
                     hint->kind >= 4 && hint->kind <= 6 ? 1 : 0;
     return cap->memory_estimates[kind][dcc_resource_bucket(hint->bytes)];
 }
@@ -877,7 +877,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         struct dcc_capacity projected;
         if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= DCC_WORK_CLASSES) {
             projected = *cap;
-            const int *capacities = client->hint.kind == DCC_WORK_THINLTO ? cap->thinlto_capacity :
+            const int *capacities = client->hint.kind == DCC_WORK_OFFLOAD_LINK ? cap->offload_capacity :
+                                    client->hint.kind == DCC_WORK_THINLTO ? cap->thinlto_capacity :
                                     client->hint.kind == DCC_WORK_RUST ? cap->rust_capacity :
                                     client->hint.kind >= 4 && client->hint.kind <= 6 ?
                                     cap->pump_capacity : cap->compile_capacity;

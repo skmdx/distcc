@@ -756,12 +756,15 @@ class BrokerTest(BrokerTestCase):
     def test_gpu_uses_compile_memory_capacity(self):
         self.check_prepared_class_capacity(9)
 
-    def check_prepared_class_capacity(self, kind):
+    def test_device_link_uses_its_own_memory_capacity(self):
+        self.check_prepared_class_capacity(10, 'offload_capacity')
+
+    def check_prepared_class_capacity(self, kind, capacity_name='compile_capacity'):
         capacities = [4] * 64
         capacities[22] = 1
         first = self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
                          queued=0, preparing=0, returning=0, running=0,
-                         compile_capacity=capacities))
+                         **{capacity_name: capacities}))
         second = self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
                           queued=0, preparing=0, returning=0, running=0))
         hosts = self.host(0, f',tcp,stats={first.port},speed=1.5') + ' ' + self.host(1, f',tcp,stats={second.port}')

@@ -31,6 +31,8 @@ __pycache__/
 /cpp_lookup.so
 /distcc-rust-native.so
 /clang_driver.so
+/distcc-linker-wrapper
+/llvm-linker-wrapper/
 
 # `make dist` products
 distcc-*.tar.*

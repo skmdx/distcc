@@ -63,6 +63,20 @@ the final link determine compatibility; version metadata is not a rejection gate
 Existing whole-link offload remains available for other links with
 `DISTCC_LINK_SYSROOT`. `DISTCC_VERBOSE=1` reports the worker for every completed
 backend; `DISTCC_FALLBACK=0` makes distribution failures fail the link.
+
+HIP links use `distcc-linker-wrapper`, built from upstream Clang's linker wrapper
+with a device-job distributor hook. LLVM extracts and groups offload inputs,
+then each AMDGPU target link runs as a separate cached TCP job. Device links
+learn their own execution and memory costs. LLVM bundles the resulting images
+and generates registration objects before the host ThinLTO backends run.
+Existing optimization options, device ABI, target features and library ordering
+are preserved. Saved-temporary-file device links remain local to keep those
+artifacts available. Native host layout and writing the final executable remain
+on the client; these dependency stages cannot run before their inputs exist.
+Build the wrapper by setting `LLVM_WRAPPER_SOURCE` to the matching upstream
+`clang/tools/clang-linker-wrapper` source directory, with `LLVM_CONFIG` selecting
+the installed LLVM headers and libraries. The Gentoo package provides both.
+
 The Portage hook exports CMake's C/C++ linker launchers as well as compiler
 launchers, respecting `RESTRICT=distcc` and explicit user overrides. Existing
 CMake build directories must be reconfigured to populate these launcher values;

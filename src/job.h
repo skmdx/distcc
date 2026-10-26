@@ -9,7 +9,7 @@
 #define DCC_JOB_RESULT_COUNT 4
 #define DCC_SYSTEM_HEADERS ".distcc-system"
 enum dcc_job_kind { DCC_JOB_COMPILE, DCC_JOB_PUMP, DCC_JOB_LINK, DCC_JOB_RUST, DCC_JOB_THINLTO,
-                    DCC_JOB_KIND_COUNT };
+                    DCC_JOB_OFFLOAD_LINK, DCC_JOB_KIND_COUNT };
 enum dcc_job_input_kind { DCC_JOB_FILE, DCC_JOB_SYMLINK, DCC_JOB_EMPTY,
                          DCC_JOB_READONLY };
 enum dcc_job_encoding { DCC_JOB_RAW, DCC_JOB_LZ4 };
@@ -37,7 +37,17 @@ static inline int dcc_job_file(const struct dcc_job_input *in)
 }
 static inline int dcc_job_tree(const struct dcc_job *job)
 {
-    return job->kind == DCC_JOB_RUST || job->kind == DCC_JOB_THINLTO;
+    return job->kind == DCC_JOB_RUST || job->kind == DCC_JOB_THINLTO ||
+           job->kind == DCC_JOB_OFFLOAD_LINK;
+}
+static inline const char *dcc_job_helper(const struct dcc_job *job)
+{
+    switch (job->kind) {
+    case DCC_JOB_RUST: return "distcc-rust";
+    case DCC_JOB_THINLTO: return "distcc-thinlto";
+    case DCC_JOB_OFFLOAD_LINK: return "distcc-offload-link";
+    default: return "distcc-link";
+    }
 }
 static inline int dcc_job_shared(const struct dcc_job *job, unsigned index)
 {

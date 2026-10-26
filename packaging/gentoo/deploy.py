@@ -50,7 +50,7 @@ def release(overlay):
             raise RuntimeError(f'uncommitted deployment inputs: {tree}')
     run(['git', '-C', ROOT, 'diff', '--exit-code', match[1], '--', 'src', 'include_server',
          'configure.ac', 'Makefile.in', 'pump.in', 'distcc-link', 'distcc-clang', 'distcc-rust',
-         'distcc-thinlto', 'distcc_job.py',
+         'distcc-thinlto', 'distcc-offload-link', 'distcc_lto.py', 'distcc_job.py',
          'packaging/systemd', 'packaging/gentoo/*.bashrc'])
     return version, ebuild
 
@@ -151,8 +151,7 @@ def install(target, version, ebuild, work, cross):
             packages.mkdir()
             env = ['ROOT=' + cross['root'], 'SYSROOT=' + cross['root'],
                    'PORTAGE_CONFIGROOT=' + cross['root'], 'PKGDIR=' + str(packages)]
-            args = ['env', *env, 'DISTCC_PUMP=0',
-                    'MAKEOPTS=-j' + str(cross['jobs']), *emerge_command('distcc buildpkg -ccache'), '--buildpkgonly',
+            args = ['env', *env, 'emerge', '--buildpkgonly',
                     '--oneshot', '--nodeps', '--usepkg=n', '--quiet-build=y', '=sys-devel/' + version]
             builder = dict(target, build_limits=cross.get('limits', []))
             bounded(args, builder, 'build', log, cross=True)
@@ -162,8 +161,7 @@ def install(target, version, ebuild, work, cross):
                     '--usepkgonly', '--quiet-build=y', '=sys-devel/' + version]
             bounded(args, target, 'install', log)
         else:
-            args = ['env', 'DISTCC_PUMP=0',
-                    'MAKEOPTS=-j' + str(target['jobs']), *emerge_command('distcc'), '--oneshot', '--nodeps',
+            args = ['emerge', '--oneshot', '--nodeps',
                     '--usepkg=n', '--quiet-build=y', '=sys-devel/' + version]
             bounded(args, target, 'build', log)
     installed = run(['portageq', 'best_version', '/', 'sys-devel/distcc'], target)
@@ -171,15 +169,6 @@ def install(target, version, ebuild, work, cross):
         raise RuntimeError(f'{name}: installed version differs: {installed}')
     print(f'{name}: installed', flush=True)
 
-
-def emerge_command(features):
-    # Query inside the build's namespace and cross-root environment. Preserve
-    # the target's FEATURES instead of replacing sandbox and packaging policy.
-    return ['python3', '-c',
-            'import os,subprocess,sys; '
-            'env=dict(os.environ); '
-            'env["FEATURES"]=subprocess.check_output(["portageq","envvar","FEATURES"],text=True).strip()+" "+sys.argv[1]; '
-            'os.execvpe("emerge",["emerge",*sys.argv[2:]],env)', features]
 
 
 def resolve_compilers(target):

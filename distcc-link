@@ -206,19 +206,30 @@ def compiler_identity(compiler, target=None):
     }
 
 
-def clang_link_args(command):
+def clang_link_command(command, *, offload=False):
     """Let the client's driver resolve configuration, runtimes and LTO flags.
 
-    Only a single LLD invocation is distributable. Source compilation and
-    offload pipelines still run locally with the original command.
+    HIP's linker wrapper owns device extraction and registration. Its host
+    linker arguments can use DTLTO without bypassing those device stages.
     """
     result = subprocess.run([command[0], '-###', *command[1:]], capture_output=True, text=True)
     commands = [shlex.split(line) for line in result.stderr.splitlines()
                 if line.lstrip().startswith('"')]
-    if (result.returncode or len(commands) != 1 or not commands[0] or
-            not re.fullmatch(r'ld\.lld(?:-\d+)?', Path(commands[0][0]).name)):
+    if result.returncode or len(commands) != 1 or not commands[0]:
         raise LocalOnly('Clang remote links require a single LLD invocation')
-    return commands[0][1:]
+    invocation = commands[0]
+    if offload and Path(invocation[0]).name == 'clang-linker-wrapper':
+        linker = next((arg.partition('=')[2] for arg in invocation[1:]
+                       if arg.startswith('--linker-path=')), '')
+    else:
+        linker = invocation[0]
+    if not re.fullmatch(r'ld\.lld(?:-\d+)?', Path(linker).name):
+        raise LocalOnly('Clang remote links require LLD')
+    return invocation
+
+
+def clang_link_args(command):
+    return clang_link_command(command)[1:]
 
 
 def lld_for(compiler):
@@ -1165,21 +1176,30 @@ def main():
         return 1
     try:
         if os.environ.get('DISTCC_BROKER') and compiler_family(command[0]) == 'clang':
-            args = clang_link_args(command)
+            invocation = clang_link_command(command, offload=True)
+            args = invocation[1:]
+            offload = Path(invocation[0]).name == 'clang-linker-wrapper'
             distributed = any(arg.startswith('--thinlto-distributor=') for arg in args)
-            if distributed:
+            if distributed and not offload:
                 os.execvp(command[0], command)
-            if (('-plugin-opt=thinlto' in args or not os.environ.get('DISTCC_LINK_SYSROOT'))
+            if ((offload or '-plugin-opt=thinlto' in args or not os.environ.get('DISTCC_LINK_SYSROOT'))
                     and thinlto_pool()):
                 helper = str(Path(__file__).resolve().with_name('distcc-thinlto'))
                 compiler = shutil.which(command[0]) or command[0]
-                result = subprocess.call([command[0],
-                    '-Wl,--thinlto-distributor=' + helper,
-                    '-Wl,--thinlto-remote-compiler=' + str(Path(compiler).absolute()),
-                    *command[1:]])
+                compiler = str(Path(compiler).absolute())
+                options = [] if distributed else ['--thinlto-distributor=' + helper,
+                                                  '--thinlto-remote-compiler=' + compiler]
+                if offload:
+                    wrapper = Path(__file__).resolve().with_name('distcc-linker-wrapper')
+                    invocation = [str(wrapper),
+                        '--device-distributor=' + str(wrapper.with_name('distcc-offload-link')),
+                        '--device-compiler-path=' + compiler, *args, *options]
+                else:
+                    invocation.extend(options)
+                result = subprocess.call(invocation)
                 if not result or os.environ.get('DISTCC_FALLBACK') == '0':
                     return result
-                print('distcc-link: distributed ThinLTO failed; retrying locally', file=sys.stderr)
+                print('distcc-link: distributed link failed; retrying locally', file=sys.stderr)
                 os.execvp(command[0], command)
         path = Path(os.environ['DISTCC_LINK_SYSROOT'])
         if path.is_dir():

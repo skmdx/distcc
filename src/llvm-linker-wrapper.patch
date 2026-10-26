@@ -1,0 +1,95 @@
+--- a/LinkerWrapperOpts.td
++++ b/LinkerWrapperOpts.td
+@@ -3,6 +3,13 @@
+ def WrapperOnlyOption : OptionFlag;
+ def DeviceOnlyOption : OptionFlag;
+ 
++def distcc_device_distributor : Joined<["--"], "device-distributor=">,
++  Flags<[WrapperOnlyOption]>,
++  HelpText<"Execute device link jobs through a JSON distributor">;
++def distcc_device_compiler : Joined<["--"], "device-compiler-path=">,
++  Flags<[WrapperOnlyOption]>,
++  HelpText<"Use the driver's selected device compiler">;
++
+ def help : Flag<["--"], "help">,
+   HelpText<"Display available options (--help-hidden for more)">;
+ 
+--- a/ClangLinkerWrapper.cpp
++++ b/ClangLinkerWrapper.cpp
+@@ -40,6 +40,7 @@
+ #include "llvm/Support/FileOutputBuffer.h"
+ #include "llvm/Support/FileSystem.h"
+ #include "llvm/Support/InitLLVM.h"
++#include "llvm/Support/JSON.h"
+ #include "llvm/Support/MemoryBuffer.h"
+ #include "llvm/Support/Parallel.h"
+ #include "llvm/Support/Path.h"
+@@ -208,7 +209,11 @@
+   exit(EXIT_FAILURE);
+ }
+ 
++StringRef DeviceCompiler;
++
+ std::string getExecutableDir(const char *Name) {
++  if (!DeviceCompiler.empty())
++    return sys::path::parent_path(DeviceCompiler).str();
+   if (!CanonicalPrefixes)
+     return sys::path::parent_path(LinkerExecutable).str();
+   void *Ptr = reinterpret_cast<void *>(&getExecutableDir);
+@@ -502,7 +507,9 @@
+   llvm::TimeTraceScope TimeScope("Clang");
+   // Use `clang` to invoke the appropriate device tools.
+   Expected<std::string> ClangPath =
+-      findProgram("clang", {getExecutableDir("clang")});
++      Args.hasArg(OPT_distcc_device_compiler)
++          ? Expected<std::string>(Args.getLastArgValue(OPT_distcc_device_compiler).str())
++          : findProgram("clang", {getExecutableDir("clang")});
+   if (!ClangPath)
+     return ClangPath.takeError();
+ 
+@@ -605,6 +612,37 @@
+   for (StringRef Arg : Args.getAllArgValues(OPT_compiler_arg_EQ))
+     CmdArgs.push_back(Args.MakeArgString(Arg));
+ 
++  if (auto *Distributor = Args.getLastArg(OPT_distcc_device_distributor);
++      Distributor && Triple.isAMDGPU() &&
++      ActiveOffloadKindMask == OFK_HIP && !SaveTemps && !DryRun) {
++    auto JobFile = createOutputFile(ExecutableName + OutputFileBase, "json");
++    if (!JobFile)
++      return JobFile.takeError();
++    json::Array Command, Inputs;
++    for (StringRef Arg : CmdArgs)
++      Command.push_back(Arg.str());
++    for (StringRef Input : InputFiles)
++      Inputs.push_back(Input.str());
++    json::Object Request{
++        {"common", json::Object{{"args", std::move(Command)},
++                                {"inputs", std::move(Inputs)}}},
++        {"jobs", json::Array{json::Object{
++                     {"args", json::Array{}}, {"inputs", json::Array{}},
++                     {"outputs", json::Array{TempFileOrErr->str()}}}}}};
++    std::error_code EC;
++    raw_fd_ostream OS(*JobFile, EC);
++    if (EC)
++      return createFileError(*JobFile, EC);
++    OS << json::Value(std::move(Request));
++    OS.close();
++    if (OS.has_error())
++      return createStringError("could not write device link job");
++    StringRef Program = Distributor->getValue();
++    if (Error Err = executeCommands(Program, {Program, *JobFile}))
++      return std::move(Err);
++    return *TempFileOrErr;
++  }
++
+   if (Error Err = executeCommands(*ClangPath, CmdArgs))
+     return std::move(Err);
+ 
+@@ -1491,6 +1529,7 @@
+   auto Args = Tbl.parseArgs(Argc, Argv, OPT_INVALID, Saver, [&](StringRef Err) {
+     reportError(createStringError(Err));
+   });
++  DeviceCompiler = Args.getLastArgValue(OPT_distcc_device_compiler);
+ 
+   if (Args.hasArg(OPT_help) || Args.hasArg(OPT_help_hidden)) {
+     Tbl.printHelp(

@@ -173,6 +173,34 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             assert subprocess.check_output([executable, *args]) == subprocess.check_output([reference, *args])
         results['thinlto'] = {'backends': len(workers), 'workers': {p: workers.count(p) for p in set(workers)},
                               'seconds': time.monotonic() - started, 'executed': True}
+        # Device links need the compiler's AMDGPU backend, but no GPU or HIP
+        # runtime on the worker. Exercise the installed helper and wire kind.
+        jobs = []
+        source = root / 'device-link.cl'
+        source.write_text('__kernel void increment(__global int *p) { p[0] += 1; }\n')
+        for target in ('gfx900', 'gfx1030'):
+            obj, image = root / (target + '.bc'), root / (target + '.co')
+            subprocess.run([clang, '--target=amdgcn-amd-amdhsa', '-mcpu=' + target,
+                            '-nogpulib', '-O2', '-emit-llvm', '-c', source, '-o', obj],
+                           check=True, capture_output=True, timeout=30)
+            jobs.append({'args': ['-mcpu=' + target, str(obj), '-o', str(image)],
+                         'inputs': [str(obj)], 'outputs': [str(image)]})
+        description = root / 'device-links.json'
+        description.write_text(json.dumps({'common': {
+            'args': [clang, '--target=amdgcn-amd-amdhsa', '-nogpulib', '-Wl,--no-undefined'],
+            'inputs': []}, 'jobs': jobs}))
+        started = time.monotonic()
+        result = subprocess.run(['distcc-offload-link', description], env=env,
+                                text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+        assert result.returncode == 0, result.stderr
+        workers = re.findall(r'^distcc-offload-link: compiled on (.+)$', result.stderr, re.M)
+        assert len(workers) == len(jobs), result.stderr
+        for job in jobs:
+            header = subprocess.check_output(['readelf', '-h', job['outputs'][0]], text=True,
+                                             env=dict(env, LC_ALL='C'))
+            assert 'AMD GPU' in header, header
+        results['device_links'] = {'jobs': len(jobs), 'workers': {p: workers.count(p) for p in set(workers)},
+                                   'seconds': time.monotonic() - started}
     # The Rust wrapper shares this broker and must really reach the TCP worker.
     # Legacy C/C++ validation also runs; Rust is exercised on the TCP pass.
     if ',tcp' in env['DISTCC_HOSTS'] and '--thinlto-only' not in sys.argv:

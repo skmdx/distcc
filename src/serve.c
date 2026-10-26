@@ -1064,8 +1064,7 @@ static int dcc_run_job(int in_fd,
 
     if (protover == DCC_VER_LINK || protover == DCC_VER_STREAM_LINK) {
         int tree = job && dcc_job_tree(job);
-        const char *helper = !tree ? "distcc-link" :
-            job->kind == DCC_JOB_RUST ? "distcc-rust" : "distcc-thinlto";
+        const char *helper = tree ? dcc_job_helper(job) : "distcc-link";
         argv = calloc(2, sizeof(*argv));
         orig_input = strdup(helper);
         if (!argv || !(argv[0] = strdup(helper)) || !orig_input) {

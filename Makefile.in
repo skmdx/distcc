@@ -25,6 +25,10 @@ LLVM_CONFIG ?= llvm-config
 # Rust native CPU discovery uses LLVM's public headers, with no LLVM linkage.
 RUST_NATIVE_TARGET = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),distcc-rust-native.so)
 CLANG_DRIVER_TARGET = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),clang_driver.so)
+# Upstream Clang owns extraction, device grouping and image registration.
+# Point at its clang/tools/clang-linker-wrapper source directory to build it.
+LLVM_WRAPPER_SOURCE ?=
+LINKER_WRAPPER_TARGET = $(if $(LLVM_WRAPPER_SOURCE),distcc-linker-wrapper)
 CPP = @CPP@
 # We add a few cppflags.  -Isrc is so that config.h can be found in the build
 # directory.  It is before I"$(srcdir)/src" to reflect VPATH semantics.
@@ -205,6 +209,9 @@ dist_extra =							\
 	distcc-link \
 	distcc-rust \
 	distcc-thinlto \
+	distcc-offload-link \
+	distcc_lto.py \
+	src/llvm-linker-wrapper.patch \
 	distcc-offload \
 	distcc_job.py \
 	src/rust_native.cc \
@@ -510,7 +517,19 @@ check_include_server_PY = \
 
 ## NOTE: "all" must be the first (default) rule, aside from patterns.
 
-all: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) pump include-server
+all: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) $(LINKER_WRAPPER_TARGET) pump include-server
+
+llvm-linker-wrapper/.patched: $(srcdir)/src/llvm-linker-wrapper.patch
+	mkdir -p llvm-linker-wrapper
+	cp "$(LLVM_WRAPPER_SOURCE)/ClangLinkerWrapper.cpp" "$(LLVM_WRAPPER_SOURCE)/LinkerWrapperOpts.td" llvm-linker-wrapper/
+	cd llvm-linker-wrapper && patch -p1 < "$(abspath $(srcdir))/src/llvm-linker-wrapper.patch"
+	touch $@
+
+llvm-linker-wrapper/LinkerWrapperOpts.inc: llvm-linker-wrapper/.patched
+	`$(LLVM_CONFIG) --bindir`/llvm-tblgen -gen-opt-parser-defs -I `$(LLVM_CONFIG) --includedir` llvm-linker-wrapper/LinkerWrapperOpts.td -o $@
+
+distcc-linker-wrapper: llvm-linker-wrapper/LinkerWrapperOpts.inc
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ llvm-linker-wrapper/ClangLinkerWrapper.cpp `$(LLVM_CONFIG) --ldflags` -lclang-cpp -lLLVM
 
 clang_driver.so: $(srcdir)/src/clang_driver.cc $(srcdir)/src/clang_inputs.h
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -shared $(LDFLAGS) -o $@ $< `$(LLVM_CONFIG) --ldflags` -lclang-cpp -lLLVM
@@ -1019,6 +1038,8 @@ clean: clean-autoconf clean-lzo clean-include-server
 	rm -f test/*.pyc
 	rm -f $(check_PROGRAMS) $(bin_PROGRAMS) $(sbin_PROGRAMS)
 	rm -f cpp_lookup.so distcc-rust-native.so clang_driver.so
+	rm -f distcc-linker-wrapper
+	rm -rf llvm-linker-wrapper
 	rm -f `echo $(man1_MEN) | sed -e 's/ /.gz /g' -e 's/$$/.gz/'`
 	rm -f $(man_HTML)
 	rm -f distccmon-gnome
@@ -1132,7 +1153,7 @@ showpaths:
 install: showpaths install-doc install-man install-programs \
 	install-include-server install-example @INSTALL_GNOME@ install-conf
 
-install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET)
+install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) $(LINKER_WRAPPER_TARGET)
 	if test -n "$(CPP_LOOKUP_TARGET)"; then \
 	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
 	  $(INSTALL_PROGRAM) cpp_lookup.so "$(DESTDIR)$(libdir)/distcc/cpp_lookup.so"; \
@@ -1142,6 +1163,11 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-link" "$(DESTDIR)$(bindir)/distcc-link"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-rust" "$(DESTDIR)$(bindir)/distcc-rust"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc-thinlto"
+	$(INSTALL_SCRIPT) "$(srcdir)/distcc-offload-link" "$(DESTDIR)$(bindir)/distcc-offload-link"
+	$(INSTALL_DATA) "$(srcdir)/distcc_lto.py" "$(DESTDIR)$(bindir)/distcc_lto.py"
+	if test -n "$(LINKER_WRAPPER_TARGET)"; then \
+	  $(INSTALL_PROGRAM) distcc-linker-wrapper "$(DESTDIR)$(bindir)/distcc-linker-wrapper"; \
+	fi
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-offload" "$(DESTDIR)$(bindir)/distcc-offload"
 	$(INSTALL_DATA) "$(srcdir)/distcc_job.py" "$(DESTDIR)$(bindir)/distcc_job.py"
 	if test -n "$(RUST_NATIVE_TARGET)"; then \
@@ -1286,6 +1312,7 @@ uninstall-programs:
 	rm -f "$(DESTDIR)$(bindir)/distcc-link"
 	rm -f "$(DESTDIR)$(bindir)/distcc-rust"
 	rm -f "$(DESTDIR)$(bindir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc_job.py"
+	rm -f "$(DESTDIR)$(bindir)/distcc-offload-link" "$(DESTDIR)$(bindir)/distcc_lto.py" "$(DESTDIR)$(bindir)/distcc-linker-wrapper"
 	rm -f "$(DESTDIR)$(bindir)/distcc-offload"
 	rm -f "$(DESTDIR)$(bindir)/distcc-clang"
 	for p in $(bin_PROGRAMS) pump; do			\

@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Distribute LLVM's per-target offload link jobs."""
+import sys
+from distcc_lto import main
+
+if __name__ == '__main__':
+    sys.exit(main(5))

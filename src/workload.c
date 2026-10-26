@@ -62,7 +62,8 @@ int dcc_work_valid(const struct dcc_work_hint *hint)
 {
     /* Backend snapshots include dependency artifacts and compiler data;
      * their size is not bounded by the C/C++ preprocessor input limit. */
-    if (hint->kind == DCC_WORK_RUST || hint->kind == DCC_WORK_THINLTO) return hint->key && hint->bytes;
+    if (hint->kind == DCC_WORK_RUST || hint->kind == DCC_WORK_THINLTO ||
+        hint->kind == DCC_WORK_OFFLOAD_LINK) return hint->key && hint->bytes;
     return hint->source_bytes <= 512U * 1024 * 1024 &&
            ((!hint->key && !hint->bytes && !hint->kind && !hint->source_bytes) ||
            (hint->key && hint->bytes && hint->bytes <= 512ULL * 1024 * 1024 &&

@@ -15,8 +15,9 @@ struct dcc_capacity {
     int pump_capacity[DCC_MEMORY_BUCKETS];
     int rust_capacity[DCC_MEMORY_BUCKETS];
     int thinlto_capacity[DCC_MEMORY_BUCKETS];
+    int offload_capacity[DCC_MEMORY_BUCKETS];
     unsigned long long memory_headroom, memory_reserved, job_memory;
-    unsigned long long memory_estimates[4][DCC_MEMORY_BUCKETS];
+    unsigned long long memory_estimates[5][DCC_MEMORY_BUCKETS];
 };
 int dcc_parse_capacity(char *buf, struct dcc_capacity *cap);
 int dcc_capacity_slots(const struct dcc_hostdef *host, const struct dcc_capacity *cap);

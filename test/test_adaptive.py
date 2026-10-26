@@ -33,10 +33,12 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
                    cpu_scale: float | str = -1, cpu_age: float | str = -1,
                    cpu_probe: float | str = 0,
                    compile_capacity=None, pump_capacity=None, rust_capacity=None, thinlto_capacity=None,
+                   offload_capacity=None,
                    memory_headroom_bytes: int | float | str = 16 * 1024**3,
                    memory_reserved_bytes: int | float | str = 0,
                    job_memory_bytes: int | float | str = 256 * 1024**2,
-                   compile_memory=None, pump_memory=None, rust_memory=None, thinlto_memory=None, **metrics):
+                   compile_memory=None, pump_memory=None, rust_memory=None, thinlto_memory=None,
+                   offload_memory=None, **metrics):
     if compile_capacity is None:
         compile_capacity = [metrics.get('capacity', jobs)] * 64
     capacities = compile_capacity if isinstance(compile_capacity, str) else ','.join(map(str, compile_capacity))
@@ -49,8 +51,12 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
     if thinlto_capacity is None:
         thinlto_capacity = [metrics.get('capacity', jobs)] * 64
     thinlto = thinlto_capacity if isinstance(thinlto_capacity, str) else ','.join(map(str, thinlto_capacity))
+    if offload_capacity is None:
+        offload_capacity = [metrics.get('capacity', jobs)] * 64
+    offload = offload_capacity if isinstance(offload_capacity, str) else ','.join(map(str, offload_capacity))
     memory = ''
-    for kind, estimates in (('compile', compile_memory), ('pump', pump_memory), ('rust', rust_memory), ('thinlto', thinlto_memory)):
+    for kind, estimates in (('compile', compile_memory), ('pump', pump_memory), ('rust', rust_memory),
+                           ('thinlto', thinlto_memory), ('offload', offload_memory)):
         if estimates is None: estimates = [job_memory_bytes] * 64
         values = estimates if isinstance(estimates, str) else ','.join(map(str, estimates))
         memory += f'dcc_{kind}_memory {values}\n'
@@ -63,6 +69,7 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
             f"dcc_pump_capacity {pump}\n"
             f"dcc_rust_capacity {rust}\n"
             f"dcc_thinlto_capacity {thinlto}\n"
+            f"dcc_offload_capacity {offload}\n"
             f"dcc_memory_headroom_bytes {memory_headroom_bytes}\n"
             f"dcc_memory_reserved_bytes {memory_reserved_bytes}\n"
             f"dcc_job_memory_bytes {job_memory_bytes}\n"

@@ -273,7 +273,8 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
     ret = dcc_job_decode(fd, &job);
     close(fd);
     if (ret || !dcc_job_tree(job) || !job->count) { ret = EXIT_PROTOCOL_ERROR; goto done; }
-    hint.kind = job->kind == DCC_JOB_RUST ? DCC_WORK_RUST : DCC_WORK_THINLTO;
+    hint.kind = job->kind == DCC_JOB_RUST ? DCC_WORK_RUST :
+                job->kind == DCC_JOB_OFFLOAD_LINK ? DCC_WORK_OFFLOAD_LINK : DCC_WORK_THINLTO;
     hint.bytes = dcc_resource_input_bytes(job);
     uint64_t key = XXH3_64bits(job->cwd, strlen(job->cwd));
     for (unsigned i = 0; i < job->count; ++i) {
@@ -282,7 +283,7 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
         key = XXH3_64bits_withSeed(input->digest, sizeof(input->digest), key);
         const char *extension = strrchr(input->path, '.');
         if (extension && (!strcmp(extension, ".rs") ||
-            (job->kind == DCC_JOB_THINLTO && i == 0))) {
+            (job->kind == DCC_JOB_THINLTO && i == 0) || job->kind == DCC_JOB_OFFLOAD_LINK)) {
             uint64_t room = UINT32_MAX - hint.source_bytes;
             hint.source_bytes += input->plain_size < room ? input->plain_size : room;
         }
@@ -331,7 +332,7 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
     ret = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
     if (!ret && getenv("DISTCC_VERBOSE") && !strcmp(getenv("DISTCC_VERBOSE"), "1"))
         fprintf(stderr, "%s: compiled on %s\n",
-                job->kind == DCC_JOB_RUST ? "distcc-rust" : "distcc-thinlto", host->hostname);
+                dcc_job_helper(job), host->hostname);
 done:
     dcc_job_result_free(&result);
     if (host) dcc_free_hostdef(host);

@@ -29,7 +29,7 @@ class ThinLTOTest(BrokerTestCase):
         return subprocess.run(list(map(str, command)), cwd=self.work, env=self.env,
                               text=True, capture_output=True, timeout=60, **kwargs)
 
-    def link(self, compiler, archive=False):
+    def link(self, compiler, archive=False, hip=False):
         objects = []
         for i in range(8):
             source = self.work / f'part {i}.c'
@@ -53,6 +53,8 @@ class ThinLTOTest(BrokerTestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             objects = [library]
         args = [compiler, '-flto=thin', '-O2', '-fuse-ld=lld', main, *objects]
+        if hip:
+            args.extend(['--hip-link', '--offload-arch=gfx900'])
         reference = self.work / 'reference'
         result = self.run_command([*args, '-o', reference])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -73,6 +75,69 @@ class ThinLTOTest(BrokerTestCase):
 
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
+
+    def test_hip_wrapper_distributes_host_thinlto(self):
+        self.link(shutil.which('clang'), hip=True)
+
+    def test_hip_device_links_and_host_backends(self):
+        """Resolve a cross-TU GPU call on two targets, then link the host."""
+        compiler = shutil.which('clang++')
+        devices = []
+        if shutil.which('amdgpu-arch'):
+            detected = self.run_command(['amdgpu-arch'])
+            if detected.returncode == 0:
+                devices = detected.stdout.split()
+        targets = list(dict.fromkeys(devices)) or ['gfx900', 'gfx1030']
+        flags = ['-O2', '-flto=thin', '-fgpu-rdc',
+                 *('--offload-arch=' + target for target in targets)]
+        sources = (
+            '__attribute__((device)) int value(int n) { return n + 17; }',
+            '#include <hip/hip_runtime.h>\n'
+            '__attribute__((device)) int value(int);\n'
+            '__global__ void kernel(int *p) { *p = value(*p); }\n'
+            '#include <cstdio>\n'
+            'int main(int argc, char **) { if (argc == 1) return 0; '
+            'int count = 0; if (hipGetDeviceCount(&count) != hipSuccess || !count) return 10; '
+            'for (int i = 0; i < count; ++i) { int *p, n = 5; '
+            'if (hipSetDevice(i) != hipSuccess || hipMalloc(&p, sizeof(n)) != hipSuccess) return 11; '
+            'if (hipMemcpy(p, &n, sizeof(n), hipMemcpyHostToDevice) != hipSuccess) return 12; '
+            'hipLaunchKernelGGL(kernel, dim3(1), dim3(1), 0, 0, p); '
+            'if (hipMemcpy(&n, p, sizeof(n), hipMemcpyDeviceToHost) != hipSuccess || n != 22) return 13; '
+            'if (hipFree(p) != hipSuccess) return 14; } '
+            'std::printf("%d GPU devices checked\\n", count); return 0; }',
+        )
+        objects = []
+        for index, source in enumerate(sources):
+            path = self.work / f'device {index}.hip'
+            path.write_text(source)
+            obj = path.with_suffix('.o')
+            result = self.run_command([compiler, *flags, '-c', path, '-o', obj])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            objects.append(obj)
+        args = [compiler, *flags, '--hip-link', '-fuse-ld=lld', *objects, '-lamdhip64']
+        for prefix, name in (([], 'reference'), ([self.build / 'distcc'], 'distributed')):
+            output = self.work / name
+            result = self.run_command([*prefix, *args, '-o', output])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if prefix:
+                self.assertEqual(result.stderr.count('distcc-offload-link: compiled on'), len(targets),
+                                 result.stderr)
+                self.assertGreater(result.stderr.count('distcc-thinlto: compiled on'), 0,
+                                   result.stderr)
+            self.assertEqual(self.run_command([output]).returncode, 0)
+            if devices:
+                runtime = self.run_command([output, '--gpu'])
+                self.assertEqual(runtime.returncode, 0, runtime.stdout + runtime.stderr)
+                print(name + ': ' + runtime.stdout.strip(), flush=True)
+            image = self.work / (name + '.hipfb')
+            dump = self.run_command(['llvm-objcopy', '--dump-section',
+                                     '.hip_fatbin=' + str(image), output, '/dev/null'])
+            self.assertEqual(dump.returncode, 0, dump.stderr)
+            bundles = self.run_command(['clang-offload-bundler', '-list', '-type=o',
+                                        '-input=' + str(image)])
+            self.assertEqual(bundles.returncode, 0, bundles.stderr)
+            for target in targets:
+                self.assertIn(target, bundles.stdout)
 
     def test_target_prefixed_compiler(self):
         selected = shutil.which('clang')
