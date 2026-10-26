@@ -457,7 +457,8 @@ class PreprocessTest(PumpTestCase):
         if not default:
             self.skipTest('Clang required')
         compiler = next((p for p in sorted(Path('/usr/lib/llvm').glob('*/bin/clang'))
-                         if p.resolve() != Path(default).resolve()), None)
+                         if p.parents[1].name in ('22', '23') and
+                         p.resolve() != Path(default).resolve()), None)
         if compiler is None:
             self.skipTest('an additional Clang release is required')
         version = subprocess.check_output([compiler, '-dumpversion'], text=True).strip()
@@ -468,13 +469,14 @@ class PreprocessTest(PumpTestCase):
         self.addCleanup(wrapper.unlink)
         self.source.write_text('#include <stddef.h>\n#include <stdint.h>\n'
                                'int main(void) { size_t n = sizeof(uint64_t); return n != 8; }\n')
-        result = self.run_cc(str(compiler), ['-O2', '-MD', '-MF', 'builtins.d',
+        result = self.run_cc(str(compiler), ['-O2', '-flto=thin', '-MD', '-MF', 'builtins.d',
                                              '-c', self.source, '-o', 'builtins.o'])
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         dependencies = {Path(p).resolve() for p in shlex.split(
             (self.work / 'builtins.d').read_text().replace('\\\n', ''))[1:]}
         self.assertIn(resource / 'include' / 'stddef.h', dependencies)
-        subprocess.run([compiler, self.work / 'builtins.o', '-o', self.work / 'builtins'],
+        subprocess.run([compiler, '-flto=thin', '-fuse-ld=lld', self.work / 'builtins.o',
+                        '-o', self.work / 'builtins'],
                        check=True, capture_output=True, timeout=15)
         subprocess.run([self.work / 'builtins'], check=True, timeout=5)
         log = (self.work / 'client.log').read_text()
@@ -801,6 +803,7 @@ class PreprocessTest(PumpTestCase):
         wrapper = wrappers / name
         worker = str(self.build / 'distcc-clang') if compiler.startswith('clang') else native
         wrapper.write_text('#!/bin/sh\n' +
+            'if [ "$1" = -dumpversion ]; then exec ' + shlex.quote(native) + ' "$@"; fi\n' +
             "printf '%s\\n' '#error worker header must not be used' > " + shlex.quote(str(header)) + '\n' +
             ': > ' + shlex.quote(str(includes / 'worker-only.h')) + '\n' +
             'exec ' + shlex.quote(worker) + ' "$@"\n')

@@ -31,7 +31,9 @@ is absolutized.
 
 __author__ = 'Manos Renieris and Nils Klarlund'
 
+import copy
 import setuptools
+from setuptools.command.build_ext import build_ext
 import doctest
 import glob
 import os
@@ -183,8 +185,8 @@ if not llvm_config:
     llvm_config = os.path.join(os.path.dirname(os.path.realpath(clang)), 'llvm-config')
 if not llvm_config or not os.path.isfile(llvm_config):
   sys.exit('libclang-cpp requires LLVM_CONFIG pointing to llvm-config (LLVM 22 or 23).')
-def llvm_option(option):
-  return subprocess.check_output([llvm_config, option], text=True).strip()
+def llvm_option(option, config=llvm_config):
+  return subprocess.check_output([config, option], text=True).strip()
 if llvm_option('--version').split('.')[0] not in ('22', '23'):
   sys.exit('libclang-cpp requires LLVM 22 or 23 headers and libraries.')
 llvm_lib = llvm_option('--libdir')
@@ -205,6 +207,33 @@ scanner = setuptools.Extension(
     define_macros=[('DCC_GCC_SCAN_DIR', '"' + libdir + '/distcc/gcc-scan"')],
 )
 
+# Worker code generation must use the requested compiler's LLVM release.
+# Loading another release would silently change bitcode and optimization semantics.
+frontends = []
+for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.pathsep):
+  major = llvm_option('--version', config).split('.')[0]
+  if major not in ('22', '23'):
+    sys.exit('Clang worker frontends require LLVM 22 or 23.')
+  library = llvm_option('--libdir', config)
+  runtime = library[len(sysroot):] if sysroot and library.startswith(sysroot + '/') else library
+  frontends.append(setuptools.Extension(
+      name='include_server.clang' + major + '.clang_compile',
+      sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_compile.cpp')],
+      depends=[os.path.join(srcdir, 'src', 'clang_inputs.h')],
+      language='c++', include_dirs=[llvm_option('--includedir', config)],
+      library_dirs=[library], runtime_library_dirs=[runtime],
+      libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
+      define_macros=[('DCC_CLANG_COMPILE_MODULE', '1')],
+  ))
+
+class VersionedBuildExt(build_ext):
+  def build_extension(self, ext):
+    # The same source has different LLVM headers and module entry points.
+    command = copy.copy(self)
+    command.build_temp = os.path.join(self.build_temp, ext.name)
+    build_ext.build_extension(command, ext)
+
+
 args = {
     'name': 'include_server',
     # The 'include_server' package is in the srcdir_include_server.
@@ -217,7 +246,8 @@ args = {
     'long_description': 'The include server is part of distcc.',
     'packages': ['include_server'],
     'package_data': {'include_server': ['*.pyi']},
-    'ext_modules': [ext, scanner],
+    'ext_modules': [ext, scanner, *frontends],
+    'cmdclass': {'build_ext': VersionedBuildExt},
     'install_requires': ['xxhash>=3.0.0'],
 }
 

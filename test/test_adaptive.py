@@ -140,6 +140,8 @@ class DistccTestCase(unittest.TestCase):
             compiler_path = shutil.which(name)
             if compiler_path:
                 (wrappers / name).symlink_to(compiler_path)
+                version = subprocess.check_output([compiler_path, '-dumpversion'], text=True).strip()
+                (wrappers / (name + '-' + version.split('.')[0])).symlink_to(compiler_path)
         target = subprocess.check_output([cls.cc, "-dumpmachine"], text=True).strip()
         (wrappers / (target + "-gcc")).symlink_to("gcc")
         for i in range(getattr(cls, 'worker_count', 2)):

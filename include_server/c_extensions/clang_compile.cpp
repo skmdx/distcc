@@ -112,9 +112,11 @@ PyObject *dcc_clang_compile(PyObject *, PyObject *arguments) {
     if (command.empty() || !*original)
         return PyErr_Format(PyExc_ValueError, "missing compiler command or source identity");
     const std::string invoked_as = command.front();
-    clang::tooling::addTargetAndModeForProgramName(command, invoked_as);
     bool ok;
     Py_BEGIN_ALLOW_THREADS
+    llvm::InitializeAllTargetInfos();
+    llvm::InitializeAllTargets();
+    clang::tooling::addTargetAndModeForProgramName(command, invoked_as);
     llvm::InitializeAllTargetMCs();
     llvm::InitializeAllAsmParsers();
     llvm::InitializeAllAsmPrinters();
@@ -131,3 +133,14 @@ PyObject *dcc_clang_compile(PyObject *, PyObject *arguments) {
     if (PyErr_CheckSignals() < 0) return nullptr;
     return PyLong_FromLong(ok ? 0 : 1);
 }
+
+#ifdef DCC_CLANG_COMPILE_MODULE
+namespace {
+PyMethodDef methods[] = {
+    {"compile", dcc_clang_compile, METH_VARARGS, "Compile with the client's source identity."},
+    {nullptr, nullptr, 0, nullptr}};
+PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_compile", nullptr, -1,
+                      methods, nullptr, nullptr, nullptr, nullptr};
+}
+PyMODINIT_FUNC PyInit_clang_compile() { return PyModule_Create(&module); }
+#endif

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """One-shot Clang worker preserving the original source's profile identity."""
+import importlib
+import os
+import re
 import shutil
+import subprocess
 import sys
-
-from include_server import clang_scan
 
 
 def main():
@@ -11,7 +13,18 @@ def main():
     # LibTooling locates resources relative to argv[0], without PATH lookup.
     # Preserve the driver name: resolving symlinks would lose target and mode.
     command[0] = shutil.which(command[0]) or command[0]
-    return clang_scan.compile(command, original, root, cwd, mode == 'pump')
+    # Remote commands encode the client's release in the driver name, even
+    # when the worker does not install a matching version-suffixed symlink.
+    release = re.search(r'(?:^|-)clang(?:\+\+)?-(\d+)(?:\.\d+)*$', os.path.basename(command[0]))
+    if release:
+        major = release.group(1)
+    else:
+        version = subprocess.check_output([command[0], '-dumpversion'], text=True).strip()
+        major = version.split('.')[0]
+        if not major.isdecimal():
+            raise ValueError('invalid Clang version: ' + version)
+    frontend = importlib.import_module('include_server.clang' + major + '.clang_compile')
+    return frontend.compile(command, original, root, cwd, mode == 'pump')
 
 
 if __name__ == '__main__':

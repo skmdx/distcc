@@ -580,7 +580,7 @@ with tempfile.TemporaryDirectory() as directory:
   def test_compatible_other_clang_release_scans_compiles_and_links(self):
     for compiler in Path('/usr/lib/llvm').glob('*/bin/clang'):
       version = subprocess.check_output([compiler, '-dumpversion'], text=True).strip()
-      if version != clang_scan.version:
+      if version.split('.')[0] in ('22', '23') and version != clang_scan.version:
         break
     else:
       self.skipTest('an additional Clang release is required')
@@ -600,10 +600,9 @@ with tempfile.TemporaryDirectory() as directory:
       copied.write_bytes(data)
     obj, executable = self.root / 'other.o', self.root / 'other'
     helper = Path(__file__).resolve().parent.parent / 'distcc-clang'
-    # The test imports include_server's modules directly; the helper uses the
-    # installed package. Do not shadow that package with include_server.py.
+    # The helper imports the built package, including its versioned frontends.
     env = dict(os.environ)
-    env.pop('PYTHONPATH', None)
+    env['PYTHONPATH'] = str(Path(clang_scan.__file__).resolve().parent.parent)
     result = subprocess.run([sys.executable, helper, worker, self.source, self.root, 'pump', compiler,
                              '-c', self.source, '-o', obj], env=env, capture_output=True, text=True)
     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
