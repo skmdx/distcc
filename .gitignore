@@ -33,6 +33,7 @@ __pycache__/
 /clang_driver.so
 /distcc-linker-wrapper
 /llvm-linker-wrapper/
+/llvm-lto*/
 
 # `make dist` products
 distcc-*.tar.*

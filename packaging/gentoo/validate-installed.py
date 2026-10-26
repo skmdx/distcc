@@ -146,8 +146,13 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         objects = []
         for index in range(12):
             source, obj = root / f'thin-{index}.c', root / f'thin-{index}.o'
-            source.write_text(f'int part{index}(int n) {{ int v=0; '
-                              f'for(int i=0;i<n;i++) v+=(i*{index+1})%101; return v; }}')
+            code = (f'int part{index}(int n) {{ int v=0; '
+                    f'for(int i=0;i<n;i++) v+=(i*{index+1})%101; return v; }}')
+            if index == 0:
+                code = '\n'.join(f'__attribute__((noinline)) static int leaf{i}(int n) '
+                                 f'{{ volatile int v=n; return v*{i+1}; }}' for i in range(32))
+                code += '\nint part0(int n) { return ' + '+'.join(f'leaf{i}(n)' for i in range(32)) + '; }'
+            source.write_text(code)
             subprocess.run(['distcc', clang, '-O2', '-flto=thin', '-c', source, '-o', obj],
                            env=env, check=True, capture_output=True, timeout=REMOTE_TIMEOUT)
             objects.append(obj)
@@ -166,12 +171,15 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                                 text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
         assert result.returncode == 0, result.stderr
         workers = re.findall(r'^distcc-thinlto: compiled on (.+)$', result.stderr, re.M)
-        assert len(workers) == len(objects) + 1, result.stderr
+        partitions = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
+        assert any(count > 1 for count in partitions), 'LLVM partition helpers were not exercised: ' + result.stderr
+        assert len(workers) == len(objects) + 1 + sum(count - 1 for count in partitions), result.stderr
         if len(env['DISTCC_HOSTS'].split()) > 1:
             assert len(set(workers)) > 1, 'ThinLTO did not distribute across workers: ' + repr(workers)
         for args in ([], ['one'], ['one', 'two']):
             assert subprocess.check_output([executable, *args]) == subprocess.check_output([reference, *args])
         results['thinlto'] = {'backends': len(workers), 'workers': {p: workers.count(p) for p in set(workers)},
+                              'partitions': partitions,
                               'seconds': time.monotonic() - started, 'executed': True}
         # Device links need the compiler's AMDGPU backend, but no GPU or HIP
         # runtime on the worker. Exercise the installed helper and wire kind.

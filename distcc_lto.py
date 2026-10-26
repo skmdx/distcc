@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """LLVM-generated link jobs over distcc's shared input transport."""
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import heapq
+import itertools
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,41 +25,118 @@ def absolute(name):
     return str(Path(os.path.abspath(name)))
 
 
+def llvm_tools(compiler):
+    """Find the helpers registered with the compiler's own LLVM installation."""
+    binary = shutil.which(compiler) or compiler
+    bindir = Path(binary).resolve().parent
+    config = bindir / 'llvm-config'
+    if not config.is_file():
+        return None
+    directory = Path(subprocess.check_output([config, '--libdir'], text=True).strip()) / 'distcc'
+    paths = dict(plan=directory / 'distcc-lto', prepare=directory / 'lto-prepare.so',
+                 linker=bindir / 'ld.lld', objcopy=bindir / 'llvm-objcopy')
+    return paths if all(path.is_file() for path in paths.values()) else None
+
+
+def publish_archive(archive, destinations):
+    """Stage the complete result before replacing any declared artifact."""
+    with tarfile.open(archive) as tar:
+        members = tar.getmembers()
+        if ([m.name for m in members] != [str(i) for i in range(len(destinations))]
+                or any(not m.isfile() for m in members)):
+            raise ValueError('invalid LLVM job result archive')
+        staged = []
+        try:
+            for member, destination in zip(members, destinations):
+                with tempfile.NamedTemporaryFile(dir=Path(destination).parent,
+                                                 prefix='.distcc-', delete=False) as output:
+                    staged.append((output.name, destination))
+                    source = tar.extractfile(member)
+                    assert source is not None  # Regular members were validated above.
+                    with source:
+                        shutil.copyfileobj(source, output, 256 * 1024)
+            for source, destination in staged:
+                os.replace(source, destination)
+        finally:
+            for source, _ in staged:
+                Path(source).unlink(missing_ok=True)
+
+
 def distribute(description, kind):
     request = json.loads(Path(description).read_text())
     common, jobs = request['common'], request['jobs']
     if not jobs:
         return 0
     transport = str(Path(__file__).resolve().with_name('distcc'))
-    slots = int(subprocess.check_output([transport, '-j'], text=True)) if len(jobs) > 1 else 1
+    slots = max(1, int(subprocess.check_output([transport, '-j'], text=True)))
     with tempfile.TemporaryDirectory(prefix='distcc-lto-') as directory:
         work = Path(directory)
         # Snapshot and hash every distinct input once per link. Per-job trees
         # and the worker's persistent cache share the immutable backing files.
         files = {}
-        for task in jobs:
+        def register(task):
             for name in [*task['inputs'], *common['inputs']]:
                 name = absolute(name)
                 if name not in files:
                     path = work / ('input-' + str(len(files)))
                     snapshot(name, path)
                     files[name] = (path, *fingerprint(path))
+            names = task['inputs'][:1] if kind == 4 else [*task['inputs'], *common['inputs']]
+            task['bytes'] = sum(files[name][1] for name in {absolute(p) for p in names})
+
+        for task in jobs:
+            register(task)
+            task['instructions'] = 0
+            task['partitions'] = 1
+        total_bytes = sum(task['bytes'] for task in jobs)
+        total_instructions = 0
+        tools = llvm_tools(common['args'][0]) if kind == 4 else None
+        indexes = [next((arg.split('=', 1)[1] for arg in task['args']
+                         if arg.startswith('-fthinlto-index=')), None) for task in jobs]
+        if tools and all(indexes):
+            plan = work / 'plan.json'
+            plan.write_text(json.dumps([dict(source=task['inputs'][0], index=index)
+                                        for task, index in zip(jobs, indexes)]))
+            weights = json.loads(subprocess.check_output([tools['plan'], 'plan', plan], text=True))
+            if len(weights) != len(jobs):
+                raise ValueError('incomplete LLVM work estimates')
+            total_instructions = sum(row['instructions'] for row in weights)
+            for task, row, index in zip(jobs, weights, indexes):
+                task['instructions'] = row['instructions']
+                task['index'] = index
+                if total_instructions and len(task['outputs']) == 1:
+                    task['partitions'] = max(1, min(slots, row['functions'],
+                        (row['instructions'] * slots + total_instructions - 1) // total_instructions))
+
+        def priority(task):
+            # Rank by the dominant share of this link's compute or data work.
+            # Instruction-only ranking leaves large constant-data modules until
+            # last; byte-only ranking misses expensive small-code backends.
+            return max(task['instructions'] / total_instructions if total_instructions else 0,
+                       task['bytes'] / total_bytes if total_bytes else 0)
 
         helper = 'distcc-thinlto' if kind == 4 else 'distcc-offload-link'
         env = dict(os.environ)
         env.pop('INCLUDE_SERVER_PORT', None)
 
-        def start(item):
-            index, task = item
+        def describe(index, task):
             jobdir = work / str(index)
-            inputs = jobdir / 'inputs'
-            inputs.mkdir(parents=True)
+            jobdir.mkdir()
             names = list(dict.fromkeys(absolute(p) for p in [*task['inputs'], *common['inputs']]))
-            command = [*common['args'], *task['args']]
-            job = {'cwd': os.getcwd(), 'args': command,
+            job = {'cwd': os.getcwd(), 'args': [*common['args'], *task['args']],
                    'inputs': names, 'outputs': [absolute(p) for p in task['outputs']]}
+            return jobdir, job
+
+        def start(index, task):
+            jobdir, job = describe(index, task)
+            if env.get('DISTCC_VERBOSE') == '1':
+                print(helper + ': submitting ' + job['inputs'][0]
+                      + ' instructions=' + str(task['instructions'])
+                      + ' bytes=' + str(task['bytes']), file=sys.stderr)
+            inputs = jobdir / 'inputs'
+            inputs.mkdir()
             entries = []
-            for name in names:
+            for name in job['inputs']:
                 source, size, digest = files[name]
                 os.link(source, inputs / str(len(entries)))
                 entries.append((name, size, digest))
@@ -93,59 +173,103 @@ def distribute(description, kind):
                     print(helper + ': retrying backend locally', file=sys.stderr)
                     return subprocess.call(job['args'])
                 return process.returncode
-            # Stage all declared artifacts before publishing any to LLD.
-            with tarfile.open(archive) as tar:
-                members = tar.getmembers()
-                if ([m.name for m in members] != [str(i) for i in range(len(job['outputs']))]
-                        or any(not m.isfile() for m in members)):
-                    raise ValueError('invalid LLVM job result archive')
-                staged = []
-                try:
-                    for member, destination in zip(members, job['outputs']):
-                        with tempfile.NamedTemporaryFile(dir=Path(destination).parent,
-                                                         prefix='.distcc-', delete=False) as output:
-                            staged.append((output.name, destination))
-                            source = tar.extractfile(member)
-                            assert source is not None  # Regular members were validated above.
-                            with source:
-                                shutil.copyfileobj(source, output, 256 * 1024)
-                    for source, destination in staged:
-                        os.replace(source, destination)
-                finally:
-                    for source, _ in staged:
-                        Path(source).unlink(missing_ok=True)
+            publish_archive(archive, job['outputs'])
             return 0
 
-        # Start expensive modules while the fastest workers are still free.
-        # LLD's JSON order is link order, not a work schedule. Output names keep
-        # that link order intact even when backend execution is reordered.
-        def weight(item):
-            task = item[1]
-            names = [*task['inputs'], *common['inputs']]
-            if kind == 4:
-                names = names[:1]  # Imports contribute only selected functions.
-            return sum(files[name][1] for name in {absolute(p) for p in names})
+        def prepare(index, task):
+            assert tools is not None
+            jobdir, job = describe(index, task)
+            root = jobdir / 'root'
+            root.mkdir()
+            for name in job['inputs']:
+                path = root / name.lstrip('/')
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.link(files[name][0], path)
+            manifest = str(jobdir / 'partitions.json')
+            job['outputs'] = [manifest]
+            job['partitions'] = task['partitions']
+            job['args'][job['args'].index('-o') + 1] = manifest + '.unused.o'
+            result = run_job(root, job, kind, tools['prepare'])
+            if result:
+                raise subprocess.CalledProcessError(result, job['args'])
+            partition = json.loads((root / manifest.lstrip('/')).read_text())
+            for part in partition['parts']:
+                part['path'] = str(root / part['path'].lstrip('/'))
+            if env.get('DISTCC_VERBOSE') == '1':
+                print(helper + ': partitioned ' + task['inputs'][0] + ' into '
+                      + str(len(partition['parts'])), file=sys.stderr)
+            outputs = [str(jobdir / f'part-{i}.o') for i in range(len(partition['parts']))]
+            group = dict(directory=jobdir, outputs=outputs, locals=partition['locals'],
+                         destination=absolute(task['outputs'][0]), remaining=len(outputs))
+            children = []
+            primary = absolute(task['inputs'][0])
+            for part, output in zip(partition['parts'], outputs):
+                args = [part['path'] if absolute(arg) == primary else arg for arg in task['args']]
+                args[args.index('-o') + 1] = output
+                args.extend(['-mllvm', '-thinlto-assume-merged'])
+                children.append(dict(args=args, inputs=[part['path'], task['index']],
+                    outputs=[output], instructions=part['instructions'], group=group))
+            return children
 
-        ordered = sorted(enumerate(jobs), key=weight, reverse=True)
-        if len(ordered) == 1:
-            results = [collect(start(ordered[0]))]
-        else:
-            limit = min(len(jobs), max(1, slots))
-            results = []
-            with ThreadPoolExecutor(max_workers=limit) as pool:
-                pending = set()
-                for item in ordered:
-                    if len(pending) == limit:
-                        finished, pending = wait(pending, return_when=FIRST_COMPLETED)
-                        results.extend(task.result() for task in finished)
-                    pending.add(pool.submit(collect, start(item)))
-                results.extend(task.result() for task in pending)
-        return next((result for result in results if result), 0)
+        def merge(group):
+            assert tools is not None
+            merged = group['directory'] / 'merged.o'
+            subprocess.run([tools['linker'], '-r', '-o', merged, *group['outputs']], check=True)
+            with tempfile.NamedTemporaryFile(dir=Path(group['destination']).parent,
+                                             prefix='.distcc-', delete=False) as output:
+                staged = output.name
+            try:
+                response = group['directory'] / 'localize.rsp'
+                response.write_text(shlex.join([*['--localize-symbol=' + name for name in group['locals']],
+                                                str(merged), staged]))
+                subprocess.run([tools['objcopy'], '@' + str(response)], check=True)
+                os.replace(staged, group['destination'])
+            finally:
+                Path(staged).unlink(missing_ok=True)
+
+        # Preparation and ordinary backends share one bounded scheduler. Ready
+        # partitions rejoin its priority queue immediately; there is no barrier
+        # waiting for every import or for all unsplit backends to finish.
+        ready, serial = [], itertools.count()
+
+        def enqueue(action, task, weight):
+            heapq.heappush(ready, (-weight, next(serial), action, task))
+
+        for task in jobs:
+            enqueue('prepare' if task['partitions'] > 1 else 'backend', task, priority(task))
+        with ThreadPoolExecutor(max_workers=slots) as pool:
+            pending = {}
+            while ready or pending:
+                while ready and len(pending) < slots:
+                    _, index, action, task = heapq.heappop(ready)
+                    if action == 'backend':
+                        future = pool.submit(collect, start(index, task))
+                    elif action == 'prepare':
+                        future = pool.submit(prepare, index, task)
+                    else:
+                        future = pool.submit(merge, task)
+                    pending[future] = action, task
+                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    action, task = pending.pop(future)
+                    result = future.result()
+                    if action == 'prepare':
+                        for child in result:
+                            register(child)
+                            enqueue('backend', child, priority(child))
+                    elif action == 'backend':
+                        if result:
+                            raise subprocess.CalledProcessError(result, task['args'])
+                        if 'group' in task:
+                            group = task['group']
+                            group['remaining'] -= 1
+                            if not group['remaining']:
+                                enqueue('merge', group, float('inf'))
+        return 0
 
 
-def worker(root, archive, kind):
+def run_job(root, job, kind, prepare_library=None):
     root = Path(root)
-    job = json.loads((root / CONTROL.lstrip('/') / 'job.json').read_text())
 
     def rooted(name):
         path = Path(name)
@@ -194,13 +318,27 @@ def worker(root, archive, kind):
         sandbox.extend(['--ro-bind', str(rooted(name)), name])
     sandbox.extend(['--remount-ro', '/', '--chdir', job['cwd'], '--clearenv',
                     '--setenv', 'PATH', os.defpath, '--setenv', 'TMPDIR', '/tmp'])
+    if prepare_library is not None:
+        sandbox.extend(['--setenv', 'LD_PRELOAD', str(prepare_library),
+                        '--setenv', 'DISTCC_LTO_PARTITION_FILE', job['outputs'][0],
+                        '--setenv', 'DISTCC_LTO_PARTITIONS', str(job['partitions'])])
     result = subprocess.run([*sandbox, compiler, *args])
     if result.returncode:
         return result.returncode if result.returncode > 0 else 128 - result.returncode
     if not outputs or not outputs[0].stat().st_size:
         raise ValueError('LLVM job produced no output')
+    return 0
+
+
+def worker(root, archive, kind):
+    root = Path(root)
+    job = json.loads((root / CONTROL.lstrip('/') / 'job.json').read_text())
+    result = run_job(root, job, kind)
+    if result:
+        return result
     with tarfile.open(archive, 'w') as tar:
-        for index, path in enumerate(outputs):
+        for index, name in enumerate(job['outputs']):
+            path = root / name.lstrip('/')
             tar.add(path, arcname=str(index), recursive=False)
     return 0
 

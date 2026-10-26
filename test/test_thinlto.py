@@ -14,6 +14,7 @@ from test_broker import BrokerTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from distcc_job import fingerprint, write_metadata
+from distcc_lto import llvm_tools
 
 
 @unittest.skipUnless(shutil.which('clang') and shutil.which('bwrap'), 'Clang and bubblewrap required')
@@ -72,7 +73,9 @@ class ThinLTOTest(BrokerTestCase):
         output = self.work / 'distributed'
         result = self.run_command([self.build / 'distcc', *args, '-o', output])
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stderr.count('distcc-thinlto: compiled on'), 9, result.stderr)
+        partitions = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
+        self.assertEqual(result.stderr.count('distcc-thinlto: compiled on'),
+                         9 + sum(count - 1 for count in partitions), result.stderr)
         for port, stats in zip(self.stats_ports, before):
             def completed(text):
                 return int(next(line.split()[1] for line in text.splitlines()
@@ -85,6 +88,84 @@ class ThinLTOTest(BrokerTestCase):
 
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
+
+    def test_partitioned_backend_preserves_private_symbols_tls_and_unwinding(self):
+        """Execute real partitions, then compare the final link's ABI and behavior."""
+        compiler = shutil.which('clang++')
+        if not llvm_tools(compiler):
+            self.skipTest('matching LLVM partition helpers are not installed')
+        heavy = self.work / 'heavy.cc'
+        definitions = '\n'.join(
+            f'__attribute__((noinline)) static int local_{i}(int x) '
+            f'{{ volatile int y = x; return y * {i+1} + shared; }}'
+            for i in range(32))
+        expression = ' + '.join(f'local_{i}(x)' for i in range(32))
+        heavy.write_text('asm(".globl heavy\\n");\n'
+            'static int shared=2, sequence;\n'
+            '__attribute__((constructor(101))) static void first() { sequence=3; }\n'
+            '__attribute__((constructor(102))) static void second() { sequence*=7; }\n'
+            'static thread_local int epoch=1;\n'
+            'struct Scope { ~Scope() { ++shared; } };\n' + definitions + '\n'
+            'extern "C" int heavy(int x) { Scope guard; if(x<0) throw x; '
+            'return sequence + epoch++ + ' + expression + '; }\n')
+        small = self.work / 'small.cc'
+        small.write_text('static int shared=11;\n'
+            '__attribute__((noinline)) static int local_0(int x) { return x+shared; }\n'
+            'extern "C" int small(int x) { return local_0(x); }\n')
+        main = self.work / 'main.cc'
+        main.write_text('extern "C" int printf(const char*, ...), atoi(const char*);\n'
+            'extern "C" int heavy(int), small(int);\n'
+            'int main(int argc,char**argv) { int x=argc>1?atoi(argv[1]):3; '
+            'try { int a=heavy(x), b=heavy(x+1); printf("%d %d %d\\n",a,b,small(x)); } '
+            'catch(int e) { printf("exception %d %d\\n",e,small(x)); } }\n')
+        objects = []
+        for source in (heavy, small, main):
+            output = source.with_suffix('.o')
+            result = self.run_command([compiler, '-O2', '-flto=thin', '-c', source, '-o', output])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            objects.append(output)
+        native, distributed = self.work / 'native', self.work / 'partitioned'
+        args = [compiler, '-O2', '-flto=thin', '-fuse-ld=lld', *objects]
+        reference = self.run_command([*args, '-o', native])
+        self.assertEqual(reference.returncode, 0, reference.stderr)
+        result = self.run_command([self.build / 'distcc', *args, '-o', distributed])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        counts = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
+        self.assertTrue(any(count > 1 for count in counts), result.stderr)
+        self.assertGreater(result.stderr.count('distcc-thinlto: compiled on'), len(objects))
+        for argument in ('0', '4', '-7'):
+            expected = self.run_command([native, argument])
+            actual = self.run_command([distributed, argument])
+            self.assertEqual((actual.returncode, actual.stdout), (expected.returncode, expected.stdout))
+        symbols = []
+        for path in (native, distributed):
+            result = self.run_command(['llvm-nm', '-g', '--defined-only', '-j', path])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            symbols.append(sorted(result.stdout.splitlines()))
+        self.assertEqual(*symbols)
+
+    def test_module_assembly_preserves_private_definitions(self):
+        compiler = shutil.which('clang')
+        tools = llvm_tools(compiler)
+        if not tools:
+            self.skipTest('matching LLVM partition helpers are not installed')
+        source = self.work / 'assembly.c'
+        source.write_text('asm(".local asm_value\\n.data\\nasm_value: .long 7\\n.text\\n");\n'
+                          'extern int asm_value;\n'
+                          '__attribute__((noinline)) int first(void) { return asm_value; }\n'
+                          '__attribute__((noinline)) int second(void) { return first()+1; }\n'
+                          'int main(void) { return second()!=8; }\n')
+        bitcode = self.work / 'assembly.bc'
+        result = self.run_command([compiler, '-emit-llvm', '-c', source, '-o', bitcode])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_command([tools['plan'], 'split', bitcode, '3', self.work / 'part'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parts = json.loads(result.stdout)['parts']
+        self.assertEqual(len(parts), 1)
+        output = self.work / 'assembly'
+        result = self.run_command([compiler, parts[0]['path'], '-o', output])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_command([output]).returncode, 0)
 
     def test_ranked_submission_survives_slow_process_start(self):
         """Use real workers while delaying the largest job before broker IPC."""

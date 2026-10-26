@@ -52,9 +52,12 @@ LLD performs the thin link, discovers imported modules and archive members, and
 invokes `distcc-thinlto` with its JSON job description. Each backend uses the
 broker's measured capacity and an independent learned ThinLTO workload class.
 Inputs are snapshotted and hashed once per link, shared across backend jobs,
-and transferred through the existing LZ4/content-cache path. Larger primary
-modules are submitted first so long backends can start while faster workers
-are available. The planner waits only for each request to enter the broker queue
+and transferred through the existing LZ4/content-cache path. When the selected
+LLVM's partition helpers are installed, its summary indexes provide instruction
+counts for primary and imported definitions. Jobs are ranked by the larger of
+their share of the link's instructions and primary input bytes, so expensive
+code and large constant-data modules both start early. The planner waits only
+for each request to enter the broker queue
 before submitting the next; transfer and execution overlap. Different manifest
 sizes and process startup times therefore do not reverse submission priority.
 Execution order does not change LLD's output or constructor order.
@@ -62,9 +65,20 @@ Workers preserve
 LLVM's embedded import paths in a private namespace. The final native link
 runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache
 remains in use, so warm cache entries do not start backend jobs.
-Each backend still optimizes and generates code for one LLVM module. A large
-module can outlive the other backends and leave workers idle near the end of
-the link. Module partitioning is not implemented in this path.
+Heavy modules are prepared through LLVM's post-import hook, partitioned with
+LLVM's module splitter, and optimized/generated on multiple workers. The number
+of partitions comes from the module's instruction share and `distcc -j`, bounded
+by its function count. Preparation overlaps ordinary backends; ready partitions
+join the same work queue. A relocatable merge restores private symbol bindings
+before LLD consumes the result. Constructors, TLS and exception handling retain
+their original link semantics. Assembly with private definitions or per-object
+weak/versioned references stays together; LLVM's assembler identifies these
+cases. Individual functions and the final native layout are not subdivided.
+
+`make lto install-lto` builds and installs the helpers for `LLVM_CONFIG` under
+its library directory's `distcc` subdirectory. Use a distinct `LTO_BUILD` when
+building for multiple installed LLVM ABIs. A compiler without its matching
+helpers still distributes whole-module backends.
 Clang 22 and 23 are exercised by the integration tests. Compiler acceptance and
 the final link determine compatibility; version metadata is not a rejection gate.
 Existing whole-link offload remains available for other links with
