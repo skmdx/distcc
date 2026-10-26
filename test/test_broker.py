@@ -10,6 +10,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1058,6 +1059,82 @@ class BrokerTest(BrokerTestCase):
 
 @unittest.skipUnless(os.geteuid() == 0, 'requires real cross-UID peers')
 class BrokerIdentityTest(unittest.TestCase):
+    def activate_broker(self, command, uid):
+        if not shutil.which('systemd-socket-activate'):
+            self.skipTest('systemd-socket-activate required')
+        storage = tempfile.TemporaryDirectory(prefix='distcc-activation-')
+        self.addCleanup(storage.cleanup)
+        root = Path(storage.name)
+        root.chmod(0o777)
+        path = root / 'broker.sock'
+        owner = Path.cwd().stat().st_uid
+        self.assertNotEqual(owner, 0, 'checkout must belong to the build user')
+        env = {k: v for k, v in os.environ.items() if not k.startswith('DISTCC')}
+        env.update(DISTCC_BROKER=str(path), DISTCC_DIR=str(root),
+                   DISTCC_HOSTS='127.0.0.1/2 --localslots_cpp=2',
+                   DISTCC_BROKER_IDLE='10', DISTCC_RECONNECT_TIMEOUT='30',
+                   DISTCC_FALLBACK='0', TMPDIR=str(root))
+        args = ['systemd-socket-activate', '--seqpacket', '-l', str(path)]
+        for name in ('DISTCC_HOSTS', 'DISTCC_DIR', 'DISTCC_BROKER_IDLE'):
+            args.extend(['-E', name])
+        # Keep LISTEN_PID and the inherited descriptor while dropping privilege.
+        args.extend([sys.executable, '-c',
+                     'import os, sys; os.setgroups([]); os.setgid(int(sys.argv[1])); '
+                     'os.setuid(int(sys.argv[1])); os.execv(sys.argv[2], sys.argv[2:])',
+                     str(uid), *command, str(path)])
+        log = open(root / 'activation.log', 'w+')
+        self.addCleanup(log.close)
+        proc = subprocess.Popen(args, env=env, stdout=log, stderr=log)
+        def stop():
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=5)
+        self.addCleanup(stop)
+        deadline = time.monotonic() + 5
+        while not path.exists():
+            self.assertIsNone(proc.poll())
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        os.chown(path, owner, -1)
+        path.chmod(0o600)
+        return root, env, owner
+
+    def test_root_socket_activation_from_build_user_namespace(self):
+        if not shutil.which('bwrap'):
+            self.skipTest('bwrap required')
+        build = Path.cwd()
+        owner = build.stat().st_uid
+        root, env, owner = self.activate_broker([str(build / 'distccd'), '--broker'], owner)
+        isolation = ['bwrap', '--ro-bind', '/', '/', '--bind', str(root), str(root),
+                     '--uid', str(owner), '--gid', str(owner)]
+        check = subprocess.run([*isolation, 'true'], user=owner, group=owner,
+                               extra_groups=[], capture_output=True)
+        if check.returncode:
+            self.skipTest('unprivileged user namespaces unavailable: ' + check.stderr.decode())
+        probe = ('import os, socket, struct; '
+                 's = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET); '
+                 's.connect(os.environ["DISTCC_BROKER"]); '
+                 'uid = struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]; '
+                 'assert uid not in (0, os.geteuid()), uid')
+        subprocess.run([*isolation, sys.executable, '-c', probe], env=env, user=owner,
+                       group=owner, extra_groups=[], check=True, capture_output=True, timeout=3)
+        result = subprocess.run([*isolation, str(build / 'distcc'), 'gcc', '-E', '-P', '-'],
+                                env=env, user=owner, group=owner, extra_groups=[],
+                                input=b'42\n', capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), b'42')
+
+    def test_root_socket_does_not_authenticate_foreign_reply_sender(self):
+        responder = ('import socket, struct; '
+                     's = socket.socket(fileno=3); c, _ = s.accept(); c.recv(4096); '
+                     'c.sendall(struct.pack("=ii1024s", 0, 99, b""))')
+        _, env, owner = self.activate_broker([sys.executable, '-c', responder], 65534)
+        result = subprocess.run([str(Path.cwd() / 'distcc'), '-j'], env=env,
+                                user=owner, group=owner, extra_groups=[],
+                                capture_output=True, timeout=3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'Permission denied', result.stderr)
+
     def test_root_build_phase_and_foreign_user(self):
         build = Path.cwd()
         owner = build.stat().st_uid

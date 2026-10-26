@@ -182,11 +182,14 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
     struct { struct request header; struct dcc_work_hint hint; } request = {{ BROKER_VERSION, command }, {0}};
     size_t request_size = sizeof(request.header);
     if (hint) { request.hint = *hint; request_size = sizeof(request); }
-    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control;
+    union {
+        struct cmsghdr align;
+        char bytes[CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))];
+    } control;
     struct iovec iov = { reply, sizeof(*reply) };
     struct msghdr msg = {0};
     struct cmsghdr *cmsg;
-    int fd, error;
+    int fd, error, passcred = 1, authenticated = 0, received_fds = 0;
     ssize_t n = -1;
     *net = -1;
     if (unix_address(getenv("DISTCC_BROKER"), &address))
@@ -194,6 +197,10 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
     fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return -1;
+    /* Authenticate the reply sender, not the listener's creator. A systemd
+     * listener belongs to root, whose UID may be unmapped in a build userns. */
+    if (setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &passcred, sizeof(passcred)))
+        goto failed;
     if (deadline) {
         struct timeval timeout;
         double remaining = deadline - now_seconds();
@@ -210,19 +217,11 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
     }
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)))
         goto failed;
-    struct ucred credentials;
-    socklen_t credentials_size = sizeof(credentials);
-    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &credentials_size))
+    if (send(fd, &request, request_size, MSG_NOSIGNAL) != (ssize_t)request_size &&
+        errno != EPIPE && errno != ECONNRESET)
         goto failed;
-    /* A foreign user's broker will reject us; that is not a reconnectable
-     * outage. Root may share a build user's broker during privileged phases.
-     * A systemd-owned activation listener reports root as its peer. */
-    if (geteuid() != 0 && credentials.uid != geteuid() && credentials.uid != 0) {
-        errno = EACCES;
-        goto failed;
-    }
-    if (send(fd, &request, request_size, MSG_NOSIGNAL) != (ssize_t)request_size)
-        goto failed;
+    /* A rejected client can receive an error even if the broker closed before
+     * send(). Read that reply so an access denial is not retried as an outage. */
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.bytes;
@@ -232,23 +231,41 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
     } while (n < 0 && errno == EINTR);
     for (cmsg = CMSG_FIRSTHDR(&msg); n >= 0 && cmsg;
          cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
-            cmsg->cmsg_len == CMSG_LEN(sizeof(int)))
-            memcpy(net, CMSG_DATA(cmsg), sizeof(*net));
+        if (cmsg->cmsg_level != SOL_SOCKET)
+            continue;
+        if (cmsg->cmsg_type == SCM_CREDENTIALS &&
+            cmsg->cmsg_len == CMSG_LEN(sizeof(struct ucred))) {
+            struct ucred credentials;
+            memcpy(&credentials, CMSG_DATA(cmsg), sizeof(credentials));
+            authenticated = geteuid() == 0 || credentials.uid == geteuid() || credentials.uid == 0;
+        } else if (cmsg->cmsg_type == SCM_RIGHTS) {
+            size_t offset, size = cmsg->cmsg_len - CMSG_LEN(0);
+            for (offset = 0; offset + sizeof(int) <= size; offset += sizeof(int)) {
+                int received;
+                memcpy(&received, (char *)CMSG_DATA(cmsg) + offset, sizeof(received));
+                if (!received_fds++) *net = received;
+                else close(received);
+            }
+        }
     }
     if (n <= 0) {
         if (!n) errno = ECONNRESET;
         goto failed;
     }
+    if (!authenticated) {
+        errno = EACCES;
+        goto failed;
+    }
     if (n != sizeof(*reply) || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
-        !memchr(reply->host, '\0', sizeof(reply->host))) {
+        received_fds > 1 || !memchr(reply->host, '\0', sizeof(reply->host))) {
         errno = EPROTO;
         goto failed;
     }
     if (reply->status) {
         /* Admission can be temporarily unavailable while failed workers
          * restart or remain in backoff. No job has been sent on this lease. */
-        errno = reply->status == EXIT_CONNECT_FAILED ? EHOSTUNREACH : EPROTO;
+        errno = reply->status == EXIT_ACCESS_DENIED ? EACCES :
+                reply->status == EXIT_CONNECT_FAILED ? EHOSTUNREACH : EPROTO;
         goto failed;
     }
     if (((command == ACQUIRE || command == ACQUIRE_POOL || command == ACQUIRE_CPP ||
@@ -1303,8 +1320,13 @@ static void accept_client(struct broker *broker, int listener_fd)
     int i, fd = accept4(listener_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (fd < 0)
         return;
-    if (!getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size) &&
-        (credentials.uid == geteuid() || credentials.uid == 0)) {
+    if (!getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size)) {
+        if (credentials.uid != geteuid() && credentials.uid != 0) {
+            struct reply reply = { .status = EXIT_ACCESS_DENIED };
+            send_reply(fd, &reply, -1);
+            close(fd);
+            return;
+        }
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *client = &broker->clients[i];
             if (client->fd < 0) {
