@@ -100,9 +100,13 @@ def log_summary(paths):
     assignments = {}
     completed = {}
     jobs = set()
+    decision_wait = dict(with_ready_seconds=0.0, without_ready_seconds=0.0,
+                         unclassified_seconds=0.0, incomplete_requests=0)
+    traced = False
     for path in paths:
         if not path.exists():
             continue
+        pending = {}
         with path.open(errors='replace') as stream:
             for line in stream:
                 counts['analysis_warnings'] += 'include server gave up analyzing' in line
@@ -114,19 +118,41 @@ def log_summary(paths):
                     counts['local_slot_waits'] += 1
                     counts['local_slot_wait_seconds'] += int(local_wait[1]) / 1000
                 if 'job cost:' in line:
-                    fields = dict(re.findall(r'(\w+)=([^ ]+)', line))
+                    fields = dict(re.findall(r'(\w+)=(\S+)', line))
                     timings.append({key: float(fields[key]) for key in ('prepare', 'queue', 'execute')})
                     host = fields['host'].strip()
                     kinds = completed.setdefault(host, {})
                     kind = fields.get('kind', 'unknown')
                     kinds[kind] = kinds.get(kind, 0) + 1
                 if 'assigning host=' in line and 'broker_wait=' in line:
-                    fields = dict(re.findall(r'(\w+)=([^ ]+)', line))
+                    fields = dict(re.findall(r'(\w+)=(\S+)', line))
                     waits.append(float(fields['broker_wait']))
                     host = fields['host']
                     assignments[host] = assignments.get(host, 0) + 1
+                waiting = 'waiting for host=' in line
+                assigning = 'assigning host=' in line
+                if waiting or assigning:
+                    fields = dict(re.findall(r'(\w+)=(\S+)', line))
+                    if {'now', 'client', 'request'} <= fields.keys():
+                        traced = True
+                        key = fields['client'], fields['request']
+                        now = float(fields['now'])
+                        previous = pending.pop(key, None)
+                        with_ready = without_ready = 0.0
+                        if previous is not None:
+                            start, ready, with_ready, without_ready = previous
+                            if ready:
+                                with_ready += now - start
+                            else:
+                                without_ready += now - start
+                        if waiting:
+                            pending[key] = now, int(fields['ready']) > 0, with_ready, without_ready
+                        else:
+                            decision_wait['with_ready_seconds'] += with_ready
+                            decision_wait['without_ready_seconds'] += without_ready
                 if 'ninja ' in line:
                     jobs.update(map(int, re.findall(r'(?:^|\s)-j\s*(\d+)', line)))
+        decision_wait['incomplete_requests'] += len(pending)
     phases = {key: dict(total_seconds=sum(t[key] for t in timings),
                         mean_seconds=sum(t[key] for t in timings) / len(timings),
                         max_seconds=max(t[key] for t in timings))
@@ -134,8 +160,11 @@ def log_summary(paths):
     if waits:
         phases['broker_wait'] = dict(total_seconds=sum(waits), mean_seconds=sum(waits) / len(waits),
                                     max_seconds=max(waits))
+    decision_wait['unclassified_seconds'] = (sum(waits) - decision_wait['with_ready_seconds']
+                                             - decision_wait['without_ready_seconds'])
     return dict(**counts, feedback_jobs=len(timings), assignments=assignments,
-                completed_by_host_kind=completed, phases=phases, ninja_jobs=sorted(jobs))
+                completed_by_host_kind=completed, phases=phases, ninja_jobs=sorted(jobs),
+                decision_wait=decision_wait if traced else None)
 
 
 def repository_revision(ebuild):

@@ -169,6 +169,21 @@ class StatisticsTest(unittest.TestCase):
             self.assertEqual(result['completed_by_host_kind'], {'worker': {'4': 1, '8': 1}})
             self.assertEqual(result['phases']['queue']['max_seconds'], .3)
 
+    def test_wait_timeline_distinguishes_ready_capacity_and_unobserved_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'broker.log'
+            path.write_text('waiting for host=fast ready=1 now=10 client=3 request=10 key=ab\n'
+                            'waiting for host=fast ready=0 now=10.25 client=3 request=10 key=ab\n'
+                            'assigning host=fast broker_wait=.75 now=10.75 client=3 request=10\n'
+                            'assigning host=slow broker_wait=.01 now=20 client=4 request=19.99\n'
+                            'waiting for host=fast ready=1 now=30 client=3 request=30\n'
+                            'waiting for host=fast ready=0 now=30.5 client=3 request=30\n')
+            result = measure.log_summary([path])['decision_wait']
+            self.assertEqual(result['with_ready_seconds'], .25)
+            self.assertEqual(result['without_ready_seconds'], .5)
+            self.assertAlmostEqual(result['unclassified_seconds'], .01)
+            self.assertEqual(result['incomplete_requests'], 1)
+
 
 class ConfigurationTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which('distcc'), 'distcc required')

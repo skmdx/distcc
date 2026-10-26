@@ -799,7 +799,7 @@ static struct prediction predict(struct broker *broker, const struct client *cli
     return result;
 }
 
-static void observe(struct broker *broker, struct client *client, const struct feedback *timing)
+static void observe(struct broker *broker, struct client *client, const struct feedback *timing, double now)
 {
     if (!client->hint.key || !timing->execute_ns || client->factor <= 0 ||
         timing->execute_ns > 86400ULL * 1000000000 ||
@@ -820,11 +820,12 @@ static void observe(struct broker *broker, struct client *client, const struct f
         *previous = .875 * prior + .125 * sample;
     }
     rs_trace("job cost: key=%llx kind=%u bytes=%llu units=%u predicted=%.6f factor=%.6f "
-             "execute=%.6f prepare=%.6f queue=%.6f normalized=%.6f host=%s",
+             "execute=%.6f prepare=%.6f queue=%.6f normalized=%.6f host=%s now=%.6f client=%td request=%.6f",
              (unsigned long long)client->hint.key, client->hint.kind,
              (unsigned long long)client->hint.bytes, client->hint.work_units,
              client->cost, client->factor, timing->execute_ns / 1e9,
-             timing->prepare_ns / 1e9, timing->queue_ns / 1e9, cost, peer->host->hostname);
+             timing->prepare_ns / 1e9, timing->queue_ns / 1e9, cost, peer->host->hostname,
+             now, client - broker->clients, client->waiting_since);
 }
 
 static unsigned long long memory_estimate(const struct dcc_capacity *cap,
@@ -853,7 +854,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         }
         return 0;
     }
-    int i, slots, available = 0;
+    int i, slots, available = 0, ready_hosts = 0;
     double work_rate = 0, min_rate = 0;
     struct selection {
         int peer, probe, wait, idle;
@@ -1050,9 +1051,15 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             }
             double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;
-            rs_trace("candidate host=%s work=%d capacity=%d cost=%.3f factor=%.3f prepare=%.3f start=%.3f score=%.3f wait=%d",
+            rs_trace("candidate host=%s work=%d capacity=%d cost=%.3f factor=%.3f prepare=%.3f start=%.3f score=%.3f wait=%d "
+                     "finish=%.6f blocked=%d busy=%d preparing=%d queued=%d leases=%d planned=%u "
+                     "now=%.6f client=%td request=%.6f key=%llx",
                      p->host->hostname, work, cap ? cap->capacity : -1, cost,
-                     forecast.factor, forecast.prepare, forecast.start, score, wait);
+                     forecast.factor, forecast.prepare, forecast.start, score, wait,
+                     forecast.finish, blocked, cap ? cap->busy : -1, cap ? cap->preparing : -1,
+                     cap ? cap->queued : -1, p->busy, batch->count,
+                     now, client - broker->clients, client->waiting_since,
+                     (unsigned long long)client->hint.key);
             /* Without any input description there is no completion estimate
              * with which to justify waiting instead of using an idle CPU. */
             int idle = !cost && staged && cap && !blocked && work < dcc_capacity_jobs(p->host, cap);
@@ -1060,6 +1067,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             if (best.peer < 0 || idle > best.idle || (idle == best.idle &&
                 (score < best.score || (score == best.score && fill < best.fill)))) best = candidate;
             if (predicted && !wait) {
+                ready_hosts++;
                 if (ready.peer < 0 || forecast.finish < ready_finish)
                     ready_finish = forecast.finish;
                 if (ready.peer < 0 || score < ready.score ||
@@ -1093,7 +1101,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
     } else if (best.peer >= 0 && best.wait) {
-        rs_trace("waiting for host=%s cost=%.3f score=%.3f", broker->peers[best.peer].host->hostname, cost, best.score);
+        rs_trace("waiting for host=%s cost=%.3f score=%.3f finish=%.6f ready=%d ready_finish=%.6f "
+                 "now=%.6f client=%td request=%.6f key=%llx",
+                 broker->peers[best.peer].host->hostname, cost, best.score, best.forecast.finish,
+                 ready_hosts, ready_finish, now, client - broker->clients, client->waiting_since,
+                 (unsigned long long)client->hint.key);
         unsigned index = batch->count++;
         batch->planned[index].peer = best.peer;
         batch->planned[index].cost = cost;
@@ -1104,9 +1116,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         client->deadline = now + delay;
     } else if (best.peer >= 0 && (!local_cpp || broker->cpp_busy < broker->cpp_limit)) {
         struct peer *p = &broker->peers[best.peer];
-        rs_trace("assigning host=%s cost=%.3f score=%.3f broker_wait=%.6f key=%llx units=%u",
+        rs_trace("assigning host=%s cost=%.3f score=%.3f broker_wait=%.6f key=%llx units=%u "
+                 "now=%.6f client=%td request=%.6f",
                  p->host->hostname, cost, best.score, now - client->waiting_since,
-                 (unsigned long long)client->hint.key, client->hint.work_units);
+                 (unsigned long long)client->hint.key, client->hint.work_units,
+                 now, client - broker->clients, client->waiting_since);
         client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
                             p->admission_supported && p->pool_supported >= 0;
         client->net = client->command != ACQUIRE ? pool_take(broker, best.peer, now) : -1;
@@ -1598,7 +1612,7 @@ int dcc_broker_serve(const char *path)
                         struct peer *p = &broker->peers[c->peer];
                         struct feedback timing;
                         memcpy(&timing, packet.payload, sizeof(timing));
-                        observe(broker, c, &timing);
+                        observe(broker, c, &timing, now);
                         if (c->serial <= p->observed_serial) p->completed++;
                         pool_store(broker, c, returned, now);
                     } else close(returned);
