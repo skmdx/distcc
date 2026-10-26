@@ -62,6 +62,9 @@ Workers preserve
 LLVM's embedded import paths in a private namespace. The final native link
 runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache
 remains in use, so warm cache entries do not start backend jobs.
+Each backend still optimizes and generates code for one LLVM module. A large
+module can outlive the other backends and leave workers idle near the end of
+the link. Module partitioning is not implemented in this path.
 Clang 22 and 23 are exercised by the integration tests. Compiler acceptance and
 the final link determine compatibility; version metadata is not a rejection gate.
 Existing whole-link offload remains available for other links with
