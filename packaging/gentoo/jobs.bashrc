@@ -46,7 +46,7 @@ distcc_configure_jobs() {
     # Preserve user/package wrappers and clear only our saved-phase value when
     # a package restricts distribution.
     for variable in RUSTC_WRAPPER CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER CMAKE_HIP_COMPILER_LAUNCHER \
-                    CMAKE_C_LINKER_LAUNCHER CMAKE_CXX_LINKER_LAUNCHER; do
+                    CMAKE_C_LINKER_LAUNCHER CMAKE_CXX_LINKER_LAUNCHER CMAKE_HIP_LINKER_LAUNCHER; do
         marker=distcc_auto_${variable}
         if [[ ${!marker} && ${!variable} == "${!marker}" ]]; then
             unset "${variable}" "${marker}"

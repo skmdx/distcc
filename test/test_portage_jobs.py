@@ -33,14 +33,14 @@ echo "${CMAKE_C_COMPILER_LAUNCHER-unset} ${CMAKE_CXX_COMPILER_LAUNCHER-unset}"
 
     def test_cmake_link_launchers_follow_distribution_policy(self):
         self.assertEqual(self.run_hook('''
-echo "$CMAKE_C_LINKER_LAUNCHER $CMAKE_CXX_LINKER_LAUNCHER"
+echo "$CMAKE_C_LINKER_LAUNCHER $CMAKE_CXX_LINKER_LAUNCHER $CMAKE_HIP_LINKER_LAUNCHER"
 RESTRICT=distcc
 source "$JOBS_HOOK"
-echo "${CMAKE_C_LINKER_LAUNCHER-unset} ${CMAKE_CXX_LINKER_LAUNCHER-unset}"
-RESTRICT= CMAKE_CXX_LINKER_LAUNCHER=custom-linker
+echo "${CMAKE_C_LINKER_LAUNCHER-unset} ${CMAKE_CXX_LINKER_LAUNCHER-unset} ${CMAKE_HIP_LINKER_LAUNCHER-unset}"
+RESTRICT= CMAKE_CXX_LINKER_LAUNCHER=custom-linker CMAKE_HIP_LINKER_LAUNCHER=custom-hip-linker
 source "$JOBS_HOOK"
-echo "$CMAKE_C_LINKER_LAUNCHER $CMAKE_CXX_LINKER_LAUNCHER"
-'''), ['distcc distcc', 'unset unset', 'distcc custom-linker'])
+echo "$CMAKE_C_LINKER_LAUNCHER $CMAKE_CXX_LINKER_LAUNCHER $CMAKE_HIP_LINKER_LAUNCHER"
+'''), ['distcc distcc distcc', 'unset unset unset', 'distcc custom-linker custom-hip-linker'])
 
     def test_prepare_exports_jobs_before_ebuild_derives_cargo_parallelism(self):
         self.assertEqual(self.run_hook('''

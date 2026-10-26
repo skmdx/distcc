@@ -179,23 +179,30 @@ class ThinLTOTest(BrokerTestCase):
 
     @unittest.skipUnless(shutil.which('cmake') and shutil.which('ninja'), 'CMake and Ninja required')
     def test_cmake_link_launcher(self):
-        (self.work / 'part.c').write_text('int value(void) { return 42; }')
-        (self.work / 'main.c').write_text('int value(void); int main(void) { return value()!=42; }')
-        (self.work / 'CMakeLists.txt').write_text(
-            'cmake_minimum_required(VERSION 3.21)\nproject(distributed_lto C)\n'
-            'add_executable(check main.c part.c)\n'
-            'set_property(TARGET check PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)\n')
-        self.env.update(CMAKE_C_LINKER_LAUNCHER='distcc', CMAKE_C_COMPILER_LAUNCHER='distcc')
-        compiler = shutil.which('clang')
-        assert compiler is not None
-        result = self.run_command(['cmake', '-S', '.', '-B', 'build', '-G', 'Ninja',
-                                   '-DCMAKE_C_COMPILER=' + compiler,
-                                   '-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld'])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        result = self.run_command(['cmake', '--build', 'build'])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((result.stdout + result.stderr).count('distcc-thinlto: compiled on'), 2)
-        self.assertEqual(self.run_command([self.work / 'build/check']).returncode, 0)
+        for language, suffix, driver in (('C', 'c', 'clang'), ('HIP', 'hip', 'clang++')):
+            with self.subTest(language=language):
+                source = self.work / language
+                source.mkdir()
+                (source / ('part.' + suffix)).write_text('int value(void) { return 42; }')
+                (source / ('main.' + suffix)).write_text('int value(void); int main(void) { return value()!=42; }')
+                (source / 'CMakeLists.txt').write_text(
+                    f'cmake_minimum_required(VERSION 3.21)\nproject(distributed_lto {language})\n'
+                    f'add_executable(check main.{suffix} part.{suffix})\n'
+                    'target_compile_options(check PRIVATE -flto=thin)\n'
+                    'target_link_options(check PRIVATE -flto=thin -fuse-ld=lld)\n')
+                self.env[f'CMAKE_{language}_LINKER_LAUNCHER'] = 'distcc'
+                self.env[f'CMAKE_{language}_COMPILER_LAUNCHER'] = 'distcc'
+                compiler = shutil.which(driver)
+                assert compiler is not None
+                build = source / 'build'
+                result = self.run_command(['cmake', '-S', source, '-B', build, '-G', 'Ninja',
+                                           f'-DCMAKE_{language}_COMPILER=' + compiler,
+                                           *(['-DCMAKE_HIP_ARCHITECTURES=gfx900'] if language == 'HIP' else [])])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                result = self.run_command(['cmake', '--build', build])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((result.stdout + result.stderr).count('distcc-thinlto: compiled on'), 2)
+                self.assertEqual(self.run_command([build / 'check']).returncode, 0)
 
     def test_absolute_clang_preserves_client_target(self):
         selected = shutil.which('clang')

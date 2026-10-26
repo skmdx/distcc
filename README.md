@@ -78,11 +78,13 @@ Build the wrapper by setting `LLVM_WRAPPER_SOURCE` to the matching upstream
 `clang/tools/clang-linker-wrapper` source directory, with `LLVM_CONFIG` selecting
 the installed LLVM headers and libraries. The Gentoo package provides both.
 
-The Portage hook exports CMake's C/C++ linker launchers as well as compiler
+The Portage hook exports CMake's C/C++/HIP linker launchers as well as compiler
 launchers, respecting `RESTRICT=distcc` and explicit user overrides. Existing
 CMake build directories must be reconfigured to populate these launcher values;
 new Portage builds receive them automatically. Outside Portage, set
-`CMAKE_C_LINKER_LAUNCHER=distcc` and `CMAKE_CXX_LINKER_LAUNCHER=distcc` when configuring.
+`CMAKE_C_LINKER_LAUNCHER=distcc`, `CMAKE_CXX_LINKER_LAUNCHER=distcc` and
+`CMAKE_HIP_LINKER_LAUNCHER=distcc` when configuring. HIP linker launchers require
+CMake 4.1 or later.
 
 Rust builds use Cargo's compiler wrapper interface:
 
