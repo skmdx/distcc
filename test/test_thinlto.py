@@ -3,12 +3,17 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import shlex
 import subprocess
+import sys
 import unittest
 
 from test_broker import BrokerTestCase
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from distcc_job import fingerprint, write_metadata
 
 
 @unittest.skipUnless(shutil.which('clang') and shutil.which('bwrap'), 'Clang and bubblewrap required')
@@ -80,6 +85,76 @@ class ThinLTOTest(BrokerTestCase):
 
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
+
+    def test_ranked_submission_survives_slow_process_start(self):
+        """Use real workers while delaying the largest job before broker IPC."""
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={self.stats_ports[i]}')
+                                  for i in range(2)), name='ranked')
+        planner = self.work / 'planner'
+        planner.mkdir()
+        for name in ('distcc-thinlto', 'distcc_lto.py', 'distcc_job.py'):
+            shutil.copy2(self.build / name, planner / name)
+        proxy = planner / 'distcc'
+        proxy.write_text('#!/usr/bin/env python3\nimport os, sys, time\n'
+                         'if len(sys.argv) > 2 and sys.argv[2].endswith("/0/job"):\n'
+                         '    time.sleep(0.2)\n'
+                         'os.execv(' + repr(str(self.build / 'distcc')) + ', sys.argv)\n')
+        proxy.chmod(0o755)
+        compiler = shutil.which('clang')
+        self.assertIsNotNone(compiler)
+        jobs, sizes, objects = [], [], []
+        for index, size in enumerate((8192, 2048, 512)):
+            source = self.work / f'part{index}.c'
+            source.write_text(f'int value{index}(void) {{ return {index + 1}; }}\n'
+                              f'const char pad{index}[] = "' + 'a' * size + '";\n')
+            bitcode = source.with_suffix('.bc')
+            result = self.run_command([compiler, '-emit-llvm', '-c', source, '-o', bitcode])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = source.with_suffix('.o')
+            objects.append(output)
+            sizes.append(bitcode.stat().st_size)
+            jobs.append(dict(args=['-O2', '-c', str(bitcode), '-o', str(output)],
+                             inputs=[str(bitcode)], outputs=[str(output)]))
+        description = self.work / 'jobs.json'
+        description.write_text(json.dumps(dict(common=dict(args=[compiler], inputs=[]), jobs=jobs)))
+        command = [planner / 'distcc-thinlto', description]
+        result = self.run_command(command)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        assigned = list(map(int, re.findall(r'assigning host=.* source=(\d+)',
+                                           (self.work / 'ranked.log').read_text())))
+        self.assertEqual(assigned, sorted(sizes, reverse=True))
+        main = self.work / 'main.c'
+        main.write_text('int value0(void), value1(void), value2(void);\n'
+                        'int main(void) { return value0()+value1()+value2()!=6; }\n')
+        result = self.run_command([compiler, main, *objects, '-o', 'check'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_command([self.work / 'check']).returncode, 0)
+        # A child failing before enqueueing must release the startup barrier
+        # and leave previously published objects intact.
+        previous = [path.read_bytes() for path in objects]
+        self.env.update(DISTCC_BROKER=str(self.work / 'absent.sock'), DISTCC_RECONNECT_TIMEOUT='0')
+        self.assertNotEqual(self.run_command(command).returncode, 0)
+        self.assertEqual([path.read_bytes() for path in objects], previous)
+
+    def test_closed_submission_notification_cancels_without_reconnect(self):
+        inputs = self.work / 'inputs'
+        inputs.mkdir()
+        source = inputs / '0'
+        source.write_bytes(b'')
+        metadata, output = self.work / 'job', self.work / 'result.tar'
+        write_metadata(4, str(self.work), 'distcc-thinlto',
+                       [(str(self.work / 'empty.bc'), *fingerprint(source))], metadata)
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        try:
+            result = subprocess.run([str(self.build / 'distcc'), '--file-job', str(metadata),
+                str(inputs), str(output), str(write_fd)], env=self.env, capture_output=True,
+                pass_fds=(write_fd,), timeout=3)
+        finally:
+            os.close(write_fd)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(output.exists())
 
     def test_hip_wrapper_distributes_host_thinlto(self):
         self.link(shutil.which('clang'), hip=True)

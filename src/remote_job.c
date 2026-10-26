@@ -257,9 +257,10 @@ done:
     return transport_complete && ret ? DCC_REMOTE_LOCAL_ERROR : ret;
 }
 
-/* The Rust planner owns immutable numbered snapshots. Scheduling, caching,
- * compression, cancellation and connection reuse stay on the ordinary path. */
-int dcc_file_transfer(const char *metadata, const char *snapshots, const char *output)
+/* Planners own immutable numbered snapshots. Scheduling, caching, compression,
+ * cancellation and connection reuse stay on the ordinary path. queued_fd is
+ * consumed after enqueueing, or closed on an earlier failure. */
+int dcc_file_transfer(const char *metadata, const char *snapshots, const char *output, int queued_fd)
 {
     struct dcc_job *job = NULL;
     struct dcc_hostdef *host = NULL;
@@ -298,7 +299,7 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
     }
     unsigned failures = 0;
     for (;;) {
-        if ((ret = dcc_broker_acquire(&host, &lease, 1, &hint))) goto done;
+        if ((ret = dcc_broker_acquire(&host, &lease, 1, &hint, &queued_fd))) goto done;
         if (!host->tcp_jobs) { ret = EXIT_PROTOCOL_ERROR; goto done; }
         dcc_broker_cpp_done(host);
         ret = dcc_tcp_exchange(host, job, files, NULL, output, NULL, &result);
@@ -334,6 +335,7 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
         fprintf(stderr, "%s: compiled on %s\n",
                 dcc_job_helper(job), host->hostname);
 done:
+    if (queued_fd >= 0) close(queued_fd);
     dcc_job_result_free(&result);
     if (host) dcc_free_hostdef(host);
     if (lease >= 0) close(lease);

@@ -54,7 +54,10 @@ broker's measured capacity and an independent learned ThinLTO workload class.
 Inputs are snapshotted and hashed once per link, shared across backend jobs,
 and transferred through the existing LZ4/content-cache path. Larger primary
 modules are submitted first so long backends can start while faster workers
-are available. Execution order does not change LLD's output or constructor order.
+are available. The planner waits only for each request to enter the broker queue
+before submitting the next; transfer and execution overlap. Different manifest
+sizes and process startup times therefore do not reverse submission priority.
+Execution order does not change LLD's output or constructor order.
 Workers preserve
 LLVM's embedded import paths in a private namespace. The final native link
 runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache

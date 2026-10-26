@@ -176,7 +176,7 @@ static int send_reply(int fd, const struct reply *reply, int net)
 }
 
 static int broker_request_once(uint32_t command, struct reply *reply, int *net,
-                               const struct dcc_work_hint *hint, double deadline)
+                               const struct dcc_work_hint *hint, double deadline, int *queued_fd)
 {
     struct sockaddr_un address;
     struct { struct request header; struct dcc_work_hint hint; } request = {{ BROKER_VERSION, command }, {0}};
@@ -217,9 +217,23 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
     }
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)))
         goto failed;
-    if (send(fd, &request, request_size, MSG_NOSIGNAL) != (ssize_t)request_size &&
+    ssize_t sent = send(fd, &request, request_size, MSG_NOSIGNAL);
+    if (sent != (ssize_t)request_size &&
         errno != EPIPE && errno != ECONNRESET)
         goto failed;
+    /* A planner may start its next ranked job once this request is queued.
+     * Do not wait for admission: a memory-limited job must not prevent a
+     * later job from using a different available worker. */
+    if (sent == (ssize_t)request_size && queued_fd && *queued_fd >= 0) {
+        ssize_t written;
+        do { written = write(*queued_fd, "Q", 1); } while (written < 0 && errno == EINTR);
+        if (written != 1) {
+            if (errno == EPIPE) errno = ECANCELED; /* Planner exit is not a broker outage. */
+            goto failed;
+        }
+        close(*queued_fd);
+        *queued_fd = -1;
+    }
     /* A rejected client can receive an error even if the broker closed before
      * send(). Read that reply so an access denial is not retried as an outage. */
     msg.msg_iov = &iov;
@@ -287,7 +301,7 @@ failed:
 }
 
 static int broker_request(uint32_t command, struct reply *reply, int *net,
-                          const struct dcc_work_hint *hint)
+                          const struct dcc_work_hint *hint, int *queued_fd)
 {
     double deadline = 0;
     int delay = 100, fd;
@@ -295,7 +309,7 @@ static int broker_request(uint32_t command, struct reply *reply, int *net,
     int timeout = setting ? atoi(setting) : 90;
     /* Closing a failed control socket releases its lease. No compiler request
      * has been sent yet, so reconnecting cannot replay a completed job. */
-    while ((fd = broker_request_once(command, reply, net, hint, deadline)) < 0) {
+    while ((fd = broker_request_once(command, reply, net, hint, deadline, queued_fd)) < 0) {
         int error = errno;
         if (error != ENOENT && error != ECONNREFUSED &&
             error != ECONNRESET && error != EPIPE &&
@@ -317,12 +331,13 @@ int dcc_broker_local_cpp(int *lease, int *occupied, int analysis)
 {
     struct reply reply;
     int net;
-    *lease = broker_request(analysis ? LOCAL_ANALYSIS : LOCAL_CPP, &reply, &net, NULL);
+    *lease = broker_request(analysis ? LOCAL_ANALYSIS : LOCAL_CPP, &reply, &net, NULL, NULL);
     if (*lease >= 0) *occupied = reply.slots;
     return *lease < 0 ? EXIT_CONNECT_FAILED : 0;
 }
 
-int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, const struct dcc_work_hint *hint)
+int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready,
+                       const struct dcc_work_hint *hint, int *queued_fd)
 {
     struct reply reply;
     struct dcc_hostdef *local = NULL;
@@ -332,7 +347,8 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, con
         return EXIT_BAD_HOSTSPEC;
     free_hosts(local);
     int remote_cpp = getenv("INCLUDE_SERVER_PORT") != NULL;
-    fd = broker_request(remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL, &reply, &net, hint);
+    fd = broker_request(remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL,
+                        &reply, &net, hint, queued_fd);
     if (fd < 0)
         return EXIT_CONNECT_FAILED;
     *host = NULL;
@@ -386,7 +402,7 @@ void dcc_broker_defer(const struct dcc_hostdef *host)
 int dcc_broker_jobs(void)
 {
     struct reply reply;
-    int net, fd = broker_request(JOBS, &reply, &net, NULL);
+    int net, fd = broker_request(JOBS, &reply, &net, NULL, NULL);
     if (fd < 0)
         return -1;
     close(fd);
@@ -1056,8 +1072,9 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         client->deadline = now + delay;
     } else if (best.peer >= 0 && (!local_cpp || broker->cpp_busy < broker->cpp_limit)) {
         struct peer *p = &broker->peers[best.peer];
-        rs_trace("assigning host=%s cost=%.3f score=%.3f broker_wait=%.6f",
-                 p->host->hostname, cost, best.score, now - client->waiting_since);
+        rs_trace("assigning host=%s cost=%.3f score=%.3f broker_wait=%.6f key=%llx source=%u",
+                 p->host->hostname, cost, best.score, now - client->waiting_since,
+                 (unsigned long long)client->hint.key, client->hint.source_bytes);
         client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
                             p->admission_supported && p->pool_supported >= 0;
         client->net = client->command != ACQUIRE ? pool_take(broker, best.peer, now) : -1;

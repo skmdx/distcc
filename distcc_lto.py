@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """LLVM-generated link jobs over distcc's shared input transport."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 import os
 from pathlib import Path
@@ -42,7 +42,11 @@ def distribute(description, kind):
                     snapshot(name, path)
                     files[name] = (path, *fingerprint(path))
 
-        def execute(item):
+        helper = 'distcc-thinlto' if kind == 4 else 'distcc-offload-link'
+        env = dict(os.environ)
+        env.pop('INCLUDE_SERVER_PORT', None)
+
+        def start(item):
             index, task = item
             jobdir = work / str(index)
             inputs = jobdir / 'inputs'
@@ -59,20 +63,36 @@ def distribute(description, kind):
             manifest = inputs / str(len(entries))
             manifest.write_text(json.dumps(job))
             entries.append((CONTROL + '/job.json', *fingerprint(manifest)))
-            helper = 'distcc-thinlto' if kind == 4 else 'distcc-offload-link'
             write_metadata(kind, job['cwd'], helper, entries, jobdir / 'job')
             archive = jobdir / 'result.tar'
-            env = dict(os.environ)
-            env.pop('INCLUDE_SERVER_PORT', None)
-            result = subprocess.run([transport, '--file-job', str(jobdir / 'job'),
-                                     str(inputs), str(archive)], env=env, capture_output=True)
-            sys.stdout.buffer.write(result.stdout)
-            sys.stderr.buffer.write(result.stderr)
-            if result.returncode:
+            read_fd, write_fd = os.pipe()
+            with os.fdopen(read_fd, 'rb') as queued, os.fdopen(write_fd, 'wb') as channel:
+                process = subprocess.Popen([transport, '--file-job', str(jobdir / 'job'),
+                    str(inputs), str(archive), str(write_fd)], env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(write_fd,))
+                channel.close()
+                try:
+                    # Preserve ranked submission despite differing manifest
+                    # sizes and process startup times. Admission, transfer and
+                    # execution remain concurrent; only request enqueueing is
+                    # ordered. Early failures close the pipe and are collected.
+                    queued.read(1)
+                except BaseException:
+                    process.kill()
+                    process.communicate()
+                    raise
+            return process, job, archive
+
+        def collect(started):
+            process, job, archive = started
+            stdout, stderr = process.communicate()
+            sys.stdout.buffer.write(stdout)
+            sys.stderr.buffer.write(stderr)
+            if process.returncode:
                 if env.get('DISTCC_FALLBACK') != '0' and env.get('DISTCC_SKIP_LOCAL_RETRY') != '1':
                     print(helper + ': retrying backend locally', file=sys.stderr)
-                    return subprocess.call(command)
-                return result.returncode
+                    return subprocess.call(job['args'])
+                return process.returncode
             # Stage all declared artifacts before publishing any to LLD.
             with tarfile.open(archive) as tar:
                 members = tar.getmembers()
@@ -108,10 +128,18 @@ def distribute(description, kind):
 
         ordered = sorted(enumerate(jobs), key=weight, reverse=True)
         if len(ordered) == 1:
-            results = [execute(ordered[0])]
+            results = [collect(start(ordered[0]))]
         else:
-            with ThreadPoolExecutor(max_workers=min(len(jobs), max(1, slots))) as pool:
-                results = list(pool.map(execute, ordered))
+            limit = min(len(jobs), max(1, slots))
+            results = []
+            with ThreadPoolExecutor(max_workers=limit) as pool:
+                pending = set()
+                for item in ordered:
+                    if len(pending) == limit:
+                        finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+                        results.extend(task.result() for task in finished)
+                    pending.add(pool.submit(collect, start(item)))
+                results.extend(task.result() for task in pending)
         return next((result for result in results if result), 0)
 
 

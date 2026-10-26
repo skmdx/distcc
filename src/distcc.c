@@ -40,6 +40,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <limits.h>
 
 #include "distcc.h"
 #include "trace.h"
@@ -257,8 +258,18 @@ int main(int argc, char **argv)
     dcc_ignore_sigpipe(1);
 
     /* Private transport entry point used by file-based compiler planners. */
-    if (argc == 5 && !strcmp(argv[1], "--file-job"))
-        dcc_exit(dcc_file_transfer(argv[2], argv[3], argv[4]));
+    if ((argc == 5 || argc == 6) && !strcmp(argv[1], "--file-job")) {
+        long queued_fd = -1;
+        if (argc == 6) {
+            char *end;
+            errno = 0;
+            queued_fd = strtol(argv[5], &end, 10);
+            if (errno || !argv[5][0] || *end || queued_fd < 0 || queued_fd > INT_MAX ||
+                fcntl((int)queued_fd, F_GETFD) < 0)
+                dcc_exit(EXIT_BAD_ARGUMENTS);
+        }
+        dcc_exit(dcc_file_transfer(argv[2], argv[3], argv[4], (int)queued_fd));
+    }
 
     if (argc > 1 && (!strcmp(dcc_find_basename(argv[1]), "rustc") ||
                     !strncmp(dcc_find_basename(argv[1]), "rustc-", 6))) {
