@@ -399,13 +399,15 @@ void dcc_broker_defer(const struct dcc_hostdef *host)
         dcc_send_fd(host->broker_lease, &request, sizeof(request), host->broker_fd);
 }
 
-int dcc_broker_jobs(void)
+int dcc_broker_jobs(char **capacity)
 {
     struct reply reply;
     int net, fd = broker_request(JOBS, &reply, &net, NULL, NULL);
     if (fd < 0)
         return -1;
     close(fd);
+    if (capacity && !(*capacity = strdup(reply.host)))
+        return -1;
     return reply.slots;
 }
 
@@ -852,6 +854,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         return 0;
     }
     int i, slots, available = 0;
+    double work_rate = 0, min_rate = 0;
     struct selection {
         int peer, probe, wait, idle;
         double score, fill;
@@ -920,7 +923,15 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             continue;
         available++;
         if (client->command == JOBS) {
-            reply.slots += dcc_capacity_jobs(p->host, cap);
+            int jobs = dcc_capacity_jobs(p->host, cap);
+            reply.slots += jobs;
+            if (jobs > 0) {
+                double factor = cap ? execution_factor(p, jobs - 1, 0, cap->capacity) :
+                                      dcc_capacity_score(p->host, NULL, jobs - 1);
+                double rate = 1 / factor;
+                work_rate += jobs * rate;
+                if (!min_rate || rate < min_rate) min_rate = rate;
+            }
             continue;
         }
         if (p->valid_until < 0) continue; /* Admission was refused: refresh first. */
@@ -1048,6 +1059,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     if (best.wait && ready.peer >= 0 && best.forecast.finish >= ready_finish)
         best = ready;
     if (client->command == JOBS || !available) {
+        if (client->command == JOBS)
+            snprintf(reply.host, sizeof(reply.host),
+                     "{\"jobs\":%d,\"work_rate\":%.9g,\"min_rate\":%.9g}",
+                     reply.slots, work_rate, min_rate);
         if (!available && client->command != JOBS) {
             for (i = 0; i < broker->count; i++) {
                 struct peer *p = &broker->peers[i];
@@ -1677,16 +1692,19 @@ int dcc_broker_serve(const char *path)
     rs_log_error("the local broker requires Linux");
     return EXIT_BAD_ARGUMENTS;
 }
-int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, const struct dcc_work_hint *hint)
+int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready,
+                       const struct dcc_work_hint *hint, int *queued_fd)
 {
+    (void)queued_fd;
     (void)hint;
     (void)cpp_ready;
     (void)host;
     (void)lease;
     return EXIT_CONNECT_FAILED;
 }
-int dcc_broker_jobs(void)
+int dcc_broker_jobs(char **capacity)
 {
+    (void)capacity;
     return -1;
 }
 void dcc_broker_cpp_done(const struct dcc_hostdef *host)

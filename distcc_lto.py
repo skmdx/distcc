@@ -4,6 +4,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import heapq
 import itertools
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -68,7 +69,11 @@ def distribute(description, kind):
     if not jobs:
         return 0
     transport = str(Path(__file__).resolve().with_name('distcc'))
-    slots = max(1, int(subprocess.check_output([transport, '-j'], text=True)))
+    capacity = json.loads(subprocess.check_output([transport, '--lto-capacity'], text=True))
+    slots = max(1, capacity['jobs'])
+    # A shard should also fit the slowest worker's share of the link, rather
+    # than giving equal-size shards to CPUs with unequal service times.
+    parallelism = capacity['work_rate'] / capacity['min_rate'] if capacity['min_rate'] else slots
     with tempfile.TemporaryDirectory(prefix='distcc-lto-') as directory:
         work = Path(directory)
         # Snapshot and hash every distinct input once per link. Per-job trees
@@ -105,8 +110,9 @@ def distribute(description, kind):
                 task['instructions'] = row['instructions']
                 task['index'] = index
                 if total_instructions and len(task['outputs']) == 1:
-                    task['partitions'] = max(1, min(slots, row['functions'],
-                        (row['instructions'] * slots + total_instructions - 1) // total_instructions))
+                    useful = row['instructions'] // row['largest_function'] if row['largest_function'] else 1
+                    task['partitions'] = max(1, min(slots, row['functions'], useful,
+                        math.ceil(row['instructions'] * parallelism / total_instructions)))
 
         def priority(task):
             # Rank by the dominant share of this link's compute or data work.

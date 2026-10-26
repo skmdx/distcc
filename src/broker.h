@@ -11,7 +11,7 @@ void dcc_broker_defer(const struct dcc_hostdef *host);
 void dcc_broker_return(const struct dcc_hostdef *host, int fd, const struct dcc_job_result *);
 #define DCC_BROKER_POOLED (1 << 30)
 #define DCC_TCP_PIPELINE 4
-int dcc_broker_jobs(void);
+int dcc_broker_jobs(char **capacity);
 void dcc_broker_cpp_done(const struct dcc_hostdef *host);
 
 /* A cache miss returns a publishing lease; closing it abandons the probe.

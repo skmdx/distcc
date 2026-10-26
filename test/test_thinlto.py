@@ -11,6 +11,7 @@ import sys
 import unittest
 
 from test_broker import BrokerTestCase
+from test_adaptive import stats_response
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from distcc_job import fingerprint, write_metadata
@@ -88,6 +89,45 @@ class ThinLTOTest(BrokerTestCase):
 
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
+
+    def test_capacity_uses_worker_speed_without_increasing_concurrency(self):
+        metrics = stats_response(cpus=4, cores=4, jobs=4, capacity=4,
+                                 busy=0, queued=0, running=0, load=0)
+        peer = self.peer(lambda: metrics)
+        self.start_broker(self.host(0, f',tcp,stats={peer.port},speed=1') + ' ' +
+                          self.host(1, f',tcp,stats={peer.port},speed=0.25'), name='capacity')
+        result = self.run_command([self.build / 'distcc', '--lto-capacity'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        capacity = json.loads(result.stdout)
+        self.assertEqual(capacity['jobs'], 8)
+        self.assertAlmostEqual(capacity['work_rate'], 5)
+        self.assertAlmostEqual(capacity['min_rate'], .25)
+        result = self.run_command([self.build / 'distcc', '-j'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(int(result.stdout), capacity['jobs'])
+
+    def test_dominant_function_skips_unproductive_partitioning(self):
+        compiler = shutil.which('clang')
+        if not llvm_tools(compiler):
+            self.skipTest('matching LLVM partition helpers are not installed')
+        source = self.work / 'dominant.c'
+        source.write_text('__attribute__((noinline)) int heavy(int x) { volatile int v=x;\n' +
+                          '\n'.join(f'v = (v * 3 + {i}) % 101;' for i in range(128)) +
+                          '\nreturn v; }\n'
+                          '__attribute__((noinline)) int tiny(int x) { return x+2; }\n'
+                          'int main(void) { return heavy(3)==tiny(7); }\n')
+        obj = source.with_suffix('.o')
+        result = self.run_command([compiler, '-O2', '-flto=thin', '-c', source, '-o', obj])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        native, distributed = self.work / 'native', self.work / 'distributed'
+        args = [compiler, '-O2', '-flto=thin', '-fuse-ld=lld', obj]
+        reference = self.run_command([*args, '-o', native])
+        self.assertEqual(reference.returncode, 0, reference.stderr)
+        result = self.run_command([self.build / 'distcc', *args, '-o', distributed])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('distcc-thinlto: partitioned ', result.stderr)
+        self.assertEqual(result.stderr.count('distcc-thinlto: compiled on'), 1, result.stderr)
+        self.assertEqual(self.run_command([distributed]).returncode, self.run_command([native]).returncode)
 
     def test_partitioned_backend_preserves_private_symbols_tls_and_unwinding(self):
         """Execute real partitions, then compare the final link's ABI and behavior."""

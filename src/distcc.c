@@ -91,6 +91,7 @@ static void dcc_show_usage(void)
 "   --help                     Explain usage, and exit.\n"
 "   --version                  Show version, and exit.\n"
 "   --show-hosts               Show host list, and exit.\n"
+"   --lto-capacity             Show broker compute capacity as JSON.\n"
 "   --show-analyzer-slots      Show available CPU capacity for analysis, and exit.\n"
 "   -j                         Show the concurrency level, as calculated from\n"
 "                              the host list, and exit.\n"
@@ -179,18 +180,26 @@ static void dcc_show_hosts(void) {
     dcc_free_hostlist(list);
 }
 
-static void dcc_concurrency_level(void) {
+static void dcc_concurrency_level(int details) {
     struct dcc_hostdef *list, *l;
     int nhosts;
     int nslots = 0;
     const char *broker_path = getenv("DISTCC_BROKER");
 
     if (broker_path && *broker_path) {
-        nslots = dcc_broker_jobs();
+        char *capacity = NULL;
+        nslots = dcc_broker_jobs(details ? &capacity : NULL);
         if (nslots < 0)
             dcc_exit(EXIT_CONNECT_FAILED);
-        printf("%i\n", nslots);
+        if (details) {
+            puts(capacity);
+            free(capacity);
+        } else printf("%i\n", nslots);
         return;
+    }
+    if (details) {
+        rs_log_error("LTO capacity requires DISTCC_BROKER");
+        dcc_exit(EXIT_BAD_ARGUMENTS);
     }
 
     if (dcc_get_hostlist(&list, &nhosts) != 0) {
@@ -321,8 +330,8 @@ int main(int argc, char **argv)
             goto out;
         }
 
-        if (!strcmp(argv[1], "-j")) {
-            dcc_concurrency_level();
+        if (!strcmp(argv[1], "-j") || !strcmp(argv[1], "--lto-capacity")) {
+            dcc_concurrency_level(!strcmp(argv[1], "--lto-capacity"));
             ret = 0;
             goto out;
         }

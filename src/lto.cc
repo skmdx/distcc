@@ -31,23 +31,24 @@ static Expected<json::Value> plan(StringRef filename) {
     auto index = getModuleSummaryIndexForFile(*job->getString("index"));
     if (!index)
       return index.takeError();
-    int64_t instructions = 0, functions = 0;
+    int64_t instructions = 0, functions = 0, largest = 0;
     for (auto &entry : **index) {
       for (auto &summary : entry.second.getSummaryList()) {
         auto *function = dyn_cast<FunctionSummary>(summary.get());
         if (!function || !(**index).isGlobalValueLive(summary.get()))
           continue;
-        if (summary->modulePath() == *job->getString("source")) {
+        bool primary = summary->modulePath() == *job->getString("source");
+        if (primary || summary->importType() == GlobalValueSummary::Definition) {
           instructions += function->instCount();
-          if (summary->linkage() != GlobalValue::AvailableExternallyLinkage)
+          largest = std::max<int64_t>(largest, function->instCount());
+          if (primary && summary->linkage() != GlobalValue::AvailableExternallyLinkage)
             ++functions;
-        } else if (summary->importType() == GlobalValueSummary::Definition) {
-          instructions += function->instCount();
         }
       }
     }
     result.push_back(json::Object{{"instructions", instructions},
-                                  {"functions", functions}});
+                                  {"functions", functions},
+                                  {"largest_function", largest}});
   }
   return json::Value(std::move(result));
 }

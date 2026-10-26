@@ -67,8 +67,13 @@ runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache
 remains in use, so warm cache entries do not start backend jobs.
 Heavy modules are prepared through LLVM's post-import hook, partitioned with
 LLVM's module splitter, and optimized/generated on multiple workers. The number
-of partitions comes from the module's instruction share and `distcc -j`, bounded
-by its function count. Preparation overlaps ordinary backends; ready partitions
+of partitions comes from the module's instruction share and the broker's total
+compute rate divided by its slowest worker's per-job rate. These rates use the
+same CPU, SMT, load and throttling model as placement. This gives slower workers
+smaller pieces without increasing concurrent jobs. The split is bounded by the
+available slots, function count, and total instructions divided by the largest
+function; a module dominated by one indivisible function avoids an unproductive
+import-and-split pass. Preparation overlaps ordinary backends; ready partitions
 join the same work queue. A relocatable merge restores private symbol bindings
 before LLD consumes the result. Constructors, TLS and exception handling retain
 their original link semantics. Assembly with private definitions or per-object
