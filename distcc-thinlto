@@ -111,7 +111,7 @@ def worker(root, archive):
     requested, *args = job['args']
     # Invoke administrator-installed Clang only; never an uploaded executable.
     name = Path(requested).name
-    if not re.fullmatch(r'clang(?:\+\+)?(?:-\d+)?', name) or '-c' not in args:
+    if not re.fullmatch(r'(?:[\w.+]+-)*clang(?:\+\+)?(?:-\d+(?:\.\d+)*)?', name) or '-c' not in args:
         raise ValueError('ThinLTO backend must be a Clang compilation')
     compiler = None
     path = Path(requested)

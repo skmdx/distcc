@@ -74,6 +74,16 @@ class ThinLTOTest(BrokerTestCase):
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
 
+    def test_target_prefixed_compiler(self):
+        selected = shutil.which('clang')
+        assert selected is not None
+        clang = Path(selected)
+        target = subprocess.check_output([clang, '-dumpmachine'], text=True).strip()
+        compiler = clang.parent / (target + '-clang++')
+        if not compiler.is_file():
+            self.skipTest('target-prefixed Clang is required')
+        self.link(compiler)
+
     def test_static_constructor_order(self):
         objects = []
         for index, name in enumerate(('z_first', 'a_second', 'm_third')):

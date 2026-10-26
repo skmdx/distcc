@@ -168,16 +168,6 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       else:
         raise basics.NotCoveredError('Unsupported compiler for header analysis')
     clang = self.frontends[identity_key]
-    if clang:
-      options = []
-    else:
-      options = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
-      if not options:
-        target = run([compiler, '-dumpmachine']).stdout.decode().strip()
-        version = run([compiler, '-dumpfullversion']).stdout.decode().strip()
-        options = os.path.join(clang_scan.gcc_scan_dir, target, version, 'distcc_gcc_scan.so')
-      if not os.path.isfile(options):
-        raise basics.NotCoveredError('GCC dependency module is not installed for this compiler')
     # Probe only built-in search directories. Explicit -I/-isystem/-idirafter
     # arguments remain on the worker's command line with their original class
     # and ordering. Target, sysroot and -nostdinc options still apply here.
@@ -209,7 +199,20 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       if any(path not in kinds for path in directories):
         raise basics.NotCoveredError('Cannot classify Clang default header directories')
       search_entries = [(kinds[path], path) for path in directories]
+      # LibTooling may use another Clang release's builtin headers. Scan the
+      # selected compiler's search paths, exactly as the worker will use them.
+      options = ['-nostdinc']
+      for kind, path in search_entries:
+        options.extend(['-Xclang', '-internal-isystem' if kind == 1 else
+                        '-internal-externc-isystem', '-Xclang', path])
     else:
+      options = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
+      if not options:
+        target = run([compiler, '-dumpmachine']).stdout.decode().strip()
+        version = run([compiler, '-dumpfullversion']).stdout.decode().strip()
+        options = os.path.join(clang_scan.gcc_scan_dir, target, version, 'distcc_gcc_scan.so')
+      if not os.path.isfile(options):
+        raise basics.NotCoveredError('GCC dependency module is not installed for this compiler')
       search_entries = [(4, 'gcc')] + [(0, path) for path in directories]
       # -nostdinc suppresses GCC's implicit stdc-predef.h inclusion. Restore
       # the compiler-reported inputs explicitly, using their sent snapshots.
@@ -261,7 +264,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     try:
       compiler = shutil.which(command[0]) or command[0]
       if clang:
-        result = clang_scan.scan([compiler, *command[1:], '-c'], currdir)
+        result = clang_scan.scan([compiler, *command[1:], *options, '-c'], currdir)
       else:
         native = gcc_scan.scan([compiler, *command[1:]], currdir, options)
         # Preserve GCC's actual default directory classes.
