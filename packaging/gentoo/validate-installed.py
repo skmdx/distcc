@@ -201,6 +201,23 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             assert 'AMD GPU' in header, header
         results['device_links'] = {'jobs': len(jobs), 'workers': {p: workers.count(p) for p in set(workers)},
                                    'seconds': time.monotonic() - started}
+        # Cover driver planning, target preprocessing and the installed cc1/LLD
+        # workers too. A hand-written link request alone misses lost GPU inputs.
+        source, obj = root / 'device.hip', root / 'device.o'
+        source.write_text('__attribute__((global)) void increment(int *p) { p[0] += 1; }\n')
+        started = time.monotonic()
+        result = subprocess.run(['distcc', clang, '--offload-new-driver', '--offload-device-only',
+                                 '--offload-arch=gfx900', '--offload-arch=gfx1030',
+                                 '-nogpuinc', '-nogpulib', '-O2', '-c', source, '-o', obj],
+                                env=env, text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+        assert result.returncode == 0, result.stderr
+        workers = re.findall(r'^distcc-offload-link: compiled on (.+)$', result.stderr, re.M)
+        assert len(workers) == 4, result.stderr
+        bundler = str(Path(clang).parent / 'clang-offload-bundler')
+        bundles = subprocess.check_output([bundler, '-list', '-type=o', '-input=' + str(obj)], text=True)
+        assert all(target in bundles for target in ('gfx900', 'gfx1030')), bundles
+        results['device_compile'] = {'jobs': len(workers),
+            'workers': {p: workers.count(p) for p in set(workers)}, 'seconds': time.monotonic() - started}
     # The Rust wrapper shares this broker and must really reach the TCP worker.
     # Legacy C/C++ validation also runs; Rust is exercised on the TCP pass.
     if ',tcp' in env['DISTCC_HOSTS'] and '--thinlto-only' not in sys.argv:

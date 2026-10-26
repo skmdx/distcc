@@ -570,6 +570,10 @@ static void dcc_add_clang_target(char **argv)
     const char *target = NATIVE_COMPILER_TRIPLE;
     const char *compiler = dcc_find_basename(argv[0]);
 
+    /* Frontend invocations already carry their driver's resolved -triple. */
+    if (dcc_argv_search(argv, "-cc1"))
+        return;
+
     if (strcmp(compiler, "clang") == 0 || strncmp(compiler, "clang-", strlen("clang-")) == 0 ||
         strcmp(compiler, "clang++") == 0 || strncmp(compiler, "clang++-", strlen("clang++-")) == 0)
         ;
@@ -827,6 +831,14 @@ dcc_build_somewhere(char *argv[],
         goto lock_local;
     }
 
+    if (offload_targets) {
+        char **command = NULL;
+        ret = dcc_offload_command(argv, input_fname, output_fname, &command);
+        if (!ret) ret = dcc_compile_local(command, input_fname);
+        if (command) dcc_free_argv(command);
+        goto unlock_and_clean_up;
+    }
+
 #if 0
     /* turned off because we never spend long in this state. */
     dcc_note_state(DCC_PHASE_STARTUP, input_fname, NULL);
@@ -870,7 +882,7 @@ dcc_build_somewhere(char *argv[],
     /* With a broker, finish local preprocessing before reserving a worker.
      * Release the local lock before requesting the remote lease; never wait
      * for a remote slot while holding a local slot. Reuse this input on retry. */
-    if ((offload_targets > 1 || (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER"))) &&
+    if (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER") &&
         !getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes) {
         dcc_read_localslots_configuration();
         if (local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
@@ -890,14 +902,6 @@ dcc_build_somewhere(char *argv[],
             ret = dcc_critique_status(*status, "cpp", input_fname, dcc_hostdef_local, 0);
         if (ret) goto unlock_and_clean_up;
         cpp_ready = 1;
-    }
-
-    if (offload_targets > 1 && cpp_ready) {
-        char **command = NULL;
-        ret = dcc_offload_command(argv, input_fname, output_fname, cpp_fname, cpp_fd, &command);
-        if (!ret) ret = dcc_compile_local(command, input_fname);
-        if (command) dcc_free_argv(command);
-        goto unlock_and_clean_up;
     }
 
     if (getenv("DISTCC_BROKER"))

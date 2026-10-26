@@ -16,7 +16,8 @@ class OffloadTest(BrokerTestCase):
         if not compiler:
             raise unittest.SkipTest('Clang is required')
         cls.compiler = compiler
-        cls.daemon_env = {'DISTCCD_PATH': str(Path(cls.compiler).parent) + os.pathsep + os.defpath}
+        cls.daemon_env = {'DISTCCD_PATH': os.pathsep.join((str(Path.cwd()),
+                          str(Path(cls.compiler).parent), os.defpath))}
         super().setUpClass()
 
     def setUp(self):
@@ -69,9 +70,15 @@ class OffloadTest(BrokerTestCase):
         subprocess.run([str(exe)], check=True)
 
     def test_hip_device_only(self):
+        self.hip_device_only([])
+
+    def test_hip_new_driver_device_only(self):
+        self.hip_device_only(['--offload-new-driver'])
+
+    def hip_device_only(self, driver_flags):
         source = self.work / 'device.hip'
         source.write_text('__attribute__((global)) void increment(int *p) { p[0] += 1; }\n')
-        obj = self.distributed(['--offload-device-only', '--offload-arch=gfx900',
+        obj = self.distributed([*driver_flags, '--offload-device-only', '--offload-arch=gfx900',
                                 '-nogpuinc', '-nogpulib', '-O2'], source)
         bundler = str(Path(self.compiler).parent / 'clang-offload-bundler')
         targets = subprocess.check_output([bundler, '-list', '-type=o', '-input=' + str(obj)], text=True)
@@ -82,6 +89,12 @@ class OffloadTest(BrokerTestCase):
         self.assertIn('AMD GPU', subprocess.check_output(['readelf', '-h', device], text=True))
 
     def test_hip_bundle_native_thinlto(self):
+        self.hip_bundle_native_thinlto([])
+
+    def test_hip_legacy_bundle_native_thinlto(self):
+        self.hip_bundle_native_thinlto(['--no-offload-new-driver'])
+
+    def hip_bundle_native_thinlto(self, driver_flags):
         libraries = os.environ.get('ROCM_DEVICE_LIB_PATH')
         if not libraries:
             self.skipTest('Set ROCM_DEVICE_LIB_PATH to test the installed HIP toolchain')
@@ -94,41 +107,58 @@ class OffloadTest(BrokerTestCase):
             return [int(next(line.split()[1] for line in self.get_stats(port).splitlines()
                              if line.startswith('dcc_compile_ok '))) for port in self.stats_ports]
         before = completed_jobs()
-        positions = [os.fstat(log.fileno()).st_size for log in self.logs]
+        devices = []
+        if shutil.which('amdgpu-arch'):
+            detected = subprocess.run(['amdgpu-arch'], capture_output=True, text=True)
+            if detected.returncode == 0:
+                devices = detected.stdout.split()
+        targets = list(dict.fromkeys(devices)) or ['gfx900', 'gfx1030']
         source = self.work / 'kernel.cpp'
         source.write_text('''#include <hip/hip_runtime.h>
 __global__ void increment(int *p) { p[0] += 1; }
-int main() { return 0; }
+int main(int argc, char **) {
+    if (argc > 1) {
+        int count;
+        if (hipGetDeviceCount(&count) != hipSuccess || !count) return 1;
+        for (int i = 0; i < count; ++i) {
+            int *p, n = 7;
+            if (hipSetDevice(i) != hipSuccess || hipMalloc(&p, sizeof(n)) != hipSuccess) return 2;
+            if (hipMemcpy(p, &n, sizeof(n), hipMemcpyHostToDevice) != hipSuccess) return 3;
+            hipLaunchKernelGGL(increment, dim3(1), dim3(1), 0, 0, p);
+            if (hipMemcpy(&n, p, sizeof(n), hipMemcpyDeviceToHost) != hipSuccess || n != 8) return 4;
+            if (hipFree(p) != hipSuccess) return 5;
+        }
+    }
+    return 0;
+}
 ''')
-        flags = ['-xhip', '--offload-arch=gfx900', '--offload-arch=gfx1030',
+        flags = ['-xhip', *driver_flags, *('--offload-arch=' + target for target in targets),
                  '--rocm-device-lib-path=' + libraries, '-O3', '-flto=thin',
                  '--offload-compress', '-march=native', '-mtune=native', '-MD']
         obj = self.distributed(flags, source)
         self.assertIn('kernel.cpp', obj.with_suffix('.d').read_text())
+        self.assertTrue(obj.with_suffix('.d').read_text().startswith(str(obj) + ':'))
         exe = self.work / 'hip-linked'
         subprocess.run([self.compiler, '-flto=thin', '--hip-link', str(obj),
                         '-lamdhip64', '-o', str(exe)], check=True, capture_output=True)
         subprocess.run([str(exe)], check=True, timeout=30)
+        if devices:
+            subprocess.run([str(exe), '--gpu'], check=True, timeout=30)
         self.assertEqual(obj.read_bytes()[:4], b'BC\xc0\xde')
         fatbinary = self.work / 'embedded.hipfb'
         subprocess.run(['llvm-objcopy', '--dump-section', '.hip_fatbin=' + str(fatbinary),
                         str(exe), '-'], stdout=subprocess.DEVNULL, check=True)
         bundler = str(Path(self.compiler).parent / 'clang-offload-bundler')
-        targets = subprocess.check_output([bundler, '-list', '-type=o',
+        bundles = subprocess.check_output([bundler, '-list', '-type=o',
                                            '-input=' + str(fatbinary)], text=True)
-        self.assertEqual({t.rsplit('--', 1)[-1] for t in targets.splitlines()
-                          if not t.startswith('host-')}, {'gfx900', 'gfx1030'})
+        self.assertEqual({t.rsplit('--', 1)[-1] for t in bundles.splitlines()
+                          if not t.startswith('host-')}, set(targets))
         after = completed_jobs()
-        self.assertEqual(sum(a - b for a, b in zip(after, before)), 3)
+        self.assertEqual(sum(a - b for a, b in zip(after, before)), 2 * len(targets) + 1)
         self.assertTrue(all(a > b for a, b in zip(after, before)), (before, after))
-        for log, position in zip(self.logs, positions):
-            with open(log.name) as worker:
-                worker.seek(position)
-                self.assertIn('--offload-device-only', worker.read())
         feedback = [line for line in (self.work / 'gpu-targets.log').read_text().splitlines()
                     if 'job cost:' in line]
-        self.assertEqual(sum('kind=9 ' in line for line in feedback), 2, feedback)
-        self.assertEqual(sum('kind=2 ' in line for line in feedback), 1)
+        self.assertEqual(sum('kind=10 ' in line for line in feedback), 2 * len(targets) + 1, feedback)
         # A second job exercises the shared device-bitcode cache.
         self.distributed(flags, source)
 

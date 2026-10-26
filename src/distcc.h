@@ -295,7 +295,7 @@ char **dcc_driver_words(char *line);
 const char *dcc_offload_language(char *const argv[]);
 int dcc_prepare_offload(char ***argv, char ***files, int *targets);
 int dcc_offload_command(char **argv, const char *input, const char *output,
-                        const char *prepared, int fd, char ***result);
+                        char ***result);
 char *dcc_native_cache_key(char *argv[], const char *input, const char *output);
 int dcc_scan_args(char *argv[], /*@out@*/ /*@relnull@*/ char **orig_o,
                   char **orig_i, char ***ret_newargv, int allow_native);

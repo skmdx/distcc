@@ -26,8 +26,13 @@ class ThinLTOTest(BrokerTestCase):
         self.env.pop('DISTCC_LINK_SYSROOT', None)
 
     def run_command(self, command, **kwargs):
-        return subprocess.run(list(map(str, command)), cwd=self.work, env=self.env,
-                              text=True, capture_output=True, timeout=60, **kwargs)
+        try:
+            return subprocess.run(list(map(str, command)), cwd=self.work, env=self.env,
+                                  text=True, capture_output=True, timeout=60, **kwargs)
+        except subprocess.TimeoutExpired as error:
+            broker = self.work / 'broker.log'
+            details = broker.read_text()[-8192:] if broker.exists() else ''
+            self.fail(f'command timed out: {command}\n{error.stderr!r}\n{details}')
 
     def link(self, compiler, archive=False, hip=False):
         objects = []
@@ -181,8 +186,10 @@ class ThinLTOTest(BrokerTestCase):
             'add_executable(check main.c part.c)\n'
             'set_property(TARGET check PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)\n')
         self.env.update(CMAKE_C_LINKER_LAUNCHER='distcc', CMAKE_C_COMPILER_LAUNCHER='distcc')
+        compiler = shutil.which('clang')
+        assert compiler is not None
         result = self.run_command(['cmake', '-S', '.', '-B', 'build', '-G', 'Ninja',
-                                   '-DCMAKE_C_COMPILER=' + shutil.which('clang'),
+                                   '-DCMAKE_C_COMPILER=' + compiler,
                                    '-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld'])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         result = self.run_command(['cmake', '--build', 'build'])
@@ -191,7 +198,9 @@ class ThinLTOTest(BrokerTestCase):
         self.assertEqual(self.run_command([self.work / 'build/check']).returncode, 0)
 
     def test_absolute_clang_preserves_client_target(self):
-        compiler = Path(shutil.which('clang')).resolve()
+        selected = shutil.which('clang')
+        assert selected is not None
+        compiler = Path(selected).resolve()
         target = subprocess.check_output([compiler, '-dumpmachine'], text=True).strip()
         other = 'x86_64-linux-gnu' if target.startswith('aarch64') else 'aarch64-linux-gnu'
         wrappers = self.work / 'bin'

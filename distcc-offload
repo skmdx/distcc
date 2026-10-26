@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Distribute the independent images in Clang's HIP fat binary."""
+"""Execute Clang's HIP action graph with distributed compilation and links."""
 import asyncio
 import errno
-import fcntl
+import json
 import os
 from pathlib import Path
 import shlex
@@ -13,23 +13,31 @@ import sys
 import tempfile
 
 
-def run(args, **kwargs):
-    return subprocess.run(args, check=True, **kwargs)
+def option(args, name):
+    return args[args.index(name) + 1] if name in args else None
 
 
-def values(args, prefix):
-    return [arg[len(prefix):] for arg in args if arg.startswith(prefix)]
+def without(args, options):
+    result = []
+    words = iter(args)
+    for arg in words:
+        if arg in options:
+            for _ in range(options[arg]):
+                next(words)
+        else:
+            result.append(arg)
+    return result
 
 
-async def child(args, env, descriptors=()):
+async def child(args, env):
     process = await asyncio.create_subprocess_exec(
-        *args, env=env, pass_fds=descriptors,
+        *args, env=env, start_new_session=True,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         stdout, stderr = await process.communicate()
     finally:
         if process.returncode is None:
-            process.terminate()
+            os.killpg(process.pid, signal.SIGTERM)
             await process.wait()
     if process.returncode:
         raise subprocess.CalledProcessError(process.returncode, args, stdout, stderr)
@@ -53,95 +61,98 @@ def publish(source, destination):
         Path(staging).unlink(missing_ok=True)
 
 
-def compile_images(prepared, source, output, args):
-    transport = str(Path(__file__).resolve().with_name('distcc'))
+def compile_images(source, output, args):
+    helper = Path(__file__).resolve().with_name('distcc-offload-link')
     env = dict(os.environ)
-    # Each child is an independent job, bounded by the broker. A single GPU
-    # action or host-only action cannot recursively enter this coordinator.
     env.pop('_DISTCC_SAFEGUARD', None)
     env.pop('INCLUDE_SERVER_PORT', None)
-    with tempfile.TemporaryDirectory(prefix='distcc-offload-') as temporary, open(prepared, 'rb') as shared:
-        env['_DISTCC_CPP_FD'] = str(shared.fileno())
+    with tempfile.TemporaryDirectory(prefix='distcc-offload-') as temporary:
         work = Path(temporary)
-        preprocessed = work / (Path(source).name + '.hipi')
-        preprocessed.symlink_to(prepared)
-        command = [str(preprocessed) if arg == source else arg for arg in args]
-        plan = run([*command, '-o', output, '-###'], capture_output=True, text=True, env=env)
-        commands = [shlex.split(line) for line in plan.stderr.splitlines() if line.startswith(' ')]
-        # The driver owns the image format, target IDs, alignment and bundle
-        # options. Substitute only the independently produced input images.
-        bundle = next(cmd for cmd in commands if cmd and
-                      'clang-offload-bundler' in Path(cmd[0]).name and '-input=/dev/null' in cmd)
-        targets = values(bundle, '-targets=')[0].split(',')
-        inputs = values(bundle, '-input=')
-        if len(targets) != len(inputs):
-            raise ValueError('Clang image bundle has mismatched targets and inputs')
-        devices = [(target, name) for target, name in zip(targets, inputs) if name != '/dev/null']
-        base = []
-        options = iter(command)
-        architectures = ('--offload-arch', '--cuda-gpu-arch', '--no-offload-arch', '--no-cuda-gpu-arch')
-        for arg in options:
-            if arg in ('-Xclang', '-mllvm', '-Xarch_host'):
-                base.extend((arg, next(options)))
-            elif arg in architectures:
-                next(options)
-            elif not any(arg.startswith(name + '=') for name in architectures):
-                base.append(arg)
-        device_only = '--offload-device-only' in base or '--cuda-device-only' in base
-        base = [arg for arg in base if arg not in ('--offload-device-only', '--cuda-device-only')]
-        slots = int(subprocess.check_output([transport, '-j'], text=True, env=env))
+        env['TMPDIR'] = temporary
+        plan = subprocess.run([*args, '-###'], capture_output=True, text=True, env=env, check=True)
+        commands = [shlex.split(line) for line in plan.stderr.splitlines()
+                    if line.lstrip().startswith('"')]
+        result = work / 'result.o'
+        nodes = []
 
-        async def compile_device(item):
-            index, (target, original) = item
-            architecture = target.rsplit('--', 1)[1]
-            obj, image = work / f'{index}.o', work / f'{index}.out'
-            await child([transport, *base, '--offload-device-only',
-                          '--offload-arch=' + architecture, '-o', str(obj)],
-                        env, (shared.fileno(),))
-            await child([bundle[0], '-unbundle', '-type=o', '-targets=' + target,
-                         '-input=' + str(obj), '-output=' + str(image)], env)
-            return original, str(image)
+        def add(command, remote, extra_outputs=()):
+            artifact = option(command, '-o') or next(
+                (arg.partition('=')[2] for arg in command if arg.startswith('-output=')), None)
+            if artifact is None:
+                raise ValueError('driver action has no output: ' + shlex.join(command))
+            # Driver-generated intermediate names are unique. A reference to
+            # a preceding output, including --image=file=..., orders that edge.
+            dependencies = [i for i, node in enumerate(nodes)
+                            if any(name in arg for name in node['outputs'] for arg in command)]
+            nodes.append({'args': command, 'outputs': [artifact, *extra_outputs],
+                          'remote': remote, 'dependencies': dependencies})
 
-        async def compile_all():
-            available = asyncio.Semaphore(max(1, slots))
-            async def scheduled(item):
-                async with available:
-                    return await compile_device(item)
-            return dict(await asyncio.gather(*(scheduled(item) for item in enumerate(devices))))
-        # asyncio.run cancels and reaps sibling jobs on the first failure.
-        images = asyncio.run(compile_all())
-        fatbinary = work / 'images.hipfb'
-        assembled = [('-input=' + images.get(arg[7:], arg[7:])) if arg.startswith('-input=')
-                     else '-output=' + str(fatbinary) if arg.startswith('-output=')
-                     else arg for arg in bundle]
-        run(assembled, env=env)
-        if device_only:
-            publish(fatbinary, output)
-        else:
-            # The source and device images use the original driver's common
-            # compilation-unit ID. Compile the host exactly once.
-            result = work / 'host.o'
-            unbundle = next(cmd for cmd in commands if cmd and '-unbundle' in cmd)
-            host_target = next(target for target in values(unbundle, '-targets=')[0].split(',')
-                               if target.startswith('host-'))
-            # The legacy HIP driver ignores host-only mode for bundled .hipi
-            # input and replaces the supplied images with a default GPU image.
-            # Give the new host-only driver the extracted host translation unit.
-            with os.fdopen(os.memfd_create('distcc-hip-host', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING),
-                           'w+b') as host:
-                run([unbundle[0], '-unbundle', next(a for a in unbundle if a.startswith('-type=')),
-                     '-targets=' + host_target, '-input=' + str(preprocessed),
-                     '-output=/proc/self/fd/' + str(host.fileno())], env=env, pass_fds=(host.fileno(),))
-                fcntl.fcntl(host, fcntl.F_ADD_SEALS,
-                            fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
-                host_source = work / (Path(source).name + '.host.hipi')
-                host_source.symlink_to(f'/proc/{os.getpid()}/fd/{host.fileno()}')
-                host_args = [str(host_source) if arg == str(preprocessed) else arg for arg in base]
-                run([transport, *host_args, '--offload-host-only', '--offload-new-driver',
-                     '-Xclang', '-fcuda-include-gpubinary', '-Xclang', str(fatbinary),
-                     '-o', str(result)], env=dict(env, _DISTCC_CPP_FD=str(host.fileno())),
-                    pass_fds=(host.fileno(),))
-            publish(result, output)
+        for index, command in enumerate(commands):
+            command = [str(result) if i and command[i - 1] == '-o' and arg == output else
+                       '-output=' + str(result) if arg == '-output=' + output else arg
+                       for i, arg in enumerate(command)]
+            name = Path(command[0]).name
+            frontend = '-cc1' in command
+            if frontend and option(command, '-x') == 'hip':
+                # A bare driver -E in the new HIP driver produces only host
+                # text. Each cc1 action has its own target macros and includes.
+                # Keep Clang's resolved frontend options, changing only action,
+                # input language and the output owned by this coordinator.
+                prepared = str(work / f'{index}.hipi')
+                cpp = without(command, {'-emit-obj': 0, '-emit-llvm-bc': 0,
+                                        '-emit-llvm': 0, '-S': 0,
+                                        '-fcuda-include-gpubinary': 1, '-o': 1})
+                dependency = option(cpp, '-dependency-file')
+                # Use the existing local preprocessing admission, releasing
+                # it before asking the broker for a remote compilation slot.
+                add([str(helper.with_name('distcc')), *cpp, '-E', '-o', prepared], False,
+                    [dependency] if dependency else [])
+                command = without(command, {'-dependency-file': 1, '-MT': 1,
+                                            '-MQ': 1, '-sys-header-deps': 0,
+                                            '-MP': 0, '-MG': 0, '-include': 1,
+                                            '-imacros': 1, '-include-pch': 1,
+                                            '-I': 1, '-isystem': 1, '-iquote': 1,
+                                            '-internal-isystem': 1, '-internal-externc-isystem': 1,
+                                            '-idirafter': 1, '-F': 1, '-iframework': 1})
+                command[command.index('-x') + 1] = 'hip-cpp-output'
+                command[-1] = prepared
+            if name == 'clang-linker-wrapper':
+                wrapper = helper.with_name('distcc-linker-wrapper')
+                command = [str(wrapper), '--device-distributor=' + str(helper),
+                           '--device-compiler-path=' + str(Path(args[0]).absolute()),
+                           *command[1:]]
+            add(command, frontend or name in ('lld', 'ld.lld'))
+
+        async def execute():
+            async def action(index, node):
+                for predecessor in node['dependencies']:
+                    await tasks[predecessor]
+                command = node['args']
+                if node['remote']:
+                    # cc1 bitcode, profile and embedded GPU inputs are explicit
+                    # operands. Ship existing file operands through the shared
+                    # cache; include directories are irrelevant after -E.
+                    inputs = []
+                    for arg in command[1:]:
+                        value = arg.partition('=')[2] if arg.startswith('-') and '=' in arg else arg
+                        if value not in node['outputs'] and not value.startswith('-') and Path(value).is_file():
+                            inputs.append(value)
+                    request = work / f'{index}.json'
+                    request.write_text(json.dumps({'common': {'args': [], 'inputs': []},
+                        'jobs': [{'args': command, 'inputs': inputs, 'outputs': node['outputs']}]}))
+                    command = [str(helper), str(request)]
+                await child(command, env)
+            tasks = [asyncio.create_task(action(i, node)) for i, node in enumerate(nodes)]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        asyncio.run(execute())
+        publish(result, output)
     return 0
 
 
@@ -150,7 +161,7 @@ if __name__ == '__main__':
         raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, interrupted)
     try:
-        sys.exit(compile_images(*sys.argv[1:4], sys.argv[4:]))
+        sys.exit(compile_images(*sys.argv[1:3], sys.argv[3:]))
     except subprocess.CalledProcessError as error:
         if error.stdout:
             sys.stdout.buffer.write(error.stdout if isinstance(error.stdout, bytes) else error.stdout.encode())

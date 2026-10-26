@@ -28,19 +28,17 @@ Clang retains macros until remote compilation to preserve diagnostics;
 see README.pump for preprocessing behavior and toolchain requirements.
 
 HIP compilation uses the client's Clang driver and the existing TCP input cache.
-When the driver produces an independent multi-target device-image bundle,
-`distcc-offload` submits one job per GPU target, assembles the images with the
-driver's bundler options, and compiles the host once. Preprocessing and dependency
-generation run once; child jobs share the immutable preprocessor input by file
-descriptor. The original compilation-unit ID is retained across host and device
-actions. A failed target cancels its siblings and does not publish a partial object.
-GPU frontends learn their own execution-cost model; host-only compilation uses
-the C++ model. New GPU work starts with capacity-based placement until measured
-execution times are available.
-This reduces the serial tail of multi-GPU-target compilation; it does not split
-a single target's compiler frontend. Other driver graphs keep their ordinary
-distcc route. The Clang 23 new-driver preprocessing limitation is tracked in
-[issue 13](https://github.com/skmdx/distcc/issues/13).
+`distcc-offload` executes the driver's action graph: each target is preprocessed
+with its own frontend options, compilation and device links run on available
+workers, and LLVM assembles the resulting images before the host object is
+published. This works with both the new and legacy HIP drivers, preserving
+target macros, dependency output, compilation-unit identity and optimization
+flags. Independent actions overlap; dependent actions start when their inputs
+are ready. A failed action cancels its siblings and preserves the previous output.
+The shared cache carries preprocessed inputs, device libraries and intermediate
+objects. Offload stages learn execution costs separately from ordinary C++ and
+host ThinLTO work. This reduces the serial tail of multi-target compilation;
+it does not split a single target's compiler frontend.
 
 ThinLTO links distribute individual optimization/code-generation backends:
 
@@ -54,7 +52,10 @@ LLD performs the thin link, discovers imported modules and archive members, and
 invokes `distcc-thinlto` with its JSON job description. Each backend uses the
 broker's measured capacity and an independent learned ThinLTO workload class.
 Inputs are snapshotted and hashed once per link, shared across backend jobs,
-and transferred through the existing LZ4/content-cache path. Workers preserve
+and transferred through the existing LZ4/content-cache path. Larger primary
+modules are submitted first so long backends can start while faster workers
+are available. Execution order does not change LLD's output or constructor order.
+Workers preserve
 LLVM's embedded import paths in a private namespace. The final native link
 runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache
 remains in use, so warm cache entries do not start backend jobs.

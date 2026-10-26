@@ -28,7 +28,7 @@ def distribute(description, kind):
     if not jobs:
         return 0
     transport = str(Path(__file__).resolve().with_name('distcc'))
-    slots = int(subprocess.check_output([transport, '-j'], text=True))
+    slots = int(subprocess.check_output([transport, '-j'], text=True)) if len(jobs) > 1 else 1
     with tempfile.TemporaryDirectory(prefix='distcc-lto-') as directory:
         work = Path(directory)
         # Snapshot and hash every distinct input once per link. Per-job trees
@@ -96,8 +96,22 @@ def distribute(description, kind):
                         Path(source).unlink(missing_ok=True)
             return 0
 
-        with ThreadPoolExecutor(max_workers=min(len(jobs), max(1, slots))) as pool:
-            results = list(pool.map(execute, enumerate(jobs)))
+        # Start expensive modules while the fastest workers are still free.
+        # LLD's JSON order is link order, not a work schedule. Output names keep
+        # that link order intact even when backend execution is reordered.
+        def weight(item):
+            task = item[1]
+            names = [*task['inputs'], *common['inputs']]
+            if kind == 4:
+                names = names[:1]  # Imports contribute only selected functions.
+            return sum(files[name][1] for name in {absolute(p) for p in names})
+
+        ordered = sorted(enumerate(jobs), key=weight, reverse=True)
+        if len(ordered) == 1:
+            results = [execute(ordered[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(jobs), max(1, slots))) as pool:
+                results = list(pool.map(execute, ordered))
         return next((result for result in results if result), 0)
 
 
@@ -112,10 +126,10 @@ def worker(root, archive, kind):
         return root / name.lstrip('/')
 
     requested, *args = job['args']
-    # Invoke administrator-installed Clang only; never an uploaded executable.
+    # Invoke administrator-installed LLVM tools; never an uploaded executable.
     name = Path(requested).name
-    if not re.fullmatch(r'(?:[\w.+]+-)*clang(?:\+\+)?(?:-\d+(?:\.\d+)*)?', name):
-        raise ValueError('LLVM jobs must invoke an installed Clang')
+    if not re.fullmatch(r'(?:[\w.+]+-)*(?:clang(?:\+\+)?|lld|ld\.lld)(?:-\d+(?:\.\d+)*)?', name):
+        raise ValueError('LLVM jobs must invoke an installed compiler or linker')
     if kind == 4 and '-c' not in args:
         raise ValueError('ThinLTO backend must be a Clang compilation')
     compiler = None
