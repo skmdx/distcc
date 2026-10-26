@@ -23,7 +23,7 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
     dcc_job_result_init(&result);
     if (setting && !saved_tmp) finished.error = EXIT_OUT_OF_MEMORY;
     else if (!memchr(run->root, 0, sizeof(run->root)) || run->root[0] != '/' ||
-        dcc_job_decode(metadata, &job)) finished.error = EXIT_PROTOCOL_ERROR;
+        dcc_job_decode(metadata, 0, &job)) finished.error = EXIT_PROTOCOL_ERROR;
     else if (setenv("TMPDIR", run->root, 1)) finished.error = EXIT_OUT_OF_MEMORY;
     else {
         changed_tmp = 1;

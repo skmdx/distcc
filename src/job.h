@@ -67,7 +67,7 @@ struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char 
 void dcc_job_result_init(struct dcc_job_result *);
 void dcc_job_result_free(struct dcc_job_result *);
 /* No file payload is copied into metadata. */
-int dcc_job_decode(int fd, struct dcc_job **);
+int dcc_job_decode(int fd, size_t offset, struct dcc_job **);
 unsigned char *dcc_job_encode_buffer(const struct dcc_job *, size_t *);
 int dcc_job_decode_buffer(const void *, size_t, struct dcc_job **);
 /* Anonymous storage for data which must outlive its producing process. */

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from typing import Any
 
 from test_adaptive import DistccTestCase, free_port, stats_response
 
@@ -81,13 +82,13 @@ class BrokerTestCase(DistccTestCase):
                         TMPDIR=str(self.work))
         return proc
 
-    def request(self, command=1, work=(0, 0, 0), source_bytes=0):
+    def request(self, command=1, work=(0, 0, 0), work_units=0):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
         payload = struct.pack("=II", 2, command)
         if command in (6, 9, 10):
-            payload += struct.pack('=QQII', *work, source_bytes)
+            payload += struct.pack('=QQII', *work, work_units)
         sock.sendall(payload)
         self.addCleanup(sock.close)
         return sock
@@ -103,8 +104,8 @@ class BrokerTestCase(DistccTestCase):
             descriptors.extend(array.array("i", data))
         return status, slots, descriptors
 
-    def acquire_reserved(self, command=6, work=(0, 0, 0), source_bytes=0):
-        lease = self.request(command, work, source_bytes)
+    def acquire_reserved(self, command=6, work=(0, 0, 0), work_units=0):
+        lease = self.request(command, work, work_units)
         status, capabilities, fds = self.receive(lease)
         self.assertEqual(status, 0)
         self.assertTrue(capabilities & (1 << 30))
@@ -153,6 +154,24 @@ class BrokerPlacementTest(BrokerTestCase):
 
 
 class BrokerTest(BrokerTestCase):
+    def test_wait_accounts_for_contention_after_next_lane_opens(self):
+        peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                    running=17, busy=16, queued=0, preparing=0, returning=0)),
+                 self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                    running=2, busy=2, queued=0, preparing=0, returning=0))]
+        self.start_broker(self.host(0, f',tcp,stats={peers[0].port},speed=1', slots=16) + ' ' +
+                          self.host(1, f',tcp,stats={peers[1].port},speed=.49', slots=4))
+        # Waiting has lower individual latency, but the fast worker's next
+        # lane still displaces saturated CPUs. It would lose placement as soon
+        # as it opens; use the spare worker without waiting for that event.
+        request = self.request(10, (1700, 4 * 1024 * 1024, 1))
+        request.settimeout(1)
+        status, _, descriptors = self.receive(request)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(descriptors), 1)
+        with socket.socket(fileno=descriptors[0]) as selected:
+            self.assertEqual(selected.getpeername()[1], self.ports[1])
+
     def test_inflight_large_job_consumes_small_job_memory_slots(self):
         small = 64 * 1024**2
         estimates = [small] * 64
@@ -527,6 +546,27 @@ class BrokerTest(BrokerTestCase):
         _, other = self.acquire_reserved(10, (12, 2 * 1024 * 1024, 2))
         self.assertEqual(other.getpeername()[1], self.ports[1])
 
+    def test_thinlto_instruction_work_is_not_capped_at_source_byte_limit(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        peer = self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
+                        queued=0, preparing=0, returning=0, capacity=1))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
+        for key, units, duration in ((1801, 1048576, 2_000_000_000),
+                                     (1804, 4194304, 8_000_000_000)):
+            seed, net = self.acquire_reserved(10, (key, 16 * 1024**2, 8), units)
+            seed.sendmsg([struct.pack('=II3Q', 2, 7, 0, 0, duration)],
+                         [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+        estimates = []
+        for key, units in ((1811, 1048576), (1814, 4194304)):
+            lease, _ = self.acquire_reserved(10, (key, 16 * 1024**2, 8), units)
+            lease.close()
+            log = (self.work / 'broker.log').read_text()
+            row = next(line for line in log.splitlines()
+                       if 'assigning host=' in line and f'key={key:x} ' in line)
+            estimates.append(float(row.split(' cost=', 1)[1].split()[0]))
+        # Equal input bytes must not erase the fourfold instruction difference.
+        self.assertGreater(estimates[1], 3 * estimates[0])
+
     def test_marginal_capacity_accounts_for_competing_cpu_work(self):
         peers = [self.peer(stats_response(cpus=8, cores=4, jobs=8, capacity=8,
                     running=4, busy=0, queued=0, preparing=0, returning=0)),
@@ -762,9 +802,10 @@ class BrokerTest(BrokerTestCase):
     def check_prepared_class_capacity(self, kind, capacity_name='compile_capacity'):
         capacities = [4] * 64
         capacities[22] = 1
+        class_metrics: dict[str, Any] = {capacity_name: capacities}
         first = self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
                          queued=0, preparing=0, returning=0, running=0,
-                         **{capacity_name: capacities}))
+                         **class_metrics))
         second = self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
                           queued=0, preparing=0, returning=0, running=0))
         hosts = self.host(0, f',tcp,stats={first.port},speed=1.5') + ' ' + self.host(1, f',tcp,stats={second.port}')

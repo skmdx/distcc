@@ -39,8 +39,10 @@ def fingerprint(path):
     return size, digest
 
 
-def write_metadata(kind, cwd, helper, entries, path):
-    data = bytearray()
+def write_metadata(kind, cwd, helper, entries, path, *, work_key=0, work_units=0):
+    # This prefix belongs to the local planner/transport contract. The TCP
+    # worker receives the job description, not client scheduling estimates.
+    data = bytearray(struct.pack('!QI', work_key, min(work_units, 2**32 - 1)))
 
     def number(value):
         data.extend(struct.pack('!Q', value))

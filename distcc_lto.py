@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """LLVM-generated link jobs over distcc's shared input transport."""
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-import heapq
-import itertools
 import json
-import math
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import xxhash
 
 from distcc_job import LocalOnly, fingerprint, snapshot, write_metadata
 
@@ -37,6 +33,24 @@ def llvm_tools(compiler):
     paths = dict(plan=directory / 'distcc-lto', prepare=directory / 'lto-prepare.so',
                  linker=bindir / 'ld.lld', objcopy=bindir / 'llvm-objcopy')
     return paths if all(path.is_file() for path in paths.values()) else None
+
+
+def work_key(job, files):
+    """Identify computation independently of temporary input/output paths."""
+    paths = {name: ('input', i) for i, name in enumerate(job['inputs'])}
+    paths.update({name: ('output', i) for i, name in enumerate(job['outputs'])})
+
+    def argument(arg):
+        if absolute(arg) in paths:
+            return paths[absolute(arg)]
+        option, separator, value = arg.partition('=')
+        if separator and absolute(value) in paths:
+            return (option, paths[absolute(value)])
+        return arg
+
+    identity = [job['cwd'], [argument(arg) for arg in job['args']],
+                [(files[name][1], files[name][2].hex()) for name in job['inputs']]]
+    return xxhash.xxh3_64_intdigest(json.dumps(identity).encode()) or 1
 
 
 def publish_archive(archive, destinations):
@@ -64,6 +78,14 @@ def publish_archive(archive, destinations):
 
 
 def distribute(description, kind):
+    # Only the client schedules tasks. Importing its executor on every worker
+    # job also initializes logging/traceback, before LLVM can start.
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+    import heapq
+    import itertools
+    import math
+    import shlex
+
     request = json.loads(Path(description).read_text())
     common, jobs = request['common'], request['jobs']
     if not jobs:
@@ -149,7 +171,8 @@ def distribute(description, kind):
             manifest = inputs / str(len(entries))
             manifest.write_text(json.dumps(job))
             entries.append((CONTROL + '/job.json', *fingerprint(manifest)))
-            write_metadata(kind, job['cwd'], helper, entries, jobdir / 'job')
+            write_metadata(kind, job['cwd'], helper, entries, jobdir / 'job',
+                           work_key=work_key(job, files), work_units=task['instructions'])
             archive = jobdir / 'result.tar'
             read_fd, write_fd = os.pipe()
             with os.fdopen(read_fd, 'rb') as queued, os.fdopen(write_fd, 'wb') as channel:
@@ -311,7 +334,8 @@ def run_job(root, job, kind, prepare_library=None):
     # an individual mount target is also rejected by bubblewrap.
     compiler_dir = str(Path(compiler).parent)
     sandbox.extend(['--ro-bind', compiler_dir, compiler_dir,
-                    '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp'])
+                    '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+                    '--dir', job['cwd']])
     outputs = [rooted(name) for name in job['outputs']]
     # LLD publishes with a temporary sibling and rename; a writable file mount
     # alone is insufficient. The per-job tree owns these writable directories.

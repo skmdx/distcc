@@ -69,8 +69,10 @@ Heavy modules are prepared through LLVM's post-import hook, partitioned with
 LLVM's module splitter, and optimized/generated on multiple workers. The number
 of partitions comes from the module's instruction share and the broker's total
 compute rate divided by its slowest worker's per-job rate. These rates use the
-same CPU, SMT, load and throttling model as placement. This gives slower workers
-smaller pieces without increasing concurrent jobs. The split is bounded by the
+CPU, SMT and throttling model evaluated at full capacity. Transient runnable
+load does not reshuffle the partitions between links; placement still accounts
+for live load. This gives slower workers smaller pieces without increasing
+concurrent jobs. The split is bounded by the
 available slots, function count, and total instructions divided by the largest
 function; a module dominated by one indivisible function avoids an unproductive
 import-and-split pass. Preparation overlaps ordinary backends; ready partitions
@@ -329,6 +331,10 @@ The existing contention curve accounts for SMT, frequency and external CPU
 load; memory capacity continues to bound execution. An idle slow core does not
 override a sooner finish on a busy fast host. The estimate also accounts for
 throughput displaced by contention on every worker, including remote SMT lanes.
+Queued placements include the displacement that remains after their next CPU
+lane opens, using the same policy as immediate placement. A low queued latency
+therefore cannot justify waiting for a worker that loses the placement decision
+as soon as it becomes available.
 Waiting must still predict an earlier finish than every available placement;
 an immediate placement's throughput penalty is not treated as elapsed time.
 Without an input hint, selection uses marginal throughput and prefers available
@@ -344,21 +350,25 @@ still overlap execution, and completion feedback releases capacity immediately.
 Successful TCP results carry input preparation, queue and execution durations
 in the existing reply and connection-return message. Only execution time is
 normalized by the dispatch-time CPU service cost and learned as compile work.
-The broker keeps 4096 bounded history entries keyed by working directory,
-compiler arguments and input path, excluding output/dependency filenames.
+The broker keeps 4096 bounded history entries. C/C++ keys include working
+directory, compiler arguments and input path, excluding output/dependency
+filenames. LLVM link keys use input content fingerprints and compiler arguments,
+replacing temporary input/output paths with their roles in the job. Fresh
+temporary directories and output filenames do not discard learned work.
 Four-way buckets retain colliding keys across repeated builds. Repeated inputs
 use their measured work, adjusted for size changes. Unseen inputs use an online
 nonnegative fit of input size and original source size for C, C++ and assembler,
 with separate classes for raw and preprocessed source. The source-size feature
 is capped at 1 MiB so large generated tables cannot dominate the fit; input
-size still represents parsing work. Initial rates and this cap are heuristics;
-contents and include trees are not read to calculate a hint. History lasts
+size still represents parsing work. ThinLTO uses LLVM instruction counts as its
+uncapped computation feature, independently of bitcode/dependency bytes. These
+counts and link identities travel only from the planner to its local broker;
+the worker RPC carries no extra scheduling fields. The C/C++ initial rates and
+source-size cap are heuristics; their input contents and include trees are not
+read to calculate a hint. History lasts
 for the broker process lifetime. Frequency or contention changes during a job
 and different optimization costs remain sources of prediction error.
 
-Predicted remaining work determines when an execution slot will become free.
-An overrun does not increase predicted remaining work; the bounded input
-pipeline can overlap that uncertain tail while server admission enforces limits.
 Unobserved jobs from other brokers use the host's recent mean work. Prepared
 network inputs use measured transfer costs. Same-host inputs and raw sources
 use measured preparation latency: FD handoffs do not upload the input, and raw

@@ -269,27 +269,32 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
     char **files = NULL;
     int lease = -1, ret = EXIT_IO_ERROR;
     int fd = open(metadata, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    uint32_t estimate[3];
     dcc_job_result_init(&result);
     if (fd < 0) goto done;
-    ret = dcc_job_decode(fd, &job);
+    ret = dcc_readx(fd, estimate, sizeof(estimate));
+    if (!ret) ret = dcc_job_decode(fd, sizeof(estimate), &job);
     close(fd);
     if (ret || !dcc_job_tree(job) || !job->count) { ret = EXIT_PROTOCOL_ERROR; goto done; }
     hint.kind = job->kind == DCC_JOB_RUST ? DCC_WORK_RUST :
                 job->kind == DCC_JOB_OFFLOAD_LINK ? DCC_WORK_OFFLOAD_LINK : DCC_WORK_THINLTO;
     hint.bytes = dcc_resource_input_bytes(job);
-    uint64_t key = XXH3_64bits(job->cwd, strlen(job->cwd));
+    hint.key = (uint64_t)ntohl(estimate[0]) << 32 | ntohl(estimate[1]);
+    uint64_t key = hint.key ? 0 : XXH3_64bits(job->cwd, strlen(job->cwd));
     for (unsigned i = 0; i < job->count; ++i) {
         const struct dcc_job_input *input = &job->inputs[i];
-        key = XXH3_64bits_withSeed(input->path, strlen(input->path) + 1, key);
-        key = XXH3_64bits_withSeed(input->digest, sizeof(input->digest), key);
+        if (!hint.key) {
+            key = XXH3_64bits_withSeed(input->path, strlen(input->path) + 1, key);
+            key = XXH3_64bits_withSeed(input->digest, sizeof(input->digest), key);
+        }
         const char *extension = strrchr(input->path, '.');
-        if (extension && (!strcmp(extension, ".rs") ||
-            (job->kind == DCC_JOB_THINLTO && i == 0) || job->kind == DCC_JOB_OFFLOAD_LINK)) {
-            uint64_t room = UINT32_MAX - hint.source_bytes;
-            hint.source_bytes += input->plain_size < room ? input->plain_size : room;
+        if (extension && (!strcmp(extension, ".rs") || job->kind == DCC_JOB_OFFLOAD_LINK)) {
+            uint64_t room = UINT32_MAX - hint.work_units;
+            hint.work_units += input->plain_size < room ? input->plain_size : room;
         }
     }
-    hint.key = key ? key : 1;
+    if (!hint.key) hint.key = key ? key : 1;
+    if (job->kind == DCC_JOB_THINLTO) hint.work_units = ntohl(estimate[2]);
     files = calloc(job->count + 1, sizeof(*files));
     if (!files) { ret = EXIT_OUT_OF_MEMORY; goto done; }
     for (unsigned i = 0; i < job->count; ++i) {

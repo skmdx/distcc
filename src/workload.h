@@ -12,11 +12,11 @@
 #define DCC_WORK_WAYS 4
 struct dcc_work_hint {
     uint64_t key, bytes;
-    uint32_t kind, source_bytes; /* 1..3: preprocessed C/C++/asm; 4..6: source + headers; 7: Rust; 8: ThinLTO; 9: GPU. */
+    uint32_t kind, work_units; /* ThinLTO: LLVM instructions; other classes: source/input bytes. */
 };
 struct dcc_work_class {
     double xx, xy, yy, xz, yz;
-    double input_rate, source_rate;
+    double input_rate, work_rate;
 };
 struct dcc_work_model {
     struct { uint64_t key, bytes; double seconds; } history[DCC_WORK_HISTORY];

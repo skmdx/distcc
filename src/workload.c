@@ -52,7 +52,7 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
     hint->bytes = st.st_size;
     if (!stat(input, &st) && S_ISREG(st.st_mode) && st.st_size > 0 &&
         st.st_size <= 512LL * 1024 * 1024)
-        hint->source_bytes = st.st_size;
+        hint->work_units = st.st_size;
     hint->kind = gpu && !host_only ? DCC_WORK_OFFLOAD : kind + (ready ? 0 : 3);
     key = XXH3_64bits_withSeed(&hint->kind, sizeof(hint->kind), key);
     hint->key = key ? key : 1;
@@ -64,8 +64,8 @@ int dcc_work_valid(const struct dcc_work_hint *hint)
      * their size is not bounded by the C/C++ preprocessor input limit. */
     if (hint->kind == DCC_WORK_RUST || hint->kind == DCC_WORK_THINLTO ||
         hint->kind == DCC_WORK_OFFLOAD_LINK) return hint->key && hint->bytes;
-    return hint->source_bytes <= 512U * 1024 * 1024 &&
-           ((!hint->key && !hint->bytes && !hint->kind && !hint->source_bytes) ||
+    return hint->work_units <= 512U * 1024 * 1024 &&
+           ((!hint->key && !hint->bytes && !hint->kind && !hint->work_units) ||
            (hint->key && hint->bytes && hint->bytes <= 512ULL * 1024 * 1024 &&
             hint->kind >= 1 && hint->kind <= DCC_WORK_CLASSES));
 }
@@ -91,11 +91,13 @@ static double initial_rate(unsigned kind)
     return kind % 3 == 1 ? 1 : kind % 3 == 2 ? .0625 : .25;
 }
 
-static double source_size(const struct dcc_work_hint *hint)
+static double computation_size(const struct dcc_work_hint *hint)
 {
-    /* Very large sources can be generated tables rather than optimizer work.
-     * Bound this feature's influence; input size still represents parsing. */
-    double size = hint->source_bytes / 1048576.0;
+    /* LLVM instruction counts measure optimizer work directly; bitcode and
+     * imported constant-data bytes remain the independent input-size feature. */
+    double size = hint->work_units / 1048576.0;
+    if (hint->kind == DCC_WORK_THINLTO) return size;
+    /* Large source text can be generated tables rather than optimizer work. */
     return size < 1 ? size : 1;
 }
 
@@ -106,7 +108,7 @@ static void learn_class(struct dcc_work_class *c, const struct dcc_work_hint *hi
         c->xx = c->yy = .001;
         c->xz = .001 * initial_rate(hint->kind - 1);
     }
-    double x = hint->bytes / 1048576.0, y = source_size(hint);
+    double x = hint->bytes / 1048576.0, y = computation_size(hint);
     c->xx = .98 * c->xx + .02 * x * x;
     c->xy = .98 * c->xy + .02 * x * y;
     c->yy = .98 * c->yy + .02 * y * y;
@@ -117,19 +119,19 @@ static void learn_class(struct dcc_work_class *c, const struct dcc_work_hint *hi
     double determinant = c->xx * c->yy - c->xy * c->xy;
     if (determinant > 1e-12) {
         double input = (c->xz * c->yy - c->yz * c->xy) / determinant;
-        double source = (c->yz * c->xx - c->xz * c->xy) / determinant;
-        if (input >= 0 && source >= 0) {
+        double work = (c->yz * c->xx - c->xz * c->xy) / determinant;
+        if (input >= 0 && work >= 0) {
             c->input_rate = input;
-            c->source_rate = source;
+            c->work_rate = work;
             return;
         }
     }
     if (c->yz <= 0 || c->xz * c->xz / c->xx >= c->yz * c->yz / c->yy) {
         c->input_rate = c->xz / c->xx;
-        c->source_rate = 0;
+        c->work_rate = 0;
     } else {
         c->input_rate = 0;
-        c->source_rate = c->yz / c->yy;
+        c->work_rate = c->yz / c->yy;
     }
 }
 
@@ -150,7 +152,7 @@ double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_wor
      * rather than treating precompiled dependencies as C++ parsing work. */
     if (hint->kind >= DCC_WORK_RUST && !c->xx) return 0;
     double seconds = hint->bytes / 1048576.0 * (c->xx ? c->input_rate : initial_rate(kind))
-                   + source_size(hint) * c->source_rate;
+                   + computation_size(hint) * c->work_rate;
     return seconds > .01 ? seconds : .01;
 }
 

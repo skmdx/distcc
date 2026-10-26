@@ -68,8 +68,8 @@ class RustTest(BrokerTestCase):
         self.assertEqual(len(records), 2)
         self.assertEqual(float(records[0]['predicted']), 0)
         self.assertGreater(float(records[1]['predicted']), 0)
-        self.assertGreater(int(records[0]['source']), 0)
-        self.assertGreater(int(records[0]['bytes']), int(records[0]['source']))
+        self.assertGreater(int(records[0]['units']), 0)
+        self.assertGreater(int(records[0]['bytes']), int(records[0]['units']))
         stats = self.get_stats(self.stats_ports[0])
         self.assertIn('dcc_rust_capacity ', stats)
 
@@ -734,7 +734,10 @@ pub fn read_only() -> bool {
             net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=15)
             self.addCleanup(net.close)
             sockets.append(net)
-            send(net, 0x54000200, struct.pack('!Q', identity) + metadata.read_bytes())
+            # The planner's scheduling hint is consumed locally, before the
+            # transport encodes the unchanged worker job description.
+            send(net, 0x54000200, struct.pack('!Q', identity) +
+                 metadata.read_bytes()[struct.calcsize('!QI'):])
             if identity == 1:
                 kind, requested = frame(net)
                 self.assertEqual(kind, 0x54000201)

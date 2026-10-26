@@ -90,16 +90,17 @@ static char *get_string(struct metadata *m)
     s[size] = 0;
     return s;
 }
-static int load(int fd, struct metadata *m)
+static int load(int fd, size_t offset, struct metadata *m)
 {
     struct stat st;
     size_t done = 0;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 8 ||
-        st.st_size > DCC_JOB_METADATA_MAX) return -1;
-    m->size = st.st_size;
+        (uint64_t)st.st_size < offset || st.st_size - offset < 8 ||
+        st.st_size - offset > DCC_JOB_METADATA_MAX) return -1;
+    m->size = st.st_size - offset;
     if (!(m->data = malloc(m->size))) return -1;
     while (done < m->size) {
-        ssize_t n = pread(fd, m->data + done, m->size - done, done);
+        ssize_t n = pread(fd, m->data + done, m->size - done, offset + done);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) { free(m->data); m->data = NULL; return -1; }
         done += n;
@@ -218,11 +219,11 @@ failed:
     dcc_job_free(job);
     return -1;
 }
-int dcc_job_decode(int fd, struct dcc_job **out)
+int dcc_job_decode(int fd, size_t offset, struct dcc_job **out)
 {
     struct metadata m = {0};
     *out = NULL;
-    if (load(fd, &m)) return -1;
+    if (load(fd, offset, &m)) return -1;
     int ret = dcc_job_decode_buffer(m.data, m.size, out);
     free(m.data);
     return ret;

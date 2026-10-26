@@ -8,6 +8,7 @@ import shutil
 import shlex
 import subprocess
 import sys
+import time
 import unittest
 
 from test_broker import BrokerTestCase
@@ -15,7 +16,7 @@ from test_adaptive import stats_response
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from distcc_job import fingerprint, write_metadata
-from distcc_lto import llvm_tools
+from distcc_lto import llvm_tools, publish_archive, work_key
 
 
 @unittest.skipUnless(shutil.which('clang') and shutil.which('bwrap'), 'Clang and bubblewrap required')
@@ -90,6 +91,68 @@ class ThinLTOTest(BrokerTestCase):
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
 
+    def test_backend_cwd_survives_private_tmp_mount(self):
+        inputs = self.work / 'inputs'
+        inputs.mkdir()
+        source = inputs / '0'
+        result = self.run_command(['clang', '-x', 'c', '-flto=thin', '-c', '-o', source, '-'],
+                                  input='int main(void) { return 0; }')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        name, output = str(self.work / 'input.bc'), str(self.work / 'output.o')
+        cwd = '/tmp/client-build'
+        manifest = inputs / '1'
+        manifest.write_text(json.dumps(dict(cwd=cwd,
+            args=[shutil.which('clang'), '-c', '-x', 'ir', name, '-o', output],
+            inputs=[name], outputs=[output])))
+        metadata, archive = self.work / 'metadata', self.work / 'result.tar'
+        write_metadata(4, cwd, 'distcc-thinlto',
+                       [(name, *fingerprint(source)),
+                        ('/__distcc_lto/job.json', *fingerprint(manifest))], metadata)
+        result = self.run_command([self.build / 'distcc', '--file-job', metadata, inputs, archive])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        publish_archive(archive, [output])
+        executable = self.work / 'linked'
+        result = self.run_command(['clang', output, '-o', executable])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_command([executable]).returncode, 0)
+
+    def test_backend_cost_identity_survives_temporary_paths(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        self.start_broker(self.env['DISTCC_HOSTS'], name='cost-broker')
+        self.env['PATH'] = str(self.build) + os.pathsep + os.environ['PATH']
+        self.env.pop('DISTCC_LINK_SYSROOT', None)
+        compiler = shutil.which('clang')
+        source = self.work / 'cost.c'
+        source.write_text('#include <stdio.h>\n'
+                          '__attribute__((noinline)) int calculate(int n) { volatile int v=n; '
+                          'for(int i=0;i<n;i++) v=(v*3+i)%101; return v; }\n'
+                          'int main(int argc,char **argv) { printf("%d\\n", calculate(argc*23)); }\n')
+        obj = source.with_suffix('.o')
+        result = self.run_command([compiler, '-O2', '-flto=thin', '-c', source, '-o', obj])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = [self.build / 'distcc', compiler, '-flto=thin', '-fuse-ld=lld', obj]
+        log = self.work / 'cost-broker.log'
+        identities = []
+        outputs = []
+        for index, level in enumerate(('-O2', '-O2', '-O0')):
+            before = log.stat().st_size
+            output = self.work / f'cost-{index}'
+            result = self.run_command([*args, level, '-o', output])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('distcc-thinlto: compiled on', result.stderr)
+            rows = re.findall(r'job cost: key=(\w+) kind=8 bytes=\d+ units=(\d+) predicted=([\d.]+)',
+                              log.read_text()[before:])
+            self.assertTrue(rows, log.read_text()[before:])
+            self.assertTrue(all(int(row[1]) > 0 for row in rows), rows)
+            identities.append({row[0] for row in rows})
+            if index == 1:
+                self.assertTrue(all(float(row[2]) > 0 for row in rows), rows)
+            outputs.append(self.run_command([output, 'argument']).stdout)
+        self.assertEqual(identities[0], identities[1])
+        self.assertFalse(identities[1] & identities[2])
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[0], outputs[2])
+
     def test_capacity_uses_worker_speed_without_increasing_concurrency(self):
         metrics = stats_response(cpus=4, cores=4, jobs=4, capacity=4,
                                  busy=0, queued=0, running=0, load=0)
@@ -105,6 +168,21 @@ class ThinLTOTest(BrokerTestCase):
         result = self.run_command([self.build / 'distcc', '-j'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(int(result.stdout), capacity['jobs'])
+        # A changed admission ceiling proves that the new snapshot reached the
+        # broker. Transient load must not change its full-capacity grain rate.
+        metrics = stats_response(cpus=4, cores=4, jobs=4, capacity=3,
+                                 busy=0, queued=0, running=16, load=16)
+        deadline = time.monotonic() + 3
+        while True:
+            result = self.run_command([self.build / 'distcc', '--lto-capacity'])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            updated = json.loads(result.stdout)
+            if updated['jobs'] == 6:
+                break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+        self.assertAlmostEqual(updated['work_rate'], 3.75)
+        self.assertAlmostEqual(updated['min_rate'], .25)
 
     def test_dominant_function_skips_unproductive_partitioning(self):
         compiler = shutil.which('clang')
@@ -242,9 +320,12 @@ class ThinLTOTest(BrokerTestCase):
         command = [planner / 'distcc-thinlto', description]
         result = self.run_command(command)
         self.assertEqual(result.returncode, 0, result.stderr)
-        assigned = list(map(int, re.findall(r'assigning host=.* source=(\d+)',
-                                           (self.work / 'ranked.log').read_text())))
-        self.assertEqual(assigned, sorted(sizes, reverse=True))
+        files = {name: (Path(name), *fingerprint(Path(name))) for job in jobs for name in job['inputs']}
+        keys = [work_key(dict(cwd=str(self.work), args=[compiler, *job['args']],
+                             inputs=job['inputs'], outputs=job['outputs']), files) for job in jobs]
+        assigned = [int(key, 16) for key in re.findall(r'assigning host=.* key=(\w+) ',
+                                                      (self.work / 'ranked.log').read_text())]
+        self.assertEqual(assigned, [key for _, key in sorted(zip(sizes, keys), reverse=True)])
         main = self.work / 'main.c'
         main.write_text('int value0(void), value1(void), value2(void);\n'
                         'int main(void) { return value0()+value1()+value2()!=6; }\n')

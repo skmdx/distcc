@@ -819,10 +819,10 @@ static void observe(struct broker *broker, struct client *client, const struct f
         double prior = *previous > 0 ? *previous : bulk ? 1.0 / (64 * 1048576) : peer->local ? .001 : .005;
         *previous = .875 * prior + .125 * sample;
     }
-    rs_trace("job cost: key=%llx kind=%u bytes=%llu source=%u predicted=%.6f factor=%.6f "
+    rs_trace("job cost: key=%llx kind=%u bytes=%llu units=%u predicted=%.6f factor=%.6f "
              "execute=%.6f prepare=%.6f queue=%.6f normalized=%.6f host=%s",
              (unsigned long long)client->hint.key, client->hint.kind,
-             (unsigned long long)client->hint.bytes, client->hint.source_bytes,
+             (unsigned long long)client->hint.bytes, client->hint.work_units,
              client->cost, client->factor, timing->execute_ns / 1e9,
              timing->prepare_ns / 1e9, timing->queue_ns / 1e9, cost, peer->host->hostname);
 }
@@ -926,8 +926,16 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             int jobs = dcc_capacity_jobs(p->host, cap);
             reply.slots += jobs;
             if (jobs > 0) {
-                double factor = cap ? execution_factor(p, jobs - 1, 0, cap->capacity) :
-                                      dcc_capacity_score(p->host, NULL, jobs - 1);
+                struct dcc_capacity full;
+                if (cap) {
+                    full = *cap;
+                    /* Grain spans the whole link. Transient runnable work
+                     * (including its planner) must not reshuffle partitions
+                     * on every invocation. Placement still uses live load. */
+                    full.running = full.busy = jobs - 1;
+                    full.queued = 0;
+                }
+                double factor = dcc_capacity_score(p->host, cap ? &full : NULL, jobs - 1);
                 double rate = 1 / factor;
                 work_rate += jobs * rate;
                 if (!min_rate || rate < min_rate) min_rate = rate;
@@ -1012,23 +1020,32 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * worker, including existing compiles on a remote SMT core.
              * Minimizing this job's latency alone packs the fastest worker's
              * SMT lanes while independent physical cores remain unused. */
-            if (staged && cap && !link && !blocked &&
-                work < dcc_capacity_jobs(p->host, cap)) {
+            if (staged && cap && !link && (predicted ||
+                (!blocked && work < dcc_capacity_jobs(p->host, cap)))) {
                 const struct dcc_capacity *observed = &p->metrics;
                 double external = (observed->running >= 0 ? observed->running : observed->load)
                                   - (observed->busy > 0 ? observed->busy : 0);
-                double demand = work + (external > 0 ? external : 0);
+                int placement = work;
+                if (wait) {
+                    int lanes = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
+                    if (cap->capacity >= 0 && cap->capacity < lanes) lanes = cap->capacity;
+                    /* A queued choice still displaces CPU work when its next
+                     * lane opens. Apply the same placement policy then as now;
+                     * otherwise we wait for a host that we reject on release. */
+                    if (placement >= lanes) placement = lanes > 0 ? lanes - 1 : 0;
+                }
+                double demand = placement + (external > 0 ? external : 0);
                 /* Include the CPU work displaced by this compile, notably
                  * client preprocessing on a machine that also runs a worker. */
-                double before = demand ? demand / execution_factor(p, work - 1, probe, cap->capacity) : 0;
-                double gain = (demand + 1) / execution_factor(p, work, probe, cap->capacity) - before;
+                double before = demand ? demand / execution_factor(p, placement - 1, probe, cap->capacity) : 0;
+                double gain = (demand + 1) / execution_factor(p, placement, probe, cap->capacity) - before;
                 /* At saturation there is no positive marginal throughput.
                  * Charge aggregate service demand instead of dropping the
                  * penalty or dividing by numerical noise. This finite bound
                  * also lets the least costly host progress when all are busy. */
-                double penalty = (demand + 1) * execution_factor(p, work, probe, cap->capacity);
+                double penalty = (demand + 1) * execution_factor(p, placement, probe, cap->capacity);
                 if (gain > 0 && gain * penalty > 1) penalty = 1 / gain;
-                double throughput = forecast.prepare + (cost > 0 ? cost : 1) * penalty;
+                double throughput = forecast.start + (cost > 0 ? cost : 1) * penalty;
                 if (!predicted || throughput > score) score = throughput;
             }
             double fill = (work + 1.0) / slots;
@@ -1087,9 +1104,9 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         client->deadline = now + delay;
     } else if (best.peer >= 0 && (!local_cpp || broker->cpp_busy < broker->cpp_limit)) {
         struct peer *p = &broker->peers[best.peer];
-        rs_trace("assigning host=%s cost=%.3f score=%.3f broker_wait=%.6f key=%llx source=%u",
+        rs_trace("assigning host=%s cost=%.3f score=%.3f broker_wait=%.6f key=%llx units=%u",
                  p->host->hostname, cost, best.score, now - client->waiting_since,
-                 (unsigned long long)client->hint.key, client->hint.source_bytes);
+                 (unsigned long long)client->hint.key, client->hint.work_units);
         client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
                             p->admission_supported && p->pool_supported >= 0;
         client->net = client->command != ACQUIRE ? pool_take(broker, best.peer, now) : -1;
