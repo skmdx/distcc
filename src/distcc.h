@@ -300,6 +300,7 @@ char *dcc_native_cache_key(char *argv[], const char *input, const char *output);
 int dcc_scan_args(char *argv[], /*@out@*/ /*@relnull@*/ char **orig_o,
                   char **orig_i, char ***ret_newargv, int allow_native);
 int dcc_expand_preprocessor_options(char ***argv_ptr);
+int dcc_expand_response_files(char ***argv_ptr);
 
 /* argutil.c */
 unsigned int dcc_argv_len(char **a);

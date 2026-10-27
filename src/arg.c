@@ -124,6 +124,31 @@ const char *dcc_offload_language(char *const argv[])
     return language && (!strncmp(language, "c++", 3)) ? "c++-cpp-output" : "cpp-output";
 }
 
+static void *dcc_clang_driver(void)
+{
+    const char *library = getenv("DISTCC_CLANG_LIBRARY");
+    void *handle = dlopen(library && *library ? library : LIBDIR "/distcc/clang_driver.so", RTLD_NOW | RTLD_LOCAL);
+    if (!handle) rs_log_warning("cannot load Clang driver: %s", dlerror());
+    return handle;
+}
+
+int dcc_expand_response_files(char ***argv)
+{
+    char **p = *argv + 1;
+    while (*p && **p != '@') ++p;
+    if (!*p) return 0;
+    void *handle = dcc_clang_driver();
+    if (!handle) return EXIT_DISTCC_FAILED;
+    int (*expand)(char **, char ***) = dlsym(handle, "dcc_clang_expand_response_files");
+    char **expanded = NULL;
+    int ret = expand ? expand(*argv, &expanded) : -1;
+    dlclose(handle);
+    if (ret) return EXIT_DISTCC_FAILED;
+    dcc_free_argv(*argv);
+    *argv = expanded;
+    return 0;
+}
+
 int dcc_prepare_clang(char ***argv, char ***files)
 {
     int needed = 0;
@@ -135,9 +160,8 @@ int dcc_prepare_clang(char ***argv, char ***files)
             str_startswith("-fauto-profile", *p) ||
             str_startswith("-fmemory-profile-use", *p)) needed = 1;
     if (!needed) return 0;
-    const char *library = getenv("DISTCC_CLANG_LIBRARY");
-    void *handle = dlopen(library && *library ? library : LIBDIR "/distcc/clang_driver.so", RTLD_NOW | RTLD_LOCAL);
-    if (!handle) { rs_log_warning("cannot load Clang driver: %s", dlerror()); return EXIT_DISTCC_FAILED; }
+    void *handle = dcc_clang_driver();
+    if (!handle) return EXIT_DISTCC_FAILED;
     int (*inputs)(char **, char ***, char ***) = dlsym(handle, "dcc_clang_inputs");
     char **normalized = NULL;
     int ret = inputs ? inputs(*argv, &normalized, files) : -1;

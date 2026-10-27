@@ -10,6 +10,8 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/Program.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/Support/Error.h>
 #include <llvm/ADT/SmallString.h>
 #include <algorithm>
 #include <cstdlib>
@@ -51,6 +53,26 @@ char **copy(const std::vector<std::string> &values) {
     }
     return result;
 }
+}
+
+extern "C" int dcc_clang_expand_response_files(char **argv, char ***expanded) {
+    llvm::SmallVector<const char *, 32> args;
+    for (char **p = argv; *p; ++p) args.push_back(*p);
+    llvm::BumpPtrAllocator allocator;
+    llvm::cl::ExpansionContext context(allocator, llvm::cl::TokenizeGNUCommandLine);
+    if (auto error = context.expandResponseFiles(args)) {
+        llvm::consumeError(std::move(error));
+        return -1;
+    }
+    std::vector<std::string> values;
+    for (const char *arg : args) {
+        // LLVM leaves unreadable response files untouched. Let the actual
+        // compiler diagnose them locally instead of sending a partial argv.
+        if (arg[0] == '@') return -1;
+        values.emplace_back(arg);
+    }
+    *expanded = copy(values);
+    return *expanded ? 0 : -1;
 }
 
 extern "C" int dcc_clang_inputs(char **argv, char ***normalized, char ***files) {

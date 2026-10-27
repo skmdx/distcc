@@ -52,6 +52,11 @@ Each analyzer owns its cwd and caches. The supervisor replaces failed analyzers
 and retains their published input snapshots until pump shuts down, so an
 in-progress transfer cannot lose its inputs during recovery.
 
+The client expands GNU-style `@response` files with LLVM's argument parser before
+classifying the job. Empty CMake module maps and nested response files therefore
+work with pump; native options and input paths inside them receive the same
+treatment as command-line arguments. Actual module generation still stays local.
+
 The include server calls libclang-cpp directly through a resident Python C++
 extension. Building pump requires LLVM 22 or 23 development headers, libclang-cpp,
 libLLVM and a C++17 compiler; set LLVM_CONFIG to the matching llvm-config if it

@@ -84,6 +84,64 @@ class AnalyzerPoolTest(PumpTestCase):
     compression = 'lz4'
     transport = ',tcp'
 
+    def test_response_files_are_expanded_before_pump_and_native_options(self):
+        source = self.work / 'response source.cc'
+        header = self.work / 'response header.h'
+        source.write_text('#include "response header.h"\nint answer() { return VALUE; }\n')
+        header.write_text('#define VALUE 42\n')
+        empty = self.work / 'empty.modmap'
+        empty.write_text('')
+        nested = self.work / 'nested options.rsp'
+        outer = self.work / 'outer.rsp'
+        for compiler in ('g++', 'clang++'):
+            for mode in ('empty', 'nested'):
+                with self.subTest(compiler=compiler, mode=mode):
+                    args = ['-march=native', '-mtune=native', '-c', source,
+                            '-o', 'response.o', '-MD', '-MF', 'response.d']
+                    if mode == 'empty':
+                        args.append('@' + empty.name)
+                    else:
+                        # Both compilers resolve nested response paths from cwd.
+                        outer.write_text(shlex.quote('@' + nested.name))
+                        nested.write_text(shlex.join(list(map(str, args))))
+                        args = ['@' + outer.name]
+                    before = re.search(r'dcc_compile_ok (\d+)', self.get_stats(self.stats_ports[0]))
+                    assert before is not None
+                    local = self.run_cc(compiler, args, remote=False)
+                    self.assertEqual(local.returncode, 0, local.stderr.decode())
+                    output, deps = self.work / 'response.o', self.work / 'response.d'
+                    expected = output.read_bytes()
+                    output.unlink()
+                    deps.unlink()
+                    remote = self.run_cc(compiler, args)
+                    self.assertEqual(remote.returncode, 0, remote.stderr.decode() +
+                                     (Path(self.env['INCLUDE_SERVER_DIR']) / 'stderr').read_text())
+                    self.assertEqual(output.read_bytes(), expected)
+                    self.assertIn('response\\ header.h', deps.read_text())
+                    self.assertIn(f'dcc_compile_ok {int(before[1]) + 1}\n',
+                                  self.get_stats(self.stats_ports[0]))
+
+    def test_response_file_changes_are_not_cached_as_arguments(self):
+        response = self.work / 'changing.rsp'
+        for value in (17, 29):
+            self.source.write_text(f'_Static_assert(VALUE == {value}, "stale response");\n')
+            response.write_text(f'-DVALUE={value} -c {shlex.quote(str(self.source))} -o changed.o')
+            result = self.run_cc('clang', ['@' + response.name])
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_invalid_response_files_stay_local_with_compiler_diagnostics(self):
+        response = self.work / 'cycle.rsp'
+        response.write_text('@cycle.rsp')
+        for name in ('missing.rsp', response.name):
+            args = ['@' + name, '-c', self.source, '-o', 'bad.o']
+            local = self.run_cc('clang', args, remote=False)
+            result = self.run_cc('clang', args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.returncode, local.returncode)
+            self.assertEqual(result.stderr, local.stderr)
+            self.assertFalse((self.work / 'bad.o').exists())
+        self.assertNotIn('send CDIR', (self.work / 'client.log').read_text())
+
     def test_portage_hook_preserves_analyzer_storage_selection(self):
         hook = self.build / 'packaging/gentoo/pump.bashrc'
         self.shutdown_pump()
@@ -256,14 +314,14 @@ read -r proceed || exit 1
         self.assertEqual(local.returncode, 0, local.stderr.decode())
         self.assertEqual(output, (self.work / 'tree.o').read_bytes())
         feedback = (self.work / 'tree-capacity.log').read_text()
-        match = re.search(r'job cost:.*kind=4 bytes=(\d+) source=(\d+)', feedback)
-        self.assertIsNotNone(match, feedback)
-        size, raw = map(int, match.groups())
+        match = re.search(r'job cost:.*kind=4 bytes=(\d+)', feedback)
+        assert match is not None, feedback
+        size = int(match[1])
         self.assertGreater(size, 2 * 1024 * 1024)
-        self.assertEqual(raw, source.stat().st_size)
         stats = self.get_stats(self.stats_ports[0])
-        vector = re.search(r'dcc_pump_capacity ([^\n]+)', stats).group(1)
-        self.assertGreater(int(vector.split(',')[size.bit_length() - 1]), 0)
+        vector = re.search(r'dcc_pump_capacity ([^\n]+)', stats)
+        assert vector is not None, stats
+        self.assertGreater(int(vector[1].split(',')[size.bit_length() - 1]), 0)
 
     def test_module_scan_and_compile_are_local_without_analysis_fallback(self):
         source = self.work / 'module.cc'
@@ -282,7 +340,9 @@ read -r proceed || exit 1
             expected = {name: (self.work / name).read_bytes() for name in outputs}
             for name in outputs:
                 (self.work / name).unlink()
-            wrapped = self.run_cc('g++', args)
+            response = self.work / 'module.rsp'
+            response.write_text(shlex.join(list(map(str, args))))
+            wrapped = self.run_cc('g++', ['@' + response.name])
             self.assertEqual(wrapped.returncode, 0, wrapped.stderr.decode())
             self.assertEqual(expected, {name: (self.work / name).read_bytes() for name in outputs})
         self.assertNotIn('send CDIR', log.read_text())

@@ -763,14 +763,18 @@ dcc_build_somewhere(char *argv[],
 
     max_retries = dcc_get_max_retries();
 
-    if ((ret = dcc_expand_preprocessor_options(&argv)) != 0)
-        goto clean_up;
-
     if ((ret = dcc_discrepancy_filename(&discrepancy_filename)))
         goto clean_up;
 
     if (sg_level) /* Recursive distcc - run locally, and skip all locking. */
         goto run_local;
+
+    /* Parse response files once, before identifying actions, native options
+     * and inputs. No client-side @ paths may escape to an analyzer or worker. */
+    if ((ret = dcc_expand_response_files(&argv)) != 0)
+        goto lock_local;
+    if ((ret = dcc_expand_preprocessor_options(&argv)) != 0)
+        goto clean_up;
 
     /* Links belong to the link driver, not the compile-only Clang scanner. */
     if (dcc_link_candidate(argv)) {
