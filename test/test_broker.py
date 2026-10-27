@@ -134,6 +134,62 @@ class BrokerTestCase(DistccTestCase):
 class BrokerPlacementTest(BrokerTestCase):
     worker_count = 3
 
+    def test_link_completion_precedes_displaced_throughput(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        metrics = stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                                running=0, busy=0, queued=0, preparing=0, returning=0)
+        fast = self.peer(lambda: metrics)
+        slow = self.peer(stats_response(cpus=8, cores=4, jobs=8, capacity=8,
+                                       running=0, busy=0, queued=0, preparing=0, returning=0))
+        hosts = self.host(0, f',tcp,stats={fast.port},speed=1', slots=16) + ' ' + \
+                self.host(1, f',tcp,stats={slow.port},speed=.56', slots=8)
+        for kind in (8, 10):
+            with self.subTest(kind=kind):
+                metrics = stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                    running=0, busy=0, queued=0, preparing=0, returning=0)
+                name = f'link-external-{kind}'
+                self.start_broker(hosts, name=name)
+                work = (1903, 393899298, kind)
+                seed, net = self.acquire_reserved(10, work, 248098)
+                seed.sendmsg([struct.pack('=II3Q', 2, 7, 0, 0, 26_000_000_000)],
+                             [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                               array.array('i', [net.fileno()]))])
+                # This reproduces a slow tail despite an idle worker queue:
+                # external CPU contention raises the fastest worker's factor
+                # to 1.333, still below the alternative's 1/.56. A throughput
+                # penalty must not reverse that known completion-time order.
+                metrics = stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                    running=11, busy=0, queued=0, preparing=0, returning=0)
+                deadline = time.monotonic() + 3
+                while True:
+                    lease, selected = self.acquire_reserved(10, work, 248098)
+                    lines = (self.work / (name + '.log')).read_text().splitlines()
+                    rows = [dict(field.split('=', 1) for field in line.split() if '=' in field)
+                            for line in lines if '(dispatch) candidate ' in line][-2:]
+                    lease.close()
+                    self.assertEqual(len(rows), 2, rows)
+                    if float(rows[0]['factor']) > 1:
+                        break
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.02)
+                self.assertGreater(float(rows[0]['cost']), 0, rows)
+                self.assertEqual(rows[0]['work'], '0', rows)
+                self.assertLess(float(rows[0]['finish']), float(rows[1]['finish']), rows)
+                self.assertEqual(selected.getpeername()[1], self.ports[0], rows)
+
+    def test_link_backends_prefer_earliest_available_completion(self):
+        peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                    running=17, busy=14, queued=0, preparing=0, returning=0)),
+                 self.peer(stats_response(cpus=8, cores=4, jobs=8, capacity=8,
+                    running=7, busy=7, queued=0, preparing=0, returning=0))]
+        hosts = self.host(0, f',tcp,stats={peers[0].port},speed=1', slots=16) + ' ' + \
+                self.host(1, f',tcp,stats={peers[1].port},speed=.56', slots=8)
+        for kind in (8, 10):
+            with self.subTest(kind=kind):
+                self.start_broker(hosts, name=f'link-latency-{kind}')
+                _, net = self.acquire_reserved(10, (1900, 3 * 1024**2, kind), 163901)
+                self.assertEqual(net.getpeername()[1], self.ports[0])
+
     def test_rejected_wait_preserves_available_throughput_ranking(self):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
                     running=26, busy=14, queued=0, preparing=0, returning=0)),
@@ -171,6 +227,62 @@ class BrokerTest(BrokerTestCase):
         self.assertEqual(len(descriptors), 1)
         with socket.socket(fileno=descriptors[0]) as selected:
             self.assertEqual(selected.getpeername()[1], self.ports[1])
+
+    def check_link_backend_wait(self, learned, running_known=True, overrun=False):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        peers = [self.peer(stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                    running=0, busy=0, queued=0, preparing=0, returning=0)) for _ in range(2)]
+        hosts = self.host(0, f',tcp,stats={peers[0].port},speed=4') + ' ' + \
+                self.host(1, f',tcp,stats={peers[1].port},speed=1')
+        for kind in (8, 10):
+            with self.subTest(kind=kind):
+                self.start_broker(hosts, name=f'link-wait-{kind}')
+                seed, net = self.acquire_reserved(10, (1901, 4 * 1024**2, kind), 1048576)
+                seed.sendmsg([struct.pack('=II3Q', 2, 7, 0, 0, 2_000_000_000)],
+                             [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                               array.array('i', [net.fileno()]))])
+                occupied, _ = self.acquire_reserved(10,
+                    (1901 if running_known else 1904, 4 * 1024**2, kind), 1048576)
+                if overrun:
+                    time.sleep(2.05)
+                request = self.request(10, (1901 if learned else 1902, 4 * 1024**2, kind), 1048576)
+                log = self.work / f'link-wait-{kind}.log'
+                should_wait = learned and running_known and not overrun
+                if should_wait:
+                    request.settimeout(.05)
+                    with self.assertRaises(socket.timeout):
+                        request.recv(1032)
+                    recorded = log.read_text()
+                    occupied.close()
+                    request.settimeout(1)
+                    reply = self.receive(request)
+                else:
+                    reply = self.receive(request)
+                    recorded = log.read_text()
+                key = 1901 if learned else 1902
+                rows = [dict(field.split('=', 1) for field in line.split() if '=' in field)
+                        for line in recorded.splitlines()
+                        if '(dispatch) candidate ' in line and f'key={key:x}' in line][-2:]
+                self.assertEqual(len(rows), 2, rows)
+                self.assertEqual((rows[0]['wait'], rows[1]['wait']), ('1', '0'), rows)
+                self.assertLess(float(rows[0]['finish']), float(rows[1]['finish']), rows)
+                status, _, descriptors = reply
+                self.assertEqual(status, 0)
+                self.assertEqual(len(descriptors), 1)
+                with socket.socket(fileno=descriptors[0]) as selected:
+                    self.assertEqual(selected.getpeername()[1], self.ports[0 if should_wait else 1])
+
+    def test_unfamiliar_link_work_uses_available_capacity(self):
+        self.check_link_backend_wait(False)
+
+    def test_learned_link_work_can_wait_for_an_earlier_finish(self):
+        self.check_link_backend_wait(True)
+
+    def test_link_work_does_not_wait_on_unlearned_running_jobs(self):
+        self.check_link_backend_wait(True, running_known=False)
+
+    def test_link_work_does_not_wait_on_an_overrun(self):
+        self.check_link_backend_wait(True, overrun=True)
 
     def test_inflight_large_job_consumes_small_job_memory_slots(self):
         small = 64 * 1024**2

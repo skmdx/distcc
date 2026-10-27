@@ -135,6 +135,11 @@ static void learn_class(struct dcc_work_class *c, const struct dcc_work_hint *hi
     }
 }
 
+int dcc_work_known(const struct dcc_work_model *model, const struct dcc_work_hint *hint)
+{
+    return hint->key && model->history[history_slot(model, hint->key)].key == hint->key;
+}
+
 double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_work_hint *hint)
 {
     if (!hint->key) return 0;
