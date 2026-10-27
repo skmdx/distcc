@@ -366,7 +366,11 @@ def run_job(root, job, kind, prepare_library=None):
         sandbox.extend(['--setenv', 'LD_PRELOAD', str(prepare_library),
                         '--setenv', 'DISTCC_LTO_PARTITION_FILE', job['outputs'][0],
                         '--setenv', 'DISTCC_LTO_PARTITIONS', str(job['partitions'])])
-    result = subprocess.run([*sandbox, compiler, *args])
+    # Portage's preload cannot follow bubblewrap's UID maps and pivot_root.
+    # Exempt only namespace setup; the compiler runs with a cleared environment
+    # inside the read-only mounts above. The parent's sandbox stays active.
+    result = subprocess.run([*sandbox, compiler, *args],
+                            env=dict(os.environ, SANDBOX_ON='0'))
     if result.returncode:
         return result.returncode if result.returncode > 0 else 128 - result.returncode
     if not outputs or not outputs[0].stat().st_size:

@@ -68,6 +68,9 @@ current CPU contention. They use available capacity immediately instead of
 waiting for a faster occupied worker. When all workers are occupied, jobs remain
 movable until an actual CPU lane opens, including before costs are learned;
 the input pipeline is not a CPU queue.
+Under Portage, only bubblewrap's namespace setup runs with `SANDBOX_ON=0`:
+the preload cannot track its UID maps and root switch. The isolated compiler
+still uses read-only input mounts, and the caller's sandbox environment is preserved.
 Workers preserve
 LLVM's embedded import paths in a private namespace. The final native link
 runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache

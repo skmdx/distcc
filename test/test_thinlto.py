@@ -20,6 +20,39 @@ from distcc_job import fingerprint, write_metadata
 from distcc_lto import InputSnapshot, llvm_tools, publish_archive, work_key
 
 
+@unittest.skipUnless(all(shutil.which(tool) for tool in ('clang', 'bwrap', 'sandbox')),
+                     'Clang, bubblewrap and Gentoo sandbox required')
+class PortageSandboxTest(unittest.TestCase):
+    def test_local_job_creates_namespace_inside_portage_sandbox(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix='distcc-sandbox-') as directory:
+            work = Path(directory).resolve()
+            root = work / 'root'
+            source, output = work / 'input.c', work / 'output.o'
+            staged_source = root / str(source).lstrip('/')
+            staged_source.parent.mkdir(parents=True)
+            staged_source.write_text('int answer(void) { return 42; }\n')
+            job = dict(cwd=str(work), inputs=[str(source)], outputs=[str(output)],
+                       args=[shutil.which('clang'), '-c', '-x', 'c', str(source), '-o', str(output)])
+            manifest = work / 'job.json'
+            manifest.write_text(json.dumps(job))
+            env = dict(os.environ, SANDBOX_WRITE=str(work), SANDBOX_LOG=str(work / 'sandbox.log'),
+                       PYTHONDONTWRITEBYTECODE='1',
+                       PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+            script = ('import json, os, sys; from distcc_lto import run_job; '
+                      'before = os.environ["SANDBOX_WRITE"]; '
+                      'assert os.environ["SANDBOX_ON"] == "1"; '
+                      'result = run_job(sys.argv[1], json.load(open(sys.argv[2])), 4); '
+                      'assert os.environ["SANDBOX_WRITE"] == before; '
+                      'assert os.environ["SANDBOX_ON"] == "1"; sys.exit(result)')
+            result = subprocess.run(['sandbox', sys.executable, '-c', script, str(root), str(manifest)],
+                                    env=env, text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertGreater((root / str(output).lstrip('/')).stat().st_size, 0)
+            self.assertFalse((work / 'sandbox.log').exists(), result.stderr)
+
+
 @unittest.skipUnless(shutil.which('clang') and shutil.which('bwrap'), 'Clang and bubblewrap required')
 class ThinLTOTest(BrokerTestCase):
     @classmethod
@@ -229,6 +262,13 @@ class ThinLTOTest(BrokerTestCase):
         self.assertEqual(self.run_command([distributed]).returncode, self.run_command([native]).returncode)
 
     def test_partitioned_backend_preserves_private_symbols_tls_and_unwinding(self):
+        self.check_partitioned_backend()
+
+    @unittest.skipUnless(shutil.which('sandbox'), 'Gentoo sandbox required')
+    def test_partitioned_link_inside_portage_sandbox(self):
+        self.check_partitioned_backend(portage=True)
+
+    def check_partitioned_backend(self, portage=False):
         """Execute real partitions, then compare the final link's ABI and behavior."""
         compiler = shutil.which('clang++')
         if not llvm_tools(compiler):
@@ -267,7 +307,15 @@ class ThinLTOTest(BrokerTestCase):
         args = [compiler, '-O2', '-flto=thin', '-fuse-ld=lld', *objects]
         reference = self.run_command([*args, '-o', native])
         self.assertEqual(reference.returncode, 0, reference.stderr)
-        result = self.run_command([self.build / 'distcc', *args, '-o', distributed])
+        command = [self.build / 'distcc', *args, '-o', distributed]
+        if portage:
+            sandbox_log = self.work / 'sandbox.log'
+            with patch.dict(self.env, SANDBOX_WRITE=str(self.root),
+                            SANDBOX_LOG=str(sandbox_log), PYTHONDONTWRITEBYTECODE='1'):
+                result = self.run_command(['sandbox', *command])
+            self.assertFalse(sandbox_log.exists(), result.stderr)
+        else:
+            result = self.run_command(command)
         self.assertEqual(result.returncode, 0, result.stderr)
         counts = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
         self.assertTrue(any(count > 1 for count in counts), result.stderr)
