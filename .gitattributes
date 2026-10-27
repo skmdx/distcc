@@ -1,2 +1,2 @@
 # Unified diff context lines can contain a single space for an empty line.
-src/llvm-linker-wrapper.patch whitespace=-blank-at-eol
+src/*.patch whitespace=-blank-at-eol

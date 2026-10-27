@@ -7,8 +7,8 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/Utils/SplitModule.h"
 #include <algorithm>
+#include <memory>
 #include <vector>
 
 using namespace llvm;
@@ -71,10 +71,10 @@ Expected<json::Value> dcc_partition_module(Module &module, unsigned count,
       if (global.hasLocalLinkage())
         locals.push_back(&global);
     Error failure = Error::success();
-    SplitModule(module, count, [&](std::unique_ptr<Module> part) {
+    dccSplitModule(module, count, [&](std::unique_ptr<Module> part) {
       if (!failure)
         failure = write(*part);
-    });
+    }, false, true);
     if (failure)
       return std::move(failure);
     for (auto *local : locals) {

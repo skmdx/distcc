@@ -218,6 +218,7 @@ dist_extra =							\
 	src/lto_prepare.cc \
 	src/lto_partition.cc \
 	src/lto_partition.h \
+	src/llvm-split-module.patch \
 	src/llvm-linker-wrapper.patch \
 	distcc-offload \
 	distcc_job.py \
@@ -541,15 +542,25 @@ distcc-linker-wrapper: llvm-linker-wrapper/LinkerWrapperOpts.inc
 clang_driver.so: $(srcdir)/src/clang_driver.cc $(srcdir)/src/clang_inputs.h
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -shared $(LDFLAGS) -o $@ $< `$(LLVM_CONFIG) --ldflags` -lclang-cpp -lLLVM
 
+$(LTO_BUILD)/SplitModule.cpp: $(srcdir)/src/llvm-split-module.patch
+	$(mkinstalldirs) "$(LTO_BUILD)"
+	cp "$(LLVM_WRAPPER_SOURCE)/../../../llvm/lib/Transforms/Utils/SplitModule.cpp" $@.tmp
+	patch $@.tmp < "$(srcdir)/src/llvm-split-module.patch"
+	mv $@.tmp $@
+
+$(LTO_BUILD)/lto_split.o: $(LTO_BUILD)/SplitModule.cpp $(srcdir)/src/lto_partition.h
+	$(mkinstalldirs) "$(LTO_BUILD)"
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -I"$(srcdir)/src" -c $< -o $@
+
 $(LTO_BUILD)/lto_partition.o: $(srcdir)/src/lto_partition.cc $(srcdir)/src/lto_partition.h
 	$(mkinstalldirs) "$(LTO_BUILD)"
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -c $< -o $@
 
-$(LTO_BUILD)/distcc-lto: $(srcdir)/src/lto.cc $(LTO_BUILD)/lto_partition.o $(srcdir)/src/lto_partition.h
-	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $< $(LTO_BUILD)/lto_partition.o `$(LLVM_CONFIG) --ldflags` -lLLVM
+$(LTO_BUILD)/distcc-lto: $(srcdir)/src/lto.cc $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o $(srcdir)/src/lto_partition.h
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $< $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o `$(LLVM_CONFIG) --ldflags` -lLLVM
 
-$(LTO_BUILD)/lto-prepare.so: $(srcdir)/src/lto_prepare.cc $(LTO_BUILD)/lto_partition.o $(srcdir)/src/lto_partition.h
-	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -shared $(LDFLAGS) -o $@ $< $(LTO_BUILD)/lto_partition.o `$(LLVM_CONFIG) --ldflags` -lLLVM -ldl
+$(LTO_BUILD)/lto-prepare.so: $(srcdir)/src/lto_prepare.cc $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o $(srcdir)/src/lto_partition.h
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -shared $(LDFLAGS) -o $@ $< $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o `$(LLVM_CONFIG) --ldflags` -lLLVM -ldl
 
 .PHONY: lto install-lto
 lto: $(LTO_TARGETS)

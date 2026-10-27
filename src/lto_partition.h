@@ -2,10 +2,17 @@
 #define DISTCC_LTO_PARTITION_H
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
+#include <memory>
 
-namespace llvm { class Module; }
+namespace llvm {
+class Module;
+// Private build of LLVM's splitter, with instruction-weighted placement.
+void dccSplitModule(Module &, unsigned,
+                    function_ref<void(std::unique_ptr<Module>)>, bool, bool);
+}
 
 // The caller owns the prepared module and will not resume its backend.
 llvm::Expected<llvm::json::Value>

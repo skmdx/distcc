@@ -82,10 +82,14 @@ join the same work queue. A relocatable merge restores private symbol bindings
 before LLD consumes the result. Constructors, TLS and exception handling retain
 their original link semantics. Assembly with private definitions or per-object
 weak/versioned references stays together; LLVM's assembler identifies these
-cases. Individual functions and the final native layout are not subdivided.
+cases. LLVM's symbol clusters and remaining functions are placed largest-first
+on the partition with the least instruction work, including weak definitions.
+Individual functions and the final native layout are not subdivided.
 
 `make lto install-lto` builds and installs the helpers for `LLVM_CONFIG` under
-its library directory's `distcc` subdirectory. Use a distinct `LTO_BUILD` when
+its library directory's `distcc` subdirectory. Set `LLVM_WRAPPER_SOURCE` as
+described below; the same source tree supplies LLVM's `SplitModule.cpp`, built
+privately with instruction-weighted placement. Use a distinct `LTO_BUILD` when
 building for multiple installed LLVM ABIs. A compiler without its matching
 helpers still distributes whole-module backends.
 Clang 22 and 23 are exercised by the integration tests. Compiler acceptance and

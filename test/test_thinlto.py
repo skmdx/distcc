@@ -283,6 +283,63 @@ class ThinLTOTest(BrokerTestCase):
             symbols.append(sorted(result.stdout.splitlines()))
         self.assertEqual(*symbols)
 
+    def test_partitions_balance_ir_work_with_mixed_symbol_linkages(self):
+        for compiler in (shutil.which('clang'), '/usr/lib/llvm/22/bin/clang'):
+            if compiler and Path(compiler).exists():
+                with self.subTest(compiler=compiler):
+                    self.check_partition_balance(compiler)
+
+    def check_partition_balance(self, compiler):
+        tools = llvm_tools(compiler)
+        if not tools:
+            self.skipTest('matching LLVM partition helpers are not installed')
+        source = self.work / 'uneven.ll'
+        definitions = []
+        sizes = [60] * 9 + [3] * 18
+        for index, size in enumerate(sizes):
+            name = f'function_{index}'
+            linkage = 'weak_odr ' if index % 3 != 2 else ''
+            group = f' comdat(${name})' if index % 3 == 1 else ''
+            if group:
+                definitions.append(f'${name} = comdat any')
+            body = [f'define {linkage}i32 @{name}(i32 %x) noinline{group} {{']
+            for step in range(size):
+                previous = '%x' if step == 0 else f'%v{step-1}'
+                body.append(f'  %v{step} = add i32 {previous}, {index+1}')
+            body.extend([f'  ret i32 %v{size-1}', '}'])
+            definitions.append('\n'.join(body))
+        definitions.append('@alias = alias i32 (i32), ptr @function_0')
+        source.write_text('\n'.join(definitions))
+        loads, identities = [], []
+        objects = []
+        for run in range(2):
+            result = self.run_command([tools['plan'], 'split', source, '3',
+                                       self.work / f'balanced-{run}-'])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            parts = json.loads(result.stdout)['parts']
+            loads.append([part['instructions'] for part in parts])
+            identities.append([fingerprint(Path(part['path'])) for part in parts])
+            if run == 0:
+                for index, part in enumerate(parts):
+                    output = self.work / f'balanced-{index}.o'
+                    result = self.run_command([compiler, '-O2', '-c', part['path'], '-o', output])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    objects.append(output)
+        self.assertEqual(*loads)
+        self.assertEqual(*identities)
+        self.assertEqual(sum(loads[0]), sum(size + 1 for size in sizes))
+        self.assertLessEqual(max(loads[0]) - min(loads[0]), max(sizes) + 1)
+        main = self.work / 'check.c'
+        main.write_text('\n'.join(f'int function_{i}(int);' for i in range(len(sizes))) +
+            '\nint alias(int);\nint main(void) { return alias(7) + ' +
+            ' + '.join(f'function_{i}(7)' for i in range(len(sizes))) +
+            ' != ' + str(7 + sizes[0] + sum(7 + size * (i+1)
+                                           for i, size in enumerate(sizes))) + '; }\n')
+        output = self.work / 'balanced'
+        result = self.run_command([compiler, main, *objects, '-o', output])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_command([output]).returncode, 0)
+
     def test_module_assembly_preserves_private_definitions(self):
         compiler = shutil.which('clang')
         tools = llvm_tools(compiler)
