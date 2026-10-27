@@ -45,18 +45,35 @@
  } // end anonymous namespace
  
  static void addNonConstUser(ClusterMapType &GVtoClusterMap,
-@@ -164,8 +178,8 @@
+@@ -164,8 +178,25 @@
    llvm::for_each(M.aliases(), recordGVSet);
    llvm::for_each(M.ifuncs(), recordGVSet);
  
 -  // Assigned all GVs to merged clusters while balancing number of objects in
 -  // each.
++  // Keep an initializer list with its functions and associated COMDAT data.
++  // Otherwise the list can land in a partition where its associated data is
++  // only declared, causing code generation to discard the initializer entry.
++  // Keeping each list intact also preserves equal-priority initialization order.
++  for (StringRef Name : {"llvm.global_ctors", "llvm.global_dtors"}) {
++    auto *List = M.getNamedGlobal(Name);
++    if (!List || !List->hasInitializer())
++      continue;
++    for (const Use &Operand : List->getInitializer()->operands()) {
++      auto *Entry = cast<ConstantStruct>(Operand.get());
++      for (unsigned Index : {1, 2})
++        if (auto *GV = dyn_cast<GlobalValue>(
++                Entry->getOperand(Index)->stripPointerCasts()))
++          GVtoClusterMap.unionSets(List, GV);
++    }
++  }
++
 +  // Keep LLVM's inseparable symbol clusters intact, placing the largest
 +  // instruction workloads first on the currently lightest partition.
    BalancingQueueType BalancingQueue(compareClusters);
    // Pre-populate priority queue with N slot blanks.
    for (unsigned i = 0; i < N; ++i)
-@@ -173,22 +187,29 @@
+@@ -173,22 +204,29 @@
  
    SmallPtrSet<const GlobalValue *, 32> Visited;
  
@@ -92,7 +109,7 @@
           MI != GVtoClusterMap.member_end(); ++MI) {
        if (!Visited.insert(*MI).second)
          continue;
-@@ -196,10 +217,8 @@
+@@ -196,10 +234,8 @@
                          << ((*MI)->hasLocalLinkage() ? " l " : " e ") << "\n");
        Visited.insert(*MI);
        ClusterIDMap[*MI] = CurrentClusterID;
@@ -104,7 +121,7 @@
    }
  }
  
-@@ -236,7 +255,7 @@
+@@ -236,7 +272,7 @@
    return (R[0] | (R[1] << 8)) % N == I;
  }
  
@@ -113,7 +130,7 @@
      Module &M, unsigned N,
      function_ref<void(std::unique_ptr<Module> MPart)> ModuleCallback,
      bool PreserveLocals, bool RoundRobin) {
-@@ -256,38 +275,35 @@
+@@ -256,38 +292,35 @@
    ClusterIDMapType ClusterIDMap;
    findPartitions(M, ClusterIDMap, N);
  
@@ -165,7 +182,7 @@
      }
    }
  
-@@ -304,7 +320,7 @@
+@@ -304,7 +337,7 @@
              return isInPartition(GV, I, N);
          }));
      if (I != 0)

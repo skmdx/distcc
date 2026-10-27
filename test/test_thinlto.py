@@ -279,14 +279,19 @@ class ThinLTOTest(BrokerTestCase):
             f'{{ volatile int y = x; return y * {i+1} + shared; }}'
             for i in range(32))
         expression = ' + '.join(f'local_{i}(x)' for i in range(32))
-        heavy.write_text('asm(".globl heavy\\n");\n'
+        heavy.write_text('#include <unordered_map>\n'
+            'template<int N> struct Registry { static const std::unordered_map<int,int> values; };\n'
+            'template<int N> const std::unordered_map<int,int> Registry<N>::values{{1,42+N}};\n'
+            'template<int N> int lookup() { return Registry<N>::values.at(1); }\n'
+            'asm(".globl heavy\\n");\n'
             'static int shared=2, sequence;\n'
             '__attribute__((constructor(101))) static void first() { sequence=3; }\n'
             '__attribute__((constructor(102))) static void second() { sequence*=7; }\n'
             'static thread_local int epoch=1;\n'
             'struct Scope { ~Scope() { ++shared; } };\n' + definitions + '\n'
             'extern "C" int heavy(int x) { Scope guard; if(x<0) throw x; '
-            'return sequence + epoch++ + ' + expression + '; }\n')
+            'return sequence + epoch++ + lookup<0>() + lookup<1>() + lookup<2>() + lookup<3>() '
+            '+ lookup<4>() + lookup<5>() + lookup<6>() + lookup<7>() + ' + expression + '; }\n')
         small = self.work / 'small.cc'
         small.write_text('static int shared=11;\n'
             '__attribute__((noinline)) static int local_0(int x) { return x+shared; }\n'
@@ -322,6 +327,7 @@ class ThinLTOTest(BrokerTestCase):
         self.assertGreater(result.stderr.count('distcc-thinlto: compiled on'), len(objects))
         for argument in ('0', '4', '-7'):
             expected = self.run_command([native, argument])
+            self.assertEqual(expected.returncode, 0, expected.stderr)
             actual = self.run_command([distributed, argument])
             self.assertEqual((actual.returncode, actual.stdout), (expected.returncode, expected.stdout))
         symbols = []
