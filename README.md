@@ -63,12 +63,11 @@ for each request to enter the broker queue
 before submitting the next; transfer and execution overlap. Different manifest
 sizes and process startup times therefore do not reverse submission priority.
 Execution order does not change LLD's output or constructor order.
-Link backends rank workers by predicted completion time, including current CPU
-contention. Waiting for an occupied worker requires measured costs for both the
-incoming and running work, with no overruns or untracked queue entries.
-Otherwise available capacity is used instead of waiting on a class-level guess.
-Before costs are learned, jobs still wait for an actual CPU lane and remain
-movable to the next available worker; the input pipeline is not a CPU queue.
+Link backends rank available workers by predicted completion time, including
+current CPU contention. They use available capacity immediately instead of
+waiting for a faster occupied worker. When all workers are occupied, jobs remain
+movable until an actual CPU lane opens, including before costs are learned;
+the input pipeline is not a CPU queue.
 Workers preserve
 LLVM's embedded import paths in a private namespace. The final native link
 runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache

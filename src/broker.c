@@ -699,7 +699,7 @@ static double lease_ready(double *releases, int count, int inflight)
     return releases[count - inflight];
 }
 
-struct prediction { double start, prepare, factor, finish; int learned; };
+struct prediction { double start, prepare, factor, finish; };
 /* Rebuilt once per dispatch pass. A waiting job reserves a forecast position,
  * not a server slot: later jobs must not all wait for the same fast CPU. */
 struct dispatch_batch {
@@ -721,8 +721,7 @@ static struct prediction predict(struct broker *broker, const struct client *cli
     const struct dcc_capacity *cap = &peer->metrics;
     int waiting = 0;
     for (unsigned i = 0; i < batch->count; ++i) waiting += batch->planned[i].peer == peer_index;
-    struct prediction result = {.factor = execution_factor(peer, work + waiting, recovering, capacity),
-                                .learned = !waiting && dcc_work_known(&broker->model, &client->hint)};
+    struct prediction result = {.factor = execution_factor(peer, work + waiting, recovering, capacity)};
     int bulk = bulk_input(peer, &client->hint);
     double prepare = peer->prepare_cost[client->hint.kind - 1];
     if (!prepare) prepare = bulk ? 1.0 / (64 * 1048576) : peer->local ? .001 : .005;
@@ -742,7 +741,6 @@ static struct prediction predict(struct broker *broker, const struct client *cli
     /* Other brokers are represented by the projected global occupancy. Their
      * work is never added again to this broker's known jobs. */
     int unknown = work > count ? work - count : 0;
-    if (unknown || count > work) result.learned = 0;
     int rounds = unknown / lanes;
     double average = (peer->mean_cost > 0 ? peer->mean_cost : 1) * result.factor;
     double free_at[MAX_CLIENTS];
@@ -753,8 +751,6 @@ static struct prediction predict(struct broker *broker, const struct client *cli
     for (int i = 0; i < count; ++i) {
         const struct client *c = assigned[i];
         double elapsed = now > c->run_at ? now - c->run_at : 0;
-        if (!dcc_work_known(&broker->model, &c->hint) || elapsed / c->factor >= c->cost)
-            result.learned = 0;
         /* Completed work belongs to the rate at which it was scheduled.
          * Apply the new contention estimate only to the remaining work;
          * repricing the past can falsely turn a recovering job into an
@@ -1091,11 +1087,12 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
      * otherwise strand idle CPUs for an entire running job. Once waiting is
      * rejected, preserve throughput ranking among the available workers;
      * choosing their lowest latency again would discard the contention cost. */
-    /* Link backends share a completion barrier. Idle lanes must not wait for
-     * class-level guesses about unfamiliar work or an overrun. A queued
-     * choice is still useful when measured job costs predict an earlier finish. */
+    /* Link backends share a completion barrier. Keep available lanes working:
+     * waiting for a faster worker concentrates later jobs there and leaves
+     * capacity idle even with learned costs. Rank the available workers by
+     * completion time, and retain queued work until any lane actually opens. */
     if (best.wait && ready.peer >= 0 &&
-        ((link_backend && !best.forecast.learned) || best.forecast.finish >= ready_finish))
+        (link_backend || best.forecast.finish >= ready_finish))
         best = ready;
     if (client->command == JOBS || !available) {
         if (client->command == JOBS)

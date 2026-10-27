@@ -272,18 +272,9 @@ class BrokerTest(BrokerTestCase):
                     time.sleep(2.05)
                 request = self.request(10, (1901 if learned else 1902, 4 * 1024**2, kind), 1048576)
                 log = self.work / f'link-wait-{kind}.log'
-                should_wait = learned and running_known and not overrun
-                if should_wait:
-                    request.settimeout(.05)
-                    with self.assertRaises(socket.timeout):
-                        request.recv(1032)
-                    recorded = log.read_text()
-                    occupied.close()
-                    request.settimeout(1)
-                    reply = self.receive(request)
-                else:
-                    reply = self.receive(request)
-                    recorded = log.read_text()
+                request.settimeout(1)
+                reply = self.receive(request)
+                recorded = log.read_text()
                 key = 1901 if learned else 1902
                 rows = [dict(field.split('=', 1) for field in line.split() if '=' in field)
                         for line in recorded.splitlines()
@@ -295,12 +286,12 @@ class BrokerTest(BrokerTestCase):
                 self.assertEqual(status, 0)
                 self.assertEqual(len(descriptors), 1)
                 with socket.socket(fileno=descriptors[0]) as selected:
-                    self.assertEqual(selected.getpeername()[1], self.ports[0 if should_wait else 1])
+                    self.assertEqual(selected.getpeername()[1], self.ports[1])
 
     def test_unfamiliar_link_work_uses_available_capacity(self):
         self.check_link_backend_wait(False)
 
-    def test_learned_link_work_can_wait_for_an_earlier_finish(self):
+    def test_learned_link_work_uses_available_capacity(self):
         self.check_link_backend_wait(True)
 
     def test_link_work_does_not_wait_on_unlearned_running_jobs(self):

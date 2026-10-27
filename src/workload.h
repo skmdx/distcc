@@ -26,6 +26,5 @@ struct dcc_work_model {
 void dcc_work_describe(struct dcc_work_hint *, char **, const char *, const char *, int, int);
 int dcc_work_valid(const struct dcc_work_hint *);
 double dcc_work_predict(const struct dcc_work_model *, const struct dcc_work_hint *);
-int dcc_work_known(const struct dcc_work_model *, const struct dcc_work_hint *);
 void dcc_work_observe(struct dcc_work_model *, const struct dcc_work_hint *, double);
 #endif
