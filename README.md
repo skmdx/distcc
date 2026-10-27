@@ -51,10 +51,12 @@ DTLTO interface, Python xxhash and bubblewrap with unprivileged user namespaces.
 LLD performs the thin link, discovers imported modules and archive members, and
 invokes `distcc-thinlto` with its JSON job description. Each backend uses the
 broker's measured capacity and an independent learned ThinLTO workload class.
-Inputs are snapshotted and hashed once per link, shared across backend jobs,
-and transferred through the existing LZ4/content-cache path. When the selected
-LLVM's partition helpers are installed, its summary indexes provide instruction
-counts for primary and imported definitions. Jobs are ranked by the larger of
+Inputs are snapshotted once per link and shared across backend jobs. Content
+hashes are computed when a remote job first references an input and then reused;
+inputs used only for local partition preparation are not hashed. Transfer uses
+the existing LZ4/content-cache path. When the selected LLVM's partition helpers
+are installed, its summary indexes provide instruction counts for primary and
+imported definitions. Jobs are ranked by the larger of
 their share of the link's instructions and primary input bytes, so expensive
 code and large constant-data modules both start early. The planner waits only
 for each request to enter the broker queue

@@ -10,13 +10,14 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest.mock import patch
 
 from test_broker import BrokerTestCase
 from test_adaptive import stats_response
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from distcc_job import fingerprint, write_metadata
-from distcc_lto import llvm_tools, publish_archive, work_key
+from distcc_lto import InputSnapshot, llvm_tools, publish_archive, work_key
 
 
 @unittest.skipUnless(shutil.which('clang') and shutil.which('bwrap'), 'Clang and bubblewrap required')
@@ -41,6 +42,26 @@ class ThinLTOTest(BrokerTestCase):
             broker = self.work / 'broker.log'
             details = broker.read_text()[-8192:] if broker.exists() else ''
             self.fail(f'command timed out: {command}\n{error.stderr!r}\n{details}')
+
+    def test_snapshot_identity_is_lazy_shared_and_immutable(self):
+        source = self.work / 'input.bc'
+        source.write_bytes(b'original input')
+        expected = fingerprint(source)
+        with patch('distcc_lto.fingerprint', wraps=fingerprint) as hashed:
+            item = InputSnapshot(source, self.work / 'snapshot')
+            self.assertEqual(item.size, source.stat().st_size)
+            hashed.assert_not_called()
+            source.write_bytes(b'replaced input')
+            self.assertEqual(item.identity, expected)
+            files = {str(source): item}
+            args = ['clang', '-c', str(source)]
+            job = dict(cwd=str(self.work), args=args,
+                       inputs=[str(source)], outputs=[])
+            key = work_key(job, files)
+            args.append('-DOTHER=1')
+            self.assertNotEqual(work_key(job, files), key)
+            self.assertEqual(item.path.read_bytes(), b'original input')
+            hashed.assert_called_once_with(item.path)
 
     def link(self, compiler, archive=False, hip=False):
         objects = []
@@ -320,7 +341,8 @@ class ThinLTOTest(BrokerTestCase):
         command = [planner / 'distcc-thinlto', description]
         result = self.run_command(command)
         self.assertEqual(result.returncode, 0, result.stderr)
-        files = {name: (Path(name), *fingerprint(Path(name))) for job in jobs for name in job['inputs']}
+        files = {name: InputSnapshot(name, self.work / f'snapshot-{i}')
+                 for i, name in enumerate(name for job in jobs for name in job['inputs'])}
         keys = [work_key(dict(cwd=str(self.work), args=[compiler, *job['args']],
                              inputs=job['inputs'], outputs=job['outputs']), files) for job in jobs]
         assigned = [int(key, 16) for key in re.findall(r'assigning host=.* key=(\w+) ',

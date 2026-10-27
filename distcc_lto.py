@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """LLVM-generated link jobs over distcc's shared input transport."""
 import json
+from functools import cached_property
 import os
 from pathlib import Path
 import re
@@ -16,6 +17,19 @@ from distcc_job import LocalOnly, fingerprint, snapshot, write_metadata
 CONTROL = '/__distcc_lto'
 RUNTIME = ('/lib', '/lib64', '/usr/lib64', '/usr/lib/gcc', '/usr/lib/llvm',
            '/etc/ld.so.cache')
+
+
+class InputSnapshot:
+    def __init__(self, source, path):
+        snapshot(source, path)
+        self.path = path
+        self.size = path.stat().st_size
+
+    @cached_property
+    def identity(self):
+        # Local partition preparation only reads the snapshot. Hash bytes
+        # when a remote job needs them, sharing that result across its users.
+        return fingerprint(self.path)
 
 
 def absolute(name):
@@ -49,7 +63,8 @@ def work_key(job, files):
         return arg
 
     identity = [job['cwd'], [argument(arg) for arg in job['args']],
-                [(files[name][1], files[name][2].hex()) for name in job['inputs']]]
+                [(files[name].identity[0], files[name].identity[1].hex())
+                 for name in job['inputs']]]
     return xxhash.xxh3_64_intdigest(json.dumps(identity).encode()) or 1
 
 
@@ -98,18 +113,17 @@ def distribute(description, kind):
     parallelism = capacity['work_rate'] / capacity['min_rate'] if capacity['min_rate'] else slots
     with tempfile.TemporaryDirectory(prefix='distcc-lto-') as directory:
         work = Path(directory)
-        # Snapshot and hash every distinct input once per link. Per-job trees
-        # and the worker's persistent cache share the immutable backing files.
+        # Freeze every input before jobs publish any outputs. Fingerprinting
+        # is deferred until transfer; local preparation needs no content key.
         files = {}
         def register(task):
             for name in [*task['inputs'], *common['inputs']]:
                 name = absolute(name)
                 if name not in files:
                     path = work / ('input-' + str(len(files)))
-                    snapshot(name, path)
-                    files[name] = (path, *fingerprint(path))
+                    files[name] = InputSnapshot(name, path)
             names = task['inputs'][:1] if kind == 4 else [*task['inputs'], *common['inputs']]
-            task['bytes'] = sum(files[name][1] for name in {absolute(p) for p in names})
+            task['bytes'] = sum(files[name].size for name in {absolute(p) for p in names})
 
         for task in jobs:
             register(task)
@@ -165,8 +179,8 @@ def distribute(description, kind):
             inputs.mkdir()
             entries = []
             for name in job['inputs']:
-                source, size, digest = files[name]
-                os.link(source, inputs / str(len(entries)))
+                size, digest = files[name].identity
+                os.link(files[name].path, inputs / str(len(entries)))
                 entries.append((name, size, digest))
             manifest = inputs / str(len(entries))
             manifest.write_text(json.dumps(job))
@@ -213,7 +227,7 @@ def distribute(description, kind):
             for name in job['inputs']:
                 path = root / name.lstrip('/')
                 path.parent.mkdir(parents=True, exist_ok=True)
-                os.link(files[name][0], path)
+                os.link(files[name].path, path)
             manifest = str(jobdir / 'partitions.json')
             job['outputs'] = [manifest]
             job['partitions'] = task['partitions']
