@@ -134,6 +134,31 @@ class BrokerTestCase(DistccTestCase):
 class BrokerPlacementTest(BrokerTestCase):
     worker_count = 3
 
+    def test_cold_file_jobs_remain_movable_until_a_cpu_lane_opens(self):
+        metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                                busy=1, running=1, queued=0, preparing=0, returning=0)
+        fast = self.peer(metrics)
+        next_ready = self.peer(lambda: metrics)
+        hosts = self.host(0, f',tcp,stats={fast.port},speed=2') + ' ' + \
+                self.host(1, f',tcp,stats={next_ready.port},speed=1')
+        for kind in (7, 8, 10):
+            with self.subTest(kind=kind):
+                metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                    busy=1, running=1, queued=0, preparing=0, returning=0)
+                self.start_broker(hosts, name=f'cold-movable-{kind}')
+                request = self.request(10, (1905, 4 * 1024**2, kind), 1048576)
+                request.settimeout(.05)
+                with self.assertRaises(socket.timeout):
+                    request.recv(1032)
+                metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                    busy=0, running=0, queued=0, preparing=0, returning=0)
+                request.settimeout(3)
+                status, _, descriptors = self.receive(request)
+                self.assertEqual(status, 0)
+                self.assertEqual(len(descriptors), 1)
+                with socket.socket(fileno=descriptors[0]) as selected:
+                    self.assertEqual(selected.getpeername()[1], self.ports[1])
+
     def test_link_completion_precedes_displaced_throughput(self):
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
         metrics = stats_response(cpus=16, cores=8, jobs=16, capacity=16,

@@ -67,6 +67,8 @@ Link backends rank workers by predicted completion time, including current CPU
 contention. Waiting for an occupied worker requires measured costs for both the
 incoming and running work, with no overruns or untracked queue entries.
 Otherwise available capacity is used instead of waiting on a class-level guess.
+Before costs are learned, jobs still wait for an actual CPU lane and remain
+movable to the next available worker; the input pipeline is not a CPU queue.
 Workers preserve
 LLVM's embedded import paths in a private namespace. The final native link
 runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache

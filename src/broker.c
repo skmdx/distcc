@@ -1013,16 +1013,20 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             if (predicted) {
                 forecast = predict(broker, client, i, work, cost, now, batch, probe, cap->capacity, inflight);
                 score = forecast.finish;
+                wait = forecast.start > forecast.prepare + .02;
+            } else if (cost > 0) score *= cost;
+            if (staged && cap && client->hint.key && !link) {
                 /* Keep a ready job movable until an execution lane is actually
                  * available. Near-zero predicted residuals are not completion
                  * evidence: uploading then would strand it behind an overrun
                  * while a different worker becomes free. Input preparation
-                 * and returning results still overlap running compilers. */
+                 * and returning results still overlap running compilers.
+                 * Cold work has no duration forecast, but still consumes a
+                 * CPU lane: the input pipeline is not an execution queue. */
                 int lanes = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
                 if (cap->capacity >= 0 && cap->capacity < lanes) lanes = cap->capacity;
-                wait = blocked || work >= lanes || p->busy >= inflight ||
-                       forecast.start > forecast.prepare + .02;
-            } else if (cost > 0) score *= cost;
+                wait |= blocked || work >= lanes || p->busy >= inflight;
+            }
             /* Charge the throughput displaced by another compiler on every
              * worker, including existing compiles on a remote SMT core.
              * Minimizing this job's latency alone packs the fastest worker's
