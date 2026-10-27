@@ -145,6 +145,45 @@ class ThinLTOTest(BrokerTestCase):
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
 
+    @unittest.skipUnless(shutil.which('meson'), 'Meson required')
+    def test_meson_install_preserves_origin_rpath(self):
+        import ctypes
+
+        prefix = self.work / 'installed'
+        libdir = prefix / 'lib/plugins/long-install-directory'
+        (self.work / 'dep.c').write_text('int dep(void) { return 42; }\n')
+        (self.work / 'plugin.c').write_text('extern int dep(void); int answer(void) { return dep(); }\n')
+        (self.work / 'meson.build').write_text('''\
+project('origin-rpath', 'c', default_options: ['b_lto=true', 'b_lto_mode=thin'])
+add_project_link_arguments('-fuse-ld=lld', language: 'c')
+location = get_option('prefix') / 'lib/plugins/long-install-directory'
+dep = shared_library('dep', 'dep.c', install: true, install_dir: location)
+shared_library('plugin', 'plugin.c', link_with: dep, install: true,
+               install_dir: location, install_rpath: location)
+''')
+        compiler = shutil.which('clang')
+        assert compiler is not None
+        self.env['CC'] = shlex.join([str(self.build / 'distcc'), compiler])
+        before = [self.get_stats(port) for port in self.stats_ports]
+        for args in (['setup', 'build', '--prefix=' + str(prefix)],
+                     ['compile', '-C', 'build'], ['install', '-C', 'build', '--no-rebuild']):
+            result = self.run_command(['meson', *args])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        built = self.run_command(['readelf', '-d', self.work / 'build/libplugin.so'])
+        self.assertEqual(built.returncode, 0, built.stderr)
+        self.assertIn('[$ORIGIN/', built.stdout)
+        self.assertNotIn(r'\$ORIGIN', built.stdout)
+        installed = self.run_command(['readelf', '-d', libdir / 'libplugin.so'])
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertIn('[' + str(libdir) + ']', installed.stdout)
+        self.assertEqual(ctypes.CDLL(str(libdir / 'libplugin.so')).answer(), 42)
+        def completed(stats):
+            match = re.search(r'^dcc_compile_ok (\d+)$', stats, re.M)
+            assert match is not None, stats
+            return int(match[1])
+        self.assertGreater(sum(completed(self.get_stats(port)) - completed(old)
+                               for port, old in zip(self.stats_ports, before)), 0)
+
     def test_backend_cwd_survives_private_tmp_mount(self):
         inputs = self.work / 'inputs'
         inputs.mkdir()

@@ -23,6 +23,21 @@ import compress_files
 
 
 class ClangScanTest(unittest.TestCase):
+  def test_driver_diagnostics_preserve_literal_linker_arguments(self):
+    # Exercise Clang's own diagnostic quoting, including shell metacharacters.
+    values = ['$ORIGIN/:XXXXXXXXXXXXXXXXXXXXXXXXXXX', 'space and "quotes"',
+              r'literal\backslash\$name', '`command`', '']
+    for value in values:
+      with self.subTest(value=value):
+        command = [self.compiler, '-###', '-shared', '-fuse-ld=lld',
+                   '-Xlinker', '-rpath', '-Xlinker', value,
+                   '-x', 'c', '/dev/null', '-o', str(self.root / 'unused.so')]
+        result = subprocess.run(command, text=True, capture_output=True, check=True)
+        invocations = [clang_scan.tokenize_command(line) for line in result.stderr.splitlines()
+                       if line.lstrip().startswith('"')]
+        linker = next(args for args in invocations if '-rpath' in args)
+        self.assertEqual(linker[linker.index('-rpath') + 1], value)
+
   def test_file_stamps_with_repeated_root_separators(self):
     # Run separately so a regression cannot hang the test runner or grow its
     # ancestor list without bound.

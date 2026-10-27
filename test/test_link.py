@@ -428,10 +428,11 @@ class ClangLinkTest(LinkTestCase):
         self.assertIn('distcc-link: linked on ', result.stderr)
 
     def test_other_linker_stays_local(self):
-        _, result = self.link(['-fuse-ld=bfd'])
+        output, result = self.link(['-fuse-ld=bfd'])
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('single LLD invocation', result.stderr)
+        self.assertIn('distcc-link: local:', result.stderr)
         self.assertNotIn('distcc-link: linked on ', result.stderr)
+        self.assertEqual(subprocess.check_output([output], text=True), 'linked\n')
 
     def test_worker_rejects_linker_side_output(self):
         outside = self.work / 'unauthorized.map'

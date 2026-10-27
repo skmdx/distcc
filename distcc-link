@@ -212,8 +212,11 @@ def clang_link_command(command, *, offload=False):
     HIP's linker wrapper owns device extraction and registration. Its host
     linker arguments can use DTLTO without bypassing those device stages.
     """
+    from include_server import clang_scan
     result = subprocess.run([command[0], '-###', *command[1:]], capture_output=True, text=True)
-    commands = [shlex.split(line) for line in result.stderr.splitlines()
+    # Clang escapes $, backticks and quotes for display. shlex preserves \$
+    # inside double quotes, corrupting literal linker operands such as $ORIGIN.
+    commands = [clang_scan.tokenize_command(line) for line in result.stderr.splitlines()
                 if line.lstrip().startswith('"')]
     if result.returncode or len(commands) != 1 or not commands[0]:
         raise LocalOnly('Clang remote links require a single LLD invocation')

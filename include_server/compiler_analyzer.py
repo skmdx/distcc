@@ -191,7 +191,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     if clang:
       # Clang distinguishes C++ system headers from implicit extern-C system
       # headers. Plain -isystem loses that distinction (including line flags).
-      invocation = next((shlex.split(line) for line in defaults.stderr.decode().splitlines()
+      invocation = next((clang_scan.tokenize_command(line) for line in defaults.stderr.decode().splitlines()
                          if ' -cc1 ' in line or ' "-cc1" ' in line), [])
       kinds = {invocation[i + 1]: (2 if arg == '-internal-externc-isystem' else 1)
                for i, arg in enumerate(invocation[:-1])

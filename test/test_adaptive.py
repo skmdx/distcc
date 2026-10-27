@@ -130,6 +130,10 @@ class DistccTestCase(unittest.TestCase):
         cls.base_env['DISTCC_JOB_MEMORY'] = '64'
         cls.base_env['DISTCCD_RUST_TMPDIR'] = str(cls.root)
         cls.base_env['DISTCC_CLANG_LIBRARY'] = str(cls.build / 'clang_driver.so')
+        # Build-tree checks need the matching native extension even after a
+        # child changes cwd. Installed-path checks use the installed package.
+        if (cls.build / '_include_server').is_dir():
+            cls.base_env['PYTHONPATH'] = str(next(cls.build.glob('_include_server/lib.*')))
         cls.daemons = []
         cls.ports = []
         cls.stats_ports = []

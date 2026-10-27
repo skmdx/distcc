@@ -12,6 +12,7 @@
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/CommandLine.h>
 #include <sys/stat.h>
 #include <map>
 #include <memory>
@@ -320,7 +321,25 @@ PyObject *scan(PyObject *, PyObject *arguments) {
     return Py_BuildValue("{s:N,s:N,s:N}", "files", files, "lookups", paths, "dependencies", deps);
 }
 
+PyObject *tokenize_command(PyObject *, PyObject *args) {
+    const char *command;
+    if (!PyArg_ParseTuple(args, "s", &command)) return nullptr;
+    llvm::BumpPtrAllocator allocator;
+    llvm::StringSaver saver(allocator);
+    llvm::SmallVector<const char *, 32> words;
+    llvm::cl::TokenizeGNUCommandLine(command, saver, words);
+    PyObject *result = PyList_New(words.size());
+    if (!result) return nullptr;
+    for (size_t i = 0; i < words.size(); ++i) {
+        PyObject *word = PyUnicode_DecodeFSDefault(words[i]);
+        if (!word) { Py_DECREF(result); return nullptr; }
+        PyList_SET_ITEM(result, i, word);
+    }
+    return result;
+}
+
 PyMethodDef methods[] = {
+    {"tokenize_command", tokenize_command, METH_VARARGS, "Decode Clang driver diagnostics with LLVM's argument parser."},
     {"compile", dcc_clang_compile, METH_VARARGS, "Compile once with the client's source identity."},
     {"scan", scan, METH_VARARGS, "Scan using libclang-cpp; return immutable inputs and lookup paths."},
     {nullptr, nullptr, 0, nullptr}};
