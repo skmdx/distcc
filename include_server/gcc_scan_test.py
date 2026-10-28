@@ -1,6 +1,7 @@
 """Check native GCC preprocessing and dependency probes, without syntax emulation."""
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -78,6 +79,16 @@ class GccScanTest(unittest.TestCase):
   def scan(self, *options):
     return gcc_scan.scan([self.compiler, '-I', str(self.root), *options, str(self.source)],
                          str(self.root), self.library)
+
+  def test_full_preprocessing_can_outlive_the_former_deadline(self):
+    self.source.write_text('int value;\n')
+    wrapper = self.root / 'slow-gcc'
+    # Cross the former 30-second limit with a real compiler and manifest.
+    wrapper.write_text('#!/bin/sh\nsleep 31\nexec ' +
+                       shlex.quote(self.compiler) + ' "$@"\n')
+    wrapper.chmod(0o755)
+    result = gcc_scan.scan([str(wrapper), str(self.source)], str(self.root), self.library)
+    self.assertIn(str(self.source), result['dependencies'])
 
   def test_native_feature_branch_and_existence_only_inputs(self):
     (self.root/'gcc.h').write_text('int gcc_only;\n')

@@ -22,8 +22,10 @@ def scan(command, cwd, library):
     invocation = [*command, '-E', '-P', '-ftrack-macro-expansion=0',
                   '-fplugin=' + library,
                   '-fplugin-arg-' + Path(library).stem + '-output-fd=' + str(fd)]
+    # Full preprocessing can outlive a fixed wall-clock deadline under load.
+    # The analyzer worker owns this subprocess and its cancellation lifetime.
     result = subprocess.run(invocation, cwd=cwd, env=env, pass_fds=(fd,),
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     output.seek(0)
     data = output.read()
   # Source diagnostics (for example #error) need not prevent input collection.
