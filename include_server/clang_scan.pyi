@@ -3,6 +3,8 @@ from typing import Sequence, TypedDict
 version: str
 gcc_scan_dir: str
 
+class InputChangedError(RuntimeError): ...
+
 class ScanResult(TypedDict):
     files: dict[str, memoryview]
     lookups: dict[str, tuple[int, int, int] | tuple[int, int, int, int, int, int] | None]

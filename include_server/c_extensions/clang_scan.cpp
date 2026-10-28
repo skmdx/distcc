@@ -75,6 +75,7 @@ struct Snapshot {
     std::shared_ptr<const Image> image;
 };
 PyTypeObject *snapshot_type;
+PyObject *input_changed_error;
 int snapshot_buffer(PyObject *object, Py_buffer *view, int flags) {
     const auto &bytes = reinterpret_cast<Snapshot *>(object)->image->bytes;
     return PyBuffer_FillInfo(view, object, const_cast<char *>(bytes.data()), bytes.size(), 1, flags);
@@ -115,6 +116,7 @@ public:
     std::map<std::string, Stamp> stamps;
     Images contents;
     bool changed = false;
+    std::string changed_path;
     std::error_code cwd_error;
     explicit Inputs(const std::string &cwd)
         : ProxyFileSystem(llvm::vfs::createPhysicalFileSystem()), cwd(cwd) {
@@ -163,7 +165,10 @@ public:
     }
     bool validate() {
         for (const auto &entry : stamps)
-            if (!(entry.second == Stamp(entry.first))) changed = true;
+            if (!(entry.second == Stamp(entry.first))) {
+                changed = true;
+                if (changed_path.empty()) changed_path = entry.first;
+            }
         return !changed;
     }
 };
@@ -526,8 +531,11 @@ PyObject *scan(PyObject *, PyObject *arguments) {
     Py_END_ALLOW_THREADS
     previous_inputs = ok ? inputs->contents : Images{};
     if (PyErr_CheckSignals() < 0) return nullptr;
+    if (inputs->changed)
+        return PyErr_Format(input_changed_error, "Input changed during Clang dependency scan: %s",
+                            inputs->changed_path.c_str());
     if (!ok) return PyErr_Format(PyExc_RuntimeError, "Clang dependency scan: %s",
-        inputs->changed ? "input changed" : result.unsupported ? "unsupported preprocessor input" :
+        result.unsupported ? "unsupported preprocessor input" :
         diagnostics.error.empty() ? "unreadable input" : diagnostics.error.c_str());
     PyObject *files = PyDict_New(), *paths = PyDict_New(), *deps = PyList_New(0);
     if (!files || !paths || !deps) { Py_XDECREF(files); Py_XDECREF(paths); Py_XDECREF(deps); return nullptr; }
@@ -606,6 +614,12 @@ PyMODINIT_FUNC PyInit_clang_scan() {
     llvm::InitializeAllTargets();
     PyObject *result = PyModule_Create(&module);
     if (result) {
+        input_changed_error = PyErr_NewException("clang_scan.InputChangedError", PyExc_RuntimeError, nullptr);
+        if (!input_changed_error || PyModule_AddObject(result, "InputChangedError", input_changed_error) < 0) {
+            Py_XDECREF(input_changed_error);
+            Py_DECREF(result);
+            return nullptr;
+        }
         PyType_Slot slots[] = {
             {Py_bf_getbuffer, reinterpret_cast<void *>(snapshot_buffer)},
             {Py_tp_dealloc, reinterpret_cast<void *>(snapshot_free)},

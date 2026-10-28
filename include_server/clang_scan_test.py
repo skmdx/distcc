@@ -718,6 +718,120 @@ with tempfile.TemporaryDirectory() as directory:
     image = next(path for path in files if path.endswith('/header.h.lz4s'))
     self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(header.read_bytes()))
 
+  def test_native_input_mutation_is_retried_with_fresh_snapshots(self):
+    # Mutate a header only after Clang has read it and reached the next include.
+    # The native scanner, its consistency check and retry all run unmocked.
+    assert self.compiler is not None
+    shim = self.root / 'mutate.c'
+    shim.write_text(r'''
+#define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
+#include <sys/stat.h>
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+int stat(const char *path, struct stat *info) {
+    static int (*real_stat)(const char *, struct stat *);
+    static int changed;
+    if (!real_stat) real_stat = dlsym(RTLD_NEXT, "stat64");
+    int result = real_stat(path, info), saved = errno;
+    const char *gate = getenv("DCC_TEST_CHANGE_GATE");
+    if (!result && gate && !strcmp(path, gate) &&
+        (!changed || getenv("DCC_TEST_CHANGE_EVERY"))) {
+        int fd = open(getenv("DCC_TEST_CHANGE_PATH"), O_WRONLY | O_TRUNC);
+        if (fd >= 0) {
+            const char replacement[] = "#include \"new.h\"\n";
+            if (write(fd, replacement, sizeof replacement - 1) == sizeof replacement - 1)
+                changed = 1;
+            close(fd);
+        }
+    }
+    errno = saved;
+    return result;
+}
+''')
+    library = self.root / 'mutate.so'
+    subprocess.run([self.compiler, '-shared', '-fPIC', str(shim), '-ldl', '-o', str(library)],
+                   check=True, capture_output=True)
+    header, gate = self.root / 'header.h', self.root / 'gate.h'
+    gate.write_text('int gate;\n')
+    (self.root / 'old.h').write_text('int old;\n')
+    (self.root / 'new.h').write_text('int current;\n')
+    self.source.write_text('#include "header.h"\n#include "gate.h"\nint body;\n')
+    script = r'''
+import os, sys
+from pathlib import Path
+import basics, clang_scan, compiler_analyzer, scan_statistics, xxhash
+root, compiler, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+command = [compiler, '-c', str(root / 'source.c')]
+if mode == 'direct':
+    try:
+        clang_scan.scan(command, str(root))
+    except clang_scan.InputChangedError as error:
+        assert str(root / 'header.h') in str(error), str(error)
+    else:
+        raise AssertionError('native mutation was not detected')
+else:
+    keeper = basics.ClientRootKeeper()
+    try:
+        analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+        if mode == 'continuous':
+            try:
+                analyzer.DoCompilationCommand(command, str(root), keeper, 'lz4s')
+            except basics.NotCoveredError as error:
+                assert 'Inputs keep changing' in str(error), str(error)
+            else:
+                raise AssertionError('changing inputs were published')
+        else:
+            files = analyzer.DoCompilationCommand(command, str(root), keeper, 'lz4s')
+            assert any(path.endswith('/new.h.lz4s') for path in files), files
+            assert not any(path.endswith('/old.h.lz4s') for path in files), files
+            image = next(path for path in files if path.endswith('/header.h.lz4s'))
+            assert Path(image + '.xxh3').read_bytes()[:8] == xxhash.xxh3_64_digest(
+                (root / 'header.h').read_bytes())
+        assert scan_statistics.scan_counter == 2, scan_statistics.scan_counter
+    finally:
+        keeper.CleanOutClientRoots()
+'''
+    for mode in ('direct', 'once', 'continuous'):
+      with self.subTest(mode=mode):
+        header.write_text('#include "old.h"\n')
+        env = dict(os.environ, LD_PRELOAD=str(library), DCC_TEST_CHANGE_PATH=str(header),
+                   DCC_TEST_CHANGE_GATE=str(gate))
+        if mode == 'continuous':
+          env['DCC_TEST_CHANGE_EVERY'] = '1'
+        result = subprocess.run([sys.executable, '-c', script, str(self.root), self.compiler, mode],
+                                env=env, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+  def test_input_changed_after_native_scan_restarts_before_publication(self):
+    self.addCleanup(os.chdir, os.getcwd())
+    header = self.root / 'header.h'
+    header.write_text('#include "old.h"\n')
+    (self.root / 'old.h').write_text('int old;\n')
+    (self.root / 'new.h').write_text('int current;\n')
+    self.source.write_text('#include "header.h"\nint body;\n')
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    native = clang_scan.scan
+    calls = []
+    def mutate(*args):
+      result = native(*args)
+      calls.append(result)
+      if len(calls) == 1:
+        header.write_text('#include "new.h"\n')
+      return result
+    with mock.patch.object(clang_scan, 'scan', side_effect=mutate):
+      files = analyzer.DoCompilationCommand([self.compiler, '-c', str(self.source)],
+                                             str(self.root), keeper, 'lz4s')
+    self.assertEqual(len(calls), 2)
+    self.assertTrue(any(path.endswith('/new.h.lz4s') for path in files))
+    self.assertFalse(any(path.endswith('/old.h.lz4s') for path in files))
+
   def test_compiler_scan_rejects_continuous_changes_during_compression(self):
     gcc = shutil.which('gcc')
     if not gcc:

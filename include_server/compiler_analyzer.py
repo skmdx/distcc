@@ -280,6 +280,8 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
             (classes[native['directories'][path]] if kind == 0 else kind, path)
             for kind, path in self.system_includes)
         result = native
+    except clang_scan.InputChangedError as error:
+      raise include_analyzer.CacheInvalidated(str(error)) from error
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
       raise basics.NotCoveredError(str(error), send_email=False) from error
     finally:
@@ -307,7 +309,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
         if matches_scan:
           # Cached bytes/path mappings belong to a previous input generation.
           raise include_analyzer.CacheInvalidated()
-        raise basics.NotCoveredError('Input changed after compiler dependency scan: ' + path)
+        raise include_analyzer.CacheInvalidated('Input changed after compiler dependency scan: ' + path)
     if stamps.Changed(()):
       raise include_analyzer.CacheInvalidated()
     # Keep source bytes unchanged. A shared header can be reached through both
@@ -324,7 +326,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       self.mirror_path.DoPath(absolute, self.currdir_idx, self.client_root_keeper.client_root)
       stamp = stamps.Observe(canonical)
       if stamp is None:
-        raise basics.NotCoveredError('Dependency disappeared: ' + path)
+        raise include_analyzer.CacheInvalidated('Dependency disappeared: ' + path)
       target = self.mirror_path.FileIdentity(
           canonical, stamp[:2], self.client_root_keeper.client_root)
       if target != canonical:
