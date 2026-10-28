@@ -244,7 +244,7 @@ static void dcc_gssapi_show_principal(void) {
  **/
 int main(int argc, char **argv)
 {
-    int status, sg_level, tweaked_path = 0;
+    int status, sg_level, tweaked_path = 0, masquerade = 0;
     char **compiler_args = NULL; /* dynamically allocated */
     char *compiler_name; /* points into argv[0] */
     int ret;
@@ -363,24 +363,28 @@ int main(int argc, char **argv)
         /* compiler_args is now respectively either "cc -c hello.c" or
          * "gcc -c hello.c" */
 
-#if 0
-        /* I don't think we need to call this: if we reached this
-         * line, our invocation name is something like 'distcc', and
-         * that's never a problem for masquerading loops. */
-        if ((ret = dcc_trim_path(compiler_name)) != 0)
-            goto out;
-#endif
+        /* Build-system launchers may wrap an absolute masquerade link.
+         * Unwrap it before compiler discovery, pump analysis and RPC, just
+         * as when the same link is invoked directly. */
+        char *resolved = strchr(compiler_args[0], '/') ? realpath(compiler_args[0], NULL) : NULL;
+        masquerade = resolved && !strcmp(dcc_find_basename(resolved), "distcc");
+        free(resolved);
     } else {
         /* Invoked as "cc -c hello.c", with masqueraded path */
-        if ((ret = dcc_support_masquerade(argv, compiler_name,
-                                          &tweaked_path)) != 0)
-            goto out;
-
         if ((ret = dcc_copy_argv(argv, &compiler_args, 0)) != 0) {
             goto out;
         }
+        masquerade = 1;
+    }
+
+    if (masquerade) {
+        compiler_name = (char *) dcc_find_basename(compiler_args[0]);
+        if ((ret = dcc_support_masquerade(compiler_args, compiler_name,
+                                        &tweaked_path)) != 0)
+            goto out;
+        char *name = strdup(compiler_name);
         free(compiler_args[0]);
-        compiler_args[0] = strdup(compiler_name);
+        compiler_args[0] = name;
         if (!compiler_args[0]) {
             rs_log_error("strdup failed - out of memory?");
             ret = EXIT_OUT_OF_MEMORY;

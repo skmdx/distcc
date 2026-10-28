@@ -1461,6 +1461,25 @@ class Lz4PreprocessTest(PreprocessTest):
 
 
 class TcpPreprocessTest(PreprocessTest):
+    def test_launcher_with_absolute_gcc_masquerade_uses_remote_pump(self):
+        masquerade = self.work / 'masquerade'
+        masquerade.mkdir()
+        compiler = masquerade / 'g++'
+        compiler.symlink_to(self.build / 'distcc')
+        self.env['PATH'] = str(masquerade) + os.pathsep + self.env['PATH']
+        header = self.work / 'local.h'
+        header.write_text('#define ANSWER 42\n')
+        source = self.work / 'source.cc'
+        source.write_text('#include "local.h"\nint main() { return ANSWER != 42; }\n')
+        result = self.run_cc(str(compiler), ['-c', source, '-o', 'source.o'])
+        log = (self.work / 'client.log').read_text()
+        self.assertEqual(result.returncode, 0, result.stderr.decode() + log[-4000:])
+        self.assertIn('pooled TCP job completed', log)
+        self.assertNotIn('gave up analyzing', log)
+        self.assertNotIn('preprocessing locally', log)
+        subprocess.run([self.cc, self.work / 'source.o', '-o', self.work / 'exe'], check=True)
+        subprocess.run([self.work / 'exe'], check=True)
+
     def test_clang_unused_link_inputs_preserve_compile_semantics(self):
         compiler = shutil.which('clang')
         if not compiler:

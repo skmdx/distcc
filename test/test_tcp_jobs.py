@@ -24,6 +24,36 @@ from test_adaptive import free_port
 
 
 class TcpJobsTest(BrokerTestCase):
+    def test_explicit_launcher_unwraps_absolute_masquerade_compilers(self):
+        self.start_tcp()
+        wrappers = self.work / 'masquerade'
+        wrappers.mkdir()
+        target = subprocess.check_output([self.cc, '-dumpmachine'], text=True).strip()
+        for name, suffix in (('gcc', 'c'), ('g++', 'cc'),
+                             (target + '-gcc', 'c'), (target + '-g++', 'cc')):
+            with self.subTest(compiler=name):
+                compiler = wrappers / name
+                compiler.symlink_to(self.build / 'distcc')
+                source = self.work / ('source.' + suffix)
+                source.write_text('int main(void) { return 0; }\n')
+                obj = self.work / (name + '.o')
+                env = dict(self.env, DISTCC_VERBOSE='1',
+                           PATH=str(wrappers) + os.pathsep + os.environ['PATH'])
+                result = subprocess.run([str(self.build / 'distcc'), str(compiler),
+                                         '-c', str(source), '-o', str(obj)], env=env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+                self.assertIn('pooled TCP job completed', result.stderr)
+                # Client-only wrapper paths must never reach a worker, even
+                # when that worker permits absolute compiler paths.
+                self.logs[0].flush()
+                log = Path(self.logs[0].name).read_text()
+                self.assertNotIn(str(compiler), log)
+                exe = self.work / (name + '.exe')
+                subprocess.run([self.cc, str(obj), '-o', str(exe)], check=True,
+                               capture_output=True, timeout=10)
+                subprocess.run([str(exe)], check=True, timeout=5)
+
     def test_compiler_execution_outlives_transport_idle_timeout(self):
         wrapper = self.work / 'slow-compiler'
         wrapper.mkdir()
