@@ -24,17 +24,59 @@ from distcc_lto import InputSnapshot, llvm_tools, publish_archive, work_key
                      'Clang, bubblewrap and Gentoo sandbox required')
 class PortageSandboxTest(unittest.TestCase):
     def test_local_job_creates_namespace_inside_portage_sandbox(self):
+        self.compile_local_job()
+
+    @unittest.skipUnless(os.geteuid() == 0, 'root install phase required')
+    def test_root_install_job_under_private_build_user_directory(self):
+        import pwd
+
+        build_uid = pwd.getpwnam('portage').pw_uid
+        self.assertNotEqual(build_uid, 0)
+        self.compile_local_job(build_uid)
+
+    def compile_local_job(self, build_uid=None):
         import tempfile
 
         with tempfile.TemporaryDirectory(prefix='distcc-sandbox-') as directory:
             work = Path(directory).resolve()
+            if build_uid is not None:
+                os.chown(work, build_uid, -1)
+                work.chmod(0o700)
             root = work / 'root'
             source, output = work / 'input.c', work / 'output.o'
             staged_source = root / str(source).lstrip('/')
             staged_source.parent.mkdir(parents=True)
             staged_source.write_text('int answer(void) { return 42; }\n')
-            job = dict(cwd=str(work), inputs=[str(source)], outputs=[str(output)],
-                       args=[shutil.which('clang'), '-c', '-x', 'c', str(source), '-o', str(output)])
+            compiler = shutil.which('clang')
+            assert compiler is not None
+            inputs = [str(source)]
+            probe = []
+            if os.geteuid() == 0:
+                library = work / 'capabilities.so'
+                result = subprocess.run([compiler, '-shared', '-fPIC', '-x', 'c',
+                                         '-', '-o', str(library)], text=True, capture_output=True,
+                                        input='''\
+#include <linux/capability.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+__attribute__((constructor)) static void check(void) {
+    struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
+    struct __user_cap_data_struct caps[2];
+    if (syscall(SYS_capget, &header, caps) ||
+        caps[0].effective || caps[0].permitted || caps[0].inheritable ||
+        caps[1].effective || caps[1].permitted || caps[1].inheritable ||
+        prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) _exit(98);
+    const char message[] = "compiler capabilities cleared\\n";
+    write(2, message, sizeof(message) - 1);
+}
+''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                shutil.copyfile(library, root / str(library).lstrip('/'))
+                inputs.append(str(library))
+                probe.append(str(library))
+            job = dict(cwd=str(work), inputs=inputs, outputs=[str(output)], partitions=1,
+                       args=[compiler, '-c', '-x', 'c', str(source), '-o', str(output)])
             manifest = work / 'job.json'
             manifest.write_text(json.dumps(job))
             env = dict(os.environ, SANDBOX_WRITE=str(work), SANDBOX_LOG=str(work / 'sandbox.log'),
@@ -43,14 +85,17 @@ class PortageSandboxTest(unittest.TestCase):
             script = ('import json, os, sys; from distcc_lto import run_job; '
                       'before = os.environ["SANDBOX_WRITE"]; '
                       'assert os.environ["SANDBOX_ON"] == "1"; '
-                      'result = run_job(sys.argv[1], json.load(open(sys.argv[2])), 4); '
+                      'result = run_job(sys.argv[1], json.load(open(sys.argv[2])), 4, '
+                      'sys.argv[3] if len(sys.argv) > 3 else None); '
                       'assert os.environ["SANDBOX_WRITE"] == before; '
                       'assert os.environ["SANDBOX_ON"] == "1"; sys.exit(result)')
-            result = subprocess.run(['sandbox', sys.executable, '-c', script, str(root), str(manifest)],
+            result = subprocess.run(['sandbox', sys.executable, '-c', script, str(root), str(manifest), *probe],
                                     env=env, text=True, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertGreater((root / str(output).lstrip('/')).stat().st_size, 0)
             self.assertFalse((work / 'sandbox.log').exists(), result.stderr)
+            if os.geteuid() == 0:
+                self.assertIn('compiler capabilities cleared', result.stderr)
 
 
 @unittest.skipUnless(shutil.which('clang') and shutil.which('bwrap'), 'Clang and bubblewrap required')

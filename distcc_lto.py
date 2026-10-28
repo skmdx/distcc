@@ -337,8 +337,16 @@ def run_job(root, job, kind, prepare_library=None):
         raise OSError('worker Clang is not installed')
     # Keep embedded import paths in LLVM indexes unchanged. A private mount
     # namespace gives Clang the client path layout and read-only cached inputs.
+    namespaces = ['--unshare-all']
+    if os.geteuid() == 0:
+        # Portage installs as root below the build user's mode-0700 directory.
+        # A new user namespace loses host DAC override before bwrap opens the
+        # bind sources. Keep it for mount setup, then drop every capability
+        # before executing Clang in the isolated, read-only filesystem.
+        namespaces = ['--unshare-ipc', '--unshare-pid', '--unshare-net',
+                      '--unshare-uts', '--unshare-cgroup-try', '--cap-drop', 'ALL']
     sandbox = [shutil.which('bwrap', path=os.defpath) or '/usr/bin/bwrap',
-               '--unshare-all', '--die-with-parent', '--bind', str(root), '/']
+               *namespaces, '--die-with-parent', '--bind', str(root), '/']
     rooted(job['cwd']).mkdir(parents=True, exist_ok=True)
     for runtime in RUNTIME:
         if Path(runtime).exists():
