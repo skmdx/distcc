@@ -598,6 +598,25 @@ class PreprocessTest(PumpTestCase):
                 with self.subTest(compiler=compiler, options=options):
                     self.compare(compiler, ['-xc', '-P', '-DWR_VERTEX_SHADER=1', *options])
 
+    def test_clang_analyzer_checks_disabled_compile_remotely(self):
+        (self.work / 'header.h').write_text('#define ANSWER 42\n')
+        self.source.write_text('#include "header.h"\nint main(void) { return ANSWER != 42; }\n')
+        for flags in (['-Xclang', '-analyzer-disable-all-checks'],
+                      ['-Xclang=-analyzer-disable-all-checks']):
+            with self.subTest(flags=flags):
+                objects = []
+                for remote in (False, True):
+                    result = self.run_cc('clang', [*flags, '-c', self.source, '-o', 'check.o'], remote)
+                    self.assertEqual(result.returncode, 0, result.stderr.decode())
+                    objects.append((self.work / 'check.o').read_bytes())
+                self.assertEqual(*objects)
+                subprocess.run(['clang', self.work / 'check.o', '-o', self.work / 'check'],
+                               check=True, capture_output=True, timeout=15)
+                subprocess.run([self.work / 'check'], check=True, timeout=5)
+        log = (self.work / 'client.log').read_text()
+        self.assertNotIn('gave up analyzing', log)
+        self.assertNotIn('retrying locally', log)
+
     def test_guarded_header_aliases_compile_remotely(self):
         header, alias = self.work / 'real.h', self.work / 'alias.h'
         declarations = 'struct Once { int member; };\nint value;\nconst char *path = __FILE__;\n'

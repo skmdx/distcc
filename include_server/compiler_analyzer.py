@@ -244,16 +244,20 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       if self.build_stat_cache.file_stamps.Stamp(path) is not None:
         raise basics.NotCoveredError('Compiler default include directory appeared: ' + path)
     command = dependency_command(self.command, self.translation_unit)
-    frontend_args = [command[i + 1] for i, arg in enumerate(command[:-1])
-                     if arg == '-Xclang']
-    # Native CPU expansion uses paired cc1 option/value arguments. They affect
-    # predefined macros and must reach the same frontend that scans the input.
+    frontend_args = []
+    for i, arg in enumerate(command):
+      if arg == '-Xclang':
+        frontend_args.append(command[i + 1] if i + 1 < len(command) else '')
+      elif arg.startswith('-Xclang='):
+        frontend_args.append(arg.split('=', 1)[1])
+    # Check arity while leaving the actual option semantics to Clang. CPU
+    # options affect macros; disabling analyzer checks does not affect inputs.
     cpu_options = {'-target-cpu', '-tune-cpu', '-target-feature'}
-    safe_frontend = (len(frontend_args) % 2 == 0 and
-                     all(frontend_args[i] in cpu_options and frontend_args[i + 1]
-                         for i in range(0, len(frontend_args), 2)))
-    if not safe_frontend or command[-1] == '-Xclang' or any(
-        (arg.startswith('-Xclang') and arg != '-Xclang') or
+    frontend_options = iter(frontend_args)
+    safe_frontend = all(arg == '-analyzer-disable-all-checks' or
+                        (arg in cpu_options and next(frontend_options, ''))
+                        for arg in frontend_options)
+    if not safe_frontend or any(
         arg.startswith(('-fmodule', '-include-pch', '-fplugin', '@',
                         '-Wp,', '-save-temps', '--save-temps', '-ftime-trace',
                         '-serialize-diagnostics', '--serialize-diagnostics'))

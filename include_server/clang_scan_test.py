@@ -927,13 +927,31 @@ else:
          '-c', str(self.source)], str(self.root), keeper, 'lz4s')
     self.assertTrue(any('/.distcc-system/' in path for path in files))
 
-  def test_clang_other_frontend_overrides_still_require_local_preprocessing(self):
+  def test_clang_analyzer_check_options_preserve_header_analysis(self):
+    self.source.write_text('#include "header.h"\nint value;\n')
+    (self.root / 'header.h').write_text('#define VALUE 1\n')
+    self.addCleanup(os.chdir, os.getcwd())
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    for flags in (['-Xclang', '-analyzer-disable-all-checks'],
+                  ['-Xclang=-analyzer-disable-all-checks'],
+                  ['-Xclang', '-target-cpu', '-Xclang', 'haswell',
+                   '-Xclang', '-analyzer-disable-all-checks',
+                   '-Xclang', '-target-feature', '-Xclang', '+avx2']):
+      with self.subTest(flags=flags):
+        analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+        files = analyzer.DoCompilationCommand([self.compiler, *flags, '-c', str(self.source)],
+                                              str(self.root), keeper, 'lz4s')
+        self.assertTrue(any(path.endswith('/header.h.lz4s') for path in files))
+
+  def test_clang_plugins_and_invalid_frontend_options_require_local_preprocessing(self):
     self.source.write_text('int value;\n')
     self.addCleanup(os.chdir, os.getcwd())
     keeper = basics.ClientRootKeeper()
     self.addCleanup(keeper.CleanOutClientRoots)
     for flags in (['-Xclang', '-load', '-Xclang', 'plugin.so'],
-                  ['-Xclang=-load'], ['-Xclang', '-target-feature']):
+                  ['-Xclang=-load'], ['-Xclang', '-target-feature'],
+                  ['-Xclang', '-include-pch', '-Xclang', 'missing.pch']):
       with self.subTest(flags=flags):
         analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
         with self.assertRaises(basics.NotCoveredError):
