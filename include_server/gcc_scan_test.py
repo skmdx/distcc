@@ -28,7 +28,7 @@ class InputMetadataTest(unittest.TestCase):
         lookups={source: (1, 2, 33188, 13, -7, 11), '/missing.h': None,
                  '/working/directory': (1, 3, 16877)}, directories={'/working/headers': 1}))
 
-  def test_rejects_truncation_conflicting_identities_and_oversized_inputs(self):
+  def test_rejects_truncation_and_conflicting_identities(self):
     good = self.manifest((b'source.c', b'1 2 33188 13 7 11'))
     for end in range(len(good)):
       with self.subTest(end=end), self.assertRaises(ValueError):
@@ -36,10 +36,16 @@ class InputMetadataTest(unittest.TestCase):
     for records in (((b'source.c', b'-'),),
                     ((b'source.c', b'1 2 33188 13 7'),),
                     ((b'source.c', b'1 2 33188 13 7 11 extra'),),
-                    ((b'source.c', b'1 2 33188 67108865 7 11'),),
                     ((b'source.c', b'1 2 33188 13 7 11'), (b'source.c', b'-'))):
       with self.subTest(records=records), self.assertRaises(ValueError):
         native.ParseGccInputs(self.manifest(*records), '/working')
+
+  def test_input_sizes_do_not_limit_metadata_collection(self):
+    data = self.manifest((b'source.c', b'1 2 33188 67108865 7 11'),
+                         (b'header.h', b'1 3 33188 67108864 7 11'))
+    result = native.ParseGccInputs(data, '/working')
+    self.assertEqual(result['dependencies'], ['/working/source.c', '/working/header.h'])
+    self.assertEqual(result['lookups']['/working/source.c'][3], 67108865)
 
   def test_batch_validation_keeps_unknown_changed_and_positive_inputs(self):
     regular = (1, 2, 33188, 13, 7, 11)
@@ -226,12 +232,21 @@ class GccScanTest(unittest.TestCase):
     self.assertIn(str(header), self.scan('-fdirectives-only')['dependencies'])
 
   def test_large_manifest_preserves_all_negative_probes(self):
-    names = [('missing-' + str(i) + '-' + 'x' * 64 + '.h') for i in range(1000)]
-    self.source.write_text(''.join('#if __has_include("' + name + '")\n#endif\n'
+    # WebKit's many include directories exceeded the former 64 MiB metadata
+    # limit even though GCC completed preprocessing successfully.
+    directories = [self.root / ('directory-' + str(i) + '-' + 'd' * 180)
+                   for i in range(192)]
+    for directory in directories:
+      directory.mkdir()
+    names = [('missing-' + str(i) + '-' + 'x' * 180 + '.h') for i in range(1024)]
+    self.source.write_text(''.join('#if __has_include(<' + name + '>)\n#endif\n'
                                    for name in names))
-    result = self.scan()
-    self.assertTrue(all(str(self.root/name) in result['lookups'] for name in names))
-    self.assertTrue(all(result['lookups'][str(self.root/name)] is None for name in names))
+    result = self.scan('-nostdinc', *('-I' + str(path) for path in directories))
+    missing = {path for path, stamp in result['lookups'].items() if stamp is None}
+    self.assertGreater(sum(len(os.fsencode(path)) + 3 for path in missing), 64 * 1024 * 1024)
+    self.assertTrue(all(str(directory/name) in missing
+                        for directory in directories for name in names))
+    self.assertIn(str(self.source), result['dependencies'])
 
   def test_bom_and_input_charset_keep_raw_input_size(self):
     for contents, options in ((b'\xef\xbb\xbfint n;\n', ()),

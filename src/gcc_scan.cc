@@ -23,7 +23,6 @@ namespace {
 FILE *output = nullptr;
 // Header search produces many short records; write them in bounded batches.
 char output_buffer[64 * 1024];
-size_t bytes = 0;
 bool precompiled = false;
 std::string input_root;
 std::vector<std::string> cxx_system_dirs;
@@ -79,8 +78,6 @@ void entered_file(void *, void *)
 
 bool append(const void *data, size_t length)
 {
-    if (length > 64 * 1024 * 1024 - bytes) return false;
-    bytes += length;
     return fwrite(data, 1, length, output) == length;
 }
 

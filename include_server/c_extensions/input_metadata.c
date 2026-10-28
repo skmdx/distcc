@@ -5,8 +5,6 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#define INPUT_LIMIT (64 * 1024 * 1024)
-
 static PyObject *stamp(const char *text)
 {
     unsigned long long values[4];
@@ -39,7 +37,7 @@ PyObject *dcc_py_parse_gcc_inputs(PyObject *self, PyObject *args)
     PyObject *path = NULL, *value = NULL, *result = NULL;
     (void)self;
     if (!PyArg_ParseTuple(args, "y#U", &data, &length, &cwd)) return NULL;
-    if (length < 7 || length > INPUT_LIMIT || memcmp(data, "DCGS2", 6) || data[length - 1]) {
+    if (length < 7 || memcmp(data, "DCGS2", 6) || data[length - 1]) {
         PyErr_SetString(PyExc_ValueError, "Incomplete or unsupported GCC dependency scan");
         return NULL;
     }
@@ -88,16 +86,8 @@ PyObject *dcc_py_parse_gcc_inputs(PyObject *self, PyObject *args)
     }
     Py_ssize_t index = 0;
     PyObject *key, *entry;
-    unsigned long long remaining = INPUT_LIMIT;
     while (PyDict_Next(lookups, &index, &key, &entry)) {
         if (entry == Py_None || PyTuple_GET_SIZE(entry) == 3) continue;
-        unsigned long long size = PyLong_AsUnsignedLongLong(PyTuple_GET_ITEM(entry, 3));
-        if (PyErr_Occurred()) goto done;
-        if (size > remaining) {
-            PyErr_SetString(PyExc_ValueError, "Compiler input snapshots exceed 64 MiB");
-            goto done;
-        }
-        remaining -= size;
         if (PyList_Append(files, key)) goto done;
     }
     if (!PyList_GET_SIZE(files)) {

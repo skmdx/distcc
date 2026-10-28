@@ -25,11 +25,11 @@ def scan(command, cwd, library):
     result = subprocess.run(invocation, cwd=cwd, env=env, pass_fds=(fd,),
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30)
     output.seek(0)
-    data = output.read(64 * 1024 * 1024 + 1)
+    data = output.read()
   # Source diagnostics (for example #error) need not prevent input collection.
   # A completed manifest lets the worker reproduce both diagnostics and partial
   # output. Startup failures, signals and incomplete collection remain failures.
-  if (result.returncode < 0 or len(data) > 64 * 1024 * 1024 or
+  if (result.returncode < 0 or
       not data.startswith(b'DCGS2\0') or not data.endswith(b'\0\0')):
     raise RuntimeError('Incomplete or unsupported GCC dependency scan: ' +
                        result.stderr.decode(errors='replace')[-2048:])
