@@ -6,6 +6,12 @@
 #include <clang/Basic/DiagnosticLex.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendActions.h>
+#include <clang/Frontend/PrecompiledPreamble.h>
+#include <clang/Frontend/CompilerInvocation.h>
+#include <clang/Basic/CodeGenOptions.h>
+#include <clang/AST/ASTConsumer.h>
+#include <clang/Lex/PreprocessorOptions.h>
+#include <clang/Serialization/ASTWriter.h>
 #include <clang/Lex/Preprocessor.h>
 #include <clang/Lex/DependencyDirectivesScanner.h>
 #include <clang/Tooling/Tooling.h>
@@ -13,10 +19,12 @@
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/Path.h>
 #include <sys/stat.h>
 #include <map>
 #include <memory>
 #include <set>
+#include <algorithm>
 
 PyObject *dcc_clang_compile(PyObject *, PyObject *);
 
@@ -162,14 +170,18 @@ public:
 
 struct Result {
     bool unsupported = false;
+    bool contextual = false;
     std::set<std::string> dependencies;
 };
 
 struct Callbacks : PPCallbacks {
     SourceManager &sources;
     Result &result;
-    Callbacks(SourceManager &sources, Result &result)
-        : sources(sources), result(result) {}
+    Preprocessor *preamble;
+    bool restored;
+    Callbacks(SourceManager &sources, Result &result, Preprocessor *preamble = nullptr,
+              bool restored = false)
+        : sources(sources), result(result), preamble(preamble), restored(restored) {}
     void FileChanged(SourceLocation loc, FileChangeReason reason,
                      SrcMgr::CharacteristicKind, FileID) override {
         if (reason != EnterFile) return;
@@ -189,14 +201,45 @@ struct Callbacks : PPCallbacks {
     }
     void EmbedDirective(SourceLocation, llvm::StringRef, bool, OptionalFileEntryRef,
                         const LexEmbedParametersResult &) override { result.unsupported = true; }
+    void MacroExpands(const Token &token, const MacroDefinition &, SourceRange range,
+                      const MacroArgs *) override {
+        if (!preamble || restored) return;
+        auto name = token.getIdentifierInfo()->getName();
+        // Preambles are shared across translation units. These native builtins
+        // can depend on the new main file or the time of the next invocation.
+        if (name == "__BASE_FILE__" || name == "__DATE__" || name == "__TIME__" ||
+            ((name == "__FILE__" || name == "__FILE_NAME__" || name == "__TIMESTAMP__") &&
+             sources.isWrittenInMainFile(sources.getExpansionLoc(range.getBegin()))))
+            result.contextual = true;
+    }
+    void PragmaDirective(SourceLocation location, PragmaIntroducerKind) override {
+        if (!preamble) return;
+        // Compiler-generated predefines have their own PCH handling.
+        if (sources.isWrittenInBuiltinFile(location)) return;
+        // Clang's PCH does not serialize its push_macro stack. Leave these
+        // inputs on the full native preprocessing path. Observe and reinject
+        // the native handler's first token, including expanded _Pragma forms.
+        Token token;
+        preamble->LexUnexpandedToken(token);
+        auto *identifier = token.getIdentifierInfo();
+        if (identifier && ((!restored && identifier->getName() == "push_macro") ||
+                           identifier->getName() == "pop_macro"))
+            result.contextual = true;
+        preamble->EnterToken(token, true);
+    }
 };
 
-struct Action : PreprocessOnlyAction {
+template<class Base = PreprocessOnlyAction>
+struct Action : Base {
     Result &result;
-    explicit Action(Result &result) : result(result) {}
+    std::optional<unsigned> counter;
+    explicit Action(Result &result, std::optional<unsigned> counter = {})
+        : result(result), counter(counter) {}
     bool BeginSourceFileAction(CompilerInstance &instance) override {
+        if (counter) instance.getPreprocessor().setCounterValue(*counter);
         instance.getPreprocessor().addPPCallbacks(
-            std::make_unique<Callbacks>(instance.getSourceManager(), result));
+            std::make_unique<Callbacks>(instance.getSourceManager(), result,
+                counter ? &instance.getPreprocessor() : nullptr, counter.has_value()));
         return true;
     }
 };
@@ -204,6 +247,11 @@ struct Action : PreprocessOnlyAction {
 struct Diagnostics : DiagnosticConsumer {
     std::string error;
     bool unsafe = false;
+    void clear() override {
+        DiagnosticConsumer::clear();
+        error.clear();
+        unsafe = false;
+    }
     void HandleDiagnostic(DiagnosticsEngine::Level level, const Diagnostic &info) override {
         if (level >= DiagnosticsEngine::Error && info.getID() != diag::err_pp_hash_error)
             unsafe = true;
@@ -212,6 +260,202 @@ struct Diagnostics : DiagnosticConsumer {
             info.FormatDiagnostic(text);
             error = text.str();
         }
+    }
+};
+
+class BuildPreamble : public GeneratePCHAction {
+public:
+    Result result;
+    unsigned counter = 0;
+    std::shared_ptr<PCHBuffer> buffer = std::make_shared<PCHBuffer>();
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &compiler,
+                                                 llvm::StringRef) override {
+        return std::make_unique<PCHGenerator>(compiler.getPreprocessor(),
+            compiler.getModuleCache(), "<distcc-preamble>", "", buffer,
+            compiler.getCodeGenOpts(), compiler.getFrontendOpts().ModuleFileExtensions);
+    }
+    bool BeginSourceFileAction(CompilerInstance &compiler) override {
+        if (!GeneratePCHAction::BeginSourceFileAction(compiler)) return false;
+        compiler.getPreprocessor().addPPCallbacks(std::make_unique<Callbacks>(
+            compiler.getSourceManager(), result, &compiler.getPreprocessor()));
+        return true;
+    }
+    void ExecuteAction() override {
+        auto &compiler = getCompilerInstance();
+        auto &preprocessor = compiler.getPreprocessor();
+        preprocessor.IgnorePragmas();
+        preprocessor.EnterMainSourceFile();
+        Token token;
+        do { preprocessor.Lex(token); } while (token.isNot(tok::eof));
+        counter = preprocessor.getCounterValue();
+        // PCHGenerator's native preprocessor-only mode serializes macros,
+        // source maps and header state without parsing declarations or bodies.
+        compiler.getASTConsumer().HandleTranslationUnit(compiler.getASTContext());
+    }
+};
+
+// Keep the current include cohort, just as previous_inputs retains the current
+// file images. A worker never accumulates one PCH for every source it has seen.
+struct PreambleCache {
+    std::vector<std::string> options;
+    std::string prefix;
+    std::string directory;
+    PreambleBounds bounds{0, false};
+    llvm::SmallVector<char, 0> compiled;
+    std::map<std::string, Stamp> stamps;
+    Images contents;
+    std::set<std::string> dependencies;
+    bool attempted = false;
+    unsigned counter = 0;
+};
+thread_local PreambleCache preamble_cache;
+
+class Scan : public tooling::ToolAction {
+    Inputs &inputs;
+    Result &result;
+    bool use_cache;
+public:
+    bool hit = false;
+    bool built = false;
+    Scan(Inputs &inputs, Result &result, bool use_cache)
+        : inputs(inputs), result(result), use_cache(use_cache) {}
+    bool runInvocation(std::shared_ptr<CompilerInvocation> invocation, FileManager *manager,
+                       std::shared_ptr<PCHContainerOperations> containers,
+                       DiagnosticConsumer *diagnostics) override {
+        auto &frontend = invocation->getFrontendOpts();
+        if (frontend.Inputs.size() != 1 || !frontend.Inputs[0].isFile()) return false;
+        auto execute = [&](std::shared_ptr<CompilerInvocation> request, FileManager *files,
+                           FrontendAction &action) {
+            CompilerInstance compiler(std::move(request), containers);
+            compiler.setFileManager(files);
+            compiler.createDiagnostics(diagnostics, false);
+            compiler.createSourceManager();
+            return compiler.ExecuteAction(action);
+        };
+        if (!use_cache) {
+            Action<> action(result);
+            return execute(invocation, manager, action);
+        }
+        auto source = frontend.Inputs[0].getFile().str();
+        auto buffer = inputs.getBufferForFile(source);
+        if (!buffer) return false;
+        auto bounds = ComputePreambleBounds(invocation->getLangOpts(), **buffer, 0);
+        auto prefix = (*buffer)->getBuffer().take_front(bounds.Size).str();
+        auto directory = llvm::sys::path::parent_path(inputs.path(source)).str();
+        CompilerInvocation normalized(*invocation);
+        normalized.getFrontendOpts().Inputs = {
+            FrontendInputFile("<main>", frontend.Inputs[0].getKind())};
+        normalized.getFrontendOpts().OutputFile.clear();
+        normalized.getCodeGenOpts().MainFileName.clear();
+        llvm::BumpPtrAllocator allocator;
+        llvm::StringSaver saver(allocator);
+        llvm::SmallVector<const char *, 64> arguments;
+        normalized.generateCC1CommandLine(arguments, [&](const llvm::Twine &arg) {
+            return saver.save(arg).data();
+        });
+        std::vector<std::string> options(arguments.begin(), arguments.end());
+        options.push_back(inputs.path("."));
+        auto &cache = preamble_cache;
+        bool same_context = cache.options == options && cache.directory == directory;
+        bool same = same_context && !cache.prefix.empty() &&
+                    llvm::StringRef(prefix).starts_with(cache.prefix);
+        if (same) { bounds = cache.bounds; prefix.resize(bounds.Size); }
+        else if (same_context) {
+            // Translation units often share initial includes followed by their
+            // own header. Let Clang delimit their common complete directives.
+            auto common = std::mismatch(prefix.begin(), prefix.end(),
+                                        cache.prefix.begin(), cache.prefix.end()).first;
+            unsigned lines = std::count(prefix.begin(), common, '\n');
+            if (lines) {
+                auto shared = ComputePreambleBounds(invocation->getLangOpts(), **buffer, lines);
+                if (shared.Size && shared.Size <= static_cast<size_t>(common - prefix.begin())) {
+                    bounds = shared;
+                    prefix.resize(bounds.Size);
+                    cache = {};
+                    cache.options = options;
+                    cache.directory = directory;
+                    cache.prefix = prefix;
+                    cache.bounds = bounds;
+                    same = true;
+                }
+            }
+        }
+        if (same) {
+            for (const auto &entry : cache.stamps)
+                if (!(entry.second == inputs.observe(entry.first))) { same = false; break; }
+        }
+        if (!same) {
+            cache = {};
+            cache.options = std::move(options);
+            cache.prefix = std::move(prefix);
+            cache.directory = std::move(directory);
+            cache.bounds = bounds;
+        } else if (!cache.attempted && bounds.Size) {
+            // Do not pay for a PCH on every one-off command. Build only after
+            // observing the same preprocessing context in a second request.
+            cache.attempted = true;
+            BuildPreamble action;
+            Diagnostics build_diagnostics;
+            auto preparation = std::make_shared<CompilerInvocation>(*invocation);
+            preparation->getFrontendOpts().ProgramAction = frontend::GeneratePCH;
+            preparation->getFrontendOpts().OutputFile = "<distcc-preamble>";
+            auto &preprocessing = preparation->getPreprocessorOpts();
+            preprocessing.GeneratePreamble = true;
+            preprocessing.addRemappedFile(source,
+                llvm::MemoryBuffer::getMemBufferCopy(cache.prefix, source).release());
+            CompilerInstance builder(preparation, containers);
+            builder.setFileManager(new FileManager(manager->getFileSystemOpts(), &inputs));
+            builder.createDiagnostics(&build_diagnostics, false);
+            builder.createSourceManager();
+            bool generated = builder.ExecuteAction(action);
+            cache.stamps = inputs.stamps;
+            cache.stamps.erase(inputs.path(source));
+            if (generated && action.buffer->IsComplete && !build_diagnostics.unsafe &&
+                !action.result.unsupported &&
+                !action.result.contextual && inputs.validate()) {
+                cache.compiled = std::move(action.buffer->Data);
+                cache.contents = inputs.contents;
+                cache.dependencies = std::move(action.result.dependencies);
+                cache.counter = action.counter;
+                // Each new main file has the same prefix but different body.
+                cache.contents.erase(inputs.path(source));
+                cache.dependencies.erase(source);
+                built = true;
+            } else cache.compiled.clear();
+        }
+        llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> filesystem(&inputs);
+        if (!cache.compiled.empty()) {
+            auto cached_invocation = std::make_shared<CompilerInvocation>(*invocation);
+            inputs.contents.insert(cache.contents.begin(), cache.contents.end());
+            result.dependencies.insert(cache.dependencies.begin(), cache.dependencies.end());
+            auto memory = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
+            const char *pch_path = "/__distcc_preamble__.pch";
+            memory->addFile(pch_path, 0, llvm::MemoryBuffer::getMemBuffer(
+                llvm::StringRef(cache.compiled.data(), cache.compiled.size()), pch_path, false));
+            auto overlay = llvm::makeIntrusiveRefCnt<llvm::vfs::OverlayFileSystem>(filesystem);
+            overlay->pushOverlay(memory);
+            filesystem = overlay;
+            auto &preprocessing = cached_invocation->getPreprocessorOpts();
+            preprocessing.addRemappedFile(source, buffer->release());
+            preprocessing.PrecompiledPreambleBytes = {bounds.Size, bounds.PreambleEndsAtStartOfLine};
+            preprocessing.DisablePCHOrModuleValidation = DisableValidationForModuleKind::PCH;
+            preprocessing.UsePredefines = false;
+            preprocessing.ImplicitPCHInclude = pch_path;
+            hit = true;
+            // Preamble reuse disables the PCHValidator listener which
+            // normally restores __COUNTER__. Restore this native scalar too.
+            Action<ReadPCHAndPreprocessAction> action(result, cache.counter);
+            bool ok = execute(cached_invocation,
+                new FileManager(manager->getFileSystemOpts(), filesystem), action);
+            if (!result.contextual) return ok;
+            // Even builtin predefines can leave a push_macro stack. If the
+            // remaining source pops a macro, replay with the full native state.
+            hit = false;
+            result = {};
+            diagnostics->clear();
+        }
+        Action<> action(result);
+        return execute(invocation, manager, action);
     }
 };
 
@@ -230,7 +474,8 @@ bool requiresModules(llvm::StringRef source) {
 PyObject *scan(PyObject *, PyObject *arguments) {
     PyObject *argv;
     const char *cwd;
-    if (!PyArg_ParseTuple(arguments, "Os", &argv, &cwd)) return nullptr;
+    int use_cache = 1;
+    if (!PyArg_ParseTuple(arguments, "Os|p", &argv, &cwd, &use_cache)) return nullptr;
     PyObject *sequence = PySequence_Fast(argv, "argv must be a sequence");
     if (!sequence) return nullptr;
     std::vector<std::string> command;
@@ -249,17 +494,22 @@ PyObject *scan(PyObject *, PyObject *arguments) {
     Result result;
     Diagnostics diagnostics;
     bool ok;
+    bool preamble_hit = false, preamble_built = false;
     Py_BEGIN_ALLOW_THREADS
     {
         // Use the canonical preprocessor so its callbacks also cover probes,
-        // unsupported directives and diagnostics. No AST or code generation.
+        // unsupported directives and diagnostics. No parsing or code generation.
         // FileManager is request-scoped: stale negative lookups cannot survive.
         FileSystemOptions options;
         options.WorkingDir = cwd;
         llvm::IntrusiveRefCntPtr<FileManager> manager(new FileManager(options, inputs));
-        tooling::ToolInvocation invocation(command, std::make_unique<Action>(result), manager.get());
+        Scan action(*inputs, result, use_cache);
+        tooling::ToolInvocation invocation(command, &action, manager.get(),
+                                           std::make_shared<PCHContainerOperations>());
         invocation.setDiagnosticConsumer(&diagnostics);
         invocation.run();
+        preamble_hit = action.hit;
+        preamble_built = action.built;
         ok = !diagnostics.unsafe && !result.dependencies.empty();
         // Probes and guarded aliases can resolve without opening the file.
         // Preserve those names and bytes so the worker can repeat every lookup.
@@ -318,7 +568,10 @@ PyObject *scan(PyObject *, PyObject *arguments) {
     }
     for (const auto &entry : result.dependencies) append(deps, entry);
     if (!success) { Py_DECREF(files); Py_DECREF(paths); Py_DECREF(deps); return nullptr; }
-    return Py_BuildValue("{s:N,s:N,s:N}", "files", files, "lookups", paths, "dependencies", deps);
+    return Py_BuildValue("{s:N,s:N,s:N,s:O,s:O,s:n}", "files", files, "lookups", paths,
+        "dependencies", deps, "preamble_hit", preamble_hit ? Py_True : Py_False,
+        "preamble_built", preamble_built ? Py_True : Py_False,
+        "preamble_bytes", static_cast<Py_ssize_t>(preamble_cache.compiled.size()));
 }
 
 PyObject *tokenize_command(PyObject *, PyObject *args) {

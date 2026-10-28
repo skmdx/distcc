@@ -265,6 +265,9 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       compiler = shutil.which(command[0]) or command[0]
       if clang:
         result = clang_scan.scan([compiler, *command[1:], *options, '-c'], currdir)
+        statistics.preamble_hits += result['preamble_hit']
+        statistics.preamble_builds += result['preamble_built']
+        statistics.preamble_bytes = result['preamble_bytes']
       else:
         native = gcc_scan.scan([compiler, *command[1:]], currdir, options)
         # Preserve GCC's actual default directory classes.

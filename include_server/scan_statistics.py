@@ -25,6 +25,9 @@ import time
 
 scan_counter = 0
 scan_seconds = 0.0
+preamble_hits = 0
+preamble_builds = 0
+preamble_bytes = 0
 resolve_counter = 0 # calls of Resolve method
 search_counter = 0 # number of probes in directory lists
 build_stat_counter = 0 # number of stats in build_stat_cache
@@ -77,6 +80,8 @@ def PrintStatistics(include_analyzer):
             total_time/translation_unit_counter,
             translation_unit_counter, total_time))
     print("SCANNING: total %.3fs, requests: %d" % (scan_seconds, scan_counter))
+    print("PREAMBLES: hits: %d, builds: %d, bytes: %d" % (
+        preamble_hits, preamble_builds, preamble_bytes))
     print("COUNTER: sys_stat_counter:        %10d"  % sys_stat_counter)
     print("COUNTER: build_stat_counter:      %10d" % build_stat_counter)
     if resolve_counter != 0:

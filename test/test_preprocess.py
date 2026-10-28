@@ -42,10 +42,13 @@ class PumpTestCase(BrokerTestCase):
         self.start_broker(self.host(0, ',' + self.compression + self.transport) +
                           f' --localslots_cpp={self.cpp_slots}', idle=60)
         self.env.update(TMPDIR=str(self.root), DISTCC_CLIENT_TMP=str(self.work),
-                        INCLUDE_SERVER_ARGS=f'--workers={self.cpp_slots}',
+                        INCLUDE_SERVER_ARGS=f'--workers={self.cpp_slots}' +
+                            (' --statistics' if getattr(self, 'analyzer_statistics', False) else ''),
                         DISTCC_CPP_LOOKUP_LIBRARY=str(self.build / 'cpp_lookup.so'),
                         DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_TESTING_INCLUDE_SERVER='1',
                         DISTCC_VERBOSE='1', DISTCC_LOG=str(self.work / 'client.log'))
+        if getattr(self, 'analyzer_statistics', False):
+            self.env['PYTHONUNBUFFERED'] = '1'
         # The isolated broker fixture drops production DISTCC settings. This
         # path selects a build artifact and is required before pump starts.
         module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
@@ -77,6 +80,48 @@ class PumpTestCase(BrokerTestCase):
     def analyzer_pids(self):
         pid = int(self.env['INCLUDE_SERVER_PID'])
         return set(map(int, Path(f'/proc/{pid}/task/{pid}/children').read_text().split()))
+
+
+class PreamblePumpTest(PumpTestCase):
+    compression = 'lz4s'
+    transport = ',tcp'
+    analyzer_statistics = True
+
+    def test_cached_headers_compile_remotely_and_invalidate(self):
+        header = self.work / 'shared.h'
+        header.write_text('#pragma once\n#include <vector>\n'
+                          '#if __has_include("generated.h")\n#include "generated.h"\n'
+                          '#else\n#define VALUE 3\n#endif\n'
+                          'enum { first_counter = __COUNTER__ };\n')
+        before = re.search(r'dcc_compile_ok (\d+)', self.get_stats(self.stats_ports[0]))
+        assert before is not None
+        for index in range(6):
+            if index == 3:
+                (self.work / 'generated.h').write_text('#define VALUE 17\n')
+            source = self.work / f'cached{index}.cc'
+            source.write_text('#include "shared.h"\n'
+                              'static_assert(__COUNTER__ == 1);\n'
+                              f'static_assert(VALUE == {3 if index < 3 else 17});\n'
+                              'int result() { std::vector<int> v(VALUE); return v.size(); }\n')
+            args = ['-g', '-c', source, '-o', 'cached.o', '-MD', '-MF', 'cached.d']
+            local = self.run_cc('clang++', args, remote=False)
+            self.assertEqual(local.returncode, 0, local.stderr.decode())
+            output, deps = self.work / 'cached.o', self.work / 'cached.d'
+            expected, expected_deps = output.read_bytes(), deps.read_bytes()
+            output.unlink()
+            deps.unlink()
+            remote = self.run_cc('clang++', args)
+            self.assertEqual(remote.returncode, 0, remote.stderr.decode())
+            self.assertEqual(output.read_bytes(), expected)
+            self.assertEqual(shlex.split(deps.read_text().replace('\\\n', '')),
+                             shlex.split(expected_deps.decode().replace('\\\n', '')))
+        self.assertIn(f'dcc_compile_ok {int(before[1]) + 6}\n',
+                      self.get_stats(self.stats_ports[0]))
+        stats = (Path(self.env['INCLUDE_SERVER_DIR']) / 'stdout').read_text()
+        hits = [int(value) for value in re.findall(r'PREAMBLES: hits: (\d+)', stats)]
+        self.assertTrue(hits and max(hits) >= 4, stats)
+        self.assertNotIn('include server gave up analyzing',
+                         (self.work / 'client.log').read_text())
 
 
 class AnalyzerPoolTest(PumpTestCase):

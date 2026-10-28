@@ -64,7 +64,7 @@ is not on PATH or beside clang. Clang release strings do not gate analysis;
 the frontend reports unsupported inputs through its normal diagnostics.
 The Clang and LLVM libraries must also use the same assertion/debug ABI settings.
 For Clang jobs, the canonical preprocessor discovers includes and existence probes without
-building an AST or generating code. Its input buffers are reused for transfer.
+parsing declarations or generating code. Its input buffers are reused for transfer.
 Each request gets a fresh FileManager to avoid stale negative lookup caches.
 Each analyzer retains only the preceding request's input bytes and module-syntax
 checks. Unchanged file identities and timestamps allow reuse. Each path is
@@ -73,6 +73,29 @@ receives read-only views of the native input buffers; these retain their content
 even after the next scan replaces the cache, avoiding per-job header copies.
 Ordinary macro expansion is retained because side effects such as __COUNTER__
 and _Pragma can change subsequent include conditions.
+
+An analyzer also retains one in-memory cache of the current common initial
+include group. On its second use, Clang's native PCH writer saves the
+preprocessor state without parsing header declarations. Later translation units
+with the same compiler options, working/source directories and prefix restore
+that state and preprocess only the remaining source. Clang's lexer determines
+prefix boundaries; headers and macros are not interpreted in Python. A shared
+prefix can be reused even when subsequent includes differ between source files.
+The cache includes the native macro/conditional/include state, __COUNTER__,
+dependency snapshots and positive/negative header lookups. File identity or
+timestamp changes and newly created or removed headers invalidate it before
+reuse. Snapshots are validated again before publication.
+
+Headers using invocation-dependent builtins or user push_macro/pop_macro
+are scanned normally because their context is not fully
+represented by this PCH state. A pop_macro in the remaining source also triggers
+a full scan, including restoration of stacks created by compiler predefines.
+Preprocessing errors also use the normal scanner;
+cache creation never turns a valid job into a rejected job. Only the current
+include group is retained per analyzer, and it is released when the analyzer
+exits. `pump` statistics report PREAMBLES hits and builds. This cache accelerates
+Clang input discovery; worker compilation and the native GCC scanner still
+preprocess their original inputs.
 
 Clang pump jobs use the installed `distcc-clang` worker helper. Its virtual
 filesystem resolves absolute include operands and existence probes against the

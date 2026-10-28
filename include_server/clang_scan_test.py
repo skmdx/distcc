@@ -86,6 +86,179 @@ with tempfile.TemporaryDirectory() as directory:
     return clang_scan.scan([self.compiler, '-c', str(self.source), '-I', str(self.root),
                             '-o', str(self.root / 'never.o')], str(self.root))
 
+  def test_preamble_reuses_headers_across_sources_and_restores_native_state(self):
+    (self.root / 'shared.h').write_text(
+        '#pragma once\n#define FLAG 1\nint first = __COUNTER__;\n')
+    (self.root / 'chosen.h').write_text('int chosen;\n')
+    (self.root / 'wrong.h').write_text('int wrong;\n')
+    for index in range(3):
+      self.source = self.root / f'source{index}.c'
+      self.source.write_text(
+          '#include "shared.h"\n'
+          'int body;\n'
+          '#include "shared.h"\n'
+          '#if __COUNTER__ == 1 && FLAG == 1\n#include "chosen.h"\n'
+          '#else\n#include "wrong.h"\n#endif\n')
+      result = self.scan()
+      self.assertEqual(result['preamble_hit'], index > 0)
+      self.assertEqual(result['preamble_built'], index == 1)
+      self.assertEqual({path for path in result['dependencies'] if path.startswith(str(self.root))},
+          {str(self.source), str(self.root / 'shared.h'), str(self.root / 'chosen.h')})
+      self.assertEqual(bytes(result['files'][str(self.source)]), self.source.read_bytes())
+
+  def test_preamble_does_not_drop_macro_stacks(self):
+    (self.root / 'shared.h').write_text(
+        '#pragma once\n#define FLAG 1\n#pragma push_macro("FLAG")\n'
+        '#undef FLAG\n#define FLAG 0\n')
+    (self.root / 'chosen.h').write_text('int chosen;\n')
+    self.source.write_text('#include "shared.h"\nint body;\n'
+                          '#pragma pop_macro("FLAG")\n'
+                          '#if FLAG == 1\n#include "chosen.h"\n#endif\n')
+    for _ in range(3):
+      result = self.scan()
+      self.assertFalse(result['preamble_hit'])
+      self.assertIn(str(self.root / 'chosen.h'), result['dependencies'])
+
+  def test_preamble_invalidates_changed_headers_and_negative_lookups(self):
+    header = self.root / 'shared.h'
+    header.write_text('#if __has_include("appeared.h")\n'
+                      '#include "appeared.h"\n#endif\n#define VALUE 1\n')
+    self.source.write_text('#include "shared.h"\nint value = VALUE;\n')
+    self.assertFalse(self.scan()['preamble_hit'])
+    self.assertTrue(self.scan()['preamble_hit'])
+    (self.root / 'appeared.h').write_text('int appeared;\n')
+    result = self.scan()
+    self.assertFalse(result['preamble_hit'])
+    self.assertIn(str(self.root / 'appeared.h'), result['dependencies'])
+    self.assertTrue(self.scan()['preamble_hit'])
+    header.write_text('#include "changed.h"\n#define VALUE 2\n')
+    (self.root / 'changed.h').write_text('int changed;\n')
+    result = self.scan()
+    self.assertFalse(result['preamble_hit'])
+    self.assertNotIn(str(self.root / 'appeared.h'), result['dependencies'])
+    self.assertIn(str(self.root / 'changed.h'), result['dependencies'])
+
+  def test_preamble_failure_does_not_prevent_preprocessing(self):
+    header = self.root / 'shared.h'
+    header.write_text('#error replay this diagnostic on the worker\n')
+    self.source.write_text('#include "shared.h"\nint value;\n')
+    for _ in range(3):
+      result = self.scan()
+      self.assertFalse(result['preamble_hit'])
+      self.assertIn(str(header), result['dependencies'])
+    header.write_text('int header;\n')
+    self.assertFalse(self.scan()['preamble_hit'])
+    self.assertTrue(self.scan()['preamble_hit'])
+
+  def test_preamble_reuses_common_initial_includes(self):
+    (self.root / 'shared.h').write_text('#pragma once\n#define SHARED 1\n')
+    for index in range(4):
+      own = self.root / f'own{index}.h'
+      own.write_text(f'int own{index};\n')
+      self.source = self.root / f'source{index}.c'
+      self.source.write_text(f'#include "shared.h"\n#include "own{index}.h"\nint body;\n')
+      result = self.scan()
+      self.assertEqual(result['preamble_hit'], index > 0)
+      self.assertIn(str(own), result['dependencies'])
+      self.assertFalse(any(f'own{old}.h' in path for old in range(index)
+                           for path in result['dependencies']))
+
+  def test_source_without_includes_does_not_disable_later_caching(self):
+    self.source.write_text('int body;\n')
+    self.assertFalse(self.scan()['preamble_hit'])
+    (self.root / 'shared.h').write_text('int header;\n')
+    self.source.write_text('#include "shared.h"\nint body;\n')
+    self.assertFalse(self.scan()['preamble_hit'])
+    self.assertTrue(self.scan()['preamble_hit'])
+
+  def test_preamble_matches_uncached_native_scan_across_contexts(self):
+    (self.root / 'shared.h').write_text(
+        '#pragma once\n#define FILE_ALIAS __FILE__\n'
+        '#if CHOICE\n#include "a.h"\n#else\n#include "b.h"\n#endif\n'
+        'int counter[] = {__COUNTER__, __COUNTER__};\n')
+    for name in ('a.h', 'b.h', 'after.h'):
+      (self.root / name).write_text('/* present */\n')
+    for choice in (0, 0, 0, 1, 1, 1):
+      self.source = self.root / f'source{choice}.c'
+      self.source.write_text('#include "shared.h"\n'
+          'int body;\n#if __COUNTER__ == 2 && __has_include(FILE_ALIAS) && '
+          '__has_include(__BASE_FILE__)\n#include "after.h"\n#endif\n')
+      command = [self.compiler, '-c', str(self.source), f'-DCHOICE={choice}',
+                 '-I', str(self.root)]
+      cached = clang_scan.scan(command, str(self.root))
+      baseline = clang_scan.scan(command, str(self.root), False)
+      self.assertEqual(set(cached['dependencies']), set(baseline['dependencies']))
+      self.assertEqual({p: bytes(b) for p, b in cached['files'].items()},
+                       {p: bytes(b) for p, b in baseline['files'].items()})
+      self.assertIn(str(self.root / 'after.h'), cached['dependencies'])
+
+  def test_preamble_keys_relative_search_by_working_directory(self):
+    self.source.write_text('#include <choice.h>\nint body;\n')
+    command = [self.compiler, '-c', str(self.source), '-I.']
+    for name in ('first', 'second'):
+      directory = self.root / name
+      directory.mkdir()
+      (directory / 'choice.h').write_text(f'int {name};\n')
+      for index in range(3):
+        result = clang_scan.scan(command, str(directory))
+        self.assertEqual(result['preamble_hit'], index > 0)
+        baseline = clang_scan.scan(command, str(directory), False)
+        self.assertEqual(set(result['dependencies']), set(baseline['dependencies']))
+
+  def test_preamble_contextual_builtins_use_full_preprocessing(self):
+    for builtin in ('__BASE_FILE__', '__FILE__', '__FILE_NAME__', '__DATE__', '__TIME__',
+                    '__TIMESTAMP__'):
+      self.source.write_text(f'#if __has_include({builtin})\n#endif\nint body;\n')
+      for _ in range(3):
+        self.assertFalse(self.scan()['preamble_hit'])
+
+  def test_preamble_uses_native_pragma_operators_and_conditional_stack(self):
+    (self.root / 'shared.h').write_text(
+        '#define PRAGMA(x) _Pragma(#x)\nPRAGMA(clang diagnostic push)\n'
+        'PRAGMA(clang diagnostic ignored "-W#warnings")\n'
+        '#define FLAG 1\nthis is deliberately not valid C;\n')
+    (self.root / 'after.h').write_text('int after;\n')
+    self.source.write_text('#include "shared.h"\n#if FLAG\n'
+        'int body;\n#warning ignored\n#include "after.h"\n'
+        '#else\n#include "missing.h"\n#endif\n'
+        'PRAGMA(clang diagnostic pop)\n')
+    command = [self.compiler, '-c', str(self.source), '-Werror']
+    for index in range(3):
+      result = clang_scan.scan(command, str(self.root))
+      self.assertEqual(result['preamble_hit'], index > 0)
+      baseline = clang_scan.scan(command, str(self.root), False)
+      self.assertEqual(set(result['dependencies']), set(baseline['dependencies']))
+      self.assertIn(str(self.root / 'after.h'), result['dependencies'])
+
+  def test_preamble_does_not_drop_operator_macro_stacks(self):
+    (self.root / 'shared.h').write_text(
+        '#define FLAG 1\n#define SAVE _Pragma("push_macro(\\\"FLAG\\\")")\n'
+        'SAVE\n#undef FLAG\n#define FLAG 0\n')
+    (self.root / 'chosen.h').write_text('int chosen;\n')
+    self.source.write_text('#include "shared.h"\nint body;\n'
+                          '#pragma pop_macro("FLAG")\n'
+                          '#if FLAG == 1\n#include "chosen.h"\n#endif\n')
+    for _ in range(3):
+      result = self.scan()
+      self.assertFalse(result['preamble_hit'])
+      self.assertIn(str(self.root / 'chosen.h'), result['dependencies'])
+
+  def test_preamble_replays_body_that_pops_builtin_macro_state(self):
+    (self.root / 'shared.h').write_text('int header;\n')
+    (self.root / 'chosen.h').write_text('int chosen;\n')
+    self.source.write_text('#include "shared.h"\nint body;\n'
+        '#undef __GCC_DESTRUCTIVE_SIZE\n#define __GCC_DESTRUCTIVE_SIZE 7\n'
+        '#pragma pop_macro("__GCC_DESTRUCTIVE_SIZE")\n'
+        '#if __GCC_DESTRUCTIVE_SIZE == 7\n#include "missing.h"\n'
+        '#else\n#include "chosen.h"\n#endif\n')
+    command = [self.compiler, '-c', str(self.source)]
+    for _ in range(3):
+      result = clang_scan.scan(command, str(self.root))
+      baseline = clang_scan.scan(command, str(self.root), False)
+      self.assertFalse(result['preamble_hit'])
+      self.assertEqual(set(result['dependencies']), set(baseline['dependencies']))
+      self.assertIn(str(self.root / 'chosen.h'), result['dependencies'])
+
   def test_guarded_header_aliases_remain_dependencies(self):
     header, alias = self.root/'real.h', self.root/'alias.h'
     for guard in ('#pragma once\nint value;\n',
