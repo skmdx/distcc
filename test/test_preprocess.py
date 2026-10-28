@@ -617,6 +617,18 @@ class PreprocessTest(PumpTestCase):
         self.assertNotIn('gave up analyzing', log)
         self.assertNotIn('retrying locally', log)
 
+    def test_c_module_typedef_compiles_remotely(self):
+        self.source.write_text('typedef struct entry *module;\nint main(void) {\n'
+                               ' module m = 0;\n return m != 0;\n}\n')
+        result = self.run_cc('clang', ['-std=gnu17', '-c', self.source, '-o', 'module.o'])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        subprocess.run(['clang', self.work / 'module.o', '-o', self.work / 'module'],
+                       check=True, capture_output=True, timeout=15)
+        subprocess.run([self.work / 'module'], check=True, timeout=5)
+        log = (self.work / 'client.log').read_text()
+        self.assertNotIn('gave up analyzing', log)
+        self.assertNotIn('retrying locally', log)
+
     def test_guarded_header_aliases_compile_remotely(self):
         header, alias = self.work / 'real.h', self.work / 'alias.h'
         declarations = 'struct Once { int member; };\nint value;\nconst char *path = __FILE__;\n'

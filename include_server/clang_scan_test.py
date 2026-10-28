@@ -1118,6 +1118,17 @@ else:
     self.source.write_text('/* import example; */\nconst char *s = "export module example;";\n')
     self.assertIn(str(self.source), clang_scan.scan(command, str(self.root))['files'])
 
+  def test_module_typedef_in_c_and_cpp17_is_not_a_module_declaration(self):
+    assert self.compiler is not None
+    self.source.write_text('typedef struct entry *module;\n'
+                           'void use(void) {\n module m = 0;\n (void)m;\n}\n')
+    for language, standard in (('c', 'gnu17'), ('c++', 'c++17')):
+      with self.subTest(language=language):
+        command = [self.compiler, '-x', language, '-std=' + standard,
+                   '-c', str(self.source), '-o', str(self.root / 'module.o')]
+        subprocess.run(command, check=True, capture_output=True)
+        self.assertIn(str(self.source), clang_scan.scan(command, str(self.root))['files'])
+
 
 if __name__ == '__main__':
   unittest.main()

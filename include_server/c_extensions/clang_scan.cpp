@@ -322,6 +322,7 @@ class Scan : public tooling::ToolAction {
 public:
     bool hit = false;
     bool built = false;
+    bool module_syntax = false;
     Scan(Inputs &inputs, Result &result, bool use_cache)
         : inputs(inputs), result(result), use_cache(use_cache) {}
     bool runInvocation(std::shared_ptr<CompilerInvocation> invocation, FileManager *manager,
@@ -329,6 +330,7 @@ public:
                        DiagnosticConsumer *diagnostics) override {
         auto &frontend = invocation->getFrontendOpts();
         if (frontend.Inputs.size() != 1 || !frontend.Inputs[0].isFile()) return false;
+        module_syntax = invocation->getLangOpts().CPlusPlusModules || invocation->getLangOpts().ObjC;
         auto execute = [&](std::shared_ptr<CompilerInvocation> request, FileManager *files,
                            FrontendAction &action) {
             CompilerInstance compiler(std::move(request), containers);
@@ -523,7 +525,9 @@ PyObject *scan(PyObject *, PyObject *arguments) {
                 !inputs->openFileForRead(path)) ok = false;
         for (const auto &path : result.dependencies) {
             auto it = inputs->contents.find(inputs->path(path));
-            if (it != inputs->contents.end() && it->second->hasModules())
+            // The directives scanner recognizes module declarations without
+            // language context. In C, "module" can simply be a typedef name.
+            if (action.module_syntax && it != inputs->contents.end() && it->second->hasModules())
                 result.unsupported = true;
         }
         ok = inputs->validate() && ok && !result.unsupported;
