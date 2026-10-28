@@ -185,6 +185,12 @@ locally unless `DISTCC_SKIP_LOCAL_RETRY=1`, so an incompatible worker does not
 block a toolchain update. `DISTCC_VERBOSE=1` reports the selected worker or
 the reason for local execution. The Gentoo jobs hook enables the Cargo wrapper
 when `FEATURES=distcc`, respecting package restrictions and existing wrappers.
+Workers prefer the client's compiler build. If rustc reports incompatible crate
+metadata (`E0514`), the worker tries its other installed compilers and returns
+only the final attempt's diagnostics and artifacts. Other compilation errors
+are returned immediately; metadata checks are never bypassed. Set the worker's
+`DISTCCD_RUSTC` to a colon-separated list of compiler paths to select its candidates;
+otherwise PATH, `/usr/lib/rust/*/bin/rustc` and `/opt/rust-*/bin/rustc` are searched.
 Gentoo's Rust eclass selects its compiler independently of `eselect` and prefers
 source-built Rust. A fleet using `rust-bin` can select that package type with
 `ERUST_TYPE_OVERRIDE=binary` in `package.env`, without pinning a Rust version.
@@ -447,8 +453,12 @@ Use names such as `clang` and `clang++` in `compiler_paths` to follow each targe
 selected toolchain; they are resolved before sudo changes the environment.
 Explicit paths select a specific installation. After rollout, every client compiles a Rust library on
 every worker, links it locally and executes the result with fallback disabled.
-Rust checks require compatible toolchains and worker addresses reachable from
-all clients in `server_hosts`. Source archives are fetched and verified locally,
+Deployment copies each selected Rust toolchain to a separate `/opt/rust-distcc-*`
+directory on peers of the same compiler host architecture, preserving the user's
+selected compiler. Cross-architecture workers still need a native compiler that
+can consume the client's Rust metadata; identical release numbers alone do not
+guarantee this. Rust checks require worker addresses reachable from all clients
+in `server_hosts`. Source archives are fetched and verified locally,
 then synchronized to targets; remote internet access is not required. Source
 builds use distcc. Cgroup resource limits are optional explicit configuration;
 the deployment command does not impose a memory cap or disable swap.

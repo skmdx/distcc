@@ -278,6 +278,47 @@ def metadata(job, inputs, work):
     return work / 'job', snapshots
 
 
+def worker_compilers(requested):
+    # Prefer the client's build, but let rustc and the eventual client link
+    # decide compatibility. Version/LLVM differences are not rejection gates.
+    # Executables still come from administrator-installed toolchains.
+    configured = os.environ.get('DISTCCD_RUSTC')
+    candidates = configured.split(os.pathsep) if configured else [shutil.which('rustc')]
+    if not configured:
+        candidates += glob.glob('/usr/lib/rust/*/bin/rustc') + glob.glob('/opt/rust-*/bin/rustc')
+    ranked = []
+    for candidate in dict.fromkeys(Path(p).resolve() for p in candidates if p):
+        try:
+            actual = identity(candidate)[0]
+            score = (actual == requested, actual['commit'] == requested['commit'],
+                     actual['version'] == requested['version'],
+                     actual['llvm'] == requested['llvm'])
+            if actual == requested:
+                # Keep the common case to one compiler query. Discover other
+                # candidates only if rustc rejects the input metadata.
+                yield candidate
+            else:
+                ranked.append((score, candidate))
+        except (OSError, subprocess.CalledProcessError):
+            continue
+    for _, candidate in sorted(ranked, key=lambda item: item[0], reverse=True):
+        yield candidate
+
+
+def incompatible_metadata(diagnostics):
+    for line in diagnostics:
+        if line.startswith(b'{'):
+            try:
+                code = json.loads(line).get('code')
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(code, dict) and code.get('code') == 'E0514':
+                return True
+        elif b'error[E0514]' in line:
+            return True
+    return False
+
+
 def worker(root, archive):
     root = Path(root)
     job = json.loads((root / CONTROL.lstrip('/') / 'job.json').read_text())
@@ -286,28 +327,6 @@ def worker(root, archive):
         if not path.is_absolute() or '..' in path.parts:
             raise LocalOnly('invalid input path')
         return root / str(path).lstrip('/')
-
-    # Prefer the client's build, but let rustc and the eventual client link
-    # decide compatibility. Version/LLVM differences are not rejection gates.
-    # Executables still come from administrator-installed toolchains.
-    candidates = [shutil.which('rustc')]
-    candidates += glob.glob('/usr/lib/rust/*/bin/rustc') + glob.glob('/opt/rust-bin-*/bin/rustc')
-    compiler, best = None, ()
-    requested = job['compiler']
-    for candidate in dict.fromkeys(Path(p).resolve() for p in candidates if p):
-        try:
-            actual = identity(candidate)[0]
-            score = (actual == requested, actual['commit'] == requested['commit'],
-                     actual['version'] == requested['version'],
-                     actual['llvm'] == requested['llvm'])
-            if score > best:
-                compiler, best = candidate, score
-            if actual == requested:
-                break
-        except (OSError, subprocess.CalledProcessError):
-            continue
-    if compiler is None:
-        raise LocalOnly('no worker Rust compiler is installed')
     # Revalidate the compilation action. Codegen option validity belongs to
     # rustc, so compiler updates do not require a second option allowlist here.
     opts = options(job['args'])
@@ -331,8 +350,7 @@ def worker(root, archive):
     for path in RUNTIME:
         if Path(path).exists():
             sandbox.extend(['--ro-bind', path, path])
-    sandbox.extend(['--ro-bind', str(compiler.parent.parent), CONTROL + '/compiler',
-                    '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+    sandbox.extend(['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
                     '--chdir', str(cwd), '--clearenv'])
     for name, value in job['environment'].items():
         if name.startswith(('LD_', 'DYLD_')) or name in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
@@ -354,14 +372,40 @@ def worker(root, archive):
                         '--setenv', 'DISTCC_RUST_NATIVE_CAPTURE', '0'])
     # Let bwrap create mount points, then protect shared input inodes. This
     # remount is nonrecursive: output, /tmp and native markers stay writable.
-    sandbox.extend(['--remount-ro', '/'])
-    result = subprocess.run([*sandbox, CONTROL + '/compiler/bin/rustc', *job['args']])
+    directory = rooted(str(output))
+    result = None
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        for compiler in worker_compilers(job['compiler']):
+            if result is not None:
+                for path in directory.iterdir():
+                    if path.is_dir() and not path.is_symlink():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+            for stream in (stdout, stderr):
+                stream.seek(0)
+                stream.truncate()
+            if native is not None:
+                for name in ('cpu-used', 'features-used'):
+                    (profile / name).unlink(missing_ok=True)
+            result = subprocess.run([*sandbox, '--ro-bind', str(compiler.parent.parent),
+                CONTROL + '/compiler', '--remount-ro', '/',
+                CONTROL + '/compiler/bin/rustc', *job['args']], stdout=stdout, stderr=stderr)
+            stderr.seek(0)
+            if result.returncode == 0 or not incompatible_metadata(stderr):
+                break
+        if result is None:
+            raise LocalOnly('no worker Rust compiler is installed')
+        # Do not publish failed attempts' artifact notifications or diagnostics.
+        for source, destination in ((stdout, sys.stdout.buffer), (stderr, sys.stderr.buffer)):
+            source.seek(0)
+            shutil.copyfileobj(source, destination)
+            destination.flush()
     if result.returncode:
         return result.returncode if result.returncode > 0 else 128 - result.returncode
     if native is not None and not all((profile / (name + '-used')).exists()
                                       for name in ('cpu', 'features')):
         raise LocalOnly('worker rustc did not consume the client native CPU profile')
-    directory = root / str(output).lstrip('/')
     with tarfile.open(archive, 'w') as tar:
         for path in sorted(directory.iterdir()):
             if not path.is_file() or path.is_symlink():

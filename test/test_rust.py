@@ -892,6 +892,68 @@ pub fn read_only() -> bool {
         self.assertEqual(result.returncode, 0, result.stderr)
         subprocess.run([executable], check=True)
 
+    def test_worker_retries_real_incompatible_metadata_and_links(self):
+        helper = runpy.run_path(str(self.build / 'distcc-rust'))
+        selected = helper['identity'](self.rustc)[0]
+        alternatives = [path for path in helper['worker_compilers'](selected)
+                        if helper['identity'](path)[0]['version'] != selected['version']]
+        if not alternatives:
+            self.skipTest('a second Rust metadata version is required')
+        incompatible = alternatives[0]
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        for diagnostic in ('json', 'human'):
+            with self.subTest(diagnostic=diagnostic):
+                work = self.work / diagnostic
+                work.mkdir()
+                source = work / 'library.rs'
+                source.write_text('pub fn answer() -> String { String::from("compatible") }')
+                output = work / 'libmetadata.rlib'
+                job, inputs, outdir, outputs = helper['plan'](self.rustc,
+                    ['--crate-name=metadata', '--crate-type=rlib', '--error-format=' + diagnostic,
+                     '--color=always', str(source), '-o', str(output)], work)
+                # Prefer an actual, incompatible compiler. The source compiler's
+                # identity is only a ranking hint; rustc must judge the inputs.
+                job['compiler'] = helper['identity'](incompatible)[0]
+                metadata, snapshots = helper['metadata'](job, inputs, work)
+                artifact = work / 'result.tar'
+                command = [str(self.build / 'distcc'), '--file-job', str(metadata),
+                           str(snapshots), str(artifact)]
+                self.restart_server(self.build / 'distccd', DISTCCD_RUSTC=str(incompatible))
+                result = subprocess.run(command, env=self.env, capture_output=True,
+                                        text=True, timeout=90)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('E0514', result.stderr)
+                self.restart_server(self.build / 'distccd',
+                                    DISTCCD_RUSTC=os.pathsep.join((str(incompatible), self.rustc)))
+                result = subprocess.run(command, env=self.env, capture_output=True,
+                                        text=True, timeout=90)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('E0514', result.stderr)
+                self.assertIn('distcc-rust: compiled on', result.stderr)
+                helper['install_outputs'](artifact, job, outdir, outputs, work)
+                main = work / 'main.rs'
+                main.write_text('fn main() { assert_eq!(metadata::answer(), "compatible"); }')
+                executable = work / 'linked'
+                result = self.rust(main, '--extern', 'metadata=' + str(output),
+                                   '-o', executable, remote=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                subprocess.run([executable], check=True, timeout=5)
+
+    def test_worker_does_not_retry_source_errors(self):
+        helper = runpy.run_path(str(self.build / 'distcc-rust'))
+        source = self.work / 'error.rs'
+        source.write_text('#[cfg(broken)] compile_error!("original diagnostic");')
+        job, inputs, _, _ = helper['plan'](self.rustc,
+            ['--crate-type=rlib', str(source)], self.work)
+        job['args'] += ['--cfg', 'broken']
+        metadata, snapshots = helper['metadata'](job, inputs, self.work)
+        result = subprocess.run([str(self.build / 'distcc'), '--file-job', str(metadata),
+                                 str(snapshots), str(self.work / 'result.tar')],
+                                env=self.env, capture_output=True, text=True, timeout=90)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('original diagnostic', result.stderr)
+        self.assertNotIn('E0514', result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

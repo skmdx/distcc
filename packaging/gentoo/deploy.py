@@ -264,6 +264,52 @@ def validate_rust_cluster(targets, work):
         parallel(targets, lambda target: run(['sudo', '-n', 'rm', '-rf', '--', path(target)], target))
 
 
+def distribute_rust_compilers(targets, work):
+    """Keep selected native toolchains available to peers without changing PATH."""
+    inventory = []
+    for target in targets:
+        info = json.loads(run(['python3', '-c', '''import hashlib, json, pathlib, shutil, subprocess
+compiler = pathlib.Path(shutil.which('rustc')).resolve()
+root = compiler.parent.parent
+version = subprocess.check_output([compiler, '-vV'], text=True)
+host = dict(line.split(': ', 1) for line in version.splitlines()[1:] if ': ' in line)['host']
+digest = hashlib.sha256()
+files = [compiler, *sorted((root / 'lib').glob('librustc_driver*')),
+         *sorted((root / 'lib/rustlib' / host / 'codegen-backends').glob('*'))]
+for path in files:
+    if path.is_file():
+        digest.update(path.name.encode() + b'\\0')
+        with path.open('rb') as stream:
+            digest.update(hashlib.file_digest(stream, 'sha256').digest())
+print(json.dumps(dict(root=str(root), host=host, digest=digest.hexdigest())))
+'''], target))
+        inventory.append((target, info))
+    for identity in dict.fromkeys(info['digest'] for _, info in inventory):
+        source, info = next(item for item in inventory if item[1]['digest'] == identity)
+        peers = [target for target, other in inventory
+                 if other['host'] == info['host'] and other['digest'] != identity]
+        if not peers:
+            continue
+        stage = work / ('rust-' + identity)
+        stage.mkdir()
+        origin = info['root'] + '/'
+        if source.get('ssh'):
+            origin = source['ssh'] + ':' + origin
+        # Preserve relative runtime-library links. The compiler and its driver
+        # come from the administrator's installed toolchain, never a job upload.
+        run(['rsync', '-rlpt', '--exclude=/share', origin, str(stage) + '/'])
+        def install_peer(target):
+            destination = '/opt/rust-distcc-' + identity
+            run(['sudo', '-n', 'mkdir', '-p', destination], target)
+            remote = (target['ssh'] + ':' if target.get('ssh') else '') + destination + '/'
+            prefix = ['rsync', '--rsync-path=sudo -n rsync'] if target.get('ssh') else ['sudo', '-n', 'rsync']
+            run([*prefix, '-rlpt', str(stage) + '/', remote])
+            run([destination + '/bin/rustc', '-vV'], target)
+        parallel(peers, install_peer)
+        shutil.rmtree(stage)
+    print('Rust: selected native compilers available on matching worker architectures', flush=True)
+
+
 def validate_thinlto_cluster(targets, work):
     hosts = ' '.join(target['server_hosts'] for target in targets)
     def validate_client(client):
@@ -307,6 +353,7 @@ def main():
                 run(['sudo', '-n', 'true'], target)
             paused = {target['name']: builds_to_pause(target) for target in targets}
             distribute_sources(settings, version, ebuild, targets, work)
+            distribute_rust_compilers(targets, work)
             for target in targets:
                 names = paused[target['name']]
                 if names:
