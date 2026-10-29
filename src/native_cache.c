@@ -92,6 +92,9 @@ static void free_image(void *entry)
  * this validation pass: replacement and in-place writes are checked next time. */
 static FILE *config_stream(struct fingerprint *key, const char *path, const struct stat *st)
 {
+    /* Retain only files that fit a normal stdio buffer. Large configurations
+     * still use the original streaming parser, without allocating their size. */
+    if (st->st_size > BUFSIZ) return fopen(path, "r");
     struct config_image probe = {.stamp = *st}, *image;
     void *found = tfind(&probe, &key->images, compare_image);
     if (found) {

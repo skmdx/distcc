@@ -184,6 +184,11 @@ int main(void) { float a[128] = {0}, b[128] = {3};
         common.unlink()
         common.write_text('# replacement inode\n')
         self.assertNotIn('native expansion cache hit', self.compare(compiler, flags))
+        # Large configuration files retain streaming behavior and the same
+        # invalidation contract instead of being retained as complete images.
+        common.write_text('# larger configuration\n' * 65536)
+        self.assertNotIn('native expansion cache hit', self.compare(compiler, flags))
+        self.assertIn('native expansion cache hit', self.compare(compiler, flags))
 
     def test_local_calls_do_not_probe(self):
         for flags in (['-E'], []):
