@@ -552,11 +552,14 @@ of their uncompressed inputs. C/C++ classes omit shared code-generation inputs
 such as PGO profiles so a common large profile does not hide source complexity;
 their storage remains part of actual cgroup usage. Each class reserves its
 largest successful RSS
-plus 25% and 64 MiB, with a 256 MiB minimum, until daemon restart. Unseen classes
-use the larger of the configured estimate and the daemon's observed peak with
-headroom. They run concurrently when those reservations fit the measured memory
-budget; an unfamiliar size alone does not serialize work. Small completed jobs
-cannot lower the estimate for unmeasured jobs. If memory admission changes after
+plus 25% and 64 MiB, with a 256 MiB minimum. Each class retains the maximum of
+two consecutive cohorts, each containing as many successful completions as the
+worker has available CPUs. A single smaller job cannot erase a recent peak;
+completed workloads eventually replace an earlier package's demand. Unseen
+classes use the larger of the configured estimate and the recent aggregate
+peak with headroom. Failed jobs cannot advance the history. Jobs run concurrently
+when those reservations fit the measured memory budget; an unfamiliar size alone
+does not serialize work. If memory admission changes after
 input transfer, the server returns the unstarted job for reselection. The broker
 refreshes that worker's capacity before assigning it again, retaining the pooled
 connection and prepared inputs without counting a compiler failure or training

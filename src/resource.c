@@ -170,9 +170,32 @@ double dcc_memory_pressure(void)
 static unsigned long long peak_job;
 static unsigned samples;
 static unsigned long long learned_job;
-/* Input kind and binary size interval distinguish materially different work.
- * Class zero is reserved for legacy sessions without prepared metadata. */
-static unsigned long long class_peak[1 + DCC_JOB_KIND_COUNT * DCC_MEMORY_BUCKETS];
+/* Keep two consecutive CPU-sized cohorts. A single small job cannot erase
+ * an expensive observation, but an earlier package cannot reserve memory
+ * forever after a whole new workload has completed. Class zero also tracks
+ * the recent demand used to admit previously unseen classes. */
+struct memory_history {
+    unsigned long long current, previous;
+    unsigned completed;
+};
+static struct memory_history class_memory[1 + DCC_JOB_KIND_COUNT * DCC_MEMORY_BUCKETS];
+
+static unsigned long long recent_peak(const struct memory_history *history)
+{
+    return history->current > history->previous ? history->current : history->previous;
+}
+
+static void observe_memory(struct memory_history *history,
+                           unsigned long long peak, int success)
+{
+    if (success && history->completed >= (unsigned)processors) {
+        history->previous = history->current;
+        history->current = 0;
+        history->completed = 0;
+    }
+    if (peak > history->current) history->current = peak;
+    if (success) ++history->completed;
+}
 
 static int memory_learning(void)
 {
@@ -212,7 +235,8 @@ unsigned dcc_resource_class(const struct dcc_job *job)
 int dcc_resource_known(unsigned memory_class)
 {
     return !memory_learning() ||
-        (memory_class < sizeof(class_peak) / sizeof(*class_peak) && class_peak[memory_class]);
+        (memory_class < sizeof(class_memory) / sizeof(*class_memory) &&
+         recent_peak(&class_memory[memory_class]));
 }
 
 static unsigned long long measured_job_bytes(unsigned long long peak)
@@ -225,12 +249,15 @@ static unsigned long long measured_job_bytes(unsigned long long peak)
 void dcc_resource_observe(unsigned memory_class, unsigned long long peak_bytes, int success)
 {
     if (peak_bytes > peak_job) peak_job = peak_bytes;
-    if (!peak_bytes || !success) return;
+    if (!peak_bytes) return;
+    sample_resources();
+    observe_memory(&class_memory[0], peak_bytes, success);
+    if (!success) return;
     if (samples < UINT_MAX) ++samples;
-    if (memory_class && memory_class < sizeof(class_peak) / sizeof(*class_peak)) {
-        if (peak_bytes > class_peak[memory_class]) class_peak[memory_class] = peak_bytes;
-        peak_bytes = class_peak[memory_class];
-    }
+    if (memory_class && memory_class < sizeof(class_memory) / sizeof(*class_memory))
+        observe_memory(&class_memory[memory_class], peak_bytes, success);
+    else memory_class = 0;
+    peak_bytes = recent_peak(&class_memory[memory_class]);
     /* Advertise the current workload, not a percentile still dominated by a
      * previous package. Admission separately charges every active class. */
     learned_job = measured_job_bytes(peak_bytes);
@@ -260,13 +287,13 @@ unsigned long long dcc_resource_job_bytes(void)
 unsigned long long dcc_resource_estimate(unsigned memory_class)
 {
     if (memory_learning() && dcc_resource_known(memory_class)) {
-        unsigned long long estimate = measured_job_bytes(class_peak[memory_class]);
+        unsigned long long estimate = measured_job_bytes(recent_peak(&class_memory[memory_class]));
         return estimate < 256ULL * 1024 * 1024 ? 256ULL * 1024 * 1024 : estimate;
     }
-    /* Small completed jobs cannot lower the reservation for unseen work. */
+    /* Unseen work retains the configured floor after a lightweight cohort. */
     unsigned long long estimate = configured_job_bytes();
-    unsigned long long observed = measured_job_bytes(peak_job);
-    if (memory_learning() && peak_job && observed > estimate) estimate = observed;
+    unsigned long long observed = measured_job_bytes(recent_peak(&class_memory[0]));
+    if (memory_learning() && observed > estimate) estimate = observed;
     return estimate;
 }
 

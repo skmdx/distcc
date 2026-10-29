@@ -700,6 +700,31 @@ int main(void) {
         assert(dcc_resource_known(memory_class));
         assert(dcc_resource_estimate(memory_class) == 256*M);
     }
+    /* Age only after successful observations from this class. Keep a heavy
+     * sample through a complete CPU-sized cohort; retire it after two.
+     * This models switching from a large C++ package to small C inputs of
+     * the same size without resetting a live daemon's learning. */
+    unsigned recent = 1 + DCC_JOB_PUMP * DCC_MEMORY_BUCKETS + 62;
+    unsigned cohort = dcc_resource_cpus();
+    dcc_resource_observe(recent, 896*M, 1);
+    for (unsigned i = 0; i < 2*cohort; ++i)
+        dcc_resource_observe(recent, 64*M, 0);
+    assert(dcc_resource_estimate(recent) == 1184*M);
+    for (unsigned i = 1; i < 2*cohort; ++i) {
+        dcc_resource_observe(recent, 64*M, 1);
+        assert(dcc_resource_estimate(recent) == 1184*M);
+    }
+    dcc_resource_observe(recent, 64*M, 1);
+    assert(dcc_resource_estimate(recent) == 256*M);
+    assert(dcc_resource_estimate(large) == 1184*M);
+    assert(dcc_resource_peak_bytes() == 1536*M);
+    /* Previously unseen work uses recent demand plus the configured floor,
+     * while lifetime telemetry remains available for diagnosis. */
+    unsigned unseen = 1 + DCC_JOB_COMPILE * DCC_MEMORY_BUCKETS + 62;
+    assert(!dcc_resource_known(unseen));
+    assert(dcc_resource_estimate(unseen) == 512*M);
+    dcc_resource_observe(recent, 896*M, 1);
+    assert(dcc_resource_estimate(recent) == 1184*M);
     dcc_resource_observe(large, ULLONG_MAX, 1);
     assert(dcc_resource_job_bytes() == ULLONG_MAX);
     assert(dcc_resource_estimate(large) == ULLONG_MAX);
