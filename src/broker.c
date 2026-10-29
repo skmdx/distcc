@@ -41,8 +41,12 @@
 #define MAX_CLIENTS 256
 enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3, MEMO_GET = 4, MEMO_PUT = 5,
        ACQUIRE_POOL = 6, RETURN = 7, ACQUIRE_LINK = 8, ACQUIRE_CPP = 9,
-       ACQUIRE_READY = 10, FAILED = 11, LOCAL_CPP = 12, LOCAL_ANALYSIS = 13, DEFER = 14 };
+       ACQUIRE_READY = 10, FAILED = 11, LOCAL_CPP = 12, LOCAL_ANALYSIS = 13, DEFER = 14,
+       TRY_LOCAL = 15 };
 #define MAX_MEMOS 32
+/* The caller can compile its original command locally. Backend-only clients
+ * still require a connected worker socket, even on this machine. */
+#define CLIENT_COMPILE (1u << 16)
 struct request { uint32_t version, command; };
 struct feedback { uint64_t prepare_ns, queue_ns, execute_ns; };
 struct reply { int32_t status, slots; char host[1024]; };
@@ -59,7 +63,7 @@ struct peer {
     double full_until, link_until, probe_after;
     int pool_supported;
     int admission_supported;
-    int local;
+    int local, direct;
     size_t used;
     char stats[DCC_STATS_SIZE];
     /* Seconds/byte for prepared network input; seconds/job otherwise. */
@@ -69,7 +73,7 @@ struct peer {
 enum client_state { REQUEST, WAITING, CONNECTING, HELLO_SEND, HELLO_READ,
                     RESERVE_SEND, RESERVE_READ, ACTIVE, MEMO_OWNER, MEMO_WAIT };
 struct client {
-    int fd, net, peer, cpp_reserved;
+    int fd, net, peer, cpp_reserved, direct, can_compile_locally;
     uint64_t serial;
     enum client_state state;
     uint32_t command;
@@ -89,6 +93,7 @@ struct broker {
     struct peer peers[MAX_HOSTS];
     struct client clients[MAX_CLIENTS];
     int count, cpp_busy, cpp_limit;
+    uint64_t direct_completed;
     double refresh_at, first_probe_until;
     struct memo memos[MAX_MEMOS];
     struct idle_connection pool[MAX_CLIENTS];
@@ -282,9 +287,15 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
                 reply->status == EXIT_CONNECT_FAILED ? EHOSTUNREACH : EPROTO;
         goto failed;
     }
+    int can_compile_locally = command & CLIENT_COMPILE;
+    command &= ~CLIENT_COMPILE;
+    int direct = (reply->slots & DCC_BROKER_DIRECT) && can_compile_locally &&
+                 (command == ACQUIRE_CPP || command == ACQUIRE_READY);
     if (((command == ACQUIRE || command == ACQUIRE_POOL || command == ACQUIRE_CPP ||
-          command == ACQUIRE_READY) && *net < 0) ||
-        ((command == JOBS || command == LOCAL_CPP || command == LOCAL_ANALYSIS) && *net >= 0)) {
+          command == ACQUIRE_READY) && !direct && *net < 0) ||
+        (direct && *net >= 0) ||
+        ((command == JOBS || command == LOCAL_CPP || command == LOCAL_ANALYSIS ||
+          command == TRY_LOCAL) && *net >= 0)) {
         errno = EPROTO;
         goto failed;
     }
@@ -336,6 +347,22 @@ int dcc_broker_local_cpp(int *lease, int *occupied, int analysis)
     return *lease < 0 ? EXIT_CONNECT_FAILED : 0;
 }
 
+int dcc_broker_try_local(void)
+{
+    struct reply reply;
+    int net, lease = broker_request(TRY_LOCAL, &reply, &net, NULL, NULL);
+    if (lease >= 0 && !reply.slots) { close(lease); lease = -1; }
+    return lease;
+}
+
+void dcc_broker_local_done(int lease, double elapsed, int status)
+{
+    struct { struct request header; struct feedback timing; } request = {{ BROKER_VERSION, RETURN }, {0}};
+    if (!status && elapsed > 0) request.timing.execute_ns = elapsed * 1e9;
+    send(lease, &request, sizeof(request), MSG_NOSIGNAL);
+    close(lease);
+}
+
 int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready,
                        const struct dcc_work_hint *hint, int *queued_fd)
 {
@@ -347,7 +374,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready,
         return EXIT_BAD_HOSTSPEC;
     free_hosts(local);
     int remote_cpp = getenv("INCLUDE_SERVER_PORT") != NULL;
-    fd = broker_request(remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL,
+    fd = broker_request(CLIENT_COMPILE | (remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL),
                         &reply, &net, hint, queued_fd);
     if (fd < 0)
         return EXIT_CONNECT_FAILED;
@@ -362,6 +389,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready,
         return EXIT_BAD_HOSTSPEC;
     }
     (*host)->broker_managed = 1;
+    if (reply.slots & DCC_BROKER_DIRECT) (*host)->mode = DCC_MODE_LOCAL;
     if (remote_cpp || cpp_ready) {
         (*host)->cpp_where = remote_cpp ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT;
         if ((*host)->compr == DCC_COMPRESS_NONE)
@@ -509,6 +537,7 @@ static void release_assignment(struct broker *broker, struct client *client)
     if (client->peer >= 0) {
         struct peer *p = &broker->peers[client->peer];
         p->busy--;
+        if (client->direct) p->direct--;
     }
     if (client->net >= 0) close(client->net);
     client->net = client->peer = -1;
@@ -639,7 +668,9 @@ static void pool_store(struct broker *broker, struct client *client, int fd, dou
 
 static void deliver_connection(struct broker *broker, struct client *client)
 {
-    struct reply reply = { .slots = client->pooled ? DCC_BROKER_POOLED : 0 };
+    struct reply reply = { .slots = client->direct ?
+        (client->command == TRY_LOCAL ? 1 : DCC_BROKER_DIRECT) :
+        client->pooled ? DCC_BROKER_POOLED : 0 };
     strcpy(reply.host, broker->peers[client->peer].host->hostdef_string);
     if (send_reply(client->fd, &reply, client->net)) {
         release_client(broker, client);
@@ -656,6 +687,7 @@ static void deliver_connection(struct broker *broker, struct client *client)
 static double execution_factor(const struct peer *peer, int work, int recovering, int capacity)
 {
     struct dcc_capacity cap = peer->metrics;
+    if (cap.busy >= 0) cap.busy += peer->direct;
     cap.capacity = capacity;
     if (recovering) cap.cpu_scale = 1;
     int parallel = cap.cpus < cap.jobs ? cap.cpus : cap.jobs;
@@ -801,12 +833,14 @@ static struct prediction predict(struct broker *broker, const struct client *cli
 
 static void observe(struct broker *broker, struct client *client, const struct feedback *timing, double now)
 {
-    if (!client->hint.key || !timing->execute_ns || client->factor <= 0 ||
+    if (!timing->execute_ns || client->factor <= 0 ||
         timing->execute_ns > 86400ULL * 1000000000 ||
         timing->prepare_ns > 86400ULL * 1000000000 ||
         timing->queue_ns > 86400ULL * 1000000000) return;
     struct peer *peer = &broker->peers[client->peer];
     double cost = timing->execute_ns / 1e9 / client->factor;
+    /* Early direct placement has no input hint; only its service time is
+     * learned. Prepared jobs also train the input-cost model. */
     dcc_work_observe(&broker->model, &client->hint, cost);
     peer->mean_cost = peer->mean_cost > 0 ? .875 * peer->mean_cost + .125 * cost : cost;
     int bulk = bulk_input(peer, &client->hint);
@@ -861,12 +895,13 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         double score, fill;
         struct prediction forecast;
     } best = {.peer = -1}, ready = {.peer = -1};
-    double cost = dcc_work_predict(&broker->model, &client->hint);
+    int direct = client->command == TRY_LOCAL;
+    double cost = direct ? 0 : dcc_work_predict(&broker->model, &client->hint);
     double ready_finish = 0;
     int link = client->command == ACQUIRE_LINK;
     int link_backend = client->hint.kind == DCC_WORK_THINLTO ||
                        client->hint.kind == DCC_WORK_OFFLOAD_LINK;
-    int local_cpp = !link && client->command != ACQUIRE_CPP && client->command != ACQUIRE_READY;
+    int local_cpp = !link && !direct && client->command != ACQUIRE_CPP && client->command != ACQUIRE_READY;
     int recent[MAX_HOSTS] = {0}, recent_links[MAX_HOSTS] = {0};
     unsigned long long headroom[MAX_HOSTS], pending[MAX_HOSTS] = {0}, new_memory[MAX_HOSTS] = {0};
     for (i = 0; i < MAX_CLIENTS; ++i) {
@@ -874,7 +909,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         if (c->fd < 0 || c->peer < 0) continue;
         unsigned long long bytes = memory_estimate(&broker->peers[c->peer].metrics, &c->hint);
         pending[c->peer] = bytes > UINT64_MAX - pending[c->peer] ? UINT64_MAX : pending[c->peer] + bytes;
-        if (c->serial > broker->peers[c->peer].observed_serial) {
+        if (!c->direct && c->serial > broker->peers[c->peer].observed_serial) {
             recent[c->peer]++;
             recent_links[c->peer] += c->command == ACQUIRE_LINK;
             new_memory[c->peer] = bytes > UINT64_MAX - new_memory[c->peer] ? UINT64_MAX : new_memory[c->peer] + bytes;
@@ -895,7 +930,9 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     }
     for (i = 0; i < broker->count; i++) {
         struct peer *p = &broker->peers[i];
-        const struct dcc_capacity *cap = p->valid_until > now ? &p->metrics : NULL;
+        struct dcc_capacity observed = p->metrics;
+        if (observed.busy >= 0) observed.busy += p->direct;
+        const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
         struct dcc_capacity projected;
         if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= DCC_WORK_CLASSES) {
             projected = *cap;
@@ -926,7 +963,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             continue;
         available++;
         if (client->command == JOBS) {
-            int jobs = dcc_capacity_jobs(p->host, cap);
+            int jobs = dcc_capacity_parallelism(p->host, cap);
             reply.slots += jobs;
             if (jobs > 0) {
                 struct dcc_capacity full;
@@ -936,6 +973,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                      * (including its planner) must not reshuffle partitions
                      * on every invocation. Placement still uses live load. */
                     full.running = full.busy = jobs - 1;
+                    full.capacity = jobs;
                     full.queued = 0;
                 }
                 double factor = dcc_capacity_score(p->host, cap ? &full : NULL, jobs - 1);
@@ -1003,7 +1041,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             double score = probe ? execution_factor(p, work, 1, cap->capacity) :
                                    dcc_capacity_score(p->host, cap, work);
             struct prediction forecast = {0};
-            if (client->hint.key && cap)
+            if ((client->hint.key || direct) && cap)
                 forecast.factor = execution_factor(p, work, probe, cap->capacity);
             int wait = 0;
             if (predicted) {
@@ -1031,7 +1069,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 (!blocked && work < dcc_capacity_jobs(p->host, cap)))) {
                 const struct dcc_capacity *observed = &p->metrics;
                 double external = (observed->running >= 0 ? observed->running : observed->load)
-                                  - (observed->busy > 0 ? observed->busy : 0);
+                                  - (observed->busy > 0 ? observed->busy : 0) - p->direct;
                 int placement = work;
                 if (wait) {
                     int lanes = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
@@ -1094,11 +1132,16 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     if (best.wait && ready.peer >= 0 &&
         (link_backend || best.forecast.finish >= ready_finish))
         best = ready;
-    if (client->command == JOBS || !available) {
+    if (direct && !(best.peer >= 0 && best.idle && !best.wait &&
+                    broker->peers[best.peer].local && broker->peers[best.peer].host->tcp_jobs)) {
+        reply.slots = 0;
+        send_reply(client->fd, &reply, -1);
+        release_client(broker, client);
+    } else if (client->command == JOBS || !available) {
         if (client->command == JOBS)
             snprintf(reply.host, sizeof(reply.host),
-                     "{\"jobs\":%d,\"work_rate\":%.9g,\"min_rate\":%.9g}",
-                     reply.slots, work_rate, min_rate);
+                     "{\"jobs\":%d,\"work_rate\":%.9g,\"min_rate\":%.9g,\"direct_completed\":%llu}",
+                     reply.slots, work_rate, min_rate, (unsigned long long)broker->direct_completed);
         if (!available && client->command != JOBS) {
             for (i = 0; i < broker->count; i++) {
                 struct peer *p = &broker->peers[i];
@@ -1132,32 +1175,41 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                  p->host->hostname, cost, best.score, now - client->waiting_since,
                  (unsigned long long)client->hint.key, client->hint.work_units,
                  now, client - broker->clients, client->waiting_since);
-        client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
-                            p->admission_supported && p->pool_supported >= 0;
-        client->net = client->command != ACQUIRE ? pool_take(broker, best.peer, now) : -1;
-        client->pooled = client->net >= 0;
-        client->reused = client->pooled;
-        if (p->host->tcp_jobs) client->pooled = 1;
-        if (client->net < 0) client->net = connect_peer(p, p->host->port);
-        if (client->net < 0) {
-            rs_log_warning("cannot connect to %s: %s", p->host->hostname, strerror(errno));
-            p->retry_at = now + 5;
-            return 1;
+        client->direct = direct || (client->can_compile_locally && p->local && p->host->tcp_jobs &&
+            p->valid_until > now && p->metrics.busy >= 0 &&
+            (client->command == ACQUIRE_CPP || client->command == ACQUIRE_READY));
+        if (!client->direct) {
+            client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
+                                p->admission_supported && p->pool_supported >= 0;
+            client->net = client->command != ACQUIRE ? pool_take(broker, best.peer, now) : -1;
+            client->pooled = client->net >= 0;
+            client->reused = client->pooled;
+            if (p->host->tcp_jobs) client->pooled = 1;
+            if (client->net < 0) client->net = connect_peer(p, p->host->port);
+            if (client->net < 0) {
+                rs_log_warning("cannot connect to %s: %s", p->host->hostname, strerror(errno));
+                p->retry_at = now + 5;
+                return 1;
+            }
         }
         client->peer = best.peer;
-        client->cost = cost;
+        client->cost = direct ? p->mean_cost : cost;
         client->factor = best.forecast.factor;
-        client->ready_at = now + best.forecast.prepare;
-        client->run_at = now + best.forecast.start;
+        client->ready_at = now + (client->direct ? 0 : best.forecast.prepare);
+        client->run_at = now + (client->direct ? 0 : best.forecast.start);
         if (best.probe) p->probe_after = now + 10;
         client->serial = ++p->serial;
         client->state = CONNECTING;
         client->deadline = now + 3;
         p->busy++;
+        p->direct += client->direct;
+        if (client->direct)
+            rs_trace("direct local compile host=%s prepared=%d client=%td", p->host->hostname,
+                     client->command != TRY_LOCAL, client - broker->clients);
         broker->cpp_busy += local_cpp;
         client->cpp_reserved = local_cpp;
         client->used = 0;
-        if (client->reused) {
+        if (client->direct || client->reused) {
             if (client->admission) client->state = RESERVE_SEND;
             else deliver_connection(broker, client);
         }
@@ -1584,6 +1636,25 @@ int dcc_broker_serve(const char *path)
                 int returned;
                 ssize_t length = dcc_recv_fd(c->fd, &packet, sizeof(packet), &returned);
                 struct request request = packet.header;
+                int can_compile_locally = request.command & CLIENT_COMPILE;
+                request.command &= ~CLIENT_COMPILE;
+                if (can_compile_locally && (c->state != REQUEST ||
+                    (request.command != ACQUIRE_POOL && request.command != ACQUIRE_CPP &&
+                     request.command != ACQUIRE_READY))) {
+                    if (returned >= 0) close(returned);
+                    release_client(broker, c);
+                    continue;
+                }
+                if (returned < 0 && c->state == ACTIVE && c->direct &&
+                    length == sizeof(request) + sizeof(struct feedback) &&
+                    request.version == BROKER_VERSION && request.command == RETURN) {
+                    struct feedback timing;
+                    memcpy(&timing, packet.payload, sizeof(timing));
+                    observe(broker, c, &timing, now);
+                    if (timing.execute_ns) broker->direct_completed++;
+                    release_client(broker, c);
+                    continue;
+                }
                 if (returned < 0 && c->state == ACTIVE && c->peer >= 0 && length == sizeof(request) &&
                     request.version == BROKER_VERSION && request.command == FAILED) {
                     if (c->reused) {
@@ -1654,7 +1725,7 @@ int dcc_broker_serve(const char *path)
                     (request.command != ACQUIRE && request.command != ACQUIRE_POOL &&
                      request.command != ACQUIRE_LINK && request.command != ACQUIRE_CPP &&
                      request.command != ACQUIRE_READY && request.command != LOCAL_CPP && request.command != LOCAL_ANALYSIS &&
-                     request.command != JOBS)) {
+                     request.command != JOBS && request.command != TRY_LOCAL)) {
                     release_client(broker, c);
                     continue;
                 }
@@ -1663,6 +1734,7 @@ int dcc_broker_serve(const char *path)
                     if (!dcc_work_valid(&c->hint)) { release_client(broker, c); continue; }
                 }
                 c->command = request.command;
+                c->can_compile_locally = can_compile_locally != 0;
                 c->state = WAITING;
                 c->waiting_since = now;
             }

@@ -235,64 +235,31 @@ static int query_capacity(const struct dcc_hostdef *host, struct dcc_capacity *c
 static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *cap)
 {
     struct dcc_hostdef endpoint = *host;
-    char buf[384];
-    long stamp;
-    time_t now;
-    int fd, valid, len;
-    ssize_t n;
+    struct { time_t stamp; int valid; struct dcc_capacity capacity; } cached = {0};
+    int fd;
 
     endpoint.port = host->stats_port;
-    if (dcc_lock_host("stats3", &endpoint, 0, 1, &fd))
-        return -1;
-    now = time(NULL);
-    n = read(fd, buf, sizeof(buf) - 1);
-    if (n > 0) {
-        buf[n] = '\0';
-        if (sscanf(buf, "%ld %d %d %d %lf %d %d %d %d %d %lf %d %d %d %d %d %lf %lf %lf %lf %d", &stamp, &valid,
-                   &cap->cpus, &cap->jobs, &cap->load, &cap->running, &cap->busy,
-                   &cap->queued, &cap->links, &cap->admission, &cap->memory_pressure, &cap->available,
-                   &cap->preparing, &cap->returning, &cap->capacity,
-                   &cap->cores, &cap->core_scale, &cap->smt_gain,
-                   &cap->cpu_scale, &cap->cpu_age, &cap->cpu_probe) == 21 &&
-            stamp == (long)now &&
-            (valid == 0 || (valid == 1 && cap->cpus > 0 &&
-             cap->cpus <= 10000 && cap->jobs > 0 && cap->jobs <= 10000 &&
-             cap->load >= 0 && cap->load <= 1e9 && cap->running >= -1 &&
-             cap->running <= 1000000 && cap->busy >= -1 && cap->busy <= 1000000 &&
-             cap->queued >= -1 && cap->queued <= 1000000 && cap->links >= -1 &&
-             cap->links <= 1000000 && cap->admission >= -1 && cap->admission <= 1000000 &&
-             cap->memory_pressure >= -1 && cap->memory_pressure <= 100 &&
-             cap->available >= -1 && cap->available <= 1000000 &&
-             cap->preparing >= -1 && cap->preparing <= 1000000 &&
-             cap->returning >= -1 && cap->returning <= 1000000 &&
-             cap->capacity >= -1 && cap->capacity <= 1000000 &&
-             cap->cores >= 1 && cap->cores <= cap->cpus &&
-             cap->core_scale >= 0 && cap->core_scale <= 1 &&
-             cap->smt_gain >= -1 && cap->smt_gain <= 1 &&
-             ((cap->cpu_scale == -1 && cap->cpu_age == -1 && !cap->cpu_probe) ||
-              (cap->cpu_scale > 0 && cap->cpu_scale <= 1 &&
-               cap->cpu_age >= 0 && cap->cpu_age <= 1e9 &&
-               (cap->cpu_probe == 0 || cap->cpu_probe == 1)))))) {
-            dcc_unlock(fd);
-            return valid ? 0 : -1;
-        }
+    if (dcc_lock_host("stats3", &endpoint, 0, 1, &fd)) return -1;
+    if (read(fd, &cached, sizeof(cached)) == sizeof(cached) &&
+        cached.stamp == time(NULL) && (cached.valid == 0 || cached.valid == 1)) {
+        *cap = cached.capacity;
+        dcc_unlock(fd);
+        return cached.valid ? 0 : -1;
     }
     memset(cap, 0, sizeof(*cap));
-    valid = query_capacity(host, cap) == 0;
-    if (!valid)
+    cached.valid = query_capacity(host, cap) == 0;
+    if (!cached.valid)
         rs_log_warning("adaptive stats unavailable for %s; using configured slots/speed",
                        host->hostname);
-    len = snprintf(buf, sizeof(buf), "%ld %d %d %d %.17g %d %d %d %d %d %.2f %d %d %d %d %d %.17g %.17g %.17g %.17g %d\n",
-                   (long)time(NULL), valid, cap->cpus, cap->jobs, cap->load,
-                   cap->running, cap->busy, cap->queued, cap->links, cap->admission,
-                   cap->memory_pressure, cap->available, cap->preparing, cap->returning,
-                   cap->capacity, cap->cores, cap->core_scale, cap->smt_gain,
-                   cap->cpu_scale, cap->cpu_age, cap->cpu_probe);
+    cached.stamp = time(NULL);
+    cached.capacity = *cap;
+    /* Cache the parsed snapshot, including per-class memory capacities. The
+     * user-owned locked file is transient state, not a second stats parser. */
     if (lseek(fd, 0, SEEK_SET) < 0 || ftruncate(fd, 0) ||
-        write(fd, buf, len) != len)
+        write(fd, &cached, sizeof(cached)) != sizeof(cached))
         rs_log_warning("could not cache adaptive stats");
     dcc_unlock(fd);
-    return valid ? 0 : -1;
+    return cached.valid ? 0 : -1;
 }
 
 /* The configured limit is a ceiling, not an estimate of CPU performance.
@@ -300,7 +267,7 @@ static int cached_capacity(const struct dcc_hostdef *host, struct dcc_capacity *
 int dcc_host_slots(const struct dcc_hostdef *host)
 {
     struct dcc_capacity cap;
-    return dcc_capacity_jobs(host,
+    return dcc_capacity_parallelism(host,
         host->is_up && host->n_slots > 0 && host->stats_port &&
         !cached_capacity(host, &cap) ? &cap : NULL);
 }
@@ -324,6 +291,22 @@ int dcc_capacity_jobs(const struct dcc_hostdef *host, const struct dcc_capacity 
     if (cap && cap->capacity >= 0 && slots > cap->capacity)
         slots = cap->capacity;
     return slots;
+}
+
+int dcc_capacity_parallelism(const struct dcc_hostdef *host, const struct dcc_capacity *cap)
+{
+    if (!cap || !host->tcp_jobs) return dcc_capacity_jobs(host, cap);
+    int limit = cap->capacity;
+    const int *classes[] = {cap->compile_capacity, cap->pump_capacity, cap->rust_capacity,
+                           cap->thinlto_capacity, cap->offload_capacity};
+    for (unsigned kind = 0; kind < sizeof(classes) / sizeof(*classes); ++kind)
+        for (unsigned bucket = 0; bucket < DCC_MEMORY_BUCKETS; ++bucket)
+            if (classes[kind][bucket] > limit) limit = classes[kind][bucket];
+    int slots = dcc_capacity_slots(host, cap);
+    /* Producer concurrency must expose lanes available to small jobs. Each
+     * actual job still passes the scheduler and worker's class-specific
+     * memory admission; a previous large job cannot shrink all later builds. */
+    return limit >= 0 && slots > limit ? limit : slots;
 }
 
 /* Estimate per-job service time relative to an idle single-job compile. */

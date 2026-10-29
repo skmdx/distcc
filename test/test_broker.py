@@ -87,7 +87,7 @@ class BrokerTestCase(DistccTestCase):
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
         payload = struct.pack("=II", 2, command)
-        if command in (6, 9, 10):
+        if command & 65535 in (6, 9, 10):
             payload += struct.pack('=QQII', *work, work_units)
         sock.sendall(payload)
         self.addCleanup(sock.close)
@@ -130,6 +130,75 @@ class BrokerTestCase(DistccTestCase):
                        capture_output=True, timeout=10)
         subprocess.run([str(exe)], check=True, timeout=5)
         return obj.read_bytes()
+
+class BrokerDirectTest(BrokerTestCase):
+    def local_broker(self):
+        metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                                 busy=0, queued=0, preparing=0, returning=0, running=0)
+        peer = self.peer(metrics)
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
+        return peer
+
+    def test_direct_lease_survives_stats_refresh_and_releases_on_disconnect(self):
+        peer = self.local_broker()
+        first = self.request(15)
+        self.assertEqual(self.receive(first), (0, 1, []))
+        requests = peer.requests
+        deadline = time.monotonic() + 3
+        while peer.requests == requests and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertGreater(peer.requests, requests)
+        denied = self.request(15)
+        self.assertEqual(self.receive(denied), (0, 0, []))
+        first.close()
+        again = self.request(15)
+        self.assertEqual(self.receive(again), (0, 1, []))
+        again.sendall(struct.pack('=II3Q', 2, 7, 0, 0, 100_000_000))
+        self.assertEqual(again.recv(1032), b'')
+        final = self.request(15)
+        self.assertEqual(self.receive(final), (0, 1, []))
+
+    def test_client_compiles_original_files_without_include_server(self):
+        self.local_broker()
+        # A direct compile must preserve native options and the client's files,
+        # even when the header-analysis endpoint is unusable.
+        self.env['INCLUDE_SERVER_PORT'] = str(self.work / 'missing-include.sock')
+        source = self.work / 'direct.c'
+        header = self.work / 'direct.h'
+        source.write_text('#include "direct.h"\nint main(void) { return VALUE - 7; }\n')
+        header.write_text('#define VALUE 7\n')
+        obj = self.work / 'direct.o'
+        command = [str(self.build / 'distcc'), 'gcc', '-march=native', '-c', str(source), '-o', str(obj)]
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('gave up analyzing', result.stderr)
+        self.assertNotIn('failed to get includes', result.stderr)
+        exe = self.work / 'direct'
+        subprocess.run(['gcc', str(obj), '-o', str(exe)], check=True, capture_output=True)
+        subprocess.run([str(exe)], check=True)
+        self.assertIn('direct local compile', (self.work / 'broker.log').read_text())
+        # A compiler error must release the lease as well.
+        source.write_text('#error expected error\n')
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('expected error', result.stderr)
+        final = self.request(15)
+        self.assertEqual(self.receive(final), (0, 1, []))
+
+    def test_prepared_command_can_use_direct_lease_without_changing_backend_clients(self):
+        self.local_broker()
+        direct = self.request(9 | (1 << 16), (128, 1024, 4), 1024)
+        self.assertEqual(self.receive(direct), (0, 1 << 29, []))
+        denied = self.request(15)
+        self.assertEqual(self.receive(denied), (0, 0, []))
+        direct.sendall(struct.pack('=II3Q', 2, 7, 0, 0, 100_000_000))
+        self.assertEqual(direct.recv(1032), b'')
+        # A backend explicitly needs a worker connection, not permission to
+        # re-run a driver in its client process.
+        lease, net = self.acquire_reserved(9, (130, 1024, 4), 1024)
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+
 
 class BrokerPlacementTest(BrokerTestCase):
     worker_count = 3
@@ -611,6 +680,24 @@ class BrokerTest(BrokerTestCase):
         self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
         status, slots, fds = self.receive(self.request(2))
         self.assertEqual((status, slots, fds), (0, 2, []))
+
+    def test_jobs_expose_small_class_capacity_without_overadmitting_large_jobs(self):
+        peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2,
+            busy=0, running=0, queued=0, preparing=0, returning=0,
+            compile_capacity=[8] * 64, pump_capacity=[2] * 64))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))
+        self.assertEqual(self.receive(self.request(2)), (0, 8, []))
+        first, first_net = self.acquire_reserved(9, (201, 1024, 4), 1024)
+        second, second_net = self.acquire_reserved(9, (202, 1024, 4), 1024)
+        waiting = self.request(9, (203, 1024, 4), 1024)
+        waiting.settimeout(.05)
+        with self.assertRaises(socket.timeout): waiting.recv(1032)
+        first.close()
+        waiting.settimeout(3)
+        status, _, descriptors = self.receive(waiting)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(descriptors), 1)
+        os.close(descriptors[0])
 
     def test_job_cost_uses_idle_cpu_when_it_finishes_sooner(self):
         peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,

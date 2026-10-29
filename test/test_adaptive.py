@@ -428,6 +428,17 @@ int open(const char *path, int flags, ...) {
                     capture_output=True, text=True, check=True, timeout=5)
                 self.assertEqual(int(result.stdout), expected)
 
+    def test_tcp_jobs_keep_class_capacity_in_the_cross_process_cache(self):
+        peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2,
+            compile_capacity=[8] * 64, pump_capacity=[2] * 64))
+        env = dict(self.base_env,
+            DISTCC_HOSTS=f'127.0.0.1:{self.ports[0]},tcp,stats={peer.port}',
+            DISTCC_DIR=str(self.ddir))
+        for _ in range(2):
+            result = subprocess.run([str(self.build / 'distcc'), '-j'], env=env,
+                                    capture_output=True, text=True, check=True, timeout=5)
+            self.assertEqual(int(result.stdout), 8)
+
     def test_load_changes_after_cache_expiry(self):
         loaded = self.peer(stats_response(load=12))
         idle = self.peer(stats_response())

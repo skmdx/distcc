@@ -44,9 +44,13 @@ broker service restarts after abnormal exits, with a three-start limit per
 minute to stop crash loops. Normal idle exits still use socket activation.
 
 The opt-in `,tcp` host option uses prepared jobs over pooled TCP connections.
-It supports shared input caching, pump and distributed links. The broker
-passes network descriptors to clients; persistent server workers execute
-prepared inputs. See README.md and doc/protocol-6.txt for configuration and
+It supports shared input caching, pump and distributed links. When the broker
+selects this machine for an ordinary compiler command, the client executes it
+against its original files under a broker CPU lease. It tries this placement
+before header analysis and input preparation, and can also use it after those
+steps. Remote jobs receive connected sockets and run on persistent workers.
+`distcc -j` exposes capacity available to smaller job classes; each dispatched
+job still passes its own memory admission. See README.md and doc/protocol-6.txt for configuration and
 storage limits. Legacy `,lz4`, `,lz4s` and `,lzo` TCP protocols remain available.
 
 GCC and Clang/LLD object links can also run on a broker-selected worker. `distcc-link --sync`

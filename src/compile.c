@@ -752,6 +752,7 @@ dcc_build_somewhere(char *argv[],
     int sets_dotd_target = 0;
     pid_t cpp_pid = 0;
     int cpu_lock_fd = -1, local_cpu_lock_fd = -1;
+    int direct_lease = -1;
     int ret;
     int remote_ret = 0;
     int remote_completed = 0, cpp_ready = 0;
@@ -806,6 +807,13 @@ dcc_build_somewhere(char *argv[],
     preprocess_only = dcc_argv_search(argv, "-E");
     if (preprocess_only && (ret || !getenv("INCLUDE_SERVER_PORT")))
         ret = EXIT_LOCAL_CPP;
+    /* Local execution consumes the same broker capacity as a local worker,
+     * but needs neither native expansion nor a duplicate header/input tree. */
+    if (!ret && !dcc_scan_includes && !dcc_offload_language(argv) &&
+        getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER")) {
+        direct_lease = dcc_broker_try_local();
+        if (direct_lease >= 0) goto run_local;
+    }
     if (!ret && (dcc_offload_language(argv) || dcc_native_requested(argv))) {
         if (dcc_offload_language(argv) ? dcc_prepare_offload(&argv, &auxiliary, &offload_targets) :
                                        dcc_expand_native(&argv, input_fname, output_fname)) {
@@ -930,6 +938,10 @@ dcc_build_somewhere(char *argv[],
         goto fallback;
     }
     if (host->mode == DCC_MODE_LOCAL) {
+        if (host->broker_managed) {
+            direct_lease = cpu_lock_fd;
+            cpu_lock_fd = -1;
+        }
         /* We picked localhost and already have a lock on it so no
          * need to lock it now. */
         goto run_local;
@@ -1185,7 +1197,17 @@ dcc_build_somewhere(char *argv[],
   run_local:
     /* Either compile locally, after remote failure, or simply do other cc tasks
        as assembling, linking, etc. */
-    ret = dcc_compile_local(argv, input_fname);
+    {
+        struct timespec started, finished;
+        if (direct_lease >= 0) clock_gettime(CLOCK_MONOTONIC, &started);
+        ret = dcc_compile_local(argv, input_fname);
+        if (direct_lease >= 0) {
+            clock_gettime(CLOCK_MONOTONIC, &finished);
+            dcc_broker_local_done(direct_lease, finished.tv_sec - started.tv_sec +
+                                 (finished.tv_nsec - started.tv_nsec) / 1e9, ret);
+            direct_lease = -1;
+        }
+    }
     if (remote_ret != 0) {
         if (remote_ret != ret && host->cpp_where == DCC_CPP_ON_SERVER) {
             /* Oops! it seems what we did remotely is not the same as what we did
