@@ -1,6 +1,8 @@
 /* Compile-cost history is advisory: it never grants execution or memory slots.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -8,6 +10,32 @@
 #include <sys/stat.h>
 #include <xxhash.h>
 #include "workload.h"
+
+static uint64_t source_family(const char *path, const char *compiler, unsigned kind)
+{
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    struct stat st;
+    if (fd < 0) return 0;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size > 512LL * 1024 * 1024) { close(fd); return 0; }
+    const char *name = strrchr(compiler, '/');
+    name = name ? name + 1 : compiler;
+    uint64_t seed = XXH3_64bits_withSeed(name, strlen(name), kind), result = 0;
+    XXH3_state_t *hash = XXH3_createState();
+    if (hash) {
+        XXH3_64bits_reset_withSeed(hash, seed);
+        char buffer[65536];
+        ssize_t length;
+        while ((length = read(fd, buffer, sizeof(buffer))) != 0) {
+            if (length < 0) { if (errno == EINTR) continue; break; }
+            XXH3_64bits_update(hash, buffer, length);
+        }
+        if (!length) result = XXH3_64bits_digest(hash);
+        XXH3_freeState(hash);
+    }
+    close(fd);
+    return result;
+}
 
 void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *input,
                        const char *prepared, int fd, int ready)
@@ -56,6 +84,7 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
     hint->kind = gpu && !host_only ? DCC_WORK_OFFLOAD : kind + (ready ? 0 : 3);
     key = XXH3_64bits_withSeed(&hint->kind, sizeof(hint->kind), key);
     hint->key = key ? key : 1;
+    if (!gpu) hint->family = source_family(input, argv[0], hint->kind);
 }
 
 int dcc_work_valid(const struct dcc_work_hint *hint)
@@ -65,19 +94,19 @@ int dcc_work_valid(const struct dcc_work_hint *hint)
     if (hint->kind == DCC_WORK_RUST || hint->kind == DCC_WORK_THINLTO ||
         hint->kind == DCC_WORK_OFFLOAD_LINK) return hint->key && hint->bytes;
     return hint->work_units <= 512U * 1024 * 1024 &&
-           ((!hint->key && !hint->bytes && !hint->kind && !hint->work_units) ||
+           ((!hint->key && !hint->bytes && !hint->kind && !hint->work_units && !hint->family) ||
            (hint->key && hint->bytes && hint->bytes <= 512ULL * 1024 * 1024 &&
             hint->kind >= 1 && hint->kind <= DCC_WORK_CLASSES));
 }
 
 /* A few colliding translation units must not evict each other on every build.
  * Four ways keep lookup bounded while retaining the existing entry limit. */
-static unsigned history_slot(const struct dcc_work_model *model, uint64_t key)
+static unsigned history_slot(const struct dcc_work_model *model, const struct dcc_work_hint *hint)
 {
-    unsigned bucket = key % (DCC_WORK_HISTORY / DCC_WORK_WAYS);
+    unsigned bucket = (hint->family ? hint->family : hint->key) % (DCC_WORK_HISTORY / DCC_WORK_WAYS);
     unsigned first = bucket * DCC_WORK_WAYS, empty = DCC_WORK_HISTORY;
     for (unsigned i = first; i < first + DCC_WORK_WAYS; ++i) {
-        if (model->history[i].key == key) return i;
+        if (model->history[i].key == hint->key && model->history[i].family == hint->family) return i;
         if (!model->history[i].key && empty == DCC_WORK_HISTORY) empty = i;
     }
     return empty < DCC_WORK_HISTORY ? empty : first + model->next[bucket];
@@ -138,12 +167,25 @@ static void learn_class(struct dcc_work_class *c, const struct dcc_work_hint *hi
 double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_work_hint *hint)
 {
     if (!hint->key) return 0;
-    unsigned i = history_slot(model, hint->key), kind = hint->kind - 1;
-    if (model->history[i].key == hint->key) {
+    unsigned i = history_slot(model, hint), kind = hint->kind - 1;
+    if (model->history[i].key == hint->key && model->history[i].family == hint->family) {
         double ratio = (double)hint->bytes / model->history[i].bytes;
         if (ratio < .25) ratio = .25;
         if (ratio > 4) ratio = 4;
         return model->history[i].seconds * ratio;
+    }
+    /* A new ABI or build directory changes the exact command, but a completed
+     * compile of the same source is a better prior than unrelated files.
+     * Reuse only timing: compiler flags and artifact identity stay untouched. */
+    if (hint->family) {
+        unsigned first = i / DCC_WORK_WAYS * DCC_WORK_WAYS, count = 0;
+        double sum = 0;
+        for (unsigned j = first; j < first + DCC_WORK_WAYS; ++j)
+            if (model->history[j].key && model->history[j].family == hint->family) {
+                sum += model->history[j].seconds;
+                ++count;
+            }
+        if (count) return sum / count;
     }
     /* Cold estimates only bridge the first completed jobs in each class.
      * Source trees and preprocessed inputs have independent learned rates. */
@@ -159,13 +201,15 @@ double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_wor
 void dcc_work_observe(struct dcc_work_model *model, const struct dcc_work_hint *hint, double seconds)
 {
     if (!hint->key || !isfinite(seconds) || seconds < .001 || seconds > 86400) return;
-    unsigned i = history_slot(model, hint->key), kind = hint->kind - 1;
+    unsigned i = history_slot(model, hint), kind = hint->kind - 1;
     learn_class(&model->classes[kind], hint, seconds);
-    if (model->history[i].key != hint->key)
+    if (model->history[i].key != hint->key || model->history[i].family != hint->family)
         model->next[i / DCC_WORK_WAYS] = (i + 1) % DCC_WORK_WAYS;
-    if (model->history[i].key == hint->key && model->history[i].bytes == hint->bytes)
+    if (model->history[i].key == hint->key && model->history[i].family == hint->family &&
+        model->history[i].bytes == hint->bytes)
         seconds = .75 * model->history[i].seconds + .25 * seconds;
     model->history[i].key = hint->key;
+    model->history[i].family = hint->family;
     model->history[i].bytes = hint->bytes;
     model->history[i].seconds = seconds;
 }

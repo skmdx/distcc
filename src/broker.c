@@ -496,6 +496,14 @@ static void finish_probe(struct peer *peer, double now, int complete)
     struct dcc_capacity metrics;
     peer->stats[peer->used] = '\0';
     if (complete && !dcc_parse_capacity(peer->stats, &metrics)) {
+        /* Direct compilers appear in system load, not daemon occupancy.
+         * Remove them while both observations refer to this snapshot; using
+         * the later live lease count would turn completed jobs into external
+         * CPU demand until the next probe. Project live leases at selection. */
+        rs_trace("capacity sample host=%s running=%d direct=%d now=%.6f",
+                 peer->host->hostname, metrics.running, peer->direct, now);
+        if (metrics.running >= 0)
+            metrics.running = metrics.running > peer->direct ? metrics.running - peer->direct : 0;
         peer->metrics = metrics;
         peer->observed_serial = peer->probe_serial;
         peer->completed = 0;
@@ -694,6 +702,7 @@ static void deliver_connection(struct broker *broker, struct client *client)
 static double execution_factor(const struct peer *peer, int work, int recovering, int capacity)
 {
     struct dcc_capacity cap = peer->metrics;
+    if (cap.running >= 0) cap.running += peer->direct;
     if (cap.busy >= 0) cap.busy += peer->direct;
     cap.capacity = capacity;
     if (recovering) cap.cpu_scale = 1;
@@ -860,12 +869,12 @@ static void observe(struct broker *broker, struct client *client, const struct f
         *previous = .875 * prior + .125 * sample;
     }
     rs_trace("job cost: key=%llx kind=%u bytes=%llu units=%u predicted=%.6f factor=%.6f "
-             "execute=%.6f prepare=%.6f queue=%.6f normalized=%.6f host=%s now=%.6f client=%td request=%.6f",
+             "execute=%.6f prepare=%.6f queue=%.6f normalized=%.6f host=%s now=%.6f client=%td request=%.6f family=%llx",
              (unsigned long long)client->hint.key, client->hint.kind,
              (unsigned long long)client->hint.bytes, client->hint.work_units,
              client->cost, client->factor, timing->execute_ns / 1e9,
              timing->prepare_ns / 1e9, timing->queue_ns / 1e9, cost, peer->host->hostname,
-             now, client - broker->clients, client->waiting_since);
+             now, client - broker->clients, client->waiting_since, (unsigned long long)client->hint.family);
 }
 
 static unsigned long long memory_estimate(const struct dcc_capacity *cap,
@@ -960,6 +969,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     for (i = 0; i < broker->count; i++) {
         struct peer *p = &broker->peers[i];
         struct dcc_capacity observed = p->metrics;
+        if (observed.running >= 0) observed.running += p->direct;
         if (observed.busy >= 0) observed.busy += p->direct;
         const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
         struct dcc_capacity projected;
@@ -1099,8 +1109,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             if (staged && cap && !link && !link_backend && !direct && (predicted ||
                 (!blocked && work < dcc_capacity_jobs(p->host, cap)))) {
                 const struct dcc_capacity *observed = &p->metrics;
-                double external = (observed->running >= 0 ? observed->running : observed->load)
-                                  - (observed->busy > 0 ? observed->busy : 0) - p->direct;
+                double external = (observed->running >= 0 ? observed->running : observed->load - p->direct)
+                                  - (observed->busy > 0 ? observed->busy : 0);
                 int placement = work;
                 if (wait) {
                     int lanes = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;

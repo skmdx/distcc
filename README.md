@@ -255,6 +255,9 @@ bounded below by 1. Work beyond the execution limit queues rather than adding
 throughput. Estimated service time is `max(1, demand / throughput) / speed`.
 The broker takes the larger estimate from projected work and runnable system
 load, without multiplying or adding these overlapping contention penalties.
+Direct local compilers are removed from the runnable snapshot when it arrives
+and projected using their live leases. Completed local jobs therefore release
+their CPU demand immediately instead of remaining as apparent external load.
 Faster SMT threads can still beat idle cores on a slower host.
 Parallelism is the smallest of CPUs, the server's job limit and its reported
 memory admission capacity. Legacy paths use the larger of local reservations
@@ -376,8 +379,13 @@ filenames. LLVM link keys use input content fingerprints and compiler arguments,
 replacing temporary input/output paths with their roles in the job. Fresh
 temporary directories and output filenames do not discard learned work.
 Four-way buckets retain colliding keys across repeated builds. Repeated inputs
-use their measured work, adjusted for size changes. Unseen inputs use an online
-nonnegative fit of input size and original source size for C, C++ and assembler,
+use their measured work, adjusted for size changes. C/C++ source-content hashes
+also associate timings across command and working-directory changes. An exact
+command match takes precedence; otherwise timings of that source's retained
+variants provide a prior, including across multilib builds. This shares timing
+estimates only; it neither reuses artifacts nor changes compiler options.
+Unseen inputs use an online nonnegative fit of input size and original source
+size for C, C++ and assembler,
 with separate classes for raw and preprocessed source. The source-size feature
 is capped at 1 MiB so large generated tables cannot dominate the fit; input
 size still represents parsing work. ThinLTO uses LLVM instruction counts as its

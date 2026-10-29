@@ -13,13 +13,14 @@
 struct dcc_work_hint {
     uint64_t key, bytes;
     uint32_t kind, work_units; /* ThinLTO: LLVM instructions; other classes: source/input bytes. */
+    uint64_t family; /* Source-content prior across command/configuration changes. */
 };
 struct dcc_work_class {
     double xx, xy, yy, xz, yz;
     double input_rate, work_rate;
 };
 struct dcc_work_model {
-    struct { uint64_t key, bytes; double seconds; } history[DCC_WORK_HISTORY];
+    struct { uint64_t key, family, bytes; double seconds; } history[DCC_WORK_HISTORY];
     unsigned char next[DCC_WORK_HISTORY / DCC_WORK_WAYS];
     struct dcc_work_class classes[DCC_WORK_CLASSES];
 };

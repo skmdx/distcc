@@ -4,6 +4,7 @@ import array
 import fcntl
 import concurrent.futures
 import os
+import re
 from pathlib import Path
 import socket
 import shutil
@@ -82,13 +83,13 @@ class BrokerTestCase(DistccTestCase):
                         TMPDIR=str(self.work))
         return proc
 
-    def request(self, command=1, work=(0, 0, 0), work_units=0):
+    def request(self, command=1, work=(0, 0, 0), work_units=0, family=0):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
         payload = struct.pack("=II", 2, command)
         if command & 65535 in (6, 9, 10, 15):
-            payload += struct.pack('=QQII', *work, work_units)
+            payload += struct.pack('=QQIIQ', *work, work_units, family)
         sock.sendall(payload)
         self.addCleanup(sock.close)
         return sock
@@ -104,8 +105,8 @@ class BrokerTestCase(DistccTestCase):
             descriptors.extend(array.array("i", data))
         return status, slots, descriptors
 
-    def acquire_reserved(self, command=6, work=(0, 0, 0), work_units=0):
-        lease = self.request(command, work, work_units)
+    def acquire_reserved(self, command=6, work=(0, 0, 0), work_units=0, family=0):
+        lease = self.request(command, work, work_units, family)
         status, capabilities, fds = self.receive(lease)
         self.assertEqual(status, 0)
         self.assertTrue(capabilities & (1 << 30))
@@ -132,6 +133,30 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerDirectTest(BrokerTestCase):
+    def test_completed_direct_jobs_do_not_become_external_load(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        def snapshot(running):
+            return stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                                  busy=0, queued=0, preparing=0, returning=0, running=running)
+        local = self.peer(snapshot(0))
+        remote = self.peer(snapshot(0), address='127.0.0.2')
+        self.start_broker(self.host(0, f',tcp,stats={local.port}', slots=4) +
+                          f' 127.0.0.2:{self.ports[1]}/4,tcp,stats={remote.port},speed=0.5')
+        leases = [self.request(15) for _ in range(4)]
+        for lease in leases:
+            self.assertEqual(self.receive(lease), (0, 1, []))
+        local.response = snapshot(4)
+        deadline = time.monotonic()+3
+        while 'running=4 direct=4' not in (self.work/'broker.log').read_text():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        for lease in leases:
+            lease.close()
+        # The snapshot still contains four runnable threads. They were ours,
+        # so their released leases must remove them immediately from demand.
+        following = self.request(15)
+        self.assertEqual(self.receive(following), (0, 1, []))
+
     def test_automatic_frontend_capacity_without_worker_statistics(self):
         self.start_broker(self.host(0))
         frontend = self.request(12)
@@ -214,6 +239,26 @@ class BrokerDirectTest(BrokerTestCase):
         self.assertEqual(again.recv(1032), b'')
         final = self.request(15)
         self.assertEqual(self.receive(final), (0, 1, []))
+
+    def test_source_cost_identity_follows_content_across_commands(self):
+        self.local_broker()
+        for index, value in enumerate((7, 7, 19)):
+            source = self.work / f'identity-{index}.c'
+            source.write_text(f'int value = {value};\n')
+            subprocess.run([str(self.build/'distcc'), 'gcc', f'-DUNUSED={index}', '-c',
+                            str(source), '-o', str(self.work/f'identity-{index}.o')],
+                           env=self.env, capture_output=True, check=True, timeout=20)
+        deadline = time.monotonic()+3
+        while True:
+            rows = re.findall(r'job cost: key=([0-9a-f]+).* family=([0-9a-f]+)',
+                              (self.work/'broker.log').read_text())
+            if len(rows) == 3: break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertEqual(len({key for key, _ in rows}), 3)
+        self.assertNotEqual(rows[0][1], '0')
+        self.assertEqual(rows[0][1], rows[1][1])
+        self.assertNotEqual(rows[0][1], rows[2][1])
 
     def test_client_compiles_original_files_without_include_server(self):
         self.local_broker()
@@ -818,6 +863,30 @@ class BrokerTest(BrokerTestCase):
         self.assertEqual(repeated.getpeername()[1], self.ports[0])
         _, other = self.acquire_reserved(10, (12, 2 * 1024 * 1024, 2))
         self.assertEqual(other.getpeername()[1], self.ports[1])
+
+    def test_source_prior_preserves_exact_command_history(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        peer = self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
+                         queued=0, preparing=0, returning=0, capacity=1))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
+
+        def estimate(key, seconds=None):
+            lease, net = self.acquire_reserved(10, (key, 1048576, 4), 1048576, family=9000)
+            log = (self.work/'broker.log').read_text()
+            row = next(line for line in reversed(log.splitlines())
+                       if 'assigning host=' in line and f'key={key:x} ' in line)
+            cost = float(row.split(' cost=', 1)[1].split()[0])
+            if seconds is not None:
+                lease.sendmsg([struct.pack('=II3Q', 2, 7, 0, 0, seconds*1_000_000_000)],
+                              [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+                self.assertEqual(lease.recv(1), b'')
+            lease.close()
+            return cost
+
+        estimate(100, 10)
+        self.assertAlmostEqual(estimate(101, 2), 10)
+        self.assertAlmostEqual(estimate(102), 6)
+        self.assertAlmostEqual(estimate(100), 10)
 
     def test_thinlto_instruction_work_is_not_capped_at_source_byte_limit(self):
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
