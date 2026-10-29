@@ -158,6 +158,33 @@ int main(void) { float a[128] = {0}, b[128] = {3};
         self.env['LANG'] = 'C'
         self.assertNotIn('native expansion cache hit', self.compare(compiler, ['-march=native']))
 
+    def test_config_aliases_keep_relative_dependencies_and_invalidation(self):
+        compiler = shutil.which('clang')
+        if not compiler:
+            self.skipTest('Clang is not installed')
+        self.env['HOME'] = str(self.work)
+        configs = self.work / '.config/clang'
+        configs.mkdir(parents=True)
+        nested = self.work / 'nested-config'
+        nested.mkdir()
+        common = configs / 'common.cfg'
+        common.write_text('@leaf.rsp\n')
+        (nested / 'alias.rsp').hardlink_to(common)
+        (configs / 'alias.cfg').write_text('@' + str(nested / 'alias.rsp') + '\n')
+        leaves = [configs / 'leaf.rsp', nested / 'leaf.rsp']
+        for leaf in leaves:
+            leaf.write_text('# initial\n')
+        flags = ['-march=native']
+        self.compare(compiler, flags)
+        self.assertIn('native expansion cache hit', self.compare(compiler, flags))
+        for leaf in leaves:
+            leaf.write_text('# changed\n')
+            self.assertNotIn('native expansion cache hit', self.compare(compiler, flags))
+            self.assertIn('native expansion cache hit', self.compare(compiler, flags))
+        common.unlink()
+        common.write_text('# replacement inode\n')
+        self.assertNotIn('native expansion cache hit', self.compare(compiler, flags))
+
     def test_local_calls_do_not_probe(self):
         for flags in (['-E'], []):
             result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-march=native',

@@ -22,7 +22,10 @@ extern char **environ;
 
 #if defined(__linux__) && defined(__SIZEOF_INT128__)
 
-struct fingerprint { __uint128_t hash; int failed, files; };
+#include <search.h>
+
+struct config_image { struct stat stamp; char *bytes; };
+struct fingerprint { __uint128_t hash; int failed, files; void *images; };
 
 static void append(struct fingerprint *key, const char *text)
 {
@@ -34,7 +37,7 @@ static void append(struct fingerprint *key, const char *text)
     } while (*text++);
 }
 
-static int stamp(struct fingerprint *key, const char *path)
+static int stamp_info(struct fingerprint *key, const char *path, struct stat *info)
 {
     struct stat st;
     char value[256];
@@ -47,6 +50,7 @@ static int stamp(struct fingerprint *key, const char *path)
         append(key, "absent");
         return 0;
     }
+    if (info) *info = st;
     /* nsfs synthesizes timestamps on lookup; only its identity is stable. */
     if (!strcmp(path, "/proc/self/ns/mnt")) {
         snprintf(value, sizeof(value), "%llu/%llu", (unsigned long long)st.st_dev,
@@ -62,16 +66,71 @@ static int stamp(struct fingerprint *key, const char *path)
     return 1;
 }
 
+static int stamp(struct fingerprint *key, const char *path)
+{
+    return stamp_info(key, path, NULL);
+}
+
+static int compare_image(const void *left, const void *right)
+{
+    const struct stat *a = &((const struct config_image *)left)->stamp;
+    const struct stat *b = &((const struct config_image *)right)->stamp;
+    if (a->st_dev != b->st_dev) return a->st_dev < b->st_dev ? -1 : 1;
+    return a->st_ino == b->st_ino ? 0 : a->st_ino < b->st_ino ? -1 : 1;
+}
+
+static void free_image(void *entry)
+{
+    struct config_image *image = entry;
+    free(image->bytes);
+    free(image);
+}
+
+/* A toolchain can expose hundreds of target aliases for the same few config
+ * files. Read each inode once per fingerprint, but still stamp every path and
+ * interpret relative @ operands at each spelling's directory. No image survives
+ * this validation pass: replacement and in-place writes are checked next time. */
+static FILE *config_stream(struct fingerprint *key, const char *path, const struct stat *st)
+{
+    struct config_image probe = {.stamp = *st}, *image;
+    void *found = tfind(&probe, &key->images, compare_image);
+    if (found) {
+        image = *(struct config_image **)found;
+        const struct stat *old = &image->stamp;
+        if (old->st_size != st->st_size || old->st_mtim.tv_sec != st->st_mtim.tv_sec ||
+            old->st_mtim.tv_nsec != st->st_mtim.tv_nsec ||
+            old->st_ctim.tv_sec != st->st_ctim.tv_sec || old->st_ctim.tv_nsec != st->st_ctim.tv_nsec)
+            return NULL;
+    } else {
+        if (st->st_size < 0 || (uintmax_t)st->st_size >= SIZE_MAX) return NULL;
+        image = calloc(1, sizeof(*image));
+        if (!image) return NULL;
+        image->stamp = *st;
+        image->bytes = malloc((size_t)st->st_size + 1);
+        FILE *file = image->bytes ? fopen(path, "r") : NULL;
+        if (!file) { free_image(image); return NULL; }
+        size_t count = fread(image->bytes, 1, (size_t)st->st_size + 1, file);
+        int valid = !ferror(file) && count == (size_t)st->st_size;
+        fclose(file);
+        if (!valid || !tsearch(image, &key->images, compare_image)) {
+            free_image(image);
+            return NULL;
+        }
+    }
+    return fmemopen(image->bytes, (size_t)st->st_size, "r");
+}
+
 /* Track nested Clang response files too. Only simple relative @ paths are
  * accepted; unfamiliar configuration syntax uses an uncached driver probe. */
 static void config_file(struct fingerprint *key, const char *path, int depth)
 {
     FILE *file;
+    struct stat info;
     char line[4096], nested[PATH_MAX], *word, *end, *slash;
     if (key->failed) return;
     if (depth > 8 || ++key->files > 4096) { key->failed = 1; return; }
-    if (!stamp(key, path)) return;
-    file = fopen(path, "r");
+    if (!stamp_info(key, path, &info)) return;
+    file = config_stream(key, path, &info);
     if (!file) { rs_trace("native cache cannot read %s: %s", path, strerror(errno)); key->failed = 1; return; }
     while (fgets(line, sizeof(line), file)) {
         if (!strchr(line, '\n') && !feof(file)) { key->failed = 1; break; }
@@ -242,6 +301,7 @@ char *dcc_native_cache_key(char *argv[], const char *input, const char *output)
         slash = strrchr(path, '/'); *slash = 0;
         config_directory(key, path, 0, 0);
     } else config_directory(key, "/usr/lib/gcc", 2, 1);
+    tdestroy(key->images, free_image);
     if (key->failed) { rs_trace("native cache bypass: unsupported configuration"); free(key); return NULL; }
     snprintf(path, sizeof(path), "native:%016llx%016llx",
              (unsigned long long)(key->hash >> 64), (unsigned long long)key->hash);
