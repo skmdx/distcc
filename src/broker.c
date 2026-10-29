@@ -92,7 +92,7 @@ struct idle_connection { int fd, peer; double expires; };
 struct broker {
     struct peer peers[MAX_HOSTS];
     struct client clients[MAX_CLIENTS];
-    int count, cpp_busy, cpp_limit;
+    int count, cpp_busy, cpp_limit, analysis_busy;
     uint64_t direct_completed, direct_prepared_completed;
     double refresh_at, first_probe_until;
     struct memo memos[MAX_MEMOS];
@@ -530,10 +530,17 @@ static void probe_event(struct peer *peer, double now)
     }
 }
 
-static void release_assignment(struct broker *broker, struct client *client)
+static void release_cpp(struct broker *broker, struct client *client)
 {
     broker->cpp_busy -= client->cpp_reserved;
+    if (client->command == LOCAL_ANALYSIS)
+        broker->analysis_busy -= client->cpp_reserved;
     client->cpp_reserved = 0;
+}
+
+static void release_assignment(struct broker *broker, struct client *client)
+{
+    release_cpp(broker, client);
     if (client->peer >= 0) {
         struct peer *p = &broker->peers[client->peer];
         p->busy--;
@@ -896,11 +903,15 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     if (client->command == LOCAL_CPP || client->command == LOCAL_ANALYSIS) {
         int limit = client->command == LOCAL_ANALYSIS ? dcc_resource_cpus() : cpp_limit(broker);
         if (broker->cpp_busy < limit) {
-            reply.slots = broker->cpp_busy + 1;
+            /* Memory calibration belongs to the analyzer pool. IR producers
+             * still consume CPU here, but are not resident analyzer workers. */
+            reply.slots = (client->command == LOCAL_ANALYSIS ?
+                           broker->analysis_busy : broker->cpp_busy) + 1;
             if (send_reply(client->fd, &reply, -1)) {
                 release_client(broker, client);
             } else {
                 broker->cpp_busy++;
+                broker->analysis_busy += client->command == LOCAL_ANALYSIS;
                 client->cpp_reserved = 1;
                 client->state = ACTIVE;
             }
@@ -1739,8 +1750,7 @@ int dcc_broker_serve(const char *path)
                     request.version == BROKER_VERSION && request.command == CPP_DONE &&
                     (c->cpp_reserved || c->command == ACQUIRE_LINK || c->command == ACQUIRE_CPP ||
                      c->command == ACQUIRE_READY)) {
-                    broker->cpp_busy -= c->cpp_reserved;
-                    c->cpp_reserved = 0;
+                    release_cpp(broker, c);
                     continue;
                 }
                 int compile = request.command == ACQUIRE_POOL || request.command == ACQUIRE_CPP ||

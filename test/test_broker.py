@@ -544,12 +544,12 @@ class BrokerTest(BrokerTestCase):
         for index in range(1, capacity):
             lease = self.request(13)
             active.append(lease)
-            self.assertEqual(self.receive(lease), (0, index + 1, []))
+            self.assertEqual(self.receive(lease), (0, index, []))
         queued_scan = self.request(13)
         import select
         self.assertFalse(select.select([queued_cpp, queued_scan], [], [], .1)[0])
         active.pop().close()
-        self.assertEqual(self.receive(queued_scan), (0, capacity, []))
+        self.assertEqual(self.receive(queued_scan), (0, capacity - 1, []))
         queued_scan.close()
         for lease in active:
             lease.close()

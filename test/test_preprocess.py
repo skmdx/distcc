@@ -93,6 +93,32 @@ class PreparedClangTest(PumpTestCase):
     compression = 'lz4s'
     transport = ',tcp'
 
+    def test_preprocessing_bootstraps_while_a_compiler_lease_is_held(self):
+        held = self.request(12)
+        self.assertEqual(self.receive(held), (0, 1, []))
+        (self.work / 'shared.h').write_text('#pragma once\nenum { value = __COUNTER__ };\n')
+        source = self.work / 'program.cc'
+        source.write_text('#include "shared.h"\nstatic_assert(__COUNTER__ == 1);\n'
+                          'int main() { return value; }\n')
+        args = ['-E', '-P', source, '-o', 'program.ii', '-MD', '-MF', 'program.d']
+        native = self.run_cc('clang++', args, remote=False)
+        self.assertEqual(native.returncode, 0, native.stderr.decode())
+        expected = (self.work / 'program.ii').read_bytes()
+        expected_deps = (self.work / 'program.d').read_text()
+        (self.work / 'program.ii').unlink()
+        before = re.search(r'dcc_compile_ok (\d+)', self.get_stats(self.stats_ports[0]))
+        assert before is not None
+        result = self.run_cc('clang++', args)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn(f'dcc_compile_ok {int(before[1]) + 1}\n',
+                      self.get_stats(self.stats_ports[0]))
+        self.assertEqual((self.work / 'program.ii').read_bytes(), expected)
+        self.assertEqual((self.work / 'program.d').read_text(), expected_deps)
+        subprocess.run(['clang++', 'program.ii', '-o', 'program'], cwd=self.work,
+                       check=True, capture_output=True, timeout=10)
+        subprocess.run([str(self.work / 'program')], check=True, timeout=5)
+        held.close()
+
     def test_frontend_ir_without_broker(self):
         self.env.pop('DISTCC_BROKER')
         self.env['DISTCC_HOSTS'] = self.host(0, ',lz4,cpp')
