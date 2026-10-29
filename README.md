@@ -424,6 +424,12 @@ a server worker before transferring a job. Ordinary broker clients finish
 local preprocessing before reserving that worker and reuse the preprocessed
 input on retries. By default, input preparation shares the available CPU slots
 with local compilation. `--localslots_cpp` sets an explicit preparation limit.
+Ordinary Clang C-family compilation prepares LLVM IR once; the selected worker
+performs optimization and code generation. A job assigned back to its client
+also consumes that IR, preserving its dependency output without repeating the
+frontend. Early local placement still runs the original command directly.
+Broker statistics report all successful direct jobs as `direct_completed`, and
+those placed after preparation as `direct_prepared_completed`.
 The broker wakes waiters when a lease closes, without polling
 slot files. Clients still check their own memory budget before starting
 preprocessing; the broker may belong to a separate, smaller cgroup. A full server

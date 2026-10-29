@@ -93,7 +93,7 @@ struct broker {
     struct peer peers[MAX_HOSTS];
     struct client clients[MAX_CLIENTS];
     int count, cpp_busy, cpp_limit;
-    uint64_t direct_completed;
+    uint64_t direct_completed, direct_prepared_completed;
     double refresh_at, first_probe_until;
     struct memo memos[MAX_MEMOS];
     struct idle_connection pool[MAX_CLIENTS];
@@ -1161,8 +1161,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     } else if (client->command == JOBS || !available) {
         if (client->command == JOBS)
             snprintf(reply.host, sizeof(reply.host),
-                     "{\"jobs\":%d,\"work_rate\":%.9g,\"min_rate\":%.9g,\"direct_completed\":%llu}",
-                     reply.slots, work_rate, min_rate, (unsigned long long)broker->direct_completed);
+                     "{\"jobs\":%d,\"work_rate\":%.9g,\"min_rate\":%.9g,\"direct_completed\":%llu,"
+                     "\"direct_prepared_completed\":%llu}",
+                     reply.slots, work_rate, min_rate, (unsigned long long)broker->direct_completed,
+                     (unsigned long long)broker->direct_prepared_completed);
         if (!available && client->command != JOBS) {
             for (i = 0; i < broker->count; i++) {
                 struct peer *p = &broker->peers[i];
@@ -1672,7 +1674,10 @@ int dcc_broker_serve(const char *path)
                     struct feedback timing;
                     memcpy(&timing, packet.payload, sizeof(timing));
                     observe(broker, c, &timing, now);
-                    if (timing.execute_ns) broker->direct_completed++;
+                    if (timing.execute_ns) {
+                        broker->direct_completed++;
+                        broker->direct_prepared_completed += c->command != TRY_LOCAL;
+                    }
                     release_client(broker, c);
                     continue;
                 }

@@ -21,6 +21,7 @@ import time
 import unittest
 
 from test_broker import BrokerTestCase
+from test_adaptive import stats_response
 
 
 class PumpTestCase(BrokerTestCase):
@@ -194,6 +195,71 @@ class PreparedClangTest(PumpTestCase):
                       self.get_stats(self.stats_ports[0]))
         self.assertNotIn('include server gave up analyzing',
                          (self.work / 'client.log').read_text())
+
+
+class PreparedLocalClangTest(BrokerTestCase):
+    def test_ready_ir_runs_only_the_local_backend(self):
+        source = self.work / 'prepared.cc'
+        source.write_text('#include <vector>\n'
+                          'enum { first = __COUNTER__ };\n'
+                          'static_assert(__COUNTER__ == 1);\n'
+                          'extern "C" int answer() { std::vector<int> a(3, 14); return a[0] * 3; }\n'
+                          'extern "C" int alias() __attribute__((alias("answer")));\n'
+                          'int main() { return alias() != 42; }\n')
+        for index, (save, options) in enumerate(((False, []), (True, []),
+                                               (False, ['-fprofile-generate']),
+                                               (False, ['-flto=thin']))):
+            with self.subTest(save_temps=save, options=options):
+                ready = threading.Event()
+                peer = self.peer(lambda: stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                    busy=0 if ready.is_set() else 1, running=0 if ready.is_set() else 1,
+                    queued=0, preparing=0, returning=0))
+                name = f'prepared-{index}'
+                self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+                self.start_broker(self.host(0, f',tcp,stats={peer.port}') +
+                                  ' --localslots_cpp=1', name=name)
+                log = self.work / f'client-{index}.log'
+                self.env.update(DISTCC_LOG=str(log), DISTCC_SAVE_TEMPS=str(int(save)),
+                                DISTCC_CLANG_DRIVER=str(self.build / 'distcc-clang'),
+                                PYTHONPATH=str(next(self.build.glob('_include_server/lib.*'))))
+                args = ['clang++', '-O3', '-g', *options, '-c', str(source),
+                        '-o', 'prepared.o', '-MD', '-MF', 'prepared.d']
+                subprocess.run(args, cwd=self.work, check=True, capture_output=True, timeout=15)
+                expected = (self.work / 'prepared.o').read_bytes()
+                dependencies = (self.work / 'prepared.d').read_bytes()
+                (self.work / 'prepared.o').unlink()
+                (self.work / 'prepared.d').unlink()
+                process = subprocess.Popen([str(self.build / 'distcc'), *args],
+                    cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    deadline = time.monotonic() + 10
+                    while not ready.is_set():
+                        self.assertIsNone(process.poll(), log.read_text() if log.exists() else '')
+                        self.assertLess(time.monotonic(), deadline, 'frontend was not reached')
+                        children = Path(f'/proc/{process.pid}/task/{process.pid}/children').read_text()
+                        for child in children.split():
+                            try:
+                                arguments = Path(f'/proc/{child}/cmdline').read_bytes().split(b'\0')
+                            except FileNotFoundError:
+                                continue
+                            if b'-emit-llvm' in arguments:
+                                ready.set()
+                        if not ready.is_set():
+                            time.sleep(.005)
+                    stdout, stderr = process.communicate(timeout=20)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                self.assertEqual(process.returncode, 0, stderr.decode())
+                self.assertIn('prepared=1', (self.work / f'{name}.log').read_text())
+                self.assertIn('-x ir', log.read_text())
+                if '-flto=thin' not in options:
+                    self.assertEqual((self.work / 'prepared.o').read_bytes(), expected)
+                self.assertEqual((self.work / 'prepared.d').read_bytes(), dependencies)
+                subprocess.run(['clang++', *options, 'prepared.o', '-o', 'prepared'],
+                               cwd=self.work, check=True, capture_output=True, timeout=15)
+                subprocess.run([str(self.work / 'prepared')], cwd=self.work, check=True, timeout=5)
 
 
 class AnalyzerPoolTest(PumpTestCase):

@@ -1251,30 +1251,11 @@ static int dcc_run_job(int in_fd,
             }
         }
     } else if (strstr(dcc_find_basename(argv[0]), "clang")) {
-        int frontend = cpp_where == DCC_CPP_ON_SERVER || (job && job->count > 1);
-        int argc = dcc_argv_len(argv);
-        for (i = 1; i < argc; ++i)
-            if (!strcmp(argv[i], "-fprofile-generate") ||
-                !strncmp(argv[i], "-fprofile-generate=", 19)) frontend = 1;
-        if (frontend) {
-            const char *helper = getenv("DISTCC_CLANG_DRIVER");
-            char **wrapped = calloc(argc + 6, sizeof(char *));
-            if (!wrapped) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
-            wrapped[0] = strdup(helper && *helper ? helper : "distcc-clang");
-            wrapped[1] = strdup(job ? root : cpp_where == DCC_CPP_ON_SERVER ? temp_dir : "");
-            wrapped[2] = strdup(orig_input);
-            wrapped[3] = strdup(job ? job->cwd : client_cwd ? client_cwd : "");
-            wrapped[4] = strdup(cpp_where == DCC_CPP_ON_SERVER ? "pump" : "preprocessed");
-            if (!wrapped[0] || !wrapped[1] || !wrapped[2] || !wrapped[3] || !wrapped[4]) {
-                for (int k = 0; k < 5; ++k) free(wrapped[k]);
-                free(wrapped);
-                ret = EXIT_OUT_OF_MEMORY;
-                goto out_cleanup;
-            }
-            memcpy(wrapped + 5, argv, (argc + 1) * sizeof(char *));
-            free(argv);
-            argv = wrapped;
-        }
+        ret = dcc_clang_command(&argv,
+            job ? root : cpp_where == DCC_CPP_ON_SERVER ? temp_dir : "",
+            orig_input, job ? job->cwd : client_cwd ? client_cwd : "",
+            cpp_where == DCC_CPP_ON_SERVER, job ? job->count : 1);
+        if (ret) goto out_cleanup;
     }
 
     if ((compile_ret = dcc_spawn_child(argv, &cc_pid,

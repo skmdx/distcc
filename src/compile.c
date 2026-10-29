@@ -402,7 +402,7 @@ int dcc_fresh_dependency_exists(const char *dotd_fname,
  * This is called with a lock on localhost already held.
  **/
 static int dcc_compile_local(char *argv[],
-                             char *input_name)
+                             char *input_name, const char *prepared)
 {
     pid_t pid;
     int ret;
@@ -411,9 +411,9 @@ static int dcc_compile_local(char *argv[],
     dcc_note_execution(dcc_hostdef_local, argv);
     dcc_note_state(DCC_PHASE_COMPILE, input_name, "localhost", DCC_LOCAL);
 
-    /* We don't do any redirection of file descriptors when running locally,
-     * so if for example cpp is being used in a pipeline we should be fine. */
-    if ((ret = dcc_spawn_child(argv, &pid, NULL, NULL, NULL)) != 0)
+    /* An IR job opens its sealed input as stdin before exec closes the
+     * original memfd. Ordinary local commands retain the caller's stdio. */
+    if ((ret = dcc_spawn_child(argv, &pid, prepared, NULL, NULL)) != 0)
         return ret;
 
     if ((ret = dcc_collect_child("cc", pid, &status, timeout_null_fd, NULL)))
@@ -421,6 +421,22 @@ static int dcc_compile_local(char *argv[],
 
     return dcc_critique_status(status, "compile", input_name,
                                dcc_hostdef_local, 1);
+}
+
+static int dcc_compile_local_ir(char **argv, char *input, const char *prepared, int fd)
+{
+    char **stripped = NULL, **command = NULL;
+    char *cwd = NULL;
+    int ret = dcc_strip_local_args(argv, &stripped, input);
+    if (!ret) ret = dcc_copy_argv(stripped, &command, 0);
+    free(stripped);
+    if (!ret) ret = dcc_set_input(command, (char *)(fd >= 0 ? "/proc/self/fd/0" : prepared));
+    if (!ret && !(cwd = getcwd(NULL, 0))) ret = EXIT_IO_ERROR;
+    if (!ret) ret = dcc_clang_command(&command, "", input, cwd, 0, 1);
+    if (!ret) ret = dcc_compile_local(command, input, fd >= 0 ? prepared : NULL);
+    free(cwd);
+    dcc_free_argv(command);
+    return ret;
 }
 
 
@@ -846,7 +862,7 @@ dcc_build_somewhere(char *argv[],
     if (offload_targets) {
         char **command = NULL;
         ret = dcc_offload_command(argv, input_fname, output_fname, &command);
-        if (!ret) ret = dcc_compile_local(command, input_fname);
+        if (!ret) ret = dcc_compile_local(command, input_fname, NULL);
         if (command) dcc_free_argv(command);
         goto unlock_and_clean_up;
     }
@@ -1205,7 +1221,10 @@ dcc_build_somewhere(char *argv[],
     {
         struct timespec started, finished;
         if (direct_lease >= 0) clock_gettime(CLOCK_MONOTONIC, &started);
-        ret = dcc_compile_local(argv, input_fname);
+        if (direct_lease >= 0 && cpp_ready && dcc_cpp_ir(argv, input_fname))
+            ret = dcc_compile_local_ir(argv, input_fname, cpp_fname, cpp_fd);
+        else
+            ret = dcc_compile_local(argv, input_fname, NULL);
         if (direct_lease >= 0) {
             clock_gettime(CLOCK_MONOTONIC, &finished);
             dcc_broker_local_done(direct_lease, finished.tv_sec - started.tv_sec +

@@ -553,6 +553,33 @@ int dcc_set_input(char **a, char *ifname)
     return EXIT_DISTCC_FAILED;
 }
 
+/* Own the rewritten vector and preserve the original source identity when
+ * Clang needs a rooted frontend or uses the module name for PGO. */
+int dcc_clang_command(char ***argv, const char *root, const char *original,
+                      const char *cwd, int pump, int inputs)
+{
+    int argc = dcc_argv_len(*argv), frontend = pump || inputs > 1;
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp((*argv)[i], "-fprofile-generate") ||
+            !strncmp((*argv)[i], "-fprofile-generate=", 19)) frontend = 1;
+    if (!frontend) return 0;
+    const char *helper = getenv("DISTCC_CLANG_DRIVER");
+    const char *prefix[] = {helper && *helper ? helper : "distcc-clang",
+                           root, original, cwd, pump ? "pump" : "preprocessed"};
+    char **wrapped = calloc(argc + 6, sizeof(char *));
+    if (!wrapped) return EXIT_OUT_OF_MEMORY;
+    for (int i = 0; i < 5; ++i) {
+        if (!(wrapped[i] = strdup(prefix[i]))) {
+            dcc_free_argv(wrapped);
+            return EXIT_OUT_OF_MEMORY;
+        }
+    }
+    memcpy(wrapped + 5, *argv, (argc + 1) * sizeof(char *));
+    free(*argv);
+    *argv = wrapped;
+    return 0;
+}
+
 /* Subroutine of dcc_expand_preprocessor_options().
  * Calculate how many extra arguments we'll need to convert
  * a "-Wp,..." option into regular gcc options.
