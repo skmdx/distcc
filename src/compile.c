@@ -855,6 +855,11 @@ dcc_build_somewhere(char *argv[],
     /* turned off because we never spend long in this state. */
     dcc_note_state(DCC_PHASE_STARTUP, input_fname, NULL);
 #endif
+    /* Emit frontend IR once. The worker optimizes and generates machine code
+     * without needing a second preprocessing pass or a header snapshot. */
+    if (!preprocess_only && !dcc_scan_includes && dcc_cpp_ir(argv, input_fname))
+        unsetenv("INCLUDE_SERVER_PORT");
+
     /* A homogeneous broker pool has a known input format before selection.
      * Finish include analysis before reserving a worker or opening its socket:
      * analysis must not consume worker slots or their idle timeout. */

@@ -422,8 +422,9 @@ uses configured slots, speed and local leases.
 With the Linux broker and a supporting server, each legacy pooled connection reserves
 a server worker before transferring a job. Ordinary broker clients finish
 local preprocessing before reserving that worker and reuse the preprocessed
-input on retries. The broker grants local preprocessing leases up to its
-`--localslots_cpp` limit and wakes waiters when a lease closes, without polling
+input on retries. By default, input preparation shares the available CPU slots
+with local compilation. `--localslots_cpp` sets an explicit preparation limit.
+The broker wakes waiters when a lease closes, without polling
 slot files. Clients still check their own memory budget before starting
 preprocessing; the broker may belong to a separate, smaller cgroup. A full server
 refuses immediately so the broker can try another host, even when several

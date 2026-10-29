@@ -119,7 +119,7 @@ struct dcc_hostdef _dcc_local_cpp = {
     0,
     NULL,
     1,                          /* host is_up */
-    8,                          /* number of tasks */
+    0,                          /* automatic frontend CPU budget */
     (char *)"localhost",        /* verbatim string */
     DCC_VER_1,                  /* protocol (ignored) */
     DCC_COMPRESS_NONE,          /* compression (ignored) */

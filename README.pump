@@ -8,12 +8,14 @@ Run a build under `pump` to distribute preprocessing as well as compilation:
 The build must invoke distcc as its compiler, as with ordinary distcc. Pump
 starts a pool of persistent include analyzers for the build and stops it when
 the command exits. It does not require build-system hooks or special handling of generated
-headers. Without pump, ordinary client-side preprocessing remains the default.
-For Clang C-family sources, the client rewrites includes while preserving macros
-and the worker finishes preprocessing. This preserves macro-sensitive diagnostics
-without requiring application headers on workers. The worker must support the
-requested target, options and source language. Dependency files are
-produced on the client.
+headers. For Clang C-family compilation, with or without pump, the client runs
+the frontend once and transfers LLVM bitcode before optimization. The worker
+runs the requested optimization and code generation. No separate include scan
+or second preprocessing pass is needed. Macro diagnostics, source locations,
+aliases and profile identities come from Clang's own frontend; dependency files
+are produced on the client. The worker must accept the client's LLVM bitcode
+and requested target and options. GCC retains pump header discovery and remote
+preprocessing; standalone preprocessing and include scans also retain that path.
 
 Clang HIP and direct AMDGPU C/C++/OpenCL jobs use full client preprocessing,
 even under pump. HIP compilation follows the selected driver's action graph,
@@ -39,8 +41,10 @@ hosts with the `,cpp,lzo` options.
 
 Pump obtains the pool size from `distcc --show-analyzer-slots`: available logical
 CPUs capped by CPU affinity and ancestor cgroup quotas. Analysis and ordinary
-local preprocessing share occupied leases. Ordinary preprocessing keeps its
-configured slot limit; native analysis can use the available CPUs and publishes
+local preprocessing share occupied leases. Without an explicit
+`--localslots_cpp` limit, input preparation uses the available CPUs; the broker
+shares these slots with local compilation. An explicit limit remains effective.
+Native analysis can use the available CPUs and publishes
 its observed resident plus frontend peak memory. One initial request calibrates
 demand before parallel scans are admitted using that peak and the existing
 memory headroom policy. Imports happen before forking so immutable library pages
@@ -97,7 +101,7 @@ exits. `pump` statistics report PREAMBLES hits and builds. This cache accelerate
 Clang input discovery; worker compilation and the native GCC scanner still
 preprocess their original inputs.
 
-Clang pump jobs use the installed `distcc-clang` worker helper. Its virtual
+Clang remote-preprocessing jobs use the installed `distcc-clang` worker helper. Its virtual
 filesystem resolves absolute include operands and existence probes against the
 transferred files while preserving the original main-file identity, including
 static-function profile names. Target and language defaults are inferred from

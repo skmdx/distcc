@@ -337,7 +337,7 @@ int dcc_prepare_clang(char ***argv, char ***files);
 int dcc_strip_dasho(char **from, char ***out_argv);
 
 /* cpp.c */
-const char *dcc_cpp_rewrite_language(char **argv, const char *input_fname);
+int dcc_cpp_ir(char **argv, const char *input_fname);
 int dcc_cpp_maybe(char **argv, char *input_fname, char **cpp_fname,
           pid_t *cpp_pid, int *cpp_fd);
 

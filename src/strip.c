@@ -66,7 +66,7 @@ int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname)
     char **to;
     int from_i, to_i;
     int from_len;
-    const char *rewrite_language = input_fname ? dcc_cpp_rewrite_language(from, input_fname) : NULL;
+    int ir = input_fname && dcc_cpp_ir(from, input_fname);
     const char *offload = dcc_offload_language(from);
 
     from_len = dcc_argv_len(from);
@@ -81,9 +81,12 @@ int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname)
      * ought to be omitted */
     to_i = 0;
     to[to_i++] = from[0];
-    if (rewrite_language || offload) {
+    if (ir || offload) {
         to[to_i++] = (char *)"-x";
-        to[to_i++] = (char *)(offload ? offload : rewrite_language);
+        to[to_i++] = (char *)(offload ? offload : "ir");
+        if (ir) {
+            to[to_i++] = (char *)"-Qunused-arguments";
+        }
         if (offload && !strcmp(offload, "hip-cpp-output")) to[to_i++] = (char *)"-nogpuinc";
         if (offload && !strncmp(offload, "cl", 2)) to[to_i++] = (char *)"-cl-no-stdinc";
     }
@@ -92,16 +95,8 @@ int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname)
             to[to_i++] = from[from_i++];
             to[to_i++] = from[from_i];
         }
-        else if (offload && str_startswith("-x", from[from_i])) {
+        else if ((offload || ir) && str_startswith("-x", from[from_i])) {
             if (!strcmp(from[from_i], "-x") && from[from_i + 1]) ++from_i;
-        }
-        else if (rewrite_language &&
-                 (str_startswith("-D", from[from_i]) ||
-                  str_startswith("-U", from[from_i]) ||
-                  str_equal("-undef", from[from_i]))) {
-            to[to_i++] = from[from_i];
-            if ((!strcmp(from[from_i], "-D") || !strcmp(from[from_i], "-U")) && from[from_i + 1])
-                to[to_i++] = from[++from_i];
         }
         else if (str_equal("-D", from[from_i])
             || str_equal("-I", from[from_i])

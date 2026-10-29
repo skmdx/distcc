@@ -333,6 +333,7 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
                 if (!language ||
                     (!str_startswith("c", language) &&
                      !str_startswith("objective-c", language) &&
+                     strcmp("ir", language) &&
                      !str_startswith("go", language) &&
                      !str_startswith("hip", language))) {
                     rs_log_info("unsupported distributed language: %s", language ? language : "empty");

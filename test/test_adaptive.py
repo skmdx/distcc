@@ -6,6 +6,7 @@ Synthetic HTTP responses cover controlled loads and bad peers; compilation
 always goes to a real daemon with local fallback disabled.
 """
 import concurrent.futures
+from collections.abc import Callable
 import contextlib
 import fcntl
 import os
@@ -79,12 +80,13 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
 
 
 class StatsPeer:
-    def __init__(self, response, delay: float = 0):
+    def __init__(self, response: bytes | Callable[[], bytes], delay: float = 0,
+                 address='127.0.0.1'):
         self.response, self.delay = response, delay
         self.requests = 0
         self.stop = threading.Event()
         self.sock = socket.socket()
-        self.sock.bind(("127.0.0.1", 0))
+        self.sock.bind((address, 0))
         self.port = self.sock.getsockname()[1]
         self.sock.listen()
         self.sock.settimeout(0.05)
@@ -114,6 +116,7 @@ class StatsPeer:
 
 
 class DistccTestCase(unittest.TestCase):
+    worker_address = '127.0.0.1'
     @classmethod
     def setUpClass(cls):
         cls.build = Path.cwd()
@@ -165,7 +168,7 @@ class DistccTestCase(unittest.TestCase):
             proc = subprocess.Popen([
                 str(cls.build / "distccd"), "--daemon", "--no-detach",
                 "--log-stderr", "--verbose", "--enable-tcp-insecure",
-                "--listen", "127.0.0.1", "--allow", "127.0.0.1",
+                "--listen", cls.worker_address, "--allow", "127.0.0.0/8",
                 "--port", str(port), "--stats", "--stats-port", str(stats),
                 "--jobs", "4", "--pid-file", str(cls.root / f"daemon-{i}.pid")],
                 env=env, stdout=log, stderr=log, start_new_session=True)
@@ -200,9 +203,9 @@ class DistccTestCase(unittest.TestCase):
             log.close()
         cls.storage.cleanup()
 
-    @staticmethod
-    def get_stats(port):
-        with socket.create_connection(("127.0.0.1", port), timeout=1) as sock:
+    @classmethod
+    def get_stats(cls, port):
+        with socket.create_connection((cls.worker_address, port), timeout=1) as sock:
             sock.sendall(b"GET / HTTP/1.0\r\n\r\n")
             response = b""
             while True:
@@ -220,10 +223,10 @@ class DistccTestCase(unittest.TestCase):
         self.source.write_text("int main(void) { return 0; }\n")
 
     def host(self, index, options="", slots=4):
-        return f"127.0.0.1:{self.ports[index]}/{slots}{options}"
+        return f"{self.worker_address}:{self.ports[index]}/{slots}{options}"
 
-    def peer(self, response, delay: float = 0):
-        peer = StatsPeer(response, delay)
+    def peer(self, response, delay: float = 0, address='127.0.0.1'):
+        peer = StatsPeer(response, delay, address)
         self.addCleanup(peer.close)
         return peer
 

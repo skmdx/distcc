@@ -71,10 +71,10 @@ static int spawn_preprocessor(char **argv, pid_t *pid, const char *output)
     return dcc_spawn_child(argv, pid, "/dev/null", output, NULL);
 }
 
-/* Expanding macros on the client loses their provenance, changing Clang's
- * diagnostics (including -Werror) and source locations. Rewrite includes only
- * and let the remote frontend expand macros in the original language. */
-const char *dcc_cpp_rewrite_language(char **argv, const char *input_fname)
+/* Clang preserves macro diagnostics and source identity in LLVM IR. Running
+ * its frontend once avoids both a dependency scan and repeated preprocessing.
+ * Offload drivers already prepare each device translation unit separately. */
+int dcc_cpp_ir(char **argv, const char *input_fname)
 {
     const char *name = dcc_find_basename(argv[0]);
     const char *clang = strstr(name, "clang");
@@ -83,7 +83,7 @@ const char *dcc_cpp_rewrite_language(char **argv, const char *input_fname)
     if (dcc_offload_language(argv) || !clang || (clang != name && clang[-1] != '-') ||
         (clang[5] && clang[5] != '-' && strcmp(clang + 5, "++") &&
          strncmp(clang + 5, "++-", 3)) || dcc_is_preprocessed(input_fname))
-        return NULL;
+        return 0;
     ext = dcc_find_extension_const(input_fname);
     if (ext) ext = dcc_preproc_exten(ext);
     if (ext) {
@@ -99,7 +99,7 @@ const char *dcc_cpp_rewrite_language(char **argv, const char *input_fname)
     }
     return language && (!strcmp(language, "c") || !strcmp(language, "c++") ||
                        !strcmp(language, "objective-c") ||
-                       !strcmp(language, "objective-c++")) ? language : NULL;
+                       !strcmp(language, "objective-c++"));
 }
 
 /**
@@ -122,6 +122,7 @@ int dcc_cpp_maybe(char **argv, char *input_fname, char **cpp_fname,
     const char *output = NULL;
     char *deps = NULL, *target = NULL;
     int needs_deps = 0, sets_target = 0, i;
+    int ir = dcc_cpp_ir(argv, input_fname);
 
     *cpp_pid = 0;
 
@@ -181,16 +182,21 @@ int dcc_cpp_maybe(char **argv, char *input_fname, char **cpp_fname,
         return ret;
 
     if ((ret = dcc_strip_dasho(argv, &cpp_argv))
-        || (ret = dcc_set_action_opt(cpp_argv, "-E")))
+        || (ret = dcc_set_action_opt(cpp_argv, ir ? "-c" : "-E")))
         { free(deps); return ret; }
 
     {
-        char **expanded = realloc(cpp_argv, (dcc_argv_len(cpp_argv) + 6) * sizeof(*cpp_argv));
+        char **expanded = realloc(cpp_argv, (dcc_argv_len(cpp_argv) + 10) * sizeof(*cpp_argv));
         if (!expanded) { free(cpp_argv); free(deps); return EXIT_OUT_OF_MEMORY; }
         cpp_argv = expanded;
     }
-    if (dcc_cpp_rewrite_language(argv, input_fname))
-        dcc_argv_append(cpp_argv, (char *)"-frewrite-includes");
+    if (ir) {
+        dcc_argv_append(cpp_argv, (char *)"-emit-llvm");
+        dcc_argv_append(cpp_argv, (char *)"-Xclang");
+        dcc_argv_append(cpp_argv, (char *)"-disable-llvm-passes");
+        dcc_argv_append(cpp_argv, (char *)"-o");
+        dcc_argv_append(cpp_argv, (char *)"-");
+    }
     if (needs_deps) {
         dcc_argv_append(cpp_argv, (char *)"-MF");
         dcc_argv_append(cpp_argv, deps);

@@ -132,6 +132,62 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerDirectTest(BrokerTestCase):
+    def test_automatic_frontend_capacity_without_worker_statistics(self):
+        self.start_broker(self.host(0))
+        frontend = self.request(12)
+        self.assertEqual(self.receive(frontend), (0, 1, []))
+
+    def test_automatic_frontend_uses_client_memory_admission(self):
+        peer = self.peer(stats_response(cpus=2, jobs=2, capacity=0,
+                        busy=0, queued=0, preparing=0, returning=0, running=0))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
+        self.assertEqual(self.receive(self.request(15)), (0, 0, []))
+        self.assertEqual(self.receive(self.request(12)), (0, 1, []))
+
+    def test_automatic_frontend_capacity_shares_local_cpu_leases(self):
+        metrics = stats_response(cpus=2, cores=2, jobs=2, capacity=2,
+                                 busy=0, queued=0, preparing=0, returning=0, running=0)
+        local = self.peer(metrics)
+        self.start_broker(self.host(0, f',tcp,stats={local.port}'))
+        native = self.request(15)
+        self.assertEqual(self.receive(native), (0, 1, []))
+        frontend = self.request(12)
+        self.assertEqual(self.receive(frontend), (0, 1, []))
+        waiting = self.request(12)
+        import select
+        self.assertFalse(select.select([waiting], [], [], .1)[0])
+        native.close()
+        self.assertEqual(self.receive(waiting), (0, 2, []))
+        full = self.request(15)
+        self.assertEqual(self.receive(full), (0, 0, []))
+        frontend.close()
+        available = self.request(15)
+        self.assertEqual(self.receive(available), (0, 1, []))
+
+    def test_preflight_prefers_faster_local_smt_lane_without_analysis(self):
+        metrics = stats_response(cpus=2, cores=1, jobs=2, capacity=2,
+                                 busy=0, queued=0, preparing=0, returning=0, running=0)
+        local = self.peer(metrics)
+        remote = self.peer(metrics, address='127.0.0.2')
+        self.start_broker(self.host(0, f',tcp,stats={local.port}') +
+                          f' 127.0.0.2:{self.ports[1]}/2,tcp,stats={remote.port},speed=0.5')
+        first = self.request(15)
+        self.assertEqual(self.receive(first), (0, 1, []))
+        second = self.request(15)
+        self.assertEqual(self.receive(second), (0, 1, []))
+        full = self.request(15)
+        self.assertEqual(self.receive(full), (0, 0, []))
+
+    def test_preflight_leaves_a_slower_local_cpu_for_faster_remote_worker(self):
+        metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                                 busy=0, queued=0, preparing=0, returning=0, running=0)
+        local = self.peer(metrics)
+        remote = self.peer(metrics, address='127.0.0.2')
+        self.start_broker(self.host(0, f',tcp,stats={local.port}') +
+                          f' 127.0.0.2:{self.ports[1]}/1,tcp,stats={remote.port},speed=2')
+        request = self.request(15)
+        self.assertEqual(self.receive(request), (0, 0, []))
+
     def local_broker(self):
         metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
                                  busy=0, queued=0, preparing=0, returning=0, running=0)
@@ -1076,7 +1132,9 @@ class BrokerTest(BrokerTestCase):
             values.update(metrics)
             peer = self.peer(stats_response(**values))
             hosts = (self.host(0, f',tcp,stats={peer.port},speed=100') + ' ' +
-                     self.host(1, ',tcp'))
+                     self.host(1, ',tcp') + ' --localslots_cpp=1')
+            # These loopback peers simulate separate machines. Their synthetic
+            # CPU saturation must not reserve the test client's frontend CPUs.
             self.start_broker(hosts, name=name)
             _, net = self.acquire_reserved(10)
             self.assertEqual(net.getpeername()[1], self.ports[1], name)

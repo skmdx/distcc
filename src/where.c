@@ -194,7 +194,8 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
             char i_cpu_is_usable = 0;
 
             for (h = hostlist; h; h = h->next) {
-                int limit = analysis ? dcc_resource_cpus() : h->n_slots;
+                int limit = analysis || (h == dcc_hostdef_local_cpp && !h->slots_specified) ?
+                            dcc_resource_cpus() : h->n_slots;
                 if (i_cpu >= limit)
                     continue;
 
@@ -252,7 +253,8 @@ static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
             /* The broker can live in a different cgroup. Keep admission
              * against this client's budget, not the small broker service. */
             if (ret || occupied <= (analysis ? dcc_resource_analysis_slots(dcc_resource_cpus()) :
-                                               dcc_resource_slots(chosen->n_slots))) break;
+                                               dcc_resource_slots(chosen->slots_specified ?
+                                                   chosen->n_slots : dcc_resource_cpus()))) break;
             dcc_unlock(*cpu_lock_fd);
             *cpu_lock_fd = -1;
             dcc_lock_pause();

@@ -871,11 +871,30 @@ static unsigned long long memory_estimate(const struct dcc_capacity *cap,
     return cap->memory_estimates[kind][dcc_resource_bucket(hint->bytes)];
 }
 
+static int cpp_limit(const struct broker *broker)
+{
+    if (broker->cpp_limit) return broker->cpp_limit;
+    int limit = dcc_resource_cpus();
+    for (int i = 0; i < broker->count; ++i) {
+        const struct peer *p = &broker->peers[i];
+        if (!p->local) continue;
+        const struct dcc_capacity *cap = &p->metrics;
+        int slots = cap->cpus > 0 ? cap->cpus : limit;
+        /* Worker memory admission belongs to the worker's cgroup. The client
+         * checks its own memory budget before starting this frontend. */
+        int busy = p->busy;
+        if (cap->cpus > 0 && cap->busy >= 0 && cap->busy + p->direct > busy)
+            busy = cap->busy + p->direct;
+        if (slots - busy < limit) limit = slots - busy;
+    }
+    return limit > 0 ? limit : 0;
+}
+
 static int dispatch(struct broker *broker, struct client *client, double now, struct dispatch_batch *batch)
 {
     struct reply reply = {0};
     if (client->command == LOCAL_CPP || client->command == LOCAL_ANALYSIS) {
-        int limit = client->command == LOCAL_ANALYSIS ? dcc_resource_cpus() : broker->cpp_limit;
+        int limit = client->command == LOCAL_ANALYSIS ? dcc_resource_cpus() : cpp_limit(broker);
         if (broker->cpp_busy < limit) {
             reply.slots = broker->cpp_busy + 1;
             if (send_reply(client->fd, &reply, -1)) {
@@ -959,6 +978,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             cap = &projected;
         }
         slots = dcc_capacity_slots(p->host, cap);
+        if (direct && p->local && !broker->cpp_limit &&
+            broker->cpp_busy >= cpp_limit(broker)) continue;
         if (!p->address_len || p->retry_at > now || slots <= 0)
             continue;
         available++;
@@ -1065,7 +1086,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * worker, including existing compiles on a remote SMT core.
              * Minimizing this job's latency alone packs the fastest worker's
              * SMT lanes while independent physical cores remain unused. */
-            if (staged && cap && !link && !link_backend && (predicted ||
+            if (staged && cap && !link && !link_backend && !direct && (predicted ||
                 (!blocked && work < dcc_capacity_jobs(p->host, cap)))) {
                 const struct dcc_capacity *observed = &p->metrics;
                 double external = (observed->running >= 0 ? observed->running : observed->load)
@@ -1168,7 +1189,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         if (delay < .05) delay = .05;
         if (delay > 1) delay = 1;
         client->deadline = now + delay;
-    } else if (best.peer >= 0 && (!local_cpp || broker->cpp_busy < broker->cpp_limit)) {
+    } else if (best.peer >= 0 && (!local_cpp || broker->cpp_busy < cpp_limit(broker))) {
         struct peer *p = &broker->peers[best.peer];
         rs_trace("assigning host=%s cost=%.3f score=%.3f broker_wait=%.6f key=%llx units=%u "
                  "now=%.6f client=%td request=%.6f",
@@ -1393,7 +1414,7 @@ static int initialize(struct broker *broker, struct dcc_hostdef *hosts)
 {
     struct dcc_hostdef *host;
     int i;
-    broker->cpp_limit = dcc_hostdef_local_cpp->n_slots;
+    broker->cpp_limit = dcc_hostdef_local_cpp->slots_specified ? dcc_hostdef_local_cpp->n_slots : 0;
     for (i = 0; i < MAX_CLIENTS; i++)
         broker->clients[i].fd = broker->clients[i].net = broker->clients[i].peer = -1;
     for (host = hosts; host; host = host->next) {

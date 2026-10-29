@@ -75,9 +75,8 @@ For example, concurrent linking should be severely curtailed using auxiliary
 locks.  The effect of other build activity, such as Java compilation when
 building mixed code, should be considered.  The
 .B --localslots_cpp
-parameter is by default set to 8.
-This limits the number of concurrent processes that do preprocessing in
-plain distcc (non-pump) mode.
+parameter can set an explicit input-preparation limit. By default the available
+CPU count is used, with the broker sharing those slots with local compilation.
 Therefore, larger
 .B -j
 values than 8 may be used without overloading a single-CPU
@@ -489,8 +488,10 @@ which are useful for adjusting load on the local machine.  The
 host specifies how many jobs that cannot be run remotely that can be run concurrently
 on the local machine, while
 .B --localslots_cpp
-controls how many preprocessors will run in parallel on the local machine.  Tuning
-these values can improve performance.  Linking on large projects
+controls how many preprocessors will run in parallel on the local machine.
+Without an explicit value, input preparation uses the available CPU count,
+subject to affinity, cgroup and memory limits. The broker shares those CPU slots
+with local compilation. Tuning these values can improve performance. Linking on large projects
 can take large amounts of memory.  Running parallel linkers, which cannot be
 executed remotely,  may
 force the machine to swap, which reduces performance over just running the
