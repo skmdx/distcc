@@ -295,18 +295,11 @@ int dcc_capacity_jobs(const struct dcc_hostdef *host, const struct dcc_capacity 
 
 int dcc_capacity_parallelism(const struct dcc_hostdef *host, const struct dcc_capacity *cap)
 {
-    if (!cap || !host->tcp_jobs) return dcc_capacity_jobs(host, cap);
-    int limit = cap->capacity;
-    const int *classes[] = {cap->compile_capacity, cap->pump_capacity, cap->rust_capacity,
-                           cap->thinlto_capacity, cap->offload_capacity};
-    for (unsigned kind = 0; kind < sizeof(classes) / sizeof(*classes); ++kind)
-        for (unsigned bucket = 0; bucket < DCC_MEMORY_BUCKETS; ++bucket)
-            if (classes[kind][bucket] > limit) limit = classes[kind][bucket];
-    int slots = dcc_capacity_slots(host, cap);
-    /* Producer concurrency must expose lanes available to small jobs. Each
-     * actual job still passes the scheduler and worker's class-specific
-     * memory admission; a previous large job cannot shrink all later builds. */
-    return limit >= 0 && slots > limit ? limit : slots;
+    /* Build tools sample this once. A cold memory estimate or temporary
+     * pressure must not cap the whole build after capacity recovers. TCP
+     * jobs wait in the broker and still pass live per-class memory admission
+     * before preparation and execution. Keep the configured CPU ceiling. */
+    return host->tcp_jobs ? dcc_capacity_slots(host, cap) : dcc_capacity_jobs(host, cap);
 }
 
 /* Estimate per-job service time relative to an idle single-job compile. */

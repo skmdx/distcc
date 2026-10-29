@@ -731,16 +731,16 @@ class BrokerTest(BrokerTestCase):
         time.sleep(1.05)
         self.assertEqual(jobs(), 8)
 
-    def test_jobs_use_effective_capacity_without_changing_admission(self):
+    def test_jobs_survive_cold_memory_estimate(self):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2, busy=2, available=0))
-        self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))
         status, slots, fds = self.receive(self.request(2))
-        self.assertEqual((status, slots, fds), (0, 2, []))
+        self.assertEqual((status, slots, fds), (0, 8, []))
 
     def test_jobs_expose_small_class_capacity_without_overadmitting_large_jobs(self):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2,
             busy=0, running=0, queued=0, preparing=0, returning=0,
-            compile_capacity=[8] * 64, pump_capacity=[2] * 64))
+            compile_capacity=[2] * 64, pump_capacity=[2] * 64))
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))
         self.assertEqual(self.receive(self.request(2)), (0, 8, []))
         first, first_net = self.acquire_reserved(9, (201, 1024, 4), 1024)
