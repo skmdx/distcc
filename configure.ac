@@ -178,6 +178,7 @@ AC_SUBST(UNINSTALL_GNOME)
 
 dnl Checks for programs
 AC_PROG_CC
+AC_PROG_CXX
 WERROR_CFLAGS=""
 PYTHON_CFLAGS=""
 if test x"$GCC" = xyes
