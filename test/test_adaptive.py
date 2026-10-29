@@ -225,8 +225,8 @@ class DistccTestCase(unittest.TestCase):
     def host(self, index, options="", slots=4):
         return f"{self.worker_address}:{self.ports[index]}/{slots}{options}"
 
-    def peer(self, response, delay: float = 0, address='127.0.0.1'):
-        peer = StatsPeer(response, delay, address)
+    def peer(self, response, delay: float = 0, address=None):
+        peer = StatsPeer(response, delay, address or self.worker_address)
         self.addCleanup(peer.close)
         return peer
 

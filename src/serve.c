@@ -1088,6 +1088,35 @@ static int dcc_run_job(int in_fd,
         goto out_cleanup;
     }
 
+    if (job && job->kind == DCC_JOB_FRONTEND) {
+        if (!job->fs_channel || !job->argv[1]) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
+        orig_input = strdup(job->argv[1]);
+        if (!orig_input) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
+        if ((ret = dcc_make_tmpnam("distccd", ".o", &temp_o))) goto out_cleanup;
+        unsigned argc = dcc_argv_len(job->argv);
+        argv = calloc(argc + 8, sizeof(*argv));
+        const char *helper = getenv("DISTCC_CLANG_DRIVER");
+        char descriptor[32];
+        snprintf(descriptor, sizeof(descriptor), "%d", job->fs_channel - 1);
+        const char *prefix[] = {helper && *helper ? helper : "distcc-clang", root, temp_o,
+                               job->cwd, "remote", descriptor, deps_fname};
+        if (!argv) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
+        for (unsigned i = 0; i < argc + 7; ++i) {
+            argv[i] = strdup(i < 7 ? prefix[i] : job->argv[i - 7]);
+            if (!argv[i]) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
+        }
+        if ((ret = dcc_spawn_child(argv, &cc_pid, "/dev/null", out_fname, err_fname)) ||
+            (ret = dcc_collect_child("frontend", cc_pid, &status, in_fd, &result->peak_bytes)))
+            goto out_cleanup;
+        result->status = status;
+        if ((ret = retain_artifact(result, DCC_JOB_STDERR, err_fname)) ||
+            (ret = retain_artifact(result, DCC_JOB_STDOUT, out_fname)) ||
+            (!status && ((ret = retain_artifact(result, DCC_JOB_OBJECT, temp_o)) ||
+                         (ret = retain_artifact(result, DCC_JOB_DEPS, deps_fname))))) goto out_cleanup;
+        job_result = status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
+        goto out_cleanup;
+    }
+
     dcc_get_features_from_protover(protover, &compr, &cpp_where);
 
     if (cpp_where == DCC_CPP_ON_SERVER) {

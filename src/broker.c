@@ -347,10 +347,10 @@ int dcc_broker_local_cpp(int *lease, int *occupied, int analysis)
     return *lease < 0 ? EXIT_CONNECT_FAILED : 0;
 }
 
-int dcc_broker_try_local(void)
+int dcc_broker_try_local(const struct dcc_work_hint *hint)
 {
     struct reply reply;
-    int net, lease = broker_request(TRY_LOCAL, &reply, &net, NULL, NULL);
+    int net, lease = broker_request(TRY_LOCAL, &reply, &net, hint, NULL);
     if (lease >= 0 && !reply.slots) { close(lease); lease = -1; }
     return lease;
 }
@@ -846,8 +846,7 @@ static void observe(struct broker *broker, struct client *client, const struct f
         timing->queue_ns > 86400ULL * 1000000000) return;
     struct peer *peer = &broker->peers[client->peer];
     double cost = timing->execute_ns / 1e9 / client->factor;
-    /* Early direct placement has no input hint; only its service time is
-     * learned. Prepared jobs also train the input-cost model. */
+    /* Both direct compilation and remote jobs train the input-cost model. */
     dcc_work_observe(&broker->model, &client->hint, cost);
     peer->mean_cost = peer->mean_cost > 0 ? .875 * peer->mean_cost + .125 * cost : cost;
     int bulk = bulk_input(peer, &client->hint);
@@ -1227,7 +1226,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             }
         }
         client->peer = best.peer;
-        client->cost = direct ? p->mean_cost : cost;
+        client->cost = direct ? dcc_work_predict(&broker->model, &client->hint) : cost;
+        if (direct && !client->cost) client->cost = p->mean_cost;
         client->factor = best.forecast.factor;
         client->ready_at = now + (client->direct ? 0 : best.forecast.prepare);
         client->run_at = now + (client->direct ? 0 : best.forecast.start);
@@ -1754,7 +1754,7 @@ int dcc_broker_serve(const char *path)
                     continue;
                 }
                 int compile = request.command == ACQUIRE_POOL || request.command == ACQUIRE_CPP ||
-                              request.command == ACQUIRE_READY;
+                              request.command == ACQUIRE_READY || request.command == TRY_LOCAL;
                 if (c->state != REQUEST || length != (ssize_t)(sizeof(request) +
                         (compile ? sizeof(struct dcc_work_hint) : 0)) ||
                     request.version != BROKER_VERSION ||

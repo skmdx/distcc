@@ -47,6 +47,7 @@
 
 #include "distcc.h"
 #include "job.h"
+#include "frontend_fs.h"
 #include "resource.h"
 #include "trace.h"
 #include "exitcode.h"
@@ -763,7 +764,7 @@ dcc_build_somewhere(char *argv[],
     char **localcpp_server_argv = NULL;
     char **remotecpp_server_argv = NULL;
     struct dcc_buffer server_stderr = {0}, server_stdout = {0};
-    int preprocess_only, offload_targets = 0;
+    int preprocess_only, offload_targets = 0, remote_frontend = 0;
     int needs_dotd = 0;
     int sets_dotd_target = 0;
     pid_t cpp_pid = 0;
@@ -827,10 +828,14 @@ dcc_build_somewhere(char *argv[],
      * but needs neither native expansion nor a duplicate header/input tree. */
     if (!ret && !dcc_scan_includes && !dcc_offload_language(argv) &&
         getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER")) {
-        direct_lease = dcc_broker_try_local();
+        dcc_work_describe(&work, argv, input_fname, NULL, -1, 0);
+        direct_lease = dcc_broker_try_local(&work);
         if (direct_lease >= 0) goto run_local;
     }
-    if (!ret && (dcc_offload_language(argv) || dcc_native_requested(argv))) {
+    remote_frontend = !ret && !preprocess_only && !dcc_scan_includes &&
+        dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) && getenv("DISTCC_BROKER") &&
+        dcc_cpp_ir(argv, input_fname);
+    if (!ret && (dcc_offload_language(argv) || (!remote_frontend && dcc_native_requested(argv)))) {
         if (dcc_offload_language(argv) ? dcc_prepare_offload(&argv, &auxiliary, &offload_targets) :
                                        dcc_expand_native(&argv, input_fname, output_fname)) {
             ret = EXIT_DISTCC_FAILED;
@@ -873,14 +878,17 @@ dcc_build_somewhere(char *argv[],
 #endif
     /* Emit frontend IR once. The worker optimizes and generates machine code
      * without needing a second preprocessing pass or a header snapshot. */
-    if (!preprocess_only && !dcc_scan_includes && dcc_cpp_ir(argv, input_fname))
+    if (remote_frontend) {
+        if ((ret = dcc_frontend_prepare(argv, &prepared_job))) goto fallback;
+    }
+    if (!prepared_job && !preprocess_only && !dcc_scan_includes && dcc_cpp_ir(argv, input_fname))
         unsetenv("INCLUDE_SERVER_PORT");
 
     /* A homogeneous broker pool has a known input format before selection.
      * Finish include analysis before reserving a worker or opening its socket:
      * analysis must not consume worker slots or their idle timeout. */
     if (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER") &&
-        getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes) {
+        getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes && !prepared_job) {
         struct dcc_hostdef *list = NULL, *entry;
         int count, same_format = 1;
         enum dcc_compress compr = DCC_COMPRESS_NONE;
@@ -916,7 +924,7 @@ dcc_build_somewhere(char *argv[],
      * Release the local lock before requesting the remote lease; never wait
      * for a remote slot while holding a local slot. Reuse this input on retry. */
     if (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER") &&
-        !getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes) {
+        !getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes && !prepared_job) {
         dcc_read_localslots_configuration();
         if (local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
             (ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
@@ -939,9 +947,9 @@ dcc_build_somewhere(char *argv[],
 
     if (getenv("DISTCC_BROKER"))
         dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready);
-    if (prepared_job && work.key)
+    if (prepared_job && prepared_job->kind != DCC_JOB_FRONTEND && work.key)
         work.bytes = dcc_resource_input_bytes(prepared_job);
-    else if (!cpp_ready)
+    else if (!cpp_ready && (!prepared_job || prepared_job->kind != DCC_JOB_FRONTEND))
         work = (struct dcc_work_hint){0};
 
     /* Lock ordering invariant: always acquire the lock for the
@@ -953,7 +961,8 @@ dcc_build_somewhere(char *argv[],
     dcc_free_buffer(&server_stderr);
     dcc_free_buffer(&server_stdout);
     remote_completed = 0;
-    if ((ret = dcc_pick_host_from_list_and_lock_it(&host, &cpu_lock_fd, cpp_ready, &work)) != 0) {
+    if ((ret = dcc_pick_host_from_list_and_lock_it(&host, &cpu_lock_fd,
+            cpp_ready || (prepared_job && prepared_job->kind == DCC_JOB_FRONTEND), &work)) != 0) {
         /* Doesn't happen at the moment: all failures are masked by
            returning localhost. */
         goto fallback;
@@ -966,6 +975,16 @@ dcc_build_somewhere(char *argv[],
         /* We picked localhost and already have a lock on it so no
          * need to lock it now. */
         goto run_local;
+    }
+
+    if (prepared_job && prepared_job->kind == DCC_JOB_FRONTEND) {
+        if (!host->broker_managed || host->compr != DCC_COMPRESS_LZ4_STREAM) goto fallback;
+        char *target = NULL;
+        dcc_get_dotd_info(argv, &deps_fname, &needs_dotd, &sets_dotd_target, &target);
+        ret = dcc_compile_direct(host, prepared_job, prepared_job->argv, NULL, -1, NULL, auxiliary,
+                                output_fname, needs_dotd ? deps_fname : NULL,
+                                &server_stderr, &server_stdout, status);
+        goto remote_result;
     }
 
     if (!cpp_ready && host->cpp_where == DCC_CPP_ON_CLIENT && !dcc_is_preprocessed(input_fname)) {
@@ -1073,6 +1092,7 @@ dcc_build_somewhere(char *argv[],
                                   cpp_pid, local_cpu_lock_fd,
                   host, status, &remote_unsupported);
     free(wire_argv);
+  remote_result:
     if (ret != 0) {
         /* Returns zero if we successfully ran the compiler, even if
          * the compiler itself bombed out. */

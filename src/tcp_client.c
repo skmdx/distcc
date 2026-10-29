@@ -17,6 +17,7 @@
 #include "exitcode.h"
 #include "trace.h"
 #include "tcp_job.h"
+#include "frontend_fs.h"
 
 struct input_stream { int fd; unsigned index; uint64_t offset, plain; };
 static int local_snapshot(int source, uint64_t size)
@@ -117,6 +118,8 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         job->inputs[0].encoding == DCC_JOB_RAW && job->inputs[0].fd >= 0;
     int send_input_fd = local_input;
     int shared_input = -1;
+    struct dcc_job_input filesystem = {0};
+    uint64_t fs_requests = 0, fs_bytes = 0;
     time_t active = time(NULL);
     dcc_job_result_init(result);
     if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested || !buffer ||
@@ -149,8 +152,11 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     open(files ? files[stream.index] : cpp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
                 if (stream.fd < 0) goto done;
             }
-            outgoing = next_chunk(&stream, &job->inputs[stream.index], &length, &file_offset, &file_left);
+            outgoing = next_chunk(&stream, stream.index == UINT_MAX ? &filesystem : &job->inputs[stream.index],
+                                  &length, &file_offset, &file_left);
             if (!outgoing) goto done;
+            if (stream.index == UINT_MAX)
+                dcc_tcp_put32(outgoing, (dcc_tcp_get32(outgoing) & DCC_TCP_FLAGS) | DCC_TCP_FS_REPLY);
             sent = 0;
         }
         int timeout = dcc_get_io_timeout() - (time(NULL) - active);
@@ -178,6 +184,14 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                             !dcc_job_file(&job->inputs[index]) || count == job->count) goto done;
                         requested[index] = 1; requests[count++] = index;
                     }
+                } else if (type == DCC_TCP_FS_QUERY && incoming.type == DCC_TCP_FS_QUERY &&
+                           job->kind == DCC_JOB_FRONTEND && !have_result &&
+                           !outgoing && stream.fd < 0 && read_request == count) {
+                    stream.fd = dcc_frontend_fs_reply(job, incoming.data, incoming.size, &filesystem.plain_size);
+                    if (stream.fd < 0) goto done;
+                    ++fs_requests; fs_bytes += filesystem.plain_size;
+                    filesystem.wire_size = filesystem.plain_size;
+                    stream.index = UINT_MAX; stream.offset = stream.plain = 0;
                 } else if (type == DCC_TCP_RESULT && !have_result && incoming.size == 64) {
                     have_result = 1;
                     result->status = dcc_tcp_get32(incoming.data);
@@ -272,7 +286,8 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                 active = time(NULL);
                 if (sent < length) sent += n;
                 if (sent == length && !file_left) {
-                    if ((dcc_tcp_get32(outgoing) & ~DCC_TCP_FLAGS) == DCC_TCP_INPUT &&
+                    if (((dcc_tcp_get32(outgoing) & ~DCC_TCP_FLAGS) == DCC_TCP_INPUT ||
+                         (dcc_tcp_get32(outgoing) & ~DCC_TCP_FLAGS) == DCC_TCP_FS_REPLY) &&
                         (dcc_tcp_get32(outgoing) & DCC_TCP_FINAL)) {
                         close(stream.fd); stream.fd = -1;
                     }
@@ -282,6 +297,8 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         }
     }
 done:
+    if (fs_requests) rs_trace("frontend filesystem: %llu requests, %llu bytes",
+        (unsigned long long)fs_requests, (unsigned long long)fs_bytes);
     if (ret)
         rs_trace("TCP exchange failed: inputs %u/%u, result %d, received frame %x (%zu bytes), pending write %zu/%zu",
                  read_request, count, have_result, incoming.type, incoming.used, sent, length);

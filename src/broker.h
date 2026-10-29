@@ -8,7 +8,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready,
 int dcc_broker_local_cpp(int *lease, int *occupied, int analysis);
 /* Try the ordinary placement policy before preparing remote inputs. A declined
  * request holds no reservation; a granted lease covers client-side execution. */
-int dcc_broker_try_local(void);
+int dcc_broker_try_local(const struct dcc_work_hint *);
 void dcc_broker_local_done(int lease, double elapsed, int status);
 void dcc_broker_failed(const struct dcc_hostdef *host);
 void dcc_broker_defer(const struct dcc_hostdef *host);

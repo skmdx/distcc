@@ -87,7 +87,7 @@ class BrokerTestCase(DistccTestCase):
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
         payload = struct.pack("=II", 2, command)
-        if command & 65535 in (6, 9, 10):
+        if command & 65535 in (6, 9, 10, 15):
             payload += struct.pack('=QQII', *work, work_units)
         sock.sendall(payload)
         self.addCleanup(sock.close)
@@ -233,7 +233,9 @@ class BrokerDirectTest(BrokerTestCase):
         exe = self.work / 'direct'
         subprocess.run(['gcc', str(obj), '-o', str(exe)], check=True, capture_output=True)
         subprocess.run([str(exe)], check=True)
-        self.assertIn('direct local compile', (self.work / 'broker.log').read_text())
+        log = (self.work / 'broker.log').read_text()
+        self.assertIn('direct local compile', log)
+        self.assertRegex(log, r'job cost: key=[1-9a-f][0-9a-f]* kind=4 bytes=[1-9][0-9]* units=[1-9][0-9]*')
         # A compiler error must release the lease as well.
         source.write_text('#error expected error\n')
         result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=20)

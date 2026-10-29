@@ -28,6 +28,10 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
     else {
         changed_tmp = 1;
         if (input >= 0) {
+            if (job->kind == DCC_JOB_FRONTEND) {
+                job->fs_channel = input + 1;
+                if (fcntl(input, F_SETFD, 0)) finished.error = EXIT_IO_ERROR;
+            } else {
             char target[64], path[PATH_MAX];
             snprintf(target, sizeof(target), "/proc/self/fd/%d", input);
             /* Only this job's compiler inherits the read-only input. The
@@ -37,6 +41,7 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
                 snprintf(path, sizeof(path), "%s%s", run->root, job->inputs[0].path) >= (int)sizeof(path) ||
                 fcntl(input, F_SETFD, 0) || symlink(target, path))
                 finished.error = EXIT_IO_ERROR;
+            }
         }
         /* Includes compiler-created temporaries: parent-owned cleanup must
          * cover even SIGKILL, when this worker cannot run its cleanup list. */

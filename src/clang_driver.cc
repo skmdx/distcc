@@ -3,6 +3,8 @@
 #include <clang/Basic/CodeGenOptions.h>
 #include <clang/Options/Options.h>
 #include <clang/Frontend/CompilerInvocation.h>
+#include <clang/Lex/HeaderSearchOptions.h>
+#include <clang/Lex/PreprocessorOptions.h>
 #include <clang/Tooling/Tooling.h>
 #include <llvm/Option/Arg.h>
 #include <llvm/Option/ArgList.h>
@@ -11,6 +13,7 @@
 #include <llvm/Support/Path.h>
 #include <llvm/Support/Program.h>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/Error.h>
 #include <llvm/ADT/SmallString.h>
 #include <algorithm>
@@ -19,6 +22,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <unistd.h>
 #include "clang_inputs.h"
 
 namespace {
@@ -73,6 +77,58 @@ extern "C" int dcc_clang_expand_response_files(char **argv, char ***expanded) {
     }
     *expanded = copy(values);
     return *expanded ? 0 : -1;
+}
+
+extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots) {
+    *cc1 = *roots = nullptr;
+    std::vector<std::string> command;
+    for (char **p = argv; *p; ++p) command.emplace_back(*p);
+    const auto invoked_as = command.front();
+    clang::tooling::addTargetAndModeForProgramName(command, invoked_as);
+    auto executable = llvm::sys::findProgramByName(command.front());
+    if (executable) command.front() = *executable;
+    llvm::IntrusiveRefCntPtr<clang::FileManager> manager(new clang::FileManager(clang::FileSystemOptions()));
+    Capture action;
+    clang::tooling::ToolInvocation tool(command, &action, manager.get(),
+        std::make_shared<clang::PCHContainerOperations>());
+    if (!tool.run() || !action.compiler) return -1;
+    auto &invocation = *action.compiler;
+    llvm::SmallVector<const char *> arguments;
+    llvm::BumpPtrAllocator storage;
+    llvm::StringSaver strings(storage);
+    invocation.generateCC1CommandLine(arguments, [&](const llvm::Twine &value) {
+        return strings.save(value.str()).data();
+    });
+    const auto &inputs = invocation.getFrontendOpts().Inputs;
+    if (inputs.size() != 1 || !inputs[0].isFile()) return -1;
+    auto boot = llvm::MemoryBuffer::getFile("/proc/sys/kernel/random/boot_id");
+    if (!boot) return -1;
+    // Cache identities include the reader's credentials. Stat permission must
+    // never let one user reuse bytes previously read by a different user.
+    std::string identity = "distcc frontend files:" + (*boot)->getBuffer().str() +
+        ':' + std::to_string(geteuid()) + ':' + std::to_string(getegid());
+    int count = getgroups(0, nullptr);
+    if (count < 0) return -1;
+    std::vector<gid_t> groups(count);
+    if (getgroups(count, groups.data()) != count) return -1;
+    std::sort(groups.begin(), groups.end());
+    for (auto group : groups) identity += ':' + std::to_string(group);
+    std::vector<std::string> result{command.front(), inputs[0].getFile().str(), identity}, directories;
+    for (auto arg : arguments) result.emplace_back(arg);
+    std::set<std::string> unique;
+    for (const auto &entry : invocation.getHeaderSearchOpts().UserEntries)
+        unique.insert(absolute(entry.Path));
+    for (const auto &input : invocation.getFrontendOpts().Inputs)
+        if (input.isFile()) unique.insert(llvm::sys::path::parent_path(absolute(input.getFile())).str());
+    const auto &preprocessor = invocation.getPreprocessorOpts();
+    for (const auto &paths : {preprocessor.Includes, preprocessor.MacroIncludes})
+        for (const auto &path : paths)
+            unique.insert(llvm::sys::path::parent_path(absolute(path)).str());
+    if (!preprocessor.ImplicitPCHInclude.empty())
+        unique.insert(llvm::sys::path::parent_path(absolute(preprocessor.ImplicitPCHInclude)).str());
+    for (const auto &path : unique) if (!path.empty()) directories.push_back(path);
+    *cc1 = copy(result); *roots = copy(directories);
+    return *cc1 && *roots ? 0 : -1;
 }
 
 extern "C" int dcc_clang_inputs(char **argv, char ***normalized, char ***files) {

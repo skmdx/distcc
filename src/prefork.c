@@ -289,6 +289,8 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
     polls[local_index] = (struct pollfd){local_listener, POLLIN, 0};
     int tcp_base = total;
     total += MAX_PENDING;
+    int fs_base = total;
+    total += MAX_PENDING;
     time_t now = time(NULL);
     for (i = 0; i < count; ++i) polls[i] = extra[i];
     polls[count] = (struct pollfd){ listen_fd, POLLIN, 0 };
@@ -309,7 +311,11 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
     int runnable = dcc_tcp_server_pending();
     for (i = 0; i < MAX_PENDING; ++i) {
         polls[tcp_base + i] = (struct pollfd){ .fd = -1 };
-        if (tcp[i]) runnable |= dcc_tcp_server_poll(tcp[i], &polls[tcp_base + i]);
+        polls[fs_base + i] = (struct pollfd){ .fd = -1 };
+        if (tcp[i]) {
+            runnable |= dcc_tcp_server_poll(tcp[i], &polls[tcp_base + i]);
+            dcc_tcp_server_fs_poll(tcp[i], &polls[fs_base + i]);
+        }
     }
     /* Bound idle expiry even without statistics or other activity. */
     result = poll(polls, total, runnable ? 0 : timeout < 1000 ? timeout : 1000);
@@ -400,7 +406,8 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
         }
     }
     for (i = 0; i < MAX_PENDING; ++i) {
-        if (tcp[i] && dcc_tcp_server_process(tcp[i], polls[tcp_base + i].revents)) {
+        if (tcp[i] && (dcc_tcp_server_fs_process(tcp[i], polls[fs_base + i].revents) ||
+                       dcc_tcp_server_process(tcp[i], polls[tcp_base + i].revents))) {
             dcc_tcp_server_free(tcp[i]); tcp[i] = NULL;
         }
     }
@@ -441,7 +448,7 @@ int dcc_preforking_parent(int listen_fd)
 #ifdef __linux__
     worker_count = dcc_max_kids;
     workers = calloc(worker_count, sizeof(*workers));
-    parent_polls = calloc(worker_count + 2 * MAX_PENDING + 5, sizeof(*parent_polls));
+    parent_polls = calloc(worker_count + 3 * MAX_PENDING + 5, sizeof(*parent_polls));
     if (!workers || !parent_polls) return EXIT_OUT_OF_MEMORY;
     for (ret = 0; ret < worker_count; ++ret) workers[ret].fd = -1;
     for (ret = 0; ret < MAX_PENDING; ++ret) pending[ret].fd = -1;

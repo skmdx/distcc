@@ -113,6 +113,10 @@ void dcc_job_free(struct dcc_job *job)
     if (!job) return;
     if (job->argv) for (i = 0; job->argv[i]; ++i) free(job->argv[i]);
     free(job->argv);
+    if (job->fs_roots) {
+        for (i = 0; job->fs_roots[i]; ++i) free(job->fs_roots[i]);
+        free(job->fs_roots);
+    }
     for (i = 0; i < job->count; ++i) {
         free(job->inputs[i].path);
         free(job->inputs[i].target);

@@ -1,6 +1,7 @@
 /* Content-addressed, bounded server input cache. */
 #ifndef DCC_FILE_CACHE_H
 #define DCC_FILE_CACHE_H
+#include <stddef.h>
 
 #define DCC_FILE_HASH_SIZE 8
 #define DCC_FILE_MANIFEST_LIMIT 65536
@@ -21,5 +22,13 @@ int dcc_file_cache_copy(const unsigned char *hash, const char *source, const cha
 int dcc_file_cache_get(const unsigned char *hash, const char *destination, int shared, const char *tmp);
 void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared, const char *tmp);
 void dcc_file_cache_prune(const unsigned char *hash, const char *tmp);
+
+/* Versioned filesystem records share the same shard limits and publication
+ * rules as content snapshots. A hit verifies both the full key and payload. */
+struct dcc_file_cache_api {
+    void *(*read)(const void *, size_t, size_t *, const char *);
+    void (*write)(const void *, size_t, const void *, size_t, const char *);
+};
+extern const struct dcc_file_cache_api dcc_file_cache_records;
 
 #endif

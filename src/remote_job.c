@@ -225,7 +225,7 @@ int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char 
     dcc_job_result_init(&result);
     /* Input metadata survives worker selection and retries. Final driver
      * arguments can add dependency targets after selection. */
-    if (prepared) {
+    if (prepared && prepared->kind != DCC_JOB_FRONTEND) {
         dcc_free_argv(job->argv);
         job->argv = NULL;
         if (dcc_copy_argv(argv, &job->argv, 0)) goto done;
@@ -246,7 +246,8 @@ int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char 
         (ret = buffer_result(result.fd[DCC_JOB_STDOUT], &result, DCC_JOB_STDOUT, out))) goto done;
     if (!*status) {
         if ((ret = publish(&result.fd[DCC_JOB_OBJECT], &result, DCC_JOB_OBJECT, output))) goto done;
-        if (files) ret = publish(&result.fd[DCC_JOB_DEPS], &result, DCC_JOB_DEPS, deps);
+        if (files || job->kind == DCC_JOB_FRONTEND)
+            ret = publish(&result.fd[DCC_JOB_DEPS], &result, DCC_JOB_DEPS, deps);
     } else if (!need_cpp && dcc_argv_search(argv, "-E") && strcmp(output, "-")) {
         struct stat st;
         if (!stat(output, &st) && S_ISREG(st.st_mode)) unlink(output);

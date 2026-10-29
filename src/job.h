@@ -9,7 +9,7 @@
 #define DCC_JOB_RESULT_COUNT 4
 #define DCC_SYSTEM_HEADERS ".distcc-system"
 enum dcc_job_kind { DCC_JOB_COMPILE, DCC_JOB_PUMP, DCC_JOB_LINK, DCC_JOB_RUST, DCC_JOB_THINLTO,
-                    DCC_JOB_OFFLOAD_LINK, DCC_JOB_KIND_COUNT };
+                    DCC_JOB_OFFLOAD_LINK, DCC_JOB_FRONTEND, DCC_JOB_KIND_COUNT };
 enum dcc_job_input_kind { DCC_JOB_FILE, DCC_JOB_SYMLINK, DCC_JOB_EMPTY,
                          DCC_JOB_READONLY };
 enum dcc_job_encoding { DCC_JOB_RAW, DCC_JOB_LZ4 };
@@ -30,6 +30,10 @@ struct dcc_job {
     char **argv;
     unsigned count;
     struct dcc_job_input *inputs;
+    /* Client-only authorization roots; never accepted from a remote peer. */
+    char **fs_roots;
+    /* Borrowed worker filesystem IPC, represented as fd + 1. */
+    int fs_channel;
 };
 static inline int dcc_job_file(const struct dcc_job_input *in)
 {

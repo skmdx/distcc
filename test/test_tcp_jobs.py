@@ -23,7 +23,150 @@ from test_broker import BrokerTestCase
 from test_adaptive import free_port
 
 
-class TcpJobsTest(BrokerTestCase):
+class FrontendTest(BrokerTestCase):
+    worker_address = '127.0.0.2'
+
+    def start_tcp(self):
+        return self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
+
+    def start_frontend(self):
+        clang = shutil.which('clang')
+        if not clang:
+            self.skipTest('Clang unavailable')
+        self.restart_server(self.build / 'distccd', DISTCC_CLANG_DRIVER=str(self.build / 'distcc-clang'),
+                            DISTCCD_FILE_CACHE=str(self.work/'cache'))
+        self.start_tcp()
+        self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
+                        DISTCC_SKIP_LOCAL_RETRY='1', INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
+        return clang
+
+    def test_remote_frontend_owns_preprocessing_and_dependency_output(self):
+        clang = self.start_frontend()
+        include = self.work / 'headers'
+        include.mkdir()
+        header = include / 'value.h'
+        forced = self.root / 'forced-frontend-headers'
+        forced.mkdir()
+        (forced / 'prelude.h').write_text('#define FORCED 2\n')
+        (forced / 'macros.h').write_text('#define MACROS 3\n')
+        source = self.work / 'frontend.cpp'
+        source.write_text('#include <cstdio>\n#include "value.h"\n'
+                          '#if __has_include("absent.h")\n#error absent header found\n#endif\n'
+                          'constexpr int a = __COUNTER__;\nconstexpr int b = __COUNTER__;\n'
+                          'int main() { std::printf("%s %s %d\\n", __FILE__, __BASE_FILE__, '
+                          'VALUE + b - a + FORCED - 2 + MACROS - 3); }\n')
+        output = self.work / 'frontend.o'
+        dependencies = self.work / 'frontend.d'
+        command = [clang, '-O3', '-march=native', '-I', str(include), '-MMD', '-MF', str(dependencies),
+                   '-include', str(forced/'prelude.h'), '-imacros', str(forced/'macros.h'),
+                   '-c', str(source), '-o', str(output)]
+        for value in (7, 19):
+            with self.subTest(value=value):
+                header.write_text(f'#define VALUE {value}\n')
+                subprocess.run(command, check=True, capture_output=True, timeout=30)
+                expected = output.read_bytes(), dependencies.read_bytes()
+                output.unlink(); dependencies.unlink()
+                client_log = self.work / f'frontend-{value}.log'
+                self.env['DISTCC_LOG'] = str(client_log)
+                result = subprocess.run([str(self.build / 'distcc'), *command], env=self.env,
+                                        capture_output=True, text=True, timeout=30)
+                result.stderr += client_log.read_text()
+                self.assertEqual(result.returncode, 0, result.stderr[-6000:])
+                self.assertIn('frontend filesystem:', result.stderr)
+                self.assertIn('pooled TCP job completed', result.stderr)
+                self.assertEqual((output.read_bytes(), dependencies.read_bytes()), expected)
+                executable = self.work / 'frontend'
+                subprocess.run([clang, str(output), '-o', str(executable)], check=True, capture_output=True)
+                actual = subprocess.check_output([str(executable)], text=True).strip()
+                self.assertEqual(actual, f'{source} {source} {value + 1}')
+                first_bytes = int(re.findall(r'frontend filesystem: \d+ requests, (\d+) bytes', result.stderr)[-1])
+                transfers = []
+                for corrupt in (False, True):
+                    if corrupt:
+                        entries = [p for p in (self.work/'cache').glob('*/*') if len(p.name)==16]
+                        self.assertTrue(entries, 'shared cache was not populated')
+                        for entry in entries:
+                            data = bytearray(entry.read_bytes()); data[-1] ^= 1
+                            entry.chmod(0o600); entry.write_bytes(data); entry.chmod(0o400)
+                    again = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                           capture_output=True, text=True, timeout=30)
+                    self.assertEqual(again.returncode, 0, again.stderr[-5000:])
+                    self.assertEqual((output.read_bytes(), dependencies.read_bytes()), expected)
+                    transferred = int(re.findall(r'frontend filesystem: \d+ requests, (\d+) bytes',
+                                                 client_log.read_text())[-1])
+                    transfers.append(transferred)
+                if value == 7:
+                    self.assertLess(transfers[0], first_bytes, 'unchanged headers were retransmitted')
+                self.assertGreater(transfers[1], transfers[0], 'corrupt cache was accepted')
+
+    def test_remote_frontend_preserves_symlink_parent_and_trailing_slash(self):
+        clang = self.start_frontend()
+        (self.work/'physical'/'deep').mkdir(parents=True)
+        (self.work/'alias').symlink_to('physical/deep', target_is_directory=True)
+        (self.work/'value.h').write_text('#define VALUE 99\n')
+        (self.work/'physical'/'value.h').write_text('#define VALUE 7\n')
+        source = self.work/'paths.c'
+        source.write_text('#include "alias/../value.h"\n'
+                          '#if __has_include("value.h/")\n#error not a directory\n#endif\n'
+                          'int main(void) { return VALUE != 7; }\n')
+        output = self.work/'paths.o'
+        command = [clang, '-O3', '-c', str(source), '-o', str(output)]
+        subprocess.run(command, check=True, capture_output=True, timeout=30)
+        expected = output.read_bytes(); output.unlink()
+        result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr[-5000:])
+        self.assertIn('frontend filesystem:', result.stderr)
+        self.assertEqual(output.read_bytes(), expected)
+        executable = self.work/'paths'
+        subprocess.run([clang, str(output), '-o', str(executable)], check=True, capture_output=True)
+        subprocess.run([str(executable)], check=True, timeout=5)
+
+    def test_remote_frontend_transfers_compressed_and_raw_chunk_tails(self):
+        clang = self.start_frontend()
+        source = self.work/'chunks.c'
+        source.write_text('/*' + 'a'*(256*1024) + random.Random(821).randbytes(256*1024+13).hex() +
+                          '*/\nint main(void) { return 0; }\n')
+        output = self.work/'chunks.o'
+        command = [clang, '-O3', '-c', str(source), '-o', str(output)]
+        subprocess.run(command, check=True, capture_output=True, timeout=30)
+        expected = output.read_bytes(); output.unlink()
+        result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr[-5000:])
+        self.assertIn('frontend filesystem:', result.stderr)
+        self.assertEqual(output.read_bytes(), expected)
+
+    def test_remote_frontend_disconnect_reclaims_worker(self):
+        clang = self.start_frontend()
+        source = self.work/'cancel.c'
+        source.write_text('unsigned values[] = {' + ','.join(map(str, range(400000))) + '};\n')
+        command = [str(self.build/'distcc'), clang, '-O3', '-c', str(source), '-o', str(self.work/'cancel.o')]
+        with (self.work/'cancel.log').open('wb') as log:
+            process = subprocess.Popen(command, env=self.env, stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic()+10
+                while 'dcc_busy 0\n' in self.get_stats(self.stats_ports[0]):
+                    self.assertIsNone(process.poll(), 'worker did not execute the job')
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                process.kill(); process.wait(timeout=5)
+                deadline = time.monotonic()+5
+                while 'dcc_busy 0\n' not in self.get_stats(self.stats_ports[0]):
+                    self.assertLess(time.monotonic(), deadline, 'disconnected compiler still holds capacity')
+                    time.sleep(.01)
+            finally:
+                if process.poll() is None: process.kill()
+                process.wait(timeout=5)
+
+class TcpJobTestCase(BrokerTestCase):
+    def start_tcp(self):
+        # Fixed transport slots keep the client on the RPC path. Live local
+        # statistics deliberately enable direct compilation, tested separately.
+        return self.start_broker(self.host(0, ',tcp'))
+
+
+class TcpJobsTest(TcpJobTestCase):
     def test_explicit_launcher_unwraps_absolute_masquerade_compilers(self):
         self.start_tcp()
         wrappers = self.work / 'masquerade'
@@ -90,20 +233,6 @@ class TcpJobsTest(BrokerTestCase):
         while list(self.root.glob('distcc-tcp-*')):
             self.assertLess(time.monotonic(), deadline, 'refused input tree was not reclaimed')
             time.sleep(.01)
-
-    def test_memory_refusal_reschedules_without_fallback(self):
-        self.start_memory_refusal()
-        before = self.get_stats(self.stats_ports[1])
-        self.job('memory-rescheduled')
-        log = (self.work / 'memory-refusal.log').read_text()
-        self.assertIn('rescheduling unstarted job', log)
-        after = self.get_stats(self.stats_ports[1])
-        count = lambda text: int(re.search(r'dcc_compile_ok (\d+)', text)[1])
-        self.assertEqual(count(after) - count(before), 1)
-        self.assertNotIn('job cost:', log.split('rescheduling unstarted job', 1)[0])
-
-    def start_tcp(self):
-        return self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
 
     @unittest.skipUnless(shutil.which('strace'), 'strace is required')
     def test_sealed_input_maps_and_sends_raw_tail(self):
@@ -354,108 +483,6 @@ int ioctl(int fd, unsigned long request, ...) {
         self.assertLess(estimate, 512 * 1024 * 1024)
         self.assertIn('dcc_job_memory_samples 8\n', after)
 
-    def test_unseen_size_uses_available_memory_in_parallel(self):
-        def metric(text, name):
-            match = re.search(rf'^{name} (\d+)$', text, re.M)
-            assert match is not None, (name, text)
-            return int(match[1])
-        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='512', DISTCC_MEMORY_LEARNING='1')
-        self.addCleanup(self.restart_server, self.build / 'distccd')
-        self.start_tcp()
-        for i in range(8):
-            self.job(f'small-{i}')
-        source = self.work / 'larger.i'
-        source.write_text('/*' + ' ' * 8192 + '*/\nint main(void) { return 0; }\n')
-        bucket = source.stat().st_size.bit_length() - 1
-        def capacity(text):
-            row = next(line for line in text.splitlines() if line.startswith('dcc_compile_capacity '))
-            return list(map(int, row.split(' ', 1)[1].split(',')))[bucket]
-        before = self.get_stats(self.stats_ports[0])
-        self.assertGreaterEqual(capacity(before), 2)
-        completed = metric(before, 'dcc_compile_ok')
-        # Expose cached client capacity to exercise the real daemon's
-        # reservation accounting rather than client-side serialization.
-        advertised = re.sub(r'dcc_compile_capacity [^\n]+',
-                            'dcc_compile_capacity ' + ','.join(['4'] * 64), before)
-        peer = self.peer(advertised.encode())
-        self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name='cached-capacity')
-        def compile_one(index):
-            state = self.work / f'independent-{index}'
-            state.mkdir()
-            env = dict(self.env, DISTCC_DIR=str(state))
-            obj = self.work / f'larger-{index}.o'
-            result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c',
-                                     str(source), '-o', str(obj)], env=env,
-                                    capture_output=True, text=True, timeout=20)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            return obj.read_bytes()
-        rows = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            jobs = [pool.submit(compile_one, i) for i in range(4)]
-            while not all(job.done() for job in jobs):
-                stats = self.get_stats(self.stats_ports[0])
-                rows.append((metric(stats, 'dcc_compile_ok'), metric(stats, 'dcc_busy')))
-                time.sleep(.01)
-            outputs = [job.result() for job in jobs]
-        cold = [busy for done, busy in rows if done == completed]
-        self.assertTrue(cold)
-        self.assertGreaterEqual(max(cold), 2)
-        native = self.work / 'native.o'
-        subprocess.run([self.cc, '-c', str(source), '-o', str(native)], check=True)
-        self.assertTrue(all(output == native.read_bytes() for output in outputs))
-        after = self.get_stats(self.stats_ports[0])
-        self.assertGreater(capacity(after), 0)
-
-    def test_known_job_runs_alongside_unmeasured_work(self):
-        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='512', DISTCC_MEMORY_LEARNING='1')
-        self.addCleanup(self.restart_server, self.build / 'distccd')
-        self.start_tcp()
-        self.job('warm-small')
-        before = self.get_stats(self.stats_ports[0])
-        advertised = re.sub(r'dcc_compile_capacity [^\n]+',
-                            'dcc_compile_capacity ' + ','.join(['4'] * 64), before)
-        peer = self.peer(advertised.encode())
-        self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name='mixed-memory')
-        source = self.work / 'unmeasured.i'
-        source.write_text('/*' + ' ' * 8192 + '*/\nint main(void) { return 0; }\n')
-        entered, release = self.work / 'entered', self.work / 'release'
-        wrapper = self.root / 'bin/gcc'
-        original = wrapper.read_bytes()
-        self.addCleanup(wrapper.write_bytes, original)
-        wrapper.write_text(f'''#!/usr/bin/python3
-import os, sys, time
-from pathlib import Path
-if any(os.path.isfile(arg) and os.stat(arg).st_size >= 8192 for arg in sys.argv[1:]):
-    Path({str(entered)!r}).touch()
-    while not Path({str(release)!r}).exists(): time.sleep(.01)
-os.execv({self.cc!r}, [{self.cc!r}, *sys.argv[1:]])
-''')
-        def compile_large(index):
-            result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(source),
-                                     '-o', str(self.work / f'large-{index}.o')], env=self.env,
-                                    capture_output=True, text=True, timeout=20)
-            self.assertEqual(result.returncode, 0, result.stderr)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            large = [pool.submit(compile_large, 0)]
-            try:
-                deadline = time.monotonic() + 5
-                while not entered.exists():
-                    self.assertLess(time.monotonic(), deadline)
-                    time.sleep(.01)
-                large.append(pool.submit(compile_large, 1))
-                while 'dcc_busy 2\n' not in self.get_stats(self.stats_ports[0]):
-                    self.assertLess(time.monotonic(), deadline)
-                    time.sleep(.01)
-                # Both unmeasured jobs remain held. A known small compile
-                # must also run while their memory reservations fit.
-                small = pool.submit(self.job, 'bypass-calibration')
-                small.result(timeout=3)
-                self.assertFalse(any(job.done() for job in large))
-            finally:
-                release.touch()
-            for job in large:
-                job.result()
-
     def test_compile_and_pool_reuse(self):
         self.start_tcp()
         before = int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
@@ -573,32 +600,6 @@ time_t time(time_t *out) {
         for lease in reservations:
             lease.close()
         self.result(net)
-
-    def test_multiple_brokers_share_workers(self):
-        hosts = ' '.join(self.host(i, f',tcp,stats={self.stats_ports[i]}') for i in range(2))
-        environments = []
-        for i in range(2):
-            self.start_broker(hosts, name=f'shared-{i}')
-            environments.append(dict(self.env, DISTCC_VERBOSE='1'))
-        before = [int(re.search(r'dcc_compile_ok (\d+)', self.get_stats(port))[1])
-                  for port in self.stats_ports]
-
-        def compile_job(i):
-            obj, exe = self.work / f'shared-{i}.o', self.work / f'shared-{i}'
-            result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(self.source),
-                                     '-o', str(obj)], env=environments[i % 2],
-                                    capture_output=True, timeout=15)
-            self.assertEqual(result.returncode, 0, result.stderr.decode())
-            self.assertIn(b'pooled TCP job completed', result.stderr)
-            subprocess.run([self.cc, str(obj), '-o', str(exe)], check=True,
-                           capture_output=True, timeout=5)
-            subprocess.run([str(exe)], check=True, timeout=5)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-            list(pool.map(compile_job, range(32)))
-        for i, port in enumerate(self.stats_ports):
-            stats = self.get_stats(port)
-            self.assertGreater(int(re.search(r'dcc_compile_ok (\d+)', stats)[1]), before[i])
 
     def test_publication_failure_keeps_completed_connection_reusable(self):
         self.start_tcp()
@@ -1094,6 +1095,150 @@ with open(args[args.index('-o') + 1], 'ab') as output:
             self.restart_server(self.build / 'distccd')
 
 
+class RemoteTcpJobsTest(TcpJobTestCase):
+    # These tests need live capacity feedback and real worker execution.
+    worker_address = '127.0.0.2'
+
+    def test_memory_refusal_reschedules_without_fallback(self):
+        self.start_memory_refusal()
+        before = self.get_stats(self.stats_ports[1])
+        self.job('memory-rescheduled')
+        log = (self.work / 'memory-refusal.log').read_text()
+        self.assertIn('rescheduling unstarted job', log)
+        after = self.get_stats(self.stats_ports[1])
+        count = lambda text: int(re.search(r'dcc_compile_ok (\d+)', text)[1])
+        self.assertEqual(count(after) - count(before), 1)
+        self.assertNotIn('job cost:', log.split('rescheduling unstarted job', 1)[0])
+
+    def test_unseen_size_uses_available_memory_in_parallel(self):
+        def metric(text, name):
+            match = re.search(rf'^{name} (\d+)$', text, re.M)
+            assert match is not None, (name, text)
+            return int(match[1])
+        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='512', DISTCC_MEMORY_LEARNING='1')
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.start_tcp()
+        for i in range(8):
+            self.job(f'small-{i}')
+        source = self.work / 'larger.i'
+        source.write_text('/*' + ' ' * 8192 + '*/\nint main(void) { return 0; }\n')
+        bucket = source.stat().st_size.bit_length() - 1
+        def capacity(text):
+            row = next(line for line in text.splitlines() if line.startswith('dcc_compile_capacity '))
+            return list(map(int, row.split(' ', 1)[1].split(',')))[bucket]
+        before = self.get_stats(self.stats_ports[0])
+        self.assertGreaterEqual(capacity(before), 2)
+        completed = metric(before, 'dcc_compile_ok')
+        # Expose cached client capacity to exercise the real daemon's
+        # reservation accounting rather than client-side serialization.
+        advertised = re.sub(r'dcc_compile_capacity [^\n]+',
+                            'dcc_compile_capacity ' + ','.join(['4'] * 64), before)
+        peer = self.peer(advertised.encode())
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name='cached-capacity')
+        def compile_one(index):
+            state = self.work / f'independent-{index}'
+            state.mkdir()
+            env = dict(self.env, DISTCC_DIR=str(state))
+            obj = self.work / f'larger-{index}.o'
+            result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c',
+                                     str(source), '-o', str(obj)], env=env,
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return obj.read_bytes()
+        rows = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            jobs = [pool.submit(compile_one, i) for i in range(4)]
+            while not all(job.done() for job in jobs):
+                stats = self.get_stats(self.stats_ports[0])
+                rows.append((metric(stats, 'dcc_compile_ok'), metric(stats, 'dcc_busy')))
+                time.sleep(.01)
+            outputs = [job.result() for job in jobs]
+        cold = [busy for done, busy in rows if done == completed]
+        self.assertTrue(cold)
+        self.assertGreaterEqual(max(cold), 2)
+        native = self.work / 'native.o'
+        subprocess.run([self.cc, '-c', str(source), '-o', str(native)], check=True)
+        self.assertTrue(all(output == native.read_bytes() for output in outputs))
+        after = self.get_stats(self.stats_ports[0])
+        self.assertGreater(capacity(after), 0)
+
+    def test_known_job_runs_alongside_unmeasured_work(self):
+        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='512', DISTCC_MEMORY_LEARNING='1')
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.start_tcp()
+        self.job('warm-small')
+        before = self.get_stats(self.stats_ports[0])
+        advertised = re.sub(r'dcc_compile_capacity [^\n]+',
+                            'dcc_compile_capacity ' + ','.join(['4'] * 64), before)
+        peer = self.peer(advertised.encode())
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name='mixed-memory')
+        source = self.work / 'unmeasured.i'
+        source.write_text('/*' + ' ' * 8192 + '*/\nint main(void) { return 0; }\n')
+        entered, release = self.work / 'entered', self.work / 'release'
+        wrapper = self.root / 'bin/gcc'
+        original = wrapper.read_bytes()
+        self.addCleanup(wrapper.write_bytes, original)
+        wrapper.write_text(f'''#!/usr/bin/python3
+import os, sys, time
+from pathlib import Path
+if any(os.path.isfile(arg) and os.stat(arg).st_size >= 8192 for arg in sys.argv[1:]):
+    Path({str(entered)!r}).touch()
+    while not Path({str(release)!r}).exists(): time.sleep(.01)
+os.execv({self.cc!r}, [{self.cc!r}, *sys.argv[1:]])
+''')
+        def compile_large(index):
+            result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(source),
+                                     '-o', str(self.work / f'large-{index}.o')], env=self.env,
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            large = [pool.submit(compile_large, 0)]
+            try:
+                deadline = time.monotonic() + 5
+                while not entered.exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                large.append(pool.submit(compile_large, 1))
+                while 'dcc_busy 2\n' not in self.get_stats(self.stats_ports[0]):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                # Both unmeasured jobs remain held. A known small compile
+                # must also run while their memory reservations fit.
+                small = pool.submit(self.job, 'bypass-calibration')
+                small.result(timeout=3)
+                self.assertFalse(any(job.done() for job in large))
+            finally:
+                release.touch()
+            for job in large:
+                job.result()
+
+    def test_multiple_brokers_share_workers(self):
+        hosts = ' '.join(self.host(i, f',tcp,stats={self.stats_ports[i]}') for i in range(2))
+        environments = []
+        for i in range(2):
+            self.start_broker(hosts, name=f'shared-{i}')
+            environments.append(dict(self.env, DISTCC_VERBOSE='1'))
+        before = [int(re.search(r'dcc_compile_ok (\d+)', self.get_stats(port))[1])
+                  for port in self.stats_ports]
+
+        def compile_job(i):
+            obj, exe = self.work / f'shared-{i}.o', self.work / f'shared-{i}'
+            result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(self.source),
+                                     '-o', str(obj)], env=environments[i % 2],
+                                    capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertIn(b'pooled TCP job completed', result.stderr)
+            subprocess.run([self.cc, str(obj), '-o', str(exe)], check=True,
+                           capture_output=True, timeout=5)
+            subprocess.run([str(exe)], check=True, timeout=5)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(compile_job, range(32)))
+        for i, port in enumerate(self.stats_ports):
+            stats = self.get_stats(port)
+            self.assertGreater(int(re.search(r'dcc_compile_ok (\d+)', stats)[1]), before[i])
+
+
 @unittest.skipUnless(os.geteuid() == 0, 'cross-UID integration requires root')
 class LocalCrossUidTest(unittest.TestCase):
     def test_private_input_can_be_compiled_by_another_uid(self):
@@ -1110,7 +1255,7 @@ class LocalCrossUidTest(unittest.TestCase):
             port, stats = free_port(), free_port()
             env = {k:v for k,v in os.environ.items() if not k.startswith('DISTCC')}
             env.update(DISTCC_JOB_MEMORY='64', DISTCC_LOCAL_SOCKET=str(root/'jobs'),
-                       DISTCC_HOSTS=f'127.0.0.1:{port}/1,tcp,stats={stats}',
+                       DISTCC_HOSTS=f'127.0.0.1:{port}/1,tcp',
                        DISTCC_DIR=str(client), DISTCC_BROKER=str(client/'broker.sock'),
                        DISTCC_FALLBACK='0', DISTCC_SKIP_LOCAL_RETRY='1', TMPDIR=str(client))
             server_env = dict(env, TMPDIR=str(root), DISTCCD_PATH=os.path.dirname(shutil.which('gcc'))+os.pathsep+os.defpath)

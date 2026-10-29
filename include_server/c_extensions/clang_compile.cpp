@@ -8,6 +8,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include "../../src/clang_inputs.h"
+#include "remote_files.h"
 
 namespace {
 // The driver sees the existing worker paths. Only the frontend uses the
@@ -134,10 +135,71 @@ PyObject *dcc_clang_compile(PyObject *, PyObject *arguments) {
     return PyLong_FromLong(ok ? 0 : 1);
 }
 
+static PyObject *compile_remote(PyObject *, PyObject *arguments) {
+    PyObject *argv;
+    int fd;
+    const char *cwd, *output, *dependencies, *root;
+    if (!PyArg_ParseTuple(arguments, "Oissss", &argv, &fd, &cwd, &output, &dependencies, &root)) return nullptr;
+    PyObject *sequence = PySequence_Fast(argv, "argv must be a sequence");
+    if (!sequence) return nullptr;
+    std::vector<std::string> command;
+    if (PySequence_Fast_GET_SIZE(sequence) < 4) {
+        Py_DECREF(sequence);
+        return PyErr_Format(PyExc_ValueError, "missing remote frontend invocation");
+    }
+    const char *client_identity = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, 2));
+    if (!client_identity) { Py_DECREF(sequence); return nullptr; }
+    std::string identity(client_identity);
+    for (Py_ssize_t i = 3; i < PySequence_Fast_GET_SIZE(sequence); ++i) {
+        const char *value = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, i));
+        if (!value) { Py_DECREF(sequence); return nullptr; }
+        command.emplace_back(value);
+    }
+    Py_DECREF(sequence);
+    PyObject *cache_module = PyImport_ImportModule("include_server.distcc_pump_c_extensions");
+    if (!cache_module) return nullptr;
+    PyObject *capsule = PyObject_GetAttrString(cache_module, "file_cache");
+    Py_DECREF(cache_module);
+    if (!capsule) return nullptr;
+    auto *cache = static_cast<dcc_file_cache_api *>(PyCapsule_GetPointer(capsule, "distcc.file_cache"));
+    if (!cache) { Py_DECREF(capsule); return nullptr; }
+    std::vector<const char *> args;
+    for (const auto &arg : command) args.push_back(arg.c_str());
+    bool ok = false;
+    Py_BEGIN_ALLOW_THREADS
+    llvm::InitializeAllTargetInfos(); llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs(); llvm::InitializeAllAsmParsers(); llvm::InitializeAllAsmPrinters();
+    auto invocation = std::make_shared<clang::CompilerInvocation>();
+    clang::CompilerInstance compiler(invocation, std::make_shared<clang::PCHContainerOperations>());
+    compiler.createDiagnostics();
+    if (clang::CompilerInvocation::CreateFromArgs(*invocation, args, compiler.getDiagnostics())) {
+        invocation->getFrontendOpts().OutputFile = output;
+        auto &deps = invocation->getDependencyOutputOpts();
+        if (!deps.OutputFile.empty()) deps.OutputFile = dependencies;
+        // LLVM profile readers use physical paths outside the frontend VFS.
+        dcc_clang_profile_inputs(invocation->getCodeGenOpts(), [&](std::string &path) {
+            if (!llvm::sys::path::is_absolute(path)) path = std::string(cwd) + '/' + path;
+            llvm::SmallString<256> normalized(path);
+            llvm::sys::path::remove_dots(normalized, true);
+            path = std::string(root) + normalized.str().str();
+        });
+        llvm::IntrusiveRefCntPtr<RemoteFiles> files(new RemoteFiles(dup(fd), cwd, *cache, identity,
+            llvm::sys::path::parent_path(root).str()));
+        compiler.setFileManager(new clang::FileManager(invocation->getFileSystemOpts(), files));
+        compiler.createSourceManager();
+        ok = clang::ExecuteCompilerInvocation(&compiler);
+    }
+    Py_END_ALLOW_THREADS
+    Py_DECREF(capsule);
+    if (PyErr_CheckSignals() < 0) return nullptr;
+    return PyLong_FromLong(ok ? 0 : 1);
+}
+
 #ifdef DCC_CLANG_COMPILE_MODULE
 namespace {
 PyMethodDef methods[] = {
     {"compile", dcc_clang_compile, METH_VARARGS, "Compile with the client's source identity."},
+    {"compile_remote", compile_remote, METH_VARARGS, "Compile using client filesystem lookups."},
     {nullptr, nullptr, 0, nullptr}};
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_compile", nullptr, -1,
                       methods, nullptr, nullptr, nullptr, nullptr};

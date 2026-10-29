@@ -36,6 +36,7 @@ const char *rs_program_name = "distcc_include_server";
 #include "distcc.h"
 #include "rpc.h"
 #include "exitcode.h"
+#include "file_cache.h"
 
 static PyObject *distcc_pump_c_extensionsError;
 void initdistcc_pump_c_extensions(void);
@@ -467,5 +468,11 @@ PyInit_distcc_pump_c_extensions(void) {
     return NULL;
   }
   distcc_pump_c_extensionsError = st->error;
+  PyObject *cache = PyCapsule_New((void *)&dcc_file_cache_records, "distcc.file_cache", NULL);
+  if (!cache || PyModule_AddObject(module, "file_cache", cache) < 0) {
+    Py_XDECREF(cache);
+    Py_DECREF(module);
+    return NULL;
+  }
   return module;
 }

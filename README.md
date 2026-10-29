@@ -428,6 +428,8 @@ Ordinary Clang C-family compilation prepares LLVM IR once; the selected worker
 performs optimization and code generation. A job assigned back to its client
 also consumes that IR, preserving its dependency output without repeating the
 frontend. Early local placement still runs the original command directly.
+Its source description and measured duration also train the broker's cost
+model, so the model includes work completed on the client.
 Broker statistics report all successful direct jobs as `direct_completed`, and
 those placed after preparation as `direct_prepared_completed`.
 The broker wakes waiters when a lease closes, without polling
@@ -663,6 +665,22 @@ Both endpoints must run this version. Restart the client broker and active
 pump sessions after upgrading. This path requires the Linux broker and the
 daemon's prefork mode. It uses the existing TCP listener and IP access rules;
 SSH and GSSAPI are unsupported with `,tcp`.
+
+For evaluation, `DISTCC_FRONTEND_REMOTE=1` moves ordinary Clang C/C++ frontend
+execution to the selected worker as well. The client's Clang driver resolves
+the invocation and native CPU options; the worker's Clang parser reads source
+files and headers on demand through the existing job connection. This skips
+both include-server analysis and local IR generation. Use matching Clang
+frontend libraries on the client and workers. GCC and offload compilation
+continue using their existing input preparation.
+
+Read requests are limited to the invocation's input and include directories.
+Directory metadata is batched, file contents use the existing LZ4 transfer,
+and workers reuse the shared file cache across jobs. Cache identity includes
+the client boot, reader credentials and file metadata, including change time;
+cached payloads are verified before use. Source paths, macros, diagnostics
+and dependency targets remain owned by Clang. Disconnecting a client cancels
+its compiler and releases the worker.
 
 The broker lends one reusable TCP connection per outstanding job. The server
 prepares inputs before reserving a compiler worker and releases the worker

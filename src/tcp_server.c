@@ -82,6 +82,10 @@ struct dcc_tcp_server {
     unsigned cache_index, borrowers;
     int cache_hit;
     struct input *copy_source;
+    int fs_peer, fs_child, fs_waiting; /* descriptor + 1; one compiler lookup at a time */
+    struct dcc_tcp_frame fs_query;
+    unsigned char *fs_reply;
+    size_t fs_size, fs_sent;
 };
 /* The parent event loop alone owns these. Children abandon inherited FDs. */
 static struct upload *uploads[256];
@@ -346,8 +350,18 @@ static void release_inputs(struct dcc_tcp_server *s)
     s->input_bytes = 0;
     s->input_pending = 0;
 }
+static void close_filesystem(struct dcc_tcp_server *s)
+{
+    if (s->fs_peer) close(s->fs_peer - 1);
+    if (s->fs_child) close(s->fs_child - 1);
+    s->fs_peer = s->fs_child = s->fs_waiting = 0;
+    dcc_tcp_frame_clear(&s->fs_query);
+    free(s->fs_reply); s->fs_reply = NULL;
+    s->fs_size = s->fs_sent = 0;
+}
 static void reset_job(struct dcc_tcp_server *s)
 {
+    close_filesystem(s);
     dequeue(s);
     release_inputs(s);
     memset(&s->run, 0, sizeof(s->run));
@@ -391,6 +405,7 @@ struct dcc_tcp_server *dcc_tcp_server_new(int fd, const struct dcc_tcp_dispatch 
 void dcc_tcp_server_abandon(struct dcc_tcp_server *s)
 {
     if (!s) return;
+    close_filesystem(s);
     if (s->encoded) { free(s->encoded->data); free(s->encoded); }
     close(s->socket);
     if (s->metadata >= 0) close(s->metadata);
@@ -934,6 +949,50 @@ static int output(struct dcc_tcp_server *s)
     }
     return 0;
 }
+void dcc_tcp_server_fs_poll(struct dcc_tcp_server *s, struct pollfd *p)
+{
+    *p = (struct pollfd){.fd = -1};
+    if (s->phase != RUNNING || !s->fs_peer) return;
+    p->fd = s->fs_peer - 1;
+    p->events = s->fs_reply ? POLLOUT : s->fs_waiting ? 0 : POLLIN;
+}
+int dcc_tcp_server_fs_process(struct dcc_tcp_server *s, short events)
+{
+    if (s->phase != RUNNING || !s->fs_peer) return 0;
+    if (s->fs_reply && (events & POLLOUT)) {
+        ssize_t n = send(s->fs_peer - 1, s->fs_reply + s->fs_sent,
+                         s->fs_size - s->fs_sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) return 0;
+        if (n <= 0) return -1;
+        s->fs_sent += n; s->active = time(NULL);
+        if (s->fs_sent == s->fs_size) {
+            free(s->fs_reply); s->fs_reply = NULL;
+            s->fs_size = s->fs_sent = 0;
+            if (s->fs_waiting == 2) s->fs_waiting = 0;
+        }
+    }
+    if (!s->fs_waiting && (events & POLLIN)) {
+        int complete = dcc_tcp_frame_read(s->fs_peer - 1, &s->fs_query, 65536);
+        if (complete < 0) {
+            if (s->fs_query.used) return -1;
+            close(s->fs_peer - 1); s->fs_peer = 0;
+            return 0;
+        }
+        if (complete) {
+            if (s->fs_query.fd_plus_one || s->fs_query.type != DCC_TCP_FS_QUERY) return -1;
+            int ret = queue(s, DCC_TCP_FS_QUERY, s->fs_query.data, s->fs_query.size);
+            dcc_tcp_frame_clear(&s->fs_query);
+            if (ret) return -1;
+            s->fs_waiting = 1;
+        }
+    }
+    /* EOF is normal after frontend completion. Worker completion owns status
+     * and final reclamation; never discard an already produced object here. */
+    if (events & (POLLHUP | POLLERR)) {
+        close(s->fs_peer - 1); s->fs_peer = 0;
+    }
+    return 0;
+}
 int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
 {
     p->fd = s->socket;
@@ -954,6 +1013,7 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
         return result_available(s);
     }
     p->events = POLLIN | (s->head ? POLLOUT : 0);
+    if (s->fs_reply) p->events &= ~POLLIN;
     if (pending && s->work.run != encode_output) p->events = POLLRDHUP;
     if (pending && s->work.run == decode_input) {
         int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
@@ -1015,7 +1075,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         if (s->prepared < s->job->count) events &= ~POLLIN;
     }
     int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
-    if (buffered || (events & (POLLIN | POLLHUP | POLLERR))) for (unsigned turn = 0; turn < 4; ++turn) {
+    if (!s->fs_reply && (buffered || (events & (POLLIN | POLLHUP | POLLERR)))) for (unsigned turn = 0; turn < 4; ++turn) {
         size_t before = s->frame.used;
         int allocated = s->frame.data != NULL;
         int ret = dcc_tcp_frame_read(s->socket, &s->frame, DCC_TCP_BYTES - retained);
@@ -1034,6 +1094,16 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
             if (!s->job && s->head) return -1;
             ret = begin(s, &s->frame);
         } else if (type == DCC_TCP_INPUT) ret = receive_input(s, &s->frame);
+        else if (type == DCC_TCP_FS_REPLY && s->phase == RUNNING && s->fs_peer && s->fs_waiting == 1) {
+            const void *data;
+            size_t size;
+            unsigned index;
+            ret = dcc_tcp_unpack(&s->frame, &index, s->buffer, &data, &size);
+            if (!ret && index == UINT_MAX && size && (s->fs_reply = malloc(size))) {
+                memcpy(s->fs_reply, data, size); s->fs_size = size; s->fs_sent = 0;
+                if (s->frame.type & DCC_TCP_FINAL) s->fs_waiting = 2;
+            } else ret = -1;
+        }
         else ret = -1;
         if (ret == 1) break; /* The task borrows this frame until completion. */
         retained -= s->frame.size;
@@ -1042,6 +1112,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
             rs_trace("TCP frame %x rejected with %llu bytes retained", type, (unsigned long long)retained);
             return -1;
         }
+        if (s->fs_reply) break;
         if (s->job && s->phase == PREPARING && s->prepared < s->job->count) break;
     }
     if (s->job && s->inputs && s->storage_reserved && s->phase == PREPARING &&
@@ -1108,6 +1179,16 @@ void dcc_tcp_dispatch_ready(void)
         if (!link || !link_waiting) {
             s->run.operation = DCC_TCP_RUN;
             int input = s->job->kind == DCC_JOB_COMPILE && s->job->count == 1 ? s->job->inputs[0].fd : -1;
+            if (s->job->kind == DCC_JOB_FRONTEND) {
+                if (!s->fs_peer) {
+                    int pair[2];
+                    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) {
+                        s->failed = 1; dequeue(s); s = next; continue;
+                    }
+                    s->fs_peer = pair[0] + 1; s->fs_child = pair[1] + 1;
+                }
+                input = s->fs_child - 1;
+            }
             int ret = s->dispatch->start(s, &s->run, s->metadata, input, s->job);
             if (ret < 0) { s->failed = 1; dequeue(s); }
             else if (ret == EXIT_BUSY) {
@@ -1121,6 +1202,7 @@ void dcc_tcp_dispatch_ready(void)
                 if (queue(s, DCC_TCP_RETRY, id, sizeof(id))) s->failed = 1;
             }
             else if (ret) {
+                if (s->fs_child) { close(s->fs_child - 1); s->fs_child = 0; }
                 dequeue(s); s->phase = RUNNING; s->started_at = monotonic_ns();
                 if (!--slots) break;
             }

@@ -15,7 +15,7 @@
 enum dcc_tcp_type {
     DCC_TCP_BEGIN = 0x54000200, DCC_TCP_NEED, DCC_TCP_INPUT,
     DCC_TCP_RESULT, DCC_TCP_OUTPUT, DCC_TCP_COMPLETE, DCC_TCP_RESULT_FD, DCC_TCP_RETRY,
-    DCC_TCP_PROGRESS
+    DCC_TCP_PROGRESS, DCC_TCP_FS_QUERY, DCC_TCP_FS_REPLY
 };
 #define DCC_TCP_COMPRESSED 0x10000U
 #define DCC_TCP_FINAL      0x20000U
@@ -71,6 +71,8 @@ void dcc_tcp_server_quiesce(void);
 int dcc_tcp_server_pending(void);
 int dcc_tcp_server_poll(struct dcc_tcp_server *, struct pollfd *);
 int dcc_tcp_server_process(struct dcc_tcp_server *, short);
+void dcc_tcp_server_fs_poll(struct dcc_tcp_server *, struct pollfd *);
+int dcc_tcp_server_fs_process(struct dcc_tcp_server *, short);
 struct dcc_server_load;
 void dcc_tcp_server_load(struct dcc_tcp_server *, struct dcc_server_load *);
 void dcc_tcp_dispatch_ready(void);

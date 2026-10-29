@@ -10,6 +10,8 @@ import sys
 
 def main():
     root, original, cwd, mode, *command = sys.argv[1:]
+    if mode == 'remote':
+        descriptor, dependencies, *command = command
     # LibTooling locates resources relative to argv[0], without PATH lookup.
     # Preserve the driver name: resolving symlinks would lose target and mode.
     command[0] = shutil.which(command[0]) or command[0]
@@ -24,6 +26,8 @@ def main():
         if not major.isdecimal():
             raise ValueError('invalid Clang version: ' + version)
     frontend = importlib.import_module('include_server.clang' + major + '.clang_compile')
+    if mode == 'remote':
+        return frontend.compile_remote(command, int(descriptor), cwd, original, dependencies, root)
     return frontend.compile(command, original, root, cwd, mode == 'pump')
 
 

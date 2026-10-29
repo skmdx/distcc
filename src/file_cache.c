@@ -244,3 +244,75 @@ void dcc_file_cache_prune(const unsigned char *hash, const char *tmp)
     if (lock >= 0) close(lock);
     close(shard);
 }
+
+struct record_header { uint64_t key_size, size, digest; };
+static int record_shard(const void *key, size_t length, char name[17], const char *tmp)
+{
+    XXH64_canonical_t hash;
+    XXH64_canonicalFromHash(&hash, XXH3_64bits(key, length));
+    return cache_shard(hash.digest, name, tmp);
+}
+static int read_record_bytes(int fd, void *data, size_t size)
+{
+    char *bytes = data;
+    while (size) {
+        ssize_t n = read(fd, bytes, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        bytes += n; size -= n;
+    }
+    return 0;
+}
+static void *record_read(const void *key, size_t key_size, size_t *size, const char *tmp)
+{
+    char name[17];
+    struct stat st;
+    struct record_header header;
+    void *stored_key = NULL, *data = NULL;
+    int shard = record_shard(key, key_size, name, tmp), fd = -1, valid = 0;
+    if (shard < 0) return NULL;
+    fd = openat(shard, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size > CACHE_BYTES ||
+        read_record_bytes(fd, &header, sizeof(header)) || header.key_size != key_size ||
+        header.size > CACHE_BYTES || key_size > CACHE_BYTES - sizeof(header) ||
+        header.size > CACHE_BYTES - sizeof(header) - key_size ||
+        (uint64_t)st.st_size != sizeof(header) + key_size + header.size) goto done;
+    stored_key = malloc(key_size ? key_size : 1);
+    data = malloc(header.size + 1);
+    if (!stored_key || !data || read_record_bytes(fd, stored_key, key_size) ||
+        memcmp(stored_key, key, key_size) || read_record_bytes(fd, data, header.size) ||
+        XXH3_64bits(data, header.size) != header.digest) goto done;
+    ((char *)data)[header.size] = 0;
+    *size = header.size;
+    valid = 1;
+done:
+    free(stored_key);
+    if (fd >= 0) close(fd);
+    close(shard);
+    if (!valid) { free(data); return NULL; }
+    return data;
+}
+static void record_write(const void *key, size_t key_size, const void *data, size_t size, const char *tmp)
+{
+    struct record_header header = {key_size, size, 0};
+    if (key_size > CACHE_BYTES - sizeof(header) || size > CACHE_BYTES - sizeof(header) - key_size) return;
+    header.digest = XXH3_64bits(data, size);
+    char name[17], temporary[40];
+    int shard = record_shard(key, key_size, name, tmp), lock = -1, fd = -1;
+    if (shard < 0) return;
+    lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) ||
+        make_room(shard, sizeof(header) + key_size + size, name)) goto done;
+    snprintf(temporary, sizeof(temporary), ".tmp-%lu", (unsigned long)getpid());
+    fd = openat(shard, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) goto done;
+    if (!dcc_writex(fd, &header, sizeof(header)) && !dcc_writex(fd, key, key_size) &&
+        !dcc_writex(fd, data, size) && !fchmod(fd, 0400))
+        renameat(shard, temporary, shard, name);
+    unlinkat(shard, temporary, 0);
+done:
+    if (fd >= 0) close(fd);
+    if (lock >= 0) close(lock);
+    close(shard);
+}
+const struct dcc_file_cache_api dcc_file_cache_records = {record_read, record_write};
