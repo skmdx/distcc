@@ -68,6 +68,12 @@ indefinitely even when an available worker would finish sooner. Preserve input
 progress and distinguish actual memory admission from an uncertain CPU forecast.
 Transient demand must not silently change the configured whole-build job count.
 
+When a queued candidate competes with immediate execution, compare it with the
+ready worker that the placement policy would actually choose. The fastest
+individual ready completion and the smallest throughput displacement can refer
+to different workers. Using the former to reject waiting and then assigning the
+latter can select a strictly slower completion with more displaced work.
+
 Use the same contention objective before and after input preparation. A local
 preflight still places a whole compiler invocation: bypassing the displacement
 cost there fills SMT siblings before independent remote cores, even when the
@@ -102,6 +108,15 @@ placement, account for the remaining work of already-owned jobs and which
 execution method will actually be available. Model a phase's release of CPU
 leases when it finishes; do not assume that the initial occupancy persists for
 the entire candidate job.
+
+Measure a capacity curve with matched compiler inputs at one job, one job per
+physical core and one per logical CPU. Record busy-weighted CPU frequency during
+those same batches when the hardware exposes it. Otherwise a frequency change
+between batches can appear to be a different SMT gain. The three measured
+frequencies are the references for the existing live clock correction; a
+missing frequency source leaves that correction unavailable, not zero. A short
+calibration does not establish sustained throughput: verify the curve against
+clock and CPU observations during the complete build, including long jobs.
 
 ## Evaluate partitioning against the remaining path
 

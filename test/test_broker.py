@@ -356,7 +356,9 @@ class BrokerDirectTest(BrokerTestCase):
         log = (self.work / 'broker.log').read_text()
         self.assertIn('direct local compile', log)
         self.assertRegex(log, r'job cost: key=[1-9a-f][0-9a-f]* kind=4 bytes=[1-9][0-9]* units=[1-9][0-9]*')
-        self.assertGreater(float(re.search(r'job cost: .* cpu=([0-9.]+)', log)[1]), 0)
+        cpu = re.search(r'job cost: .* cpu=([0-9.]+)', log)
+        assert cpu is not None, log
+        self.assertGreater(float(cpu[1]), 0)
         # A compiler error must release the lease as well.
         source.write_text('#error expected error\n')
         result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=20)
@@ -480,6 +482,40 @@ class BrokerPlacementTest(BrokerTestCase):
         # ranking rather than crowding the fastest, CPU-saturated worker.
         _, net = self.acquire_reserved(10, (1500, 4 * 1024 * 1024, 2))
         self.assertEqual(net.getpeername()[1], self.ports[1])
+
+    def test_wait_compares_against_the_actual_ready_choice(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        queued = stats_response(cpus=8, cores=4, jobs=8, capacity=8,
+                                running=8, busy=8, queued=0, preparing=0, returning=0)
+        peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                     running=26, busy=14, queued=0, preparing=0, returning=0)),
+                 self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                     running=2, busy=2, queued=0, preparing=0, returning=0)),
+                 self.peer(lambda: queued)]
+        speeds, slots = (1, .4, .7), (16, 4, 8)
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={speeds[i]}',
+                                     slots=slots[i]) for i, p in enumerate(peers)))
+        request = self.request(10, (1501, 4 * 1024**2, 2))
+        request.settimeout(.1)
+        with self.assertRaises(socket.timeout): request.recv(1032)
+        rows = [dict(field.split('=', 1) for field in line.split() if '=' in field)
+                for line in (self.work/'broker.log').read_text().splitlines()
+                if '(dispatch) candidate ' in line][:3]
+        self.assertEqual(len(rows), 3)
+        # A finishes soonest but would displace the most CPU work. C can
+        # finish before the actual immediate choice B even after its queue.
+        self.assertLess(float(rows[0]['finish']), float(rows[2]['finish']))
+        self.assertLess(float(rows[2]['finish']), float(rows[1]['finish']))
+        self.assertLess(float(rows[2]['score']), float(rows[1]['score']))
+        self.assertLess(float(rows[1]['score']), float(rows[0]['score']))
+        queued = stats_response(cpus=8, cores=4, jobs=8, capacity=8,
+                                running=7, busy=7, queued=0, preparing=0, returning=0)
+        request.settimeout(3)
+        status, _, descriptors = self.receive(request)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(descriptors), 1)
+        with socket.socket(fileno=descriptors[0]) as selected:
+            self.assertEqual(selected.getpeername()[1], self.ports[2])
 
 
 class BrokerTest(BrokerTestCase):

@@ -1010,7 +1010,6 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     } best = {.peer = -1}, ready = {.peer = -1};
     int direct = client->command == TRY_LOCAL;
     double cost = direct ? 0 : dcc_work_predict(&broker->model, &client->hint);
-    double ready_finish = 0;
     int link = client->command == ACQUIRE_LINK;
     int link_backend = client->hint.kind == DCC_WORK_THINLTO ||
                        client->hint.kind == DCC_WORK_OFFLOAD_LINK;
@@ -1224,8 +1223,6 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 (score < best.score || (score == best.score && fill < best.fill)))) best = candidate;
             if (predicted && !wait) {
                 ready_hosts++;
-                if (ready.peer < 0 || forecast.finish < ready_finish)
-                    ready_finish = forecast.finish;
                 if (ready.peer < 0 || score < ready.score ||
                     (score == ready.score && fill < ready.fill)) ready = candidate;
             }
@@ -1235,14 +1232,15 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
      * time. Waiting must actually finish sooner than an available placement;
      * comparing a queued latency with an immediate throughput penalty can
      * otherwise strand idle CPUs for an entire running job. Once waiting is
-     * rejected, preserve throughput ranking among the available workers;
-     * choosing their lowest latency again would discard the contention cost. */
+     * rejected, preserve throughput ranking among the available workers.
+     * Compare the queued job with that actual ready choice: another worker's
+     * shorter latency cannot justify choosing a slower ready alternative. */
     /* Link backends share a completion barrier. Keep available lanes working:
      * waiting for a faster worker concentrates later jobs there and leaves
      * capacity idle even with learned costs. Rank the available workers by
      * completion time, and retain queued work until any lane actually opens. */
     if (best.wait && ready.peer >= 0 &&
-        (link_backend || best.forecast.finish >= ready_finish))
+        (link_backend || best.forecast.finish >= ready.forecast.finish))
         best = ready;
     if (direct && !(best.peer >= 0 && best.idle && !best.wait &&
                     broker->peers[best.peer].local && broker->peers[best.peer].host->tcp_jobs)) {
@@ -1272,7 +1270,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         rs_trace("waiting for host=%s cost=%.3f score=%.3f finish=%.6f ready=%d ready_finish=%.6f "
                  "now=%.6f client=%td request=%.6f key=%llx",
                  broker->peers[best.peer].host->hostname, cost, best.score, best.forecast.finish,
-                 ready_hosts, ready_finish, now, client - broker->clients, client->waiting_since,
+                 ready_hosts, ready.forecast.finish, now, client - broker->clients, client->waiting_since,
                  (unsigned long long)client->hint.key);
         unsigned index = batch->count++;
         batch->planned[index].peer = best.peer;
