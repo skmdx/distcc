@@ -48,6 +48,47 @@ replaying them as fixed arrivals cannot prove a new full-build time. The broker
 only knows submitted jobs and cannot promise an optimal schedule for unseen
 work.
 
+For a proposed tail-only improvement, first hold all other completion times
+fixed. If the selected dependency chain ends at `E` and the last unaffected
+output ends at `U`, eliminating that chain's remaining work saves at most
+`max(0, E-U)`. Add these bounds only for sequential build phases. If their sum
+is smaller than the required saving, the proposal also needs a demonstrated
+reduction in other service demand or dependency timing. A long compiler
+invocation is not necessarily on the completion barrier.
+
+## Requirements for placement forecasts
+
+Separate the scheduling objective from its inputs. Minimizing the drain time
+of currently known jobs can pack a fast host while leaving independent cores
+unused, because it excludes future arrivals. Minimizing the sum of completion
+times prices interference with existing jobs, but is not equivalent to
+minimizing the whole build's final completion time either. Neither objective
+alone establishes the requested build-time bound.
+
+With known residual work and equal service rates at a given occupancy, sort
+the residuals and integrate successive completion events. If `n` jobs remain,
+the next work increment is `dw`, and the measured per-job service cost is
+`f(n)`, that interval lasts `dw*f(n)` and contributes `n*dw*f(n)` to the sum of
+remaining completion times. Comparing schedules with and without a candidate
+then includes the finite delay it adds to other jobs. Do not charge the initial
+contention for the candidate's entire lifetime.
+
+This calculation requires actual residual estimates. An aggregate count of
+unknown jobs does not establish their completion order; assigning the same mean
+residual to all of them must not be interpreted as simultaneous completion.
+External runnable counts likewise do not establish a finite interference
+duration. Record which decisions satisfy the model's premises before attributing
+whole-build results to that model.
+
+Check work-estimate error before making placement more elaborate. Raw source
+bytes, preprocessed tree bytes, LLVM instruction counts and compiler CPU time
+describe different work. In particular, two source-size features are collinear
+when both measure the same raw file, and neither predicts arbitrary optimizer
+complexity. Compare predicted and observed execution in the same units and
+execution method. A source-content timing prior is evidence from completed
+work; a cold size-based estimate is not. Do not hide a large prediction error
+by adjusting host speed or contention coefficients.
+
 ## Distinguish service demand from runnable counts
 
 The broker distinguishes daemon compilers, direct local compilers and input

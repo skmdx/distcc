@@ -359,7 +359,7 @@ Queued placements include the displacement that remains after their next CPU
 lane opens, using the same policy as immediate placement. A low queued latency
 therefore cannot justify waiting for a worker that loses the placement decision
 as soon as it becomes available.
-Waiting must still predict an earlier finish than every available placement;
+Waiting must still predict an earlier finish than the selected ready placement;
 an immediate placement's throughput penalty is not treated as elapsed time.
 Without an input hint, selection uses marginal throughput and prefers available
 execution capacity. A missed completion forecast uses the running job's service
@@ -405,8 +405,8 @@ source size does not describe its include tree. Fast samples are included and
 sub-chunk inputs do not train bandwidth, preventing a delayed small request
 from dominating later estimates. Uploads are deferred while predicted CPU wait
 exceeds preparation time by more than 20ms, retaining work at the broker so it
-can choose another host. Waiting must finish sooner than every immediately
-available placement. Otherwise, available workers retain their throughput
+can choose another host. Waiting must finish sooner than the ready placement
+selected by the throughput ranking. Otherwise, available workers retain that
 ranking, including the CPU work displaced by another compiler.
 Completion notifications and bounded timed wakes
 reconsider waiting jobs. Each pass prioritizes larger estimated jobs, which pay
