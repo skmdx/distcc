@@ -355,19 +355,22 @@ static long dcc_get_tmpdirinfo(void) {
         return (buf.f_bavail * buf.f_bsize) / (1024 * 1024);
 }
 
+static int class_capacity(unsigned memory_class, int cpu_limit, const struct dcc_server_load *load)
+{
+    int active = load->busy > 0 ? load->busy : 0;
+    /* Capacity is total occupancy, including jobs already reserved. Only
+     * additional admissions use the requested class's memory estimate. */
+    int slots = active + dcc_resource_class_slots(cpu_limit - active, memory_class, load->reserved);
+    return slots < cpu_limit ? slots : cpu_limit;
+}
+
 static void format_capacity(char *buffer, size_t size, char *memory, size_t memory_size, unsigned kind,
                             int cpu_limit, const struct dcc_server_load *load)
 {
-    int active = load->busy > 0 ? load->busy : 0;
     size_t length = 0;
     size_t memory_length = 0;
     for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
-        int slots = dcc_resource_class_slots(cpu_limit - active,
-            1 + kind * DCC_MEMORY_BUCKETS + i, load->reserved);
-        /* Advertise total occupancy: existing jobs retain their own class
-         * reservations, and only additional jobs use the requested class. */
-        slots += active;
-        if (slots > cpu_limit) slots = cpu_limit;
+        int slots = class_capacity(1 + kind * DCC_MEMORY_BUCKETS + i, cpu_limit, load);
         length += snprintf(buffer + length, size - length, "%s%d", i ? "," : "", slots);
         memory_length += snprintf(memory + memory_length, memory_size - memory_length, "%s%llu",
             i ? "," : "", dcc_resource_estimate(1 + kind * DCC_MEMORY_BUCKETS + i));
@@ -552,7 +555,7 @@ dcc_free_mem %d MB\n\
                                capacity, dcc_resource_job_bytes(), dcc_resource_samples(),
                                dcc_resource_peak_bytes(), dcc_resource_spare_bytes(),
                                compile_capacity, pump_capacity, rust_capacity, thinlto_capacity, offload_capacity,
-                               dcc_resource_class_slots(cpu_limit, 1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS, load.reserved),
+                               class_capacity(1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS, cpu_limit, &load),
                                dcc_resource_headroom(load.reserved), load.reserved,
                                compile_memory, pump_memory, rust_memory, thinlto_memory, offload_memory,
                                dcc_resource_estimate(1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS),

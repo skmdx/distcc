@@ -213,7 +213,13 @@ class FrontendTest(BrokerTestCase):
         self.assertEqual(output.read_bytes(), expected)
 
     def test_remote_frontend_disconnect_reclaims_worker(self):
-        clang = self.start_frontend()
+        # Reserve half the measured budget without allocating it. While one
+        # job is active, additional capacity is zero, but total occupancy must
+        # still include that job, as on every other RPC path.
+        initial = self.get_stats(self.stats_ports[0])
+        headroom = int(re.search(r'dcc_memory_headroom_bytes (\d+)', initial)[1])
+        reservation_mib = max(1, headroom // (2 * 1024**2))
+        clang = self.start_frontend(DISTCC_JOB_MEMORY=str(reservation_mib), DISTCC_MEMORY_LEARNING='0')
         source = self.work/'cancel.c'
         source.write_text('unsigned values[] = {' + ','.join(map(str, range(400000))) + '};\n')
         command = [str(self.build/'distcc'), clang, '-O3', '-c', str(source), '-o', str(self.work/'cancel.o')]
@@ -221,10 +227,13 @@ class FrontendTest(BrokerTestCase):
             process = subprocess.Popen(command, env=self.env, stdout=log, stderr=log)
             try:
                 deadline = time.monotonic()+10
-                while 'dcc_busy 0\n' in self.get_stats(self.stats_ports[0]):
+                while 'dcc_busy 0\n' in (active := self.get_stats(self.stats_ports[0])):
                     self.assertIsNone(process.poll(), 'worker did not execute the job')
                     self.assertLess(time.monotonic(), deadline)
                     time.sleep(.01)
+                busy = int(re.search(r'dcc_busy (\d+)', active)[1])
+                capacity = int(re.search(r'dcc_frontend_capacity (\d+)', active)[1])
+                self.assertEqual(capacity, busy, active)
                 process.kill(); process.wait(timeout=5)
                 deadline = time.monotonic()+5
                 while 'dcc_busy 0\n' not in self.get_stats(self.stats_ports[0]):
