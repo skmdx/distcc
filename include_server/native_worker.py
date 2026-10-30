@@ -36,7 +36,7 @@ def serve(descriptor, frontend):
                     try:
                         if not data:
                             return 0
-                        if data != b'C' or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(fds) != 5:
+                        if data not in (b'C', b'P') or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(fds) != 5:
                             raise ValueError('invalid local compiler request')
                         cwd, compiler = protocol.RArgv(fds[0])
                         argv = protocol.RArgv(fds[0])
@@ -56,9 +56,20 @@ def serve(descriptor, frontend):
                                 os.setpgid(0, 0)
                                 for dest, source in enumerate(fds[2:]): os.dup2(source, dest)
                                 for fd in fds:
-                                    if fd >= 0: os.close(fd)
+                                    if fd >= 0 and (data != b'P' or fd != fds[0]): os.close(fd)
                                 os.chdir(cwd)
-                                status = frontend.run(argv)
+                                if data == b'P':
+                                    prepared = frontend.prepare(argv)
+                                    if prepared is not None:
+                                        # The input has been fully consumed. Reuse
+                                        # its memfd for the captured command.
+                                        os.ftruncate(fds[0], 0)
+                                        os.lseek(fds[0], 0, os.SEEK_SET)
+                                        for values in prepared: protocol.XArgv(fds[0], values)
+                                        status = 0
+                                    os.close(fds[0])
+                                else:
+                                    status = frontend.run(argv)
                             except BaseException:
                                 traceback.print_exc()
                             sys.stdout.flush(); sys.stderr.flush()

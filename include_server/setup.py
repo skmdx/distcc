@@ -235,10 +235,11 @@ for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.paths
       name='include_server.clang' + major + '.clang_native',
       sources=[os.path.join(srcdir_include_server, 'c_extensions', name)
                for name in ('clang_native.cpp', 'clang_codegen.cpp')]
-              + [os.path.join(srcdir, 'src', 'lto_partition.cc'),
+              + [os.path.join(srcdir, 'src', 'clang_driver.cc'),
+                 os.path.join(srcdir, 'src', 'lto_partition.cc'),
                  os.path.join(os.environ.get('LTO_BUILD', 'llvm-lto'), 'SplitModule.cpp')],
       depends=[os.path.join(srcdir, 'src', name) for name in
-               ('broker_protocol.h', 'workload.h', 'lto_partition.h')]
+               ('broker_protocol.h', 'workload.h', 'lto_partition.h', 'clang_inputs.h')]
               + [os.path.join(srcdir_include_server, 'c_extensions', 'clang_codegen.h')],
       language='c++', include_dirs=[llvm_option('--includedir', config), os.path.join(srcdir, 'src')],
       library_dirs=[library], runtime_library_dirs=[runtime],

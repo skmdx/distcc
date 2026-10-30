@@ -140,10 +140,13 @@ int dcc_frontend_prepare(char **argv, struct dcc_job **result)
     if (!job) return EXIT_OUT_OF_MEMORY;
     job->kind = DCC_JOB_FRONTEND;
     job->cwd = getcwd(NULL, 0);
-    void *handle = dcc_clang_driver();
-    int (*capture)(char **, char ***, char ***) = handle ? dlsym(handle, "dcc_clang_frontend") : NULL;
-    int ret = job->cwd && capture ? capture(argv, &job->argv, &job->fs_roots) : -1;
-    if (handle) dlclose(handle);
+    int ret = job->cwd ? dcc_clang_local_prepare(argv, &job->argv, &job->fs_roots) : EXIT_IO_ERROR;
+    if (ret < 0) {
+        void *handle = dcc_clang_driver();
+        int (*capture)(char **, char ***, char ***) = handle ? dlsym(handle, "dcc_clang_frontend") : NULL;
+        ret = capture ? capture(argv, &job->argv, &job->fs_roots) : -1;
+        if (handle) dlclose(handle);
+    }
     if (ret) { dcc_job_free(job); return EXIT_DISTCC_FAILED; }
     *result = job;
     return 0;

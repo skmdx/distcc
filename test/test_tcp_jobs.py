@@ -37,8 +37,43 @@ class FrontendTest(BrokerTestCase):
                             DISTCCD_FILE_CACHE=str(self.work/'cache'), **settings)
         self.start_tcp()
         self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
+                        DISTCC_CLANG_LOCAL='1', PATH=str(self.build)+os.pathsep+self.env['PATH'],
                         DISTCC_SKIP_LOCAL_RETRY='1', INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
         return clang
+
+    def test_frontend_preparation_shares_resident_compiler_and_isolates_requests(self):
+        clang = self.start_frontend()
+        log = self.work/'client.log'
+        self.env['DISTCC_LOG'] = str(log)
+        # A local preprocessing command and concurrent remote preparations use
+        # one library owner. Each preparation must retain its own cwd/macros.
+        query = subprocess.run([str(self.build/'distcc'), clang, '-E', '-P', '-x', 'c', '-'],
+                               input=b'23\n', env=self.env, capture_output=True, timeout=30)
+        self.assertEqual((query.returncode, query.stdout.strip()), (0, b'23'), query.stderr)
+        def compile(index):
+            directory = self.work/str(index)
+            directory.mkdir()
+            (directory/'value.h').write_text(f'#define VALUE {index}\n')
+            (directory/'source.c').write_text('#include "value.h"\nint main(void) { return VALUE != EXPECTED; }\n')
+            command = [clang, '-O2', '-c', 'source.c', '-o', 'out.o', '-MMD', '-MF', 'out.d',
+                       f'-DEXPECTED={index}']
+            subprocess.run(command, cwd=directory, check=True, capture_output=True, timeout=30)
+            expected = [(directory/name).read_bytes() for name in ('out.o', 'out.d')]
+            for name in ('out.o', 'out.d'): (directory/name).unlink()
+            result = subprocess.run([str(self.build/'distcc'), *command], cwd=directory,
+                                    env=self.env, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([(directory/name).read_bytes() for name in ('out.o', 'out.d')], expected)
+            subprocess.run([clang, 'out.o', '-o', 'out'], cwd=directory, check=True, capture_output=True)
+            subprocess.run([str(directory/'out')], check=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(compile, range(8)))
+        text = log.read_text()
+        self.assertEqual(text.count('started local compiler libraries'), 1)
+        self.assertEqual(text.count('operation=P'), 8, '\n'.join(
+            line for line in text.splitlines() if 'compiler libraries' in line or 'frontend' in line))
+        self.assertIn('operation=C', text)
+        self.assertEqual(text.count('frontend filesystem:'), 8)
 
     def test_remote_frontend_advertises_its_learned_memory_class(self):
         clang = self.start_frontend(DISTCC_JOB_MEMORY='1536', DISTCC_MEMORY_LEARNING='1')

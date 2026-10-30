@@ -8,6 +8,7 @@
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/FrontendTool/Utils.h>
 #include <llvm/TargetParser/Host.h>
+#include <llvm/ADT/ScopeExit.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/FileSystem.h>
@@ -20,6 +21,8 @@
 #include "clang_codegen.h"
 
 LLD_HAS_DRIVER(elf)
+
+extern "C" int dcc_clang_frontend(char **, char ***, char ***);
 
 namespace {
 int isolated(const std::function<int()> &run) {
@@ -117,7 +120,51 @@ PyObject *run(PyObject *, PyObject *input) {
     if (PyErr_CheckSignals() < 0) return nullptr;
     return PyLong_FromLong(status);
 }
-PyMethodDef methods[] = {{"run", run, METH_O, "Run the compiler's own driver and jobs."}, {nullptr, nullptr, 0, nullptr}};
+PyObject *prepare(PyObject *, PyObject *input) {
+    PyObject *sequence = PySequence_Fast(input, "argv must be a sequence");
+    if (!sequence) return nullptr;
+    auto release = llvm::scope_exit([&] { Py_DECREF(sequence); });
+    std::vector<char *> args;
+    for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE(sequence); ++i) {
+        const char *value = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, i));
+        if (!value) return nullptr;
+        args.push_back(const_cast<char *>(value));
+    }
+    if (args.empty()) return PyErr_Format(PyExc_ValueError, "empty compiler command");
+    args.push_back(nullptr);
+    char **command = nullptr, **roots = nullptr;
+    auto cleanup = llvm::scope_exit([&] {
+        for (auto values : {command, roots}) {
+            if (values) for (char **p = values; *p; ++p) free(*p);
+            free(values);
+        }
+    });
+    int status;
+    Py_BEGIN_ALLOW_THREADS
+    status = dcc_clang_frontend(args.data(), &command, &roots);
+    Py_END_ALLOW_THREADS
+    if (status) Py_RETURN_NONE;
+    PyObject *result = PyTuple_New(2);
+    if (!result) return nullptr;
+    unsigned index = 0;
+    for (auto values : {command, roots}) {
+        unsigned length = 0;
+        while (values[length]) ++length;
+        PyObject *list = PyList_New(length);
+        if (!list) { Py_DECREF(result); return nullptr; }
+        PyTuple_SET_ITEM(result, index++, list);
+        for (unsigned i = 0; i < length; ++i) {
+            PyObject *value = PyUnicode_DecodeFSDefault(values[i]);
+            if (!value) { Py_DECREF(result); return nullptr; }
+            PyList_SET_ITEM(list, i, value);
+        }
+    }
+    return result;
+}
+PyMethodDef methods[] = {
+    {"run", run, METH_O, "Run the compiler's own driver and jobs."},
+    {"prepare", prepare, METH_O, "Capture the compiler's frontend command and input roots."},
+    {nullptr, nullptr, 0, nullptr}};
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_native", nullptr, -1, methods, nullptr, nullptr, nullptr, nullptr};
 }
 PyMODINIT_FUNC PyInit_clang_native() {

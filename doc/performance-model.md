@@ -199,6 +199,15 @@ the build's completion barrier determine the observable saving.
 
 ## Evidence required for adoption
 
+Frontend command preparation and local compilation share the caller's resident
+Clang libraries. Each request still runs in an isolated child with its own
+working directory and descriptors; the compiler's driver owns argument
+interpretation and input roots. Preparation reuses its consumed command memfd
+for the response. This avoids loading LLVM into every remote-preparation client
+without introducing another daemon or serializing compiler invocations.
+Measure that reduction separately from placement: fewer loader CPU samples do
+not establish an earlier build completion when different long jobs own the tail.
+
 Derive the expected saving and its limiting assumptions before changing the
 implementation. Use existing traces to rule out proposals whose optimistic
 saving is insufficient. If destination service demand or dependency timing is

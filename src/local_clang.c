@@ -18,6 +18,7 @@
 #include "exec.h"
 #include "exitcode.h"
 #include "job.h"
+#include "rpc.h"
 #include "trace.h"
 #include "util.h"
 
@@ -74,8 +75,8 @@ static int start_worker(const char *compiler)
     return pair[0];
 }
 
-/* -1 means no request was accepted: ordinary exec is still safe. */
-int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
+/* -1 means no request was accepted: ordinary execution is still safe. */
+static int request(char **argv, char operation, int output, int *status, uint64_t *cpu_ns)
 {
     if (!dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0) ||
         !strstr(dcc_find_basename(argv[0]), "clang")) return -1;
@@ -94,12 +95,12 @@ int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
     }
     if (worker < 0 || !(cwd = getcwd(NULL, 0)) ||
         socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) ||
-        (input = dcc_job_memfd("distcc-local-command")) < 0) goto out;
+        (input = output >= 0 ? dup(output) : dcc_job_memfd("distcc-local-command")) < 0) goto out;
     char *directory[] = {cwd, compiler, NULL};
     if (dcc_x_argv(input, "ARGC", "ARGV", directory) ||
         dcc_x_argv(input, "ARGC", "ARGV", argv) || lseek(input, 0, SEEK_SET) < 0) goto out;
     int fds[] = {input, pair[1], 0, 1, 2};
-    if (dcc_send_fds(worker, "C", 1, fds, 5)) goto out;
+    if (dcc_send_fds(worker, &operation, 1, fds, 5)) goto out;
     close(pair[1]); pair[1] = -1;
     uint64_t result[2];
     ssize_t length;
@@ -108,7 +109,7 @@ int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
     if (!ret) {
         *status = result[0];
         if (cpu_ns) *cpu_ns = result[1];
-        rs_trace("reused local compiler libraries status=%d", *status);
+        rs_trace("reused local compiler libraries status=%d operation=%c", *status, operation);
     }
 out:
     if (lease >= 0) close(lease);
@@ -117,5 +118,24 @@ out:
     if (pair[0] >= 0) close(pair[0]);
     if (pair[1] >= 0) close(pair[1]);
     free(compiler); free(cwd);
+    return ret;
+}
+
+int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
+{
+    return request(argv, 'C', -1, status, cpu_ns);
+}
+
+int dcc_clang_local_prepare(char **argv, char ***command, char ***roots)
+{
+    int output = dcc_job_memfd("distcc-frontend-command"), status;
+    if (output < 0) return EXIT_IO_ERROR;
+    int ret = request(argv, 'P', output, &status, NULL);
+    if (!ret) {
+        if (status || lseek(output, 0, SEEK_SET) < 0) ret = EXIT_DISTCC_FAILED;
+        else if ((ret = dcc_r_argv(output, "ARGC", "ARGV", command)) == 0)
+            ret = dcc_r_argv(output, "ARGC", "ARGV", roots);
+    }
+    close(output);
     return ret;
 }
