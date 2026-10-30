@@ -32,10 +32,14 @@ frequency and memory contention can change a job's CPU demand; the bound is
 conditional on holding that demand fixed, not a hardware-independent limit.
 
 A proposed placement must satisfy destination capacity as well as relieve the
-source. For each job `j`, estimate its service demand `w[j,h]` on each candidate
-host. A placement requires `sum_j w[j,h] <= B*C[h]` on every host, plus its
-dependency and transfer constraints. Input/output phases may overlap execution;
-sum only intervals on the same dependency path when predicting wall time.
+source. For each job `j`, distinguish CPU service demand `w[j,h,m]` from elapsed
+execution time `t[j,h,m]` on host `h` using execution method `m`. Whole compilation
+and parallel machine-code generation are different methods: splitting can
+shorten elapsed time while increasing total CPU work. A scalar host-speed ratio
+does not describe this difference. A placement requires
+`sum_j w[j,h,m] <= B*C[h]` on every host, plus its dependency and transfer
+constraints. Input/output phases may overlap execution; sum only intervals on
+the same dependency path when predicting wall time.
 
 Use a build tool's emitted dependency graph for offline evaluation. Do not
 change the tool's job ordering or add package names to the runtime scheduler.
@@ -64,9 +68,26 @@ indefinitely even when an available worker would finish sooner. Preserve input
 progress and distinguish actual memory admission from an uncertain CPU forecast.
 Transient demand must not silently change the configured whole-build job count.
 
-Lower client CPU demand and more remote completions are necessary intermediate
+Lower client CPU demand and more remote completions are useful intermediate
 observations for an offload proposal, not acceptance criteria. Evaluate their
 effect on destination service demand and the dependency path together.
+
+Do not derive service demand by dividing elapsed time by the same contention
+forecast that the observation will train. That feeds prediction errors back
+into the work estimate. CPU accounting and elapsed timing are independent
+observations; retain both. For an isolated worker, before/after daemon cgroup
+counters can establish service demand without a new protocol. Verify that the
+daemon did not restart and that exactly the intended job completed. Keep client
+input-service CPU separate, preserve I/O counters, and include helper startup
+in the stated measurement scope. Under concurrent execution, attribution needs
+per-job child usage rather than a shared cgroup delta.
+
+An idle-host measurement is a service-demand observation under those conditions,
+not a calibration of SMT or a promise of loaded completion time. Before changing
+placement, account for the remaining work of already-owned jobs and which
+execution method will actually be available. Model a phase's release of CPU
+leases when it finishes; do not assume that the initial occupancy persists for
+the entire candidate job.
 
 ## Evaluate partitioning against the remaining path
 
