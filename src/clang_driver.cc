@@ -3,6 +3,7 @@
 #include <clang/Basic/CodeGenOptions.h>
 #include <clang/Options/Options.h>
 #include <clang/Frontend/CompilerInvocation.h>
+#include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <clang/Lex/HeaderSearchOptions.h>
 #include <clang/Lex/PreprocessorOptions.h>
 #include <clang/Tooling/Tooling.h>
@@ -89,9 +90,15 @@ extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots) {
     if (executable) command.front() = *executable;
     llvm::IntrusiveRefCntPtr<clang::FileManager> manager(new clang::FileManager(clang::FileSystemOptions()));
     Capture action;
+    clang::DiagnosticOptions diagnostic_options;
+    clang::TextDiagnosticPrinter diagnostics(llvm::errs(), diagnostic_options);
     clang::tooling::ToolInvocation tool(command, &action, manager.get(),
         std::make_shared<clang::PCHContainerOperations>());
-    if (!tool.run() || !action.compiler) return -1;
+    tool.setDiagnosticConsumer(&diagnostics);
+    // A driver may still construct a cc1 job after reporting another missing
+    // input or an invalid option. Capturing that job alone must not turn a
+    // failed configure probe into a successful compile.
+    if (!tool.run() || diagnostics.getNumErrors() || !action.compiler) return -1;
     auto &invocation = *action.compiler;
     llvm::SmallVector<const char *> arguments;
     llvm::BumpPtrAllocator storage;

@@ -68,42 +68,6 @@ int dcc_x_req_header(int fd,
 
 
 /**
- * Transmit an argv-type array.
- **/
-int dcc_x_argv(int fd,
-               const char *argc_token,
-               const char *argv_token,
-               char **argv)
-{
-    int i, ret, argc = dcc_argv_len(argv);
-    size_t size = 12;
-    char *buf, *p;
-
-    /* Keep the wire format unchanged, but send the argument frame together.
-     * dcc_writex retains the existing partial-write and timeout handling. */
-    for (i = 0; i < argc; ++i) {
-        size_t len = strlen(argv[i]);
-        if (len > UINT_MAX || len > SIZE_MAX - 13 || size > SIZE_MAX - 13 - len)
-            return EXIT_PROTOCOL_ERROR;
-        size += 12 + len;
-    }
-    if (!(buf = malloc(size + 1)))
-        return EXIT_OUT_OF_MEMORY;
-    ret = dcc_format_token_int(buf, argc_token, (unsigned)argc);
-    p = buf + 12;
-    for (i = 0; !ret && i < argc; ++i) {
-        size_t len = strlen(argv[i]);
-        ret = dcc_format_token_int(p, argv_token, (unsigned)len);
-        memcpy(p + 12, argv[i], len);
-        p += 12 + len;
-    }
-    if (!ret)
-        ret = dcc_writex(fd, buf, size);
-    free(buf);
-    return ret;
-}
-
-/**
  * Transmit the current working directory
  */
 int dcc_x_cwd(int fd)

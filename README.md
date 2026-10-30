@@ -686,6 +686,11 @@ both include-server analysis and local IR generation. Use matching Clang
 frontend libraries on the client and workers. GCC and offload compilation
 continue using their existing input preparation.
 
+Each daemon worker loads the Clang libraries once and forks a separate compiler
+child for each job. This avoids repeated library loading without sharing macro,
+target or compiler state between invocations. The child reports its own peak
+memory; cancellation terminates its worker group before releasing job files.
+
 Read requests are limited to the invocation's input and include directories.
 Directory metadata is batched, file contents use the existing LZ4 transfer,
 and workers reuse the shared file cache across jobs. Cache identity includes

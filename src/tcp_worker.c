@@ -30,7 +30,6 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
         if (input >= 0) {
             if (job->kind == DCC_JOB_FRONTEND) {
                 job->fs_channel = input + 1;
-                if (fcntl(input, F_SETFD, 0)) finished.error = EXIT_IO_ERROR;
             } else {
             char target[64], path[PATH_MAX];
             snprintf(target, sizeof(target), "/proc/self/fd/%d", input);

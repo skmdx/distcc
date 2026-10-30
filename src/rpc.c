@@ -38,6 +38,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <limits.h>
 
 #include <sys/stat.h>
 
@@ -293,6 +294,33 @@ int dcc_x_token_string(int fd,
         return ret;
     rs_trace("send string '%s'", buf);
     return 0;
+}
+
+int dcc_x_argv(int fd, const char *argc_token, const char *argv_token, char **argv)
+{
+    int i, ret, argc = dcc_argv_len(argv);
+    size_t size = 12;
+    char *buf, *p;
+    /* Send the argument frame together, including when its destination is a
+     * descriptor passed to a local worker. dcc_writex handles partial writes. */
+    for (i = 0; i < argc; ++i) {
+        size_t len = strlen(argv[i]);
+        if (len > UINT_MAX || len > SIZE_MAX - 13 || size > SIZE_MAX - 13 - len)
+            return EXIT_PROTOCOL_ERROR;
+        size += 12 + len;
+    }
+    if (!(buf = malloc(size + 1))) return EXIT_OUT_OF_MEMORY;
+    ret = dcc_format_token_int(buf, argc_token, (unsigned)argc);
+    p = buf + 12;
+    for (i = 0; !ret && i < argc; ++i) {
+        size_t len = strlen(argv[i]);
+        ret = dcc_format_token_int(p, argv_token, (unsigned)len);
+        memcpy(p + 12, argv[i], len);
+        p += 12 + len;
+    }
+    if (!ret) ret = dcc_writex(fd, buf, size);
+    free(buf);
+    return ret;
 }
 
 

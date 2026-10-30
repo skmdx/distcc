@@ -60,6 +60,61 @@ class FrontendTest(BrokerTestCase):
         self.assertLess(estimate, 1536 * 1024**2)
         self.assertIn('dcc_job_memory_samples 2\n', after)
 
+    def test_frontend_preserves_driver_errors_during_configure_probes(self):
+        clang = self.start_frontend()
+        source = self.work/'probe.c'
+        output = self.work/'probe.o'
+        source.write_text('int answer(void) { return 42; }\n')
+        for option in ('/wd4189', '-fno-such-distcc-test-option'):
+            with self.subTest(option=option):
+                command = [clang, '-c', str(source), option, '-o', str(output)]
+                native = subprocess.run(command, capture_output=True, text=True)
+                self.assertNotEqual(native.returncode, 0, native.stderr)
+                distributed = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                             capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(distributed.returncode, 0, distributed.stderr)
+                self.assertFalse(output.exists())
+
+    def test_frontend_reuses_libraries_without_sharing_compiler_state(self):
+        clang = self.start_frontend()
+        source = self.work/'reused.c'
+        output = self.work/'reused.o'
+        dependencies = self.work/'reused.d'
+        source.write_text('int answer(void) { return VALUE + sizeof(void*) + __COUNTER__; }\n')
+        for language, abi, value in (('c', '-m64', 3), ('c++', '-m32', 9), ('c', '-m64', 12)):
+            command = [clang, '-x', language, abi, '-O3', '-DVALUE='+str(value),
+                       '-MMD', '-MF', str(dependencies), '-c', str(source), '-o', str(output)]
+            subprocess.run(command, check=True, capture_output=True)
+            expected = output.read_bytes(), dependencies.read_bytes()
+            result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('frontend filesystem:', result.stderr)
+            self.assertEqual((output.read_bytes(), dependencies.read_bytes()), expected)
+        self.logs[0].flush()
+        trace = Path(self.logs[0].name).read_text()
+        helpers = re.findall(r'started reusable frontend pid=(\d+)', trace)
+        self.assertEqual(len(helpers), 1, trace[-6000:])
+        self.assertEqual(len(re.findall(r'reused frontend pid=', trace)), 3)
+        sockets = [fd for fd in Path('/proc', helpers[0], 'fd').iterdir()
+                   if os.readlink(fd).startswith('socket:')]
+        self.assertEqual(len(sockets), 1, 'completed job filesystem descriptor was retained')
+        broken = [arg for arg in command if not arg.startswith('-DVALUE=')]
+        failed = subprocess.run([str(self.build/'distcc'), *broken], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(failed.returncode, 0, failed.stderr)
+        restored = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual((output.read_bytes(), dependencies.read_bytes()), expected)
+        # An idle compiler helper may die independently. Its next job must
+        # start a replacement, rather than reuse a closed IPC connection.
+        os.kill(int(helpers[0]), signal.SIGKILL)
+        result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((output.read_bytes(), dependencies.read_bytes()), expected)
+
     def test_remote_frontend_owns_preprocessing_and_dependency_output(self):
         clang = self.start_frontend()
         include = self.work / 'headers'

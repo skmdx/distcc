@@ -1,34 +1,90 @@
 #!/usr/bin/env python3
-"""One-shot Clang worker preserving the original source's profile identity."""
+"""Clang execution with isolated jobs and reusable frontend libraries."""
+import array
 import importlib
 import os
 import re
 import shutil
 import subprocess
+import socket
+import struct
 import sys
+import traceback
 
 
-def main():
-    root, original, cwd, mode, *command = sys.argv[1:]
-    if mode == 'remote':
-        descriptor, dependencies, *command = command
+def load_frontend(compiler):
     # LibTooling locates resources relative to argv[0], without PATH lookup.
     # Preserve the driver name: resolving symlinks would lose target and mode.
-    command[0] = shutil.which(command[0]) or command[0]
+    compiler = shutil.which(compiler) or compiler
     # Remote commands encode the client's release in the driver name, even
     # when the worker does not install a matching version-suffixed symlink.
-    release = re.search(r'(?:^|-)clang(?:\+\+)?-(\d+)(?:\.\d+)*$', os.path.basename(command[0]))
+    release = re.search(r'(?:^|-)clang(?:\+\+)?-(\d+)(?:\.\d+)*$', os.path.basename(compiler))
     if release:
         major = release.group(1)
     else:
-        version = subprocess.check_output([command[0], '-dumpversion'], text=True).strip()
+        version = subprocess.check_output([compiler, '-dumpversion'], text=True).strip()
         major = version.split('.')[0]
         if not major.isdecimal():
             raise ValueError('invalid Clang version: ' + version)
-    frontend = importlib.import_module('include_server.clang' + major + '.clang_compile')
+    return importlib.import_module('include_server.clang' + major + '.clang_compile')
+
+
+def compile_command(arguments, frontend=None):
+    root, original, cwd, mode, *command = arguments
+    if mode == 'remote':
+        descriptor, dependencies, *command = command
+    command[0] = shutil.which(command[0]) or command[0]
+    if frontend is None:
+        frontend = load_frontend(command[0])
     if mode == 'remote':
         return frontend.compile_remote(command, int(descriptor), cwd, original, dependencies, root)
     return frontend.compile(command, original, root, cwd, mode == 'pump')
+
+
+def worker(descriptor, compiler):
+    from include_server import distcc_pump_c_extensions as protocol
+    frontend = load_frontend(compiler)
+    with socket.socket(fileno=int(descriptor)) as channel:
+        while True:
+            data, control, flags, _ = channel.recvmsg(1, socket.CMSG_SPACE(4 * array.array('i').itemsize),
+                                                     socket.MSG_CMSG_CLOEXEC)
+            fds = []
+            for level, kind, values in control:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    fds.extend(array.array('i', values))
+            if not data:
+                for fd in fds: os.close(fd)
+                return 0
+            try:
+                if data != b'C' or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(fds) != 4:
+                    raise ValueError('invalid compiler request')
+                arguments = protocol.RArgv(fds[0])
+                if len(arguments) < 8 or arguments[4] != 'remote':
+                    raise ValueError('invalid remote compiler command')
+                pid = os.fork()
+                if pid == 0:
+                    channel.close()
+                    status = 1
+                    try:
+                        os.dup2(fds[2], 1); os.dup2(fds[3], 2)
+                        os.close(fds[0]); os.close(fds[2]); os.close(fds[3])
+                        arguments[5] = str(fds[1])
+                        os.environ['TMPDIR'] = arguments[1]
+                        status = compile_command(arguments[1:], frontend)
+                    except BaseException:
+                        traceback.print_exc()
+                    sys.stdout.flush(); sys.stderr.flush()
+                    os._exit(status)
+            finally:
+                for fd in fds: os.close(fd)
+            _, status, usage = os.wait4(pid, 0)
+            channel.sendall(struct.pack('=QQ', status, usage.ru_maxrss * 1024))
+
+
+def main():
+    if sys.argv[1] == '--worker':
+        return worker(*sys.argv[2:])
+    return compile_command(sys.argv[1:])
 
 
 if __name__ == '__main__':

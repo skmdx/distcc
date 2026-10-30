@@ -383,13 +383,13 @@ h_getline_obj = src/h_getline.o $(common_obj)
 common_obj += src/job.o
 common_obj += src/tcp_job.o
 distcc_obj += src/tcp_client.o src/frontend_fs.o
-distccd_obj += src/tcp_server.o src/tcp_worker.o src/tcp_async.o
+distccd_obj += src/tcp_server.o src/tcp_worker.o src/tcp_async.o src/clang_worker.o
 h_compile_obj += src/tcp_client.o src/frontend_fs.o
 distcc_obj += src/remote_job.o
 h_compile_obj += src/remote_job.o
 
 # All source files, for the purposes of building the distribution
-SRC =	src/stats.c src/adaptive.c src/broker.c src/workload.c	\
+SRC =	src/stats.c src/adaptive.c src/broker.c src/workload.c src/clang_worker.c	\
 	src/access.c src/arg.c src/argutil.c				\
 	src/auth_common.c src/auth_distcc.c src/auth_distccd.c		\
 	src/backoff.c src/bulk.c src/compress_stream.c src/file_cache.c	\
@@ -614,6 +614,7 @@ pump: pump.in config.status
 -include */*.d
 
 src/job.o src/remote_job.o src/remote.o src/serve.o: src/job.h
+src/clang_worker.o src/serve.o: src/clang_worker.h
 src/tcp_job.o src/tcp_client.o src/tcp_server.o src/tcp_worker.o src/prefork.o src/remote_job.o: src/tcp_job.h src/job.h
 src/tcp_async.o src/tcp_server.o src/prefork.o src/stats.o: src/tcp_async.h
 src/tcp_async.o: CFLAGS += -pthread
@@ -1435,6 +1436,6 @@ SRC += src/job.c src/remote_job.c
 SRC += src/tcp_job.c src/tcp_client.c src/tcp_server.c src/tcp_worker.c src/tcp_async.c
 SRC += src/frontend_fs.c
 src/frontend_fs.o src/tcp_client.o src/arg.o: src/frontend_fs.h
-HEADERS += src/tcp_job.h src/tcp_async.h
+HEADERS += src/tcp_job.h src/tcp_async.h src/clang_worker.h
 HEADERS += src/job.h
 HEADERS += src/frontend_fs.h include_server/c_extensions/remote_files.h

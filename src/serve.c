@@ -91,6 +91,7 @@
 #include "dotd.h"
 #include "fix_debug_info.h"
 #include "job.h"
+#include "clang_worker.h"
 #include "tcp_job.h"
 #ifdef HAVE_GSSAPI
 #include "auth.h"
@@ -1105,8 +1106,8 @@ static int dcc_run_job(int in_fd,
             argv[i] = strdup(i < 7 ? prefix[i] : job->argv[i - 7]);
             if (!argv[i]) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
         }
-        if ((ret = dcc_spawn_child(argv, &cc_pid, "/dev/null", out_fname, err_fname)) ||
-            (ret = dcc_collect_child("frontend", cc_pid, &status, in_fd, &result->peak_bytes)))
+        if ((ret = dcc_clang_worker(argv, job->fs_channel - 1, in_fd,
+                                    out_fname, err_fname, &status, &result->peak_bytes)))
             goto out_cleanup;
         result->status = status;
         if ((ret = retain_artifact(result, DCC_JOB_STDERR, err_fname)) ||
