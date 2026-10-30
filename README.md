@@ -715,8 +715,10 @@ existing LLVM splitter and relocatable linker preserve ownership and local
 symbols across machine-code partitions. Additional CPUs require immediate
 broker leases; an occupied machine continues with one compiler. The helper
 learns serial code-generation cost and split/merge overhead from completed jobs
-in its own compiler environment, and partitions only when that estimate favors
-it. LTO and other output formats retain their existing paths.
+in its own compiler environment. It selects the partition count with the lowest
+predicted completion time, bounded by useful parallelism and immediately
+available leases. The first parallel invocation uses two parts to measure
+overhead. LTO and other output formats retain their existing paths.
 
 Read requests are limited to the invocation's input and include directories.
 Directory metadata is batched, file contents use the existing LZ4 transfer,

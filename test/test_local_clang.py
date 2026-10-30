@@ -130,6 +130,28 @@ class LocalClangTest(BrokerTestCase):
     def test_codegen_uses_spare_leases_and_preserves_result(self):
         self.check_codegen(False)
 
+    def test_codegen_selects_the_fastest_predicted_partition_count(self):
+        self.start_local()
+        header = self.build/'include_server/c_extensions/clang_codegen.h'
+        (self.work/'plan.cc').write_text(f'#include "{header}"\n' + '''
+int main() {
+    // Both 4 and 5 parts cost .45s; prefer the smaller resource footprint.
+    // Sixteen parts still beat serial (0.8625s), but are not the best choice.
+    if (dcc_codegen_parallelism(1., .05, 16, true) != 4) return 1;
+    if (dcc_codegen_parallelism(1., .05, 3, true) != 3) return 2;
+    if (dcc_codegen_parallelism(1., .25, 16, true) != 1) return 3;
+    if (dcc_codegen_parallelism(0., 0., 16, false) != 1) return 4;
+    if (dcc_codegen_parallelism(1., 0., 16, false) != 2) return 5;
+    if (dcc_codegen_parallelism(1., 0., 1, false) != 1) return 6;
+    if (dcc_codegen_parallelism(1., 0., 16, true) != 16) return 7;
+    return 0;
+}
+''')
+        result = self.command(['--driver-mode=g++', '-std=c++17', 'plan.cc', '-o', 'plan'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        checked = subprocess.run([str(self.work/'plan')], cwd=self.work)
+        self.assertEqual(checked.returncode, 0)
+
     def test_native_cpu_feedback_is_per_job(self):
         self.start_local()
         self.base_env['DISTCC_VERBOSE'] = '1'
@@ -243,6 +265,8 @@ class LocalClangTest(BrokerTestCase):
             else: self.assertEqual(actual, expected)
         self.assertEqual(b'distcc codegen:' in result.stderr, not occupied,
                          result.stderr.decode() + (self.work/'client.log').read_text())
+        if not occupied:
+            self.assertIn(b'distcc codegen: 2 parts', result.stderr)
 
     def test_available_frontend_releases(self):
         self.start_local()

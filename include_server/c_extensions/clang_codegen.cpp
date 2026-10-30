@@ -127,24 +127,28 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
     std::vector<int> lanes;
     auto release = llvm::scope_exit([&] { for (int fd : lanes) close(fd); });
     double serial = 0, overhead = 0;
+    bool overhead_known = false;
     if (measured) {
         auto instructions = measured->instructions.load();
         auto parts = measured->parts.load();
         if (instructions) serial = double(measured->codegen_ns.load())*total/instructions;
-        if (parts) overhead = double(measured->overhead_ns.load())/parts;
+        if (parts) {
+            overhead = double(measured->overhead_ns.load())/parts;
+            overhead_known = true;
+        }
     }
     // Learn both serial codegen work and split/merge overhead from completed
     // jobs in this compiler environment, rather than a source-size threshold.
-    bool worthwhile = serial && serial*(1.-1./useful) > overhead*useful;
-    while (worthwhile && lanes.size()+1 < useful) {
+    unsigned selected = dcc_codegen_parallelism(serial, overhead, useful, overhead_known);
+    while (lanes.size()+1 < selected) {
         int fd = try_lane();
         if (fd < 0) break;
         lanes.push_back(fd);
     }
-    if (!lanes.empty() && serial*(1.-1./(lanes.size()+1)) <= overhead*(lanes.size()+1)) {
-        for (int fd : lanes) close(fd);
-        lanes.clear();
-    }
+    if (getenv("DISTCC_VERBOSE"))
+        llvm::errs() << "distcc codegen plan: serial_ns=" << serial << " overhead_ns=" << overhead
+                     << " useful=" << useful << " selected=" << selected
+                     << " available=" << lanes.size()+1 << '\n';
     if (lanes.empty()) {
         auto start = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
         bool ok = emit(compiler, *module, frontend.OutputFile);

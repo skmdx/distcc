@@ -175,6 +175,19 @@ earlier. A faster invocation only shortens the build to the extent that it
 advances the completion barrier. Check both that barrier and the host-capacity
 budget before adding partitioning or speculative duplicate execution.
 
+The local codegen planner estimates serial codegen work `S` from completed
+instruction-count/CPU-time samples and per-part split/merge time `H` from
+completed splits. Its model is `T(1)=S`, and `T(k)=S/k+H*k` for `k>=2`.
+Choose the minimum, not the largest `k` that beats serial execution. For example,
+`S=1s` and `H=.05s` predict `.45s` with four parts but `.8625s` with sixteen:
+both beat serial execution, yet the larger split almost doubles elapsed time.
+The model is convex beyond two parts, so stop when another part ceases to help;
+fewer available leases do not require a second profitability rule. Before the
+first overhead observation, use the smallest split, two parts, to obtain one.
+This model assumes independent equal-rate lanes. SMT, changing contention and
+unequal backend work remain reasons to verify complete-build results rather
+than claiming the predicted minimum is the actual optimum.
+
 For local code generation, the splitter hands verified IR directly to a child
 through `fork`. Partition construction overlaps earlier children, and the last
 partition uses the caller's existing CPU lease. This removes bitcode encoding,
