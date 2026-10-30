@@ -77,6 +77,7 @@ class FrontendTest(BrokerTestCase):
 
     def test_frontend_reuses_libraries_without_sharing_compiler_state(self):
         clang = self.start_frontend()
+        trace_offset = Path(self.logs[0].name).stat().st_size
         source = self.work/'reused.c'
         output = self.work/'reused.o'
         dependencies = self.work/'reused.d'
@@ -92,7 +93,7 @@ class FrontendTest(BrokerTestCase):
             self.assertIn('frontend filesystem:', result.stderr)
             self.assertEqual((output.read_bytes(), dependencies.read_bytes()), expected)
         self.logs[0].flush()
-        trace = Path(self.logs[0].name).read_text()
+        trace = Path(self.logs[0].name).read_bytes()[trace_offset:].decode()
         helpers = re.findall(r'started reusable frontend pid=(\d+)', trace)
         self.assertEqual(len(helpers), 1, trace[-6000:])
         self.assertEqual(len(re.findall(r'reused frontend pid=', trace)), 3)
@@ -213,12 +214,13 @@ class FrontendTest(BrokerTestCase):
         self.assertEqual(output.read_bytes(), expected)
 
     def test_remote_frontend_disconnect_reclaims_worker(self):
-        # Reserve half the measured budget without allocating it. While one
+        # Reserve within the one-job-only interval (half to all of the
+        # measured budget), away from its fluctuating boundary. While one
         # job is active, additional capacity is zero, but total occupancy must
         # still include that job, as on every other RPC path.
         initial = self.get_stats(self.stats_ports[0])
         headroom = int(re.search(r'dcc_memory_headroom_bytes (\d+)', initial)[1])
-        reservation_mib = max(1, headroom // (2 * 1024**2))
+        reservation_mib = max(1, 3 * headroom // (4 * 1024**2))
         clang = self.start_frontend(DISTCC_JOB_MEMORY=str(reservation_mib), DISTCC_MEMORY_LEARNING='0')
         source = self.work/'cancel.c'
         source.write_text('unsigned values[] = {' + ','.join(map(str, range(400000))) + '};\n')
