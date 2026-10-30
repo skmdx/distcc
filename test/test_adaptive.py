@@ -16,6 +16,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -386,6 +387,10 @@ int open(const char *path, int flags, ...) {
             self.assertIn("dcc_max_kids 4\n", stats)
             self.assertRegex(stats, r"dcc_load1 [0-9.]+\n")
             self.assertRegex(stats, r"dcc_free_mem -?[0-9]+ MB\n")
+            if sys.platform.startswith('linux'):
+                fields = dict(line.split(' ', 1) for line in stats.splitlines() if ' ' in line)
+                self.assertEqual(int(fields['dcc_running']),
+                                 max(0, int(fields['dcc_current_load']) - 1))
             for diagnostic in ('dcc_num_procstate_D', 'dcc_max_RSS', 'dcc_max_RSS_name'):
                 self.assertNotIn(diagnostic + ' ', stats)
         hosts = " ".join(self.host(i, f",stats={self.stats_ports[i]},speed={speed}")

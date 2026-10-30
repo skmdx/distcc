@@ -405,7 +405,6 @@ static void dcc_service_stats_request(int http_fd) {
     struct dcc_server_load load = { .busy = -1, .queued = -1, .links = -1,
                                     .preparing = -1, .returning = -1 };
     int admission = 0, available = -1, capacity = -1;
-    int running = dcc_getcurrentload();
     double memory_pressure = -1;
     unsigned long long ready_idle_ns = 0;
     unsigned long parallel_tasks = 0;
@@ -513,7 +512,6 @@ dcc_free_mem %d MB\n\
     ready_idle_ns = dcc_tcp_ready_idle_ns();
     parallel_tasks = dcc_tcp_async_tasks();
     parallel_peak = dcc_tcp_async_peak();
-    if (running > 0) running--; /* Exclude this statistics request itself. */
 #endif
 
     free_space_mb = dcc_get_tmpdirinfo();
@@ -529,6 +527,12 @@ dcc_free_mem %d MB\n\
     if (dcc_check_client((struct sockaddr *)&cli_addr,
                          (int) cli_len,
                          opt_allowed) == 0) {
+        /* Resource queries can outlast short client jobs. Sample load near
+         * reply construction, and report both fields from the same instant. */
+        int current_load = dcc_getcurrentload(), running = current_load;
+#ifdef __linux__
+        if (running > 0) running--; /* Exclude this statistics request itself. */
+#endif
         reply_len = snprintf(reply, sizeof(reply), replytemplate,
                                dcc_stats.counters[STATS_TCP_ACCEPT],
                                dcc_stats.counters[STATS_REJ_BAD_REQ],
@@ -549,7 +553,7 @@ dcc_free_mem %d MB\n\
                                dcc_stats.kids_avg[0],
                                dcc_stats.kids_avg[1],
                                dcc_stats.kids_avg[2],
-                               dcc_getcurrentload(),
+                               current_load,
                                loadavg[0], loadavg[1], loadavg[2],
                                running, load.busy, load.queued, load.preparing, load.returning,
                                capacity, dcc_resource_job_bytes(), dcc_resource_samples(),

@@ -1202,12 +1202,12 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;
             rs_trace("candidate host=%s work=%d capacity=%d cost=%.3f factor=%.3f prepare=%.3f start=%.3f score=%.3f wait=%d "
-                     "finish=%.6f blocked=%d busy=%d preparing=%d queued=%d leases=%d planned=%u "
+                     "finish=%.6f blocked=%d busy=%d preparing=%d queued=%d leases=%d direct=%d cpp=%d planned=%u "
                      "now=%.6f client=%td request=%.6f key=%llx",
                      p->host->hostname, work, cap ? cap->capacity : -1, cost,
                      forecast.factor, forecast.prepare, forecast.start, score, wait,
                      forecast.finish, blocked, cap ? cap->busy : -1, cap ? cap->preparing : -1,
-                     cap ? cap->queued : -1, p->busy, batch->count,
+                     cap ? cap->queued : -1, p->busy, p->direct, p->local ? broker->cpp_busy : 0, batch->count,
                      now, client - broker->clients, client->waiting_since,
                      (unsigned long long)client->hint.key);
             /* Without any input description there is no completion estimate
