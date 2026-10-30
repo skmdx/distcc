@@ -512,19 +512,20 @@ static int connected(int fd)
     return 0;
 }
 
-static void finish_probe(struct peer *peer, double now, int complete)
+static void finish_probe(struct peer *peer, double now, int complete, int cpp)
 {
     struct dcc_capacity metrics;
     peer->stats[peer->used] = '\0';
     if (complete && !dcc_parse_capacity(peer->stats, &metrics)) {
-        /* Direct compilers appear in system load, not daemon occupancy.
-         * Remove them while both observations refer to this snapshot; using
+        /* Direct compilers and input producers appear in system load, not
+         * daemon occupancy. Remove them at this snapshot; using
          * the later live lease count would turn completed jobs into external
          * CPU demand until the next probe. Project live leases at selection. */
-        rs_trace("capacity sample host=%s running=%d direct=%d now=%.6f",
-                 peer->host->hostname, metrics.running, peer->direct, now);
+        int owned = peer->direct + (peer->local ? cpp : 0);
+        rs_trace("capacity sample host=%s running=%d direct=%d cpp=%d now=%.6f",
+                 peer->host->hostname, metrics.running, peer->direct, peer->local ? cpp : 0, now);
         if (metrics.running >= 0)
-            metrics.running = metrics.running > peer->direct ? metrics.running - peer->direct : 0;
+            metrics.running = metrics.running > owned ? metrics.running - owned : 0;
         peer->metrics = metrics;
         peer->observed_serial = peer->probe_serial;
         peer->completed = 0;
@@ -535,7 +536,7 @@ static void finish_probe(struct peer *peer, double now, int complete)
     peer->stats_fd = -1;
 }
 
-static void probe_event(struct peer *peer, double now)
+static void probe_event(struct peer *peer, double now, int cpp)
 {
     static const char request[] = "GET / HTTP/1.0\r\n\r\n";
     ssize_t n;
@@ -543,7 +544,7 @@ static void probe_event(struct peer *peer, double now)
         if (connected(peer->stats_fd) ||
             send(peer->stats_fd, request, sizeof(request) - 1, MSG_NOSIGNAL) !=
             sizeof(request) - 1) {
-            finish_probe(peer, now, 0);
+            finish_probe(peer, now, 0, cpp);
             return;
         }
         peer->stats_reading = 1;
@@ -553,9 +554,9 @@ static void probe_event(struct peer *peer, double now)
     if (n > 0) {
         peer->used += n;
         if (peer->used == sizeof(peer->stats) - 1)
-            finish_probe(peer, now, 0);
+            finish_probe(peer, now, 0, cpp);
     } else if (!n || (errno != EAGAIN && errno != EINTR)) {
-        finish_probe(peer, now, !n);
+        finish_probe(peer, now, !n, cpp);
     }
 }
 
@@ -745,14 +746,20 @@ static void deliver_connection(struct broker *broker, struct client *client)
     client->state = ACTIVE;
 }
 
+static struct dcc_capacity observed_capacity(const struct peer *peer, int cpp)
+{
+    struct dcc_capacity cap = peer->metrics;
+    if (cap.running >= 0) cap.running += peer->direct + (peer->local ? cpp : 0);
+    if (cap.busy >= 0) cap.busy += peer->direct;
+    return cap;
+}
+
 /* Service time while executing, excluding the queue predicted below. Replace
  * this daemon's runnable compilers with the projected execution concurrency;
  * external CPU demand remains in the existing contention calculation. */
-static double execution_factor(const struct peer *peer, int work, int recovering, int capacity)
+static double execution_factor(const struct peer *peer, int work, int recovering, int capacity, int cpp)
 {
-    struct dcc_capacity cap = peer->metrics;
-    if (cap.running >= 0) cap.running += peer->direct;
-    if (cap.busy >= 0) cap.busy += peer->direct;
+    struct dcc_capacity cap = observed_capacity(peer, cpp);
     cap.capacity = capacity;
     if (recovering) cap.cpu_scale = 1;
     int parallel = cap.cpus < cap.jobs ? cap.cpus : cap.jobs;
@@ -818,7 +825,7 @@ static struct prediction predict(struct broker *broker, const struct client *cli
     const struct dcc_capacity *cap = &peer->metrics;
     int waiting = 0;
     for (unsigned i = 0; i < batch->count; ++i) waiting += batch->planned[i].peer == peer_index;
-    struct prediction result = {.factor = execution_factor(peer, work + waiting, recovering, capacity)};
+    struct prediction result = {.factor = execution_factor(peer, work + waiting, recovering, capacity, broker->cpp_busy)};
     int bulk = bulk_input(peer, &client->hint);
     double prepare = peer->prepare_cost[client->hint.kind - 1];
     if (!prepare) prepare = bulk ? 1.0 / (64 * 1048576) : peer->local ? .001 : .005;
@@ -1033,9 +1040,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     }
     for (i = 0; i < broker->count; i++) {
         struct peer *p = &broker->peers[i];
-        struct dcc_capacity observed = p->metrics;
-        if (observed.running >= 0) observed.running += p->direct;
-        if (observed.busy >= 0) observed.busy += p->direct;
+        struct dcc_capacity observed = observed_capacity(p, broker->cpp_busy);
         const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
         struct dcc_capacity projected;
         if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= DCC_WORK_CLASSES) {
@@ -1139,11 +1144,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * completion time. An uncompetitive host need not delay this job
              * just to refresh stale frequency telemetry. */
             int probe = !link && cap && cap->cpu_probe && work == 0 && now >= p->probe_after;
-            double score = probe ? execution_factor(p, work, 1, cap->capacity) :
+            double score = probe ? execution_factor(p, work, 1, cap->capacity, broker->cpp_busy) :
                                    dcc_capacity_score(p->host, cap, work);
             struct prediction forecast = {0};
             if ((client->hint.key || direct) && cap)
-                forecast.factor = execution_factor(p, work, probe, cap->capacity);
+                forecast.factor = execution_factor(p, work, probe, cap->capacity, broker->cpp_busy);
             int wait = 0;
             if (predicted) {
                 forecast = predict(broker, client, i, work, cost, now, batch, probe, cap->capacity, inflight);
@@ -1168,9 +1173,9 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * SMT lanes while independent physical cores remain unused. */
             if (staged && cap && !link && !link_backend && !direct && (predicted ||
                 (!blocked && work < dcc_capacity_jobs(p->host, cap)))) {
-                const struct dcc_capacity *observed = &p->metrics;
-                double external = (observed->running >= 0 ? observed->running : observed->load - p->direct)
-                                  - (observed->busy > 0 ? observed->busy : 0);
+                struct dcc_capacity live = observed_capacity(p, broker->cpp_busy);
+                double external = (live.running >= 0 ? live.running : live.load)
+                                  - (live.busy > 0 ? live.busy : 0);
                 int placement = work;
                 if (wait) {
                     int lanes = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
@@ -1183,13 +1188,13 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 double demand = placement + (external > 0 ? external : 0);
                 /* Include the CPU work displaced by this compile, notably
                  * client preprocessing on a machine that also runs a worker. */
-                double before = demand ? demand / execution_factor(p, placement - 1, probe, cap->capacity) : 0;
-                double gain = (demand + 1) / execution_factor(p, placement, probe, cap->capacity) - before;
+                double before = demand ? demand / execution_factor(p, placement - 1, probe, cap->capacity, broker->cpp_busy) : 0;
+                double gain = (demand + 1) / execution_factor(p, placement, probe, cap->capacity, broker->cpp_busy) - before;
                 /* At saturation there is no positive marginal throughput.
                  * Charge aggregate service demand instead of dropping the
                  * penalty or dividing by numerical noise. This finite bound
                  * also lets the least costly host progress when all are busy. */
-                double penalty = (demand + 1) * execution_factor(p, placement, probe, cap->capacity);
+                double penalty = (demand + 1) * execution_factor(p, placement, probe, cap->capacity, broker->cpp_busy);
                 if (gain > 0 && gain * penalty > 1) penalty = 1 / gain;
                 double throughput = forecast.start + (cost > 0 ? cost : 1) * penalty;
                 if (!predicted || throughput > score) score = throughput;
@@ -1660,7 +1665,7 @@ int dcc_broker_serve(const char *path)
             if (clients && p->full_until > now && p->full_until < wake_at) wake_at = p->full_until;
             if (clients && p->link_until > now && p->link_until < wake_at) wake_at = p->link_until;
             if (p->stats_fd >= 0 && now >= p->deadline)
-                finish_probe(p, now, 0);
+                finish_probe(p, now, 0, broker->cpp_busy);
             stats_index[i] = -1;
             if (p->stats_fd >= 0) {
                 if (p->deadline < wake_at)
@@ -1730,7 +1735,7 @@ int dcc_broker_serve(const char *path)
         now = now_seconds();
         for (i = 0; i < broker->count; i++)
             if (stats_index[i] >= 0 && polls[stats_index[i]].revents)
-                probe_event(&broker->peers[i], now);
+                probe_event(&broker->peers[i], now, broker->cpp_busy);
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *c = &broker->clients[i];
             if (control_index[i] < 0)

@@ -165,6 +165,28 @@ class BrokerDirectTest(BrokerTestCase):
         frontend = self.request(12)
         self.assertEqual(self.receive(frontend), (0, 1, []))
 
+    def test_completed_input_producers_do_not_become_external_load(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        def snapshot(running):
+            return stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                                  busy=0, queued=0, preparing=0, returning=0, running=running)
+        local = self.peer(snapshot(0))
+        remote = self.peer(snapshot(0), address='127.0.0.2')
+        self.start_broker(self.host(0, f',tcp,stats={local.port}', slots=4) +
+                          f' 127.0.0.2:{self.ports[1]}/4,tcp,stats={remote.port},speed=0.8')
+        leases = [self.request(12) for _ in range(4)]
+        for index, lease in enumerate(leases):
+            self.assertEqual(self.receive(lease), (0, index+1, []))
+        local.response = snapshot(4)
+        deadline = time.monotonic()+3
+        while 'running=4 direct=0 cpp=4' not in (self.work/'broker.log').read_text():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        for lease in leases: lease.close()
+        # The same snapshot remains valid, but none of its input producers
+        # still runs. Their lease closure must free demand before another probe.
+        self.assertEqual(self.receive(self.request(15)), (0, 1, []))
+
     def test_automatic_frontend_uses_client_memory_admission(self):
         peer = self.peer(stats_response(cpus=2, jobs=2, capacity=0,
                         busy=0, queued=0, preparing=0, returning=0, running=0))

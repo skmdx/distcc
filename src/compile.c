@@ -883,7 +883,11 @@ dcc_build_somewhere(char *argv[],
     /* Emit frontend IR once. The worker optimizes and generates machine code
      * without needing a second preprocessing pass or a header snapshot. */
     if (remote_frontend) {
-        if ((ret = dcc_frontend_prepare(argv, &prepared_job))) goto fallback;
+        if ((ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
+        ret = dcc_frontend_prepare(argv, &prepared_job);
+        dcc_unlock(local_cpu_lock_fd);
+        local_cpu_lock_fd = -1;
+        if (ret) goto fallback;
     }
     if (!prepared_job && !preprocess_only && !dcc_scan_includes && dcc_cpp_ir(argv, input_fname))
         unsetenv("INCLUDE_SERVER_PORT");

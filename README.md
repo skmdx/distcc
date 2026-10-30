@@ -255,9 +255,10 @@ bounded below by 1. Work beyond the execution limit queues rather than adding
 throughput. Estimated service time is `max(1, demand / throughput) / speed`.
 The broker takes the larger estimate from projected work and runnable system
 load, without multiplying or adding these overlapping contention penalties.
-Direct local compilers are removed from the runnable snapshot when it arrives
-and projected using their live leases. Completed local jobs therefore release
-their CPU demand immediately instead of remaining as apparent external load.
+Direct local compilers and client input producers are removed from the runnable
+snapshot when it arrives and projected using their live leases. Completed local
+work therefore releases its CPU demand immediately instead of remaining as
+apparent external load.
 Faster SMT threads can still beat idle cores on a slower host.
 Parallelism is the smallest of CPUs, the server's job limit and its reported
 memory admission capacity. Legacy paths use the larger of local reservations
@@ -685,6 +686,10 @@ files and headers on demand through the existing job connection. This skips
 both include-server analysis and local IR generation. Use matching Clang
 frontend libraries on the client and workers. GCC and offload compilation
 continue using their existing input preparation.
+
+Client driver planning shares the automatic local input-preparation budget.
+Its lease is released before worker selection, so completed planning does not
+keep the client apparently busy or reserve a worker while awaiting a local CPU.
 
 Each daemon worker loads the Clang libraries once and forks a separate compiler
 child for each job. This avoids repeated library loading without sharing macro,
