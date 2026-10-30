@@ -20,6 +20,7 @@ class LocalClangTest(BrokerTestCase):
         self.compiler = compiler
         self.broker = self.start_broker()
         self.env.update(DISTCC_HOSTS='localhost/4', DISTCC_CLANG_LOCAL='1', DISTCC_VERBOSE='1',
+                        DISTCC_CLANG_CODEGEN='1',
                         DISTCC_LOG=str(self.work/'client.log'),
                         PATH=str(self.build)+os.pathsep+self.env['PATH'])
 
@@ -125,6 +126,74 @@ class LocalClangTest(BrokerTestCase):
         log = (self.work/'client.log').read_text()
         self.assertEqual(log.count('started local compiler libraries'), 1)
         self.assertEqual(log.count('reused local compiler libraries'), 2)
+
+    def test_codegen_uses_spare_leases_and_preserves_result(self):
+        self.check_codegen(False)
+
+    def test_codegen_finishes_when_no_extra_cpu_is_available(self):
+        self.check_codegen(True)
+
+    def test_codegen_cpp_preserves_exceptions_and_static_initialization(self):
+        self.check_codegen(False, True)
+
+    def test_codegen_with_alternate_installed_llvm(self):
+        compiler = shutil.which('clang-22')
+        if not compiler: self.skipTest('alternate LLVM release unavailable')
+        self.check_codegen(False, compiler=compiler)
+
+    def test_codegen_does_not_publish_failed_assembly(self):
+        self.start_local()
+        (self.work/'broken.c').write_text('void f(void) { __asm__("not_a_distcc_instruction"); }\n')
+        for reused in (False, True):
+            result = self.command(['-c', 'broken.c', '-o', 'broken.o'], reused)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b'error:', result.stderr)
+            self.assertFalse((self.work/'broken.o').exists())
+
+    def check_codegen(self, occupied, cpp=False, compiler=None):
+        self.start_local()
+        if compiler: self.compiler = compiler
+        if cpp:
+            cxx = shutil.which('clang++')
+            if not cxx: self.skipTest('C++ driver required')
+            self.compiler = cxx
+        saved = dict(self.env)
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='codegen')
+        saved.update({key: self.env[key] for key in ('DISTCC_HOSTS', 'DISTCC_BROKER')})
+        self.env = dict(saved, DISTCC_CLANG_CODEGEN='1')
+        if occupied:
+            for _ in range(3):
+                self.assertEqual(self.receive(self.request(15)), (0, 1, []))
+        source = self.work/'codegen.c'
+        source.write_text('#include <stdio.h>\nstatic unsigned value = 7;\n'
+                          '_Thread_local unsigned thread_value = 3;\n' +
+                          '\n'.join(f'__attribute__((noinline)) unsigned f{i}(unsigned n) {{ '
+                                    f'for (unsigned j=0;j<100;j++) n=(n*33+{i}+value)^thread_value; return n; }}'
+                                    for i in range(8)) +
+                          '\nint main(void) { for (unsigned i=0;i<20;i++) printf("%u\\n", ' +
+                          '+'.join(f'f{i}(i)' for i in range(8)) + '); return 0; }\n')
+        if cpp:
+            source.write_text('#include <vector>\nstatic std::vector<unsigned> values{4, 8, 12};\n' +
+                              source.read_text().replace('_Thread_local', 'thread_local')
+                              .replace('return n; }', 'try { if (n&1) throw n; return n+values[0]; } '
+                                       'catch (unsigned v) { return v+values[1]; } }'))
+        # The first serial job supplies measured codegen cost to the shared
+        # compiler parent. No guessed throughput or fixed size cutoff is used.
+        warm = self.command(['-O3', '-c', 'codegen.c', '-o', 'codegen.o'])
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+        expected = None
+        for reused in (False, True):
+            result = self.command(['-O3', '-g', '-ffunction-sections', '-fdata-sections',
+                                   '-MMD', '-MF', 'codegen.d', '-c', 'codegen.c', '-o', 'codegen.o'], reused)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            subprocess.run([self.compiler, 'codegen.o', '-o', 'codegen'], cwd=self.work,
+                           capture_output=True, check=True)
+            actual = (subprocess.check_output([str(self.work/'codegen')]),
+                      (self.work/'codegen.d').read_bytes())
+            if expected is None: expected = actual
+            else: self.assertEqual(actual, expected)
+        self.assertEqual(b'distcc codegen:' in result.stderr, not occupied,
+                         result.stderr.decode() + (self.work/'client.log').read_text())
 
     def test_available_frontend_releases(self):
         self.start_local()

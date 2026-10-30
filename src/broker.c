@@ -22,6 +22,7 @@
 #include "hosts.h"
 #include "adaptive.h"
 #include "broker.h"
+#include "broker_protocol.h"
 #include "resource.h"
 #include <netinet/tcp.h>
 #include "exitcode.h"
@@ -36,21 +37,9 @@
  * The control connection is a lease: EOF releases the reserved slot. Bulk
  * compiler traffic goes directly over the descriptor sent with the reply.
  * Only an explicit RETURN with a descriptor can populate the idle pool. */
-#define BROKER_VERSION 2
 #define MAX_HOSTS 128
 #define MAX_CLIENTS 256
-enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3, MEMO_GET = 4, MEMO_PUT = 5,
-       ACQUIRE_POOL = 6, RETURN = 7, ACQUIRE_LINK = 8, ACQUIRE_CPP = 9,
-       ACQUIRE_READY = 10, FAILED = 11, LOCAL_CPP = 12, LOCAL_ANALYSIS = 13, DEFER = 14,
-       TRY_LOCAL = 15, WORKER_GET = 16, WORKER_PUT = 17 };
 #define MAX_MEMOS 32
-/* The caller can compile its original command locally. Backend-only clients
- * still require a connected worker socket, even on this machine. */
-#define CLIENT_COMPILE (1u << 16)
-struct request { uint32_t version, command; };
-struct feedback { uint64_t prepare_ns, queue_ns, execute_ns; };
-struct reply { int32_t status, slots; char host[1024]; };
-
 struct peer {
     struct dcc_hostdef *host;
     struct sockaddr_storage address;

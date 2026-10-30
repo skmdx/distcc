@@ -707,6 +707,15 @@ cancels the invocation, and closing the broker cache releases idle helpers.
 This evaluation path requires the selected Clang release's `clang_native`
 extension and keeps the caller's filesystem, credentials and sandbox context.
 
+`DISTCC_CLANG_CODEGEN=1` evaluates parallel code generation inside that local
+compiler path. Clang first optimizes the complete translation unit, then the
+existing LLVM splitter and relocatable linker preserve ownership and local
+symbols across machine-code partitions. Additional CPUs require immediate
+broker leases; an occupied machine continues with one compiler. The helper
+learns serial code-generation cost and split/merge overhead from completed jobs
+in its own compiler environment, and partitions only when that estimate favors
+it. LTO and other output formats retain their existing paths.
+
 Read requests are limited to the invocation's input and include directories.
 Directory metadata is batched, file contents use the existing LZ4 transfer,
 and workers reuse the shared file cache across jobs. Cache identity includes

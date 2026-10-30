@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <functional>
+#include "clang_codegen.h"
 
 LLD_HAS_DRIVER(elf)
 
@@ -83,6 +84,7 @@ PyObject *run(PyObject *, PyObject *input) {
                 instance.createDiagnostics();
                 if (!clang::CompilerInvocation::CreateFromArgs(*invocation,
                     llvm::ArrayRef(command).drop_front(2), instance.getDiagnostics(), args[0])) return 1;
+                if (auto result = dcc_clang_codegen(instance)) return *result ? 0 : 1;
                 return clang::ExecuteCompilerInvocation(&instance) ? 0 : 1;
             };
             // The enclosing driver is already a per-invocation child. A single
@@ -119,6 +121,7 @@ PyMethodDef methods[] = {{"run", run, METH_O, "Run the compiler's own driver and
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_native", nullptr, -1, methods, nullptr, nullptr, nullptr, nullptr};
 }
 PyMODINIT_FUNC PyInit_clang_native() {
+    dcc_clang_codegen_init();
     llvm::InitializeAllTargetInfos(); llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs(); llvm::InitializeAllAsmParsers(); llvm::InitializeAllAsmPrinters();
     return PyModule_Create(&module);

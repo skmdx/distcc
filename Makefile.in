@@ -207,6 +207,8 @@ include_server_SRC = \
 	include_server/c_extensions/clang_scan.cpp \
 	include_server/c_extensions/clang_compile.cpp \
 	include_server/c_extensions/clang_native.cpp \
+	include_server/c_extensions/clang_codegen.cpp \
+	include_server/c_extensions/clang_codegen.h \
 	include_server/native_worker.py
 
 update_distcc_symlinks_PY = update-distcc-symlinks.py
@@ -428,7 +430,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c src/workload.c src/clang_worker.c 
 	src/gcc_scan.cc src/gcc_scan_inputs.cc include_server/build_gcc_scan.py
 
 
-HEADERS = src/stats.h src/adaptive.h src/broker.h src/cpuperf.h src/workload.h src/file_cache.h	\
+HEADERS = src/stats.h src/adaptive.h src/broker.h src/broker_protocol.h src/cpuperf.h src/workload.h src/file_cache.h	\
 	src/access.h							\
 	src/auth.h							\
 	src/bulk.h							\
@@ -703,13 +705,14 @@ distccmon-gnome@EXEEXT@: $(mon_obj) $(gnome_obj)
 # The include-server is a python app, so we use Python's build system.  We pass
 # the distcc version, the source location, the CPP flags (for location of the
 # includes), and the build location.
-include-server:
+include-server: $(LTO_BUILD)/SplitModule.cpp
 	if test -z "$(PYTHON)"; then	\
 	  echo "Not building $@: No suitable python found"; \
 	else						\
 	  mkdir -p "$(include_server_builddir)" &&      \
 	  DISTCC_VERSION="$(VERSION)"			\
 	  SRCDIR="$(srcdir)"                            \
+	  LTO_BUILD="$(LTO_BUILD)"                     \
 	  CFLAGS="$(CFLAGS) $(PYTHON_CFLAGS)"           \
 	  CC="$(CC)" CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" \
 	  LDFLAGS="$(LDFLAGS)"                          \

@@ -233,12 +233,19 @@ for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.paths
   ))
   frontends.append(setuptools.Extension(
       name='include_server.clang' + major + '.clang_native',
-      sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_native.cpp')],
-      language='c++', include_dirs=[llvm_option('--includedir', config)],
+      sources=[os.path.join(srcdir_include_server, 'c_extensions', name)
+               for name in ('clang_native.cpp', 'clang_codegen.cpp')]
+              + [os.path.join(srcdir, 'src', 'lto_partition.cc'),
+                 os.path.join(os.environ.get('LTO_BUILD', 'llvm-lto'), 'SplitModule.cpp')],
+      depends=[os.path.join(srcdir, 'src', name) for name in
+               ('broker_protocol.h', 'workload.h', 'lto_partition.h')]
+              + [os.path.join(srcdir_include_server, 'c_extensions', 'clang_codegen.h')],
+      language='c++', include_dirs=[llvm_option('--includedir', config), os.path.join(srcdir, 'src')],
       library_dirs=[library], runtime_library_dirs=[runtime],
       libraries=['clang-cpp', 'lldELF', 'lldCommon', 'LLVM'],
       extra_compile_args=['-std=c++17', '-g0'],
-      define_macros=[('DCC_LLD_PATH', '"' + os.path.join(bindir, 'ld.lld') + '"')],
+      define_macros=[('DCC_LLD_PATH', '"' + os.path.join(bindir, 'ld.lld') + '"'),
+                     ('DCC_OBJCOPY_PATH', '"' + os.path.join(bindir, 'llvm-objcopy') + '"')],
   ))
 
 class VersionedBuildExt(build_ext):
