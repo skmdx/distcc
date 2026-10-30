@@ -514,6 +514,8 @@ Phase totals sum overlapping jobs and are not elapsed wall time. Worker CPU
 utilization includes unrelated host activity. Detailed logs and profiling have
 overhead; compare results collected with the same instrumentation. One build
 can verify distribution; use repeated builds to assess timing variation.
+Use the [build-time model](doc/performance-model.md) to derive capacity and
+dependency bounds before choosing a performance change.
 For long builds, `perf.call_graph` and `perf.frequency` control profiling cost.
 To resume a failed build, set `build_root` to its retained `build-N` directory
 and `repetitions` to 1. Portage reuses its preserved work tree. Incremental
