@@ -119,6 +119,15 @@ earlier. A faster invocation only shortens the build to the extent that it
 advances the completion barrier. Check both that barrier and the host-capacity
 budget before adding partitioning or speculative duplicate execution.
 
+For local code generation, the splitter hands verified IR directly to a child
+through `fork`. Partition construction overlaps earlier children, and the last
+partition uses the caller's existing CPU lease. This removes bitcode encoding,
+file input/output and decoding from that path without changing optimization or
+partition ownership. The network backend still serializes partitions because
+its consumer is outside the process tree. Count these avoided operations as
+reduced work, not as an equal reduction in build wall time: parallel phases and
+the build's completion barrier determine the observable saving.
+
 ## Evidence required for adoption
 
 Derive the expected saving and its limiting assumptions before changing the

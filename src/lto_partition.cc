@@ -13,8 +13,9 @@
 
 using namespace llvm;
 
-Expected<json::Value> dcc_partition_module(Module &module, unsigned count,
-                                         StringRef prefix) {
+Expected<std::vector<std::string>>
+dcc_split_module(Module &module, unsigned count,
+                 function_ref<Error(Module &, bool)> consume) {
   auto definitions = llvm::count_if(module, [](const Function &function) {
     return !function.isDeclarationForLinker();
   });
@@ -41,10 +42,41 @@ Expected<json::Value> dcc_partition_module(Module &module, unsigned count,
     });
   }
 
-  json::Array parts;
-  auto write = [&](const Module &part) -> Error {
+  auto emit = [&](Module &part, bool last) -> Error {
     if (verifyModule(part, &errs()))
       return createStringError("invalid LLVM partition");
+    return consume(part, last);
+  };
+  std::vector<std::string> names;
+  if (count < 2 || keepAssemblyTogether) {
+    if (auto error = emit(module, true))
+      return std::move(error);
+  } else {
+    std::vector<GlobalValue *> locals;
+    for (auto &global : module.global_values())
+      if (global.hasLocalLinkage())
+        locals.push_back(&global);
+    Error failure = Error::success();
+    unsigned index = 0;
+    dccSplitModule(module, count, [&](std::unique_ptr<Module> part) {
+      if (!failure)
+        failure = emit(*part, ++index == count);
+    }, false, true);
+    if (failure)
+      return std::move(failure);
+    for (auto *local : locals) {
+      SmallString<128> name;
+      Mangler::getNameWithPrefix(name, local->getName(), module.getDataLayout());
+      names.push_back(name.str().str());
+    }
+  }
+  return names;
+}
+
+Expected<json::Value> dcc_partition_module(Module &module, unsigned count,
+                                         StringRef prefix) {
+  json::Array parts;
+  auto names = dcc_split_module(module, count, [&](Module &part, bool) -> Error {
     auto path = (prefix + Twine(parts.size()) + ".bc").str();
     std::error_code error;
     raw_fd_ostream output(path, error, sys::fs::OF_None);
@@ -60,29 +92,11 @@ Expected<json::Value> dcc_partition_module(Module &module, unsigned count,
     parts.push_back(json::Object{{"path", std::move(path)},
                                  {"instructions", instructions}});
     return Error::success();
-  };
-  json::Array names;
-  if (count < 2 || keepAssemblyTogether) {
-    if (auto error = write(module))
-      return std::move(error);
-  } else {
-    std::vector<GlobalValue *> locals;
-    for (auto &global : module.global_values())
-      if (global.hasLocalLinkage())
-        locals.push_back(&global);
-    Error failure = Error::success();
-    dccSplitModule(module, count, [&](std::unique_ptr<Module> part) {
-      if (!failure)
-        failure = write(*part);
-    }, false, true);
-    if (failure)
-      return std::move(failure);
-    for (auto *local : locals) {
-      SmallString<128> name;
-      Mangler::getNameWithPrefix(name, local->getName(), module.getDataLayout());
-      names.push_back(name.str().str());
-    }
-  }
+  });
+  if (!names)
+    return names.takeError();
+  json::Array locals;
+  for (auto &name : *names) locals.push_back(std::move(name));
   return json::Value(json::Object{{"parts", std::move(parts)},
-                                  {"locals", std::move(names)}});
+                                  {"locals", std::move(locals)}});
 }

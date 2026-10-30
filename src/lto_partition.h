@@ -6,6 +6,8 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace llvm {
 class Module;
@@ -14,7 +16,15 @@ void dccSplitModule(Module &, unsigned,
                     function_ref<void(std::unique_ptr<Module>)>, bool, bool);
 }
 
-// The caller owns the prepared module and will not resume its backend.
+// Consume verified partitions while their IR is alive. The callback may fork
+// before returning; the last partition can use the caller's execution lane.
+// The original module is modified and must not resume its backend. The returned
+// names identify promoted local symbols to restore after the relocatable merge.
+llvm::Expected<std::vector<std::string>>
+dcc_split_module(llvm::Module &, unsigned count,
+                 llvm::function_ref<llvm::Error(llvm::Module &, bool last)>);
+
+// File transport for backends that execute outside this process tree.
 llvm::Expected<llvm::json::Value>
 dcc_partition_module(llvm::Module &module, unsigned count, llvm::StringRef prefix);
 

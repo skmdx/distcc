@@ -177,6 +177,28 @@ class LocalClangTest(BrokerTestCase):
             self.assertIn(b'error:', result.stderr)
             self.assertFalse((self.work/'broken.o').exists())
 
+    def test_codegen_partition_failure_releases_leases(self):
+        self.check_codegen(False)
+        source = self.work/'codegen.c'
+        valid = source.read_text()
+        # Keep the same substantial partitionable module as the successful
+        # invocation, but make every backend fail in its assembler.
+        source.write_text(valid.replace('for (unsigned j=0;',
+                          '__asm__("not_a_distcc_instruction"); ' * 512 + 'for (unsigned j=0;'))
+        (self.work/'codegen.o').unlink()
+        failed = self.command(['-O3', '-c', 'codegen.c', '-o', 'codegen.o'])
+        self.assertNotEqual(failed.returncode, 0, failed.stderr)
+        self.assertIn(b'cannot emit LLVM partition', failed.stderr)
+        self.assertFalse((self.work/'codegen.o').exists())
+        self.assertFalse(list(self.work.glob('distcc-codegen*')))
+        source.write_text(valid)
+        result = self.command(['-O3', '-c', 'codegen.c', '-o', 'codegen.o'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Profitability learning may now prefer serial execution. Check the
+        # actual lease pool, independently of that advisory choice.
+        leases = [self.request(15) for _ in range(4)]
+        for lease in leases: self.assertEqual(self.receive(lease), (0, 1, []))
+
     def check_codegen(self, occupied, cpp=False, compiler=None):
         self.start_local()
         if compiler: self.compiler = compiler
