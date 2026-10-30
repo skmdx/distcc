@@ -280,6 +280,7 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
     hint.kind = job->kind == DCC_JOB_RUST ? DCC_WORK_RUST :
                 job->kind == DCC_JOB_OFFLOAD_LINK ? DCC_WORK_OFFLOAD_LINK : DCC_WORK_THINLTO;
     hint.bytes = dcc_resource_input_bytes(job);
+    hint.memory_class = dcc_resource_class(job);
     hint.key = (uint64_t)ntohl(estimate[0]) << 32 | ntohl(estimate[1]);
     uint64_t key = hint.key ? 0 : XXH3_64bits(job->cwd, strlen(job->cwd));
     for (unsigned i = 0; i < job->count; ++i) {

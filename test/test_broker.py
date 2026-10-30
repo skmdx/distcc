@@ -83,13 +83,16 @@ class BrokerTestCase(DistccTestCase):
                         TMPDIR=str(self.work))
         return proc
 
-    def request(self, command=1, work=(0, 0, 0), work_units=0, family=0):
+    def request(self, command=1, work=(0, 0, 0), work_units=0, family=0, memory_class=None):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
         payload = struct.pack("=II", 2, command)
         if command & 65535 in (6, 9, 10, 15):
-            payload += struct.pack('=QQIIQ', *work, work_units, family)
+            if memory_class is None:
+                kind = {7: 3, 8: 4, 10: 5}.get(work[2], 1 if 4 <= work[2] <= 6 else 0)
+                memory_class = 1 + kind * 64 + max(0, work[1].bit_length() - 1) if work[0] else 0
+            payload += struct.pack('=QQIIQQ', *work, work_units, family, memory_class)
         sock.sendall(payload)
         self.addCleanup(sock.close)
         return sock
@@ -105,8 +108,8 @@ class BrokerTestCase(DistccTestCase):
             descriptors.extend(array.array("i", data))
         return status, slots, descriptors
 
-    def acquire_reserved(self, command=6, work=(0, 0, 0), work_units=0, family=0):
-        lease = self.request(command, work, work_units, family)
+    def acquire_reserved(self, command=6, work=(0, 0, 0), work_units=0, family=0, memory_class=None):
+        lease = self.request(command, work, work_units, family, memory_class)
         status, capabilities, fds = self.receive(lease)
         self.assertEqual(status, 0)
         self.assertTrue(capabilities & (1 << 30))
@@ -1134,6 +1137,24 @@ class BrokerTest(BrokerTestCase):
 
     def test_prepared_input_uses_its_class_capacity_after_small_jobs(self):
         self.check_prepared_class_capacity(1)
+
+    def test_frontend_uses_worker_class_for_capacity_and_pending_memory(self):
+        for capacity in (1, 4):
+            with self.subTest(capacity=capacity):
+                first = self.peer(stats_response(cpus=4, jobs=4, capacity=4,
+                    busy=0, queued=0, preparing=0, returning=0, running=0,
+                    pump_capacity=[1] * 64, frontend_capacity=capacity,
+                    memory_headroom_bytes=1024**3, job_memory_bytes=1536 * 1024**2,
+                    frontend_memory=256 * 1024**2))
+                second = self.peer(stats_response(cpus=4, jobs=4, capacity=4,
+                    busy=0, queued=0, preparing=0, returning=0, running=0))
+                self.start_broker(self.host(0, f',tcp,stats={first.port},speed=2') + ' ' +
+                                  self.host(1, f',tcp,stats={second.port}'), name=f'frontend-{capacity}')
+                for index in range(2):
+                    _, net = self.acquire_reserved(10, (940 + index, 1024**2, 5),
+                                                   memory_class=1 + 6 * 64)
+                    expected = self.ports[1] if index and capacity == 1 else self.ports[0]
+                    self.assertEqual(net.getpeername()[1], expected)
 
     def test_gpu_uses_compile_memory_capacity(self):
         self.check_prepared_class_capacity(9)

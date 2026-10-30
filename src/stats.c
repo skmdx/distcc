@@ -460,6 +460,7 @@ dcc_pump_capacity %s\n\
 dcc_rust_capacity %s\n\
 dcc_thinlto_capacity %s\n\
 dcc_offload_capacity %s\n\
+dcc_frontend_capacity %d\n\
 dcc_memory_headroom_bytes %llu\n\
 dcc_memory_reserved_bytes %llu\n\
 dcc_compile_memory %s\n\
@@ -467,6 +468,7 @@ dcc_pump_memory %s\n\
 dcc_rust_memory %s\n\
 dcc_thinlto_memory %s\n\
 dcc_offload_memory %s\n\
+dcc_frontend_memory %llu\n\
 dcc_local_input_jobs %llu\n\
 dcc_local_input_bytes %llu\n\
 dcc_tcp_ready_idle_ns %llu\n\
@@ -550,8 +552,10 @@ dcc_free_mem %d MB\n\
                                capacity, dcc_resource_job_bytes(), dcc_resource_samples(),
                                dcc_resource_peak_bytes(), dcc_resource_spare_bytes(),
                                compile_capacity, pump_capacity, rust_capacity, thinlto_capacity, offload_capacity,
+                               dcc_resource_class_slots(cpu_limit, 1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS, load.reserved),
                                dcc_resource_headroom(load.reserved), load.reserved,
                                compile_memory, pump_memory, rust_memory, thinlto_memory, offload_memory,
+                               dcc_resource_estimate(1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS),
                                (unsigned long long)dcc_tcp_local_input_jobs(),
                                (unsigned long long)dcc_tcp_local_input_bytes(),
                                ready_idle_ns, parallel_tasks, parallel_peak,

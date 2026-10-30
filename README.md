@@ -601,6 +601,10 @@ the memory cost of leases not yet represented by the worker's reservations befor
 placing more work, including input preparation across snapshot refreshes. A large
 in-flight job can consume several small-job memory slots. Selection and queue bounds
 use the incoming job's capacity, not the last completed job's memory estimate.
+Lazy Clang frontend jobs have no uploaded input tree; their learned capacity and
+memory estimate are reported as `dcc_frontend_capacity` and `dcc_frontend_memory`.
+The broker uses the actual worker job's resource class for both capacity and
+pending reservations.
 Leave learning unset to keep a fixed estimate.
 
 To avoid copying ordinary preprocessed input to a server on the same machine,

@@ -34,12 +34,14 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
                    cpu_scale: float | str = -1, cpu_age: float | str = -1,
                    cpu_probe: float | str = 0,
                    compile_capacity=None, pump_capacity=None, rust_capacity=None, thinlto_capacity=None,
-                   offload_capacity=None,
+                   offload_capacity=None, frontend_capacity=None,
                    memory_headroom_bytes: int | float | str = 16 * 1024**3,
                    memory_reserved_bytes: int | float | str = 0,
                    job_memory_bytes: int | float | str = 256 * 1024**2,
                    compile_memory=None, pump_memory=None, rust_memory=None, thinlto_memory=None,
-                   offload_memory=None, **metrics):
+                   offload_memory=None, frontend_memory=None, **metrics):
+    if frontend_capacity is None: frontend_capacity = metrics.get('capacity', jobs)
+    if frontend_memory is None: frontend_memory = job_memory_bytes
     if compile_capacity is None:
         compile_capacity = [metrics.get('capacity', jobs)] * 64
     capacities = compile_capacity if isinstance(compile_capacity, str) else ','.join(map(str, compile_capacity))
@@ -71,6 +73,8 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
             f"dcc_rust_capacity {rust}\n"
             f"dcc_thinlto_capacity {thinlto}\n"
             f"dcc_offload_capacity {offload}\n"
+            f"dcc_frontend_capacity {frontend_capacity}\n"
+            f"dcc_frontend_memory {frontend_memory}\n"
             f"dcc_memory_headroom_bytes {memory_headroom_bytes}\n"
             f"dcc_memory_reserved_bytes {memory_reserved_bytes}\n"
             f"dcc_job_memory_bytes {job_memory_bytes}\n"

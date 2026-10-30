@@ -10,6 +10,8 @@
 #include <sys/stat.h>
 #include <xxhash.h>
 #include "workload.h"
+#include "job.h"
+#include "resource.h"
 
 static uint64_t source_family(const char *path, const char *compiler, unsigned kind)
 {
@@ -82,6 +84,8 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
         st.st_size <= 512LL * 1024 * 1024)
         hint->work_units = st.st_size;
     hint->kind = gpu && !host_only ? DCC_WORK_OFFLOAD : kind + (ready ? 0 : 3);
+    hint->memory_class = 1 + (ready ? DCC_JOB_COMPILE : DCC_JOB_PUMP) * DCC_MEMORY_BUCKETS +
+                         dcc_resource_bucket(hint->bytes);
     key = XXH3_64bits_withSeed(&hint->kind, sizeof(hint->kind), key);
     hint->key = key ? key : 1;
     if (!gpu) hint->family = source_family(input, argv[0], hint->kind);
@@ -89,6 +93,8 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
 
 int dcc_work_valid(const struct dcc_work_hint *hint)
 {
+    if (hint->memory_class > DCC_JOB_KIND_COUNT * DCC_MEMORY_BUCKETS ||
+        (!!hint->key != !!hint->memory_class)) return 0;
     /* Backend snapshots include dependency artifacts and compiler data;
      * their size is not bounded by the C/C++ preprocessor input limit. */
     if (hint->kind == DCC_WORK_RUST || hint->kind == DCC_WORK_THINLTO ||

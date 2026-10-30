@@ -877,13 +877,29 @@ static void observe(struct broker *broker, struct client *client, const struct f
              now, client - broker->clients, client->waiting_since, (unsigned long long)client->hint.family);
 }
 
-static unsigned long long memory_estimate(const struct dcc_capacity *cap,
-                                         const struct dcc_work_hint *hint)
+static unsigned long long memory_forecast(const struct dcc_capacity *cap,
+                                          const struct dcc_work_hint *hint, int *slots)
 {
-    if (hint->kind < 1 || hint->kind > DCC_WORK_CLASSES) return cap->job_memory;
-    unsigned kind = hint->kind == DCC_WORK_OFFLOAD_LINK ? 4 : hint->kind == DCC_WORK_THINLTO ? 3 : hint->kind == DCC_WORK_RUST ? 2 :
-                    hint->kind >= 4 && hint->kind <= 6 ? 1 : 0;
-    return cap->memory_estimates[kind][dcc_resource_bucket(hint->bytes)];
+    if (slots) *slots = cap->capacity;
+    if (!hint->memory_class) return cap->job_memory;
+    unsigned kind = (hint->memory_class - 1) / DCC_MEMORY_BUCKETS;
+    unsigned bucket = (hint->memory_class - 1) % DCC_MEMORY_BUCKETS;
+    if (kind == DCC_JOB_FRONTEND) {
+        if (slots) *slots = cap->frontend_capacity;
+        return cap->frontend_memory;
+    }
+    unsigned row;
+    const int *capacities;
+    switch (kind) {
+    case DCC_JOB_COMPILE: row = 0; capacities = cap->compile_capacity; break;
+    case DCC_JOB_PUMP: row = 1; capacities = cap->pump_capacity; break;
+    case DCC_JOB_RUST: row = 2; capacities = cap->rust_capacity; break;
+    case DCC_JOB_THINLTO: row = 3; capacities = cap->thinlto_capacity; break;
+    case DCC_JOB_OFFLOAD_LINK: row = 4; capacities = cap->offload_capacity; break;
+    default: return cap->job_memory;
+    }
+    if (slots) *slots = capacities[bucket];
+    return cap->memory_estimates[row][bucket];
 }
 
 static int cpp_limit(const struct broker *broker)
@@ -945,7 +961,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     for (i = 0; i < MAX_CLIENTS; ++i) {
         const struct client *c = &broker->clients[i];
         if (c->fd < 0 || c->peer < 0) continue;
-        unsigned long long bytes = memory_estimate(&broker->peers[c->peer].metrics, &c->hint);
+        unsigned long long bytes = memory_forecast(&broker->peers[c->peer].metrics, &c->hint, NULL);
         pending[c->peer] = bytes > UINT64_MAX - pending[c->peer] ? UINT64_MAX : pending[c->peer] + bytes;
         if (!c->direct && c->serial > broker->peers[c->peer].observed_serial) {
             recent[c->peer]++;
@@ -975,12 +991,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         struct dcc_capacity projected;
         if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= DCC_WORK_CLASSES) {
             projected = *cap;
-            const int *capacities = client->hint.kind == DCC_WORK_OFFLOAD_LINK ? cap->offload_capacity :
-                                    client->hint.kind == DCC_WORK_THINLTO ? cap->thinlto_capacity :
-                                    client->hint.kind == DCC_WORK_RUST ? cap->rust_capacity :
-                                    client->hint.kind >= 4 && client->hint.kind <= 6 ?
-                                    cap->pump_capacity : cap->compile_capacity;
-            int limit = capacities[dcc_resource_bucket(client->hint.bytes)];
+            int limit;
+            unsigned long long estimate = memory_forecast(cap, &client->hint, &limit);
             /* The snapshot's class capacity assumes no subsequent jobs have
              * reserved memory. Charge their own measured classes: one large
              * lease can consume several small-job memory slots. CPU counts
@@ -989,7 +1001,6 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 int occupied = cap->busy + recent[i];
                 int leased = p->busy - (cap->returning > 0 ? cap->returning : 0);
                 if (leased > occupied) occupied = leased;
-                unsigned long long estimate = memory_estimate(cap, &client->hint);
                 unsigned long long extra = headroom[i] / estimate;
                 if (limit > occupied && extra < (unsigned)(limit - occupied))
                     limit = occupied + (int)extra;

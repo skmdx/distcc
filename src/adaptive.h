@@ -16,6 +16,9 @@ struct dcc_capacity {
     int rust_capacity[DCC_MEMORY_BUCKETS];
     int thinlto_capacity[DCC_MEMORY_BUCKETS];
     int offload_capacity[DCC_MEMORY_BUCKETS];
+    /* Frontend jobs fetch inputs lazily and have no uploaded input tree. */
+    int frontend_capacity;
+    unsigned long long frontend_memory;
     unsigned long long memory_headroom, memory_reserved, job_memory;
     unsigned long long memory_estimates[5][DCC_MEMORY_BUCKETS];
 };

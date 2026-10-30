@@ -14,6 +14,7 @@ struct dcc_work_hint {
     uint64_t key, bytes;
     uint32_t kind, work_units; /* ThinLTO: LLVM instructions; other classes: source/input bytes. */
     uint64_t family; /* Source-content prior across command/configuration changes. */
+    uint64_t memory_class; /* Same resource class as the serialized worker job. */
 };
 struct dcc_work_class {
     double xx, xy, yy, xz, yz;

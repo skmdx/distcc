@@ -951,6 +951,8 @@ dcc_build_somewhere(char *argv[],
         work.bytes = dcc_resource_input_bytes(prepared_job);
     else if (!cpp_ready && (!prepared_job || prepared_job->kind != DCC_JOB_FRONTEND))
         work = (struct dcc_work_hint){0};
+    if (prepared_job && work.key)
+        work.memory_class = dcc_resource_class(prepared_job);
 
     /* Lock ordering invariant: always acquire the lock for the
      * remote host (if any) first. */

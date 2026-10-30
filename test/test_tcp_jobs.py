@@ -29,16 +29,36 @@ class FrontendTest(BrokerTestCase):
     def start_tcp(self):
         return self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
 
-    def start_frontend(self):
+    def start_frontend(self, **settings):
         clang = shutil.which('clang')
         if not clang:
             self.skipTest('Clang unavailable')
         self.restart_server(self.build / 'distccd', DISTCC_CLANG_DRIVER=str(self.build / 'distcc-clang'),
-                            DISTCCD_FILE_CACHE=str(self.work/'cache'))
+                            DISTCCD_FILE_CACHE=str(self.work/'cache'), **settings)
         self.start_tcp()
         self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
                         DISTCC_SKIP_LOCAL_RETRY='1', INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
         return clang
+
+    def test_remote_frontend_advertises_its_learned_memory_class(self):
+        clang = self.start_frontend(DISTCC_JOB_MEMORY='1536', DISTCC_MEMORY_LEARNING='1')
+        source = self.work/'frontend-memory.c'
+        source.write_text('int answer(void) { return 42; }\n')
+        before = self.get_stats(self.stats_ports[0])
+        self.assertIn('dcc_frontend_memory 1610612736\n', before)
+        for index in range(2):
+            result = subprocess.run([str(self.build/'distcc'), clang, '-O3', '-c', str(source),
+                                     '-o', str(self.work/f'frontend-memory-{index}.o')],
+                                    env=self.env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('frontend filesystem:', result.stderr)
+        after = self.get_stats(self.stats_ports[0])
+        match = re.search(r'dcc_frontend_memory (\d+)', after)
+        assert match is not None, after
+        estimate = int(match[1])
+        self.assertGreaterEqual(estimate, 256 * 1024**2)
+        self.assertLess(estimate, 1536 * 1024**2)
+        self.assertIn('dcc_job_memory_samples 2\n', after)
 
     def test_remote_frontend_owns_preprocessing_and_dependency_output(self):
         clang = self.start_frontend()
