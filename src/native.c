@@ -78,7 +78,7 @@ int dcc_read_driver(char **argv, char **text)
     if (!(probe[argc] = strdup("-###")) ||
         dcc_make_tmpnam("distcc_driver", ".txt", &file)) goto out;
     if (dcc_spawn_child(probe, &pid, "/dev/null", "/dev/null", file) ||
-        dcc_collect_child("compiler driver discovery", pid, &status, timeout_null_fd, NULL) || status ||
+        dcc_collect_child("compiler driver discovery", pid, &status, timeout_null_fd, NULL, NULL) || status ||
         stat(file, &st) || st.st_size > 1024 * 1024 || dcc_load_file_string(file, text)) goto out;
     ret = 0;
 out:

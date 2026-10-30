@@ -77,11 +77,11 @@ def serve(descriptor, frontend):
                     except ProcessLookupError: pass
                     selector.unregister(event.fileobj)
             for pid, peer in list(jobs.items()):
-                done, status = os.waitpid(pid, os.WNOHANG)
+                done, status, usage = os.wait4(pid, os.WNOHANG)
                 if done:
                     try: selector.unregister(peer)
                     except KeyError: pass
-                    try: peer.sendall(struct.pack('=I', status))
+                    try: peer.sendall(struct.pack('=2Q', status, round((usage.ru_utime + usage.ru_stime) * 1e9)))
                     except BrokenPipeError: pass
                     peer.close()
                     del jobs[pid]

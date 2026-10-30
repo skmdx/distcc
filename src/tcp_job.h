@@ -22,6 +22,7 @@ enum dcc_tcp_type {
 #define DCC_TCP_FLAGS (DCC_TCP_COMPRESSED | DCC_TCP_FINAL)
 #define DCC_TCP_CHUNK (256 * 1024)
 #define DCC_TCP_BYTES (512ULL * 1024 * 1024)
+#define DCC_TCP_RESULT_SIZE 72
 /* The parser buffers one frame, never a whole file. */
 struct dcc_tcp_frame {
     unsigned char header[8], *data;
@@ -52,6 +53,7 @@ struct dcc_tcp_run { uint32_t operation; uint64_t id; char root[PATH_MAX]; };
 struct dcc_tcp_finished {
     uint64_t id;
     uint64_t peak_bytes;
+    uint64_t cpu_ns;
     uint32_t error, retiring, status, mode, present;
     uint64_t size[DCC_JOB_RESULT_COUNT];
 };

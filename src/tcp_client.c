@@ -192,7 +192,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     ++fs_requests; fs_bytes += filesystem.plain_size;
                     filesystem.wire_size = filesystem.plain_size;
                     stream.index = UINT_MAX; stream.offset = stream.plain = 0;
-                } else if (type == DCC_TCP_RESULT && !have_result && incoming.size == 64) {
+                } else if (type == DCC_TCP_RESULT && !have_result && incoming.size == DCC_TCP_RESULT_SIZE) {
                     have_result = 1;
                     result->status = dcc_tcp_get32(incoming.data);
                     result->mode = dcc_tcp_get32(incoming.data + 4);
@@ -200,6 +200,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     result->prepare_ns = dcc_tcp_get64(incoming.data + 40);
                     result->queue_ns = dcc_tcp_get64(incoming.data + 48);
                     result->execute_ns = dcc_tcp_get64(incoming.data + 56);
+                    result->cpu_ns = dcc_tcp_get64(incoming.data + 64);
                     if (result->prepare_ns > 86400ULL * 1000000000 ||
                         result->queue_ns > 86400ULL * 1000000000 ||
                         result->execute_ns > 86400ULL * 1000000000) goto done;

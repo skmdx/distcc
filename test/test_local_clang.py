@@ -130,6 +130,33 @@ class LocalClangTest(BrokerTestCase):
     def test_codegen_uses_spare_leases_and_preserves_result(self):
         self.check_codegen(False)
 
+    def test_native_cpu_feedback_is_per_job(self):
+        self.start_local()
+        self.base_env['DISTCC_VERBOSE'] = '1'
+        saved = dict(self.env)
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='usage')
+        saved.update({key: self.env[key] for key in ('DISTCC_HOSTS', 'DISTCC_BROKER')})
+        self.env = saved
+        # Compile different amounts of real work in the same resident helper.
+        # Its accumulated CPU counter must not be charged to the second job.
+        (self.work/'large.c').write_text('\n'.join(
+            f'unsigned f{i}(unsigned x) {{ for (unsigned j=0;j<100;j++) x=x*33+j+{i}; return x; }}'
+            for i in range(800)))
+        (self.work/'small.c').write_text('int answer(void) { return 42; }\n')
+        for name in ('large', 'small'):
+            result = self.command(['-O2', '-c', name+'.c', '-o', name+'.o'])
+            self.assertEqual(result.returncode, 0, result.stderr)
+        deadline = time.monotonic()+3
+        while True:
+            cpu = [float(value) for value in re.findall(r'job cost: .* cpu=([0-9.]+)',
+                                                       (self.work/'usage.log').read_text())]
+            if len(cpu) == 2: break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertGreater(cpu[1], 0)
+        self.assertLess(cpu[1], cpu[0])
+        self.assertEqual((self.work/'client.log').read_text().count('started local compiler libraries'), 1)
+
     def test_codegen_finishes_when_no_extra_cpu_is_available(self):
         self.check_codegen(True)
 

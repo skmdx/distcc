@@ -75,7 +75,7 @@ static int start_worker(const char *compiler)
 }
 
 /* -1 means no request was accepted: ordinary exec is still safe. */
-int dcc_clang_local(char **argv, int *status)
+int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
 {
     if (!dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0) ||
         !strstr(dcc_find_basename(argv[0]), "clang")) return -1;
@@ -101,11 +101,15 @@ int dcc_clang_local(char **argv, int *status)
     int fds[] = {input, pair[1], 0, 1, 2};
     if (dcc_send_fds(worker, "C", 1, fds, 5)) goto out;
     close(pair[1]); pair[1] = -1;
-    uint32_t result;
+    uint64_t result[2];
     ssize_t length;
     do { length = recv(pair[0], &result, sizeof(result), MSG_TRUNC); } while (length < 0 && errno == EINTR);
-    ret = length == sizeof(result) && result <= 65535 ? 0 : EXIT_IO_ERROR;
-    if (!ret) { *status = result; rs_trace("reused local compiler libraries status=%d", *status); }
+    ret = length == sizeof(result) && result[0] <= 65535 ? 0 : EXIT_IO_ERROR;
+    if (!ret) {
+        *status = result[0];
+        if (cpu_ns) *cpu_ns = result[1];
+        rs_trace("reused local compiler libraries status=%d", *status);
+    }
 out:
     if (lease >= 0) close(lease);
     if (worker >= 0) close(worker);

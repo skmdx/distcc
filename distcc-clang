@@ -78,7 +78,8 @@ def worker(descriptor, compiler):
             finally:
                 for fd in fds: os.close(fd)
             _, status, usage = os.wait4(pid, 0)
-            channel.sendall(struct.pack('=QQ', status, usage.ru_maxrss * 1024))
+            channel.sendall(struct.pack('=3Q', status, usage.ru_maxrss * 1024,
+                                       round((usage.ru_utime + usage.ru_stime) * 1e9)))
 
 
 def main():

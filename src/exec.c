@@ -458,7 +458,8 @@ static void dcc_child_changed(int sig)
 }
 
 int dcc_collect_child(const char *what, pid_t pid,
-                      int *wait_status, int in_fd, unsigned long long *peak_bytes)
+                      int *wait_status, int in_fd, unsigned long long *peak_bytes,
+                      uint64_t *cpu_ns)
 {
     struct rusage ru;
     struct sigaction action = {0}, previous_action;
@@ -466,6 +467,7 @@ int dcc_collect_child(const char *what, pid_t pid,
     struct timespec deadline;
     int ret = 0;
     if (peak_bytes) *peak_bytes = 0;
+    if (cpu_ns) *cpu_ns = 0;
 
     /* Block before wait4, atomically unblock while sleeping. Otherwise a
      * child exiting between wait4 and select loses its wakeup and adds the
@@ -494,6 +496,9 @@ int dcc_collect_child(const char *what, pid_t pid,
             ret = EXIT_DISTCC_FAILED;
             break;
         } else if (ret_pid != 0) {
+            if (cpu_ns)
+                *cpu_ns = ((uint64_t)ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000000000 +
+                          ((uint64_t)ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) * 1000;
 #ifdef __linux__
             if (peak_bytes && ru.ru_maxrss > 0) *peak_bytes = (unsigned long long)ru.ru_maxrss * 1024;
 #endif

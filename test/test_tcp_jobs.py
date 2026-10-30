@@ -76,6 +76,7 @@ class FrontendTest(BrokerTestCase):
                 self.assertFalse(output.exists())
 
     def test_frontend_reuses_libraries_without_sharing_compiler_state(self):
+        self.base_env['DISTCC_VERBOSE'] = '1'
         clang = self.start_frontend()
         trace_offset = Path(self.logs[0].name).stat().st_size
         source = self.work/'reused.c'
@@ -97,6 +98,9 @@ class FrontendTest(BrokerTestCase):
         helpers = re.findall(r'started reusable frontend pid=(\d+)', trace)
         self.assertEqual(len(helpers), 1, trace[-6000:])
         self.assertEqual(len(re.findall(r'reused frontend pid=', trace)), 3)
+        usage = re.findall(r'job cost: .* cpu=([0-9.]+)', (self.work/'broker.log').read_text())
+        self.assertEqual(len(usage), 3)
+        self.assertTrue(all(float(value) > 0 for value in usage))
         sockets = [fd for fd in Path('/proc', helpers[0], 'fd').iterdir()
                    if os.readlink(fd).startswith('socket:')]
         self.assertEqual(len(sockets), 1, 'completed job filesystem descriptor was retained')
@@ -533,7 +537,7 @@ int ioctl(int fd, unsigned long request, ...) {
             self.assertIn('SCM_RIGHTS', calls)
             self.assertIn('sendfile(', calls)  # Result publication, not an input snapshot.
             self.assertNotRegex(calls, r'sendfile\([^\n]*distcc-preprocessed')
-            returned = re.search(r'sendmsg\([^\n]*iov_len=32[^\n]*SCM_RIGHTS', calls)
+            returned = re.search(r'sendmsg\([^\n]*iov_len=40[^\n]*SCM_RIGHTS', calls)
             self.assertIsNotNone(returned, 'pooled connection was not returned')
             self.assertLess(returned.start(), calls.index('sendfile('), 'copy held the pooled connection')
             self.assertEqual(actual.read_bytes(), expected.read_bytes())
@@ -814,10 +818,12 @@ ssize_t write(int fd, const void *data, size_t size) {
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
         kind, description = self.frame(net)
         self.assertEqual(kind, 0x54000203)
-        self.assertEqual(len(description), 64)
+        self.assertEqual(len(description), 72)
         status, mode, *sizes = struct.unpack('!II4Q', description[:40])
-        prepare, queued, execute = struct.unpack('!3Q', description[40:])
+        prepare, queued, execute, cpu = struct.unpack('!4Q', description[40:])
         self.assertGreater(execute, 0)
+        if not expected_status:
+            self.assertGreater(cpu, 0)
         self.assertLess(prepare + queued + execute, 60 * 1000000000)
         outputs = [bytearray() for _ in sizes]
         while True:
@@ -1134,7 +1140,7 @@ with open(args[args.index('-o') + 1], 'ab') as output:
                         if kind & 0x20000:
                             break
                     # Deliberately fragment the response header.
-                    response = struct.pack('!IIII7Q', 0x54000203, 64, 0, 0, 0, 0, 4, 0, 0, 0, 0)
+                    response = struct.pack('!IIII8Q', 0x54000203, 72, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0)
                     net.sendall(response[:3])
                     time.sleep(.01)
                     net.sendall(response[3:])

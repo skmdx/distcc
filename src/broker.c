@@ -365,10 +365,13 @@ int dcc_broker_try_local(const struct dcc_work_hint *hint)
     return lease;
 }
 
-void dcc_broker_local_done(int lease, double elapsed, int status)
+void dcc_broker_local_done(int lease, double elapsed, uint64_t cpu_ns, int status)
 {
     struct { struct request header; struct feedback timing; } request = {{ BROKER_VERSION, RETURN }, {0}};
-    if (!status && elapsed > 0) request.timing.execute_ns = elapsed * 1e9;
+    if (!status && elapsed > 0) {
+        request.timing.execute_ns = elapsed * 1e9;
+        request.timing.cpu_ns = cpu_ns;
+    }
     send(lease, &request, sizeof(request), MSG_NOSIGNAL);
     close(lease);
 }
@@ -419,7 +422,8 @@ void dcc_broker_return(const struct dcc_hostdef *host, int fd, const struct dcc_
 {
     struct { struct request header; struct feedback timing; } request = {{ BROKER_VERSION, RETURN }, {0}};
     if (result && !result->status)
-        request.timing = (struct feedback){result->prepare_ns, result->queue_ns, result->execute_ns};
+        request.timing = (struct feedback){result->prepare_ns, result->queue_ns,
+                                          result->execute_ns, result->cpu_ns};
     if (host->broker_pooled)
         dcc_send_fd(host->broker_lease, &request, sizeof(request), fd);
 }
@@ -919,12 +923,13 @@ static void observe(struct broker *broker, struct client *client, const struct f
         *previous = .875 * prior + .125 * sample;
     }
     rs_trace("job cost: key=%llx kind=%u bytes=%llu units=%u predicted=%.6f factor=%.6f "
-             "execute=%.6f prepare=%.6f queue=%.6f normalized=%.6f host=%s now=%.6f client=%td request=%.6f family=%llx",
+             "execute=%.6f prepare=%.6f queue=%.6f normalized=%.6f host=%s now=%.6f client=%td request=%.6f family=%llx cpu=%.6f",
              (unsigned long long)client->hint.key, client->hint.kind,
              (unsigned long long)client->hint.bytes, client->hint.work_units,
              client->cost, client->factor, timing->execute_ns / 1e9,
              timing->prepare_ns / 1e9, timing->queue_ns / 1e9, cost, peer->host->hostname,
-             now, client - broker->clients, client->waiting_since, (unsigned long long)client->hint.family);
+             now, client - broker->clients, client->waiting_since, (unsigned long long)client->hint.family,
+             timing->cpu_ns / 1e9);
 }
 
 static unsigned long long memory_forecast(const struct dcc_capacity *cap,
@@ -1038,6 +1043,9 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     }
     for (i = 0; i < broker->count; i++) {
         struct peer *p = &broker->peers[i];
+        /* An empty preflight describes an extra local codegen lane, not a
+         * movable compiler invocation. It has no remote execution method. */
+        if (direct && !client->hint.key && !p->local) continue;
         struct dcc_capacity observed = observed_capacity(p, broker->cpp_busy);
         const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
         struct dcc_capacity projected;
@@ -1169,7 +1177,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * worker, including existing compiles on a remote SMT core.
              * Minimizing this job's latency alone packs the fastest worker's
              * SMT lanes while independent physical cores remain unused. */
-            if (staged && cap && !link && !link_backend && !direct && (predicted ||
+            if (staged && cap && !link && !link_backend && (predicted ||
                 (!blocked && work < dcc_capacity_jobs(p->host, cap)))) {
                 struct dcc_capacity live = observed_capacity(p, broker->cpp_busy);
                 double external = (live.running >= 0 ? live.running : live.load)

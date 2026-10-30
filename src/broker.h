@@ -1,4 +1,5 @@
 /* Local distccd scheduling and connected-socket leases. */
+#include <stdint.h>
 struct dcc_hostdef;
 struct dcc_work_hint;
 struct dcc_job_result;
@@ -7,9 +8,10 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int
                        const struct dcc_work_hint *, int *queued_fd);
 int dcc_broker_local_cpp(int *lease, int *occupied, int analysis);
 /* Try the ordinary placement policy before preparing remote inputs. A declined
- * request holds no reservation; a granted lease covers client-side execution. */
+ * request holds no reservation; a granted lease covers client-side execution.
+ * An empty hint borrows an extra local codegen lane; there is no movable job. */
 int dcc_broker_try_local(const struct dcc_work_hint *);
-void dcc_broker_local_done(int lease, double elapsed, int status);
+void dcc_broker_local_done(int lease, double elapsed, uint64_t cpu_ns, int status);
 void dcc_broker_failed(const struct dcc_hostdef *host);
 void dcc_broker_defer(const struct dcc_hostdef *host);
 void dcc_broker_return(const struct dcc_hostdef *host, int fd, const struct dcc_job_result *);

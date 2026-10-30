@@ -11,6 +11,6 @@ enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3, MEMO_GET = 4, MEMO_PUT = 5,
 /* Backend-only clients need a worker socket even on this machine. */
 #define CLIENT_COMPILE (1u << 16)
 struct request { uint32_t version, command; };
-struct feedback { uint64_t prepare_ns, queue_ns, execute_ns; };
+struct feedback { uint64_t prepare_ns, queue_ns, execute_ns, cpu_ns; };
 struct reply { int32_t status, slots; char host[1024]; };
 #endif

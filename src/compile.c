@@ -403,7 +403,7 @@ int dcc_fresh_dependency_exists(const char *dotd_fname,
  * This is called with a lock on localhost already held.
  **/
 static int dcc_compile_local(char *argv[],
-                             char *input_name, const char *prepared)
+                             char *input_name, const char *prepared, uint64_t *cpu_ns)
 {
     pid_t pid;
     int ret;
@@ -412,7 +412,7 @@ static int dcc_compile_local(char *argv[],
     dcc_note_execution(dcc_hostdef_local, argv);
     dcc_note_state(DCC_PHASE_COMPILE, input_name, "localhost", DCC_LOCAL);
 
-    if (!prepared && (ret = dcc_clang_local(argv, &status)) >= 0)
+    if (!prepared && (ret = dcc_clang_local(argv, &status, cpu_ns)) >= 0)
         return ret ? ret : dcc_critique_status(status, "compile", input_name,
                                               dcc_hostdef_local, 1);
 
@@ -421,14 +421,14 @@ static int dcc_compile_local(char *argv[],
     if ((ret = dcc_spawn_child(argv, &pid, prepared, NULL, NULL)) != 0)
         return ret;
 
-    if ((ret = dcc_collect_child("cc", pid, &status, timeout_null_fd, NULL)))
+    if ((ret = dcc_collect_child("cc", pid, &status, timeout_null_fd, NULL, cpu_ns)))
         return ret;
 
     return dcc_critique_status(status, "compile", input_name,
                                dcc_hostdef_local, 1);
 }
 
-static int dcc_compile_local_ir(char **argv, char *input, const char *prepared, int fd)
+static int dcc_compile_local_ir(char **argv, char *input, const char *prepared, int fd, uint64_t *cpu_ns)
 {
     char **stripped = NULL, **command = NULL;
     char *cwd = NULL;
@@ -438,7 +438,7 @@ static int dcc_compile_local_ir(char **argv, char *input, const char *prepared, 
     if (!ret) ret = dcc_set_input(command, (char *)(fd >= 0 ? "/proc/self/fd/0" : prepared));
     if (!ret && !(cwd = getcwd(NULL, 0))) ret = EXIT_IO_ERROR;
     if (!ret) ret = dcc_clang_command(&command, "", input, cwd, 0, 1);
-    if (!ret) ret = dcc_compile_local(command, input, fd >= 0 ? prepared : NULL);
+    if (!ret) ret = dcc_compile_local(command, input, fd >= 0 ? prepared : NULL, cpu_ns);
     free(cwd);
     dcc_free_argv(command);
     return ret;
@@ -871,7 +871,7 @@ dcc_build_somewhere(char *argv[],
     if (offload_targets) {
         char **command = NULL;
         ret = dcc_offload_command(argv, input_fname, output_fname, &command);
-        if (!ret) ret = dcc_compile_local(command, input_fname, NULL);
+        if (!ret) ret = dcc_compile_local(command, input_fname, NULL, NULL);
         if (command) dcc_free_argv(command);
         goto unlock_and_clean_up;
     }
@@ -1250,15 +1250,16 @@ dcc_build_somewhere(char *argv[],
        as assembling, linking, etc. */
     {
         struct timespec started, finished;
+        uint64_t cpu_ns = 0;
         if (direct_lease >= 0) clock_gettime(CLOCK_MONOTONIC, &started);
         if (direct_lease >= 0 && cpp_ready && dcc_cpp_ir(argv, input_fname))
-            ret = dcc_compile_local_ir(argv, input_fname, cpp_fname, cpp_fd);
+            ret = dcc_compile_local_ir(argv, input_fname, cpp_fname, cpp_fd, &cpu_ns);
         else
-            ret = dcc_compile_local(argv, input_fname, NULL);
+            ret = dcc_compile_local(argv, input_fname, NULL, &cpu_ns);
         if (direct_lease >= 0) {
             clock_gettime(CLOCK_MONOTONIC, &finished);
             dcc_broker_local_done(direct_lease, finished.tv_sec - started.tv_sec +
-                                 (finished.tv_nsec - started.tv_nsec) / 1e9, ret);
+                                 (finished.tv_nsec - started.tv_nsec) / 1e9, cpu_ns, ret);
             direct_lease = -1;
         }
     }

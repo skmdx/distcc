@@ -55,6 +55,7 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
     free(saved_tmp);
     finished.status = result.status;
     finished.peak_bytes = result.peak_bytes;
+    finished.cpu_ns = result.cpu_ns;
     finished.mode = result.mode;
     for (unsigned i = 0; i < DCC_JOB_RESULT_COUNT; ++i) {
         finished.size[i] = result.size[i];

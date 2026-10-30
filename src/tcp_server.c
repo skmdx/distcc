@@ -828,12 +828,13 @@ void dcc_tcp_server_finished(struct dcc_tcp_server *s, const struct dcc_tcp_fini
     /* A result exists already. Keep its FDs while asynchronous input cleanup
      * frees the budget; never discard completed work for transient pressure.
      * One connection buffer, the result header and one output chunk must fit. */
-    if (bytes > DCC_TCP_BYTES - 2 * DCC_TCP_CHUNK - 88U) goto fail;
+    if (bytes > DCC_TCP_BYTES - 2 * DCC_TCP_CHUNK - DCC_TCP_RESULT_SIZE - 24U) goto fail;
     returning_bytes += bytes; s->result_bytes = bytes;
     s->result.status = r->status; s->result.mode = r->mode;
     s->result.prepare_ns = s->ready_at - s->begun_at;
     s->result.queue_ns = s->started_at - s->ready_at;
     s->result.execute_ns = monotonic_ns() - s->started_at;
+    s->result.cpu_ns = r->cpu_ns;
     s->result_pending = 1; ++waiting_results;
     s->phase = RETURNING;
     s->active = time(NULL);
@@ -844,19 +845,20 @@ fail:
 }
 static int result_available(struct dcc_tcp_server *s)
 {
-    return s->result_bytes + DCC_TCP_CHUNK + 88U <= DCC_TCP_BYTES - retained;
+    return s->result_bytes + DCC_TCP_CHUNK + DCC_TCP_RESULT_SIZE + 24U <= DCC_TCP_BYTES - retained;
 }
 static int publish_result(struct dcc_tcp_server *s)
 {
     retained += s->result_bytes; s->reserved += s->result_bytes;
     s->result_pending = 0; --waiting_results;
-    unsigned char description[64];
+    unsigned char description[DCC_TCP_RESULT_SIZE];
     dcc_tcp_put32(description, s->result.status); dcc_tcp_put32(description + 4, s->result.mode);
     for (unsigned i = 0; i < DCC_JOB_RESULT_COUNT; ++i)
         dcc_tcp_put64(description + 8 + i * 8, s->result.size[i]);
     dcc_tcp_put64(description + 40, s->result.prepare_ns);
     dcc_tcp_put64(description + 48, s->result.queue_ns);
     dcc_tcp_put64(description + 56, s->result.execute_ns);
+    dcc_tcp_put64(description + 64, s->result.cpu_ns);
     return queue(s, DCC_TCP_RESULT, description, sizeof(description));
 }
 static void encode_output(void *argument)

@@ -68,6 +68,14 @@ indefinitely even when an available worker would finish sooner. Preserve input
 progress and distinguish actual memory admission from an uncertain CPU forecast.
 Transient demand must not silently change the configured whole-build job count.
 
+Use the same contention objective before and after input preparation. A local
+preflight still places a whole compiler invocation: bypassing the displacement
+cost there fills SMT siblings before independent remote cores, even when the
+prepared-job scheduler would make the opposite choice. Extra codegen leases
+have a different feasible set. Their empty work hint represents a local CPU
+borrow, so an unavailable remote execution method must not prevent borrowing a
+free local lane. They need no input-producer reservation.
+
 Lower client CPU demand and more remote completions are useful intermediate
 observations for an offload proposal, not acceptance criteria. Evaluate their
 effect on destination service demand and the dependency path together.
@@ -80,7 +88,13 @@ counters can establish service demand without a new protocol. Verify that the
 daemon did not restart and that exactly the intended job completed. Keep client
 input-service CPU separate, preserve I/O counters, and include helper startup
 in the stated measurement scope. Under concurrent execution, attribution needs
-per-job child usage rather than a shared cgroup delta.
+per-job child usage rather than a shared cgroup delta. The completion feedback
+therefore carries `cpu_ns` from `wait4` alongside preparation, queue and execution
+durations. Reused compiler helpers report the individual child, including its
+reaped descendants, rather than their lifetime usage. Zero means no measured
+compiler service; a job rejected before starting a compiler must not invent CPU
+work. Verbose broker job observations expose this as `cpu` in seconds. The CPU
+measurement does not change the existing placement policy by itself.
 
 An idle-host measurement is a service-demand observation under those conditions,
 not a calibration of SMT or a promise of loaded completion time. Before changing

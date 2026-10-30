@@ -65,7 +65,7 @@ static int start_session(char **argv)
 
 int dcc_clang_worker(char **argv, int filesystem, int cancel,
                      const char *output, const char *errors,
-                     int *status, unsigned long long *peak)
+                     int *status, unsigned long long *peak, uint64_t *cpu_ns)
 {
     int ret = start_session(argv);
     if (ret) return ret;
@@ -98,10 +98,11 @@ int dcc_clang_worker(char **argv, int filesystem, int cancel,
         if (ready < 0 || polls[1].revents) { ret = EXIT_IO_ERROR; break; }
         if (!ready) { ret = EXIT_TIMEOUT; break; }
         if (polls[0].revents) {
-            uint64_t reply[2];
+            uint64_t reply[3];
             ssize_t length = recv(session, reply, sizeof(reply), MSG_TRUNC);
             if (length != sizeof(reply) || reply[0] > 65535) { ret = EXIT_IO_ERROR; break; }
             *status = reply[0]; *peak = reply[1];
+            *cpu_ns = reply[2];
             rs_trace("reused frontend pid=%ld status=%d peak=%llu", (long)helper_pid, *status, *peak);
             return 0;
         }

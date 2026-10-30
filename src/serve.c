@@ -946,7 +946,8 @@ static int dcc_run_helper_job(int in_fd, int out_fd,
     argv[4] = NULL;
     if ((ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname)) ||
         (ret = dcc_collect_child(helper, pid, status, in_fd,
-                                 result ? &result->peak_bytes : NULL)))
+                                 result ? &result->peak_bytes : NULL,
+                                 result ? &result->cpu_ns : NULL)))
         *status = W_EXITCODE(ret, 0);
     if (!*status && stat(output, &st))
         *status = W_EXITCODE(EXIT_IO_ERROR, 0);
@@ -1107,7 +1108,7 @@ static int dcc_run_job(int in_fd,
             if (!argv[i]) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
         }
         if ((ret = dcc_clang_worker(argv, job->fs_channel - 1, in_fd,
-                                    out_fname, err_fname, &status, &result->peak_bytes)))
+                                    out_fname, err_fname, &status, &result->peak_bytes, &result->cpu_ns)))
             goto out_cleanup;
         result->status = status;
         if ((ret = retain_artifact(result, DCC_JOB_STDERR, err_fname)) ||
@@ -1291,7 +1292,8 @@ static int dcc_run_job(int in_fd,
     if ((compile_ret = dcc_spawn_child(argv, &cc_pid,
                                        "/dev/null", out_fname, err_fname))
         || (compile_ret = dcc_collect_child("cc", cc_pid, &status, in_fd,
-                                          result ? &result->peak_bytes : NULL))) {
+                                          result ? &result->peak_bytes : NULL,
+                                          result ? &result->cpu_ns : NULL))) {
         /* We didn't get around to finding a wait status from the actual
          * compiler */
         status = W_EXITCODE(compile_ret, 0);
