@@ -306,7 +306,7 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
     }
     unsigned failures = 0;
     for (;;) {
-        if ((ret = dcc_broker_acquire(&host, &lease, 1, &hint, &queued_fd))) goto done;
+        if ((ret = dcc_broker_acquire(&host, &lease, 1, 0, &hint, &queued_fd))) goto done;
         if (!host->tcp_jobs) { ret = EXIT_PROTOCOL_ERROR; goto done; }
         dcc_broker_cpp_done(host);
         ret = dcc_tcp_exchange(host, job, files, NULL, output, NULL, &result);

@@ -230,6 +230,12 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
                                for port, old in zip(self.stats_ports, before)), 0)
 
     def test_backend_cwd_survives_private_tmp_mount(self):
+        self.check_backend_cwd(False)
+
+    def test_cc1_backend_without_driver_compile_flag(self):
+        self.check_backend_cwd(True)
+
+    def check_backend_cwd(self, cc1):
         inputs = self.work / 'inputs'
         inputs.mkdir()
         source = inputs / '0'
@@ -239,8 +245,9 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         name, output = str(self.work / 'input.bc'), str(self.work / 'output.o')
         cwd = '/tmp/client-build'
         manifest = inputs / '1'
+        options = ['-cc1', '-emit-obj'] if cc1 else ['-c']
         manifest.write_text(json.dumps(dict(cwd=cwd,
-            args=[shutil.which('clang'), '-c', '-x', 'ir', name, '-o', output],
+            args=[shutil.which('clang'), *options, '-x', 'ir', name, '-o', output],
             inputs=[name], outputs=[output])))
         metadata, archive = self.work / 'metadata', self.work / 'result.tar'
         write_metadata(4, cwd, 'distcc-thinlto',
@@ -306,9 +313,9 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         result = self.run_command([self.build / 'distcc', '-j'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(int(result.stdout), capacity['jobs'])
-        # A changed admission ceiling proves that the new snapshot reached the
+        # A changed CPU ceiling proves that the new snapshot reached the
         # broker. Transient load must not change its full-capacity grain rate.
-        metrics = stats_response(cpus=4, cores=4, jobs=4, capacity=3,
+        metrics = stats_response(cpus=3, cores=3, jobs=3, capacity=3,
                                  busy=0, queued=0, running=16, load=16)
         deadline = time.monotonic() + 3
         while True:
@@ -710,10 +717,14 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(str(compiler)) +
                            ' --target=' + other + ' "$@"\n')
         wrapper.chmod(0o755)
-        self.restart_server(self.build / 'distccd', DISTCCD_PATH=str(wrappers) + os.pathsep + os.defpath)
+        # A secondary loopback address exercises worker execution even when
+        # the broker can optimize the primary local address into direct exec.
+        address = '127.0.0.2'
+        self.restart_server(self.build / 'distccd', address=address,
+                            DISTCCD_PATH=str(wrappers) + os.pathsep + os.defpath)
         self.addCleanup(self.restart_server, self.build / 'distccd')
         saved = dict(self.env)
-        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='target')
+        self.start_broker(f'{address}:{self.ports[0]}/4,tcp,stats={self.stats_ports[0]}', name='target')
         saved['DISTCC_BROKER'] = self.env['DISTCC_BROKER']
         self.env = saved
         source = self.work / 'target.c'

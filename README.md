@@ -432,7 +432,8 @@ With the Linux broker and a supporting server, each legacy pooled connection res
 a server worker before transferring a job. Ordinary broker clients finish
 local preprocessing before reserving that worker and reuse the preprocessed
 input on retries. By default, input preparation shares the available CPU slots
-with local compilation. `--localslots_cpp` sets an explicit preparation limit.
+with local compilation, keeping one producer able to feed remote workers even
+when local execution is full. `--localslots_cpp` sets an explicit preparation limit.
 Ordinary Clang C-family compilation prepares LLVM IR once; the selected worker
 performs optimization and code generation. A job assigned back to its client
 also consumes that IR, preserving its dependency output without repeating the

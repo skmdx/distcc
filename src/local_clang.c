@@ -36,7 +36,8 @@ static int worker_key(const char *compiler, char *key, size_t size)
         XXH3_128bits_update(hash, &info.st_ino, sizeof(info.st_ino));
         if (!i) XXH3_128bits_update(hash, &info.st_ctim, sizeof(info.st_ctim));
     }
-    XXH3_128bits_update(hash, compiler, strlen(compiler)+1);
+    /* Driver aliases of the same executable share libraries. Each request
+     * carries its original argv[0], which owns target and C/C++ mode. */
     for (char **p = environ; *p; ++p) XXH3_128bits_update(hash, *p, strlen(*p)+1);
     gid_t groups[NGROUPS_MAX];
     int count = getgroups(NGROUPS_MAX, groups);

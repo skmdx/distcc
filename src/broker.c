@@ -384,7 +384,7 @@ void dcc_broker_local_done(int lease, double elapsed, int status)
     close(lease);
 }
 
-int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready,
+int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int can_compile_locally,
                        const struct dcc_work_hint *hint, int *queued_fd)
 {
     struct reply reply;
@@ -394,8 +394,9 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready,
     if (dcc_get_hostlist(&local, &count))
         return EXIT_BAD_HOSTSPEC;
     free_hosts(local);
-    int remote_cpp = getenv("INCLUDE_SERVER_PORT") != NULL;
-    fd = broker_request(CLIENT_COMPILE | (remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL),
+    int remote_cpp = can_compile_locally && getenv("INCLUDE_SERVER_PORT") != NULL;
+    fd = broker_request((can_compile_locally ? CLIENT_COMPILE : 0) |
+                        (remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL),
                         &reply, &net, hint, queued_fd);
     if (fd < 0)
         return EXIT_CONNECT_FAILED;
@@ -562,6 +563,10 @@ static void probe_event(struct peer *peer, double now, int cpp)
 
 static void release_cpp(struct broker *broker, struct client *client)
 {
+    if (client->cpp_reserved && (client->command == LOCAL_CPP || client->command == LOCAL_ANALYSIS))
+        rs_trace("input preparation command=%u wait=%.6f execute=%.6f client=%td request=%.6f",
+                 client->command, client->run_at - client->waiting_since,
+                 now_seconds() - client->run_at, client - broker->clients, client->waiting_since);
     broker->cpp_busy -= client->cpp_reserved;
     if (client->command == LOCAL_ANALYSIS)
         broker->analysis_busy -= client->cpp_reserved;
@@ -974,7 +979,10 @@ static int cpp_limit(const struct broker *broker)
             busy = cap->busy + p->direct;
         if (slots - busy < limit) limit = slots - busy;
     }
-    return limit > 0 ? limit : 0;
+    /* Execution cannot feed remote workers. Keep one producer able to make
+     * progress even when local compilers occupy every CPU; further producers
+     * still share the remaining local capacity. Explicit limits stay exact. */
+    return limit > 0 ? limit : 1;
 }
 
 static int dispatch(struct broker *broker, struct client *client, double now, struct dispatch_batch *batch)
@@ -994,6 +1002,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 broker->analysis_busy += client->command == LOCAL_ANALYSIS;
                 client->cpp_reserved = 1;
                 client->state = ACTIVE;
+                client->run_at = now;
             }
         }
         return 0;
@@ -1932,10 +1941,11 @@ int dcc_broker_serve(const char *path)
     rs_log_error("the local broker requires Linux");
     return EXIT_BAD_ARGUMENTS;
 }
-int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready,
+int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int can_compile_locally,
                        const struct dcc_work_hint *hint, int *queued_fd)
 {
     (void)queued_fd;
+    (void)can_compile_locally;
     (void)hint;
     (void)cpp_ready;
     (void)host;

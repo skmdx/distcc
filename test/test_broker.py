@@ -37,7 +37,7 @@ class BrokerTestCase(DistccTestCase):
                           self.host(1, f',tcp,stats={self.stats_ports[1]}'), name='memory-refusal')
         return peer
 
-    def restart_server(self, binary, **settings):
+    def restart_server(self, binary, address=None, **settings):
         old = self.daemons[0]
         os.killpg(old.pid, signal.SIGTERM)
         old.wait(timeout=5)
@@ -45,13 +45,15 @@ class BrokerTestCase(DistccTestCase):
                    DISTCCD_PATH=str(self.root / 'bin') + os.pathsep + os.defpath)
         env.update(getattr(self, 'daemon_env', {}))
         env.update(settings)
-        replacement = subprocess.Popen([str(binary), *old.args[1:]], env=env, stdout=self.logs[0],
+        command = [str(binary), *old.args[1:]]
+        command[command.index('--listen') + 1] = address or self.worker_address
+        replacement = subprocess.Popen(command, env=env, stdout=self.logs[0],
                                        stderr=self.logs[0], start_new_session=True)
         self.daemons[0] = replacement
         deadline = time.monotonic() + 5
         while True:
             try:
-                self.get_stats(self.stats_ports[0])
+                self.get_stats(self.stats_ports[0], address)
                 break
             except OSError:
                 self.assertIsNone(replacement.poll())
@@ -213,6 +215,24 @@ class BrokerDirectTest(BrokerTestCase):
         frontend.close()
         available = self.request(15)
         self.assertEqual(self.receive(available), (0, 1, []))
+
+    def test_full_local_execution_leaves_one_input_producer(self):
+        metrics = stats_response(cpus=2, cores=2, jobs=2, capacity=2,
+                                 busy=0, queued=0, preparing=0, returning=0, running=0)
+        local = self.peer(metrics)
+        self.start_broker(self.host(0, f',tcp,stats={local.port}'))
+        compilers = [self.request(15) for _ in range(2)]
+        for compiler in compilers:
+            self.assertEqual(self.receive(compiler), (0, 1, []))
+        producer = self.request(12)
+        self.assertEqual(self.receive(producer), (0, 1, []))
+        queued = self.request(12)
+        import select
+        self.assertFalse(select.select([queued], [], [], .1)[0])
+        producer.close()
+        self.assertEqual(self.receive(queued), (0, 1, []))
+        # Progress does not open another local execution lane.
+        self.assertEqual(self.receive(self.request(15)), (0, 0, []))
 
     def test_preflight_prefers_faster_local_smt_lane_without_analysis(self):
         metrics = stats_response(cpus=2, cores=1, jobs=2, capacity=2,

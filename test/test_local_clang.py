@@ -107,6 +107,25 @@ class LocalClangTest(BrokerTestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(result.stdout.strip(),b'17')
 
+    def test_driver_aliases_share_libraries_and_preserve_language(self):
+        self.start_local()
+        cxx = shutil.which('clang++')
+        if not cxx or not os.path.samefile(self.compiler, cxx):
+            self.skipTest('C and C++ driver aliases of one executable required')
+        (self.work/'input.c').write_text('')
+        for compiler, is_cxx in ((self.compiler, False), (cxx, True)):
+            self.compiler = compiler
+            arguments = ['-E', '-dM', 'input.c']
+            native = self.command(arguments, False, input=b'')
+            reused = self.command(arguments, input=b'')
+            self.assertEqual(native.returncode, 0, native.stderr)
+            self.assertEqual((native.returncode, native.stdout),
+                             (reused.returncode, reused.stdout), reused.stderr)
+            self.assertEqual(b'#define __cplusplus ' in reused.stdout, is_cxx)
+        log = (self.work/'client.log').read_text()
+        self.assertEqual(log.count('started local compiler libraries'), 1)
+        self.assertEqual(log.count('reused local compiler libraries'), 2)
+
     def test_available_frontend_releases(self):
         self.start_local()
         (self.work/'source.c').write_text('int value;\n')

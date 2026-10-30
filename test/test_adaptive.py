@@ -209,8 +209,8 @@ class DistccTestCase(unittest.TestCase):
         cls.storage.cleanup()
 
     @classmethod
-    def get_stats(cls, port):
-        with socket.create_connection((cls.worker_address, port), timeout=1) as sock:
+    def get_stats(cls, port, address=None):
+        with socket.create_connection((address or cls.worker_address, port), timeout=1) as sock:
             sock.sendall(b"GET / HTTP/1.0\r\n\r\n")
             response = b""
             while True:

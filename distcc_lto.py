@@ -325,8 +325,8 @@ def run_job(root, job, kind, prepare_library=None):
     name = Path(requested).name
     if not re.fullmatch(r'(?:[\w.+]+-)*(?:clang(?:\+\+)?|lld|ld\.lld)(?:-\d+(?:\.\d+)*)?', name):
         raise ValueError('LLVM jobs must invoke an installed compiler or linker')
-    if kind == 4 and '-c' not in args:
-        raise ValueError('ThinLTO backend must be a Clang compilation')
+    # LLVM backends may use either driver arguments or a compiler-generated
+    # cc1 invocation. Let Clang validate its action; cc1 uses -emit-obj, not -c.
     compiler = None
     path = Path(requested)
     if (path.is_absolute() and path.parent.parent.parent == Path('/usr/lib/llvm')
