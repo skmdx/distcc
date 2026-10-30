@@ -56,6 +56,23 @@ is smaller than the required saving, the proposal also needs a demonstrated
 reduction in other service demand or dependency timing. A long compiler
 invocation is not necessarily on the completion barrier.
 
+## Design the intervention before changing placement
+
+First derive the required saving `delta = P + T - D` from a completed baseline.
+For fixed service demand and assignment, the utilization required of host `h`
+is `W[h] / (C[h] * (D-P))`. This distinguishes a capacity deficit from lost
+overlap; an accounting bound below the target does not prove that a feasible
+dependency-respecting schedule exists. Do not add CPU seconds across unlike
+hosts to claim interchangeable capacity.
+
+Use the complete set of outputs at the completion barrier. Accelerating one
+translation unit may merely expose the next slowest branch. For each proposed
+intervention, name the affected phases, the bytes or CPU work removed, and the
+dependency edges whose completion changes. If even its optimistic saving is
+less than `delta`, do not run another full-build comparison of that intervention
+alone. When assumptions or parameter values are missing, obtain those specific
+measurements before extending the implementation.
+
 ## Requirements for placement forecasts
 
 Separate the scheduling objective from its inputs. Minimizing the drain time
@@ -88,6 +105,52 @@ complexity. Compare predicted and observed execution in the same units and
 execution method. A source-content timing prior is evidence from completed
 work; a cold size-based estimate is not. Do not hide a large prediction error
 by adjusting host speed or contention coefficients.
+
+The existing `observe` implementation still trains a normalized work value by
+dividing measured execution time by the factor predicted at dispatch. This is
+not an independently measured service demand. A replacement must separate:
+
+- CPU work consumed by the compiler and its descendants, measured by `wait4`;
+- elapsed execution, preparation and queue time, already returned separately;
+- the worker and execution method, particularly serial execution versus local
+  partitioning;
+- the assumptions used to predict future concurrency, frequency and transfer.
+
+Keep measurements in their native units at the observation boundary. Do not
+infer an idle service time from a predicted contention multiplier and then use
+that inferred value to validate the same multiplier. CPU work alone also does
+not determine elapsed time: parallel codegen can consume several CPU seconds
+in one wall second. Method and capacity assumptions belong in the prediction,
+not in the stored observation.
+
+The prediction boundary is therefore
+`finish = max(cpu_ready, input_ready) + w/r + delivery`, where `w` is predicted
+CPU seconds for this worker and execution method and `r` is effective CPU
+seconds per wall second over execution, including any demand-paged input stalls.
+Input preparation and the CPU queue overlap; do not add their full durations.
+Work and effective rate are separate predictions. A serial backend cannot receive the same parallel share
+as a split backend. Training pairs of CPU and elapsed time can check `r` under
+observed conditions; they do not identify its value under unobserved occupancy.
+Keep such missing counterfactuals explicit instead of treating an inverse
+dispatch factor as a measurement.
+
+Evaluate forecasts in request order, using only jobs completed before that
+request. Separate exact-command observations, source-family priors across
+different commands, and cold size estimates. For the existing execution
+forecast, report `sum(abs(predicted-actual))/sum(actual)` as a diagnostic, with
+its sample count and phase boundaries. This is an aggregate error measure, not
+a probability or a bound on the next job. In particular, a later ABI's result
+cannot be used to predict an earlier ABI's request.
+
+The next placement design must treat uncertainty as information about the
+forecast, never as a reason to reject a compatible compile. Queueing behind a
+busy worker requires evidence that it beats the available alternative after
+prediction error and added interference are accounted for. Without that
+evidence, dispatch available work using measured capacity; do not fabricate a
+precise release time from source bytes. Before adopting a more complex policy,
+show which decisions its independently checked forecasts can actually resolve.
+An offline replay of recorded arrivals can test those decisions, but cannot
+establish the resulting build completion time because arrivals can change.
 
 ## Distinguish service demand from runnable counts
 
@@ -127,11 +190,8 @@ Lower client CPU demand and more remote completions are useful intermediate
 observations for an offload proposal, not acceptance criteria. Evaluate their
 effect on destination service demand and the dependency path together.
 
-Do not derive service demand by dividing elapsed time by the same contention
-forecast that the observation will train. That feeds prediction errors back
-into the work estimate. CPU accounting and elapsed timing are independent
-observations; retain both. For an isolated worker, before/after daemon cgroup
-counters can establish service demand without a new protocol. Verify that the
+For an isolated worker, before/after daemon cgroup counters can establish
+service demand without a new protocol. Verify that the
 daemon did not restart and that exactly the intended job completed. Keep client
 input-service CPU separate, preserve I/O counters, and include helper startup
 in the stated measurement scope. Under concurrent execution, attribution needs
