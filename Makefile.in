@@ -205,7 +205,9 @@ include_server_SRC = \
 	include_server/c_extensions/distcc_pump_c_extensions_module.c \
 	include_server/c_extensions/input_metadata.c \
 	include_server/c_extensions/clang_scan.cpp \
-	include_server/c_extensions/clang_compile.cpp
+	include_server/c_extensions/clang_compile.cpp \
+	include_server/c_extensions/clang_native.cpp \
+	include_server/native_worker.py
 
 update_distcc_symlinks_PY = update-distcc-symlinks.py
 
@@ -257,6 +259,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_portage_jobs.py \
 	test/test_broker.py \
 	test/test_tcp_jobs.py \
+	test/test_local_clang.py \
 	test/test_rust.py \
 	test/test_thinlto.py \
 	test/test_link.py \
@@ -382,14 +385,14 @@ h_getline_obj = src/h_getline.o $(common_obj)
 
 common_obj += src/job.o
 common_obj += src/tcp_job.o
-distcc_obj += src/tcp_client.o src/frontend_fs.o
+distcc_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o
 distccd_obj += src/tcp_server.o src/tcp_worker.o src/tcp_async.o src/clang_worker.o
-h_compile_obj += src/tcp_client.o src/frontend_fs.o
+h_compile_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o
 distcc_obj += src/remote_job.o
 h_compile_obj += src/remote_job.o
 
 # All source files, for the purposes of building the distribution
-SRC =	src/stats.c src/adaptive.c src/broker.c src/workload.c src/clang_worker.c	\
+SRC =	src/stats.c src/adaptive.c src/broker.c src/workload.c src/clang_worker.c src/local_clang.c	\
 	src/access.c src/arg.c src/argutil.c				\
 	src/auth_common.c src/auth_distcc.c src/auth_distccd.c		\
 	src/backoff.c src/bulk.c src/compress_stream.c src/file_cache.c	\
@@ -909,6 +912,7 @@ adaptive-check: distcc distccd h_hosts h_compile include-server
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v
 	$(PYTHON) "$(srcdir)/test/test_broker.py" -v
 	$(PYTHON) "$(srcdir)/test/test_tcp_jobs.py" -v
+	$(PYTHON) "$(srcdir)/test/test_local_clang.py" -v
 	$(PYTHON) "$(srcdir)/test/test_rust.py" -v
 	$(PYTHON) "$(srcdir)/test/test_thinlto.py" -v
 	$(PYTHON) "$(srcdir)/test/test_link.py" -v

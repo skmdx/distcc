@@ -412,6 +412,10 @@ static int dcc_compile_local(char *argv[],
     dcc_note_execution(dcc_hostdef_local, argv);
     dcc_note_state(DCC_PHASE_COMPILE, input_name, "localhost", DCC_LOCAL);
 
+    if (!prepared && (ret = dcc_clang_local(argv, &status)) >= 0)
+        return ret ? ret : dcc_critique_status(status, "compile", input_name,
+                                              dcc_hostdef_local, 1);
+
     /* An IR job opens its sealed input as stdin before exec closes the
      * original memfd. Ordinary local commands retain the caller's stdio. */
     if ((ret = dcc_spawn_child(argv, &pid, prepared, NULL, NULL)) != 0)

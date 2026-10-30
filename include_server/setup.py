@@ -219,6 +219,9 @@ for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.paths
     sys.exit('Clang worker frontends require LLVM 22 or 23.')
   library = llvm_option('--libdir', config)
   runtime = library[len(sysroot):] if sysroot and library.startswith(sysroot + '/') else library
+  bindir = llvm_option('--bindir', config)
+  if sysroot and bindir.startswith(sysroot + '/'):
+    bindir = bindir[len(sysroot):]
   frontends.append(setuptools.Extension(
       name='include_server.clang' + major + '.clang_compile',
       sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_compile.cpp')],
@@ -227,6 +230,15 @@ for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.paths
       library_dirs=[library], runtime_library_dirs=[runtime],
       libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
       define_macros=[('DCC_CLANG_COMPILE_MODULE', '1')],
+  ))
+  frontends.append(setuptools.Extension(
+      name='include_server.clang' + major + '.clang_native',
+      sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_native.cpp')],
+      language='c++', include_dirs=[llvm_option('--includedir', config)],
+      library_dirs=[library], runtime_library_dirs=[runtime],
+      libraries=['clang-cpp', 'lldELF', 'lldCommon', 'LLVM'],
+      extra_compile_args=['-std=c++17', '-g0'],
+      define_macros=[('DCC_LLD_PATH', '"' + os.path.join(bindir, 'ld.lld') + '"')],
   ))
 
 class VersionedBuildExt(build_ext):

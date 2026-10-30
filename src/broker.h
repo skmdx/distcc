@@ -24,3 +24,7 @@ void dcc_broker_cpp_done(const struct dcc_hostdef *host);
 #define DCC_MEMO_LIMIT 65536
 int dcc_broker_memo_get(const char *key, char **value);
 void dcc_broker_memo_put(int lease, const char *value);
+/* The same publishing lease can retain a compiler helper's control socket.
+ * Helpers are scoped to the authenticated caller, not shared across UIDs. */
+int dcc_broker_worker_get(const char *key, int *worker);
+void dcc_broker_worker_put(int lease, int worker);

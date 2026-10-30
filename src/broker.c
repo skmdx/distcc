@@ -42,7 +42,7 @@
 enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3, MEMO_GET = 4, MEMO_PUT = 5,
        ACQUIRE_POOL = 6, RETURN = 7, ACQUIRE_LINK = 8, ACQUIRE_CPP = 9,
        ACQUIRE_READY = 10, FAILED = 11, LOCAL_CPP = 12, LOCAL_ANALYSIS = 13, DEFER = 14,
-       TRY_LOCAL = 15 };
+       TRY_LOCAL = 15, WORKER_GET = 16, WORKER_PUT = 17 };
 #define MAX_MEMOS 32
 /* The caller can compile its original command locally. Backend-only clients
  * still require a connected worker socket, even on this machine. */
@@ -87,7 +87,7 @@ struct client {
     struct dcc_work_hint hint;
     double cost, ready_at, run_at, factor, waiting_since;
 };
-struct memo { char *key, *value; double used; };
+struct memo { char *key, *value; double used; uid_t owner; int worker, socket; };
 struct idle_connection { int fd, peer; double expires; };
 struct broker {
     struct peer peers[MAX_HOSTS];
@@ -102,17 +102,18 @@ struct broker {
 
 static int unix_address(const char *path, struct sockaddr_un *address);
 
-int dcc_broker_memo_get(const char *key, char **value)
+static int memo_get(const char *key, char **value, int *worker)
 {
     struct sockaddr_un address;
-    struct request request = { BROKER_VERSION, MEMO_GET };
+    struct request request = { BROKER_VERSION, worker ? WORKER_GET : MEMO_GET };
     struct iovec parts[2] = {{ &request, sizeof(request) }, { (void *)key, strlen(key) + 1 }};
     struct msghdr msg = { .msg_iov = parts, .msg_iovlen = 2 };
     struct timeval timeout = { 5, 0 };
     char *buffer;
     int fd;
     ssize_t size;
-    *value = NULL;
+    if (value) *value = NULL;
+    if (worker) *worker = -1;
     if (strlen(key) >= DCC_MEMO_LIMIT || unix_address(getenv("DISTCC_BROKER"), &address))
         return -1;
     fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
@@ -122,9 +123,18 @@ int dcc_broker_memo_get(const char *key, char **value)
     if (!buffer || connect(fd, (struct sockaddr *)&address, sizeof(address)) ||
         sendmsg(fd, &msg, MSG_NOSIGNAL) != (ssize_t)(sizeof(request) + strlen(key) + 1))
         goto failed;
-    size = recv(fd, buffer, DCC_MEMO_LIMIT, MSG_TRUNC);
+    int received = -1;
+    size = dcc_recv_fd(fd, buffer, DCC_MEMO_LIMIT, &received);
+    if (received >= 0) {
+        if (worker && size == 2 && !memcmp(buffer, "W", 2)) {
+            *worker = received;
+            free(buffer); close(fd); return -1;
+        }
+        close(received);
+        goto failed;
+    }
     if (size == 1 && !buffer[0]) { free(buffer); return fd; }
-    if (size > 1 && size <= DCC_MEMO_LIMIT && !buffer[size - 1] &&
+    if (value && size > 1 && size <= DCC_MEMO_LIMIT && !buffer[size - 1] &&
         strlen(buffer) == (size_t)size - 1) {
         *value = buffer;
         close(fd);
@@ -134,6 +144,17 @@ failed:
     free(buffer);
     close(fd);
     return -1;
+}
+
+int dcc_broker_memo_get(const char *key, char **value) { return memo_get(key, value, NULL); }
+int dcc_broker_worker_get(const char *key, int *worker) { return memo_get(key, NULL, worker); }
+
+void dcc_broker_worker_put(int lease, int worker)
+{
+    struct request request = { BROKER_VERSION, WORKER_PUT };
+    if (lease < 0) return;
+    if (worker >= 0) dcc_send_fd(lease, &request, sizeof(request), worker);
+    close(lease);
 }
 
 void dcc_broker_memo_put(int lease, const char *value)
@@ -560,7 +581,8 @@ static void release_assignment(struct broker *broker, struct client *client)
 
 static void release_client(struct broker *broker, struct client *client)
 {
-    if (client->state == MEMO_OWNER && !broker->memos[client->memo].value) {
+    if (client->state == MEMO_OWNER && !broker->memos[client->memo].value &&
+        !broker->memos[client->memo].socket) {
         int i;
         free(broker->memos[client->memo].key);
         broker->memos[client->memo].key = NULL;
@@ -575,18 +597,42 @@ static void release_client(struct broker *broker, struct client *client)
     client->fd = client->net = client->peer = -1;
 }
 
+static int memo_ready(const struct memo *memo) { return memo->value || memo->socket; }
+
+static void memo_clear(struct memo *memo)
+{
+    free(memo->key); free(memo->value);
+    if (memo->socket) close(memo->socket - 1);
+    memset(memo, 0, sizeof(*memo));
+}
+
+static void memo_reply(int fd, const struct memo *memo)
+{
+    if (memo->socket) dcc_send_fd(fd, "W", 2, memo->socket - 1);
+    else if (memo->value) send(fd, memo->value, strlen(memo->value) + 1, MSG_NOSIGNAL);
+}
+
 static void memo_request(struct broker *broker, struct client *client,
-                         unsigned command, const char *payload, double now)
+                         unsigned command, const char *payload, int worker_fd, double now)
 {
     int i, slot = -1;
     struct memo *memo;
-    if (command == MEMO_GET && client->state == REQUEST) {
+    int worker = command == WORKER_GET || command == WORKER_PUT;
+    struct ucred credentials;
+    socklen_t length = sizeof(credentials);
+    if (getsockopt(client->fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length)) goto done;
+    if ((command == MEMO_GET || command == WORKER_GET) && client->state == REQUEST) {
         for (i = 0; i < MAX_MEMOS; i++) {
             memo = &broker->memos[i];
-            if (memo->key && !strcmp(memo->key, payload)) {
+            if (memo->socket) {
+                char byte;
+                ssize_t alive = recv(memo->socket - 1, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+                if (alive != -1 || (errno != EAGAIN && errno != EWOULDBLOCK)) memo_clear(memo);
+            }
+            if (memo->key && memo->worker == worker && memo->owner == credentials.uid && !strcmp(memo->key, payload)) {
                 memo->used = now;
-                if (memo->value) {
-                    send(client->fd, memo->value, strlen(memo->value) + 1, MSG_NOSIGNAL);
+                if (memo_ready(memo)) {
+                    memo_reply(client->fd, memo);
                     release_client(broker, client);
                 } else {
                     client->state = MEMO_WAIT;
@@ -595,15 +641,15 @@ static void memo_request(struct broker *broker, struct client *client,
                 }
                 return;
             }
-            if ((!memo->key || memo->value) &&
+            if ((!memo->key || memo_ready(memo)) &&
                 (slot < 0 || memo->used < broker->memos[slot].used)) slot = i;
         }
         if (slot >= 0) {
             memo = &broker->memos[slot];
-            free(memo->key);
-            free(memo->value);
+            memo_clear(memo);
             memo->key = strdup(payload);
-            memo->value = NULL;
+            memo->owner = credentials.uid;
+            memo->worker = worker;
             memo->used = now;
             if (memo->key && send(client->fd, "", 1, MSG_NOSIGNAL) == 1) {
                 client->memo = slot;
@@ -614,18 +660,21 @@ static void memo_request(struct broker *broker, struct client *client,
             free(memo->key);
             memo->key = NULL;
         }
-    } else if (command == MEMO_PUT && client->state == MEMO_OWNER) {
+    } else if ((command == MEMO_PUT || command == WORKER_PUT) && client->state == MEMO_OWNER) {
         memo = &broker->memos[client->memo];
-        memo->value = strdup(payload);
+        if (memo->worker != worker) goto done;
+        if (worker) { memo->socket = worker_fd + 1; worker_fd = -1; }
+        else memo->value = strdup(payload);
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *waiter = &broker->clients[i];
             if (waiter->fd >= 0 && waiter->state == MEMO_WAIT && waiter->memo == client->memo) {
-                if (memo->value)
-                    send(waiter->fd, payload, strlen(payload) + 1, MSG_NOSIGNAL);
+                memo_reply(waiter->fd, memo);
                 release_client(broker, waiter);
             }
         }
     }
+done:
+    if (worker_fd >= 0) close(worker_fd);
     release_client(broker, client);
 }
 
@@ -1733,6 +1782,11 @@ int dcc_broker_serve(const char *path)
                     release_client(broker, c);
                     continue;
                 }
+                if (returned >= 0 && length == sizeof(request) && request.version == BROKER_VERSION &&
+                    request.command == WORKER_PUT) {
+                    memo_request(broker, c, request.command, NULL, returned, now);
+                    continue;
+                }
                 if (returned >= 0) {
                     if (length == sizeof(request) && request.version == BROKER_VERSION &&
                         request.command == DEFER && c->state == ACTIVE && c->pooled) {
@@ -1761,10 +1815,10 @@ int dcc_broker_serve(const char *path)
                 }
                 if (length > (ssize_t)sizeof(request) && length <= (ssize_t)sizeof(packet) &&
                     request.version == BROKER_VERSION &&
-                    (request.command == MEMO_GET || request.command == MEMO_PUT) &&
+                    (request.command == MEMO_GET || request.command == MEMO_PUT || request.command == WORKER_GET) &&
                     packet.payload[0] && !packet.payload[length - sizeof(request) - 1] &&
                     strlen(packet.payload) == (size_t)length - sizeof(request) - 1) {
-                    memo_request(broker, c, request.command, packet.payload, now);
+                    memo_request(broker, c, request.command, packet.payload, -1, now);
                     continue;
                 }
                 if (c->state == ACTIVE && length == sizeof(request) &&
@@ -1815,8 +1869,7 @@ done:
     for (count = 0; count < MAX_CLIENTS; ++count)
         if (broker->pool[count].fd >= 0) close(broker->pool[count].fd);
     for (count = 0; count < MAX_MEMOS; count++) {
-        free(broker->memos[count].key);
-        free(broker->memos[count].value);
+        memo_clear(&broker->memos[count]);
     }
     if (fd >= 0) {
         close(fd);
@@ -1831,6 +1884,17 @@ done:
 }
 
 #else
+int dcc_broker_worker_get(const char *key, int *worker)
+{
+    (void)key;
+    *worker = -1;
+    return -1;
+}
+void dcc_broker_worker_put(int lease, int worker)
+{
+    (void)lease;
+    (void)worker;
+}
 int dcc_broker_local_cpp(int *lease, int *occupied, int analysis)
 {
     (void)analysis;

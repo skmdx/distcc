@@ -691,6 +691,16 @@ child for each job. This avoids repeated library loading without sharing macro,
 target or compiler state between invocations. The child reports its own peak
 memory; cancellation terminates its worker group before releasing job files.
 
+`DISTCC_CLANG_LOCAL=1` also reuses Clang and LLD libraries for local driver
+commands, including configure probes. The existing broker caches a control
+socket for each compiler, caller environment and namespace. It retains job
+scheduling; the compiler helper forks an isolated child for each invocation.
+The selected driver handles options and tool selection, and other linkers and
+specialized compiler tools retain their native execution. Client disconnection
+cancels the invocation, and closing the broker cache releases idle helpers.
+This evaluation path requires the selected Clang release's `clang_native`
+extension and keeps the caller's filesystem, credentials and sandbox context.
+
 Read requests are limited to the invocation's input and include directories.
 Directory metadata is batched, file contents use the existing LZ4 transfer,
 and workers reuse the shared file cache across jobs. Cache identity includes

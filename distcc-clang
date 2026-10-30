@@ -12,21 +12,21 @@ import sys
 import traceback
 
 
-def load_frontend(compiler):
+def load_frontend(compiler, module='clang_compile'):
     # LibTooling locates resources relative to argv[0], without PATH lookup.
     # Preserve the driver name: resolving symlinks would lose target and mode.
     compiler = shutil.which(compiler) or compiler
     # Remote commands encode the client's release in the driver name, even
     # when the worker does not install a matching version-suffixed symlink.
     release = re.search(r'(?:^|-)clang(?:\+\+)?-(\d+)(?:\.\d+)*$', os.path.basename(compiler))
-    if release:
+    if release and module == 'clang_compile':
         major = release.group(1)
     else:
         version = subprocess.check_output([compiler, '-dumpversion'], text=True).strip()
         major = version.split('.')[0]
         if not major.isdecimal():
             raise ValueError('invalid Clang version: ' + version)
-    return importlib.import_module('include_server.clang' + major + '.clang_compile')
+    return importlib.import_module('include_server.clang' + major + '.' + module)
 
 
 def compile_command(arguments, frontend=None):
@@ -82,6 +82,9 @@ def worker(descriptor, compiler):
 
 
 def main():
+    if sys.argv[1] == '--native-worker':
+        from include_server.native_worker import serve
+        return serve(int(sys.argv[2]), load_frontend(sys.argv[3], 'clang_native'))
     if sys.argv[1] == '--worker':
         return worker(*sys.argv[2:])
     return compile_command(sys.argv[1:])

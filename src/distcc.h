@@ -364,7 +364,8 @@ void dcc_truncate_to_dirname(char *file);
 int dcc_writex(int fd, const void *buf, size_t len);
 int dcc_send_fd(int sock, const void *data, size_t size, int fd);
 ssize_t dcc_recv_fd(int sock, void *data, size_t size, int *fd);
-#define DCC_IPC_FDS_MAX 4
+#define DCC_IPC_FDS_MAX 5
+int dcc_clang_local(char **argv, int *status);
 int dcc_prefork_shutdown(int signal_number);
 int dcc_send_fds(int sock, const void *data, size_t size, const int *fds, unsigned count);
 ssize_t dcc_recv_fds(int sock, void *data, size_t size, int *fds, unsigned *count);
