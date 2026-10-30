@@ -201,11 +201,12 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
         do { result = waitpid(child, &status, 0); } while (result < 0 && errno == EINTR);
         ok &= result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     }
-    for (int fd : lanes) close(fd);
-    lanes.clear();
     if (!ok) return false;
     auto merge_start = clock_ns();
-    std::vector<std::string> link{DCC_LLD_PATH, "-r", "-o", frontend.OutputFile};
+    // Internal linking owns the same CPU budget as the parts it merges. LLD's
+    // hardware-thread default would otherwise oversubscribe unleased CPUs.
+    std::vector<std::string> link{DCC_LLD_PATH, "--threads=" + std::to_string(lanes.size()+1),
+                                 "-r", "-o", frontend.OutputFile};
     link.insert(link.end(), outputs.begin(), outputs.end());
     if (!tool(link)) return false;
     std::string symbols = (directory+"/locals").str();

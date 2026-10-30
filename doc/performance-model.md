@@ -192,7 +192,9 @@ For local code generation, the splitter hands verified IR directly to a child
 through `fork`. Partition construction overlaps earlier children, and the last
 partition uses the caller's existing CPU lease. This removes bitcode encoding,
 file input/output and decoding from that path without changing optimization or
-partition ownership. The network backend still serializes partitions because
+partition ownership. Retain the borrowed leases through the internal merge and
+give LLD that same thread budget; returning the leases before a merge that uses
+all hardware threads would leave its CPU demand unaccounted. The network backend still serializes partitions because
 its consumer is outside the process tree. Count these avoided operations as
 reduced work, not as an equal reduction in build wall time: parallel phases and
 the build's completion barrier determine the observable saving.
