@@ -12,23 +12,26 @@
 #include <clang/Frontend/MultiplexConsumer.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/CommandLine.h>
-#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/BuryPointer.h>
 #include <llvm/Support/JSON.h>
-#include <llvm/Support/Path.h>
 #include <llvm/Support/Program.h>
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/TargetParser/Triple.h>
+#include <lld/Common/Driver.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <cerrno>
 #include <cstring>
 #include <atomic>
 #include <new>
 #include <time.h>
+
+LLD_HAS_DRIVER(elf)
 
 namespace {
 struct Measurements {
@@ -139,8 +142,12 @@ int try_lane() {
 }
 
 bool emit(clang::CompilerInstance &compiler, llvm::Module &module,
-          llvm::StringRef output) {
-    auto stream = compiler.createOutputFile(output, true, true, true);
+          llvm::StringRef output, int descriptor = -1) {
+    std::unique_ptr<llvm::raw_pwrite_stream> stream;
+    if (descriptor >= 0)
+        stream = std::make_unique<llvm::raw_fd_ostream>(descriptor, false);
+    else
+        stream = compiler.createOutputFile(output, true, true, true);
     if (!stream) return false;
     // IPO and all requested LLVM optimization passes have already run on the
     // complete module. Each part still receives the original target/codegen options.
@@ -156,6 +163,8 @@ bool emit(clang::CompilerInstance &compiler, llvm::Module &module,
     compiler.clearOutputFiles(!ok);
     return ok;
 }
+
+std::string fd_path(int fd) { return "/proc/self/fd/" + std::to_string(fd); }
 
 bool tool(llvm::ArrayRef<std::string> arguments) {
     llvm::SmallVector<llvm::StringRef> args(arguments.begin(), arguments.end());
@@ -191,8 +200,16 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
                                           &compiler.getVirtualFileSystem());
     }
     TimedIRAction action;
+    std::unique_ptr<llvm::Module> module;
+    auto dispose = llvm::scope_exit([&] {
+        if (frontend.DisableFree) {
+            if (!module) module = action.takeModule();
+            llvm::BuryPointer(std::move(module));
+            llvm::BuryPointer(action.takeLLVMContext());
+        }
+    });
     if (!compiler.ExecuteAction(action)) return false;
-    auto module = action.takeModule();
+    module = action.takeModule();
     if (!module) return false;
     uint64_t total = 0, largest = 0;
     unsigned functions = 0;
@@ -240,22 +257,22 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
     }
 
     auto prepare_start = clock_ns();
-    llvm::SmallString<256> directory;
-    auto error = llvm::sys::fs::createUniqueDirectory("distcc-codegen", directory);
-    if (error) { llvm::errs() << error.message() << '\n'; return false; }
+    std::vector<int> parts;
+    int symbols = -1;
     auto cleanup = llvm::scope_exit([&] {
-        if (auto error = llvm::sys::fs::remove_directories(directory))
-            llvm::errs() << "distcc codegen cleanup: " << error.message() << '\n';
+        for (int fd : parts) close(fd);
+        if (symbols >= 0) close(symbols);
     });
-    std::vector<std::string> outputs;
     std::vector<pid_t> children;
     uint64_t prepared = 0;
     auto names = dcc_split_module(*module, lanes.size()+1, [&](llvm::Module &part, bool last) -> llvm::Error {
-        unsigned i = outputs.size();
-        outputs.push_back((directory+"/part-"+llvm::Twine(i)+".o").str());
+        unsigned i = parts.size();
+        int fd = memfd_create("distcc-codegen", MFD_CLOEXEC);
+        if (fd < 0) return llvm::errorCodeToError(std::error_code(errno, std::generic_category()));
+        parts.push_back(fd);
         if (last) {
             prepared = clock_ns()-prepare_start;
-            return emit(compiler, part, outputs[i]) ? llvm::Error::success() :
+            return emit(compiler, part, {}, fd) ? llvm::Error::success() :
                 llvm::createStringError("cannot emit LLVM partition");
         }
         // Fork while the splitter's module is alive. The child consumes its
@@ -266,7 +283,8 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
         if (child < 0) return llvm::errorCodeToError(std::error_code(errno, std::generic_category()));
         if (!child) {
             for (unsigned j = 0; j < lanes.size(); ++j) if (j != i) close(lanes[j]);
-            bool success = emit(compiler, part, outputs[i]);
+            for (int other : parts) if (other != fd) close(other);
+            bool success = emit(compiler, part, {}, fd);
             llvm::outs().flush(); llvm::errs().flush();
             _exit(success ? 0 : 1);
         }
@@ -287,21 +305,29 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
     // hardware-thread default would otherwise oversubscribe unleased CPUs.
     std::vector<std::string> link{DCC_LLD_PATH, "--threads=" + std::to_string(lanes.size()+1),
                                  "-r", "-o", frontend.OutputFile};
-    link.insert(link.end(), outputs.begin(), outputs.end());
-    if (!tool(link)) return false;
-    std::string symbols = (directory+"/locals").str();
-    llvm::raw_fd_ostream list(symbols, error);
-    if (error) return false;
+    for (int fd : parts) link.push_back(fd_path(fd));
+    // LLD is already resident for local driver jobs. This compiler child owns
+    // one merge, so its linker state cannot leak into another invocation.
+    llvm::SmallVector<const char *> link_args;
+    for (const auto &argument : link) link_args.push_back(argument.c_str());
+    if (lld::lldMain(link_args, llvm::outs(), llvm::errs(),
+                     {{lld::Gnu, &lld::elf::link}}).retCode) return false;
+    // Parts remain anonymous tmpfs files until the resident linker consumes
+    // them. Only the small symbol list crosses exec into llvm-objcopy.
+    symbols = memfd_create("distcc-codegen-locals", MFD_CLOEXEC);
+    if (symbols < 0) return false;
+    llvm::raw_fd_ostream list(symbols, false);
     for (const auto &name : *names) list << name << '\n';
-    list.close();
+    list.flush();
     if (list.has_error()) return false;
-    if (!tool({DCC_OBJCOPY_PATH, "--localize-symbols="+symbols, frontend.OutputFile})) return false;
+    if (fcntl(symbols, F_SETFD, 0) ||
+        !tool({DCC_OBJCOPY_PATH, "--localize-symbols="+fd_path(symbols), frontend.OutputFile})) return false;
     if (measured) {
         measured->overhead_ns.fetch_add(prepared+clock_ns()-merge_start);
-        measured->parts.fetch_add(outputs.size());
+        measured->parts.fetch_add(parts.size());
     }
     if (getenv("DISTCC_VERBOSE"))
-        llvm::errs() << "distcc codegen: " << outputs.size() << " parts, " << total
+        llvm::errs() << "distcc codegen: " << parts.size() << " parts, " << total
                      << " instructions, " << codegen.MainFileName << '\n';
     return true;
 }

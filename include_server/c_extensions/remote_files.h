@@ -46,16 +46,32 @@ static llvm::vfs::Status metadata(llvm::StringRef path, const char *p) {
         number(p + 36, 4), number(p + 40, 4), number(p + 24, 8),
         file_type(number(p + 32, 4)), (llvm::sys::fs::perms)(number(p + 32, 4) & 07777));
 }
+// LLVM may retain a buffer after closing its VFS file. Keep the immutable
+// backing allocation alive instead of copying the complete header again.
+class SnapshotBuffer : public llvm::MemoryBuffer {
+    std::shared_ptr<const void> owner;
+    std::string identifier;
+public:
+    SnapshotBuffer(llvm::StringRef bytes, std::string identifier,
+                   std::shared_ptr<const void> owner)
+        : owner(std::move(owner)), identifier(std::move(identifier)) {
+        init(bytes.begin(), bytes.end(), true);
+    }
+    llvm::StringRef getBufferIdentifier() const override { return identifier; }
+    BufferKind getBufferKind() const override { return MemoryBuffer_Malloc; }
+};
+
 class SnapshotFile : public llvm::vfs::File {
     llvm::vfs::Status info;
-    std::shared_ptr<std::string> bytes;
+    std::shared_ptr<const llvm::MemoryBuffer> bytes;
 public:
-    SnapshotFile(llvm::vfs::Status info, std::shared_ptr<std::string> bytes)
+    SnapshotFile(llvm::vfs::Status info, std::shared_ptr<const llvm::MemoryBuffer> bytes)
         : info(std::move(info)), bytes(std::move(bytes)) {}
     llvm::ErrorOr<llvm::vfs::Status> status() override { return info; }
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> getBuffer(
             const llvm::Twine &name, int64_t, bool, bool) override {
-        return llvm::MemoryBuffer::getMemBufferCopy(*bytes, name.str());
+        return std::unique_ptr<llvm::MemoryBuffer>(
+            new SnapshotBuffer(bytes->getBuffer(), name.str(), bytes));
     }
     std::error_code close() override { return {}; }
 };
@@ -74,7 +90,7 @@ class RemoteFiles : public llvm::vfs::FileSystem {
     int fd;
     std::string cwd;
     std::unordered_map<std::string, llvm::ErrorOr<llvm::vfs::Status>> statuses;
-    std::unordered_map<std::string, std::shared_ptr<std::string>> contents;
+    std::unordered_map<std::string, std::shared_ptr<const llvm::MemoryBuffer>> contents;
     std::unordered_map<std::string, std::string> versions;
     const dcc_file_cache_api &cache;
     std::string identity, cache_root;
@@ -182,12 +198,14 @@ public:
                 size_t length = 0;
                 void *bytes = cache.read(key.data(), key.size(), &length, cache_root.c_str());
                 if (bytes) {
-                    auto data = std::make_shared<std::string>(static_cast<char *>(bytes), length);
-                    free(bytes);
                     if (length == found->second->getSize()) {
+                        auto owner = std::shared_ptr<void>(bytes, free);
+                        auto data = std::make_shared<SnapshotBuffer>(
+                            llvm::StringRef(static_cast<char *>(bytes), length), name, std::move(owner));
                         contents.emplace(name, data);
                         return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(*found->second, std::move(data)));
                     }
+                    free(bytes);
                 }
             }
         } else if (auto error = cachedError(name)) return error;
@@ -196,9 +214,12 @@ public:
         if (answer->size() < 52) return std::make_error_code(std::errc::protocol_error);
         auto info = metadata(name, answer->data());
         if (info.getSize() != answer->size() - 52) return std::make_error_code(std::errc::protocol_error);
-        auto data = std::make_shared<std::string>(answer->substr(52));
-        if (!key.empty() && version == answer->substr(0, 52))
-            cache.write(key.data(), key.size(), data->data(), data->size(), cache_root.c_str());
+        bool cacheable = !key.empty() && version == answer->substr(0, 52);
+        auto owner = std::make_shared<std::string>(std::move(*answer));
+        auto data = std::make_shared<SnapshotBuffer>(
+            llvm::StringRef(owner->data() + 52, info.getSize()), name, owner);
+        if (cacheable)
+            cache.write(key.data(), key.size(), data->getBufferStart(), data->getBufferSize(), cache_root.c_str());
         contents.emplace(name, data);
         statuses.insert_or_assign(name, info);
         return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(info, std::move(data)));

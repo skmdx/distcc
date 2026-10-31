@@ -27,6 +27,7 @@
 #include <algorithm>
 
 PyObject *dcc_clang_compile(PyObject *, PyObject *);
+void dcc_clang_compile_init();
 
 namespace {
 using namespace clang;
@@ -614,8 +615,7 @@ PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_scan", nullptr, -1, methods,
 PyMODINIT_FUNC PyInit_clang_scan() {
     // Program-name target inference consults LLVM's registered targets,
     // including on the first scan in a fresh include-server process.
-    llvm::InitializeAllTargetInfos();
-    llvm::InitializeAllTargets();
+    dcc_clang_compile_init();
     PyObject *result = PyModule_Create(&module);
     if (result) {
         input_changed_error = PyErr_NewException("clang_scan.InputChangedError", PyExc_RuntimeError, nullptr);

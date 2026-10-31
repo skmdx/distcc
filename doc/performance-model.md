@@ -84,6 +84,11 @@ invocation is not necessarily on the completion barrier.
 ## Design the intervention before changing placement
 
 First derive the required saving `delta = P + T - D` from a completed baseline.
+Reduce total overhead cumulatively: group related ownership, copying, process
+startup and intermediate-storage changes into one implementation unit. A small
+reduction need not meet `delta` by itself to be useful. Preserve changes whose
+structural simplification independently justifies them, without describing that
+decision as evidence of a stable speedup.
 For fixed service demand and assignment, the utilization required of host `h`
 is `W[h] / (C[h] * (D-P))`. This distinguishes a capacity deficit from lost
 overlap; an accounting bound below the target does not prove that a feasible
@@ -93,9 +98,10 @@ hosts to claim interchangeable capacity.
 Use the complete set of outputs at the completion barrier. Accelerating one
 translation unit may merely expose the next slowest branch. For each proposed
 intervention, name the affected phases, the bytes or CPU work removed, and the
-dependency edges whose completion changes. If even its optimistic saving is
-less than `delta`, do not run another full-build comparison of that intervention
-alone. When assumptions or parameter values are missing, obtain those specific
+dependency edges whose completion changes. Validate individual reductions on
+their real paths, then compare the combined implementation in complete builds.
+Do not add overlapping phase savings as if they were independent elapsed time.
+When assumptions or parameter values are missing, obtain those specific
 measurements before extending the implementation.
 
 ## Requirements for placement forecasts
@@ -333,7 +339,9 @@ For local code generation, the splitter hands verified IR directly to a child
 through `fork`. Partition construction overlaps earlier children, and the last
 partition uses the caller's existing CPU lease. This removes bitcode encoding,
 file input/output and decoding from that path without changing optimization or
-partition ownership. Retain the borrowed leases through the internal merge and
+partition ownership. Intermediate objects remain in anonymous tmpfs files,
+which the resident LLD reads directly; only the symbol-localization command
+requires an external process. Retain the borrowed leases through the internal merge and
 give LLD that same thread budget; returning the leases before a merge that uses
 all hardware threads would leave its CPU demand unaccounted. The network backend still serializes partitions because
 its consumer is outside the process tree. Count these avoided operations as
@@ -368,6 +376,14 @@ for the response. This avoids loading LLVM into every remote-preparation client
 without introducing another daemon or serializing compiler invocations.
 Measure that reduction separately from placement: fewer loader CPU samples do
 not establish an earlier build completion when different long jobs own the tail.
+
+Initialize remote compiler targets once in the resident parent. Disposable
+compiler children honor the driver's `-disable-free` contract: finalize owned
+diagnostic consumers, then let process exit reclaim compiler, module and LLVM
+context storage. The long-lived analyzer must retain normal destruction.
+Remote header buffers share immutable received or cached storage; LLVM buffer
+views own that storage even after their VFS file closes. Validate ownership on
+both network and cache-hit paths, including empty headers and chunk boundaries.
 
 Derive the expected saving and its limiting assumptions before changing the
 implementation. Use existing traces to rule out proposals whose optimistic

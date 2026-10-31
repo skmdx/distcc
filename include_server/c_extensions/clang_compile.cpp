@@ -9,6 +9,7 @@
 #include <llvm/Support/VirtualFileSystem.h>
 #include "../../src/clang_inputs.h"
 #include "remote_files.h"
+#include "clang_compiler.h"
 
 namespace {
 // The driver sees the existing worker paths. Only the frontend uses the
@@ -86,13 +87,20 @@ public:
             llvm::sys::path::remove_dots(normalized, true);
             path = files.translate(normalized);
         });
-        clang::CompilerInstance compiler(invocation, std::move(pch));
-        compiler.setFileManager(manager);
-        compiler.createDiagnostics(diagnostics, false);
-        compiler.createSourceManager();
-        return clang::ExecuteCompilerInvocation(&compiler);
+        DccChildCompiler compiler(new clang::CompilerInstance(invocation, std::move(pch)));
+        compiler->setFileManager(manager);
+        compiler->createDiagnostics(diagnostics, false);
+        compiler->createSourceManager();
+        return clang::ExecuteCompilerInvocation(compiler.get());
     }
 };
+}
+
+// Import-time initialization is shared by the worker's forked jobs. Repeating
+// target registration in every child also dirties otherwise shared pages.
+void dcc_clang_compile_init() {
+    llvm::InitializeAllTargetInfos(); llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs(); llvm::InitializeAllAsmParsers(); llvm::InitializeAllAsmPrinters();
 }
 
 // Called in a dedicated compiler child, never in the long-lived include server.
@@ -115,12 +123,7 @@ PyObject *dcc_clang_compile(PyObject *, PyObject *arguments) {
     const std::string invoked_as = command.front();
     bool ok;
     Py_BEGIN_ALLOW_THREADS
-    llvm::InitializeAllTargetInfos();
-    llvm::InitializeAllTargets();
     clang::tooling::addTargetAndModeForProgramName(command, invoked_as);
-    llvm::InitializeAllTargetMCs();
-    llvm::InitializeAllAsmParsers();
-    llvm::InitializeAllAsmPrinters();
     {
         llvm::IntrusiveRefCntPtr<ClientFiles> files(new ClientFiles(root, cwd, pump));
         llvm::IntrusiveRefCntPtr<clang::FileManager> manager(
@@ -167,12 +170,10 @@ static PyObject *compile_remote(PyObject *, PyObject *arguments) {
     for (const auto &arg : command) args.push_back(arg.c_str());
     bool ok = false;
     Py_BEGIN_ALLOW_THREADS
-    llvm::InitializeAllTargetInfos(); llvm::InitializeAllTargets();
-    llvm::InitializeAllTargetMCs(); llvm::InitializeAllAsmParsers(); llvm::InitializeAllAsmPrinters();
     auto invocation = std::make_shared<clang::CompilerInvocation>();
-    clang::CompilerInstance compiler(invocation, std::make_shared<clang::PCHContainerOperations>());
-    compiler.createDiagnostics();
-    if (clang::CompilerInvocation::CreateFromArgs(*invocation, args, compiler.getDiagnostics())) {
+    DccChildCompiler compiler(new clang::CompilerInstance(invocation, std::make_shared<clang::PCHContainerOperations>()));
+    compiler->createDiagnostics();
+    if (clang::CompilerInvocation::CreateFromArgs(*invocation, args, compiler->getDiagnostics())) {
         invocation->getFrontendOpts().OutputFile = output;
         auto &deps = invocation->getDependencyOutputOpts();
         if (!deps.OutputFile.empty()) deps.OutputFile = dependencies;
@@ -185,9 +186,9 @@ static PyObject *compile_remote(PyObject *, PyObject *arguments) {
         });
         llvm::IntrusiveRefCntPtr<RemoteFiles> files(new RemoteFiles(dup(fd), cwd, *cache, identity,
             llvm::sys::path::parent_path(root).str()));
-        compiler.setFileManager(new clang::FileManager(invocation->getFileSystemOpts(), files));
-        compiler.createSourceManager();
-        ok = clang::ExecuteCompilerInvocation(&compiler);
+        compiler->setFileManager(new clang::FileManager(invocation->getFileSystemOpts(), files));
+        compiler->createSourceManager();
+        ok = clang::ExecuteCompilerInvocation(compiler.get());
     }
     Py_END_ALLOW_THREADS
     Py_DECREF(capsule);
@@ -204,5 +205,8 @@ PyMethodDef methods[] = {
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_compile", nullptr, -1,
                       methods, nullptr, nullptr, nullptr, nullptr};
 }
-PyMODINIT_FUNC PyInit_clang_compile() { return PyModule_Create(&module); }
+PyMODINIT_FUNC PyInit_clang_compile() {
+    dcc_clang_compile_init();
+    return PyModule_Create(&module);
+}
 #endif

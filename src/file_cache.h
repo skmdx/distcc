@@ -26,6 +26,8 @@ void dcc_file_cache_prune(const unsigned char *hash, const char *tmp);
 /* Versioned filesystem records share the same shard limits and publication
  * rules as content snapshots. A hit verifies both the full key and payload. */
 struct dcc_file_cache_api {
+    /* A hit returns a malloc-owned allocation, with an extra NUL after *size
+     * payload bytes. The terminator is not part of the stored record/hash. */
     void *(*read)(const void *, size_t, size_t *, const char *);
     void (*write)(const void *, size_t, const void *, size_t, const char *);
 };

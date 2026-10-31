@@ -34,6 +34,8 @@ class LocalClangTest(BrokerTestCase):
         self.start_local()
         (self.work/'source.c').write_text('#include <stdio.h>\nint main(void) { puts("local"); return 0; }\n')
         (self.work/'source.cc').write_text('#include <vector>\nint main() { std::vector<int> v{1,2}; return v[1]!=2; }\n')
+        (self.work/'warning.c').write_text('#warning diagnostic must be finalized\nint value;\n')
+        (self.work/'error.c').write_text('#error diagnostic must be finalized\n')
         (self.work/'options.rsp').write_text('-O2 -c source.c -o out -MMD -MF out.d')
         cases = [
             ['-O2', '-c', 'source.c', '-o', 'out', '-MMD', '-MF', 'out.d'],
@@ -45,14 +47,16 @@ class LocalClangTest(BrokerTestCase):
             ['-cc1','-help'],
             ['-c', 'source.c', '/wd4189', '-o', 'out'],
             ['-c', 'source.c', '-fno-such-distcc-option', '-o', 'out'],
+            ['-c', 'warning.c', '-o', 'out', '-serialize-diagnostics', 'out.dia'],
+            ['-c', 'error.c', '-o', 'out', '-serialize-diagnostics', 'out.dia'],
         ]
         for arguments in cases:
             with self.subTest(arguments=arguments):
                 outputs = []
                 for reused in (False, True):
-                    for name in ('out', 'out.d'): (self.work/name).unlink(missing_ok=True)
+                    for name in ('out', 'out.d', 'out.dia'): (self.work/name).unlink(missing_ok=True)
                     result = self.command(arguments, reused)
-                    artifacts = {name:(self.work/name).read_bytes() for name in ('out','out.d')
+                    artifacts = {name:(self.work/name).read_bytes() for name in ('out','out.d','out.dia')
                                  if (self.work/name).exists()}
                     outputs.append((result.returncode,result.stdout,artifacts))
                     if not result.returncode and '-c' not in arguments and arguments[0] != '@options.rsp' and 'out' in artifacts:

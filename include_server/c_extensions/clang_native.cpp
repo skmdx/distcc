@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <functional>
 #include "clang_codegen.h"
+#include "clang_compiler.h"
 
 LLD_HAS_DRIVER(elf)
 
@@ -83,12 +84,12 @@ PyObject *run(PyObject *, PyObject *input) {
             }
             auto compile = [&] {
                 auto invocation = std::make_shared<clang::CompilerInvocation>();
-                clang::CompilerInstance instance(invocation);
-                instance.createDiagnostics();
+                DccChildCompiler instance(new clang::CompilerInstance(invocation));
+                instance->createDiagnostics();
                 if (!clang::CompilerInvocation::CreateFromArgs(*invocation,
-                    llvm::ArrayRef(command).drop_front(2), instance.getDiagnostics(), args[0])) return 1;
-                if (auto result = dcc_clang_codegen(instance)) return *result ? 0 : 1;
-                return clang::ExecuteCompilerInvocation(&instance) ? 0 : 1;
+                    llvm::ArrayRef(command).drop_front(2), instance->getDiagnostics(), args[0])) return 1;
+                if (auto result = dcc_clang_codegen(*instance)) return *result ? 0 : 1;
+                return clang::ExecuteCompilerInvocation(instance.get()) ? 0 : 1;
             };
             // The enclosing driver is already a per-invocation child. A single
             // phase cannot leak compiler state into another phase or job.

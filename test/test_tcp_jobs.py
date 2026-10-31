@@ -240,17 +240,63 @@ class FrontendTest(BrokerTestCase):
     def test_remote_frontend_transfers_compressed_and_raw_chunk_tails(self):
         clang = self.start_frontend()
         source = self.work/'chunks.c'
-        source.write_text('/*' + 'a'*(256*1024) + random.Random(821).randbytes(256*1024+13).hex() +
-                          '*/\nint main(void) { return 0; }\n')
+        (self.work/'chunks.h').write_text('/*' + 'a'*(256*1024) +
+                                        random.Random(821).randbytes(256*1024+13).hex() + '*/\n')
+        (self.work/'empty.h').write_bytes(b'')
+        source.write_text('#include "chunks.h"\n#include "empty.h"\nint main(void) { return 0; }\n')
         output = self.work/'chunks.o'
         command = [clang, '-O3', '-c', str(source), '-o', str(output)]
         subprocess.run(command, check=True, capture_output=True, timeout=30)
         expected = output.read_bytes(); output.unlink()
-        result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
-                                capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr[-5000:])
-        self.assertIn('frontend filesystem:', result.stderr)
-        self.assertEqual(output.read_bytes(), expected)
+        transfers = []
+        for _ in range(2):
+            result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr[-5000:])
+            self.assertIn('frontend filesystem:', result.stderr)
+            self.assertEqual(output.read_bytes(), expected)
+            transfers.append(int(re.findall(r'frontend filesystem: \d+ requests, (\d+) bytes',
+                                            result.stderr)[-1]))
+        self.assertLess(transfers[1], transfers[0])
+
+    def test_frontend_buffers_share_storage_and_outlive_closed_files(self):
+        clang = self.start_frontend()
+        config = Path(clang).resolve().parent/'llvm-config'
+        if not config.exists(): self.skipTest('LLVM development files unavailable')
+        source = self.work/'buffer.cc'
+        header = self.build/'include_server/c_extensions/remote_files.h'
+        source.write_text(f'#include "{header}"\n' + r'''
+int main(int argc, char **argv) {
+    auto loaded = llvm::MemoryBuffer::getFile(argv[1]);
+    auto info = llvm::vfs::getRealFileSystem()->status(argv[1]);
+    if (!loaded || !info) return 1;
+    std::shared_ptr<llvm::MemoryBuffer> storage(std::move(*loaded));
+    std::weak_ptr<llvm::MemoryBuffer> lifetime(storage);
+    auto file = std::make_unique<SnapshotFile>(*info, storage);
+    auto first = file->getBuffer("first", -1, true, false);
+    auto second = file->getBuffer("second", -1, true, false);
+    if (!first || !second) return 2;
+    if ((*first)->getBufferStart() != storage->getBufferStart() ||
+        (*second)->getBufferStart() != storage->getBufferStart()) return 3;
+    auto size = storage->getBufferSize();
+    file->close(); file.reset(); storage.reset();
+    if (lifetime.expired() || (*first)->getBufferSize() != size ||
+        (*first)->getBufferIdentifier() != "first" ||
+        (*second)->getBufferIdentifier() != "second" ||
+        (*first)->getBufferStart()[size] != '\0') return 4;
+    first->reset();
+    if (lifetime.expired() || (*second)->getBuffer().count('\n') == 0) return 5;
+    second->reset();
+    return lifetime.expired() ? 0 : 6;
+}
+''')
+        includedir = subprocess.check_output([config, '--includedir'], text=True).strip()
+        libdir = subprocess.check_output([config, '--libdir'], text=True).strip()
+        executable = self.work/'buffer'
+        subprocess.run([clang, '--driver-mode=g++', '-std=c++17', str(source),
+                        '-I'+includedir, '-L'+libdir, '-Wl,-rpath,'+libdir, '-lLLVM',
+                        '-o', str(executable)], check=True, capture_output=True, timeout=30)
+        subprocess.run([str(executable), str(source)], check=True, timeout=5)
 
     def test_remote_frontend_preserves_large_directory_snapshots(self):
         clang = self.start_frontend()

@@ -198,7 +198,8 @@ if sysroot and llvm_lib.startswith(sysroot + '/'):
   llvm_runtime_lib = llvm_lib[len(sysroot):]
 frontend_headers = [os.path.join(srcdir, 'src', name)
                     for name in ('clang_inputs.h', 'job.h', 'tcp_job.h', 'file_cache.h')]
-frontend_headers.append(os.path.join(srcdir_include_server, 'c_extensions', 'remote_files.h'))
+frontend_headers.extend(os.path.join(srcdir_include_server, 'c_extensions', name)
+                        for name in ('remote_files.h', 'clang_compiler.h'))
 scanner = setuptools.Extension(
     name='include_server.clang_scan',
     sources=[os.path.join(srcdir_include_server, 'c_extensions', name)
@@ -240,7 +241,8 @@ for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.paths
                  os.path.join(os.environ.get('LTO_BUILD', 'llvm-lto'), 'SplitModule.cpp')],
       depends=[os.path.join(srcdir, 'src', name) for name in
                ('broker_protocol.h', 'workload.h', 'lto_partition.h', 'clang_inputs.h')]
-              + [os.path.join(srcdir_include_server, 'c_extensions', 'clang_codegen.h')],
+              + [os.path.join(srcdir_include_server, 'c_extensions', name)
+                 for name in ('clang_codegen.h', 'clang_compiler.h')],
       language='c++', include_dirs=[llvm_option('--includedir', config), os.path.join(srcdir, 'src')],
       library_dirs=[library], runtime_library_dirs=[runtime],
       libraries=['clang-cpp', 'lldELF', 'lldCommon', 'LLVM'],
