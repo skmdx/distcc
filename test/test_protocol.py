@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Argument framing and TCP buffering through a real compiler/daemon."""
 import os
+import array
+import contextlib
 import importlib.util
 from pathlib import Path
 import re
@@ -8,6 +10,8 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
+import tempfile
 import unittest
 
 from test_adaptive import DistccTestCase
@@ -60,6 +64,62 @@ class ArgumentFileTest(unittest.TestCase):
         os.write(self.fd, b'ARGC       1ARGV       3one')
         os.lseek(self.fd, 0, os.SEEK_SET)
         self.assertEqual(self.protocol.RArgvFile(self.fd, 1), (['one'],))
+
+    def test_helpers_contain_bad_commands_and_accept_the_next_request(self):
+        compiler = shutil.which('clang')
+        if not compiler: self.skipTest('Clang unavailable')
+        build = Path.cwd()
+        env = dict(os.environ, PYTHONPATH=str(next(build.glob('_include_server/lib.*'))))
+        for native in (False, True):
+            with self.subTest(native=native), contextlib.ExitStack() as cleanup:
+                work = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='distcc-worker-')))
+                control, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                cleanup.callback(control.close); cleanup.callback(child.close)
+                control.settimeout(15)
+                process = subprocess.Popen([sys.executable, str(build/'distcc-clang'),
+                    '--native-worker' if native else '--worker', str(child.fileno()), compiler],
+                    pass_fds=(child.fileno(),), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                def finish():
+                    control.close()
+                    try: process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill(); process.communicate(timeout=5)
+                cleanup.callback(finish)
+                child.close()
+                if native: self.assertEqual(control.recv(1), b'R')
+                outputs = [os.memfd_create('distcc-worker-test') for _ in range(3)]
+                for fd in outputs: cleanup.callback(os.close, fd)
+                directory = [str(build), compiler]
+                valid = [directory, [compiler, '--version']] if native else [[
+                    'distcc-clang', str(work/'root'), str(work/'output.o'), str(work), 'remote', '0', str(work/'output.d'),
+                    compiler, '--distcc-frontend', 'client', '-version']]
+                # Broken framing and well-framed but invalid command shapes
+                # must fail their invocation, never the resident process.
+                cases = [(b'bad', b'C', False),
+                         ([[], []] if native else [[]], b'C', False)]
+                if native: cases.append((b'bad', b'P', False))
+                cases.append((valid, b'C', True))
+                for payload, operation, success in cases:
+                    os.ftruncate(self.fd, 0); os.lseek(self.fd, 0, os.SEEK_SET)
+                    if isinstance(payload, bytes): os.write(self.fd, payload)
+                    else:
+                        for group in payload: self.protocol.XArgv(self.fd, group)
+                    os.lseek(self.fd, 0, os.SEEK_SET)
+                    for fd in outputs: os.ftruncate(fd, 0); os.lseek(fd, 0, os.SEEK_SET)
+                    reply, peer = socket.socketpair()
+                    with reply, peer:
+                        reply.settimeout(15)
+                        fds = [self.fd, peer.fileno(), *outputs] if native else [self.fd, peer.fileno(), *outputs[1:]]
+                        control.sendmsg([operation], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))])
+                        channel = reply if native else control
+                        response = channel.recv(16 if native else 24, socket.MSG_WAITALL)
+                    self.assertEqual(len(response), 16 if native else 24)
+                    status = struct.unpack_from('=Q', response)[0]
+                    self.assertEqual(os.waitstatus_to_exitcode(status) == 0, success,
+                                     os.pread(outputs[2], 65536, 0))
+                    self.assertIsNone(process.poll())
+                    if success:
+                        self.assertIn(b'version', os.pread(outputs[1], 65536, 0)+os.pread(outputs[2], 65536, 0))
 
 
 class ProtocolTest(DistccTestCase):

@@ -7,6 +7,8 @@
 #include <llvm/Support/Path.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/VirtualFileSystem.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/ADT/ScopeExit.h>
 #include "../../src/clang_inputs.h"
 #include "remote_files.h"
 #include "clang_compiler.h"
@@ -15,6 +17,7 @@
 #endif
 
 namespace {
+const dcc_file_cache_api *file_cache;
 // The driver sees the existing worker paths. Only the frontend uses the
 // client's main-file identity, including quoted-include lookup from its parent.
 // File contents and metadata remain owned by the physical filesystem.
@@ -136,6 +139,7 @@ PyObject *dcc_clang_compile(PyObject *, PyObject *arguments) {
             std::make_shared<clang::PCHContainerOperations>());
         ok = invocation.run();
     }
+    llvm::outs().flush(); llvm::errs().flush();
     Py_END_ALLOW_THREADS
     if (PyErr_CheckSignals() < 0) return nullptr;
     return PyLong_FromLong(ok ? 0 : 1);
@@ -146,31 +150,23 @@ static PyObject *compile_remote(PyObject *, PyObject *arguments) {
     int fd;
     const char *cwd, *output, *dependencies, *root;
     if (!PyArg_ParseTuple(arguments, "Oissss", &argv, &fd, &cwd, &output, &dependencies, &root)) return nullptr;
-    PyObject *sequence = PySequence_Fast(argv, "argv must be a sequence");
+    PyObject *sequence = PySequence_Tuple(argv);
     if (!sequence) return nullptr;
-    std::vector<std::string> command;
+    auto release = llvm::scope_exit([&] { Py_DECREF(sequence); });
+    std::vector<const char *> args;
     if (PySequence_Fast_GET_SIZE(sequence) < 4) {
-        Py_DECREF(sequence);
         return PyErr_Format(PyExc_ValueError, "missing remote frontend invocation");
     }
     const char *client_identity = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, 2));
-    if (!client_identity) { Py_DECREF(sequence); return nullptr; }
-    std::string identity(client_identity);
+    if (!client_identity) return nullptr;
+    args.reserve(PySequence_Fast_GET_SIZE(sequence)-3);
     for (Py_ssize_t i = 3; i < PySequence_Fast_GET_SIZE(sequence); ++i) {
         const char *value = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, i));
-        if (!value) { Py_DECREF(sequence); return nullptr; }
-        command.emplace_back(value);
+        if (!value) return nullptr;
+        args.push_back(value);
     }
-    Py_DECREF(sequence);
-    PyObject *cache_module = PyImport_ImportModule("include_server.distcc_pump_c_extensions");
-    if (!cache_module) return nullptr;
-    PyObject *capsule = PyObject_GetAttrString(cache_module, "file_cache");
-    Py_DECREF(cache_module);
-    if (!capsule) return nullptr;
-    auto *cache = static_cast<dcc_file_cache_api *>(PyCapsule_GetPointer(capsule, "distcc.file_cache"));
-    if (!cache) { Py_DECREF(capsule); return nullptr; }
-    std::vector<const char *> args;
-    for (const auto &arg : command) args.push_back(arg.c_str());
+    // The sequence retains immutable strings until compilation returns. Borrow
+    // their UTF-8 storage instead of copying every captured cc1 argument.
     bool ok = false;
     Py_BEGIN_ALLOW_THREADS
     auto invocation = std::make_shared<clang::CompilerInvocation>();
@@ -187,7 +183,7 @@ static PyObject *compile_remote(PyObject *, PyObject *arguments) {
             llvm::sys::path::remove_dots(normalized, true);
             path = std::string(root) + normalized.str().str();
         });
-        llvm::IntrusiveRefCntPtr<RemoteFiles> files(new RemoteFiles(dup(fd), cwd, *cache, identity,
+        llvm::IntrusiveRefCntPtr<RemoteFiles> files(new RemoteFiles(dup(fd), cwd, *file_cache, client_identity,
             llvm::sys::path::parent_path(root).str()));
         compiler->setFileManager(new clang::FileManager(invocation->getFileSystemOpts(), files));
         compiler->createSourceManager();
@@ -198,8 +194,8 @@ static PyObject *compile_remote(PyObject *, PyObject *arguments) {
         ok = clang::ExecuteCompilerInvocation(compiler.get());
 #endif
     }
+    llvm::outs().flush(); llvm::errs().flush();
     Py_END_ALLOW_THREADS
-    Py_DECREF(capsule);
     if (PyErr_CheckSignals() < 0) return nullptr;
     return PyLong_FromLong(ok ? 0 : 1);
 }
@@ -214,6 +210,16 @@ PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_compile", nullptr, -1,
                       methods, nullptr, nullptr, nullptr, nullptr};
 }
 PyMODINIT_FUNC PyInit_clang_compile() {
+    PyObject *cache_module = PyImport_ImportModule("include_server.distcc_pump_c_extensions");
+    if (!cache_module) return nullptr;
+    PyObject *capsule = PyObject_GetAttrString(cache_module, "file_cache");
+    Py_DECREF(cache_module);
+    if (!capsule) return nullptr;
+    // This capsule exposes a static C function table, independent of Python
+    // object lifetime. Resolve it once in the resident worker before forking.
+    file_cache = static_cast<const dcc_file_cache_api *>(PyCapsule_GetPointer(capsule, "distcc.file_cache"));
+    Py_DECREF(capsule);
+    if (!file_cache) return nullptr;
     dcc_clang_compile_init();
     dcc_clang_codegen_init();
     return PyModule_Create(&module);

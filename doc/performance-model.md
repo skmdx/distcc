@@ -376,13 +376,19 @@ working directory and descriptors; the compiler's driver owns argument
 interpretation and input roots. Preparation reuses its consumed command memfd
 for the response. This avoids loading LLVM into every remote-preparation client
 without introducing another daemon or serializing compiler invocations.
+Resident parents dispatch descriptors; their isolated children decode and own
+command data. This keeps request preparation off the shared acceptance loop and
+contains malformed commands within the failed invocation. Borrow immutable
+argument storage across the native call, retaining its Python owner until the
+compiler returns, and resolve static service tables before forking.
 Measure that reduction separately from placement: fewer loader CPU samples do
 not establish an earlier build completion when different long jobs own the tail.
 
 Initialize remote compiler targets once in the resident parent. Disposable
 compiler children honor the driver's `-disable-free` contract: finalize owned
 diagnostic consumers, then let process exit reclaim compiler, module and LLVM
-context storage. The long-lived analyzer must retain normal destruction.
+context storage. Flush LLVM output streams before that exit, including native
+actions such as version queries. The long-lived analyzer retains normal destruction.
 Remote header buffers share immutable received or cached storage; LLVM buffer
 views own that storage even after their VFS file closes. Validate ownership on
 both network and cache-hit paths, including empty headers and chunk boundaries.

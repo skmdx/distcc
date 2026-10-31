@@ -59,7 +59,7 @@ public:
 };
 
 PyObject *run(PyObject *, PyObject *input) {
-    PyObject *sequence = PySequence_Fast(input, "argv must be a sequence");
+    PyObject *sequence = PySequence_Tuple(input);
     if (!sequence) return nullptr;
     llvm::SmallVector<const char *> args;
     for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE(sequence); ++i) {
@@ -122,7 +122,7 @@ PyObject *run(PyObject *, PyObject *input) {
     return PyLong_FromLong(status);
 }
 PyObject *prepare(PyObject *, PyObject *input) {
-    PyObject *sequence = PySequence_Fast(input, "argv must be a sequence");
+    PyObject *sequence = PySequence_Tuple(input);
     if (!sequence) return nullptr;
     auto release = llvm::scope_exit([&] { Py_DECREF(sequence); });
     std::vector<char *> args;

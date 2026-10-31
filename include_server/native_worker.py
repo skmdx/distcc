@@ -38,9 +38,6 @@ def serve(descriptor, frontend):
                             return 0
                         if data not in (b'C', b'P') or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(fds) != 5:
                             raise ValueError('invalid local compiler request')
-                        directory, argv = protocol.RArgvFile(fds[0], 2)
-                        cwd, compiler = directory
-                        argv[0] = compiler
                         reply = socket.socket(fileno=fds[1])
                         fds[1] = -1
                         pid = os.fork()
@@ -56,7 +53,14 @@ def serve(descriptor, frontend):
                                 os.setpgid(0, 0)
                                 for dest, source in enumerate(fds[2:]): os.dup2(source, dest)
                                 for fd in fds:
-                                    if fd >= 0 and (data != b'P' or fd != fds[0]): os.close(fd)
+                                    if fd >= 0 and fd != fds[0]: os.close(fd)
+                                # The parent only dispatches descriptors. Decode
+                                # and own invocation data in its isolated child.
+                                directory, argv = protocol.RArgvFile(fds[0], 2)
+                                cwd, compiler = directory
+                                argv[0] = compiler
+                                if data != b'P':
+                                    os.close(fds[0]); fds[0] = -1
                                 os.chdir(cwd)
                                 if data == b'P':
                                     prepared = frontend.prepare(argv)
@@ -67,11 +71,12 @@ def serve(descriptor, frontend):
                                         os.lseek(fds[0], 0, os.SEEK_SET)
                                         for values in prepared: protocol.XArgv(fds[0], values)
                                         status = 0
-                                    os.close(fds[0])
                                 else:
                                     status = frontend.run(argv)
                             except BaseException:
                                 traceback.print_exc()
+                            finally:
+                                if fds[0] >= 0: os.close(fds[0])
                             sys.stdout.flush(); sys.stderr.flush()
                             os._exit(status if status >= 0 else 128-status)
                         try: os.setpgid(pid, pid)

@@ -33,7 +33,10 @@ def compile_command(arguments, frontend=None):
     root, original, cwd, mode, *command = arguments
     if mode == 'remote':
         descriptor, dependencies, *command = command
-    command[0] = shutil.which(command[0]) or command[0]
+    # Captured remote cc1 arguments do not use the driver executable. Native
+    # ToolInvocation still needs its resource directory resolved from argv[0].
+    if mode != 'remote':
+        command[0] = shutil.which(command[0]) or command[0]
     if frontend is None:
         frontend = load_frontend(command[0])
     if mode == 'remote':
@@ -58,16 +61,19 @@ def worker(descriptor, compiler):
             try:
                 if data != b'C' or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(fds) != 4:
                     raise ValueError('invalid compiler request')
-                arguments, = protocol.RArgvFile(fds[0], 1)
-                if len(arguments) < 8 or arguments[4] != 'remote':
-                    raise ValueError('invalid remote compiler command')
                 pid = os.fork()
                 if pid == 0:
                     channel.close()
                     status = 1
                     try:
                         os.dup2(fds[2], 1); os.dup2(fds[3], 2)
-                        os.close(fds[0]); os.close(fds[2]); os.close(fds[3])
+                        os.close(fds[2]); os.close(fds[3])
+                        try:
+                            arguments, = protocol.RArgvFile(fds[0], 1)
+                        finally:
+                            os.close(fds[0])
+                        if len(arguments) < 8 or arguments[4] != 'remote':
+                            raise ValueError('invalid remote compiler command')
                         arguments[5] = str(fds[1])
                         os.environ['TMPDIR'] = arguments[1]
                         status = compile_command(arguments[1:], frontend)
