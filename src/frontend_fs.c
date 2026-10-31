@@ -51,20 +51,42 @@ static int allowed(const struct dcc_job *job, const char *path, int metadata)
     free(name);
     return result;
 }
-static int append(int fd, const void *bytes, size_t length)
+/* Small metadata fields share writes. Track their logical offsets without
+ * seeking; file payloads flush the metadata and continue with sendfile. */
+struct reply_writer {
+    int fd;
+    uint64_t size;
+    size_t used;
+    unsigned char buffer[BUFSIZ];
+};
+static int flush(struct reply_writer *writer)
 {
-    off_t offset = lseek(fd, 0, SEEK_CUR);
-    if (offset < 0 || length > DCC_TCP_BYTES - (uint64_t)offset) { errno = EFBIG; return -1; }
-    const char *data = bytes;
+    const unsigned char *data = writer->buffer;
+    size_t length = writer->used;
     while (length) {
-        ssize_t n = write(fd, data, length);
+        ssize_t n = write(writer->fd, data, length);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         data += n; length -= n;
     }
+    writer->used = 0;
     return 0;
 }
-static int metadata(int fd, const struct stat *st)
+static int append(struct reply_writer *writer, const void *bytes, size_t length)
+{
+    if (length > DCC_TCP_BYTES - writer->size) { errno = EFBIG; return -1; }
+    const unsigned char *data = bytes;
+    writer->size += length;
+    while (length) {
+        size_t n = sizeof(writer->buffer) - writer->used;
+        if (n > length) n = length;
+        memcpy(writer->buffer + writer->used, data, n);
+        writer->used += n; data += n; length -= n;
+        if (writer->used == sizeof(writer->buffer) && flush(writer)) return -1;
+    }
+    return 0;
+}
+static int metadata(struct reply_writer *writer, const struct stat *st)
 {
     unsigned char data[DCC_FS_METADATA];
     dcc_tcp_put64(data, st->st_dev); dcc_tcp_put64(data + 8, st->st_ino);
@@ -72,16 +94,16 @@ static int metadata(int fd, const struct stat *st)
     dcc_tcp_put64(data + 24, st->st_size); dcc_tcp_put32(data + 32, st->st_mode);
     dcc_tcp_put32(data + 36, st->st_uid); dcc_tcp_put32(data + 40, st->st_gid);
     dcc_tcp_put64(data + 44, (uint64_t)st->st_ctim.tv_sec * 1000000000 + st->st_ctim.tv_nsec);
-    return append(fd, data, sizeof(data));
+    return append(writer, data, sizeof(data));
 }
-static int directory(int fd, const char *path, int statuses)
+static int directory(struct reply_writer *writer, const char *path, int statuses)
 {
     DIR *dir = opendir(path);
     if (!dir) return -1;
-    off_t offset = lseek(fd, 0, SEEK_CUR);
+    uint64_t offset = writer->size;
     unsigned char header[8] = {0};
     uint32_t count = 0;
-    int result = statuses ? append(fd, header, 4) : 0;
+    int result = statuses ? append(writer, header, 4) : 0;
     struct dirent *entry;
     if (!result) errno = 0;
     while (!result && (entry = readdir(dir))) {
@@ -91,8 +113,8 @@ static int directory(int fd, const char *path, int statuses)
         size_t length = strlen(entry->d_name);
         dcc_tcp_put32(header, length);
         dcc_tcp_put32(header + 4, statuses ? error : error ? 0 : st.st_mode);
-        result = append(fd, header, 8) || append(fd, entry->d_name, length) ||
-            (statuses && !error && metadata(fd, &st));
+        result = append(writer, header, 8) || append(writer, entry->d_name, length) ||
+            (statuses && !error && metadata(writer, &st));
         if (result) break;
         ++count;
         errno = 0;
@@ -102,7 +124,7 @@ static int directory(int fd, const char *path, int statuses)
     closedir(dir);
     if (!result && statuses) {
         dcc_tcp_put32(header, count);
-        result = pwrite(fd, header, 4, offset) != 4 ? -1 : 0;
+        result = flush(writer) || pwrite(writer->fd, header, 4, offset) != 4 ? -1 : 0;
         if (result) error = errno;
     }
     errno = error;
@@ -115,41 +137,44 @@ int dcc_frontend_fs_reply(const struct dcc_job *job, const void *data, size_t si
     unsigned operation = dcc_tcp_get32(data);
     char *path = strndup((const char *)data + 4, size - 4);
     int fd = dcc_job_memfd("distcc-filesystem"), source = -1, error = 0;
+    struct reply_writer writer = {.fd = fd};
     unsigned char header[8] = {0};
     struct stat st;
-    if (!path || fd < 0 || append(fd, header, 8)) goto failed;
+    if (!path || fd < 0 || append(&writer, header, 8)) goto failed;
     if (!allowed(job, path, operation == DCC_FS_STAT || operation == DCC_FS_REALPATH)) error = EACCES;
     else if (operation == DCC_FS_STAT) {
-        if (stat(path, &st) || metadata(fd, &st) ||
-            (S_ISDIR(st.st_mode) && allowed(job, path, 0) && directory(fd, path, 1))) error = errno;
+        if (stat(path, &st) || metadata(&writer, &st) ||
+            (S_ISDIR(st.st_mode) && allowed(job, path, 0) && directory(&writer, path, 1))) error = errno;
     } else if (operation == DCC_FS_READ) {
         source = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (source < 0 || fstat(source, &st)) error = errno;
         else if (!S_ISREG(st.st_mode)) error = EINVAL;
         else if ((uint64_t)st.st_size > DCC_TCP_BYTES - 8 - DCC_FS_METADATA) error = EFBIG;
-        else if (metadata(fd, &st)) error = errno;
+        else if (metadata(&writer, &st) || flush(&writer)) error = errno;
         else {
             off_t offset = 0;
             while (offset < st.st_size) {
                 ssize_t n = sendfile(fd, source, &offset, st.st_size - offset);
                 if (n < 0 && errno == EINTR) continue;
                 if (n <= 0) { error = n ? errno : EIO; break; }
+                writer.size += n;
             }
         }
     } else if (operation == DCC_FS_REALPATH) {
         char *resolved = realpath(path, NULL);
-        if (!resolved || append(fd, resolved, strlen(resolved))) error = errno;
+        if (!resolved || append(&writer, resolved, strlen(resolved))) error = errno;
         free(resolved);
     } else if (operation == DCC_FS_LIST) {
-        if (directory(fd, path, 0)) error = errno;
+        if (directory(&writer, path, 0)) error = errno;
     } else error = EINVAL;
     if (source >= 0) { close(source); source = -1; }
-    if (error && (ftruncate(fd, 8) || lseek(fd, 8, SEEK_SET) < 0)) goto failed;
-    off_t end = lseek(fd, 0, SEEK_CUR);
-    if (end < 8 || (uint64_t)end > DCC_TCP_BYTES) goto failed;
-    dcc_tcp_put32(header, error); dcc_tcp_put32(header + 4, end - 8);
+    if (error) {
+        if (ftruncate(fd, 8)) goto failed;
+        writer.size = 8;
+    } else if (flush(&writer)) goto failed;
+    dcc_tcp_put32(header, error); dcc_tcp_put32(header + 4, writer.size - 8);
     if (pwrite(fd, header, 8, 0) != 8) goto failed;
-    *length = end;
+    *length = writer.size;
     free(path);
     return fd;
 failed:

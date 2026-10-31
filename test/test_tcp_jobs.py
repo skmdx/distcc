@@ -252,6 +252,32 @@ class FrontendTest(BrokerTestCase):
         self.assertIn('frontend filesystem:', result.stderr)
         self.assertEqual(output.read_bytes(), expected)
 
+    def test_remote_frontend_preserves_large_directory_snapshots(self):
+        clang = self.start_frontend()
+        directory = self.work/'headers'
+        directory.mkdir()
+        names = [f'header_{i:03d}_with_a_long_directory_entry_name.h' for i in range(180)]
+        for name in names:
+            (directory/name).write_text('#define VALUE 42\n')
+        (directory/'dangling.h').symlink_to('absent.h')
+        source = self.work/'directory.c'
+        source.write_text(f'#include "headers/{names[-1]}"\n'
+                          '#if __has_include("headers/dangling.h")\n#error dangling header\n#endif\n'
+                          'int main(void) { return VALUE != 42; }\n')
+        output, deps = self.work/'directory.o', self.work/'directory.d'
+        command = [clang, '-O3', '-c', str(source), '-o', str(output), '-MMD', '-MF', str(deps)]
+        subprocess.run(command, check=True, capture_output=True, timeout=30)
+        expected = output.read_bytes(), deps.read_bytes()
+        output.unlink(); deps.unlink()
+        result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr[-5000:])
+        self.assertIn('frontend filesystem:', result.stderr)
+        self.assertEqual((output.read_bytes(), deps.read_bytes()), expected)
+        executable = self.work/'directory'
+        subprocess.run([clang, str(output), '-o', str(executable)], check=True, capture_output=True)
+        subprocess.run([str(executable)], check=True, timeout=5)
+
     def test_remote_frontend_disconnect_reclaims_worker(self):
         # Reserve within the one-job-only interval (half to all of the
         # measured budget), away from its fluctuating boundary. While one

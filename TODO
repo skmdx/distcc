@@ -2,6 +2,13 @@ TODO list for distcc
 
 --> See also TODO and FIXME comments in source files and doc/todo/
 
+type-check TCP integration tests
+
+    test/test_tcp_jobs.py has existing Pyright diagnostics for unchecked
+    optional regexp matches, compiler discovery and a possibly unbound
+    measurement variable. Preserve the real-path checks when making these
+    preconditions explicit; the runtime suite currently passes.
+
 
 should rewrite non-ELF, non-DWARF2 object files
 
