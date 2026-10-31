@@ -373,7 +373,14 @@ both compatible reuse and a sufficient net-work reduction.
 Frontend command preparation and local compilation share the caller's resident
 Clang libraries. Each request still runs in an isolated child with its own
 working directory and descriptors; the compiler's driver owns argument
-interpretation and input roots. Preparation reuses its consumed command memfd
+interpretation and input roots. Preparation and auxiliary-input discovery share
+the driver's plan. Inspect its parsed invocation for input metadata, but forward
+the driver's cc1 command directly. Tooling's invocation wrapper clears
+`DisableFree` for long-lived callers; serializing that modified invocation loses
+the actual driver's process-exit reclamation policy. Avoid this wrapper and
+argument regeneration in disposable compiler preparation, while preserving
+Clang's own job selection, option parsing and diagnostics.
+Preparation reuses its consumed command memfd
 for the response. This avoids loading LLVM into every remote-preparation client
 without introducing another daemon or serializing compiler invocations.
 Resident parents dispatch descriptors; their isolated native children decode and

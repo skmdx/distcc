@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 from pathlib import Path
 import re
+import shlex
 import shutil
 import socket
 import struct
@@ -112,6 +113,8 @@ class ArgumentFileTest(unittest.TestCase):
                     source.write_text('int answer(void) { return 42; }\n')
                     cases.append(([directory, [compiler, '-c', str(source), '-o', str(work/'out.o')]],
                                   b'P', True))
+                    cases.append(([directory, [compiler, '-cc1', '-emit-obj', '-x', 'c',
+                                               str(source), '-o', str(work/'out.o')]], b'P', True))
                 cases.append((valid, b'C', True))
                 for payload, operation, success in cases:
                     os.ftruncate(self.fd, 0); os.lseek(self.fd, 0, os.SEEK_SET)
@@ -137,6 +140,18 @@ class ArgumentFileTest(unittest.TestCase):
                         prepared, roots = self.protocol.RArgvFile(self.fd, 2)
                         self.assertEqual(prepared[1], str(source))
                         self.assertIn(str(work), roots)
+                        assert not isinstance(payload, bytes)
+                        command = payload[1]
+                        if '-cc1' in command:
+                            native_args = command[1:]
+                        else:
+                            dry_run = subprocess.run([*command, '-###'], capture_output=True, check=True)
+                            native_args = next(shlex.split(os.fsdecode(line)) for line in dry_run.stderr.splitlines()
+                                               if b'"-cc1"' in line)
+                        # Tooling disables process-exit reclamation for its own
+                        # long-lived callers. Our disposable worker must retain
+                        # the actual driver's lifetime choice in both directions.
+                        self.assertEqual('-disable-free' in prepared, '-disable-free' in native_args)
                     elif success:
                         self.assertIn(b'version', os.pread(outputs[1], 65536, 0)+os.pread(outputs[2], 65536, 0))
 

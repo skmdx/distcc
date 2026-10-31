@@ -2,6 +2,9 @@
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <clang/Basic/CodeGenOptions.h>
 #include <clang/Options/Options.h>
+#include <clang/Driver/Compilation.h>
+#include <clang/Driver/Driver.h>
+#include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/CompilerInvocation.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <clang/Lex/HeaderSearchOptions.h>
@@ -17,6 +20,7 @@
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/Error.h>
 #include <llvm/ADT/SmallString.h>
+#include <llvm/TargetParser/Host.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -27,16 +31,47 @@
 #include "clang_inputs.h"
 
 namespace {
-class Capture : public clang::tooling::ToolAction {
+// Own the driver's plan while callers borrow its cc1 arguments. Parsing the
+// invocation supplies input roots and auxiliary files; it must not regenerate
+// or otherwise change the command the actual compiler selected.
+class FrontendPlan {
+    std::vector<std::string> command;
+    llvm::SmallVector<const char *> argv;
+    std::unique_ptr<clang::DiagnosticOptions> diagnostic_options;
+    llvm::IntrusiveRefCntPtr<clang::DiagnosticsEngine> diagnostics;
+    std::unique_ptr<clang::driver::Driver> driver;
+    std::unique_ptr<clang::driver::Compilation> compilation;
 public:
-    std::shared_ptr<clang::CompilerInvocation> compiler;
-    bool runInvocation(std::shared_ptr<clang::CompilerInvocation> invocation,
-                       clang::FileManager *,
-                       std::shared_ptr<clang::PCHContainerOperations>,
-                       clang::DiagnosticConsumer *) override {
+    llvm::ArrayRef<const char *> cc1;
+    std::unique_ptr<clang::CompilerInvocation> compiler;
+    explicit FrontendPlan(char **input) {
+        for (char **p = input; *p; ++p) command.emplace_back(*p);
+        if (command.empty()) return;
+        const auto invoked_as = command.front();
+        clang::tooling::addTargetAndModeForProgramName(command, invoked_as);
+        auto executable = llvm::sys::findProgramByName(command.front());
+        if (executable) command.front() = *executable;
+        for (const auto &arg : command) argv.push_back(arg.c_str());
+        diagnostic_options = clang::CreateAndPopulateDiagOpts(argv);
+        diagnostics = clang::CompilerInstance::createDiagnostics(
+            *llvm::vfs::getRealFileSystem(), *diagnostic_options);
+        if (argv.size() >= 2 && llvm::StringRef(argv[1]) == "-cc1") {
+            cc1 = llvm::ArrayRef(argv).drop_front();
+        } else {
+            driver = std::make_unique<clang::driver::Driver>(argv[0],
+                llvm::sys::getDefaultTargetTriple(), *diagnostics);
+            compilation.reset(driver->BuildCompilation(argv));
+            if (!compilation || compilation->containsError() || diagnostics->hasErrorOccurred()) return;
+            auto args = clang::tooling::getCC1Arguments(diagnostics.get(), compilation.get());
+            if (!args) return;
+            cc1 = *args;
+        }
+        auto invocation = std::make_unique<clang::CompilerInvocation>();
+        if (!clang::CompilerInvocation::CreateFromArgs(*invocation, cc1, *diagnostics, argv[0]) ||
+            diagnostics->hasErrorOccurred()) return;
         compiler = std::move(invocation);
-        return true;
     }
+    const std::string &executable() const { return command.front(); }
 };
 
 std::string absolute(llvm::StringRef name) {
@@ -82,30 +117,9 @@ extern "C" int dcc_clang_expand_response_files(char **argv, char ***expanded) {
 
 extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots) {
     *cc1 = *roots = nullptr;
-    std::vector<std::string> command;
-    for (char **p = argv; *p; ++p) command.emplace_back(*p);
-    const auto invoked_as = command.front();
-    clang::tooling::addTargetAndModeForProgramName(command, invoked_as);
-    auto executable = llvm::sys::findProgramByName(command.front());
-    if (executable) command.front() = *executable;
-    llvm::IntrusiveRefCntPtr<clang::FileManager> manager(new clang::FileManager(clang::FileSystemOptions()));
-    Capture action;
-    clang::DiagnosticOptions diagnostic_options;
-    clang::TextDiagnosticPrinter diagnostics(llvm::errs(), diagnostic_options);
-    clang::tooling::ToolInvocation tool(command, &action, manager.get(),
-        std::make_shared<clang::PCHContainerOperations>());
-    tool.setDiagnosticConsumer(&diagnostics);
-    // A driver may still construct a cc1 job after reporting another missing
-    // input or an invalid option. Capturing that job alone must not turn a
-    // failed configure probe into a successful compile.
-    if (!tool.run() || diagnostics.getNumErrors() || !action.compiler) return -1;
-    auto &invocation = *action.compiler;
-    llvm::SmallVector<const char *> arguments;
-    llvm::BumpPtrAllocator storage;
-    llvm::StringSaver strings(storage);
-    invocation.generateCC1CommandLine(arguments, [&](const llvm::Twine &value) {
-        return strings.save(value.str()).data();
-    });
+    FrontendPlan plan(argv);
+    if (!plan.compiler) return -1;
+    auto &invocation = *plan.compiler;
     const auto &inputs = invocation.getFrontendOpts().Inputs;
     if (inputs.size() != 1 || !inputs[0].isFile()) return -1;
     auto boot = llvm::MemoryBuffer::getFile("/proc/sys/kernel/random/boot_id");
@@ -120,8 +134,8 @@ extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots) {
     if (getgroups(count, groups.data()) != count) return -1;
     std::sort(groups.begin(), groups.end());
     for (auto group : groups) identity += ':' + std::to_string(group);
-    std::vector<std::string> result{command.front(), inputs[0].getFile().str(), identity}, directories;
-    for (auto arg : arguments) result.emplace_back(arg);
+    std::vector<std::string> result{plan.executable(), inputs[0].getFile().str(), identity}, directories;
+    for (auto arg : plan.cc1) result.emplace_back(arg);
     std::set<std::string> unique;
     for (const auto &entry : invocation.getHeaderSearchOpts().UserEntries)
         unique.insert(absolute(entry.Path));
@@ -139,24 +153,12 @@ extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots) {
 }
 
 extern "C" int dcc_clang_inputs(char **argv, char ***normalized, char ***files) {
-    std::vector<std::string> command;
+    FrontendPlan plan(argv);
+    if (!plan.compiler) return -1;
     std::vector<const char *> raw;
-    for (unsigned i = 0; argv[i]; ++i) {
-        command.emplace_back(argv[i]);
-        if (i) raw.push_back(argv[i]);
-    }
-    const std::string invoked_as = command.front();
-    clang::tooling::addTargetAndModeForProgramName(command, invoked_as);
-    auto executable = llvm::sys::findProgramByName(command.front());
-    if (executable) command.front() = *executable;
-    llvm::IntrusiveRefCntPtr<clang::FileManager> manager(
-        new clang::FileManager(clang::FileSystemOptions()));
-    Capture action;
-    clang::tooling::ToolInvocation invocation(command, &action, manager.get(),
-        std::make_shared<clang::PCHContainerOperations>());
-    if (!invocation.run() || !action.compiler) return -1;
+    for (unsigned i = 1; argv[i]; ++i) raw.push_back(argv[i]);
     std::set<std::string> used;
-    for (const auto &input : action.compiler->getFrontendOpts().Inputs)
+    for (const auto &input : plan.compiler->getFrontendOpts().Inputs)
         if (input.isFile()) used.insert(absolute(input.getFile()));
     unsigned missing_index = 0, missing_count = 0;
     auto args = clang::getDriverOptTable().ParseArgs(raw, missing_index, missing_count);
@@ -169,7 +171,7 @@ extern "C" int dcc_clang_inputs(char **argv, char ***normalized, char ***files) 
     const auto *profile = args.getLastArg(clang::options::OPT_fprofile_use,
         clang::options::OPT_fprofile_use_EQ, clang::options::OPT_fprofile_instr_use,
         clang::options::OPT_fprofile_instr_use_EQ);
-    auto profile_path = action.compiler->getCodeGenOpts().ProfileInstrumentUsePath;
+    auto profile_path = plan.compiler->getCodeGenOpts().ProfileInstrumentUsePath;
     std::vector<std::string> result, inputs;
     for (unsigned i = 0; argv[i]; ++i) {
         if (unused.count(i)) continue;
@@ -178,7 +180,7 @@ extern "C" int dcc_clang_inputs(char **argv, char ***normalized, char ***files) 
         else result.emplace_back(argv[i]);
     }
     bool valid = true;
-    dcc_clang_profile_inputs(action.compiler->getCodeGenOpts(), [&](std::string &path) {
+    dcc_clang_profile_inputs(plan.compiler->getCodeGenOpts(), [&](std::string &path) {
         auto name = absolute(path);
         if (name.empty()) { valid = false; return; }
         if (std::find(inputs.begin(), inputs.end(), name) == inputs.end())
