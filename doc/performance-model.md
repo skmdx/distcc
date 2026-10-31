@@ -90,12 +90,28 @@ remaining completion times. Comparing schedules with and without a candidate
 then includes the finite delay it adds to other jobs. Do not charge the initial
 contention for the candidate's entire lifetime.
 
+If a forecast also assumes `b` persistent background tasks, price their lost
+progress over that finite schedule. For a work increment `dw`, `n` known jobs
+take `dt = dw*f(n+b)`. The known completion sum grows by `n*dt`. Background
+progress is `b*dw`, which would take `b*dw*f(b)` seconds of aggregate service
+without the known jobs. The combined area is therefore
+`((n+b)*f(n+b) - b*f(b))*dw`. Subtract the baseline area from the candidate
+area. An inverse marginal-throughput price describes indefinitely replaced
+work; it is not this finite added delay. This derivation assumes equal service
+rates, persistent background demand and known residuals. It does not prove
+those assumptions for a sampled runnable count.
+
 This calculation requires actual residual estimates. An aggregate count of
 unknown jobs does not establish their completion order; assigning the same mean
 residual to all of them must not be interpreted as simultaneous completion.
 External runnable counts likewise do not establish a finite interference
 duration. Record which decisions satisfy the model's premises before attributing
 whole-build results to that model.
+
+A job that has exceeded its work estimate has an unknown residual. Its observed
+age is not a measurement of remaining work. Using age to avoid an indefinitely
+stale queue-release prediction does not justify treating the same value as a
+known completion event in an interference calculation.
 
 Check work-estimate error before making placement more elaborate. Raw source
 bytes, preprocessed tree bytes, LLVM instruction counts and compiler CPU time
@@ -165,6 +181,15 @@ within `B*C`. Subtracting instantaneous external runnable tasks from the CPU
 count is not equivalent to this condition. It may leave capacity unused after
 short-lived tasks finish or move a long job to a slower host that extends the
 completion barrier.
+
+A mean-reverting model can estimate the average background over a candidate's
+service horizon from preceding observations. Validate it in time order against
+the time-weighted future count, without fitting to future samples. Lower error
+in runnable-count prediction is only an intermediate result: it neither measures
+CPU service nor validates residual-work estimates or the placement objective.
+Require a repeated complete-build comparison before retaining the extra model
+state solely for speed. Moving one formerly slow job can expose another branch
+or increase service demand elsewhere.
 
 Prepared jobs must still compare completion times, including contention. A
 hard limit inferred from background runnable counts can leave them waiting
