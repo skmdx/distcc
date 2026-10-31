@@ -336,6 +336,7 @@ int dcc_add_cleanup(const char *filename) WARN_UNUSED;
 /* strip.c */
 int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname);
 int dcc_prepare_clang(char ***argv, char ***files);
+void *dcc_clang_driver(void);
 int dcc_strip_dasho(char **from, char ***out_argv);
 
 /* cpp.c */
@@ -366,7 +367,6 @@ int dcc_send_fd(int sock, const void *data, size_t size, int fd);
 ssize_t dcc_recv_fd(int sock, void *data, size_t size, int *fd);
 #define DCC_IPC_FDS_MAX 5
 int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns);
-int dcc_clang_local_prepare(char **argv, char ***command, char ***roots);
 int dcc_prefork_shutdown(int signal_number);
 int dcc_send_fds(int sock, const void *data, size_t size, const int *fds, unsigned count);
 ssize_t dcc_recv_fds(int sock, void *data, size_t size, int *fds, unsigned *count);

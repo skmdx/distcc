@@ -89,7 +89,6 @@
 #include "util.h"
 #include "exitcode.h"
 #include "job.h"
-#include "frontend_fs.h"
 #include "snprintf.h"
 
 /* Offload preprocessing is a compiler-generated bundle of target-specific
@@ -126,30 +125,12 @@ const char *dcc_offload_language(char *const argv[])
     return language && (!strncmp(language, "c++", 3)) ? "c++-cpp-output" : "cpp-output";
 }
 
-static void *dcc_clang_driver(void)
+void *dcc_clang_driver(void)
 {
     const char *library = getenv("DISTCC_CLANG_LIBRARY");
     void *handle = dlopen(library && *library ? library : LIBDIR "/distcc/clang_driver.so", RTLD_NOW | RTLD_LOCAL);
     if (!handle) rs_log_warning("cannot load Clang driver: %s", dlerror());
     return handle;
-}
-
-int dcc_frontend_prepare(char **argv, struct dcc_job **result)
-{
-    struct dcc_job *job = calloc(1, sizeof(*job));
-    if (!job) return EXIT_OUT_OF_MEMORY;
-    job->kind = DCC_JOB_FRONTEND;
-    job->cwd = getcwd(NULL, 0);
-    int ret = job->cwd ? dcc_clang_local_prepare(argv, &job->argv, &job->fs_roots) : EXIT_IO_ERROR;
-    if (ret < 0) {
-        void *handle = dcc_clang_driver();
-        int (*capture)(char **, char ***, char ***) = handle ? dlsym(handle, "dcc_clang_frontend") : NULL;
-        ret = capture ? capture(argv, &job->argv, &job->fs_roots) : -1;
-        if (handle) dlclose(handle);
-    }
-    if (ret) { dcc_job_free(job); return EXIT_DISTCC_FAILED; }
-    *result = job;
-    return 0;
 }
 
 int dcc_expand_response_files(char ***argv)

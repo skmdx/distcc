@@ -1,6 +1,7 @@
 /* Client-owned compiler libraries, shared through the existing broker cache.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -18,6 +19,7 @@
 #include "broker.h"
 #include "exec.h"
 #include "exitcode.h"
+#include "frontend_fs.h"
 #include "job.h"
 #include "rpc.h"
 #include "trace.h"
@@ -128,7 +130,7 @@ int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
     return request(argv, 'C', -1, status, cpu_ns);
 }
 
-int dcc_clang_local_prepare(char **argv, char ***command, char ***roots)
+static int dcc_clang_local_prepare(char **argv, char ***command, char ***roots)
 {
     int output = dcc_job_memfd("distcc-frontend-command"), status;
     if (output < 0) return EXIT_IO_ERROR;
@@ -143,4 +145,24 @@ int dcc_clang_local_prepare(char **argv, char ***command, char ***roots)
     }
     close(output);
     return ret;
+}
+
+/* This owns client broker requests; shared argument parsing is also linked
+ * into the daemon and standalone tools without the client worker cache. */
+int dcc_frontend_prepare(char **argv, struct dcc_job **result)
+{
+    struct dcc_job *job = calloc(1, sizeof(*job));
+    if (!job) return EXIT_OUT_OF_MEMORY;
+    job->kind = DCC_JOB_FRONTEND;
+    job->cwd = getcwd(NULL, 0);
+    int ret = job->cwd ? dcc_clang_local_prepare(argv, &job->argv, &job->fs_roots) : EXIT_IO_ERROR;
+    if (ret < 0) {
+        void *handle = dcc_clang_driver();
+        int (*capture)(char **, char ***, char ***) = handle ? dlsym(handle, "dcc_clang_frontend") : NULL;
+        ret = capture ? capture(argv, &job->argv, &job->fs_roots) : -1;
+        if (handle) dlclose(handle);
+    }
+    if (ret) { dcc_job_free(job); return EXIT_DISTCC_FAILED; }
+    *result = job;
+    return 0;
 }
