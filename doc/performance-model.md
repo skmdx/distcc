@@ -386,6 +386,17 @@ context storage. The long-lived analyzer must retain normal destruction.
 Remote header buffers share immutable received or cached storage; LLVM buffer
 views own that storage even after their VFS file closes. Validate ownership on
 both network and cache-hit paths, including empty headers and chunk boundaries.
+Keep status, version, contents and directory-query state in one record per path;
+ancestor lookups can use string views without constructing every path prefix.
+Changed metadata invalidates that record's buffer, while already opened views
+retain their original immutable storage. Receive directly into uninitialized
+payload storage and publish it only after the complete reply arrives.
+
+The resident local helper owns all of its invocation children. Drain completed
+children with `wait4(-1, WNOHANG)` after processing each event batch, rather than
+polling every live PID. Work scales with received events and completions instead
+of their product with the live child count; out-of-order exits and cancellation
+must still preserve each reply's own status and CPU accounting.
 
 Filesystem responses retain metadata in memory and an optional open source FD.
 The sender joins the prefix and file extent in the existing compressed chunks;

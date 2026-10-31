@@ -417,6 +417,19 @@ int main(int argc, char **argv) {
                         '-o', str(executable)], check=True, capture_output=True, timeout=30)
         subprocess.run([str(executable), str(source)], check=True, timeout=5)
 
+    def test_remote_files_partial_ipc_cache_and_snapshot_ownership(self):
+        clang = self.start_frontend()
+        config = Path(clang).resolve().parent/'llvm-config'
+        if not config.exists(): self.skipTest('LLVM development files unavailable')
+        includedir = subprocess.check_output([config, '--includedir'], text=True).strip()
+        libdir = subprocess.check_output([config, '--libdir'], text=True).strip()
+        executable = self.work/'remote-files'
+        subprocess.run([clang, '--driver-mode=g++', '-std=c++17',
+                        str(self.build/'test/remote_files_contract.cc'), '-I'+str(self.build),
+                        '-I'+includedir, '-L'+libdir, '-Wl,-rpath,'+libdir, '-lLLVM', '-pthread',
+                        '-o', str(executable)], check=True, capture_output=True, timeout=30)
+        subprocess.run([str(executable)], check=True, timeout=10)
+
     def test_frontend_reply_stream_owns_open_file_and_checks_truncation(self):
         # Exercise the actual reply producer, chunk encoder and decoder,
         # including binary payloads that a C source fixture cannot contain.

@@ -87,15 +87,17 @@ def serve(descriptor, frontend):
                     try: os.killpg(pid, signal.SIGKILL)
                     except ProcessLookupError: pass
                     selector.unregister(event.fileobj)
-            for pid, peer in list(jobs.items()):
-                done, status, usage = os.wait4(pid, os.WNOHANG)
-                if done:
-                    try: selector.unregister(peer)
-                    except KeyError: pass
-                    try: peer.sendall(struct.pack('=2Q', status, round((usage.ru_utime + usage.ru_stime) * 1e9)))
-                    except BrokenPipeError: pass
-                    peer.close()
-                    del jobs[pid]
+            # All children belong to this helper. Drain completed invocations
+            # directly instead of probing every running PID on each event.
+            while jobs:
+                pid, status, usage = os.wait4(-1, os.WNOHANG)
+                if not pid: break
+                peer = jobs.pop(pid)
+                try: selector.unregister(peer)
+                except KeyError: pass
+                try: peer.sendall(struct.pack('=2Q', status, round((usage.ru_utime + usage.ru_stime) * 1e9)))
+                except BrokenPipeError: pass
+                peer.close()
     finally:
         for pid, peer in jobs.items():
             try: os.killpg(pid, signal.SIGKILL)

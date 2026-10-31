@@ -262,6 +262,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_portage_jobs.py \
 	test/test_broker.py \
 	test/test_tcp_jobs.py \
+	test/remote_files_contract.cc \
 	test/test_local_clang.py \
 	test/test_rust.py \
 	test/test_thinlto.py \
