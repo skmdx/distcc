@@ -12,6 +12,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/uio.h>
 #ifdef __linux__
 #include <linux/fs.h>
 #include <sys/ioctl.h>
@@ -155,8 +156,12 @@ static int make_room(int shard, off_t size, const char *replaced)
     struct stat st;
     off_t bytes = 0;
     int count = 0, i, oldest;
-    DIR *dir = fdopendir(dup(shard));
-    if (!dir) return -1;
+    /* A retained shard can be shared by forked compilers. Each scan needs
+     * its own open file description, rather than dup's shared offset. */
+    int iterator = openat(shard, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (iterator < 0) return -1;
+    DIR *dir = fdopendir(iterator);
+    if (!dir) { close(iterator); return -1; }
     while ((de = readdir(dir))) {
         if (!strncmp(de->d_name, ".tmp-", 5)) {
             if (unlinkat(shard, de->d_name, 0)) { closedir(dir); return -1; }
@@ -246,11 +251,40 @@ void dcc_file_cache_prune(const unsigned char *hash, const char *tmp)
 }
 
 struct record_header { uint64_t key_size, size, digest; };
-static int record_shard(const void *key, size_t length, char name[17], const char *tmp)
+struct dcc_record_cache { int root, shards[CACHE_SHARDS]; };
+
+static struct dcc_record_cache *record_open(const char *tmp)
 {
-    XXH64_canonical_t hash;
-    XXH64_canonicalFromHash(&hash, XXH3_64bits(key, length));
-    return cache_shard(hash.digest, name, tmp);
+    int root = cache_root(tmp);
+    if (root < 0) return NULL;
+    struct dcc_record_cache *cache = malloc(sizeof(*cache));
+    if (!cache) { close(root); return NULL; }
+    cache->root = root;
+    for (unsigned i = 0; i < CACHE_SHARDS; ++i) cache->shards[i] = -1;
+    return cache;
+}
+
+static void record_close(struct dcc_record_cache *cache)
+{
+    if (!cache) return;
+    for (unsigned i = 0; i < CACHE_SHARDS; ++i)
+        if (cache->shards[i] >= 0) close(cache->shards[i]);
+    close(cache->root);
+    free(cache);
+}
+
+static int record_shard(struct dcc_record_cache *cache, const void *key, size_t length, char name[17])
+{
+    if (!cache) return -1;
+    uint64_t hash = XXH3_64bits(key, length);
+    unsigned index = (hash >> 56) % CACHE_SHARDS;
+    snprintf(name, 17, "%016llx", (unsigned long long)hash);
+    if (cache->shards[index] < 0) {
+        char shard[3];
+        snprintf(shard, sizeof(shard), "%02x", index);
+        cache->shards[index] = private_directory(cache->root, shard);
+    }
+    return cache->shards[index];
 }
 static int read_record_bytes(int fd, void *data, size_t size)
 {
@@ -263,42 +297,65 @@ static int read_record_bytes(int fd, void *data, size_t size)
     }
     return 0;
 }
-static void *record_read(const void *key, size_t key_size, size_t *size, const char *tmp)
+static void *record_read(struct dcc_record_cache *cache, const void *key, size_t key_size,
+                         const void **data, size_t *size)
 {
     char name[17];
     struct stat st;
     struct record_header header;
-    void *stored_key = NULL, *data = NULL;
-    int shard = record_shard(key, key_size, name, tmp), fd = -1, valid = 0;
+    char *storage = NULL;
+    int shard = record_shard(cache, key, key_size, name), fd = -1, valid = 0;
     if (shard < 0) return NULL;
     fd = openat(shard, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size > CACHE_BYTES ||
-        read_record_bytes(fd, &header, sizeof(header)) || header.key_size != key_size ||
-        header.size > CACHE_BYTES || key_size > CACHE_BYTES - sizeof(header) ||
+    if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+        st.st_size < (off_t)sizeof(header) || st.st_size > CACHE_BYTES) goto done;
+    storage = malloc(st.st_size + 1);
+    if (!storage || read_record_bytes(fd, storage, st.st_size)) goto done;
+    memcpy(&header, storage, sizeof(header));
+    if (header.key_size != key_size || header.size > CACHE_BYTES || key_size > CACHE_BYTES - sizeof(header) ||
         header.size > CACHE_BYTES - sizeof(header) - key_size ||
         (uint64_t)st.st_size != sizeof(header) + key_size + header.size) goto done;
-    stored_key = malloc(key_size ? key_size : 1);
-    data = malloc(header.size + 1);
-    if (!stored_key || !data || read_record_bytes(fd, stored_key, key_size) ||
-        memcmp(stored_key, key, key_size) || read_record_bytes(fd, data, header.size) ||
-        XXH3_64bits(data, header.size) != header.digest) goto done;
-    ((char *)data)[header.size] = 0;
+    if (memcmp(storage + sizeof(header), key, key_size) ||
+        XXH3_64bits(storage + sizeof(header) + key_size, header.size) != header.digest) goto done;
+    storage[st.st_size] = 0;
+    *data = storage + sizeof(header) + key_size;
     *size = header.size;
     valid = 1;
 done:
-    free(stored_key);
     if (fd >= 0) close(fd);
-    close(shard);
-    if (!valid) { free(data); return NULL; }
-    return data;
+    if (!valid) { free(storage); return NULL; }
+    return storage;
 }
-static void record_write(const void *key, size_t key_size, const void *data, size_t size, const char *tmp)
+
+static int write_record(int fd, struct record_header *header, const void *key, const void *data)
 {
+    struct iovec parts[] = {{header, sizeof(*header)}, {(void *)key, header->key_size},
+                           {(void *)data, header->size}};
+    struct iovec *part = parts;
+    int count = 3;
+    while (count) {
+        ssize_t written = writev(fd, part, count);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return -1;
+        size_t consumed = written;
+        while (count && consumed >= part->iov_len) {
+            consumed -= part->iov_len;
+            ++part; --count;
+        }
+        if (count) { part->iov_base = (char *)part->iov_base + consumed; part->iov_len -= consumed; }
+    }
+    return 0;
+}
+
+static void record_write(struct dcc_record_cache *cache, const void *key, size_t key_size,
+                         const void *data, size_t size)
+{
+    if (!cache) return;
     struct record_header header = {key_size, size, 0};
     if (key_size > CACHE_BYTES - sizeof(header) || size > CACHE_BYTES - sizeof(header) - key_size) return;
     header.digest = XXH3_64bits(data, size);
     char name[17], temporary[40];
-    int shard = record_shard(key, key_size, name, tmp), lock = -1, fd = -1;
+    int shard = record_shard(cache, key, key_size, name), lock = -1, fd = -1;
     if (shard < 0) return;
     lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) ||
@@ -306,13 +363,11 @@ static void record_write(const void *key, size_t key_size, const void *data, siz
     snprintf(temporary, sizeof(temporary), ".tmp-%lu", (unsigned long)getpid());
     fd = openat(shard, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0) goto done;
-    if (!dcc_writex(fd, &header, sizeof(header)) && !dcc_writex(fd, key, key_size) &&
-        !dcc_writex(fd, data, size) && !fchmod(fd, 0400))
+    if (!write_record(fd, &header, key, data) && !fchmod(fd, 0400))
         renameat(shard, temporary, shard, name);
     unlinkat(shard, temporary, 0);
 done:
     if (fd >= 0) close(fd);
     if (lock >= 0) close(lock);
-    close(shard);
 }
-const struct dcc_file_cache_api dcc_file_cache_records = {record_read, record_write};
+const struct dcc_file_cache_api dcc_file_cache_records = {record_open, record_close, record_read, record_write};

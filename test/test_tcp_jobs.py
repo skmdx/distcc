@@ -2,10 +2,13 @@
 """Prepared-input TCP jobs through real broker, daemon and compilers."""
 import concurrent.futures
 import array
+import ctypes
+import importlib.util
 import os
 from pathlib import Path
 import re
 import random
+import resource
 import runpy
 import signal
 import stat
@@ -22,6 +25,151 @@ import xxhash
 
 from test_broker import BrokerTestCase
 from test_adaptive import free_port
+
+
+class FileCacheTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        extension = next(Path.cwd().glob('_include_server/lib*/include_server/distcc_pump_c_extensions*.so'))
+        spec = importlib.util.spec_from_file_location('distcc_pump_c_extensions', extension)
+        assert spec and spec.loader
+        cls.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.module)
+        pointer = ctypes.c_void_p
+        size = ctypes.c_size_t
+        class Api(ctypes.Structure):
+            _fields_ = [('open', ctypes.CFUNCTYPE(pointer, ctypes.c_char_p)),
+                        ('close', ctypes.CFUNCTYPE(None, pointer)),
+                        ('read', ctypes.CFUNCTYPE(pointer, pointer, pointer, size,
+                                                ctypes.POINTER(pointer), ctypes.POINTER(size))),
+                        ('write', ctypes.CFUNCTYPE(None, pointer, pointer, size, pointer, size))]
+        capsule = ctypes.pythonapi.PyCapsule_GetPointer
+        capsule.argtypes = (ctypes.py_object, ctypes.c_char_p)
+        capsule.restype = pointer
+        cls.api = Api.from_address(capsule(cls.module.file_cache, b'distcc.file_cache'))
+        cls.free = ctypes.CDLL(None).free
+        cls.free.argtypes = (pointer,)
+        cls.free.restype = None
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix='distcc-record-cache-')
+        self.addCleanup(directory.cleanup)
+        self.cache_path = Path(directory.name)/'records'
+        setting = os.environ.get('DISTCCD_FILE_CACHE')
+        def restore():
+            if setting is None: os.environ.pop('DISTCCD_FILE_CACHE', None)
+            else: os.environ['DISTCCD_FILE_CACHE'] = setting
+        self.addCleanup(restore)
+        os.environ['DISTCCD_FILE_CACHE'] = str(self.cache_path)
+        self.initial_fds = len(os.listdir('/proc/self/fd'))
+        self.handle = self.api.open(directory.name.encode())
+        self.assertTrue(self.handle)
+        self.addCleanup(self.close_cache)
+
+    def close_cache(self):
+        self.api.close(self.handle)
+        self.handle = None
+
+    def write(self, key, data):
+        self.api.write(self.handle, key, len(key), data, len(data))
+
+    def read(self, key):
+        data, size = ctypes.c_void_p(), ctypes.c_size_t()
+        storage = self.api.read(self.handle, key, len(key), ctypes.byref(data), ctypes.byref(size))
+        return storage, data, size.value
+
+    def get(self, key):
+        storage, data, size = self.read(key)
+        if not storage: return None
+        try:
+            assert data.value is not None
+            self.assertEqual(ctypes.string_at(data.value+size, 1), b'\0')
+            return ctypes.string_at(data, size)
+        finally:
+            self.free(storage)
+
+    def test_binary_records_and_storage_outlive_cache_handle(self):
+        for value in (b'', bytes(range(256))*16, os.urandom(131072)):
+            self.write(b'binary', value)
+            self.assertEqual(self.get(b'binary'), value)
+        storage, data, size = self.read(b'binary')
+        self.assertTrue(storage)
+        try:
+            self.close_cache()
+            self.assertEqual(ctypes.string_at(data, size), value)
+            self.assertEqual(len(os.listdir('/proc/self/fd')), self.initial_fds)
+        finally:
+            self.free(storage)
+
+    def test_corrupt_or_symlink_records_are_misses_and_can_be_replaced(self):
+        key, value = b'key', b'payload'
+        self.write(key, value)
+        path = next(p for p in self.cache_path.glob('*/*') if len(p.name) == 16)
+        original = path.read_bytes()
+        damaged = (b'', original[:-1], original+b'extra',
+                   original[:24]+b'X'+original[25:], original[:-1]+b'X',
+                   struct.pack('=3Q', 2**64-1, 2**64-1, 0))
+        for content in damaged:
+            with self.subTest(content=content):
+                path.chmod(0o600)
+                path.write_bytes(content)
+                path.chmod(0o400)
+                self.assertIsNone(self.get(key))
+                self.write(key, value)
+                self.assertEqual(self.get(key), value)
+        outside = self.cache_path.parent/'outside'
+        outside.write_bytes(original)
+        path.unlink()
+        path.symlink_to(outside)
+        self.assertIsNone(self.get(key))
+        self.write(key, value)
+        self.assertFalse(path.is_symlink())
+        self.assertEqual(self.get(key), value)
+        self.assertEqual(outside.read_bytes(), original)
+
+    def test_short_write_keeps_previous_complete_record(self):
+        self.write(b'key', b'complete')
+        pid = os.fork()
+        if not pid:
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
+            self.write(b'key', b'incomplete'*16384)
+            os._exit(0)
+        self.assertEqual(os.waitpid(pid, 0)[1], 0)
+        self.assertEqual(self.get(b'key'), b'complete')
+        self.assertFalse(list(self.cache_path.glob('*/.tmp-*')))
+
+    def test_retained_shards_prune_after_fork_and_publish_atomic_snapshots(self):
+        keys = []
+        candidate = 0
+        while len(keys) < 80:
+            key = ('entry-%d' % candidate).encode()
+            if (xxhash.xxh3_64_intdigest(key) >> 56) % 64 == 0: keys.append(key)
+            candidate += 1
+        for key in keys[:40]: self.write(key, b'entry')
+        pid = os.fork()
+        if not pid:
+            for key in keys[40:]: self.write(key, b'entry')
+            self.close_cache()
+            os._exit(0)
+        self.assertEqual(os.waitpid(pid, 0)[1], 0)
+        self.assertIsNone(self.get(keys[0]))
+        self.assertEqual(self.get(keys[-1]), b'entry')
+        key, values = b'atomic', (b'A'*65536, b'B'*65536)
+        self.write(key, values[0])
+        children = []
+        for value in values:
+            pid = os.fork()
+            if not pid:
+                for _ in range(40): self.write(key, value)
+                os._exit(0)
+            children.append(pid)
+        try:
+            for _ in range(80): self.assertTrue(self.get(key) in values)
+        finally:
+            statuses = [os.waitpid(pid, 0)[1] for pid in children]
+        self.assertEqual(statuses, [0, 0])
+        self.assertTrue(self.get(key) in values)
 
 
 class FrontendTest(BrokerTestCase):

@@ -391,6 +391,12 @@ ancestor lookups can use string views without constructing every path prefix.
 Changed metadata invalidates that record's buffer, while already opened views
 retain their original immutable storage. Receive directly into uninitialized
 payload storage and publish it only after the complete reply arrives.
+The versioned disk cache retains validated root and shard directory handles for
+each compiler invocation. Read a whole record into one allocation, validate its
+key and digest, and lend the payload view to LLVM with that allocation as owner.
+Batch header, key and payload writes before atomic publication. Eviction scans
+use independent directory offsets even when a compiler forks with cached handles;
+closing the cache cannot invalidate already returned buffers.
 
 The resident local helper owns all of its invocation children. Drain completed
 children with `wait4(-1, WNOHANG)` after processing each event batch, rather than

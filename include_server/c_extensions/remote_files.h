@@ -136,7 +136,8 @@ class RemoteFiles : public llvm::vfs::FileSystem {
     std::string cwd;
     llvm::StringMap<Entry> entries;
     const dcc_file_cache_api &cache;
-    std::string identity, cache_root;
+    dcc_record_cache *records;
+    std::string identity;
     Entry &remember(llvm::StringRef name, const char *bytes) {
         auto [found, inserted] = entries.try_emplace(name, name, bytes);
         if (!inserted) found->second.update(name, bytes);
@@ -206,9 +207,10 @@ class RemoteFiles : public llvm::vfs::FileSystem {
 public:
     RemoteFiles(int fd, std::string cwd, const dcc_file_cache_api &cache,
                 std::string identity, std::string cache_root)
-        : fd(fd), cwd(std::move(cwd)), cache(cache), identity(std::move(identity)),
-          cache_root(std::move(cache_root)) {}
+        : fd(fd), cwd(std::move(cwd)), cache(cache), records(cache.open(cache_root.c_str())),
+          identity(std::move(identity)) {}
     ~RemoteFiles() override {
+        cache.close(records);
         if (shared) { pthread_mutex_destroy(shared); munmap(shared, sizeof(*shared)); }
         ::close(fd);
     }
@@ -290,15 +292,16 @@ public:
                 key.reserve(identity.size()+1+version.size()+name.size());
                 key.append(identity); key += '\0'; key.append(version.data(), version.size()); key += name;
                 size_t length = 0;
-                void *bytes = cache.read(key.data(), key.size(), &length, cache_root.c_str());
-                if (bytes) {
+                const void *bytes;
+                void *storage = cache.read(records, key.data(), key.size(), &bytes, &length);
+                if (storage) {
                     if (length == record.info->getSize()) {
-                        auto owner = std::shared_ptr<void>(bytes, free);
+                        auto owner = std::shared_ptr<void>(storage, free);
                         record.contents = std::make_shared<SnapshotBuffer>(
-                            llvm::StringRef(static_cast<char *>(bytes), length), name, std::move(owner));
+                            llvm::StringRef(static_cast<const char *>(bytes), length), name, std::move(owner));
                         return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(*record.info, record.contents));
                     }
-                    free(bytes);
+                    free(storage);
                 }
             }
         } else if (auto error = cachedError(name)) return error;
@@ -313,8 +316,8 @@ public:
         auto owner = std::shared_ptr<const llvm::MemoryBuffer>(std::move(*response));
         record.contents = std::make_shared<SnapshotBuffer>(answer.drop_front(DCC_FS_METADATA), name, owner);
         if (cacheable)
-            cache.write(key.data(), key.size(), record.contents->getBufferStart(),
-                        record.contents->getBufferSize(), cache_root.c_str());
+            cache.write(records, key.data(), key.size(), record.contents->getBufferStart(),
+                        record.contents->getBufferSize());
         return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(*record.info, record.contents));
     }
     llvm::vfs::directory_iterator dir_begin(const llvm::Twine &path, std::error_code &error) override {

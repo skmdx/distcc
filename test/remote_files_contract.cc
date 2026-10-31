@@ -29,13 +29,17 @@ static void read_bytes(int fd, char *bytes, size_t size) {
     }
 }
 static unsigned cache_reads, cache_writes;
-static void *cached(const void *key, size_t size, size_t *length, const char *) {
+static dcc_record_cache *cache_open(const char *) { return reinterpret_cast<dcc_record_cache *>(&cache_reads); }
+static void cache_close(dcc_record_cache *) {}
+static void *cached(dcc_record_cache *, const void *key, size_t size, const void **data, size_t *length) {
     ++cache_reads;
     if (!llvm::StringRef(static_cast<const char *>(key), size).ends_with("/tree/b")) return nullptr;
     *length = 5;
-    return strdup("cache");
+    char *storage = strdup("headcache");
+    *data = storage+4;
+    return storage;
 }
-static void store(const void *key, size_t size, const void *bytes, size_t length, const char *) {
+static void store(dcc_record_cache *, const void *key, size_t size, const void *bytes, size_t length) {
     ++cache_writes;
     require(llvm::StringRef(static_cast<const char *>(key), size).ends_with("/tree/c"), "cached changed version");
     require(llvm::StringRef(static_cast<const char *>(bytes), length) == "third", "wrong cache bytes");
@@ -97,9 +101,9 @@ int main() {
         }
         close(sockets[1]);
     });
-    std::unique_ptr<llvm::MemoryBuffer> retained;
+    std::unique_ptr<llvm::MemoryBuffer> retained, retained_cache;
     {
-        dcc_file_cache_api cache{cached, store};
+        dcc_file_cache_api cache{cache_open, cache_close, cached, store};
         RemoteFiles files(sockets[0], "/", cache, "client", "/unused-cache");
         auto tree = files.status("/tree");
         require(tree && tree->isDirectory(), "directory snapshot");
@@ -115,6 +119,7 @@ int main() {
             auto file = files.openFileForRead(name); require(bool(file), "cache/read file");
             auto bytes = (*file)->getBuffer(name, -1, true, false);
             require(bytes && (*bytes)->getBuffer() == (name[6] == 'b' ? "cache" : "third"), "cache/read bytes");
+            if (name[6] == 'b') retained_cache = std::move(*bytes);
         }
         require(files.status("/tree/new/file").getError() == std::errc::no_such_file_or_directory,
                 "missing child snapshot");
@@ -142,4 +147,5 @@ int main() {
     }
     peer.join();
     require(retained->getBuffer() == "fresh", "buffer did not outlive filesystem");
+    require(retained_cache->getBuffer() == "cache", "cache view did not outlive filesystem");
 }
