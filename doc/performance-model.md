@@ -412,11 +412,16 @@ Changed metadata invalidates that record's buffer, while already opened views
 retain their original immutable storage. Receive directly into uninitialized
 payload storage and publish it only after the complete reply arrives.
 The versioned disk cache retains validated root and shard directory handles for
-each compiler invocation. Read a whole record into one allocation, validate its
-key and digest, and lend the payload view to LLVM with that allocation as owner.
-Batch header, key and payload writes before atomic publication. Eviction scans
-use independent directory offsets even when a compiler forks with cached handles;
-closing the cache cannot invalidate already returned buffers.
+each compiler invocation. Batch header, key and payload writes before atomic
+publication. Eviction scans use independent directory offsets even when a
+compiler forks with cached handles; closing the cache cannot invalidate already
+returned buffers. Record lookup
+returns an independently owned, read-only descriptor. LLVM's MemoryBuffer
+chooses copying versus mapping; validate the complete key, extent and payload
+digest before exposing its contents. Atomic replacement and eviction preserve
+the opened inode, so large headers can remain mapped instead of being copied
+into a new heap allocation for every compilation. The compiler's shared buffer
+owns that storage and its trailing NUL independently of the cache handle.
 
 Local and remote resident helpers share native descriptor dispatch and child
 ownership. Python selects and loads the configured frontend once; invocation

@@ -41,16 +41,14 @@ class FileCacheTest(unittest.TestCase):
         class Api(ctypes.Structure):
             _fields_ = [('open', ctypes.CFUNCTYPE(pointer, ctypes.c_char_p)),
                         ('close', ctypes.CFUNCTYPE(None, pointer)),
-                        ('read', ctypes.CFUNCTYPE(pointer, pointer, pointer, size,
-                                                ctypes.POINTER(pointer), ctypes.POINTER(size))),
+                        ('lookup', ctypes.CFUNCTYPE(ctypes.c_int, pointer, pointer, size, ctypes.POINTER(size))),
+                        ('contents', ctypes.CFUNCTYPE(ctypes.c_int, pointer, size, pointer, size,
+                                                     ctypes.POINTER(pointer), ctypes.POINTER(size))),
                         ('write', ctypes.CFUNCTYPE(None, pointer, pointer, size, pointer, size))]
         capsule = ctypes.pythonapi.PyCapsule_GetPointer
         capsule.argtypes = (ctypes.py_object, ctypes.c_char_p)
         capsule.restype = pointer
         cls.api = Api.from_address(capsule(cls.module.file_cache, b'distcc.file_cache'))
-        cls.free = ctypes.CDLL(None).free
-        cls.free.argtypes = (pointer,)
-        cls.free.restype = None
 
     def setUp(self):
         directory = tempfile.TemporaryDirectory(prefix='distcc-record-cache-')
@@ -75,32 +73,40 @@ class FileCacheTest(unittest.TestCase):
         self.api.write(self.handle, key, len(key), data, len(data))
 
     def read(self, key):
+        extent = ctypes.c_size_t()
+        fd = self.api.lookup(self.handle, key, len(key), ctypes.byref(extent))
+        if fd < 0: return None, ctypes.c_void_p(), 0
+        return self.load_record(fd, extent.value, key)
+
+    def load_record(self, fd, extent, key):
+        with os.fdopen(fd, 'rb') as stream: record = stream.read(extent)
+        storage = ctypes.create_string_buffer(record)
         data, size = ctypes.c_void_p(), ctypes.c_size_t()
-        storage = self.api.read(self.handle, key, len(key), ctypes.byref(data), ctypes.byref(size))
+        if not self.api.contents(storage, len(record), key, len(key), ctypes.byref(data), ctypes.byref(size)):
+            return None, data, 0
         return storage, data, size.value
 
     def get(self, key):
         storage, data, size = self.read(key)
         if not storage: return None
-        try:
-            assert data.value is not None
-            self.assertEqual(ctypes.string_at(data.value+size, 1), b'\0')
-            return ctypes.string_at(data, size)
-        finally:
-            self.free(storage)
+        assert data.value is not None
+        self.assertEqual(ctypes.string_at(data.value+size, 1), b'\0')
+        return ctypes.string_at(data, size)
 
-    def test_binary_records_and_storage_outlive_cache_handle(self):
+    def test_binary_records_and_open_snapshots_outlive_replacement_and_cache(self):
         for value in (b'', bytes(range(256))*16, os.urandom(131072)):
             self.write(b'binary', value)
             self.assertEqual(self.get(b'binary'), value)
-        storage, data, size = self.read(b'binary')
-        self.assertTrue(storage)
-        try:
-            self.close_cache()
-            self.assertEqual(ctypes.string_at(data, size), value)
-            self.assertEqual(len(os.listdir('/proc/self/fd')), self.initial_fds)
-        finally:
-            self.free(storage)
+        extent = ctypes.c_size_t()
+        fd = self.api.lookup(self.handle, b'binary', len(b'binary'), ctypes.byref(extent))
+        self.assertGreaterEqual(fd, 0)
+        self.write(b'binary', b'replacement')
+        self.assertEqual(self.get(b'binary'), b'replacement')
+        self.close_cache()
+        storage, data, size = self.load_record(fd, extent.value, b'binary')
+        self.assertIsNotNone(storage)
+        self.assertEqual(ctypes.string_at(data, size), value)
+        self.assertEqual(len(os.listdir('/proc/self/fd')), self.initial_fds)
 
     def test_corrupt_or_symlink_records_are_misses_and_can_be_replaced(self):
         key, value = b'key', b'payload'

@@ -31,13 +31,24 @@ static void read_bytes(int fd, char *bytes, size_t size) {
 static unsigned cache_reads, cache_writes;
 static dcc_record_cache *cache_open(const char *) { return reinterpret_cast<dcc_record_cache *>(&cache_reads); }
 static void cache_close(dcc_record_cache *) {}
-static void *cached(dcc_record_cache *, const void *key, size_t size, const void **data, size_t *length) {
+static int cached(dcc_record_cache *, const void *key, size_t size, size_t *length) {
     ++cache_reads;
-    if (!llvm::StringRef(static_cast<const char *>(key), size).ends_with("/tree/b")) return nullptr;
-    *length = 5;
-    char *storage = strdup("headcache");
-    *data = storage+4;
-    return storage;
+    auto name = llvm::StringRef(static_cast<const char *>(key), size);
+    bool large = name.ends_with("/tree/large"), aligned = name.ends_with("/tree/aligned");
+    if (!large && !aligned && !name.ends_with("/tree/b")) return -1;
+    int fd = memfd_create("remote-files-cache", MFD_CLOEXEC);
+    require(fd >= 0 && write(fd, "headcache", 9) == 9, "cache record");
+    *length = large ? 1024*1024+4 : aligned ? 1024*1024 : 9;
+    if (large || aligned)
+        require(!ftruncate(fd, *length) && pwrite(fd, "x", 1, *length-1) == 1, "large cache record");
+    return fd;
+}
+static int contents(const void *record, size_t record_size, const void *, size_t,
+                    const void **data, size_t *length) {
+    require(record_size >= 9 && !memcmp(record, "head", 4), "complete record validation");
+    *data = static_cast<const char *>(record)+4;
+    *length = record_size-4;
+    return 1;
 }
 static void store(dcc_record_cache *, const void *key, size_t size, const void *bytes, size_t length) {
     ++cache_writes;
@@ -51,9 +62,11 @@ int main() {
     auto directory = stamp(S_IFDIR | 0755, 0, 1);
     auto regular = stamp(S_IFREG | 0644, 5, 1);
     auto listing = directory;
-    integer(listing, 4, 4);
+    integer(listing, 6, 4);
     child(listing, "a", regular); child(listing, "b", regular); child(listing, "c", regular);
     child(listing, "child", directory);
+    child(listing, "large", stamp(S_IFREG | 0644, 1024*1024, 1));
+    child(listing, "aligned", stamp(S_IFREG | 0644, 1024*1024-4, 1));
     std::string types;
     integer(types, 1, 4); integer(types, S_IFREG, 4); types += 'a';
     integer(types, 5, 4); integer(types, S_IFDIR, 4); types += "child";
@@ -105,9 +118,10 @@ int main() {
         close(sockets[1]);
     });
     std::unique_ptr<llvm::MemoryBuffer> retained, retained_cache;
+    std::vector<std::unique_ptr<llvm::MemoryBuffer>> retained_large;
     llvm::vfs::directory_iterator retained_directory;
     {
-        dcc_file_cache_api cache{cache_open, cache_close, cached, store};
+        dcc_file_cache_api cache{cache_open, cache_close, cached, contents, store};
         RemoteFiles files(sockets[0], "/", cache, "client", "/unused-cache");
         auto tree = files.status("/tree");
         require(tree && tree->isDirectory(), "directory snapshot");
@@ -124,6 +138,13 @@ int main() {
             auto bytes = (*file)->getBuffer(name, -1, true, false);
             require(bytes && (*bytes)->getBuffer() == (name[6] == 'b' ? "cache" : "third"), "cache/read bytes");
             if (name[6] == 'b') retained_cache = std::move(*bytes);
+        }
+        for (auto name : {"/tree/large", "/tree/aligned"}) {
+            auto file = files.openFileForRead(name); require(bool(file), "large cached file");
+            auto bytes = (*file)->getBuffer(name, -1, true, false);
+            require(bytes && (*bytes)->getBufferSize() == (name[6] == 'l' ? 1024*1024U : 1024*1024U-4) &&
+                    (*bytes)->getBuffer().ends_with("x") && !(*bytes)->getBufferEnd()[0], "large buffer terminator");
+            retained_large.push_back(std::move(*bytes));
         }
         require(files.status("/tree/new/file").getError() == std::errc::no_such_file_or_directory,
                 "missing child snapshot");
@@ -162,11 +183,14 @@ int main() {
         require(files.status("/denied").getError() == std::errc::permission_denied, "denied status");
         require(files.openFileForRead("/denied").getError() == std::errc::permission_denied, "lost cached error");
         require(files.getRealPath("/broken", resolved) == std::errc::io_error, "published truncated reply");
-        require(cache_reads == 3 && cache_writes == 1, "cache admission count");
+        require(cache_reads == 5 && cache_writes == 1, "cache admission count");
     }
     peer.join();
     require(retained->getBuffer() == "fresh", "buffer did not outlive filesystem");
     require(retained_cache->getBuffer() == "cache", "cache view did not outlive filesystem");
+    for (const auto &buffer : retained_large)
+        require(buffer->getBuffer().starts_with("cache") && buffer->getBuffer().ends_with("x") &&
+                !buffer->getBufferEnd()[0], "large cache view did not outlive filesystem");
     std::error_code error;
     retained_directory.increment(error);
     require(!error && retained_directory->path() == "/tree/child", "iterator lost its reply storage");

@@ -29,10 +29,12 @@ struct dcc_record_cache;
 struct dcc_file_cache_api {
     struct dcc_record_cache *(*open)(const char *);
     void (*close)(struct dcc_record_cache *);
-    /* A hit returns the malloc-owned record allocation. *data views its
-     * payload, with an extra NUL after *size bytes. The allocation outlives
-     * the cache handle; the terminator is not part of the record/hash. */
-    void *(*read)(struct dcc_record_cache *, const void *, size_t, const void **data, size_t *size);
+    /* The caller owns the immutable record FD independently of this cache.
+     * It chooses the buffer implementation, then validates the complete record
+     * before exposing its payload. Atomic replacement never changes an open FD. */
+    int (*lookup)(struct dcc_record_cache *, const void *, size_t, size_t *record_size);
+    int (*contents)(const void *record, size_t record_size, const void *key, size_t key_size,
+                    const void **data, size_t *size);
     void (*write)(struct dcc_record_cache *, const void *, size_t, const void *, size_t);
 };
 extern const struct dcc_file_cache_api dcc_file_cache_records;

@@ -321,17 +321,22 @@ public:
                 version = record.version;
                 key.reserve(identity.size()+1+version.size()+name.size());
                 key.append(identity); key += '\0'; key.append(version.data(), version.size()); key.append(name.data(), name.size());
-                size_t length = 0;
-                const void *bytes;
-                void *storage = cache.read(records, key.data(), key.size(), &bytes, &length);
-                if (storage) {
-                    if (length == record.size()) {
-                        auto owner = std::shared_ptr<void>(storage, free);
+                size_t extent = 0, length = 0;
+                const void *bytes = nullptr;
+                int snapshot = cache.lookup(records, key.data(), key.size(), &extent);
+                if (snapshot >= 0) {
+                    // LLVM chooses read versus mmap and owns the terminator.
+                    // Cache publication replaces inodes, so mapped input stays
+                    // immutable through eviction and subsequent invocations.
+                    auto buffer = llvm::MemoryBuffer::getOpenFile(snapshot, name, extent);
+                    ::close(snapshot);
+                    if (buffer && cache.contents((*buffer)->getBufferStart(), (*buffer)->getBufferSize(),
+                                                  key.data(), key.size(), &bytes, &length) && length == record.size()) {
+                        std::shared_ptr<const llvm::MemoryBuffer> owner(std::move(*buffer));
                         record.contents = std::make_shared<SnapshotBuffer>(
                             llvm::StringRef(static_cast<const char *>(bytes), length), name.str().str(), std::move(owner));
                         return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));
                     }
-                    free(storage);
                 }
             }
         } else if (auto error = cachedError(name)) return error;

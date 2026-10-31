@@ -286,45 +286,37 @@ static int record_shard(struct dcc_record_cache *cache, const void *key, size_t 
     }
     return cache->shards[index];
 }
-static int read_record_bytes(int fd, void *data, size_t size)
-{
-    char *bytes = data;
-    while (size) {
-        ssize_t n = read(fd, bytes, size);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return -1;
-        bytes += n; size -= n;
-    }
-    return 0;
-}
-static void *record_read(struct dcc_record_cache *cache, const void *key, size_t key_size,
-                         const void **data, size_t *size)
+static int record_lookup(struct dcc_record_cache *cache, const void *key, size_t key_size,
+                          size_t *record_size)
 {
     char name[17];
     struct stat st;
-    struct record_header header;
-    char *storage = NULL;
-    int shard = record_shard(cache, key, key_size, name), fd = -1, valid = 0;
-    if (shard < 0) return NULL;
-    fd = openat(shard, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    int shard = record_shard(cache, key, key_size, name);
+    if (shard < 0) return -1;
+    int fd = openat(shard, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
-        st.st_size < (off_t)sizeof(header) || st.st_size > CACHE_BYTES) goto done;
-    storage = malloc(st.st_size + 1);
-    if (!storage || read_record_bytes(fd, storage, st.st_size)) goto done;
+        st.st_size < (off_t)sizeof(struct record_header) || st.st_size > CACHE_BYTES) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    *record_size = st.st_size;
+    return fd;
+}
+static int record_contents(const void *record, size_t record_size, const void *key, size_t key_size,
+                            const void **data, size_t *size)
+{
+    const char *storage = record;
+    struct record_header header;
+    if (record_size < sizeof(header)) return 0;
     memcpy(&header, storage, sizeof(header));
     if (header.key_size != key_size || header.size > CACHE_BYTES || key_size > CACHE_BYTES - sizeof(header) ||
         header.size > CACHE_BYTES - sizeof(header) - key_size ||
-        (uint64_t)st.st_size != sizeof(header) + key_size + header.size) goto done;
+        record_size != sizeof(header) + key_size + header.size) return 0;
     if (memcmp(storage + sizeof(header), key, key_size) ||
-        XXH3_64bits(storage + sizeof(header) + key_size, header.size) != header.digest) goto done;
-    storage[st.st_size] = 0;
+        XXH3_64bits(storage + sizeof(header) + key_size, header.size) != header.digest) return 0;
     *data = storage + sizeof(header) + key_size;
     *size = header.size;
-    valid = 1;
-done:
-    if (fd >= 0) close(fd);
-    if (!valid) { free(storage); return NULL; }
-    return storage;
+    return 1;
 }
 
 static int write_record(int fd, struct record_header *header, const void *key, const void *data)
@@ -370,4 +362,6 @@ done:
     if (fd >= 0) close(fd);
     if (lock >= 0) close(lock);
 }
-const struct dcc_file_cache_api dcc_file_cache_records = {record_open, record_close, record_read, record_write};
+const struct dcc_file_cache_api dcc_file_cache_records = {
+    record_open, record_close, record_lookup, record_contents, record_write
+};
