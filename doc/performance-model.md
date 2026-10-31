@@ -254,6 +254,21 @@ slot is still available to ordinary compilation, but does not justify `S/k`
 for optional partitioning. Declining an extra lease leaves the caller's existing
 compile running. Check this at the codegen phase: testing spare capacity before
 the frontend and optimizer does not establish availability when codegen begins.
+Availability later in the build does not establish an immediate grant either.
+Match compiler lifetimes and phase samples to the same capacity timeline. With
+constant per-lane service and perfectly divisible remaining work `S`, even an
+ideal dynamic executor needs `integral_0^T k(t) dt >= S`, where `k(t)` counts
+lanes it can actually use at time `t`. A fixed partition plan cannot use a later
+free core once only one indivisible partition remains. Dynamic borrowing must
+therefore pay for partition preparation, preserve unfinished parallel work and
+include interference with ordinary jobs; it is not a free extension of `S/k`.
+
+Timestamp alignment and symbol coverage limit this analysis. A first sampled
+backend function is evidence that codegen has begun, not its exact start. Match
+the sample lifetime and sampled CPU total against the job's completion and
+`wait4` counters before assigning it to a job. Runnable compiler counts do not
+include all external work and are not measured CPU service. Missing symbols or
+call chains must not be assigned to a convenient phase.
 
 For local code generation, the splitter hands verified IR directly to a child
 through `fork`. Partition construction overlaps earlier children, and the last
@@ -265,6 +280,24 @@ all hardware threads would leave its CPU demand unaccounted. The network backend
 its consumer is outside the process tree. Count these avoided operations as
 reduced work, not as an equal reduction in build wall time: parallel phases and
 the build's completion barrier determine the observable saving.
+
+## Account for reusable frontend work
+
+Frontend library samples include parsing, semantic analysis and IR generation;
+they do not directly measure reusable header work. Derive compatible shared
+prefixes with Clang, preserving command options, source identity, macro context
+and dependencies. Count exact full-prefix reuse separately from partial-prefix
+or normalized-prefix opportunities, which require additional correctness work.
+
+For a proposed cache, subtract construction, validation and deserialization CPU
+from the parsing CPU actually avoided over its lifetime. Count every cache
+construction on every worker. State created only in a per-job child cannot serve
+the next child. A successful warm hit does not establish positive amortized
+savings, and a positive CPU balance does not establish a shorter dependency
+path. Reuse a prior coverage or cost measurement when its inputs and execution
+path still apply; differences between analyzer-only and compiler AST caches must
+remain explicit. Do not repeat a whole-build cache trial before establishing
+both compatible reuse and a sufficient net-work reduction.
 
 ## Evidence required for adoption
 
