@@ -162,8 +162,20 @@ static char RArgv_doc__[] =
 
 ;
 static PyObject *
+argv_list(char **argv) {
+  PyObject *list = PyList_New(dcc_argv_len(argv));
+  if (!list) return NULL;
+  for (int i = 0; argv[i]; ++i) {
+    PyObject *value = PyUnicode_FromString(argv[i]);
+    if (!value) { Py_DECREF(list); return NULL; }
+    PyList_SET_ITEM(list, i, value);
+  }
+  return list;
+}
+
+static PyObject *
 RArgv(PyObject *dummy, PyObject *args) {
-  int i, ret, with_compression = 0;
+  int ret, with_compression = 0;
   PyObject *list_object = NULL;
   int ifd;
   char **argv = NULL;
@@ -192,13 +204,7 @@ RArgv(PyObject *dummy, PyObject *args) {
     PyErr_SetString(distcc_pump_c_extensionsError, "Couldn't read that.");
     goto error;
   }
-  if ((list_object = PyList_New(dcc_argv_len(argv))) == NULL) goto error;
-  for (i = 0; argv[i]; i++) {
-    PyObject *string_object = PyUnicode_FromString(argv[i]);
-    if (!string_object)
-      goto error;
-    PyList_SET_ITEM(list_object, i, string_object);
-  }
+  if ((list_object = argv_list(argv)) == NULL) goto error;
   dcc_free_argv(argv);
   if (with_compression)
     return Py_BuildValue("Ns", list_object, compression);
@@ -210,6 +216,35 @@ RArgv(PyObject *dummy, PyObject *args) {
   return NULL;
 }
 
+
+static PyObject *
+RArgvFile(PyObject *dummy, PyObject *args) {
+  int fd, count;
+  UNUSED(dummy);
+  if (!PyArg_ParseTuple(args, "ii", &fd, &count)) return NULL;
+  if (count <= 0) {
+    PyErr_SetString(PyExc_ValueError, "Expected at least one argument group.");
+    return NULL;
+  }
+  char ***groups = PyMem_Calloc(count, sizeof(*groups));
+  if (!groups) return PyErr_NoMemory();
+  PyObject *result = NULL;
+  if (dcc_r_argv_file(fd, count, groups)) {
+    PyErr_SetString(distcc_pump_c_extensionsError, "Couldn't read complete argument file.");
+    goto out;
+  }
+  result = PyTuple_New(count);
+  if (!result) goto out;
+  for (int g = 0; g < count; ++g) {
+    PyObject *list = argv_list(groups[g]);
+    if (!list) { Py_CLEAR(result); goto out; }
+    PyTuple_SET_ITEM(result, g, list);
+  }
+out:
+  for (int g = 0; g < count; ++g) if (groups[g]) dcc_free_argv(groups[g]);
+  PyMem_Free(groups);
+  return result;
+}
 
 static char XArgv_doc__[] =
 "XArgv(ifd, argv)\n"
@@ -431,6 +466,8 @@ static PyMethodDef module_methods[] = {
    RTokenString_doc__},
   {"RCwd",        (PyCFunction)RCwd,    METH_VARARGS, RCwd_doc__},
   {"RArgv",       (PyCFunction)RArgv,   METH_VARARGS, RArgv_doc__},
+  {"RArgvFile",   (PyCFunction)RArgvFile, METH_VARARGS,
+   "Read all complete argument groups from the current file offset to EOF."},
   {"XArgv",       (PyCFunction)XArgv,   METH_VARARGS, XArgv_doc__},
   {"CompressLzo1xAlloc", (PyCFunction)CompressLzo1xAlloc, METH_VARARGS,
    CompressLzo1xAlloc_doc__},

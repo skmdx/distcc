@@ -172,37 +172,42 @@ int dcc_explain_mismatch(const char *buf,
  * @param expected 4-char token that is expected to come in next
  * @param val      receives the parameter value
  **/
-int dcc_r_token_int(int ifd, const char *expected, unsigned *val)
+static int parse_token_int(const char *bytes, const char *expected, unsigned *val)
 {
-    char buf[13], *bum;
-    int ret;
-
+    char number[9], *end;
     if (strlen(expected) != 4) {
         rs_log_error("expected token \"%s\" seems wrong", expected);
         return EXIT_PROTOCOL_ERROR;
     }
 
-    if ((ret = dcc_readx(ifd, buf, 12))) {
-        rs_log_error("read failed while waiting for token \"%s\"",
-                    expected);
-        return ret;
-    }
-
-    if (memcmp(buf, expected, 4)) {
+    if (memcmp(bytes, expected, 4)) {
         rs_log_error("protocol derailment: expected token \"%s\"", expected);
-        dcc_explain_mismatch(buf, 12, ifd);
         return EXIT_PROTOCOL_ERROR;
     }
-
-    buf[12] = '\0';             /* terminate */
-
-    *val = strtoul(&buf[4], &bum, 16);
-    if (bum != &buf[12]) {
+    memcpy(number, bytes+4, 8);
+    number[8] = '\0';
+    *val = strtoul(number, &end, 16);
+    if (end != number+8) {
         rs_log_error("failed to parse parameter of token \"%s\"",
                      expected);
-        dcc_explain_mismatch(buf, 12, ifd);
         return EXIT_PROTOCOL_ERROR;
     }
+    return 0;
+}
+
+int dcc_r_token_int(int ifd, const char *expected, unsigned *val)
+{
+    char buf[13];
+    int ret;
+    if ((ret = dcc_readx(ifd, buf, 12))) {
+        rs_log_error("read failed while waiting for token \"%s\"", expected);
+        return ret;
+    }
+    if ((ret = parse_token_int(buf, expected, val))) {
+        dcc_explain_mismatch(buf, 12, ifd);
+        return ret;
+    }
+    buf[12] = '\0';
 
     rs_trace("got %s", buf);
 
@@ -386,4 +391,53 @@ int dcc_r_argv_body(int ifd, const char *argv_token, unsigned argc, char ***argv
     dcc_trace_argv("got arguments", a);
 
     return 0;
+}
+
+/* Compiler commands are complete files handed off before the receiver runs.
+ * Read the remaining extent once and decode all groups with the same token
+ * parser as the stream protocol. No persistent buffering or socket read-ahead.
+ * Every output is independently owned and released with dcc_free_argv(). */
+int dcc_r_argv_file(int fd, unsigned groups, char ***output)
+{
+    struct stat info;
+    off_t offset = lseek(fd, 0, SEEK_CUR);
+    for (unsigned g = 0; g < groups; ++g) output[g] = NULL;
+    if (offset < 0 || fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size < offset)
+        return EXIT_IO_ERROR;
+    uintmax_t extent = info.st_size-offset;
+    if (extent > SIZE_MAX) return EXIT_OUT_OF_MEMORY;
+    size_t size = extent, cursor = 0;
+    if (!groups || groups > size/12) return EXIT_PROTOCOL_ERROR;
+    char *bytes = malloc(size);
+    if (!bytes) return EXIT_OUT_OF_MEMORY;
+    int ret = dcc_readx(fd, bytes, size);
+    if (ret) goto out;
+    ret = EXIT_PROTOCOL_ERROR;
+    for (unsigned g = 0; g < groups; ++g) {
+        unsigned argc;
+        if (size-cursor < 12 || parse_token_int(bytes+cursor, "ARGC", &argc)) goto out;
+        cursor += 12;
+        if (argc > (size-cursor)/12) goto out;
+        char **argv = output[g] = calloc((size_t)argc+1, sizeof(*argv));
+        if (!argv) { ret = EXIT_OUT_OF_MEMORY; goto out; }
+        for (unsigned a = 0; a < argc; ++a) {
+            unsigned length;
+            if (size-cursor < 12 || parse_token_int(bytes+cursor, "ARGV", &length)) goto out;
+            cursor += 12;
+            if (length > size-cursor || (uintmax_t)length+1 > SIZE_MAX) goto out;
+            argv[a] = malloc((size_t)length+1);
+            if (!argv[a]) { ret = EXIT_OUT_OF_MEMORY; goto out; }
+            memcpy(argv[a], bytes+cursor, length);
+            argv[a][length] = '\0';
+            cursor += length;
+        }
+    }
+    if (cursor == size) ret = 0;
+out:
+    free(bytes);
+    if (ret) for (unsigned g = 0; g < groups; ++g) {
+        if (output[g]) dcc_free_argv(output[g]);
+        output[g] = NULL;
+    }
+    return ret;
 }

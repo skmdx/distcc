@@ -133,8 +133,11 @@ int dcc_clang_local_prepare(char **argv, char ***command, char ***roots)
     int ret = request(argv, 'P', output, &status, NULL);
     if (!ret) {
         if (status || lseek(output, 0, SEEK_SET) < 0) ret = EXIT_DISTCC_FAILED;
-        else if ((ret = dcc_r_argv(output, "ARGC", "ARGV", command)) == 0)
-            ret = dcc_r_argv(output, "ARGC", "ARGV", roots);
+        else {
+            char **groups[2];
+            ret = dcc_r_argv_file(output, 2, groups);
+            if (!ret) { *command = groups[0]; *roots = groups[1]; }
+        }
     }
     close(output);
     return ret;

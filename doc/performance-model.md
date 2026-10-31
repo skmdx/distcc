@@ -398,6 +398,12 @@ polling every live PID. Work scales with received events and completions instead
 of their product with the live child count; out-of-order exits and cancellation
 must still preserve each reply's own status and CPU accounting.
 
+Compiler request and preparation-result memfds are complete before their
+descriptor is handed off. Read each complete remaining extent once, then parse
+its argument groups in memory using the stream protocol's token decoder. This
+removes per-argument read syscalls in both resident helpers and the preparation
+caller, without adding buffered socket state or changing the command format.
+
 Filesystem responses retain metadata in memory and an optional open source FD.
 The sender joins the prefix and file extent in the existing compressed chunks;
 it does not stage each response in another file or add a frame boundary.

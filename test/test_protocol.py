@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Argument framing and TCP buffering through a real compiler/daemon."""
 import os
+import importlib.util
+from pathlib import Path
 import re
 import shutil
 import socket
@@ -9,6 +11,55 @@ import subprocess
 import unittest
 
 from test_adaptive import DistccTestCase
+
+
+class ArgumentFileTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        extension = next(Path.cwd().glob('_include_server/lib*/include_server/distcc_pump_c_extensions*.so'))
+        spec = importlib.util.spec_from_file_location('distcc_pump_c_extensions', extension)
+        assert spec and spec.loader
+        cls.protocol = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.protocol)
+
+    def setUp(self):
+        self.fd = os.memfd_create('distcc-argv-test')
+        self.addCleanup(os.close, self.fd)
+
+    def test_file_groups_offsets_and_reused_command_storage(self):
+        for values in ((['/working directory', '/compiler'], []),
+                       (['', 'spaced value', 'quote"', '日本語'],),
+                       (['-DARG%d=%d' % (i, i) for i in range(16000)], ['root']),
+                       ([], [])):
+            with self.subTest(lengths=list(map(len, values))):
+                os.ftruncate(self.fd, 0)
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                os.write(self.fd, b'prefix')
+                for group in values: self.protocol.XArgv(self.fd, group)
+                end = os.lseek(self.fd, 0, os.SEEK_CUR)
+                os.lseek(self.fd, len(b'prefix'), os.SEEK_SET)
+                self.assertEqual(self.protocol.RArgvFile(self.fd, len(values)), values)
+                self.assertEqual(os.lseek(self.fd, 0, os.SEEK_CUR), end)
+
+    def test_partial_or_invalid_file_never_publishes_arguments(self):
+        frame = b'ARGC00000002ARGV00000003oneARGV00000003two'
+        cases = [(frame[:i], 1) for i in range(len(frame))]
+        cases += [(frame+b'extra', 1), (frame, 2), (b'ARGCffffffff', 1),
+                  (b'ARGC00000001ARGVffffffff', 1), (b'ARGC0000000z', 1),
+                  (b'XXXX00000001ARGV00000000', 1), (b'ARGC00000001XXXX00000000', 1)]
+        for data, groups in cases:
+            with self.subTest(data=data, groups=groups):
+                os.ftruncate(self.fd, 0)
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                os.write(self.fd, data)
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                with self.assertRaises(self.protocol.Error): self.protocol.RArgvFile(self.fd, groups)
+        # Preserve the existing stream decoder's padded hexadecimal syntax.
+        os.ftruncate(self.fd, 0)
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        os.write(self.fd, b'ARGC       1ARGV       3one')
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        self.assertEqual(self.protocol.RArgvFile(self.fd, 1), (['one'],))
 
 
 class ProtocolTest(DistccTestCase):

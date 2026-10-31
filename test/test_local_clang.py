@@ -30,6 +30,17 @@ class LocalClangTest(BrokerTestCase):
                               [self.compiler, *arguments], env=self.env, cwd=self.work,
                               capture_output=True, timeout=30, **options)
 
+    def test_large_command_preserves_driver_arguments(self):
+        self.start_local()
+        source = self.work/'source with spaces.c'
+        source.write_text('#ifndef LAST_ARGUMENT\n#error lost argument\n#endif\n'
+                          'int main(void) { return LAST_ARGUMENT != 123; }\n')
+        result = self.command(['-fno-inline']*4096 + ['-DLAST_ARGUMENT=123',
+                              str(source), '-o', str(self.work/'program')])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('reused local compiler libraries', (self.work/'client.log').read_text())
+        subprocess.run([str(self.work/'program')], check=True)
+
     def test_real_driver_outputs_and_errors(self):
         self.start_local()
         (self.work/'source.c').write_text('#include <stdio.h>\nint main(void) { puts("local"); return 0; }\n')

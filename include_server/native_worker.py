@@ -38,8 +38,8 @@ def serve(descriptor, frontend):
                             return 0
                         if data not in (b'C', b'P') or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(fds) != 5:
                             raise ValueError('invalid local compiler request')
-                        cwd, compiler = protocol.RArgv(fds[0])
-                        argv = protocol.RArgv(fds[0])
+                        directory, argv = protocol.RArgvFile(fds[0], 2)
+                        cwd, compiler = directory
                         argv[0] = compiler
                         reply = socket.socket(fileno=fds[1])
                         fds[1] = -1

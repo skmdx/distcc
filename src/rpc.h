@@ -54,6 +54,8 @@ int dcc_r_argv(int ifd,
                const char *argv_token,
                /*@out@*/ char ***argv);
 int dcc_r_argv_body(int ifd, const char *argv_token, unsigned argc, char ***argv);
+/* Consume complete ARGC/ARGV groups from the current offset to EOF. */
+int dcc_r_argv_file(int fd, unsigned groups, char ***output);
 
 
 #endif

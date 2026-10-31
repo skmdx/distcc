@@ -58,7 +58,7 @@ def worker(descriptor, compiler):
             try:
                 if data != b'C' or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(fds) != 4:
                     raise ValueError('invalid compiler request')
-                arguments = protocol.RArgv(fds[0])
+                arguments, = protocol.RArgvFile(fds[0], 1)
                 if len(arguments) < 8 or arguments[4] != 'remote':
                     raise ValueError('invalid remote compiler command')
                 pid = os.fork()
