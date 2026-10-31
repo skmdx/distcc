@@ -388,6 +388,11 @@ views own that storage even after their VFS file closes. Validate ownership on
 both network and cache-hit paths, including empty headers and chunk boundaries.
 Keep status, version, contents and directory-query state in one record per path;
 ancestor lookups can use string views without constructing every path prefix.
+Store attributes only in the wire version record; construct LLVM's named status
+only when requested, rather than for every sibling in a directory snapshot.
+Directory iterators own the reply and decode entries as they advance, avoiding
+an eager vector of copied paths. Both buffers and iterators may outlive the VFS;
+short entries must still report errors through the iterator contract.
 Changed metadata invalidates that record's buffer, while already opened views
 retain their original immutable storage. Receive directly into uninitialized
 payload storage and publish it only after the complete reply arrives.

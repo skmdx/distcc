@@ -66,6 +66,9 @@ int main() {
         {DCC_FS_READ, "/tree/c", regular + "third"},
         {DCC_FS_STAT, "/tree/child", empty_directory},
         {DCC_FS_LIST, "/tree", types},
+        {DCC_FS_LIST, "/tree/child", {}},
+        {DCC_FS_LIST, "/short", "bad"},
+        {DCC_FS_LIST, "/broken-list", types+"bad"},
         {DCC_FS_REALPATH, long_path, "/tree/a"},
         {DCC_FS_READ, "/direct", stamp(S_IFREG | 0644, 0, 1)},
         {DCC_FS_STAT, "/denied", {}, EACCES},
@@ -102,6 +105,7 @@ int main() {
         close(sockets[1]);
     });
     std::unique_ptr<llvm::MemoryBuffer> retained, retained_cache;
+    llvm::vfs::directory_iterator retained_directory;
     {
         dcc_file_cache_api cache{cache_open, cache_close, cached, store};
         RemoteFiles files(sockets[0], "/", cache, "client", "/unused-cache");
@@ -127,13 +131,28 @@ int main() {
         require(bool(files.status("/tree/child")), "batched directory was treated as already queried");
         require(files.status("/tree/child/missing").getError() == std::errc::no_such_file_or_directory,
                 "empty directory snapshot");
+        require(!files.setCurrentWorkingDirectory("/tree"), "change directory");
+        auto relative = files.status("a");
+        require(relative && relative->getName() == "/tree/a" && relative->getSize() == 5 &&
+                relative->getPermissions() == static_cast<llvm::sys::fs::perms>(0644) &&
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    relative->getLastModificationTime().time_since_epoch()).count() == 2,
+                "relative status lost metadata");
+        require(files.status("new/../a").getError() == std::errc::no_such_file_or_directory,
+                "normalized a missing parent");
+        require(files.status("a/").getError() == std::errc::not_a_directory, "lost trailing slash");
         std::error_code error;
         auto it = files.dir_begin("/tree", error);
         require(!error && it->path() == "/tree/a" && it->type() == llvm::sys::fs::file_type::regular_file,
                 "directory entry");
-        it.increment(error);
-        require(!error && it->path() == "/tree/child", "second directory entry");
-        it.increment(error); require(!error && it == llvm::vfs::directory_iterator(), "directory end");
+        retained_directory = std::move(it);
+        it = files.dir_begin("/tree/child", error);
+        require(!error && it == llvm::vfs::directory_iterator(), "empty directory listing");
+        it = files.dir_begin("/short", error);
+        require(error == std::errc::protocol_error && it == llvm::vfs::directory_iterator(), "short directory entry");
+        it = files.dir_begin("/broken-list", error);
+        while (!error && it != llvm::vfs::directory_iterator()) it.increment(error);
+        require(error == std::errc::protocol_error, "accepted truncated directory tail");
         llvm::SmallString<64> resolved;
         require(!files.getRealPath(long_path, resolved) && resolved == "/tree/a" && interrupted,
                 "interrupted scatter/gather query");
@@ -148,4 +167,9 @@ int main() {
     peer.join();
     require(retained->getBuffer() == "fresh", "buffer did not outlive filesystem");
     require(retained_cache->getBuffer() == "cache", "cache view did not outlive filesystem");
+    std::error_code error;
+    retained_directory.increment(error);
+    require(!error && retained_directory->path() == "/tree/child", "iterator lost its reply storage");
+    retained_directory.increment(error);
+    require(!error && retained_directory == llvm::vfs::directory_iterator(), "directory end");
 }

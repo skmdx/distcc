@@ -102,31 +102,54 @@ public:
     std::error_code close() override { return {}; }
 };
 class Directory : public llvm::vfs::detail::DirIterImpl {
-    std::vector<llvm::vfs::directory_entry> entries;
-    size_t next = 0;
+    std::unique_ptr<llvm::MemoryBuffer> storage;
+    std::string prefix;
+    size_t offset = 0;
 public:
-    explicit Directory(std::vector<llvm::vfs::directory_entry> entries)
-        : entries(std::move(entries)) { (void)increment(); }
+    Directory(llvm::StringRef parent, std::unique_ptr<llvm::MemoryBuffer> storage)
+        : storage(std::move(storage)) {
+        prefix.reserve(parent.size()+1);
+        prefix.append(parent.data(), parent.size()); prefix += '/';
+    }
     std::error_code increment() override {
-        CurrentEntry = next < entries.size() ? entries[next++] : llvm::vfs::directory_entry();
+        auto bytes = storage->getBuffer();
+        if (offset == bytes.size()) { CurrentEntry = {}; return {}; }
+        if (bytes.size()-offset < 8) {
+            CurrentEntry = {};
+            return std::make_error_code(std::errc::protocol_error);
+        }
+        unsigned length = number(bytes.data()+offset, 4), mode = number(bytes.data()+offset+4, 4);
+        offset += 8;
+        if (length > bytes.size()-offset) {
+            CurrentEntry = {};
+            return std::make_error_code(std::errc::protocol_error);
+        }
+        CurrentEntry = llvm::vfs::directory_entry((llvm::Twine(prefix)+bytes.substr(offset, length)).str(), file_type(mode));
+        offset += length;
         return {};
     }
 };
 class RemoteFiles : public llvm::vfs::FileSystem {
-    // One owned path and record replace separate status, version, contents
-    // and directory-state tables. StringRef probes need no substring copies.
+    // The key owns the path and the wire metadata owns its attributes.
+    // Materialize LLVM Status only for entries the compiler actually asks for.
     struct Entry {
-        llvm::ErrorOr<llvm::vfs::Status> info;
+        std::error_code error;
         std::array<char, DCC_FS_METADATA> version{};
         std::shared_ptr<const llvm::MemoryBuffer> contents;
         bool queried = false, listed = false;
-        explicit Entry(std::error_code error) : info(error) {}
-        Entry(llvm::StringRef name, const char *bytes) : info(metadata(name, bytes)) {
+        explicit Entry(std::error_code error) : error(error) {}
+        explicit Entry(const char *bytes) {
             memcpy(version.data(), bytes, version.size());
         }
-        void update(llvm::StringRef name, const char *bytes) {
-            if (info && !memcmp(version.data(), bytes, version.size())) return;
-            info = metadata(name, bytes);
+        unsigned mode() const { return number(version.data()+32, 4); }
+        uint64_t size() const { return number(version.data()+24, 8); }
+        llvm::ErrorOr<llvm::vfs::Status> status(llvm::StringRef name) const {
+            if (error) return error;
+            return metadata(name, version.data());
+        }
+        void update(const char *bytes) {
+            if (!error && !memcmp(version.data(), bytes, version.size())) return;
+            error.clear();
             memcpy(version.data(), bytes, version.size());
             contents.reset(); queried = listed = false;
         }
@@ -139,17 +162,21 @@ class RemoteFiles : public llvm::vfs::FileSystem {
     dcc_record_cache *records;
     std::string identity;
     Entry &remember(llvm::StringRef name, const char *bytes) {
-        auto [found, inserted] = entries.try_emplace(name, name, bytes);
-        if (!inserted) found->second.update(name, bytes);
+        auto [found, inserted] = entries.try_emplace(name, bytes);
+        if (!inserted) found->second.update(bytes);
         return found->second;
     }
     std::error_code remember(llvm::StringRef name, std::error_code error) {
         entries.insert_or_assign(name, Entry(error));
         return error;
     }
-    std::string absolute(const llvm::Twine &path) const {
-        auto name = path.str();
-        if (!llvm::sys::path::is_absolute(name)) name = cwd + '/' + name;
+    llvm::SmallString<256> absolute(const llvm::Twine &path) const {
+        llvm::SmallString<256> name;
+        path.toVector(name);
+        if (!llvm::sys::path::is_absolute(name)) {
+            name.insert(name.begin(), '/');
+            name.insert(name.begin(), cwd.begin(), cwd.end());
+        }
         return name;
     }
     std::error_code cachedError(llvm::StringRef name) const {
@@ -162,8 +189,8 @@ class RemoteFiles : public llvm::vfs::FileSystem {
             auto entry = name.take_front(end);
             auto found = entries.find(entry);
             if (found != entries.end()) {
-                if (!found->second.info) return found->second.info.getError();
-                if (end < name.size() && !found->second.info->isDirectory())
+                if (found->second.error) return found->second.error;
+                if (end < name.size() && !S_ISDIR(found->second.mode()))
                     return std::make_error_code(std::errc::not_a_directory);
             } else {
                 auto leaf = llvm::sys::path::filename(entry);
@@ -243,8 +270,8 @@ public:
     llvm::ErrorOr<llvm::vfs::Status> status(const llvm::Twine &path) override {
         auto name = absolute(path);
         auto found = entries.find(name);
-        if (found != entries.end() && (!found->second.info ||
-            !found->second.info->isDirectory() || found->second.queried)) return found->second.info;
+        if (found != entries.end() && (found->second.error ||
+            !S_ISDIR(found->second.mode()) || found->second.queried)) return found->second.status(name);
         if (found == entries.end()) {
             if (auto error = cachedError(name)) return error;
         }
@@ -253,16 +280,19 @@ public:
         auto answer = (*response)->getBuffer();
         if (answer.size() < DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
         auto &record = remember(name, answer.data());
-        if (record.info->isDirectory() && answer.size() >= DCC_FS_METADATA+4) {
+        if (S_ISDIR(record.mode()) && answer.size() >= DCC_FS_METADATA+4) {
             unsigned count = number(answer.data() + DCC_FS_METADATA, 4);
             size_t offset = DCC_FS_METADATA+4;
+            llvm::SmallString<256> entry(name);
+            entry += '/';
+            size_t prefix = entry.size();
             for (unsigned i = 0; i < count; ++i) {
                 if (answer.size() - offset < 8) return std::make_error_code(std::errc::protocol_error);
                 unsigned length = number(answer.data() + offset, 4), error = number(answer.data() + offset + 4, 4);
                 offset += 8;
                 if (length > answer.size() - offset) return std::make_error_code(std::errc::protocol_error);
-                llvm::SmallString<256> entry(name);
-                entry += '/'; entry += answer.substr(offset, length);
+                entry.resize(prefix);
+                entry += answer.substr(offset, length);
                 offset += length;
                 if (error) (void)remember(entry, std::error_code(error, std::generic_category()));
                 else {
@@ -275,7 +305,7 @@ public:
             record.listed = true;
         }
         record.queried = true;
-        return record.info;
+        return record.status(name);
     }
     llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(const llvm::Twine &path) override {
         auto name = absolute(path);
@@ -284,22 +314,22 @@ public:
         auto found = entries.find(name);
         if (found != entries.end()) {
             auto &record = found->second;
-            if (!record.info) return record.info.getError();
+            if (record.error) return record.error;
             if (record.contents)
-                return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(*record.info, record.contents));
-            if (record.info->isRegularFile()) {
+                return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));
+            if (S_ISREG(record.mode())) {
                 version = record.version;
                 key.reserve(identity.size()+1+version.size()+name.size());
-                key.append(identity); key += '\0'; key.append(version.data(), version.size()); key += name;
+                key.append(identity); key += '\0'; key.append(version.data(), version.size()); key.append(name.data(), name.size());
                 size_t length = 0;
                 const void *bytes;
                 void *storage = cache.read(records, key.data(), key.size(), &bytes, &length);
                 if (storage) {
-                    if (length == record.info->getSize()) {
+                    if (length == record.size()) {
                         auto owner = std::shared_ptr<void>(storage, free);
                         record.contents = std::make_shared<SnapshotBuffer>(
-                            llvm::StringRef(static_cast<const char *>(bytes), length), name, std::move(owner));
-                        return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(*record.info, record.contents));
+                            llvm::StringRef(static_cast<const char *>(bytes), length), name.str().str(), std::move(owner));
+                        return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));
                     }
                     free(storage);
                 }
@@ -309,40 +339,30 @@ public:
         if (!response) return remember(name, response.getError());
         auto answer = (*response)->getBuffer();
         if (answer.size() < DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
-        auto info = metadata(name, answer.data());
-        if (info.getSize() != answer.size() - DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
+        if (number(answer.data()+24, 8) != answer.size() - DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
         bool cacheable = !key.empty() && !memcmp(version.data(), answer.data(), version.size());
         auto &record = remember(name, answer.data());
         auto owner = std::shared_ptr<const llvm::MemoryBuffer>(std::move(*response));
-        record.contents = std::make_shared<SnapshotBuffer>(answer.drop_front(DCC_FS_METADATA), name, owner);
+        record.contents = std::make_shared<SnapshotBuffer>(answer.drop_front(DCC_FS_METADATA), name.str().str(), owner);
         if (cacheable)
             cache.write(records, key.data(), key.size(), record.contents->getBufferStart(),
                         record.contents->getBufferSize());
-        return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(*record.info, record.contents));
+        return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));
     }
     llvm::vfs::directory_iterator dir_begin(const llvm::Twine &path, std::error_code &error) override {
         auto name = absolute(path);
         auto response = request(DCC_FS_LIST, name);
         if (!response) { error = response.getError(); return {}; }
-        auto answer = (*response)->getBuffer();
-        std::vector<llvm::vfs::directory_entry> entries;
-        size_t offset = 0;
-        while (offset < answer.size()) {
-            if (answer.size() - offset < 8) { error = std::make_error_code(std::errc::protocol_error); return {}; }
-            unsigned length = number(answer.data() + offset, 4), mode = number(answer.data() + offset + 4, 4);
-            offset += 8;
-            if (length > answer.size() - offset) { error = std::make_error_code(std::errc::protocol_error); return {}; }
-            entries.emplace_back(name + '/' + answer.substr(offset, length).str(), file_type(mode));
-            offset += length;
-        }
-        error.clear();
-        return llvm::vfs::directory_iterator(std::make_shared<Directory>(std::move(entries)));
+        auto iterator = std::make_shared<Directory>(name, std::move(*response));
+        error = iterator->increment();
+        if (error) return {};
+        return llvm::vfs::directory_iterator(std::move(iterator));
     }
     std::error_code setCurrentWorkingDirectory(const llvm::Twine &path) override {
         auto info = status(path);
         if (!info) return info.getError();
         if (!info->isDirectory()) return std::make_error_code(std::errc::not_a_directory);
-        cwd = absolute(path);
+        cwd = absolute(path).str().str();
         return {};
     }
     llvm::ErrorOr<std::string> getCurrentWorkingDirectory() const override { return cwd; }
