@@ -8,6 +8,7 @@ import re
 import random
 import runpy
 import signal
+import stat
 import shutil
 import socket
 import struct
@@ -298,11 +299,100 @@ int main(int argc, char **argv) {
                         '-o', str(executable)], check=True, capture_output=True, timeout=30)
         subprocess.run([str(executable), str(source)], check=True, timeout=5)
 
+    def test_frontend_reply_stream_owns_open_file_and_checks_truncation(self):
+        # Exercise the actual reply producer, chunk encoder and decoder,
+        # including binary payloads that a C source fixture cannot contain.
+        source = self.work/'reply.c'
+        source.write_text(r'''
+#include "tcp_client.c"
+int main(int argc, char **argv) {
+    if (argc != 4) return 1;
+    char *roots[] = {argv[1], NULL};
+    struct dcc_job job = {.fs_roots = roots};
+    size_t length = strlen(argv[2]);
+    unsigned char *query = malloc(length + 4);
+    unsigned operation = !strcmp(argv[3], "list") ? DCC_FS_LIST : DCC_FS_READ;
+    dcc_tcp_put32(query, operation); memcpy(query + 4, argv[2], length);
+    struct dcc_frontend_reply reply;
+    if (dcc_frontend_fs_reply(&job, query, length + 4, &reply)) return 2;
+    free(query);
+    unsigned error = dcc_tcp_get32(reply.data);
+    if (!strcmp(argv[3], "denied")) {
+        int ok = error == EACCES && reply.size == 8 && reply.fd < 0 && !reply.file_size;
+        dcc_frontend_fs_clear(&reply); return ok ? 0 : 3;
+    }
+    if (error) return 4;
+    if (operation == DCC_FS_READ) {
+        struct stat actual, expected;
+        if (reply.fd < 0 || fstat(reply.fd, &actual) || stat(argv[2], &expected) ||
+            actual.st_dev != expected.st_dev || actual.st_ino != expected.st_ino) return 4;
+    } else if (reply.fd >= 0 || reply.file_size) return 4;
+    if (!strcmp(argv[3], "unlink") && unlink(argv[2])) return 5;
+    if (!strcmp(argv[3], "truncate") && truncate(argv[2], 0)) return 6;
+    unsigned char raw[DCC_TCP_CHUNK], decoded[DCC_TCP_CHUNK];
+    uint64_t offset = 0, total = reply.size + reply.file_size;
+    while (offset < total) {
+        size_t size = 0;
+        unsigned char *chunk = next_fs_chunk(&reply, &offset, raw, &size);
+        if (!strcmp(argv[3], "truncate")) {
+            int rejected = !chunk;
+            free(chunk); dcc_frontend_fs_clear(&reply);
+            return rejected ? 0 : 7;
+        }
+        if (!chunk || size != 8 + dcc_tcp_get32(chunk + 4)) return 8;
+        struct dcc_tcp_frame frame = {.type = dcc_tcp_get32(chunk), .data = chunk + 8, .size = size - 8};
+        const void *data; size_t plain; unsigned index;
+        if (dcc_tcp_unpack(&frame, &index, decoded, &data, &plain) || index != UINT_MAX ||
+            !!(frame.type & DCC_TCP_FINAL) != (offset == total) ||
+            fwrite(data, 1, plain, stdout) != plain) return 9;
+        free(chunk);
+    }
+    int fd = reply.fd;
+    dcc_frontend_fs_clear(&reply);
+    return reply.data || reply.fd != -1 || fcntl(fd, F_GETFD) != -1 || errno != EBADF ? 10 : 0;
+}
+''')
+        executable = self.work/'reply'
+        compiler = shutil.which('cc')
+        assert compiler is not None, 'C compiler required for filesystem reply tests'
+        subprocess.run([compiler, '-D_GNU_SOURCE', '-ffunction-sections', '-fdata-sections',
+                        '-I'+str(self.build/'src'), str(source), str(self.build/'src/frontend_fs.c'),
+                        str(self.build/'src/tcp_job.c'), '-Wl,--gc-sections', '-llz4',
+                        '-o', str(executable)], check=True, capture_output=True, timeout=30)
+        path = self.work/'payload'
+        for length in (0, 1, 256*1024-60, 256*1024-59, 2*256*1024+13):
+            with self.subTest(length=length):
+                payload = random.Random(length).randbytes(length)
+                path.write_bytes(payload)
+                result = subprocess.run([str(executable), str(self.work), str(path), 'unlink'],
+                                        check=True, capture_output=True, timeout=5)
+                self.assertEqual(result.stdout[60:], payload)
+                self.assertEqual(struct.unpack('!II', result.stdout[:8]), (0, len(payload)+52))
+                self.assertFalse(path.exists())
+        path.write_bytes(b'truncated source')
+        subprocess.run([str(executable), str(self.work), str(path), 'truncate'], check=True, timeout=5)
+        subprocess.run([str(executable), str(self.work/'other-root'), str(path), 'denied'], check=True, timeout=5)
+        listing = self.work/'listing'
+        listing.mkdir()
+        (listing/'file').write_bytes(b'')
+        (listing/'directory').mkdir()
+        (listing/'dangling').symlink_to('absent')
+        os.mkfifo(listing/'fifo')
+        data = subprocess.check_output([str(executable), str(self.work), str(listing), 'list'], timeout=5)
+        self.assertEqual(struct.unpack('!II', data[:8]), (0, len(data)-8))
+        actual, offset = {}, 8
+        while offset < len(data):
+            length, mode = struct.unpack_from('!II', data, offset)
+            offset += 8
+            actual[data[offset:offset+length].decode()] = stat.S_IFMT(mode)
+            offset += length
+        self.assertEqual(actual, {p.name: stat.S_IFMT(p.lstat().st_mode) for p in listing.iterdir()})
+
     def test_remote_frontend_preserves_large_directory_snapshots(self):
         clang = self.start_frontend()
         directory = self.work/'headers'
         directory.mkdir()
-        names = [f'header_{i:03d}_with_a_long_directory_entry_name.h' for i in range(180)]
+        names = [f'header_{i:04d}_with_a_long_directory_entry_name.h' for i in range(3000)]
         for name in names:
             (directory/name).write_text('#define VALUE 42\n')
         (directory/'dangling.h').symlink_to('absent.h')

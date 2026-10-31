@@ -19,7 +19,7 @@
 #include "tcp_job.h"
 #include "frontend_fs.h"
 
-struct input_stream { int fd; unsigned index; uint64_t offset, plain; };
+struct input_stream { int fd, immutable; unsigned index; uint64_t offset, plain; };
 static int local_snapshot(int source, uint64_t size)
 {
     if (size > DCC_TCP_BYTES) return -1;
@@ -58,11 +58,8 @@ static unsigned char *next_chunk(struct input_stream *stream, const struct dcc_j
     uint64_t remaining = in->plain_size - stream->plain;
     size_t amount = remaining < DCC_TCP_CHUNK ? remaining : DCC_TCP_CHUNK;
     if (in->encoding == DCC_JOB_RAW) {
-        int seals = fcntl(stream->fd, F_GET_SEALS);
-        int immutable = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
         unsigned char *p = dcc_tcp_file_chunk(DCC_TCP_INPUT, stream->index, stream->fd,
-            stream->offset, amount, amount == remaining,
-            seals >= 0 && (seals & immutable) == immutable, size);
+            stream->offset, amount, amount == remaining, stream->immutable, size);
         if (!p) return NULL;
         if (*size == 16) { *file_offset = stream->offset; *file_left = amount; }
         stream->offset += amount; stream->plain += amount;
@@ -96,6 +93,36 @@ static unsigned char *next_chunk(struct input_stream *stream, const struct dcc_j
     *size = 16; /* The immutable snapshot supplies the following file extent. */
     return p;
 }
+/* Metadata is already in memory. A READ joins its prefix and open file into
+ * the same existing chunk stream, taking a private snapshot of mutable bytes
+ * before compression/send. This does not introduce an extra frame or wait. */
+static unsigned char *next_fs_chunk(const struct dcc_frontend_reply *reply,
+                                    uint64_t *offset, unsigned char *buffer, size_t *size)
+{
+    uint64_t total = reply->size + reply->file_size;
+    size_t amount = total - *offset < DCC_TCP_CHUNK ? total - *offset : DCC_TCP_CHUNK;
+    size_t prefix = *offset < reply->size ? reply->size - *offset : 0;
+    if (prefix > amount) prefix = amount;
+    const void *data;
+    if (prefix == amount) data = reply->data + *offset;
+    else {
+        if (prefix) memcpy(buffer, reply->data + *offset, prefix);
+        size_t used = prefix;
+        while (used < amount) {
+            ssize_t n = pread(reply->fd, buffer + used, amount - used, *offset + used - reply->size);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return NULL; /* A truncated source must fail the job. */
+            used += n;
+        }
+        data = buffer;
+    }
+    unsigned char *p = malloc(amount + 16);
+    if (!p) return NULL;
+    *size = dcc_tcp_encode(DCC_TCP_FS_REPLY, UINT_MAX, data, amount, *offset + amount == total, p);
+    if (*size == 16) { memcpy(p + 16, data, amount); *size += amount; }
+    *offset += amount;
+    return p;
+}
 int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files,
                       const char *cpp, const char *output, const char *deps, struct dcc_job_result *result)
 {
@@ -118,8 +145,8 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         job->inputs[0].encoding == DCC_JOB_RAW && job->inputs[0].fd >= 0;
     int send_input_fd = local_input;
     int shared_input = -1;
-    struct dcc_job_input filesystem = {0};
-    uint64_t fs_requests = 0, fs_bytes = 0;
+    struct dcc_frontend_reply filesystem = {.fd = -1};
+    uint64_t fs_offset = 0, fs_requests = 0, fs_bytes = 0;
     time_t active = time(NULL);
     dcc_job_result_init(result);
     if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested || !buffer ||
@@ -144,6 +171,11 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
             requested[i] = 1; requests[count++] = i;
         }
     for (;;) {
+        if (!outgoing && filesystem.data) {
+            outgoing = next_fs_chunk(&filesystem, &fs_offset, buffer, &length);
+            if (!outgoing) goto done;
+            sent = 0;
+        }
         if (!outgoing && (stream.fd >= 0 || read_request < count)) {
             if (stream.fd < 0) {
                 stream.index = requests[read_request++]; stream.offset = stream.plain = 0;
@@ -151,12 +183,13 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                 stream.fd = retained >= 0 ? fcntl(retained, F_DUPFD_CLOEXEC, 0) :
                     open(files ? files[stream.index] : cpp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
                 if (stream.fd < 0) goto done;
+                int seals = fcntl(stream.fd, F_GET_SEALS);
+                int immutable = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
+                stream.immutable = seals >= 0 && (seals & immutable) == immutable;
             }
-            outgoing = next_chunk(&stream, stream.index == UINT_MAX ? &filesystem : &job->inputs[stream.index],
+            outgoing = next_chunk(&stream, &job->inputs[stream.index],
                                   &length, &file_offset, &file_left);
             if (!outgoing) goto done;
-            if (stream.index == UINT_MAX)
-                dcc_tcp_put32(outgoing, (dcc_tcp_get32(outgoing) & DCC_TCP_FLAGS) | DCC_TCP_FS_REPLY);
             sent = 0;
         }
         int timeout = dcc_get_io_timeout() - (time(NULL) - active);
@@ -186,12 +219,10 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     }
                 } else if (type == DCC_TCP_FS_QUERY && incoming.type == DCC_TCP_FS_QUERY &&
                            job->kind == DCC_JOB_FRONTEND && !have_result &&
-                           !outgoing && stream.fd < 0 && read_request == count) {
-                    stream.fd = dcc_frontend_fs_reply(job, incoming.data, incoming.size, &filesystem.plain_size);
-                    if (stream.fd < 0) goto done;
-                    ++fs_requests; fs_bytes += filesystem.plain_size;
-                    filesystem.wire_size = filesystem.plain_size;
-                    stream.index = UINT_MAX; stream.offset = stream.plain = 0;
+                           !outgoing && stream.fd < 0 && !filesystem.data && read_request == count) {
+                    if (dcc_frontend_fs_reply(job, incoming.data, incoming.size, &filesystem)) goto done;
+                    ++fs_requests; fs_bytes += filesystem.size + filesystem.file_size;
+                    fs_offset = 0;
                 } else if (type == DCC_TCP_RESULT && !have_result && incoming.size == DCC_TCP_RESULT_SIZE) {
                     have_result = 1;
                     result->status = dcc_tcp_get32(incoming.data);
@@ -250,11 +281,11 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     }
                 } else if (type == DCC_TCP_RETRY && !have_result && incoming.size == 8 &&
                            dcc_tcp_get64(incoming.data) == id &&
-                           !outgoing && stream.fd < 0 && read_request == count) {
+                           !outgoing && stream.fd < 0 && !filesystem.data && read_request == count) {
                     ret = EXIT_BUSY; goto done;
                 } else if (type == DCC_TCP_COMPLETE && have_result && incoming.size == 8 &&
                            dcc_tcp_get64(incoming.data) == id && finals == (1U << DCC_JOB_RESULT_COUNT) - 1 &&
-                           !outgoing && stream.fd < 0 && read_request == count) {
+                           !outgoing && stream.fd < 0 && !filesystem.data && read_request == count) {
                     ret = 0; goto done;
                 } else goto done;
                 dcc_tcp_frame_clear(&incoming);
@@ -287,10 +318,10 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                 active = time(NULL);
                 if (sent < length) sent += n;
                 if (sent == length && !file_left) {
-                    if (((dcc_tcp_get32(outgoing) & ~DCC_TCP_FLAGS) == DCC_TCP_INPUT ||
-                         (dcc_tcp_get32(outgoing) & ~DCC_TCP_FLAGS) == DCC_TCP_FS_REPLY) &&
-                        (dcc_tcp_get32(outgoing) & DCC_TCP_FINAL)) {
-                        close(stream.fd); stream.fd = -1;
+                    if (dcc_tcp_get32(outgoing) & DCC_TCP_FINAL) {
+                        unsigned type = dcc_tcp_get32(outgoing) & ~DCC_TCP_FLAGS;
+                        if (type == DCC_TCP_FS_REPLY) dcc_frontend_fs_clear(&filesystem);
+                        else if (type == DCC_TCP_INPUT) { close(stream.fd); stream.fd = -1; }
                     }
                     free(outgoing); outgoing = NULL; sent = 0;
                 }
@@ -313,6 +344,7 @@ done:
         if (cached) rs_trace("input cache: %u of %u entries transferred", transferred, job->count);
     }
     if (stream.fd >= 0) close(stream.fd);
+    dcc_frontend_fs_clear(&filesystem);
     free(requests); free(requested); free(buffer); free(outgoing);
     dcc_tcp_frame_clear(&incoming);
     if (ret) dcc_job_result_free(result);

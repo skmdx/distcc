@@ -5,11 +5,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include "distcc.h"
 #include "tcp_job.h"
@@ -41,49 +39,40 @@ static int within(const char *path, const char *root)
     size_t n = strlen(root);
     return !strncmp(path, root, n) && (!path[n] || path[n] == '/' || !strcmp(root, "/"));
 }
-static int allowed(const struct dcc_job *job, const char *path, int metadata)
+enum { PATH_METADATA = 1, PATH_CONTENTS = 2 };
+static int allowed(const struct dcc_job *job, const char *path)
 {
     char *name = normalized(path);
     if (!name) return 0;
     int result = 0;
-    for (char **p = job->fs_roots; p && *p; ++p)
-        if (within(name, *p) || (metadata && within(*p, name))) { result = 1; break; }
+    for (char **p = job->fs_roots; p && *p; ++p) {
+        if (within(name, *p)) { result = PATH_METADATA | PATH_CONTENTS; break; }
+        if (within(*p, name)) result = PATH_METADATA;
+    }
     free(name);
     return result;
 }
-/* Small metadata fields share writes. Track their logical offsets without
- * seeking; file payloads flush the metadata and continue with sendfile. */
+/* Metadata stays in one owned allocation. File contents are read only when
+ * the transport can send its next chunk, without a temporary-file round trip. */
 struct reply_writer {
-    int fd;
-    uint64_t size;
-    size_t used;
-    unsigned char buffer[BUFSIZ];
+    struct dcc_frontend_reply *reply;
+    size_t capacity;
 };
-static int flush(struct reply_writer *writer)
-{
-    const unsigned char *data = writer->buffer;
-    size_t length = writer->used;
-    while (length) {
-        ssize_t n = write(writer->fd, data, length);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return -1;
-        data += n; length -= n;
-    }
-    writer->used = 0;
-    return 0;
-}
 static int append(struct reply_writer *writer, const void *bytes, size_t length)
 {
-    if (length > DCC_TCP_BYTES - writer->size) { errno = EFBIG; return -1; }
-    const unsigned char *data = bytes;
-    writer->size += length;
-    while (length) {
-        size_t n = sizeof(writer->buffer) - writer->used;
-        if (n > length) n = length;
-        memcpy(writer->buffer + writer->used, data, n);
-        writer->used += n; data += n; length -= n;
-        if (writer->used == sizeof(writer->buffer) && flush(writer)) return -1;
+    struct dcc_frontend_reply *reply = writer->reply;
+    if (length > DCC_TCP_BYTES - reply->size) { errno = EFBIG; return -1; }
+    size_t needed = reply->size + length;
+    if (needed > writer->capacity) {
+        size_t capacity = writer->capacity ? writer->capacity * 2 : 64;
+        if (capacity < needed) capacity = needed;
+        if (capacity > DCC_TCP_BYTES) capacity = DCC_TCP_BYTES;
+        void *data = realloc(reply->data, capacity);
+        if (!data) return -1;
+        reply->data = data; writer->capacity = capacity;
     }
+    memcpy(reply->data + reply->size, bytes, length);
+    reply->size = needed;
     return 0;
 }
 static int metadata(struct reply_writer *writer, const struct stat *st)
@@ -100,7 +89,7 @@ static int directory(struct reply_writer *writer, const char *path, int statuses
 {
     DIR *dir = opendir(path);
     if (!dir) return -1;
-    uint64_t offset = writer->size;
+    size_t offset = writer->reply->size;
     unsigned char header[8] = {0};
     uint32_t count = 0;
     int result = statuses ? append(writer, header, 4) : 0;
@@ -109,10 +98,13 @@ static int directory(struct reply_writer *writer, const char *path, int statuses
     while (!result && (entry = readdir(dir))) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
         struct stat st;
-        int error = fstatat(dirfd(dir), entry->d_name, &st, statuses ? 0 : AT_SYMLINK_NOFOLLOW) ? errno : 0;
+        int error = 0;
+        if (statuses || entry->d_type == DT_UNKNOWN)
+            error = fstatat(dirfd(dir), entry->d_name, &st, statuses ? 0 : AT_SYMLINK_NOFOLLOW) ? errno : 0;
+        else st.st_mode = DTTOIF(entry->d_type); /* LIST exposes only the file type. */
         size_t length = strlen(entry->d_name);
         dcc_tcp_put32(header, length);
-        dcc_tcp_put32(header + 4, statuses ? error : error ? 0 : st.st_mode);
+        dcc_tcp_put32(header + 4, statuses ? (uint32_t)error : error ? 0 : st.st_mode);
         result = append(writer, header, 8) || append(writer, entry->d_name, length) ||
             (statuses && !error && metadata(writer, &st));
         if (result) break;
@@ -123,43 +115,43 @@ static int directory(struct reply_writer *writer, const char *path, int statuses
     int error = errno;
     closedir(dir);
     if (!result && statuses) {
-        dcc_tcp_put32(header, count);
-        result = flush(writer) || pwrite(writer->fd, header, 4, offset) != 4 ? -1 : 0;
-        if (result) error = errno;
+        dcc_tcp_put32(writer->reply->data + offset, count);
     }
     errno = error;
     return result;
 }
-int dcc_frontend_fs_reply(const struct dcc_job *job, const void *data, size_t size, uint64_t *length)
+void dcc_frontend_fs_clear(struct dcc_frontend_reply *reply)
 {
+    if (reply->fd >= 0) close(reply->fd);
+    free(reply->data);
+    *reply = (struct dcc_frontend_reply){.fd = -1};
+}
+int dcc_frontend_fs_reply(const struct dcc_job *job, const void *data, size_t size,
+                          struct dcc_frontend_reply *reply)
+{
+    *reply = (struct dcc_frontend_reply){.fd = -1};
     if (!job->fs_roots || size < 5 || size > 65536 ||
         ((const char *)data)[4] != '/' || memchr((const char *)data + 4, 0, size - 4)) return -1;
     unsigned operation = dcc_tcp_get32(data);
     char *path = strndup((const char *)data + 4, size - 4);
-    int fd = dcc_job_memfd("distcc-filesystem"), source = -1, error = 0;
-    struct reply_writer writer = {.fd = fd};
+    int error = 0;
+    struct reply_writer writer = {.reply = reply};
     unsigned char header[8] = {0};
     struct stat st;
-    if (!path || fd < 0 || append(&writer, header, 8)) goto failed;
-    if (!allowed(job, path, operation == DCC_FS_STAT || operation == DCC_FS_REALPATH)) error = EACCES;
+    if (!path || append(&writer, header, 8)) goto failed;
+    int access = allowed(job, path);
+    int required = operation == DCC_FS_STAT || operation == DCC_FS_REALPATH ? PATH_METADATA : PATH_CONTENTS;
+    if (!(access & required)) error = EACCES;
     else if (operation == DCC_FS_STAT) {
         if (stat(path, &st) || metadata(&writer, &st) ||
-            (S_ISDIR(st.st_mode) && allowed(job, path, 0) && directory(&writer, path, 1))) error = errno;
+            (S_ISDIR(st.st_mode) && (access & PATH_CONTENTS) && directory(&writer, path, 1))) error = errno;
     } else if (operation == DCC_FS_READ) {
-        source = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-        if (source < 0 || fstat(source, &st)) error = errno;
+        reply->fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (reply->fd < 0 || fstat(reply->fd, &st)) error = errno;
         else if (!S_ISREG(st.st_mode)) error = EINVAL;
         else if ((uint64_t)st.st_size > DCC_TCP_BYTES - 8 - DCC_FS_METADATA) error = EFBIG;
-        else if (metadata(&writer, &st) || flush(&writer)) error = errno;
-        else {
-            off_t offset = 0;
-            while (offset < st.st_size) {
-                ssize_t n = sendfile(fd, source, &offset, st.st_size - offset);
-                if (n < 0 && errno == EINTR) continue;
-                if (n <= 0) { error = n ? errno : EIO; break; }
-                writer.size += n;
-            }
-        }
+        else if (metadata(&writer, &st)) error = errno;
+        else reply->file_size = st.st_size;
     } else if (operation == DCC_FS_REALPATH) {
         char *resolved = realpath(path, NULL);
         if (!resolved || append(&writer, resolved, strlen(resolved))) error = errno;
@@ -167,19 +159,16 @@ int dcc_frontend_fs_reply(const struct dcc_job *job, const void *data, size_t si
     } else if (operation == DCC_FS_LIST) {
         if (directory(&writer, path, 0)) error = errno;
     } else error = EINVAL;
-    if (source >= 0) { close(source); source = -1; }
     if (error) {
-        if (ftruncate(fd, 8)) goto failed;
-        writer.size = 8;
-    } else if (flush(&writer)) goto failed;
-    dcc_tcp_put32(header, error); dcc_tcp_put32(header + 4, writer.size - 8);
-    if (pwrite(fd, header, 8, 0) != 8) goto failed;
-    *length = writer.size;
+        if (reply->fd >= 0) close(reply->fd);
+        reply->fd = -1; reply->file_size = 0; reply->size = 8;
+    }
+    dcc_tcp_put32(reply->data, error);
+    dcc_tcp_put32(reply->data + 4, reply->size + reply->file_size - 8);
     free(path);
-    return fd;
+    return 0;
 failed:
-    if (source >= 0) close(source);
-    if (fd >= 0) close(fd);
+    dcc_frontend_fs_clear(reply);
     free(path);
     return -1;
 }

@@ -385,6 +385,14 @@ Remote header buffers share immutable received or cached storage; LLVM buffer
 views own that storage even after their VFS file closes. Validate ownership on
 both network and cache-hit paths, including empty headers and chunk boundaries.
 
+Filesystem responses retain metadata in memory and an optional open source FD.
+The sender joins the prefix and file extent in the existing compressed chunks;
+it does not stage each response in another file or add a frame boundary.
+Mutable file bytes are read into a private chunk before sending, and premature
+EOF fails the job. Directory listings reuse reported entry types when available;
+full metadata queries still obtain current file versions. Compare generation,
+payload reading and encoding together so deferred work is not counted as saved.
+
 Derive the expected saving and its limiting assumptions before changing the
 implementation. Use existing traces to rule out proposals whose optimistic
 saving is insufficient. If destination service demand or dependency timing is
