@@ -147,22 +147,24 @@ PyObject *dcc_clang_compile(PyObject *, PyObject *arguments) {
     return PyLong_FromLong(ok ? 0 : 1);
 }
 
-static PyObject *compile_file(PyObject *, PyObject *arguments) {
-    int request, fd;
-    if (!PyArg_ParseTuple(arguments, "ii", &request, &fd)) return nullptr;
+static int compile_file(int request, int fd) {
     CompilerCommand command(*command_api);
-    if (!command.read(request, 1)) return nullptr;
+    if (!command.read(request, 1)) {
+        llvm::errs() << "distcc: invalid complete compiler command file\n";
+        return 1;
+    }
     llvm::SmallVector<const char *> argv;
     for (char **p = command[0]; *p; ++p) argv.push_back(*p);
-    if (argv.size() < 11 || llvm::StringRef(argv[4]) != "remote")
-        return PyErr_Format(PyExc_ValueError, "invalid remote compiler command");
+    if (argv.size() < 11 || llvm::StringRef(argv[4]) != "remote") {
+        llvm::errs() << "distcc: invalid remote compiler command\n";
+        return 1;
+    }
     const char *root = argv[1], *output = argv[2], *cwd = argv[3],
                *dependencies = argv[6], *client_identity = argv[9];
-    if (setenv("TMPDIR", root, 1)) return PyErr_SetFromErrno(PyExc_OSError);
+    if (setenv("TMPDIR", root, 1)) { llvm::errs() << "distcc: " << strerror(errno) << '\n'; return 1; }
     auto args = llvm::ArrayRef(argv).drop_front(10);
     // Arguments borrow the decoded command file, owned until compilation ends.
     bool ok = false;
-    Py_BEGIN_ALLOW_THREADS
     auto invocation = std::make_shared<clang::CompilerInvocation>();
     DccChildCompiler compiler(new clang::CompilerInstance(invocation, std::make_shared<clang::PCHContainerOperations>()));
     compiler->createDiagnostics();
@@ -189,16 +191,38 @@ static PyObject *compile_file(PyObject *, PyObject *arguments) {
 #endif
     }
     llvm::outs().flush(); llvm::errs().flush();
-    Py_END_ALLOW_THREADS
-    if (PyErr_CheckSignals() < 0) return nullptr;
-    return PyLong_FromLong(ok ? 0 : 1);
+    return ok ? 0 : 1;
 }
 
 #ifdef DCC_CLANG_COMPILE_MODULE
+#include "native_worker.h"
 namespace {
+PyObject *compile_request(PyObject *, PyObject *arguments) {
+    int request, fd;
+    if (!PyArg_ParseTuple(arguments, "ii", &request, &fd)) return nullptr;
+    int status;
+    Py_BEGIN_ALLOW_THREADS
+    status = compile_file(request, fd);
+    Py_END_ALLOW_THREADS
+    if (PyErr_CheckSignals() < 0) return nullptr;
+    return PyLong_FromLong(status);
+}
+PyObject *serve(PyObject *, PyObject *arguments) {
+    int descriptor;
+    if (!PyArg_ParseTuple(arguments, "i", &descriptor)) return nullptr;
+    int status;
+    Py_BEGIN_ALLOW_THREADS
+    status = dcc_native_worker(descriptor, [](int request, bool preparing) {
+        return preparing ? 1 : compile_file(request, STDIN_FILENO);
+    });
+    Py_END_ALLOW_THREADS
+    if (PyErr_CheckSignals() < 0) return nullptr;
+    return PyLong_FromLong(status);
+}
 PyMethodDef methods[] = {
     {"compile", dcc_clang_compile, METH_VARARGS, "Compile with the client's source identity."},
-    {"compile_file", compile_file, METH_VARARGS, "Consume a remote command file and filesystem channel."},
+    {"compile_file", compile_request, METH_VARARGS, "Consume a remote command file and filesystem channel."},
+    {"serve", serve, METH_VARARGS, "Own descriptor dispatch and isolated compiler children."},
     {nullptr, nullptr, 0, nullptr}};
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_compile", nullptr, -1,
                       methods, nullptr, nullptr, nullptr, nullptr};

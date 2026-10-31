@@ -211,7 +211,8 @@ include_server_SRC = \
 	include_server/c_extensions/clang_native.cpp \
 	include_server/c_extensions/clang_codegen.cpp \
 	include_server/c_extensions/clang_codegen.h \
-	include_server/native_worker.py
+	include_server/c_extensions/native_worker.cpp \
+	include_server/c_extensions/native_worker.h
 
 update_distcc_symlinks_PY = update-distcc-symlinks.py
 

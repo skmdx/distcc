@@ -21,6 +21,7 @@
 #include "clang_codegen.h"
 #include "clang_compiler.h"
 #include "compiler_command.h"
+#include "native_worker.h"
 
 LLD_HAS_DRIVER(elf)
 
@@ -124,27 +125,38 @@ int prepare(int fd, char **args) {
     return command_api->write(fd, "ARGC", "ARGV", command) ||
            command_api->write(fd, "ARGC", "ARGV", roots);
 }
-PyObject *execute(PyObject *, PyObject *input) {
-    int fd, preparing;
-    if (!PyArg_ParseTuple(input, "ip", &fd, &preparing)) return nullptr;
+int execute(int fd, bool preparing) {
     CompilerCommand command(*command_api);
-    if (!command.read(fd, 2)) return nullptr;
+    if (!command.read(fd, 2)) {
+        llvm::errs() << "distcc: invalid complete compiler command file\n";
+        return 1;
+    }
     char **directory = command[0], **argv = command[1];
-    if (!directory[0] || !directory[1] || directory[2] || !argv[0])
-        return PyErr_Format(PyExc_ValueError, "invalid local compiler command");
-    if (chdir(directory[0])) return PyErr_SetFromErrno(PyExc_OSError);
+    if (!directory[0] || !directory[1] || directory[2] || !argv[0]) {
+        llvm::errs() << "distcc: invalid local compiler command\n";
+        return 1;
+    }
+    if (chdir(directory[0])) {
+        llvm::errs() << "distcc: " << directory[0] << ": " << strerror(errno) << '\n';
+        return 1;
+    }
     argv[0] = directory[1];
     llvm::SmallVector<const char *> args;
     if (!preparing) for (char **p = argv; *p; ++p) args.push_back(*p);
+    return preparing ? prepare(fd, argv) : run(args);
+}
+PyObject *serve(PyObject *, PyObject *input) {
+    int fd;
+    if (!PyArg_ParseTuple(input, "i", &fd)) return nullptr;
     int status;
     Py_BEGIN_ALLOW_THREADS
-    status = preparing ? prepare(fd, argv) : run(args);
+    status = dcc_native_worker(fd, execute);
     Py_END_ALLOW_THREADS
     if (PyErr_CheckSignals() < 0) return nullptr;
     return PyLong_FromLong(status);
 }
 PyMethodDef methods[] = {
-    {"execute", execute, METH_VARARGS, "Consume a command file for execution or frontend preparation."},
+    {"serve", serve, METH_VARARGS, "Own descriptor dispatch and isolated compiler children."},
     {nullptr, nullptr, 0, nullptr}};
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_native", nullptr, -1, methods, nullptr, nullptr, nullptr, nullptr};
 }

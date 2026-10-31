@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """Clang execution with isolated jobs and reusable frontend libraries."""
-import array
 import importlib
 import os
 import re
 import shutil
 import subprocess
-import socket
-import struct
 import sys
-import traceback
 
 
 def load_frontend(compiler, module='clang_compile'):
@@ -51,50 +47,11 @@ def compile_command(arguments, frontend=None):
     return frontend.compile(command, original, root, cwd, mode == 'pump')
 
 
-def worker(descriptor, compiler):
-    frontend = load_frontend(compiler)
-    with socket.socket(fileno=int(descriptor)) as channel:
-        while True:
-            data, control, flags, _ = channel.recvmsg(1, socket.CMSG_SPACE(4 * array.array('i').itemsize),
-                                                     socket.MSG_CMSG_CLOEXEC)
-            fds = []
-            for level, kind, values in control:
-                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                    fds.extend(array.array('i', values))
-            if not data:
-                for fd in fds: os.close(fd)
-                return 0
-            try:
-                if data != b'C' or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(fds) != 4:
-                    raise ValueError('invalid compiler request')
-                pid = os.fork()
-                if pid == 0:
-                    channel.close()
-                    status = 1
-                    try:
-                        os.dup2(fds[2], 1); os.dup2(fds[3], 2)
-                        os.close(fds[2]); os.close(fds[3])
-                        try:
-                            status = frontend.compile_file(fds[0], fds[1])
-                        finally:
-                            os.close(fds[0])
-                    except BaseException:
-                        traceback.print_exc()
-                    sys.stdout.flush(); sys.stderr.flush()
-                    os._exit(status)
-            finally:
-                for fd in fds: os.close(fd)
-            _, status, usage = os.wait4(pid, 0)
-            channel.sendall(struct.pack('=3Q', status, usage.ru_maxrss * 1024,
-                                       round((usage.ru_utime + usage.ru_stime) * 1e9)))
-
-
 def main():
     if sys.argv[1] == '--native-worker':
-        from include_server.native_worker import serve
-        return serve(int(sys.argv[2]), load_frontend(sys.argv[3], 'clang_native'))
+        return load_frontend(sys.argv[3], 'clang_native').serve(int(sys.argv[2]))
     if sys.argv[1] == '--worker':
-        return worker(*sys.argv[2:])
+        return load_frontend(sys.argv[3]).serve(int(sys.argv[2]))
     return compile_command(sys.argv[1:])
 
 

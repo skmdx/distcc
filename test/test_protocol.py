@@ -8,11 +8,13 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from test_adaptive import DistccTestCase
@@ -30,6 +32,62 @@ class ArgumentFileTest(unittest.TestCase):
     def setUp(self):
         self.fd = os.memfd_create('distcc-argv-test')
         self.addCleanup(os.close, self.fd)
+
+    def test_native_worker_shutdown_reaps_active_compilers(self):
+        compiler = shutil.which('clang')
+        if not compiler: self.skipTest('Clang unavailable')
+        build = Path.cwd()
+        env = dict(os.environ, PYTHONPATH=str(next(build.glob('_include_server/lib.*'))))
+        for shutdown in ('disconnect', 'terminate', 'malformed'):
+            with self.subTest(shutdown=shutdown), contextlib.ExitStack() as cleanup:
+                control, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                cleanup.callback(control.close); cleanup.callback(child.close)
+                process = subprocess.Popen([sys.executable, str(build/'distcc-clang'),
+                    '--native-worker', str(child.fileno()), compiler], pass_fds=(child.fileno(),),
+                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                def finish():
+                    control.close()
+                    try: process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill(); process.communicate(timeout=5)
+                cleanup.callback(finish)
+                child.close(); control.settimeout(15)
+                self.assertEqual(control.recv(1), b'R')
+                os.ftruncate(self.fd, 0); os.lseek(self.fd, 0, os.SEEK_SET)
+                self.protocol.XArgv(self.fd, [str(build), compiler])
+                self.protocol.XArgv(self.fd, [compiler, '-E', '-x', 'c', '-'])
+                null = os.open(os.devnull, os.O_RDWR)
+                cleanup.callback(os.close, null)
+                for _ in range(2):
+                    source, writer = os.pipe()
+                    cleanup.callback(os.close, source); cleanup.callback(os.close, writer)
+                    reply, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                    cleanup.callback(reply.close)
+                    # Independent file offsets let both actual cc1 invocations
+                    # read the complete command before blocking on stdin.
+                    request = os.open(f'/proc/self/fd/{self.fd}', os.O_RDONLY)
+                    with peer:
+                        try:
+                            control.sendmsg([b'C'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                array.array('i', [request, peer.fileno(), source, null, null]))])
+                        finally: os.close(request)
+                deadline = time.monotonic()+10
+                while True:
+                    children = Path(f'/proc/{process.pid}/task/{process.pid}/children').read_text().split()
+                    if len(children) == 2 and all(Path(f'/proc/{pid}/wchan').read_text().endswith('pipe_read')
+                                                  for pid in children): break
+                    self.assertIsNone(process.poll())
+                    self.assertLess(time.monotonic(), deadline, children)
+                    time.sleep(.01)
+                if shutdown == 'terminate': process.send_signal(signal.SIGTERM)
+                elif shutdown == 'malformed':
+                    control.sendmsg([b'C'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                            array.array('i', [self.fd]*6))])
+                else: control.close()
+                _, errors = process.communicate(timeout=5)
+                expected = {'disconnect': 0, 'terminate': 128+signal.SIGTERM, 'malformed': 1}[shutdown]
+                self.assertEqual(process.returncode, expected, errors)
+                self.assertTrue(all(not Path(f'/proc/{pid}').exists() for pid in children), children)
 
     def test_file_groups_offsets_and_reused_command_storage(self):
         for values in ((['/working directory', '/compiler'], []),
@@ -94,7 +152,7 @@ class ArgumentFileTest(unittest.TestCase):
                         process.kill(); process.communicate(timeout=5)
                 cleanup.callback(finish)
                 child.close()
-                if native: self.assertEqual(control.recv(1), b'R')
+                self.assertEqual(control.recv(1), b'R')
                 outputs = [os.memfd_create('distcc-worker-test') for _ in range(3)]
                 for fd in outputs: cleanup.callback(os.close, fd)
                 directory = [str(build), compiler]
@@ -126,11 +184,10 @@ class ArgumentFileTest(unittest.TestCase):
                     reply, peer = socket.socketpair()
                     with reply, peer:
                         reply.settimeout(15)
-                        fds = [self.fd, peer.fileno(), *outputs] if native else [self.fd, peer.fileno(), *outputs[1:]]
+                        fds = [self.fd, peer.fileno(), *outputs]
                         control.sendmsg([operation], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))])
-                        channel = reply if native else control
-                        response = channel.recv(16 if native else 24, socket.MSG_WAITALL)
-                    self.assertEqual(len(response), 16 if native else 24)
+                        response = reply.recv(24, socket.MSG_WAITALL)
+                    self.assertEqual(len(response), 24)
                     status = struct.unpack_from('=Q', response)[0]
                     self.assertEqual(os.waitstatus_to_exitcode(status) == 0, success,
                                      os.pread(outputs[2], 65536, 0))

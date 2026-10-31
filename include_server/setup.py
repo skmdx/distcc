@@ -220,6 +220,9 @@ codegen_sources = [os.path.join(srcdir_include_server, 'c_extensions', 'clang_co
 codegen_headers = [os.path.join(srcdir, 'src', name) for name in
                    ('broker_protocol.h', 'workload.h', 'lto_partition.h')]
 codegen_headers.append(os.path.join(srcdir_include_server, 'c_extensions', 'clang_codegen.h'))
+worker_sources = [os.path.join(srcdir_include_server, 'c_extensions', 'native_worker.cpp')]
+worker_headers = [os.path.join(srcdir_include_server, 'c_extensions', 'native_worker.h'),
+                  os.path.join(srcdir, 'src', 'clang_worker.h')]
 for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.pathsep):
   major = llvm_option('--version', config).split('.')[0]
   if major not in ('22', '23'):
@@ -232,8 +235,8 @@ for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.paths
   codegen_macros: list[tuple[str, str | None]] = [('DCC_LLD_PATH', '"' + os.path.join(bindir, 'ld.lld') + '"')]
   frontends.append(setuptools.Extension(
       name='include_server.clang' + major + '.clang_compile',
-      sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_compile.cpp')] + codegen_sources,
-      depends=frontend_headers + codegen_headers,
+      sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_compile.cpp')] + codegen_sources + worker_sources,
+      depends=frontend_headers + codegen_headers + worker_headers,
       language='c++', include_dirs=[llvm_option('--includedir', config), os.path.join(srcdir, 'src')],
       library_dirs=[library], runtime_library_dirs=[runtime],
       libraries=['clang-cpp', 'lldELF', 'lldCommon', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
@@ -242,8 +245,8 @@ for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.paths
   frontends.append(setuptools.Extension(
       name='include_server.clang' + major + '.clang_native',
       sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_native.cpp'),
-               os.path.join(srcdir, 'src', 'clang_driver.cc')] + codegen_sources,
-      depends=codegen_headers + [os.path.join(srcdir, 'src', 'clang_inputs.h'),
+               os.path.join(srcdir, 'src', 'clang_driver.cc')] + codegen_sources + worker_sources,
+      depends=codegen_headers + worker_headers + [os.path.join(srcdir, 'src', 'clang_inputs.h'),
                                 os.path.join(srcdir, 'src', 'argv_file.h'),
                                 os.path.join(srcdir_include_server, 'c_extensions', 'clang_compiler.h'),
                                 os.path.join(srcdir_include_server, 'c_extensions', 'compiler_command.h')],

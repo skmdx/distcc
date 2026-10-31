@@ -13,9 +13,7 @@ public:
     CompilerCommand &operator=(const CompilerCommand &) = delete;
     ~CompilerCommand() { api.close(&file); }
     bool read(int fd, unsigned groups) {
-        if (!api.read(fd, groups, &file)) return true;
-        PyErr_SetString(PyExc_ValueError, "invalid complete compiler command file");
-        return false;
+        return !api.read(fd, groups, &file);
     }
     char **operator[](unsigned group) const { return file.groups[group]; }
     static const dcc_argv_file_api *load() {

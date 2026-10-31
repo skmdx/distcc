@@ -59,6 +59,14 @@ static int start_session(char **argv)
     if (ret) { close(pair[0]); free(selected); return ret; }
     session = pair[0];
     compiler = selected;
+    char ready;
+    ret = dcc_select_for_read(session, dcc_get_io_timeout());
+    if (!ret) ret = dcc_readx(session, &ready, 1);
+    if (ret || ready != 'R') {
+        kill(helper_pid, SIGKILL);
+        close_session();
+        return ret ? ret : EXIT_IO_ERROR;
+    }
     rs_trace("started reusable frontend pid=%ld", (long)helper_pid);
     return 0;
 }
@@ -69,21 +77,23 @@ int dcc_clang_worker(char **argv, int filesystem, int cancel,
 {
     int ret = start_session(argv);
     if (ret) return ret;
-    int fds[] = {dcc_job_memfd("distcc-clang-command"), filesystem,
+    int reply[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, reply)) return EXIT_IO_ERROR;
+    int fds[] = {dcc_job_memfd("distcc-clang-command"), reply[1], filesystem,
                 open(output, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600),
                 open(errors, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)};
-    if (fds[0] < 0 || fds[2] < 0 || fds[3] < 0) ret = EXIT_IO_ERROR;
+    if (fds[0] < 0 || fds[3] < 0 || fds[4] < 0) ret = EXIT_IO_ERROR;
     else {
         ret = dcc_x_argv(fds[0], "ARGC", "ARGV", argv);
         if (!ret && (lseek(fds[0], 0, SEEK_SET) < 0 ||
-                     dcc_send_fds(session, "C", 1, fds, 4))) ret = EXIT_IO_ERROR;
+                     dcc_send_fds(session, "C", 1, fds, 5))) ret = EXIT_IO_ERROR;
     }
-    for (unsigned i = 0; i < 4; ++i) if (i != 1 && fds[i] >= 0) close(fds[i]);
+    for (unsigned i = 0; i < 5; ++i) if (i != 2 && fds[i] >= 0) close(fds[i]);
     if (ret) goto failed;
     struct timespec started, now;
     clock_gettime(CLOCK_MONOTONIC, &started);
     for (;;) {
-        struct pollfd polls[] = {{session, POLLIN, 0}, {cancel, POLLIN, 0}};
+        struct pollfd polls[] = {{reply[0], POLLIN, 0}, {cancel, POLLIN, 0}};
         int timeout = -1;
         if (dcc_job_lifetime) {
             clock_gettime(CLOCK_MONOTONIC, &now);
@@ -98,20 +108,22 @@ int dcc_clang_worker(char **argv, int filesystem, int cancel,
         if (ready < 0 || polls[1].revents) { ret = EXIT_IO_ERROR; break; }
         if (!ready) { ret = EXIT_TIMEOUT; break; }
         if (polls[0].revents) {
-            uint64_t reply[3];
-            ssize_t length = recv(session, reply, sizeof(reply), MSG_TRUNC);
-            if (length != sizeof(reply) || reply[0] > 65535) { ret = EXIT_IO_ERROR; break; }
-            *status = reply[0]; *peak = reply[1];
-            *cpu_ns = reply[2];
+            struct dcc_clang_result result;
+            ssize_t length = recv(reply[0], &result, sizeof(result), MSG_TRUNC);
+            if (length != sizeof(result) || result.status > 65535) { ret = EXIT_IO_ERROR; break; }
+            *status = result.status; *peak = result.peak_bytes;
+            *cpu_ns = result.cpu_ns;
+            close(reply[0]);
             rs_trace("reused frontend pid=%ld status=%d peak=%llu", (long)helper_pid, *status, *peak);
             return 0;
         }
     }
 failed:
-    /* Cancellation and helper failure have the same ownership as ordinary
-     * compiler children. The daemon reaps this group before deleting its tree. */
-    if (dcc_worker_group) { killpg(getpgrp(), SIGKILL); _exit(ret); }
-    kill(helper_pid, SIGKILL);
+    close(reply[0]);
+    /* The helper owns per-invocation groups. Let it terminate and reap those
+     * before the daemon removes this worker group and its input tree. */
+    kill(helper_pid, SIGTERM);
     close_session();
+    if (dcc_worker_group) { killpg(getpgrp(), SIGKILL); _exit(ret); }
     return ret;
 }

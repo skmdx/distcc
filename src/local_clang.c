@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <xxhash.h>
 #include "distcc.h"
+#include "clang_worker.h"
 #include "broker.h"
 #include "exec.h"
 #include "exitcode.h"
@@ -102,13 +103,13 @@ static int request(char **argv, char operation, int output, int *status, uint64_
     int fds[] = {input, pair[1], 0, 1, 2};
     if (dcc_send_fds(worker, &operation, 1, fds, 5)) goto out;
     close(pair[1]); pair[1] = -1;
-    uint64_t result[2];
+    struct dcc_clang_result result;
     ssize_t length;
     do { length = recv(pair[0], &result, sizeof(result), MSG_TRUNC); } while (length < 0 && errno == EINTR);
-    ret = length == sizeof(result) && result[0] <= 65535 ? 0 : EXIT_IO_ERROR;
+    ret = length == sizeof(result) && result.status <= 65535 ? 0 : EXIT_IO_ERROR;
     if (!ret) {
-        *status = result[0];
-        if (cpu_ns) *cpu_ns = result[1];
+        *status = result.status;
+        if (cpu_ns) *cpu_ns = result.cpu_ns;
         rs_trace("reused local compiler libraries status=%d operation=%c", *status, operation);
     }
 out:

@@ -147,7 +147,12 @@ class FileCacheTest(unittest.TestCase):
             key = ('entry-%d' % candidate).encode()
             if (xxhash.xxh3_64_intdigest(key) >> 56) % 64 == 0: keys.append(key)
             candidate += 1
-        for key in keys[:40]: self.write(key, b'entry')
+        self.write(keys[0], b'entry')
+        oldest = next(p for p in self.cache_path.glob('*/*') if len(p.name) == 16)
+        # Eviction compares file ages; creation within one timestamp tick
+        # does not establish an order between otherwise equal-age entries.
+        os.utime(oldest, (1, 1))
+        for key in keys[1:40]: self.write(key, b'entry')
         pid = os.fork()
         if not pid:
             for key in keys[40:]: self.write(key, b'entry')
@@ -913,7 +918,12 @@ ssize_t read(int fd, void *data, size_t size) {
     char link[64], path[4096];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
     ssize_t n = readlink(link, path, sizeof(path)-1);
-    if (n > 0) { path[n] = 0; if (strstr(path, "/distcc-tcp-")) gate("cache"); }
+    if (n > 0) {
+        path[n] = 0;
+        const char *cache = getenv("DISTCCD_FILE_CACHE");
+        if (cache && *cache && !strncmp(path, cache, strlen(cache)) && path[strlen(cache)] == '/')
+            gate("cache");
+    }
     return real_read(fd, data, size);
 }
 int unlinkat(int fd, const char *path, int flags) {
@@ -947,6 +957,13 @@ int ioctl(int fd, unsigned long request, ...) {
                     self.upload(first, body)
                     self.result(first)
                     first.close()
+                    # A job result can precede asynchronous cache publication.
+                    # Arm the cache-read gate only after a complete input exists.
+                    deadline = time.monotonic()+5
+                    while not any(p.read_bytes() == body for p in (self.work/'cache').glob('*/*')
+                                  if len(p.name) == 16):
+                        self.assertLess(time.monotonic(), deadline, 'cache input was not published')
+                        time.sleep(.01)
                 arm.touch()
                 owner = None
                 if kind == 'copy':

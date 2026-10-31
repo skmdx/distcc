@@ -418,11 +418,23 @@ Batch header, key and payload writes before atomic publication. Eviction scans
 use independent directory offsets even when a compiler forks with cached handles;
 closing the cache cannot invalidate already returned buffers.
 
-The resident local helper owns all of its invocation children. Drain completed
-children with `wait4(-1, WNOHANG)` after processing each event batch, rather than
-polling every live PID. Work scales with received events and completions instead
-of their product with the live child count; out-of-order exits and cancellation
-must still preserve each reply's own status and CPU accounting.
+Local and remote resident helpers share native descriptor dispatch and child
+ownership. Python selects and loads the configured frontend once; invocation
+children never enter the interpreter. Each request owns its command file, reply
+channel and standard streams; the remote frontend uses its input stream for
+filesystem RPC. Install these descriptors, close unrelated inherited descriptors
+in one operation, then execute in a separate process group. Do not run Python's
+fork callbacks or rebuild Python descriptor/argument objects per invocation.
+The same reply reports exit status, peak RSS and descendant CPU time on both
+paths. Read signal notifications through the event loop and drain completed
+children with `wait4(-1, WNOHANG)` after each event batch. Work scales with received
+events and completions instead of their product with the live child count.
+Client closure cancels that invocation; control closure or helper termination
+reaps all owned groups before returning. Remote daemon cancellation must allow
+this cleanup before removing its own worker group and input tree. Validate
+out-of-order exits, malformed commands, active shutdown and per-job accounting
+through real compiler requests, then measure fork/dispatch overhead separately
+from compilation and complete-build time.
 
 Compiler request and preparation-result memfds are complete before their
 descriptor is handed off. Read each complete remaining extent once, then parse
