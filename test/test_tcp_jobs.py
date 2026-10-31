@@ -30,12 +30,12 @@ class FrontendTest(BrokerTestCase):
     def start_tcp(self):
         return self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
 
-    def start_frontend(self, **settings):
+    def start_frontend(self, jobs=4, **settings):
         clang = shutil.which('clang')
         if not clang:
             self.skipTest('Clang unavailable')
         self.restart_server(self.build / 'distccd', DISTCC_CLANG_DRIVER=str(self.build / 'distcc-clang'),
-                            DISTCCD_FILE_CACHE=str(self.work/'cache'), **settings)
+                            DISTCCD_FILE_CACHE=str(self.work/'cache'), jobs=jobs, **settings)
         self.start_tcp()
         self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
                         DISTCC_CLANG_LOCAL='1', PATH=str(self.build)+os.pathsep+self.env['PATH'],
@@ -75,6 +75,124 @@ class FrontendTest(BrokerTestCase):
             line for line in text.splitlines() if 'compiler libraries' in line or 'frontend' in line))
         self.assertIn('operation=C', text)
         self.assertEqual(text.count('frontend filesystem:'), 8)
+
+    def test_remote_codegen_shares_ipc_and_preserves_cpp_results(self):
+        self.check_remote_codegen(4)
+
+    def test_remote_codegen_respects_single_cpu_limit(self):
+        self.check_remote_codegen(1)
+
+    def test_remote_codegen_uses_requested_llvm_release(self):
+        compiler = shutil.which('clang-22')
+        if not compiler: self.skipTest('Alternate LLVM release unavailable')
+        self.check_remote_codegen(4, compiler)
+
+    def test_remote_codegen_disconnect_reaps_partitions_and_releases_capacity(self):
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        trace_offset = Path(self.logs[0].name).stat().st_size
+        source, output = self.work/'cancel-codegen.c', self.work/'cancel-codegen.o'
+        source.write_text('\n'.join(
+            f'unsigned f{i}(unsigned n) {{ '
+            '__asm__ volatile(".rept 100000\\nnop\\n.endr\\n"); '
+            f'for (unsigned j=0;j<100;j++) n=n*33+j+{i}; return n; }}' for i in range(8)))
+        command = [str(self.build/'distcc'), clang, '-O3', '-c', str(source), '-o', str(output)]
+        warm = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+        trace = Path(self.logs[0].name).read_bytes()[trace_offset:].decode()
+        helpers = re.findall(r'started reusable frontend pid=(\d+)', trace)
+        self.assertEqual(len(helpers), 1)
+        def children(pid):
+            try: return [int(value) for value in Path(f'/proc/{pid}/task/{pid}/children').read_text().split()]
+            except FileNotFoundError: return []
+        output.unlink()
+        with (self.work/'cancel-codegen.log').open('wb') as log:
+            process = subprocess.Popen(command, env=self.env, stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic()+10
+                parents, partitions = [], []
+                while not partitions:
+                    self.assertIsNone(process.poll(), 'parallel backend was not reached')
+                    self.assertLess(time.monotonic(), deadline)
+                    parents = children(int(helpers[0]))
+                    partitions = [child for parent in parents for child in children(parent)]
+                    time.sleep(.001)
+                # Hold an actual backend child to prove that cancellation
+                # reaps descendants, rather than merely observing a fast exit.
+                for child in partitions: os.kill(child, signal.SIGSTOP)
+                self.assertIn('dcc_busy 2\n', self.get_stats(self.stats_ports[0]))
+                process.kill(); process.wait(timeout=5)
+                deadline = time.monotonic()+5
+                while True:
+                    alive = []
+                    for child in parents + partitions:
+                        try:
+                            if Path(f'/proc/{child}/stat').read_text().rsplit(')', 1)[1].split()[0] != 'Z':
+                                alive.append(child)
+                        except FileNotFoundError: pass
+                    state = self.get_stats(self.stats_ports[0])
+                    if not alive and 'dcc_busy 0\n' in state: break
+                    self.assertLess(time.monotonic(), deadline, (alive, state))
+                    time.sleep(.01)
+                self.assertIn('dcc_memory_reserved_bytes 0\n', state)
+                self.assertFalse(output.exists())
+            finally:
+                if process.poll() is None: process.kill()
+                process.wait(timeout=5)
+        recovered = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+
+    def check_remote_codegen(self, jobs, compiler=None):
+        clang = self.start_frontend(jobs=jobs, DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        if compiler: clang = compiler
+        source = self.work/'partition.cpp'
+        payload = self.work/'backend.bin'
+        payload.write_bytes(random.Random(911).randbytes(256))
+        asm = r'__asm__ volatile(".pushsection .rodata\n.incbin \"" PAYLOAD "\"\n.popsection\n");'
+        source.write_text('#include <cstdio>\n#include <vector>\n'
+                          f'#define PAYLOAD "{payload}"\n'
+                          'static std::vector<unsigned> values{3,7};\nthread_local unsigned bias=2;\n' +
+                          '\n'.join(f'__attribute__((noinline)) unsigned f{i}(unsigned n) {{ {asm} '
+                                    f'for (unsigned j=0;j<100;j++) n=n*33+j+{i}; '
+                                    'try { if (n&1) throw n; return n+values[0]+bias; } '
+                                    'catch (unsigned v) { return v+values[1]; }}' for i in range(8)) +
+                          '\nint main() { std::printf("%u\\n", ' +
+                          '+'.join(f'f{i}(2)' for i in range(8)) + '); }\n')
+        output, deps = self.work/'partition.o', self.work/'partition.d'
+        command = [clang, '--driver-mode=g++', '-O3', '-g', '-ffunction-sections', '-fdata-sections',
+                   '-MMD', '-MF', str(deps), '-c', str(source), '-o', str(output)]
+        executable = self.work/'partition'
+        def result():
+            subprocess.run([clang, '--driver-mode=g++', str(output), '-o', str(executable)],
+                           check=True, capture_output=True, timeout=30)
+            return subprocess.check_output([str(executable)]), deps.read_bytes()
+        subprocess.run(command, check=True, capture_output=True, timeout=30)
+        expected = result()
+        warm = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+        self.assertIn('distcc codegen plan:', warm.stderr)
+        self.assertNotIn('distcc codegen: ', warm.stderr)
+        compiled = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        self.assertEqual(result(), expected)
+        if jobs > 1: self.assertIn('distcc codegen: 2 parts', compiled.stderr)
+        else: self.assertNotIn('distcc codegen: ', compiled.stderr)
+        # Missing assembler input fails after the frontend, including when
+        # multiple partitions share the same request/reply stream.
+        output.unlink(); payload.unlink()
+        failed = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(failed.returncode, 0, failed.stderr)
+        self.assertFalse(output.exists())
+        payload.write_bytes(random.Random(911).randbytes(256))
+        restored = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(result(), expected)
+        state = self.get_stats(self.stats_ports[0])
+        self.assertIn('dcc_busy 0\n', state)
+        self.assertIn('dcc_memory_reserved_bytes 0\n', state)
 
     def test_remote_frontend_advertises_its_learned_memory_class(self):
         clang = self.start_frontend(DISTCC_JOB_MEMORY='1536', DISTCC_MEMORY_LEARNING='1')

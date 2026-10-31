@@ -10,6 +10,9 @@
 #include "../../src/clang_inputs.h"
 #include "remote_files.h"
 #include "clang_compiler.h"
+#ifdef DCC_CLANG_COMPILE_MODULE
+#include "clang_codegen.h"
+#endif
 
 namespace {
 // The driver sees the existing worker paths. Only the frontend uses the
@@ -188,7 +191,12 @@ static PyObject *compile_remote(PyObject *, PyObject *arguments) {
             llvm::sys::path::parent_path(root).str()));
         compiler->setFileManager(new clang::FileManager(invocation->getFileSystemOpts(), files));
         compiler->createSourceManager();
+#ifdef DCC_CLANG_COMPILE_MODULE
+        auto generated = dcc_clang_codegen(*compiler, [&](unsigned count) { return files->codegen_cpus(count); });
+        ok = generated ? *generated : clang::ExecuteCompilerInvocation(compiler.get());
+#else
         ok = clang::ExecuteCompilerInvocation(compiler.get());
+#endif
     }
     Py_END_ALLOW_THREADS
     Py_DECREF(capsule);
@@ -207,6 +215,7 @@ PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_compile", nullptr, -1,
 }
 PyMODINIT_FUNC PyInit_clang_compile() {
     dcc_clang_compile_init();
+    dcc_clang_codegen_init();
     return PyModule_Create(&module);
 }
 #endif

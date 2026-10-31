@@ -197,7 +197,7 @@ sysroot = os.environ.get('SYSROOT', '').rstrip('/')
 if sysroot and llvm_lib.startswith(sysroot + '/'):
   llvm_runtime_lib = llvm_lib[len(sysroot):]
 frontend_headers = [os.path.join(srcdir, 'src', name)
-                    for name in ('clang_inputs.h', 'job.h', 'tcp_job.h', 'file_cache.h')]
+                    for name in ('clang_inputs.h', 'job.h', 'tcp_job.h', 'file_cache.h', 'frontend_fs.h')]
 frontend_headers.extend(os.path.join(srcdir_include_server, 'c_extensions', name)
                         for name in ('remote_files.h', 'clang_compiler.h'))
 scanner = setuptools.Extension(
@@ -214,6 +214,12 @@ scanner = setuptools.Extension(
 # Worker code generation must use the requested compiler's LLVM release.
 # Loading another release would silently change bitcode and optimization semantics.
 frontends = []
+codegen_sources = [os.path.join(srcdir_include_server, 'c_extensions', 'clang_codegen.cpp'),
+                   os.path.join(srcdir, 'src', 'lto_partition.cc'),
+                   os.path.join(os.environ.get('LTO_BUILD', 'llvm-lto'), 'SplitModule.cpp')]
+codegen_headers = [os.path.join(srcdir, 'src', name) for name in
+                   ('broker_protocol.h', 'workload.h', 'lto_partition.h')]
+codegen_headers.append(os.path.join(srcdir_include_server, 'c_extensions', 'clang_codegen.h'))
 for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.pathsep):
   major = llvm_option('--version', config).split('.')[0]
   if major not in ('22', '23'):
@@ -223,32 +229,27 @@ for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.paths
   bindir = llvm_option('--bindir', config)
   if sysroot and bindir.startswith(sysroot + '/'):
     bindir = bindir[len(sysroot):]
+  codegen_macros: list[tuple[str, str | None]] = [('DCC_LLD_PATH', '"' + os.path.join(bindir, 'ld.lld') + '"')]
   frontends.append(setuptools.Extension(
       name='include_server.clang' + major + '.clang_compile',
-      sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_compile.cpp')],
-      depends=frontend_headers,
-      language='c++', include_dirs=[llvm_option('--includedir', config)],
+      sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_compile.cpp')] + codegen_sources,
+      depends=frontend_headers + codegen_headers,
+      language='c++', include_dirs=[llvm_option('--includedir', config), os.path.join(srcdir, 'src')],
       library_dirs=[library], runtime_library_dirs=[runtime],
-      libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
-      define_macros=[('DCC_CLANG_COMPILE_MODULE', '1')],
+      libraries=['clang-cpp', 'lldELF', 'lldCommon', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
+      define_macros=[('DCC_CLANG_COMPILE_MODULE', '1')] + codegen_macros,
   ))
   frontends.append(setuptools.Extension(
       name='include_server.clang' + major + '.clang_native',
-      sources=[os.path.join(srcdir_include_server, 'c_extensions', name)
-               for name in ('clang_native.cpp', 'clang_codegen.cpp')]
-              + [os.path.join(srcdir, 'src', 'clang_driver.cc'),
-                 os.path.join(srcdir, 'src', 'lto_partition.cc'),
-                 os.path.join(os.environ.get('LTO_BUILD', 'llvm-lto'), 'SplitModule.cpp')],
-      depends=[os.path.join(srcdir, 'src', name) for name in
-               ('broker_protocol.h', 'workload.h', 'lto_partition.h', 'clang_inputs.h')]
-              + [os.path.join(srcdir_include_server, 'c_extensions', name)
-                 for name in ('clang_codegen.h', 'clang_compiler.h')],
+      sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_native.cpp'),
+               os.path.join(srcdir, 'src', 'clang_driver.cc')] + codegen_sources,
+      depends=codegen_headers + [os.path.join(srcdir, 'src', 'clang_inputs.h'),
+                                os.path.join(srcdir_include_server, 'c_extensions', 'clang_compiler.h')],
       language='c++', include_dirs=[llvm_option('--includedir', config), os.path.join(srcdir, 'src')],
       library_dirs=[library], runtime_library_dirs=[runtime],
       libraries=['clang-cpp', 'lldELF', 'lldCommon', 'LLVM'],
       extra_compile_args=['-std=c++17', '-g0'],
-      define_macros=[('DCC_LLD_PATH', '"' + os.path.join(bindir, 'ld.lld') + '"'),
-                     ('DCC_OBJCOPY_PATH', '"' + os.path.join(bindir, 'llvm-objcopy') + '"')],
+      define_macros=codegen_macros,
   ))
 
 class VersionedBuildExt(build_ext):

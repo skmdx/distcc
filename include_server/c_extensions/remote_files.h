@@ -2,6 +2,7 @@
 #pragma once
 #include "../../src/tcp_job.h"
 #include "../../src/file_cache.h"
+#include "../../src/frontend_fs.h"
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/FrontendTool/Utils.h>
 #include <clang/Lex/HeaderSearchOptions.h>
@@ -11,10 +12,13 @@
 #include <llvm/Support/Path.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/VirtualFileSystem.h>
+#include <llvm/ADT/ScopeExit.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <cstring>
 #include <unordered_map>
@@ -88,6 +92,7 @@ public:
 };
 class RemoteFiles : public llvm::vfs::FileSystem {
     int fd;
+    pthread_mutex_t *shared = nullptr;
     std::string cwd;
     std::unordered_map<std::string, llvm::ErrorOr<llvm::vfs::Status>> statuses;
     std::unordered_map<std::string, std::shared_ptr<const llvm::MemoryBuffer>> contents;
@@ -125,6 +130,19 @@ class RemoteFiles : public llvm::vfs::FileSystem {
         return {};
     }
     llvm::ErrorOr<std::string> request(unsigned op, const std::string &path) {
+        // Forked backend partitions can still read assembler inputs. One
+        // owner covers the complete exchange, so replies cannot cross jobs.
+        if (shared) {
+            int error = pthread_mutex_lock(shared);
+            if (error) {
+                if (error == EOWNERDEAD) {
+                    shutdown(fd, SHUT_RDWR);
+                    pthread_mutex_unlock(shared); // Leave the broken stream unrecoverable.
+                }
+                return std::error_code(error, std::generic_category());
+            }
+        }
+        auto unlock = llvm::scope_exit([&] { if (shared) pthread_mutex_unlock(shared); });
         uint32_t header[] = {htonl(DCC_TCP_FS_QUERY), htonl(path.size() + 4), htonl(op)};
         std::string data((char *)header, sizeof(header)); data += path;
         if (!transfer(fd, data.data(), data.size(), true) ||
@@ -142,7 +160,36 @@ public:
                 std::string identity, std::string cache_root)
         : fd(fd), cwd(std::move(cwd)), cache(cache), identity(std::move(identity)),
           cache_root(std::move(cache_root)) {}
-    ~RemoteFiles() override { ::close(fd); }
+    ~RemoteFiles() override {
+        if (shared) { pthread_mutex_destroy(shared); munmap(shared, sizeof(*shared)); }
+        ::close(fd);
+    }
+    bool share_stream() {
+        if (shared) return true;
+        void *memory = mmap(nullptr, sizeof(pthread_mutex_t), PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (memory == MAP_FAILED) return false;
+        auto mutex = static_cast<pthread_mutex_t *>(memory);
+        pthread_mutexattr_t attributes;
+        int error = pthread_mutexattr_init(&attributes);
+        if (!error) {
+            error = pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED);
+            if (!error) error = pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST);
+            if (!error) error = pthread_mutex_init(mutex, &attributes);
+            pthread_mutexattr_destroy(&attributes);
+        }
+        if (error) { munmap(memory, sizeof(*mutex)); return false; }
+        shared = mutex;
+        return true;
+    }
+    unsigned codegen_cpus(unsigned requested) {
+        if (requested && !share_stream()) return 0;
+        uint32_t count = htonl(requested);
+        auto answer = request(DCC_FS_CODEGEN, std::string(reinterpret_cast<char *>(&count), sizeof(count)));
+        if (!answer || answer->size() != 4) return 0;
+        unsigned granted = number(answer->data(), 4);
+        return granted <= requested ? granted : 0;
+    }
     llvm::ErrorOr<llvm::vfs::Status> status(const llvm::Twine &path) override {
         auto name = absolute(path);
         auto found = statuses.find(name);

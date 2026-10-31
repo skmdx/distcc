@@ -79,6 +79,7 @@ enum worker_phase { IDLE, EXECUTING, RETIRING };
 struct worker {
     pid_t pid;
     int fd, busy, link;
+    unsigned codegen_cpus;
     struct dcc_tcp_server *tcp;
     unsigned memory_class;
     unsigned long long reservation;
@@ -134,7 +135,8 @@ static void cancel_tcp_job(struct dcc_tcp_server *job)
         w->busy = RETIRING;
     }
 }
-static const struct dcc_tcp_dispatch tcp_dispatch = {accept_tcp_job, cancel_tcp_job};
+static unsigned reserve_codegen(struct dcc_tcp_server *, unsigned);
+static const struct dcc_tcp_dispatch tcp_dispatch = {accept_tcp_job, cancel_tcp_job, reserve_codegen};
 
 int dcc_prefork_shutdown(int signal_number)
 {
@@ -179,6 +181,7 @@ int dcc_prefork_status(struct dcc_server_load *load)
     if (!workers) return 0;
     for (i = 0; i < worker_count; ++i) {
         load->busy += workers[i].fd >= 0 && workers[i].busy == EXECUTING;
+        load->busy += workers[i].codegen_cpus;
         load->links += workers[i].fd >= 0 && workers[i].busy == EXECUTING && workers[i].link;
         struct worker *w = &workers[i];
         if (!w->busy || !w->reservation) continue;
@@ -187,6 +190,8 @@ int dcc_prefork_status(struct dcc_server_load *load)
             unsigned long long estimate = dcc_resource_estimate(w->memory_class);
             if (estimate > charge) charge = estimate;
         }
+        unsigned copies = 1 + w->codegen_cpus;
+        charge = charge <= ULLONG_MAX / copies ? charge * copies : ULLONG_MAX;
         load->reserved = charge <= ULLONG_MAX - load->reserved ? load->reserved + charge : ULLONG_MAX;
     }
     for (i = 0; i < MAX_PENDING; ++i)
@@ -197,6 +202,38 @@ int dcc_prefork_status(struct dcc_server_load *load)
     if (dcc_auth_enabled) return 0;
 #endif
     return 1;
+}
+
+static unsigned reserve_codegen(struct dcc_tcp_server *job, unsigned requested)
+{
+    for (int i = 0; i < worker_count; ++i) {
+        struct worker *w = &workers[i];
+        if (w->tcp != job || w->busy != EXECUTING) continue;
+        if (!requested) { w->codegen_cpus = 0; return 0; }
+        if (w->codegen_cpus) return w->codegen_cpus;
+        struct dcc_server_load load;
+        dcc_prefork_status(&load);
+        int logical, physical;
+        double core_scale, smt_gain;
+        dcc_cpu_topology(&logical, &physical, &core_scale, &smt_gain);
+        int limit = dcc_cpu_perf_limit(dcc_max_kids), available = dcc_resource_cpus();
+        if (limit > physical) limit = physical;
+        if (limit > available) limit = available;
+        int running = dcc_getcurrentload();
+        if (running > 0) --running; /* Exclude this serving parent. */
+        int occupied = load.busy > running ? load.busy : running;
+        occupied += load.preparing;
+        /* Optional backend lanes never wait or displace ready compilations.
+         * The parent accounts for them through merge, cancellation and reaping. */
+        while (!load.queued && w->codegen_cpus < requested && occupied < limit &&
+               dcc_resource_admit(w->memory_class, load.reserved)) {
+            ++w->codegen_cpus; ++occupied;
+            dcc_prefork_status(&load);
+        }
+        rs_trace("codegen CPUs requested=%u granted=%u worker=%ld", requested, w->codegen_cpus, (long)w->pid);
+        return w->codegen_cpus;
+    }
+    return 0;
 }
 
 void dcc_prefork_reaped(pid_t pid)
@@ -257,6 +294,7 @@ static void receive_worker_message(struct worker *w)
         struct dcc_tcp_server *job = w->tcp;
         dcc_resource_observe(w->memory_class, finished.peak_bytes, !finished.error && !finished.status);
         w->reservation = 0;
+        w->codegen_cpus = 0;
         w->tcp = NULL; w->busy = finished.retiring ? RETIRING : IDLE; w->link = 0;
         dcc_tcp_ready_idle_ns();
         dcc_tcp_server_finished(job, &finished, fds, count);

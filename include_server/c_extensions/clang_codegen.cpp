@@ -11,10 +11,13 @@
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/MultiplexConsumer.h>
 #include <llvm/IR/Module.h>
+#include <llvm/ObjCopy/ConfigManager.h>
+#include <llvm/ObjCopy/ObjCopy.h>
+#include <llvm/Object/Binary.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/BuryPointer.h>
+#include <llvm/Support/FileSystem.h>
 #include <llvm/Support/JSON.h>
-#include <llvm/Support/Program.h>
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/TargetParser/Triple.h>
 #include <lld/Common/Driver.h>
@@ -23,6 +26,7 @@
 #include <sys/resource.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
@@ -166,10 +170,6 @@ bool emit(clang::CompilerInstance &compiler, llvm::Module &module,
 
 std::string fd_path(int fd) { return "/proc/self/fd/" + std::to_string(fd); }
 
-bool tool(llvm::ArrayRef<std::string> arguments) {
-    llvm::SmallVector<llvm::StringRef> args(arguments.begin(), arguments.end());
-    return llvm::sys::ExecuteAndWait(args[0], args) == 0;
-}
 }
 
 void dcc_clang_codegen_init() {
@@ -178,13 +178,14 @@ void dcc_clang_codegen_init() {
     if (memory != MAP_FAILED) measured = new(memory) Measurements;
 }
 
-std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
+std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler,
+    const std::function<unsigned(unsigned)> &reserve) {
     const char *enabled = getenv("DISTCC_CLANG_CODEGEN");
     auto &frontend = compiler.getFrontendOpts();
     const auto &codegen = compiler.getCodeGenOpts();
     // These actions produce other artifacts, or have wrappers around the
     // frontend action; their original Clang path owns those contracts.
-    if (!enabled || strcmp(enabled, "1") || !getenv("DISTCC_BROKER") ||
+    if (!enabled || strcmp(enabled, "1") || (!reserve && !getenv("DISTCC_BROKER")) ||
         frontend.ProgramAction != clang::frontend::EmitObj || frontend.ShowHelp || frontend.ShowVersion ||
         frontend.OutputFile.empty() || frontend.OutputFile == "-" ||
         frontend.FixAndRecompile || frontend.EmitSymbolGraph || !frontend.ASTMergeFiles.empty() ||
@@ -222,7 +223,11 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
     action.irReady(total);
     unsigned useful = largest ? std::min<uint64_t>(functions, total/largest) : 1;
     std::vector<int> lanes;
-    auto release = llvm::scope_exit([&] { for (int fd : lanes) close(fd); });
+    unsigned extra = 0;
+    auto release = llvm::scope_exit([&] {
+        for (int fd : lanes) close(fd);
+        if (reserve && extra) reserve(0);
+    });
     double serial = 0, overhead = 0;
     bool overhead_known = false;
     if (measured) {
@@ -237,16 +242,21 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
     // Learn both serial codegen work and split/merge overhead from completed
     // jobs in this compiler environment, rather than a source-size threshold.
     unsigned selected = dcc_codegen_parallelism(serial, overhead, useful, overhead_known);
-    while (lanes.size()+1 < selected) {
-        int fd = try_lane();
-        if (fd < 0) break;
-        lanes.push_back(fd);
+    if (reserve) {
+        if (selected > 1) extra = reserve(selected-1);
+    } else {
+        while (lanes.size()+1 < selected) {
+            int fd = try_lane();
+            if (fd < 0) break;
+            lanes.push_back(fd);
+        }
+        extra = lanes.size();
     }
     if (getenv("DISTCC_VERBOSE"))
         llvm::errs() << "distcc codegen plan: serial_ns=" << serial << " overhead_ns=" << overhead
                      << " useful=" << useful << " selected=" << selected
-                     << " available=" << lanes.size()+1 << '\n';
-    if (lanes.empty()) {
+                     << " available=" << extra+1 << '\n';
+    if (!extra) {
         auto start = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
         bool ok = emit(compiler, *module, frontend.OutputFile);
         if (ok && measured) {
@@ -258,14 +268,12 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
 
     auto prepare_start = clock_ns();
     std::vector<int> parts;
-    int symbols = -1;
     auto cleanup = llvm::scope_exit([&] {
         for (int fd : parts) close(fd);
-        if (symbols >= 0) close(symbols);
     });
     std::vector<pid_t> children;
     uint64_t prepared = 0;
-    auto names = dcc_split_module(*module, lanes.size()+1, [&](llvm::Module &part, bool last) -> llvm::Error {
+    auto names = dcc_split_module(*module, extra+1, [&](llvm::Module &part, bool last) -> llvm::Error {
         unsigned i = parts.size();
         int fd = memfd_create("distcc-codegen", MFD_CLOEXEC);
         if (fd < 0) return llvm::errorCodeToError(std::error_code(errno, std::generic_category()));
@@ -279,9 +287,11 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
         // COW snapshot as the parent prepares the next partition; no bitcode
         // serialization, temporary input file or second LLVM parser is needed.
         llvm::outs().flush(); llvm::errs().flush();
+        pid_t parent = getpid();
         pid_t child = fork();
         if (child < 0) return llvm::errorCodeToError(std::error_code(errno, std::generic_category()));
         if (!child) {
+            if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() != parent) _exit(1);
             for (unsigned j = 0; j < lanes.size(); ++j) if (j != i) close(lanes[j]);
             for (int other : parts) if (other != fd) close(other);
             bool success = emit(compiler, part, {}, fd);
@@ -300,10 +310,14 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
         ok &= result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     }
     if (!ok) return false;
+    ok = false;
+    auto remove_failed_output = llvm::scope_exit([&] {
+        if (!ok) llvm::sys::fs::remove(frontend.OutputFile);
+    });
     auto merge_start = clock_ns();
     // Internal linking owns the same CPU budget as the parts it merges. LLD's
     // hardware-thread default would otherwise oversubscribe unleased CPUs.
-    std::vector<std::string> link{DCC_LLD_PATH, "--threads=" + std::to_string(lanes.size()+1),
+    std::vector<std::string> link{DCC_LLD_PATH, "--threads=" + std::to_string(extra+1),
                                  "-r", "-o", frontend.OutputFile};
     for (int fd : parts) link.push_back(fd_path(fd));
     // LLD is already resident for local driver jobs. This compiler child owns
@@ -312,16 +326,30 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
     for (const auto &argument : link) link_args.push_back(argument.c_str());
     if (lld::lldMain(link_args, llvm::outs(), llvm::errs(),
                      {{lld::Gnu, &lld::elf::link}}).retCode) return false;
-    // Parts remain anonymous tmpfs files until the resident linker consumes
-    // them. Only the small symbol list crosses exec into llvm-objcopy.
-    symbols = memfd_create("distcc-codegen-locals", MFD_CLOEXEC);
-    if (symbols < 0) return false;
-    llvm::raw_fd_ostream list(symbols, false);
-    for (const auto &name : *names) list << name << '\n';
-    list.flush();
-    if (list.has_error()) return false;
-    if (fcntl(symbols, F_SETFD, 0) ||
-        !tool({DCC_OBJCOPY_PATH, "--localize-symbols="+fd_path(symbols), frontend.OutputFile})) return false;
+    // LLD owns output-file creation. Read its merged object before opening
+    // Clang's temporary replacement, then restore local symbols with the
+    // resident library. No symbol-list file or external objcopy is needed.
+    auto binary = llvm::object::createBinary(frontend.OutputFile);
+    if (!binary) { llvm::logAllUnhandledErrors(binary.takeError(), llvm::errs()); return false; }
+    llvm::objcopy::ConfigManager config;
+    config.Common.OutputFilename = frontend.OutputFile;
+    for (const auto &name : *names) {
+        auto matcher = llvm::objcopy::NameOrPattern::create(name, llvm::objcopy::MatchStyle::Literal,
+            [](llvm::Error error) { return error; });
+        if (auto error = config.Common.SymbolsToLocalize.addMatcher(std::move(matcher))) {
+            llvm::logAllUnhandledErrors(std::move(error), llvm::errs()); return false;
+        }
+    }
+    auto output = compiler.createOutputFile(frontend.OutputFile, true, true, true);
+    if (!output) return false;
+    auto error = llvm::objcopy::executeObjcopyOnBinary(config, *binary->getBinary(), *output);
+    output->flush();
+    ok = !error;
+    if (error) llvm::logAllUnhandledErrors(std::move(error), llvm::errs());
+    output.reset();
+    ok &= !compiler.getDiagnostics().hasErrorOccurred();
+    compiler.clearOutputFiles(!ok);
+    if (!ok) return false;
     if (measured) {
         measured->overhead_ns.fetch_add(prepared+clock_ns()-merge_start);
         measured->parts.fetch_add(parts.size());

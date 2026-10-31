@@ -25,6 +25,7 @@
 #include "cpuperf.h"
 #include "daemon.h"
 #include "tcp_job.h"
+#include "frontend_fs.h"
 #include "tcp_async.h"
 
 enum phase { PREPARING, RUNNING, RETURNING };
@@ -982,10 +983,21 @@ int dcc_tcp_server_fs_process(struct dcc_tcp_server *s, short events)
         }
         if (complete) {
             if (s->fs_query.fd_plus_one || s->fs_query.type != DCC_TCP_FS_QUERY) return -1;
-            int ret = queue(s, DCC_TCP_FS_QUERY, s->fs_query.data, s->fs_query.size);
+            int ret = 0;
+            if (s->fs_query.size >= 4 && dcc_tcp_get32(s->fs_query.data) == DCC_FS_CODEGEN) {
+                if (s->fs_query.size != 8) return -1;
+                s->fs_reply = malloc(12);
+                if (!s->fs_reply) return -1;
+                unsigned granted = s->dispatch->codegen(s, dcc_tcp_get32(s->fs_query.data + 4));
+                dcc_tcp_put32(s->fs_reply, 0); dcc_tcp_put32(s->fs_reply + 4, 4);
+                dcc_tcp_put32(s->fs_reply + 8, granted);
+                s->fs_size = 12; s->fs_sent = 0; s->fs_waiting = 2;
+            } else {
+                ret = queue(s, DCC_TCP_FS_QUERY, s->fs_query.data, s->fs_query.size);
+                s->fs_waiting = 1;
+            }
             dcc_tcp_frame_clear(&s->fs_query);
             if (ret) return -1;
-            s->fs_waiting = 1;
         }
     }
     /* EOF is normal after frontend completion. Worker completion owns status

@@ -37,7 +37,7 @@ class BrokerTestCase(DistccTestCase):
                           self.host(1, f',tcp,stats={self.stats_ports[1]}'), name='memory-refusal')
         return peer
 
-    def restart_server(self, binary, address=None, **settings):
+    def restart_server(self, binary, address=None, jobs=None, **settings):
         old = self.daemons[0]
         os.killpg(old.pid, signal.SIGTERM)
         old.wait(timeout=5)
@@ -47,6 +47,7 @@ class BrokerTestCase(DistccTestCase):
         env.update(settings)
         command = [str(binary), *old.args[1:]]
         command[command.index('--listen') + 1] = address or self.worker_address
+        if jobs is not None: command[command.index('--jobs') + 1] = str(jobs)
         replacement = subprocess.Popen(command, env=env, stdout=self.logs[0],
                                        stderr=self.logs[0], start_new_session=True)
         self.daemons[0] = replacement

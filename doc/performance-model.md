@@ -7,8 +7,8 @@ when evaluating a scheduling change.
 
 ## Observe compiler phases at their actual boundaries
 
-With local Clang codegen enabled, `DISTCC_VERBOSE` emits one JSON record prefixed
-by `distcc compiler phases:` for each completed source-to-IR action. It records
+With Clang codegen enabled locally or on a worker, `DISTCC_VERBOSE` emits one
+JSON record prefixed by `distcc compiler phases:` for each completed source-to-IR action. It records
 monotonic wall time and process CPU time, including reaped codegen children:
 
 - `frontend`: action startup, preprocessing, parsing and incremental IR generation;
@@ -22,7 +22,9 @@ IR input and failed frontend actions lack these AST boundaries and do not emit a
 complete phase record. Unfinalized instruction counts are not final module size.
 Concurrent wall intervals must not be added as elapsed build time. Preserve the
 compiler's callbacks through its `MultiplexConsumer`; do not infer phase starts
-from the first identifiable sampling-profiler symbol.
+from the first identifiable sampling-profiler symbol. Monotonic timestamps and
+PIDs belong to the emitting host and PID namespace; join them to the matching
+host's observations before comparing timelines.
 
 A fixed learned cost can represent header/setup work missing from a raw-byte
 model, but cannot identify arbitrary template or optimizer complexity. Lower
@@ -300,7 +302,7 @@ earlier. A faster invocation only shortens the build to the extent that it
 advances the completion barrier. Check both that barrier and the host-capacity
 budget before adding partitioning or speculative duplicate execution.
 
-The local codegen planner estimates serial codegen work `S` from completed
+The common codegen planner estimates serial codegen work `S` from completed
 instruction-count/CPU-time samples and per-part split/merge time `H` from
 completed splits. Its model is `T(1)=S`, and `T(k)=S/k+H*k` for `k>=2`.
 Choose the minimum, not the largest `k` that beats serial execution. For example,
@@ -313,8 +315,8 @@ This model assumes independent equal-rate lanes. SMT, changing contention and
 unequal backend work remain reasons to verify complete-build results rather
 than claiming the predicted minimum is the actual optimum.
 
-The broker therefore lends extra codegen CPUs only while independent physical
-cores remain available after existing compiler and input demand. An unused SMT
+The broker or worker daemon therefore lends extra codegen CPUs only while
+independent physical cores remain available after existing compiler and input demand. An unused SMT
 slot is still available to ordinary compilation, but does not justify `S/k`
 for optional partitioning. Declining an extra lease leaves the caller's existing
 compile running. Check this at the codegen phase: testing spare capacity before

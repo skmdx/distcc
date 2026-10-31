@@ -2,6 +2,7 @@
 #ifndef DCC_CLANG_CODEGEN_H
 #define DCC_CLANG_CODEGEN_H
 #include <optional>
+#include <functional>
 namespace clang { class CompilerInstance; }
 
 // Serial execution has no split/merge cost. Beyond two parts the model is
@@ -23,5 +24,6 @@ inline unsigned dcc_codegen_parallelism(double serial, double overhead,
 }
 
 void dcc_clang_codegen_init();
-std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &);
+std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &,
+    const std::function<unsigned(unsigned)> &reserve = {});
 #endif

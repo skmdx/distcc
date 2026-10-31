@@ -709,16 +709,25 @@ cancels the invocation, and closing the broker cache releases idle helpers.
 This evaluation path requires the selected Clang release's `clang_native`
 extension and keeps the caller's filesystem, credentials and sandbox context.
 
-`DISTCC_CLANG_CODEGEN=1` evaluates parallel code generation inside that local
-compiler path. Clang first optimizes the complete translation unit, then the
+`DISTCC_CLANG_CODEGEN=1` evaluates parallel code generation in the local and
+remote frontend paths; set it in the process that owns the compiler helper
+(the client broker or worker daemon). Clang first optimizes the complete
+translation unit, then the
 existing LLVM splitter and relocatable linker preserve ownership and local
-symbols across machine-code partitions. Additional CPUs require immediate
-broker leases; an occupied machine continues with one compiler. The helper
+symbols across machine-code partitions. Additional CPUs require an immediate
+grant from the broker or daemon; an occupied machine continues with one
+compiler. The helper
 learns serial code-generation cost and split/merge overhead from completed jobs
 in its own compiler environment. It selects the partition count with the lowest
 predicted completion time, bounded by useful parallelism and immediately
 available leases. The first parallel invocation uses two parts to measure
 overhead. LTO and other output formats retain their existing paths.
+
+Both paths share copy-on-write LLVM partitions, anonymous output buffers and
+resident LLD/LLVM object-copy libraries. Remote helpers request spare physical
+cores through their existing filesystem IPC. The daemon counts those cores and
+their memory demand until merging or cancellation finishes. Backend file reads
+serialize complete request/reply exchanges across the forked partitions.
 
 Read requests are limited to the invocation's input and include directories.
 Directory metadata is batched, file contents use the existing LZ4 transfer,

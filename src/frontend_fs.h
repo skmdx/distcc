@@ -9,6 +9,9 @@
  * file types, not permission bits; STAT carries the complete metadata. */
 #define DCC_FS_METADATA 52
 enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LIST };
+/* Compiler-to-daemon only: a requested CPU count replaces the path. Zero
+ * releases borrowed CPUs. The reply contains the granted count. */
+#define DCC_FS_CODEGEN 5
 struct dcc_job;
 /* An owned metadata prefix followed by an optional open file extent. No
  * temporary file is needed to concatenate them for the transport. */
