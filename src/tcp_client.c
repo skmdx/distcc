@@ -288,7 +288,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                            !outgoing && stream.fd < 0 && !filesystem.data && read_request == count) {
                     ret = 0; goto done;
                 } else goto done;
-                dcc_tcp_frame_clear(&incoming);
+                dcc_tcp_frame_next(&incoming);
             }
         }
         for (unsigned turn = 0; turn < 4 && (p.revents & POLLOUT) && outgoing; ++turn) {

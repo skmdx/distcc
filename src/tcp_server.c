@@ -85,12 +85,32 @@ struct dcc_tcp_server {
     struct input *copy_source;
     int fs_peer, fs_child, fs_waiting; /* descriptor + 1; one compiler lookup at a time */
     struct dcc_tcp_frame fs_query;
-    unsigned char *fs_reply;
+    const unsigned char *fs_reply; /* Borrows frame or buffer until sent. */
     size_t fs_size, fs_sent;
 };
 /* The parent event loop alone owns these. Children abandon inherited FDs. */
 static struct upload *uploads[256];
 static uint64_t retained;
+static int read_frame(int fd, struct dcc_tcp_frame *frame, size_t limit)
+{
+    size_t capacity = frame->capacity;
+    size_t available = DCC_TCP_BYTES - retained + capacity;
+    if (available > limit) available = limit;
+    int result = dcc_tcp_frame_read(fd, frame, available);
+    retained += frame->capacity - capacity;
+    return result;
+}
+static void consume_frame(struct dcc_tcp_frame *frame)
+{
+    retained -= frame->capacity;
+    dcc_tcp_frame_next(frame);
+    retained += frame->capacity;
+}
+static void free_frame(struct dcc_tcp_frame *frame)
+{
+    retained -= frame->capacity;
+    dcc_tcp_frame_clear(frame);
+}
 static uint64_t storage_pending[2];
 static uint64_t returning_bytes;
 static unsigned waiting_results;
@@ -356,8 +376,8 @@ static void close_filesystem(struct dcc_tcp_server *s)
     if (s->fs_peer) close(s->fs_peer - 1);
     if (s->fs_child) close(s->fs_child - 1);
     s->fs_peer = s->fs_child = s->fs_waiting = 0;
-    dcc_tcp_frame_clear(&s->fs_query);
-    free(s->fs_reply); s->fs_reply = NULL;
+    free_frame(&s->fs_query);
+    s->fs_reply = NULL;
     s->fs_size = s->fs_sent = 0;
 }
 static void reset_job(struct dcc_tcp_server *s)
@@ -416,8 +436,8 @@ void dcc_tcp_server_abandon(struct dcc_tcp_server *s)
     if (s->inputs) for (unsigned i = 0; i < s->job->count; ++i) free(s->inputs[i].path);
     free(s->inputs);
     dcc_job_free(s->job);
-    dcc_tcp_frame_clear(&s->frame);
-    dcc_tcp_frame_clear(&s->decoding);
+    free_frame(&s->frame);
+    free_frame(&s->decoding);
     while (s->head) {
         struct packet *p = s->head;
         s->head = p->next; free(p->data); free(p);
@@ -455,10 +475,9 @@ void dcc_tcp_server_free(struct dcc_tcp_server *s)
         free(p->data); free(p);
     }
     close(s->socket);
-    retained -= DCC_TCP_CHUNK + (s->frame.data ? s->frame.size : 0) +
-                (s->decoding.data ? s->decoding.size : 0);
-    dcc_tcp_frame_clear(&s->frame);
-    dcc_tcp_frame_clear(&s->decoding);
+    retained -= DCC_TCP_CHUNK;
+    free_frame(&s->frame);
+    free_frame(&s->decoding);
     free(s->buffer); XXH3_freeState(s->hash); free(s);
 }
 static int path_order(const void *a, const void *b)
@@ -732,8 +751,7 @@ static int finish_input(struct dcc_tcp_server *s)
 static int complete_input(struct dcc_tcp_server *s)
 {
     int ret = finish_input(s);
-    retained -= s->decoding.size;
-    dcc_tcp_frame_clear(&s->decoding);
+    consume_frame(&s->decoding);
     return ret;
 }
 static void input_complete(void *argument)
@@ -755,8 +773,9 @@ static int receive_input(struct dcc_tcp_server *s, const struct dcc_tcp_frame *f
     }
     if (index != s->input_index || length > s->job->inputs[index].plain_size - s->input_offset) return -1;
     int compressed = f->type & DCC_TCP_COMPRESSED;
+    struct dcc_tcp_frame spare = s->decoding;
     s->decoding = s->frame;
-    memset(&s->frame, 0, sizeof(s->frame));
+    s->frame = spare;
     /* RAW already points into the receive frame: avoid a thread handoff for
      * a bounded write. Offload expansion, where independent jobs can use CPUs. */
     if ((length >= 65536 && compressed) ||
@@ -969,13 +988,13 @@ int dcc_tcp_server_fs_process(struct dcc_tcp_server *s, short events)
         if (n <= 0) return -1;
         s->fs_sent += n; s->active = time(NULL);
         if (s->fs_sent == s->fs_size) {
-            free(s->fs_reply); s->fs_reply = NULL;
+            s->fs_reply = NULL;
             s->fs_size = s->fs_sent = 0;
             if (s->fs_waiting == 2) s->fs_waiting = 0;
         }
     }
     if (!s->fs_waiting && (events & POLLIN)) {
-        int complete = dcc_tcp_frame_read(s->fs_peer - 1, &s->fs_query, 65536);
+        int complete = read_frame(s->fs_peer - 1, &s->fs_query, 65536);
         if (complete < 0) {
             if (s->fs_query.used) return -1;
             close(s->fs_peer - 1); s->fs_peer = 0;
@@ -986,17 +1005,16 @@ int dcc_tcp_server_fs_process(struct dcc_tcp_server *s, short events)
             int ret = 0;
             if (s->fs_query.size >= 4 && dcc_tcp_get32(s->fs_query.data) == DCC_FS_CODEGEN) {
                 if (s->fs_query.size != 8) return -1;
-                s->fs_reply = malloc(12);
-                if (!s->fs_reply) return -1;
+                s->fs_reply = s->buffer;
                 unsigned granted = s->dispatch->codegen(s, dcc_tcp_get32(s->fs_query.data + 4));
-                dcc_tcp_put32(s->fs_reply, 0); dcc_tcp_put32(s->fs_reply + 4, 4);
-                dcc_tcp_put32(s->fs_reply + 8, granted);
+                dcc_tcp_put32(s->buffer, 0); dcc_tcp_put32(s->buffer + 4, 4);
+                dcc_tcp_put32(s->buffer + 8, granted);
                 s->fs_size = 12; s->fs_sent = 0; s->fs_waiting = 2;
             } else {
                 ret = queue(s, DCC_TCP_FS_QUERY, s->fs_query.data, s->fs_query.size);
                 s->fs_waiting = 1;
             }
-            dcc_tcp_frame_clear(&s->fs_query);
+            consume_frame(&s->fs_query);
             if (ret) return -1;
         }
     }
@@ -1058,11 +1076,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         if (events & (POLLHUP | POLLERR | POLLRDHUP)) return -1;
         if (events & POLLIN) {
             size_t before = s->frame.used;
-            int allocated = s->frame.data != NULL;
-            size_t available = DCC_TCP_BYTES - retained;
-            if (available > DCC_TCP_CHUNK + 8U) available = DCC_TCP_CHUNK + 8U;
-            int ret = dcc_tcp_frame_read(s->socket, &s->frame, available);
-            if (!allocated && s->frame.data) retained += s->frame.size;
+            int ret = read_frame(s->socket, &s->frame, DCC_TCP_CHUNK + 8U);
             input_prefetch_bytes += s->frame.used - before;
             if (s->frame.used != before) s->active = now;
             if (ret < 0) return -1;
@@ -1091,9 +1105,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
     int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
     if (!s->fs_reply && (buffered || (events & (POLLIN | POLLHUP | POLLERR)))) for (unsigned turn = 0; turn < 4; ++turn) {
         size_t before = s->frame.used;
-        int allocated = s->frame.data != NULL;
-        int ret = dcc_tcp_frame_read(s->socket, &s->frame, DCC_TCP_BYTES - retained);
-        if (!allocated && s->frame.data) retained += s->frame.size;
+        int ret = read_frame(s->socket, &s->frame, DCC_TCP_BYTES);
         if (s->frame.used != before) s->active = now;
         if (ret <= 0) {
             if (ret < 0) {
@@ -1113,15 +1125,14 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
             size_t size;
             unsigned index;
             ret = dcc_tcp_unpack(&s->frame, &index, s->buffer, &data, &size);
-            if (!ret && index == UINT_MAX && size && (s->fs_reply = malloc(size))) {
-                memcpy(s->fs_reply, data, size); s->fs_size = size; s->fs_sent = 0;
+            if (!ret && index == UINT_MAX && size) {
+                s->fs_reply = data; s->fs_size = size; s->fs_sent = 0;
                 if (s->frame.type & DCC_TCP_FINAL) s->fs_waiting = 2;
             } else ret = -1;
         }
         else ret = -1;
         if (ret == 1) break; /* The task borrows this frame until completion. */
-        retained -= s->frame.size;
-        dcc_tcp_frame_clear(&s->frame);
+        consume_frame(&s->frame);
         if (ret) {
             rs_trace("TCP frame %x rejected with %llu bytes retained", type, (unsigned long long)retained);
             return -1;

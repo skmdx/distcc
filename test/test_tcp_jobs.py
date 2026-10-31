@@ -14,6 +14,7 @@ import signal
 import stat
 import shutil
 import socket
+import base64
 import struct
 import subprocess
 import threading
@@ -508,7 +509,7 @@ class FrontendTest(BrokerTestCase):
         clang = self.start_frontend()
         source = self.work/'chunks.c'
         (self.work/'chunks.h').write_text('/*' + 'a'*(256*1024) +
-                                        random.Random(821).randbytes(256*1024+13).hex() + '*/\n')
+                                        base64.b64encode(random.Random(821).randbytes(256*1024+13)).decode() + '*/\n')
         (self.work/'empty.h').write_bytes(b'')
         source.write_text('#include "chunks.h"\n#include "empty.h"\nint main(void) { return 0; }\n')
         output = self.work/'chunks.o'

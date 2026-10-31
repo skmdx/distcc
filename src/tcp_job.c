@@ -65,6 +65,18 @@ void dcc_tcp_frame_clear(struct dcc_tcp_frame *f)
     free(f->data);
     memset(f, 0, sizeof(*f));
 }
+void dcc_tcp_frame_next(struct dcc_tcp_frame *f)
+{
+    /* Large manifests are one-off metadata, not a per-connection reservation. */
+    if (f->capacity > DCC_TCP_CHUNK + 8U) {
+        dcc_tcp_frame_clear(f);
+        return;
+    }
+    if (f->fd_plus_one) close(f->fd_plus_one - 1);
+    f->used = f->size = 0;
+    f->type = 0;
+    f->fd_plus_one = 0;
+}
 int dcc_tcp_frame_read(int fd, struct dcc_tcp_frame *f, size_t available)
 {
     for (;;) {
@@ -74,7 +86,7 @@ int dcc_tcp_frame_read(int fd, struct dcc_tcp_frame *f, size_t available)
             remaining = 8 - f->used;
             where = f->header + f->used;
         } else {
-            if (!f->data) {
+            if (f->used == 8) {
                 uint32_t kind;
                 f->type = dcc_tcp_get32(f->header);
                 f->size = dcc_tcp_get32(f->header + 4);
@@ -86,8 +98,14 @@ int dcc_tcp_frame_read(int fd, struct dcc_tcp_frame *f, size_t available)
                     ((f->type & DCC_TCP_FLAGS) && kind != DCC_TCP_INPUT &&
                      kind != DCC_TCP_OUTPUT && kind != DCC_TCP_FS_REPLY))
                     return -1;
-                f->data = malloc(f->size ? f->size : 1);
-                if (!f->data) return -1;
+                size_t needed = f->size ? f->size : 1;
+                if (needed > f->capacity) {
+                    if (needed > available) return -1;
+                    unsigned char *data = realloc(f->data, needed);
+                    if (!data) return -1;
+                    f->data = data;
+                    f->capacity = needed;
+                }
             }
             remaining = f->size - (f->used - 8);
             if (!remaining) return 1;

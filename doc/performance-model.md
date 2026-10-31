@@ -422,6 +422,11 @@ removes per-argument read syscalls in both resident helpers and the preparation
 caller, without adding buffered socket state or changing the command format.
 
 Filesystem responses retain metadata in memory and an optional open source FD.
+Receive buffers are reused within a connection and charged by allocated
+capacity. Reader and asynchronous decoder exchange exclusive buffer ownership;
+oversized manifest storage is released after consumption. Filesystem replies
+borrow the receive or decompression buffer until IPC transmission completes,
+while the existing receive backpressure protects that storage from reuse.
 The sender joins the prefix and file extent in the existing compressed chunks;
 it does not stage each response in another file or add a frame boundary.
 Mutable file bytes are read into a private chunk before sending, and premature

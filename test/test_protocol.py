@@ -125,6 +125,13 @@ class ArgumentFileTest(unittest.TestCase):
 class ProtocolTest(DistccTestCase):
     daemon_env = {'DISTCCD_PATH': os.defpath}
 
+    def test_frame_storage_and_descriptor_lifetimes(self):
+        executable = self.work/'tcp-frames'
+        subprocess.run([self.cc, '-I'+str(self.build/'src'),
+                        str(self.build/'test/tcp_frames.c'), str(self.build/'src/tcp_job.c'),
+                        '-llz4', '-o', str(executable)], check=True, capture_output=True, timeout=30)
+        subprocess.run([str(executable)], check=True, timeout=10)
+
     def setUp(self):
         super().setUp()
         self.env = dict(self.base_env, DISTCC_HOSTS=self.host(0),

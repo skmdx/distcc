@@ -26,7 +26,7 @@ enum dcc_tcp_type {
 /* The parser buffers one frame, never a whole file. */
 struct dcc_tcp_frame {
     unsigned char header[8], *data;
-    size_t used, size;
+    size_t used, size, capacity;
     uint32_t type;
     int fd_plus_one; /* Zero-initializable ownership of an optional local FD. */
 };
@@ -37,7 +37,10 @@ uint64_t dcc_tcp_get64(const void *);
 void dcc_tcp_put32(void *, uint32_t);
 void dcc_tcp_put64(void *, uint64_t);
 void dcc_tcp_frame_clear(struct dcc_tcp_frame *);
-/* 1 complete, 0 would block, -1 malformed/closed. Caller clears after use. */
+/* Consume one frame. Retain bounded payload storage until clear/destroy;
+ * payload views remain valid until the next read, unless oversized metadata. */
+void dcc_tcp_frame_next(struct dcc_tcp_frame *);
+/* 1 complete, 0 would block, -1 malformed/closed. Caller consumes after use. */
 int dcc_tcp_frame_read(int, struct dcc_tcp_frame *, size_t);
 /* Encode at most one chunk; raw input and precompressed pump blocks share
  * this framing. Returned allocation includes the complete 8-byte header. */
