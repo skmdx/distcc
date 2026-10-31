@@ -248,6 +248,13 @@ This model assumes independent equal-rate lanes. SMT, changing contention and
 unequal backend work remain reasons to verify complete-build results rather
 than claiming the predicted minimum is the actual optimum.
 
+The broker therefore lends extra codegen CPUs only while independent physical
+cores remain available after existing compiler and input demand. An unused SMT
+slot is still available to ordinary compilation, but does not justify `S/k`
+for optional partitioning. Declining an extra lease leaves the caller's existing
+compile running. Check this at the codegen phase: testing spare capacity before
+the frontend and optimizer does not establish availability when codegen begins.
+
 For local code generation, the splitter hands verified IR directly to a child
 through `fork`. Partition construction overlaps earlier children, and the last
 partition uses the caller's existing CPU lease. This removes bitcode encoding,

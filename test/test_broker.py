@@ -141,7 +141,7 @@ class BrokerDirectTest(BrokerTestCase):
     def test_completed_direct_jobs_do_not_become_external_load(self):
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
         def snapshot(running):
-            return stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+            return stats_response(cpus=4, cores=4, jobs=4, capacity=4,
                                   busy=0, queued=0, preparing=0, returning=0, running=running)
         local = self.peer(snapshot(0))
         remote = self.peer(snapshot(0), address='127.0.0.2')
@@ -277,6 +277,36 @@ class BrokerDirectTest(BrokerTestCase):
                           f' 127.0.0.2:{self.ports[1]}/2,tcp,stats={remote.port},speed=2')
         borrowed = self.request(15)
         self.assertEqual(self.receive(borrowed), (0, 1, []))
+
+    def test_codegen_borrows_independent_cores_and_reclaims_released_lease(self):
+        metrics = stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                                 busy=0, queued=0, preparing=0, returning=0, running=0)
+        local = self.peer(metrics)
+        self.start_broker(self.host(0, f',tcp,stats={local.port}', slots=4))
+        compiler = self.request(15, (1, 1024, 1))
+        self.assertEqual(self.receive(compiler), (0, 1, []))
+        borrowed = self.request(15)
+        self.assertEqual(self.receive(borrowed), (0, 1, []))
+        self.assertEqual(self.receive(self.request(15)), (0, 0, []))
+        # Declining optional parallelism must not prohibit ordinary SMT work.
+        ordinary = self.request(15, (2, 1024, 1))
+        self.assertEqual(self.receive(ordinary), (0, 1, []))
+        borrowed.close()
+        self.assertEqual(self.receive(self.request(15)), (0, 0, []))
+        ordinary.close()
+        self.assertEqual(self.receive(self.request(15)), (0, 1, []))
+
+    def test_codegen_borrow_accounts_for_external_cpu_work(self):
+        for running, load in ((2, 0), (-1, 2)):
+            with self.subTest(running=running):
+                metrics = stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                                         busy=0, queued=0, preparing=0, returning=0,
+                                         running=running, load=load)
+                local = self.peer(metrics)
+                self.start_broker(self.host(0, f',tcp,stats={local.port}', slots=4),
+                                  name=f'external-{running}')
+                self.assertEqual(self.receive(self.request(15)), (0, 0, []))
+                self.assertEqual(self.receive(self.request(15, (1, 1024, 1))), (0, 1, []))
 
     def test_preflight_leaves_a_slower_local_cpu_for_faster_remote_worker(self):
         metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,

@@ -1144,6 +1144,16 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             projected.queued = 0;
             cap = &projected;
         }
+        /* Codegen's S/k estimate assumes independent lanes. A free logical
+         * slot on an occupied SMT core does not supply that service rate;
+         * cloning/merging still costs work and delays ordinary compiles.
+         * Empty hints are optional parallelism, so declining them leaves the
+         * caller's existing compiler lease running. Normal compiles continue
+         * to use the full measured SMT capacity. */
+        if (direct && !client->hint.key && cap && cap->cores > 0 &&
+            (work >= cap->cores ||
+             (cap->running >= 0 ? cap->running : cap->load) >= cap->cores))
+            continue;
         if (p->busy < inflight || predicted) {
             /* A recovery trial uses the host's calibrated speed, not a zero
              * completion time. An uncompetitive host need not delay this job
