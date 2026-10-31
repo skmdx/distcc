@@ -34,6 +34,8 @@ struct dcc_job {
     char **fs_roots;
     /* Borrowed worker filesystem IPC, represented as fd + 1. */
     int fs_channel;
+    /* Borrowed resident compiler IPC, represented as fd + 1; never serialized. */
+    int compiler_channel;
 };
 static inline int dcc_job_file(const struct dcc_job_input *in)
 {

@@ -70,6 +70,7 @@ static int dcc_preforked_child(int listen_fd);
 #ifdef __linux__
 #include "tcp_job.h"
 #include "tcp_async.h"
+#include "clang_worker.h"
 /* Only the parent owns idle sockets. Legacy workers borrow an active socket;
  * prepared-job workers receive input metadata instead. */
 #define MAX_PENDING 256
@@ -113,8 +114,14 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
         struct worker *w = &workers[i];
         if (w->fd < 0 || w->busy) continue;
         size_t length = offsetof(struct dcc_tcp_run, root) + strlen(run->root) + 1;
-        int descriptors[2] = {fd, input};
-        if (dcc_send_fds(w->fd, run, length, descriptors, input >= 0 ? 2 : 1)) {
+        int descriptors[3] = {fd, input, -1};
+        unsigned count = input >= 0 ? 2 : 1;
+        if (description->kind == DCC_JOB_FRONTEND) {
+            descriptors[2] = dcc_clang_pool_get(description->argv[0]);
+            if (descriptors[2] < 0) return -1;
+            count = 3;
+        }
+        if (dcc_send_fds(w->fd, run, length, descriptors, count)) {
             close(w->fd); w->fd = -1; w->busy = RETIRING;
             return -1;
         }
@@ -153,6 +160,7 @@ static void finish_shutdown(void)
         if (!dcc_tcp_local_address(arg_port, &address)) unlink(address.sun_path);
     }
     dcc_tcp_server_quiesce();
+    dcc_clang_pool_shutdown();
     /* Run outside the signal handler: tree cleanup uses allocator/directory
      * routines, and must follow worker death rather than race compiler IO. */
     for (int i = 0; i < worker_count; ++i) if (workers[i].pid > 0) {
@@ -567,6 +575,7 @@ static void dcc_create_kids(int listen_fd) {
 #ifdef __linux__
             close(pair[0]);
             dcc_tcp_async_child();
+            dcc_clang_pool_abandon();
             worker_channel = pair[1];
             close(listen_fd);
             if (local_listener >= 0) { close(local_listener); local_listener = -1; }
@@ -645,21 +654,25 @@ static int dcc_preforked_child(int listen_fd)
 
 #ifdef __linux__
         struct dcc_tcp_run run;
-        int descriptors[2];
-        unsigned descriptor_count = 2;
+        int descriptors[3];
+        unsigned descriptor_count = 3;
         ssize_t request_size = dcc_recv_fds(worker_channel, &run, sizeof(run), descriptors, &descriptor_count);
         if (request_size < 0 || !descriptor_count) return 0;
         acc_fd = descriptors[0];
-        int input = descriptor_count == 2 ? descriptors[1] : -1;
+        int input = descriptor_count >= 2 ? descriptors[1] : -1;
+        int frontend = descriptor_count == 3 ? descriptors[2] : -1;
         message = run.operation;
         if (request_size > (ssize_t)offsetof(struct dcc_tcp_run, root) &&
             request_size <= (ssize_t)sizeof(run) && message == DCC_TCP_RUN &&
             run.root[request_size - offsetof(struct dcc_tcp_run, root) - 1] == 0) {
-            if (dcc_new_pgrp()) { close(acc_fd); if (input >= 0) close(input); return EXIT_IO_ERROR; }
+            if (dcc_new_pgrp()) {
+                for (unsigned i = 0; i < descriptor_count; ++i) close(descriptors[i]);
+                return EXIT_IO_ERROR;
+            }
             dcc_worker_group = 1;
             now = time(NULL);
             int retiring = ireq + 1 >= child_requests && now - start >= child_lifetime;
-            ret = dcc_tcp_worker(worker_channel, &run, acc_fd, input, retiring);
+            ret = dcc_tcp_worker(worker_channel, &run, acc_fd, input, frontend, retiring);
             if (ret || retiring) return ret;
             /* The loop must use the same lifetime snapshot as the result's
              * retiring flag. Crossing the deadline during this job must not
@@ -667,8 +680,7 @@ static int dcc_preforked_child(int listen_fd)
             continue;
         }
         if (request_size != sizeof(message) || input >= 0) {
-            close(acc_fd);
-            if (input >= 0) close(input);
+            for (unsigned i = 0; i < descriptor_count; ++i) close(descriptors[i]);
             return 0;
         }
         dcc_worker_group = 0;

@@ -68,7 +68,7 @@ class ArgumentFileTest(unittest.TestCase):
                     request = os.open(f'/proc/self/fd/{self.fd}', os.O_RDONLY)
                     with peer:
                         try:
-                            control.sendmsg([b'C'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                            control.sendmsg([struct.pack('=2I', ord('C'), 0)], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                 array.array('i', [request, peer.fileno(), source, null, null]))])
                         finally: os.close(request)
                 deadline = time.monotonic()+10
@@ -81,7 +81,7 @@ class ArgumentFileTest(unittest.TestCase):
                     time.sleep(.01)
                 if shutdown == 'terminate': process.send_signal(signal.SIGTERM)
                 elif shutdown == 'malformed':
-                    control.sendmsg([b'C'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                    control.sendmsg([struct.pack('=2I', ord('C'), 0)], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                             array.array('i', [self.fd]*6))])
                 else: control.close()
                 _, errors = process.communicate(timeout=5)
@@ -174,7 +174,12 @@ class ArgumentFileTest(unittest.TestCase):
                     cases.append(([directory, [compiler, '-cc1', '-emit-obj', '-x', 'c',
                                                str(source), '-o', str(work/'out.o')]], b'P', True))
                 cases.append((valid, b'C', True))
-                for payload, operation, success in cases:
+                # The execution worker may already have been cancelled when
+                # its queued request reaches a shared helper. A missing group
+                # fails only that invocation, then normal compilation resumes.
+                grouped_cases = [(payload, operation, success, 0) for payload, operation, success in cases]
+                grouped_cases += [(valid, b'C', False, 2**31-1), (valid, b'C', True, 0)]
+                for payload, operation, success, process_group in grouped_cases:
                     os.ftruncate(self.fd, 0); os.lseek(self.fd, 0, os.SEEK_SET)
                     if isinstance(payload, bytes): os.write(self.fd, payload)
                     else:
@@ -185,7 +190,8 @@ class ArgumentFileTest(unittest.TestCase):
                     with reply, peer:
                         reply.settimeout(15)
                         fds = [self.fd, peer.fileno(), *outputs]
-                        control.sendmsg([operation], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))])
+                        control.sendmsg([struct.pack('=2I', operation[0], process_group)],
+                                        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))])
                         response = reply.recv(24, socket.MSG_WAITALL)
                     self.assertEqual(len(response), 24)
                     status = struct.unpack_from('=Q', response)[0]

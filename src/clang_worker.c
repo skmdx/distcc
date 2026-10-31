@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,63 +21,104 @@
 #include "trace.h"
 #include "clang_worker.h"
 
-static int session = -1;
-static pid_t helper_pid = -1;
-static char *compiler;
+extern char **environ;
 
-static void close_session(void)
-{
-    if (session >= 0) close(session);
-    session = -1;
-    if (helper_pid > 0)
-        while (waitpid(helper_pid, NULL, 0) < 0 && errno == EINTR) {}
-    helper_pid = -1;
-    free(compiler); compiler = NULL;
-}
+struct frontend {
+    struct frontend *next;
+    char *compiler, *helper;
+    pid_t pid;
+    int channel;
+};
+static struct frontend *frontends;
 
-static int start_session(char **argv)
+int dcc_clang_pool_reaped(pid_t pid)
 {
-    if (helper_pid > 0 && waitpid(helper_pid, NULL, WNOHANG) == helper_pid)
-        close_session();
-    char *selected = strdup(argv[7]);
-    if (!selected) return EXIT_OUT_OF_MEMORY;
-    /* cc1 already owns language/target options. C and C++ driver spellings
-     * select the same loaded frontend, while a changed compiler replaces it. */
-    char *mode = strstr(selected, "clang++");
-    if (mode) memmove(mode + 5, mode + 7, strlen(mode + 7) + 1);
-    if (session >= 0 && !strcmp(compiler, selected)) { free(selected); return 0; }
-    close_session();
-    int pair[2];
-    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair)) {
-        free(selected); return EXIT_IO_ERROR;
+    for (struct frontend **entry = &frontends; *entry; entry = &(*entry)->next) {
+        struct frontend *f = *entry;
+        if (f->pid != pid) continue;
+        *entry = f->next;
+        close(f->channel);
+        free(f->compiler); free(f->helper); free(f);
+        return 1;
     }
-    char descriptor[32];
-    snprintf(descriptor, sizeof(descriptor), "%d", pair[1]);
-    char *command[] = {argv[0], "--worker", descriptor, argv[7], NULL};
-    int ret = fcntl(pair[1], F_SETFD, 0) ? EXIT_IO_ERROR :
-        dcc_spawn_child(command, &helper_pid, "/dev/null", NULL, NULL);
-    close(pair[1]);
-    if (ret) { close(pair[0]); free(selected); return ret; }
-    session = pair[0];
-    compiler = selected;
-    char ready;
-    ret = dcc_select_for_read(session, dcc_get_io_timeout());
-    if (!ret) ret = dcc_readx(session, &ready, 1);
-    if (ret || ready != 'R') {
-        kill(helper_pid, SIGKILL);
-        close_session();
-        return ret ? ret : EXIT_IO_ERROR;
-    }
-    rs_trace("started reusable frontend pid=%ld", (long)helper_pid);
     return 0;
 }
 
-int dcc_clang_worker(char **argv, int filesystem, int cancel,
+void dcc_clang_pool_abandon(void)
+{
+    while (frontends) dcc_clang_pool_reaped(frontends->pid);
+}
+
+void dcc_clang_pool_shutdown(void)
+{
+    for (struct frontend *f = frontends; f; f = f->next) kill(f->pid, SIGTERM);
+    while (frontends) {
+        pid_t pid = frontends->pid;
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        dcc_clang_pool_reaped(pid);
+    }
+}
+
+int dcc_clang_pool_get(const char *compiler)
+{
+    const char *helper = getenv("DISTCC_CLANG_DRIVER");
+    if (!helper || !*helper) helper = "distcc-clang";
+    char *selected = strdup(compiler);
+    if (!selected) return -1;
+    /* cc1 already owns language/target options. C and C++ driver spellings
+     * select the same loaded frontend. Different compilers remain independent. */
+    char *mode = strstr(selected, "clang++");
+    if (mode) memmove(mode + 5, mode + 7, strlen(mode + 7) + 1);
+    for (struct frontend *f = frontends; f; f = f->next) {
+        if (strcmp(f->compiler, selected) || strcmp(f->helper, helper)) continue;
+        if (waitpid(f->pid, NULL, WNOHANG) == f->pid) {
+            dcc_clang_pool_reaped(f->pid);
+            break;
+        }
+        free(selected);
+        return f->channel;
+    }
+    struct frontend *f = calloc(1, sizeof(*f));
+    if (!f) { free(selected); return -1; }
+    f->compiler = selected;
+    f->helper = strdup(helper);
+    int pair[2];
+    if (!f->helper || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair)) {
+        free(f->helper); free(selected); free(f); return -1;
+    }
+    /* The daemon has asynchronous IO threads: spawn only, never run Python
+     * or compiler library code after a fork of the daemon's address space. */
+    posix_spawn_file_actions_t actions;
+    int ret = posix_spawn_file_actions_init(&actions);
+    if (!ret) {
+        char option[] = "--worker", descriptor[] = "3";
+        char *command[] = {f->helper, option, descriptor, selected, NULL};
+        ret = posix_spawn_file_actions_adddup2(&actions, pair[1], 3);
+        if (!ret) ret = posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+        if (!ret) ret = posix_spawn_file_actions_addclosefrom_np(&actions, 4);
+        if (!ret) ret = posix_spawnp(&f->pid, helper, &actions, NULL, command, environ);
+        posix_spawn_file_actions_destroy(&actions);
+    }
+    close(pair[1]);
+    if (ret) {
+        close(pair[0]); free(f->helper); free(selected); free(f);
+        errno = ret;
+        return -1;
+    }
+    f->channel = pair[0];
+    f->next = frontends; frontends = f;
+    /* Requests queue during startup. Results use private reply sockets, so
+     * the helper's single readiness byte need not block the daemon loop. */
+    rs_trace("started reusable frontend pid=%ld", (long)f->pid);
+    return f->channel;
+}
+
+int dcc_clang_worker(int session, char **argv, int filesystem, int cancel,
                      const char *output, const char *errors,
                      int *status, unsigned long long *peak, uint64_t *cpu_ns)
 {
-    int ret = start_session(argv);
-    if (ret) return ret;
+    int ret = 0;
+    struct dcc_clang_request request = {'C', getpgrp()};
     int reply[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, reply)) return EXIT_IO_ERROR;
     int fds[] = {dcc_job_memfd("distcc-clang-command"), reply[1], filesystem,
@@ -86,7 +128,7 @@ int dcc_clang_worker(char **argv, int filesystem, int cancel,
     else {
         ret = dcc_x_argv(fds[0], "ARGC", "ARGV", argv);
         if (!ret && (lseek(fds[0], 0, SEEK_SET) < 0 ||
-                     dcc_send_fds(session, "C", 1, fds, 5))) ret = EXIT_IO_ERROR;
+                     dcc_send_fds(session, &request, sizeof(request), fds, 5))) ret = EXIT_IO_ERROR;
     }
     for (unsigned i = 0; i < 5; ++i) if (i != 2 && fds[i] >= 0) close(fds[i]);
     if (ret) goto failed;
@@ -114,16 +156,14 @@ int dcc_clang_worker(char **argv, int filesystem, int cancel,
             *status = result.status; *peak = result.peak_bytes;
             *cpu_ns = result.cpu_ns;
             close(reply[0]);
-            rs_trace("reused frontend pid=%ld status=%d peak=%llu", (long)helper_pid, *status, *peak);
+            rs_trace("reused frontend status=%d peak=%llu", *status, *peak);
             return 0;
         }
     }
 failed:
     close(reply[0]);
-    /* The helper owns per-invocation groups. Let it terminate and reap those
-     * before the daemon removes this worker group and its input tree. */
-    kill(helper_pid, SIGTERM);
-    close_session();
+    /* The compiler joined this worker's group. Never terminate the shared
+     * helper or another execution slot when cancelling this job. */
     if (dcc_worker_group) { killpg(getpgrp(), SIGKILL); _exit(ret); }
     return ret;
 }

@@ -405,7 +405,7 @@ class FrontendTest(BrokerTestCase):
         trace = Path(self.logs[0].name).read_bytes()[trace_offset:].decode()
         helpers = re.findall(r'started reusable frontend pid=(\d+)', trace)
         self.assertEqual(len(helpers), 1, trace[-6000:])
-        self.assertEqual(len(re.findall(r'reused frontend pid=', trace)), 3)
+        self.assertEqual(len(re.findall(r'reused frontend status=', trace)), 3)
         usage = re.findall(r'job cost: .* cpu=([0-9.]+)', (self.work/'broker.log').read_text())
         self.assertEqual(len(usage), 3)
         self.assertTrue(all(float(value) > 0 for value in usage))
@@ -427,6 +427,111 @@ class FrontendTest(BrokerTestCase):
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((output.read_bytes(), dependencies.read_bytes()), expected)
+
+    def test_frontend_shares_parallel_slots_and_cancels_only_owner(self):
+        clang = self.start_frontend(DISTCC_VERBOSE='1')
+        trace_offset = Path(self.logs[0].name).stat().st_size
+        sources = []
+        for i in range(2):
+            source = self.work/f'parallel-{i}.c'
+            source.write_text('int main(void) { __asm__ volatile(".rept 1000000\\nnop\\n.endr\\n"); '
+                              f'return VALUE != {i}; }}\n')
+            sources.append(source)
+        def command(i):
+            return [str(self.build/'distcc'), clang, '-O2', f'-DVALUE={i}', '-c',
+                    str(sources[i]), '-o', str(sources[i].with_suffix('.o'))]
+        # Load the frontend once, then hold two actual compiler invocations to
+        # prove concurrent use of distinct execution slots and the same helper.
+        warm = subprocess.run(command(0), env=self.env, capture_output=True, timeout=30)
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+        trace = Path(self.logs[0].name).read_bytes()[trace_offset:].decode()
+        helpers = re.findall(r'started reusable frontend pid=(\d+)', trace)
+        self.assertEqual(len(helpers), 1, trace[-6000:])
+        helper = int(helpers[0])
+        held, clients = [], []
+        def children():
+            return [int(value) for value in Path(f'/proc/{helper}/task/{helper}/children').read_text().split()]
+        try:
+            for i in range(2):
+                process = subprocess.Popen(command(i), env=self.env, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.PIPE)
+                clients.append(process)
+                deadline = time.monotonic()+10
+                while True:
+                    active = set(children())-set(held)
+                    if active:
+                        self.assertEqual(len(active), 1)
+                        child = active.pop()
+                        os.kill(child, signal.SIGSTOP)
+                        held.append(child)
+                        break
+                    self.assertIsNone(process.poll())
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.001)
+            groups = [os.getpgid(pid) for pid in held]
+            self.assertEqual(len(set(groups)), 2)
+            daemon_children = Path(f'/proc/{self.daemons[0].pid}/task/{self.daemons[0].pid}/children').read_text().split()
+            self.assertTrue(all(str(group) in daemon_children for group in groups), groups)
+            clients[0].kill(); clients[0].wait(timeout=5)
+            deadline = time.monotonic()+5
+            while held[0] in children():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            self.assertIn(held[1], children())
+            self.assertEqual(os.getpgid(held[1]), groups[1])
+            os.kill(held[1], signal.SIGCONT)
+            _, errors = clients[1].communicate(timeout=30)
+            self.assertEqual(clients[1].returncode, 0, errors)
+            self.assertIn(b'frontend filesystem:', errors)
+            binary = self.work/'parallel-result'
+            subprocess.run([clang, str(sources[1].with_suffix('.o')), '-o', str(binary)], check=True, capture_output=True)
+            subprocess.run([str(binary)], check=True)
+            trace = Path(self.logs[0].name).read_bytes()[trace_offset:].decode()
+            self.assertEqual(len(re.findall(r'started reusable frontend pid=', trace)), 1, trace[-6000:])
+            # Stop another real invocation before shutting down its daemon.
+            # The helper must reap it before the input tree is reclaimed.
+            active_client = subprocess.Popen(command(0), env=self.env, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.PIPE)
+            clients.append(active_client)
+            deadline = time.monotonic()+10
+            while not (active := children()):
+                self.assertIsNone(active_client.poll())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.001)
+            self.assertEqual(len(active), 1)
+            os.kill(active[0], signal.SIGSTOP)
+            held.append(active[0])
+            self.restart_server(self.build/'distccd')
+            self.assertFalse(Path(f'/proc/{helper}').exists())
+            self.assertFalse(Path(f'/proc/{active[0]}').exists())
+            # The client may retry after a daemon restart. Its cleanup below
+            # cancels that retry after server-side reclamation was observed.
+        finally:
+            for pid in held:
+                try: os.kill(pid, signal.SIGCONT)
+                except ProcessLookupError: pass
+            for process in clients:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
+    def test_frontend_keeps_requested_compilers_in_separate_helpers(self):
+        alternate = shutil.which('clang-22')
+        if not alternate: self.skipTest('Alternate LLVM release unavailable')
+        clang = self.start_frontend(DISTCC_VERBOSE='1')
+        trace_offset = Path(self.logs[0].name).stat().st_size
+        source, output = self.work/'release.c', self.work/'release.o'
+        source.write_text('int release(void) { return __clang_major__; }\n')
+        for compiler in (clang, alternate, clang):
+            command = [compiler, '-O2', '-c', str(source), '-o', str(output)]
+            subprocess.run(command, check=True, capture_output=True)
+            expected = output.read_bytes()
+            result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                    capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b'frontend filesystem:', result.stderr)
+            self.assertEqual(output.read_bytes(), expected)
+        trace = Path(self.logs[0].name).read_bytes()[trace_offset:].decode()
+        self.assertEqual(len(re.findall(r'started reusable frontend pid=', trace)), 2, trace[-6000:])
 
     def test_remote_frontend_owns_preprocessing_and_dependency_output(self):
         clang = self.start_frontend()
@@ -913,8 +1018,7 @@ static void gate(const char *kind) {
     dprintf(fd, "%ld %ld", (long)getpid(), (long)syscall(SYS_gettid)); close(fd);
     for (int i = 0; i < 1000 && access(getenv("TEST_FILE_RELEASE"), F_OK); ++i) usleep(10000);
 }
-ssize_t read(int fd, void *data, size_t size) {
-    ssize_t (*real_read)(int, void *, size_t) = dlsym(RTLD_NEXT, "read");
+static void cache_input(int fd) {
     char link[64], path[4096];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
     ssize_t n = readlink(link, path, sizeof(path)-1);
@@ -924,6 +1028,10 @@ ssize_t read(int fd, void *data, size_t size) {
         if (cache && *cache && !strncmp(path, cache, strlen(cache)) && path[strlen(cache)] == '/')
             gate("cache");
     }
+}
+ssize_t read(int fd, void *data, size_t size) {
+    ssize_t (*real_read)(int, void *, size_t) = dlsym(RTLD_NEXT, "read");
+    cache_input(fd);
     return real_read(fd, data, size);
 }
 int unlinkat(int fd, const char *path, int flags) {
@@ -934,7 +1042,11 @@ int unlinkat(int fd, const char *path, int flags) {
 int ioctl(int fd, unsigned long request, ...) {
     va_list args; va_start(args, request);
     unsigned long argument;
-    if (request == FICLONE) { argument = va_arg(args, int); gate("copy"); gate("store"); }
+    if (request == FICLONE) {
+        argument = va_arg(args, int);
+        /* Reflink filesystems can satisfy cache hits without any read(). */
+        cache_input(argument); gate("copy"); gate("store");
+    }
     else argument = (unsigned long)va_arg(args, void *);
     va_end(args);
     return syscall(SYS_ioctl, fd, request, argument);

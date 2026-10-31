@@ -429,9 +429,14 @@ The same reply reports exit status, peak RSS and descendant CPU time on both
 paths. Read signal notifications through the event loop and drain completed
 children with `wait4(-1, WNOHANG)` after each event batch. Work scales with received
 events and completions instead of their product with the live child count.
-Client closure cancels that invocation; control closure or helper termination
-reaps all owned groups before returning. Remote daemon cancellation must allow
-this cleanup before removing its own worker group and input tree. Validate
+The daemon owns one lazy helper per selected compiler, shared by all execution
+slots. Spawn it without forking daemon library state; requests can queue during
+startup, so loading libraries never blocks the daemon event loop. Compiler
+children join the requesting execution worker's process group. Client closure
+cancels only that group; helper shutdown reaps all its invocations before the
+daemon removes their trees. Helper exits do not consume execution slots, and
+replacement workers close inherited helper channels without terminating them.
+Local invocations retain independent groups. Validate
 out-of-order exits, malformed commands, active shutdown and per-job accounting
 through real compiler requests, then measure fork/dispatch overhead separately
 from compilation and complete-build time.

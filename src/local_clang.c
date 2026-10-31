@@ -101,7 +101,8 @@ static int request(char **argv, char operation, int output, int *status, uint64_
     if (dcc_x_argv(input, "ARGC", "ARGV", directory) ||
         dcc_x_argv(input, "ARGC", "ARGV", argv) || lseek(input, 0, SEEK_SET) < 0) goto out;
     int fds[] = {input, pair[1], 0, 1, 2};
-    if (dcc_send_fds(worker, &operation, 1, fds, 5)) goto out;
+    struct dcc_clang_request request = {operation, 0};
+    if (dcc_send_fds(worker, &request, sizeof(request), fds, 5)) goto out;
     close(pair[1]); pair[1] = -1;
     struct dcc_clang_result result;
     ssize_t length;

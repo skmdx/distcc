@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <map>
 
@@ -35,7 +36,8 @@ bool child_descriptors(int *fds) {
 
 int dcc_native_worker(int control, int (*execute)(int, bool)) {
     int events = -1, signals = -1;
-    std::map<pid_t, int> jobs;
+    struct job { int peer; pid_t group; };
+    std::map<pid_t, job> jobs;
     sigset_t blocked, previous_mask;
     sigemptyset(&blocked);
     sigaddset(&blocked, SIGCHLD);
@@ -47,8 +49,8 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
     sigemptyset(&action.sa_mask);
     bool installed = !sigaction(SIGCHLD, &action, &previous_action);
     auto cleanup = llvm::scope_exit([&] {
-        for (auto [pid, peer] : jobs) { kill(-pid, SIGKILL); close(peer); }
-        for (auto [pid, peer] : jobs)
+        for (auto [pid, run] : jobs) { kill(-run.group, SIGKILL); close(run.peer); }
+        for (auto [pid, run] : jobs)
             while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
         close(control);
         if (signals >= 0) close(signals);
@@ -77,10 +79,10 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                 while (read(signals, &signal, sizeof(signal)) > 0)
                     if (signal.ssi_signo != SIGCHLD) return 128+signal.ssi_signo;
             } else if (id == 0) {
-                char operation;
+                dcc_clang_request request;
                 int fds[5], received = 0;
                 alignas(cmsghdr) char ancillary[CMSG_SPACE(sizeof(fds))];
-                iovec bytes{&operation, 1};
+                iovec bytes{&request, sizeof(request)};
                 msghdr message{};
                 message.msg_iov = &bytes; message.msg_iovlen = 1;
                 message.msg_control = ancillary; message.msg_controllen = sizeof(ancillary);
@@ -100,8 +102,8 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                     for (int n = 0; n != received; ++n) if (fds[n] >= 0) close(fds[n]);
                 });
                 if (!length) return 0;
-                if (length != 1 || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) || received != 5 ||
-                    (operation != 'C' && operation != 'P')) return 1;
+                if (length != sizeof(request) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) || received != 5 ||
+                    (request.operation != 'C' && request.operation != 'P') || request.group > INT_MAX) return 1;
                 llvm::outs().flush(); llvm::errs().flush();
                 pid_t parent = getpid(), pid = fork();
                 if (pid < 0) return 1;
@@ -109,21 +111,26 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                     // No Python API or at-fork interpreter work occurs in the
                     // compiler child. Its lifetime ends through _exit only.
                     if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() != parent ||
-                        setpgid(0, 0) || sigprocmask(SIG_SETMASK, &previous_mask, nullptr) ||
+                        setpgid(0, request.group) || sigprocmask(SIG_SETMASK, &previous_mask, nullptr) ||
                         sigaction(SIGINT, &action, nullptr) ||
                         !child_descriptors(fds)) _exit(1);
-                    int status = execute(3, operation == 'P');
+                    int status = execute(3, request.operation == 'P');
                     llvm::outs().flush(); llvm::errs().flush();
                     _exit(status >= 0 ? status : 128-status);
                 }
-                jobs.emplace(pid, fds[1]);
+                pid_t group = request.group ? pid_t(request.group) : pid;
+                jobs.emplace(pid, job{fds[1], group});
                 fds[1] = -1;
-                if ((setpgid(pid, pid) && errno != ESRCH) || !watch(jobs.at(pid), uint64_t(pid)+2)) return 1;
+                // Cancellation can remove the execution worker's group while
+                // this request is queued. Contain that failure to its child;
+                // it must not terminate the other users of this frontend.
+                if (setpgid(pid, group) && errno != ESRCH) kill(pid, SIGKILL);
+                if (!watch(jobs.at(pid).peer, uint64_t(pid)+2)) return 1;
             } else {
                 auto found = jobs.find(id-2);
                 if (found != jobs.end()) {
-                    kill(-found->first, SIGKILL);
-                    epoll_ctl(events, EPOLL_CTL_DEL, found->second, nullptr);
+                    kill(-found->second.group, SIGKILL);
+                    epoll_ctl(events, EPOLL_CTL_DEL, found->second.peer, nullptr);
                 }
             }
         }
@@ -140,7 +147,7 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
             uint64_t cpu = uint64_t(usage.ru_utime.tv_sec+usage.ru_stime.tv_sec)*1000000000 +
                 uint64_t(usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)*1000;
             dcc_clang_result reply{uint64_t(status), uint64_t(usage.ru_maxrss)*1024, cpu};
-            int peer = found->second;
+            int peer = found->second.peer;
             epoll_ctl(events, EPOLL_CTL_DEL, peer, nullptr);
             send(peer, &reply, sizeof(reply), MSG_NOSIGNAL);
             close(peer);

@@ -71,6 +71,7 @@
 #include "daemon.h"
 #include "netutil.h"
 #include "zeroconf.h"
+#include "clang_worker.h"
 #ifdef HAVE_GSSAPI
 #include "auth.h"
 #endif
@@ -212,6 +213,13 @@ void dcc_reap_kids(int must_reap)
             break;
         } else if (kid != -1) {
             /* child exited */
+#ifdef __linux__
+            if (dcc_clang_pool_reaped(kid)) {
+                dcc_log_child_exited(kid, status);
+                must_reap = FALSE;
+                continue;
+            }
+#endif
             --dcc_nkids;
 #ifdef __linux__
             dcc_prefork_reaped(kid);

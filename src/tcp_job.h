@@ -60,7 +60,7 @@ struct dcc_tcp_finished {
     uint32_t error, retiring, status, mode, present;
     uint64_t size[DCC_JOB_RESULT_COUNT];
 };
-int dcc_tcp_worker(int, const struct dcc_tcp_run *, int, int, int);
+int dcc_tcp_worker(int, const struct dcc_tcp_run *, int, int, int, int);
 
 struct dcc_tcp_server;
 struct dcc_tcp_dispatch {

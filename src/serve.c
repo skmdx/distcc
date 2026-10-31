@@ -1091,7 +1091,7 @@ static int dcc_run_job(int in_fd,
     }
 
     if (job && job->kind == DCC_JOB_FRONTEND) {
-        if (!job->fs_channel || !job->argv[1]) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
+        if (!job->fs_channel || !job->compiler_channel || !job->argv[1]) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
         orig_input = strdup(job->argv[1]);
         if (!orig_input) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
         if ((ret = dcc_make_tmpnam("distccd", ".o", &temp_o))) goto out_cleanup;
@@ -1107,7 +1107,7 @@ static int dcc_run_job(int in_fd,
             argv[i] = strdup(i < 7 ? prefix[i] : job->argv[i - 7]);
             if (!argv[i]) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
         }
-        if ((ret = dcc_clang_worker(argv, job->fs_channel - 1, in_fd,
+        if ((ret = dcc_clang_worker(job->compiler_channel - 1, argv, job->fs_channel - 1, in_fd,
                                     out_fname, err_fname, &status, &result->peak_bytes, &result->cpu_ns)))
             goto out_cleanup;
         result->status = status;

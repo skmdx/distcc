@@ -10,7 +10,7 @@
 #include "exitcode.h"
 #include "tcp_job.h"
 
-int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int input, int retiring)
+int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int input, int frontend, int retiring)
 {
     struct dcc_job *job = NULL;
     struct dcc_job_result result;
@@ -24,12 +24,15 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
     if (setting && !saved_tmp) finished.error = EXIT_OUT_OF_MEMORY;
     else if (!memchr(run->root, 0, sizeof(run->root)) || run->root[0] != '/' ||
         dcc_job_decode(metadata, 0, &job)) finished.error = EXIT_PROTOCOL_ERROR;
+    else if (job->kind == DCC_JOB_FRONTEND ? (input < 0 || frontend < 0) : frontend >= 0)
+        finished.error = EXIT_PROTOCOL_ERROR;
     else if (setenv("TMPDIR", run->root, 1)) finished.error = EXIT_OUT_OF_MEMORY;
     else {
         changed_tmp = 1;
         if (input >= 0) {
             if (job->kind == DCC_JOB_FRONTEND) {
                 job->fs_channel = input + 1;
+                job->compiler_channel = frontend + 1;
             } else {
             char target[64], path[PATH_MAX];
             snprintf(target, sizeof(target), "/proc/self/fd/%d", input);
@@ -47,6 +50,7 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
         if (!finished.error) finished.error = dcc_execute_job(job, run->root, channel, &result);
     }
     if (input >= 0) close(input);
+    if (frontend >= 0) close(frontend);
     close(metadata);
     dcc_job_free(job);
     dcc_cleanup_tempfiles();
