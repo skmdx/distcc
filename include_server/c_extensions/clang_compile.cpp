@@ -12,12 +12,14 @@
 #include "../../src/clang_inputs.h"
 #include "remote_files.h"
 #include "clang_compiler.h"
+#include "compiler_command.h"
 #ifdef DCC_CLANG_COMPILE_MODULE
 #include "clang_codegen.h"
 #endif
 
 namespace {
 const dcc_file_cache_api *file_cache;
+const dcc_argv_file_api *command_api;
 // The driver sees the existing worker paths. Only the frontend uses the
 // client's main-file identity, including quoted-include lookup from its parent.
 // File contents and metadata remain owned by the physical filesystem.
@@ -145,28 +147,20 @@ PyObject *dcc_clang_compile(PyObject *, PyObject *arguments) {
     return PyLong_FromLong(ok ? 0 : 1);
 }
 
-static PyObject *compile_remote(PyObject *, PyObject *arguments) {
-    PyObject *argv;
-    int fd;
-    const char *cwd, *output, *dependencies, *root;
-    if (!PyArg_ParseTuple(arguments, "Oissss", &argv, &fd, &cwd, &output, &dependencies, &root)) return nullptr;
-    PyObject *sequence = PySequence_Tuple(argv);
-    if (!sequence) return nullptr;
-    auto release = llvm::scope_exit([&] { Py_DECREF(sequence); });
-    std::vector<const char *> args;
-    if (PySequence_Fast_GET_SIZE(sequence) < 4) {
-        return PyErr_Format(PyExc_ValueError, "missing remote frontend invocation");
-    }
-    const char *client_identity = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, 2));
-    if (!client_identity) return nullptr;
-    args.reserve(PySequence_Fast_GET_SIZE(sequence)-3);
-    for (Py_ssize_t i = 3; i < PySequence_Fast_GET_SIZE(sequence); ++i) {
-        const char *value = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, i));
-        if (!value) return nullptr;
-        args.push_back(value);
-    }
-    // The sequence retains immutable strings until compilation returns. Borrow
-    // their UTF-8 storage instead of copying every captured cc1 argument.
+static PyObject *compile_file(PyObject *, PyObject *arguments) {
+    int request, fd;
+    if (!PyArg_ParseTuple(arguments, "ii", &request, &fd)) return nullptr;
+    CompilerCommand command(*command_api);
+    if (!command.read(request, 1)) return nullptr;
+    llvm::SmallVector<const char *> argv;
+    for (char **p = command[0]; *p; ++p) argv.push_back(*p);
+    if (argv.size() < 11 || llvm::StringRef(argv[4]) != "remote")
+        return PyErr_Format(PyExc_ValueError, "invalid remote compiler command");
+    const char *root = argv[1], *output = argv[2], *cwd = argv[3],
+               *dependencies = argv[6], *client_identity = argv[9];
+    if (setenv("TMPDIR", root, 1)) return PyErr_SetFromErrno(PyExc_OSError);
+    auto args = llvm::ArrayRef(argv).drop_front(10);
+    // Arguments borrow the decoded command file, owned until compilation ends.
     bool ok = false;
     Py_BEGIN_ALLOW_THREADS
     auto invocation = std::make_shared<clang::CompilerInvocation>();
@@ -204,12 +198,14 @@ static PyObject *compile_remote(PyObject *, PyObject *arguments) {
 namespace {
 PyMethodDef methods[] = {
     {"compile", dcc_clang_compile, METH_VARARGS, "Compile with the client's source identity."},
-    {"compile_remote", compile_remote, METH_VARARGS, "Compile using client filesystem lookups."},
+    {"compile_file", compile_file, METH_VARARGS, "Consume a remote command file and filesystem channel."},
     {nullptr, nullptr, 0, nullptr}};
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_compile", nullptr, -1,
                       methods, nullptr, nullptr, nullptr, nullptr};
 }
 PyMODINIT_FUNC PyInit_clang_compile() {
+    command_api = CompilerCommand::load();
+    if (!command_api) return nullptr;
     PyObject *cache_module = PyImport_ImportModule("include_server.distcc_pump_c_extensions");
     if (!cache_module) return nullptr;
     PyObject *capsule = PyObject_GetAttrString(cache_module, "file_cache");

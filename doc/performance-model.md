@@ -376,11 +376,13 @@ working directory and descriptors; the compiler's driver owns argument
 interpretation and input roots. Preparation reuses its consumed command memfd
 for the response. This avoids loading LLVM into every remote-preparation client
 without introducing another daemon or serializing compiler invocations.
-Resident parents dispatch descriptors; their isolated children decode and own
-command data. This keeps request preparation off the shared acceptance loop and
-contains malformed commands within the failed invocation. Borrow immutable
-argument storage across the native call, retaining its Python owner until the
-compiler returns, and resolve static service tables before forking.
+Resident parents dispatch descriptors; their isolated native children decode and
+own command data through the same codec as the C client. Lend strings in the
+received allocation directly to the driver or frontend, without
+per-argument allocations or Python string conversions. Preparation writes the
+captured command directly into the consumed request file. This keeps request
+preparation off the shared acceptance loop and contains malformed commands within
+the failed invocation. Resolve static service tables before forking.
 Measure that reduction separately from placement: fewer loader CPU samples do
 not establish an earlier build completion when different long jobs own the tail.
 

@@ -20,12 +20,14 @@
 #include <functional>
 #include "clang_codegen.h"
 #include "clang_compiler.h"
+#include "compiler_command.h"
 
 LLD_HAS_DRIVER(elf)
 
 extern "C" int dcc_clang_frontend(char **, char ***, char ***);
 
 namespace {
+const dcc_argv_file_api *command_api;
 int isolated(const std::function<int()> &run) {
     llvm::outs().flush(); llvm::errs().flush();
     pid_t child = fork();
@@ -58,18 +60,8 @@ public:
     }
 };
 
-PyObject *run(PyObject *, PyObject *input) {
-    PyObject *sequence = PySequence_Tuple(input);
-    if (!sequence) return nullptr;
-    llvm::SmallVector<const char *> args;
-    for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE(sequence); ++i) {
-        auto value = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, i));
-        if (!value) { Py_DECREF(sequence); return nullptr; }
-        args.push_back(value);
-    }
-    if (args.empty()) { Py_DECREF(sequence); return PyErr_Format(PyExc_ValueError, "empty compiler command"); }
+int run(llvm::ArrayRef<const char *> args) {
     int status = 1;
-    Py_BEGIN_ALLOW_THREADS
     {
         clang::DiagnosticOptions options;
         auto diagnostics = clang::CompilerInstance::createDiagnostics(*llvm::vfs::getRealFileSystem(), options);
@@ -116,23 +108,9 @@ PyObject *run(PyObject *, PyObject *input) {
         }
         llvm::outs().flush(); llvm::errs().flush();
     }
-    Py_END_ALLOW_THREADS
-    Py_DECREF(sequence);
-    if (PyErr_CheckSignals() < 0) return nullptr;
-    return PyLong_FromLong(status);
+    return status;
 }
-PyObject *prepare(PyObject *, PyObject *input) {
-    PyObject *sequence = PySequence_Tuple(input);
-    if (!sequence) return nullptr;
-    auto release = llvm::scope_exit([&] { Py_DECREF(sequence); });
-    std::vector<char *> args;
-    for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE(sequence); ++i) {
-        const char *value = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, i));
-        if (!value) return nullptr;
-        args.push_back(const_cast<char *>(value));
-    }
-    if (args.empty()) return PyErr_Format(PyExc_ValueError, "empty compiler command");
-    args.push_back(nullptr);
+int prepare(int fd, char **args) {
     char **command = nullptr, **roots = nullptr;
     auto cleanup = llvm::scope_exit([&] {
         for (auto values : {command, roots}) {
@@ -140,35 +118,39 @@ PyObject *prepare(PyObject *, PyObject *input) {
             free(values);
         }
     });
+    if (dcc_clang_frontend(args, &command, &roots)) return 1;
+    // The complete input is now owned in memory. Reuse its file for the reply.
+    if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) return 1;
+    return command_api->write(fd, "ARGC", "ARGV", command) ||
+           command_api->write(fd, "ARGC", "ARGV", roots);
+}
+PyObject *execute(PyObject *, PyObject *input) {
+    int fd, preparing;
+    if (!PyArg_ParseTuple(input, "ip", &fd, &preparing)) return nullptr;
+    CompilerCommand command(*command_api);
+    if (!command.read(fd, 2)) return nullptr;
+    char **directory = command[0], **argv = command[1];
+    if (!directory[0] || !directory[1] || directory[2] || !argv[0])
+        return PyErr_Format(PyExc_ValueError, "invalid local compiler command");
+    if (chdir(directory[0])) return PyErr_SetFromErrno(PyExc_OSError);
+    argv[0] = directory[1];
+    llvm::SmallVector<const char *> args;
+    if (!preparing) for (char **p = argv; *p; ++p) args.push_back(*p);
     int status;
     Py_BEGIN_ALLOW_THREADS
-    status = dcc_clang_frontend(args.data(), &command, &roots);
+    status = preparing ? prepare(fd, argv) : run(args);
     Py_END_ALLOW_THREADS
-    if (status) Py_RETURN_NONE;
-    PyObject *result = PyTuple_New(2);
-    if (!result) return nullptr;
-    unsigned index = 0;
-    for (auto values : {command, roots}) {
-        unsigned length = 0;
-        while (values[length]) ++length;
-        PyObject *list = PyList_New(length);
-        if (!list) { Py_DECREF(result); return nullptr; }
-        PyTuple_SET_ITEM(result, index++, list);
-        for (unsigned i = 0; i < length; ++i) {
-            PyObject *value = PyUnicode_DecodeFSDefault(values[i]);
-            if (!value) { Py_DECREF(result); return nullptr; }
-            PyList_SET_ITEM(list, i, value);
-        }
-    }
-    return result;
+    if (PyErr_CheckSignals() < 0) return nullptr;
+    return PyLong_FromLong(status);
 }
 PyMethodDef methods[] = {
-    {"run", run, METH_O, "Run the compiler's own driver and jobs."},
-    {"prepare", prepare, METH_O, "Capture the compiler's frontend command and input roots."},
+    {"execute", execute, METH_VARARGS, "Consume a command file for execution or frontend preparation."},
     {nullptr, nullptr, 0, nullptr}};
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_native", nullptr, -1, methods, nullptr, nullptr, nullptr, nullptr};
 }
 PyMODINIT_FUNC PyInit_clang_native() {
+    command_api = CompilerCommand::load();
+    if (!command_api) return nullptr;
     dcc_clang_codegen_init();
     llvm::InitializeAllTargetInfos(); llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs(); llvm::InitializeAllAsmParsers(); llvm::InitializeAllAsmPrinters();

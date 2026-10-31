@@ -40,12 +40,18 @@ def compile_command(arguments, frontend=None):
     if frontend is None:
         frontend = load_frontend(command[0])
     if mode == 'remote':
-        return frontend.compile_remote(command, int(descriptor), cwd, original, dependencies, root)
+        from include_server import distcc_pump_c_extensions as protocol
+        request = os.memfd_create('distcc-clang-command')
+        try:
+            protocol.XArgv(request, ['distcc-clang', *arguments])
+            os.lseek(request, 0, os.SEEK_SET)
+            return frontend.compile_file(request, int(descriptor))
+        finally:
+            os.close(request)
     return frontend.compile(command, original, root, cwd, mode == 'pump')
 
 
 def worker(descriptor, compiler):
-    from include_server import distcc_pump_c_extensions as protocol
     frontend = load_frontend(compiler)
     with socket.socket(fileno=int(descriptor)) as channel:
         while True:
@@ -69,14 +75,9 @@ def worker(descriptor, compiler):
                         os.dup2(fds[2], 1); os.dup2(fds[3], 2)
                         os.close(fds[2]); os.close(fds[3])
                         try:
-                            arguments, = protocol.RArgvFile(fds[0], 1)
+                            status = frontend.compile_file(fds[0], fds[1])
                         finally:
                             os.close(fds[0])
-                        if len(arguments) < 8 or arguments[4] != 'remote':
-                            raise ValueError('invalid remote compiler command')
-                        arguments[5] = str(fds[1])
-                        os.environ['TMPDIR'] = arguments[1]
-                        status = compile_command(arguments[1:], frontend)
                     except BaseException:
                         traceback.print_exc()
                     sys.stdout.flush(); sys.stderr.flush()

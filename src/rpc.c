@@ -46,6 +46,7 @@
 #include "trace.h"
 #include "exitcode.h"
 #include "rpc.h"
+#include "argv_file.h"
 #include "snprintf.h"
 
 
@@ -396,45 +397,75 @@ int dcc_r_argv_body(int ifd, const char *argv_token, unsigned argc, char ***argv
 /* Compiler commands are complete files handed off before the receiver runs.
  * Read the remaining extent once and decode all groups with the same token
  * parser as the stream protocol. No persistent buffering or socket read-ahead.
- * Every output is independently owned and released with dcc_free_argv(). */
-int dcc_r_argv_file(int fd, unsigned groups, char ***output)
+ * Strings stay at their received offsets. Their terminator may overwrite the
+ * next token's first byte, so write it only after decoding that token. */
+int dcc_argv_file_read(int fd, unsigned groups, struct dcc_argv_file *file)
 {
     struct stat info;
     off_t offset = lseek(fd, 0, SEEK_CUR);
-    for (unsigned g = 0; g < groups; ++g) output[g] = NULL;
+    memset(file, 0, sizeof(*file));
     if (offset < 0 || fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size < offset)
         return EXIT_IO_ERROR;
     uintmax_t extent = info.st_size-offset;
-    if (extent > SIZE_MAX) return EXIT_OUT_OF_MEMORY;
+    if (extent >= SIZE_MAX) return EXIT_OUT_OF_MEMORY;
     size_t size = extent, cursor = 0;
     if (!groups || groups > size/12) return EXIT_PROTOCOL_ERROR;
-    char *bytes = malloc(size);
+    char *bytes = malloc(size+1), *terminator = NULL;
     if (!bytes) return EXIT_OUT_OF_MEMORY;
+    file->bytes = bytes;
+    file->groups = calloc(groups, sizeof(*file->groups));
+    if (!file->groups) { dcc_argv_file_close(file); return EXIT_OUT_OF_MEMORY; }
+    file->count = groups;
     int ret = dcc_readx(fd, bytes, size);
     if (ret) goto out;
     ret = EXIT_PROTOCOL_ERROR;
     for (unsigned g = 0; g < groups; ++g) {
         unsigned argc;
         if (size-cursor < 12 || parse_token_int(bytes+cursor, "ARGC", &argc)) goto out;
+        if (terminator) { *terminator = '\0'; terminator = NULL; }
         cursor += 12;
         if (argc > (size-cursor)/12) goto out;
-        char **argv = output[g] = calloc((size_t)argc+1, sizeof(*argv));
+        char **argv = file->groups[g] = calloc((size_t)argc+1, sizeof(*argv));
         if (!argv) { ret = EXIT_OUT_OF_MEMORY; goto out; }
         for (unsigned a = 0; a < argc; ++a) {
             unsigned length;
             if (size-cursor < 12 || parse_token_int(bytes+cursor, "ARGV", &length)) goto out;
+            if (terminator) *terminator = '\0';
             cursor += 12;
             if (length > size-cursor || (uintmax_t)length+1 > SIZE_MAX) goto out;
-            argv[a] = malloc((size_t)length+1);
-            if (!argv[a]) { ret = EXIT_OUT_OF_MEMORY; goto out; }
-            memcpy(argv[a], bytes+cursor, length);
-            argv[a][length] = '\0';
+            argv[a] = bytes+cursor;
             cursor += length;
+            terminator = bytes+cursor;
         }
     }
-    if (cursor == size) ret = 0;
+    if (cursor == size) {
+        if (terminator) *terminator = '\0';
+        ret = 0;
+    }
 out:
-    free(bytes);
+    if (ret) dcc_argv_file_close(file);
+    return ret;
+}
+
+void dcc_argv_file_close(struct dcc_argv_file *file)
+{
+    for (unsigned g = 0; g < file->count; ++g) free(file->groups[g]);
+    free(file->groups);
+    free(file->bytes);
+    memset(file, 0, sizeof(*file));
+}
+
+/* C callers that modify vectors retain independently owned strings. */
+int dcc_r_argv_file(int fd, unsigned groups, char ***output)
+{
+    struct dcc_argv_file file;
+    for (unsigned g = 0; g < groups; ++g) output[g] = NULL;
+    int ret = dcc_argv_file_read(fd, groups, &file);
+    if (!ret) for (unsigned g = 0; g < groups; ++g) {
+        ret = dcc_copy_argv(file.groups[g], &output[g], 0);
+        if (ret) break;
+    }
+    dcc_argv_file_close(&file);
     if (ret) for (unsigned g = 0; g < groups; ++g) {
         if (output[g]) dcc_free_argv(output[g]);
         output[g] = NULL;

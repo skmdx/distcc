@@ -41,6 +41,15 @@ class LocalClangTest(BrokerTestCase):
         self.assertIn('reused local compiler libraries', (self.work/'client.log').read_text())
         subprocess.run([str(self.work/'program')], check=True)
 
+    def test_command_file_preserves_filesystem_bytes(self):
+        self.start_local()
+        source = self.work/os.fsdecode(b'source-\xff.c')
+        source.write_text('int main(void) { return 0; }\n')
+        result = self.command([str(source), '-o', str(self.work/'program')])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b'reused local compiler libraries', (self.work/'client.log').read_bytes())
+        subprocess.run([str(self.work/'program')], check=True)
+
     def test_real_driver_outputs_and_errors(self):
         self.start_local()
         (self.work/'source.c').write_text('#include <stdio.h>\nint main(void) { puts("local"); return 0; }\n')

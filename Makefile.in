@@ -207,6 +207,7 @@ include_server_SRC = \
 	include_server/c_extensions/clang_scan.cpp \
 	include_server/c_extensions/clang_compile.cpp \
 	include_server/c_extensions/clang_compiler.h \
+	include_server/c_extensions/compiler_command.h \
 	include_server/c_extensions/clang_native.cpp \
 	include_server/c_extensions/clang_codegen.cpp \
 	include_server/c_extensions/clang_codegen.h \
@@ -231,6 +232,7 @@ dist_extra =							\
 	distcc_job.py \
 	src/rust_native.cc \
 	src/clang_driver.cc \
+	src/argv_file.h \
 	src/clang_inputs.h \
 	distcc-clang \
 	README.packaging ChangeLog \

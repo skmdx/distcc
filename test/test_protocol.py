@@ -32,7 +32,7 @@ class ArgumentFileTest(unittest.TestCase):
 
     def test_file_groups_offsets_and_reused_command_storage(self):
         for values in ((['/working directory', '/compiler'], []),
-                       (['', 'spaced value', 'quote"', '日本語'],),
+                       (['', 'spaced value', 'quote"', '日本語', os.fsdecode(b'file-\xff')],),
                        (['-DARG%d=%d' % (i, i) for i in range(16000)], ['root']),
                        ([], [])):
             with self.subTest(lengths=list(map(len, values))):
@@ -64,6 +64,13 @@ class ArgumentFileTest(unittest.TestCase):
         os.write(self.fd, b'ARGC       1ARGV       3one')
         os.lseek(self.fd, 0, os.SEEK_SET)
         self.assertEqual(self.protocol.RArgvFile(self.fd, 1), (['one'],))
+
+    def test_encoding_error_does_not_publish_a_partial_command(self):
+        for values in (['valid', object()], ['valid', '\ud800']):
+            with self.subTest(values=values):
+                with self.assertRaises((TypeError, UnicodeEncodeError)):
+                    self.protocol.XArgv(self.fd, values)
+                self.assertEqual(os.fstat(self.fd).st_size, 0)
 
     def test_helpers_contain_bad_commands_and_accept_the_next_request(self):
         compiler = shutil.which('clang')
@@ -97,7 +104,14 @@ class ArgumentFileTest(unittest.TestCase):
                 # must fail their invocation, never the resident process.
                 cases = [(b'bad', b'C', False),
                          ([[], []] if native else [[]], b'C', False)]
-                if native: cases.append((b'bad', b'P', False))
+                source = work/os.fsdecode(b'source-\xff.c')
+                if native:
+                    cases += [(b'bad', b'P', False),
+                              ([[str(work)], [compiler]], b'C', False),
+                              ([directory, []], b'P', False)]
+                    source.write_text('int answer(void) { return 42; }\n')
+                    cases.append(([directory, [compiler, '-c', str(source), '-o', str(work/'out.o')]],
+                                  b'P', True))
                 cases.append((valid, b'C', True))
                 for payload, operation, success in cases:
                     os.ftruncate(self.fd, 0); os.lseek(self.fd, 0, os.SEEK_SET)
@@ -118,7 +132,12 @@ class ArgumentFileTest(unittest.TestCase):
                     self.assertEqual(os.waitstatus_to_exitcode(status) == 0, success,
                                      os.pread(outputs[2], 65536, 0))
                     self.assertIsNone(process.poll())
-                    if success:
+                    if success and operation == b'P':
+                        os.lseek(self.fd, 0, os.SEEK_SET)
+                        prepared, roots = self.protocol.RArgvFile(self.fd, 2)
+                        self.assertEqual(prepared[1], str(source))
+                        self.assertIn(str(work), roots)
+                    elif success:
                         self.assertIn(b'version', os.pread(outputs[1], 65536, 0)+os.pread(outputs[2], 65536, 0))
 
 

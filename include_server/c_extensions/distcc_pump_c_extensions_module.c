@@ -35,6 +35,7 @@ const char *rs_program_name = "distcc_include_server";
 
 #include "distcc.h"
 #include "rpc.h"
+#include "argv_file.h"
 #include "exitcode.h"
 #include "file_cache.h"
 
@@ -166,7 +167,7 @@ argv_list(char **argv) {
   PyObject *list = PyList_New(dcc_argv_len(argv));
   if (!list) return NULL;
   for (int i = 0; argv[i]; ++i) {
-    PyObject *value = PyUnicode_FromString(argv[i]);
+    PyObject *value = PyUnicode_DecodeFSDefault(argv[i]);
     if (!value) { Py_DECREF(list); return NULL; }
     PyList_SET_ITEM(list, i, value);
   }
@@ -226,23 +227,21 @@ RArgvFile(PyObject *dummy, PyObject *args) {
     PyErr_SetString(PyExc_ValueError, "Expected at least one argument group.");
     return NULL;
   }
-  char ***groups = PyMem_Calloc(count, sizeof(*groups));
-  if (!groups) return PyErr_NoMemory();
+  struct dcc_argv_file file;
   PyObject *result = NULL;
-  if (dcc_r_argv_file(fd, count, groups)) {
+  if (dcc_argv_file_read(fd, count, &file)) {
     PyErr_SetString(distcc_pump_c_extensionsError, "Couldn't read complete argument file.");
     goto out;
   }
   result = PyTuple_New(count);
   if (!result) goto out;
   for (int g = 0; g < count; ++g) {
-    PyObject *list = argv_list(groups[g]);
+    PyObject *list = argv_list(file.groups[g]);
     if (!list) { Py_CLEAR(result); goto out; }
     PyTuple_SET_ITEM(result, g, list);
   }
 out:
-  for (int g = 0; g < count; ++g) if (groups[g]) dcc_free_argv(groups[g]);
-  PyMem_Free(groups);
+  dcc_argv_file_close(&file);
   return result;
 }
 
@@ -257,30 +256,27 @@ static char XArgv_doc__[] =
 
 static PyObject *
 XArgv(PyObject *dummy, PyObject *args) {
-  int i;
-  char **ptr;
   PyObject *list_object;
   int ifd;
-  int len;
+  Py_ssize_t len;
   int ret;
   char **argv;
   UNUSED(dummy);
   if (!PyArg_ParseTuple(args, "iO!", &ifd, &PyList_Type, &list_object))
     return NULL;
   len = PyList_Size(list_object);
-  argv = ptr = (char **) calloc((size_t) len + 1, sizeof (char *));
-  if (ptr == NULL) {
-    return PyErr_NoMemory();
-  }
-  argv[len] = NULL;
-  for (i = 0; i < len; i++) {
-    PyObject *string_object;
-    string_object = PyList_GetItem(list_object, i); /* borrowed ref */
-/* TODO do it properly, catch exceptions for fancy Unicode symbols */
-    argv[i] = (char*)PyUnicode_AsUTF8(string_object); /* does not increase
-                                                     ref count */
+  argv = calloc((size_t)len + 1, sizeof(*argv));
+  if (!argv) return PyErr_NoMemory();
+  PyObject *encoded = PyTuple_New(len);
+  if (!encoded) { free(argv); return NULL; }
+  for (Py_ssize_t i = 0; i < len; i++) {
+    PyObject *value = PyUnicode_EncodeFSDefault(PyList_GetItem(list_object, i));
+    if (!value) { Py_DECREF(encoded); free(argv); return NULL; }
+    PyTuple_SET_ITEM(encoded, i, value);
+    argv[i] = PyBytes_AS_STRING(value);
   }
   ret = dcc_x_argv(ifd, "ARGC", "ARGV", argv);
+  Py_DECREF(encoded);
   free(argv);
   if (ret == 0)
     Py_RETURN_TRUE;
@@ -505,6 +501,15 @@ PyInit_distcc_pump_c_extensions(void) {
     return NULL;
   }
   distcc_pump_c_extensionsError = st->error;
+  static const struct dcc_argv_file_api command_api = {
+    dcc_argv_file_read, dcc_argv_file_close, dcc_x_argv
+  };
+  PyObject *commands = PyCapsule_New((void *)&command_api, "distcc.argv_file", NULL);
+  if (!commands || PyModule_AddObject(module, "argv_file", commands) < 0) {
+    Py_XDECREF(commands);
+    Py_DECREF(module);
+    return NULL;
+  }
   PyObject *cache = PyCapsule_New((void *)&dcc_file_cache_records, "distcc.file_cache", NULL);
   if (!cache || PyModule_AddObject(module, "file_cache", cache) < 0) {
     Py_XDECREF(cache);

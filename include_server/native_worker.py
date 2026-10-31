@@ -8,9 +8,6 @@ import struct
 import sys
 import traceback
 
-from include_server import distcc_pump_c_extensions as protocol
-
-
 def serve(descriptor, frontend):
     control = socket.socket(fileno=descriptor)
     wake_read, wake_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
@@ -56,23 +53,7 @@ def serve(descriptor, frontend):
                                     if fd >= 0 and fd != fds[0]: os.close(fd)
                                 # The parent only dispatches descriptors. Decode
                                 # and own invocation data in its isolated child.
-                                directory, argv = protocol.RArgvFile(fds[0], 2)
-                                cwd, compiler = directory
-                                argv[0] = compiler
-                                if data != b'P':
-                                    os.close(fds[0]); fds[0] = -1
-                                os.chdir(cwd)
-                                if data == b'P':
-                                    prepared = frontend.prepare(argv)
-                                    if prepared is not None:
-                                        # The input has been fully consumed. Reuse
-                                        # its memfd for the captured command.
-                                        os.ftruncate(fds[0], 0)
-                                        os.lseek(fds[0], 0, os.SEEK_SET)
-                                        for values in prepared: protocol.XArgv(fds[0], values)
-                                        status = 0
-                                else:
-                                    status = frontend.run(argv)
+                                status = frontend.execute(fds[0], data == b'P')
                             except BaseException:
                                 traceback.print_exc()
                             finally:
