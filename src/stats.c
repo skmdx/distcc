@@ -494,6 +494,10 @@ dcc_free_mem %d MB\n\
     ct = dcc_stats_get_compile_totals();
     dcc_getloadavg(loadavg);
     dcc_cpu_topology(&ncpus, &ncores, &core_scale, &smt_gain);
+    /* Direct clients can use this CPU without a daemon job. Explicit stats
+     * queries share the busy-worker sampling limit; admission getters remain
+     * passive so an unqueried idle daemon does not sample in the background. */
+    dcc_cpu_perf_refresh();
     dcc_cpu_perf_get(&perf);
     int cpu_limit = dcc_cpu_perf_limit(dcc_max_kids);
 #ifdef __linux__

@@ -14,7 +14,7 @@
 #include <sched.h>
 
 static struct {
-    int initialized, enabled, active;
+    int initialized, enabled, have_counters, daemon_busy;
     cpu_set_t allowed;
     struct { int fd; unsigned long long busy, total; } cpu[CPU_SETSIZE];
     double baseline[3], sampled_at, next_sample, valid_at, recovery_until, probe_after;
@@ -64,6 +64,9 @@ static double frequency_reference(double active)
  * files are opened only when the allowed CPU set changes. */
 static int sample(double now)
 {
+    /* A long idle gap cannot pair an old CPU interval with today's clock.
+     * Use the same freshness horizon as recovery admission below. */
+    if (now - cpu_perf.sampled_at >= 10) cpu_perf.have_counters = 0;
     cpu_set_t allowed;
     if (sched_getaffinity(0, sizeof(allowed), &allowed)) return 0;
     if (!CPU_EQUAL(&allowed, &cpu_perf.allowed)) {
@@ -77,7 +80,7 @@ static int sample(double now)
             }
         }
         cpu_perf.allowed = allowed;
-        cpu_perf.active = 0;
+        cpu_perf.have_counters = 0;
         cpu_perf.perf.scale = -1;
         cpu_perf.valid_at = 0;
     }
@@ -94,7 +97,7 @@ static int sample(double now)
         if (cpu < 0 || cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &allowed)) continue;
         unsigned long long busy = user + nice + system + irq + softirq;
         unsigned long long total = busy + idle + iowait + steal;
-        if (cpu_perf.active && busy >= cpu_perf.cpu[cpu].busy && total > cpu_perf.cpu[cpu].total) {
+        if (cpu_perf.have_counters && busy >= cpu_perf.cpu[cpu].busy && total > cpu_perf.cpu[cpu].total) {
             double db = busy - cpu_perf.cpu[cpu].busy;
             double dt = total - cpu_perf.cpu[cpu].total;
             if (db <= dt) {
@@ -117,8 +120,11 @@ static int sample(double now)
         cpu_perf.cpu[cpu].busy = busy;
         cpu_perf.cpu[cpu].total = total;
     }
-    int valid = !ferror(file) && cpu_perf.active &&
-                busy_ticks >= sysconf(_SC_CLK_TCK) * .1 && observed_busy >= busy_ticks * .8;
+    /* The lowest calibration point is one continuously busy CPU. Sparse
+     * housekeeping on an idle machine observes its power-saving clock, not
+     * the capacity it can provide to a compiler. Do not train on that state. */
+    int valid = !ferror(file) && cpu_perf.have_counters && active >= 1 &&
+                observed_busy >= busy_ticks * .8;
     fclose(file);
     if (valid) {
         double reference = frequency_reference(active);
@@ -143,22 +149,33 @@ static int sample(double now)
         cpu_perf.valid_at = now;
     }
     cpu_perf.sampled_at = now;
-    cpu_perf.active = 1;
+    cpu_perf.have_counters = 1;
     return valid;
 }
 #endif
+
+void dcc_cpu_perf_refresh(void)
+{
+#ifdef __linux__
+    initialize();
+    if (!cpu_perf.enabled) return;
+    double now = monotonic_seconds();
+    if (now >= cpu_perf.next_sample) {
+        sample(now);
+        cpu_perf.next_sample = now + .5;
+    }
+#endif
+}
 
 int dcc_cpu_perf_poll(int busy, int timeout)
 {
 #ifdef __linux__
     initialize();
     if (!cpu_perf.enabled) return timeout;
-    if (!busy) { cpu_perf.active = 0; return timeout; }
+    cpu_perf.daemon_busy = busy;
+    if (!busy) return timeout;
+    dcc_cpu_perf_refresh();
     double now = monotonic_seconds();
-    if (now >= cpu_perf.next_sample) {
-        sample(now);
-        cpu_perf.next_sample = now + .5;
-    }
     double remaining = cpu_perf.next_sample - now;
     int next = remaining > 0 ? (int)(remaining * 1000) + 1 : 500;
     if (next < timeout) timeout = next;
@@ -177,7 +194,7 @@ void dcc_cpu_perf_get(struct dcc_cpu_perf *perf)
     double now = monotonic_seconds();
     *perf = cpu_perf.perf;
     perf->age = now - cpu_perf.valid_at;
-    perf->probe = !cpu_perf.active && perf->scale < .98 && perf->age >= 10 &&
+    perf->probe = !cpu_perf.daemon_busy && perf->scale < .98 && perf->age >= 10 &&
                   now >= cpu_perf.probe_after;
 #endif
 }

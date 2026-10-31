@@ -764,6 +764,39 @@ class CpuPerfTest(DistccTestCase):
     # without changing the machine's governor or frequency limits.
     daemon_env = {'DISTCC_CPU_FREQ_REF': '10000000,10000000,10000000'}
 
+    def test_direct_compilation_refreshes_clock_without_daemon_jobs(self):
+        if not list(Path('/sys/devices/system/cpu/cpufreq').glob('policy*/cpuinfo_avg_freq')):
+            self.skipTest('hardware frequency feedback is unavailable')
+
+        def metrics():
+            return dict(line.split(' ', 1) for line in self.get_stats(self.stats_ports[0]).splitlines()
+                        if line.startswith('dcc_'))
+
+        initial = metrics()
+        self.source.write_text(''.join(
+            f'int f{i}(int x) {{ return (x + {i}) * (x ^ {i}); }}\n' for i in range(10000)))
+        process = subprocess.Popen([self.cc, '-c', str(self.source), '-o', str(self.work/'direct.o')],
+                                   start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        seen = False
+        deadline = time.monotonic() + 20
+        try:
+            while process.poll() is None and time.monotonic() < deadline:
+                current = metrics()
+                self.assertEqual(current['dcc_busy'], '0', current)
+                if int(current['dcc_cpu_samples']) > int(initial['dcc_cpu_samples']):
+                    seen = True
+                    self.assertGreater(float(current['dcc_cpu_scale']), 0)
+                    self.assertLess(float(current['dcc_cpu_scale']), .9)
+                time.sleep(.1)
+            _, err = process.communicate(timeout=1)
+            self.assertEqual(process.returncode, 0, err.decode())
+            self.assertTrue(seen, 'direct compiler never produced a fresh frequency sample')
+            self.assertEqual(metrics()['dcc_compile_ok'], initial['dcc_compile_ok'])
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+
     def test_stats_eof_when_request_arrives_after_response(self):
         for unused in range(50):
             with socket.create_connection(('127.0.0.1', self.stats_ports[0]), timeout=1) as sock:
@@ -812,8 +845,9 @@ class CpuPerfTest(DistccTestCase):
                 job.result()
         self.assertTrue(seen_busy)
         self.assertGreater(int(metrics()['dcc_cpu_samples']), int(warm['dcc_cpu_samples']))
-        # A tiny job cannot provide 100ms of busy feedback. Its trial must
-        # still release the global one-worker limit, retaining the old scale.
+        # A tiny daemon job may not cover one busy CPU for an interval. The
+        # trial must expire either way. An on-demand host sample can also
+        # include direct clients or unrelated CPU work during this interval.
         time.sleep(10.1)
         stale = metrics()
         self.assertEqual(stale['dcc_cpu_probe'], '1')
@@ -821,9 +855,14 @@ class CpuPerfTest(DistccTestCase):
         self.compile(host, 'tiny-recovery')
         time.sleep(2.1)
         expired = metrics()
-        self.assertEqual(expired['dcc_cpu_samples'], stale['dcc_cpu_samples'])
-        self.assertEqual(expired['dcc_cpu_scale'], stale['dcc_cpu_scale'])
+        self.assertGreaterEqual(int(expired['dcc_cpu_samples']), int(stale['dcc_cpu_samples']))
+        if expired['dcc_cpu_samples'] == stale['dcc_cpu_samples']:
+            self.assertEqual(expired['dcc_cpu_scale'], stale['dcc_cpu_scale'])
+        else:
+            self.assertLess(float(expired['dcc_cpu_age']), .5)
+            self.assertGreater(float(expired['dcc_cpu_scale']), 0)
         self.assertEqual(expired['dcc_cpu_probe'], '0')
+        self.assertGreater(int(expired['dcc_capacity']), 1)
         self.assertGreater(int(expired['dcc_capacity']), 1)
 
 

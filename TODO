@@ -2,14 +2,6 @@ TODO list for distcc
 
 --> See also TODO and FIXME comments in source files and doc/todo/
 
-sample CPU frequency during direct client compilation
-
-    prefork.c passes only daemon EXECUTING workers to dcc_cpu_perf_poll.
-    Direct client compilers can therefore load the same host while its
-    daemon reports no frequency sample. Separate sampling activity from
-    daemon admission/recovery state and verify direct-client feedback;
-    missing cpu_scale must not be interpreted as unthrottled performance.
-
 type-check TCP integration tests
 
     test/test_tcp_jobs.py has existing Pyright diagnostics for unchecked

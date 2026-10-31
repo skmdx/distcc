@@ -244,6 +244,15 @@ missing frequency source leaves that correction unavailable, not zero. A short
 calibration does not establish sustained throughput: verify the curve against
 clock and CPU observations during the complete build, including long jobs.
 
+Clock sampling belongs to host observation, not daemon occupancy. Statistics
+requests and active-worker polling share one sampling deadline, so direct
+client compilation is observable and unqueried idle daemons need no timer.
+Capacity getters remain passive. Keep the previous CPU-counter snapshot
+separate from the daemon-busy state used for recovery admission. The lowest
+calibration point represents one continuously busy CPU; intervals with less
+aggregate activity must not train the speed correction from an idle
+power-saving clock. They retain the previous valid observation and its age.
+
 ## Evaluate partitioning against the remaining path
 
 For one invocation with frontend time `F`, whole-module optimization time `O`,

@@ -10,6 +10,7 @@ struct dcc_cpu_perf {
 
 /* Owned by the daemon parent; workers and clients never sample the CPU. */
 int dcc_cpu_perf_poll(int busy, int timeout);
+void dcc_cpu_perf_refresh(void);
 void dcc_cpu_perf_get(struct dcc_cpu_perf *perf);
 int dcc_cpu_perf_limit(int limit);
 void dcc_cpu_perf_started(void);
