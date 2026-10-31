@@ -1,5 +1,6 @@
 """Real compiler equivalence and lifecycle through the broker's worker cache."""
 import concurrent.futures
+import json
 import os
 from pathlib import Path
 import re
@@ -182,6 +183,9 @@ int main() {
     def test_codegen_finishes_when_no_extra_cpu_is_available(self):
         self.check_codegen(True)
 
+    def test_codegen_without_diagnostics_preserves_result(self):
+        self.check_codegen(True, verbose=False)
+
     def test_codegen_cpp_preserves_exceptions_and_static_initialization(self):
         self.check_codegen(False, True)
 
@@ -221,7 +225,7 @@ int main() {
         leases = [self.request(15) for _ in range(4)]
         for lease in leases: self.assertEqual(self.receive(lease), (0, 1, []))
 
-    def check_codegen(self, occupied, cpp=False, compiler=None):
+    def check_codegen(self, occupied, cpp=False, compiler=None, verbose=True):
         self.start_local()
         if compiler: self.compiler = compiler
         if cpp:
@@ -232,6 +236,8 @@ int main() {
         self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='codegen')
         saved.update({key: self.env[key] for key in ('DISTCC_HOSTS', 'DISTCC_BROKER')})
         self.env = dict(saved, DISTCC_CLANG_CODEGEN='1')
+        if not verbose:
+            self.env.pop('DISTCC_VERBOSE', None)
         if occupied:
             for _ in range(3):
                 self.assertEqual(self.receive(self.request(15)), (0, 1, []))
@@ -267,6 +273,24 @@ int main() {
                          result.stderr.decode() + (self.work/'client.log').read_text())
         if not occupied:
             self.assertIn(b'distcc codegen: 2 parts', result.stderr)
+        traces = [json.loads(line.removeprefix(b'distcc compiler phases: '))
+                  for line in result.stderr.splitlines()
+                  if line.startswith(b'distcc compiler phases: ')]
+        if not verbose:
+            self.assertFalse(traces)
+            return
+        self.assertEqual(len(traces), 1, result.stderr.decode())
+        trace = traces[0]
+        self.assertTrue(trace['source'].endswith('codegen.c'))
+        self.assertGreater(trace['unfinalized_instructions'], 0)
+        self.assertGreater(trace['optimized_instructions'], 0)
+        self.assertEqual([phase['name'] for phase in trace['phases']],
+                         ['frontend', 'finalize_optimize', 'ir_cleanup', 'codegen'])
+        self.assertEqual(sum(phase['wall_ns'] for phase in trace['phases']),
+                         trace['end_ns'] - trace['start_ns'])
+        for phase in trace['phases']:
+            self.assertGreater(phase['wall_ns'], 0)
+            self.assertGreater(phase['cpu_ns'], 0)
 
     def test_available_frontend_releases(self):
         self.start_local()

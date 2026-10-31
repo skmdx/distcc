@@ -5,6 +5,31 @@ smaller sum of queue times does not establish a shorter build. Keep the build
 system, package generators, compiler options and configured job count unchanged
 when evaluating a scheduling change.
 
+## Observe compiler phases at their actual boundaries
+
+With local Clang codegen enabled, `DISTCC_VERBOSE` emits one JSON record prefixed
+by `distcc compiler phases:` for each completed source-to-IR action. It records
+monotonic wall time and process CPU time, including reaped codegen children:
+
+- `frontend`: action startup, preprocessing, parsing and incremental IR generation;
+- `finalize_optimize`: Clang's `HandleTranslationUnit`, including deferred IR
+  finalization and LLVM optimization;
+- `ir_cleanup`: the rest of the IR action and module accounting;
+- `codegen`: machine-code generation, partitioning, merging and module cleanup.
+
+The trace excludes driver preparation and final `CompilerInstance` destruction.
+IR input and failed frontend actions lack these AST boundaries and do not emit a
+complete phase record. Unfinalized instruction counts are not final module size.
+Concurrent wall intervals must not be added as elapsed build time. Preserve the
+compiler's callbacks through its `MultiplexConsumer`; do not infer phase starts
+from the first identifiable sampling-profiler symbol.
+
+A fixed learned cost can represent header/setup work missing from a raw-byte
+model, but cannot identify arbitrary template or optimizer complexity. Lower
+aggregate prediction error is insufficient for adopting a placement change:
+the model can still misplace long jobs on completion-critical branches. Check
+their actual finish times and the complete build before changing the policy.
+
 ## Work and dependency bounds
 
 Model a build as a dependency graph of commands and compiler phases. For a

@@ -7,16 +7,20 @@
 #include <clang/Basic/TargetInfo.h>
 #include <clang/CodeGen/BackendUtil.h>
 #include <clang/CodeGen/CodeGenAction.h>
+#include <clang/CodeGen/ModuleBuilder.h>
 #include <clang/Frontend/CompilerInstance.h>
+#include <clang/Frontend/MultiplexConsumer.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/JSON.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/Program.h>
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/TargetParser/Triple.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -36,6 +40,81 @@ uint64_t clock_ns(clockid_t clock = CLOCK_MONOTONIC) {
     clock_gettime(clock, &now);
     return uint64_t(now.tv_sec)*1000000000+now.tv_nsec;
 }
+
+// Observe Clang's actual action boundaries without replacing its AST or
+// preprocessor callbacks. HandleTranslationUnit also finalizes deferred IR;
+// its time must not be reported as LLVM optimization alone.
+class TimedIRAction : public clang::EmitLLVMOnlyAction {
+    struct Sample {
+        uint64_t wall, cpu;
+        static Sample now() {
+            rusage children{};
+            getrusage(RUSAGE_CHILDREN, &children);
+            uint64_t child_ns = uint64_t(children.ru_utime.tv_sec + children.ru_stime.tv_sec)*1000000000
+                + uint64_t(children.ru_utime.tv_usec + children.ru_stime.tv_usec)*1000;
+            return {clock_ns(), clock_ns(CLOCK_PROCESS_CPUTIME_ID) + child_ns};
+        }
+    };
+    class Boundary : public clang::ASTConsumer {
+        TimedIRAction &action;
+        bool after;
+    public:
+        Boundary(TimedIRAction &action, bool after) : action(action), after(after) {}
+        void HandleTranslationUnit(clang::ASTContext &) override {
+            if (!after) {
+                if (auto *module = action.getCodeGenerator()->GetModule())
+                    for (const auto &function : *module)
+                        action.unfinalized_instructions += function.getInstructionCount();
+            }
+            action.samples[after ? 2 : 1] = Sample::now();
+        }
+    };
+    bool enabled = getenv("DISTCC_VERBOSE");
+    bool ready = false;
+    Sample samples[4]{};
+    std::string source;
+    uint64_t unfinalized_instructions = 0, optimized_instructions = 0;
+    std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(
+            clang::CompilerInstance &compiler, llvm::StringRef input) override {
+        auto backend = EmitLLVMOnlyAction::CreateASTConsumer(compiler, input);
+        if (!enabled || !backend) return backend;
+        source = input.str();
+        std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
+        consumers.push_back(std::make_unique<Boundary>(*this, false));
+        consumers.push_back(std::move(backend));
+        consumers.push_back(std::make_unique<Boundary>(*this, true));
+        return std::make_unique<clang::MultiplexConsumer>(std::move(consumers));
+    }
+public:
+    TimedIRAction() { if (enabled) samples[0] = Sample::now(); }
+    void irReady(uint64_t instructions) {
+        if (!enabled) return;
+        optimized_instructions = instructions;
+        samples[3] = Sample::now();
+        ready = true;
+    }
+    ~TimedIRAction() override {
+        // IR input bypasses AST callbacks, and frontend failures have no
+        // complete phase sequence. Neither is a zero-duration observation.
+        if (!ready || !samples[1].wall || !samples[2].wall) return;
+        auto end = Sample::now();
+        llvm::json::Array phases;
+        const char *names[] = {"frontend", "finalize_optimize", "ir_cleanup", "codegen"};
+        for (unsigned i = 0; i != 4; ++i) {
+            auto next = i == 3 ? end : samples[i+1];
+            phases.push_back(llvm::json::Object{{"name", names[i]},
+                {"wall_ns", next.wall-samples[i].wall}, {"cpu_ns", next.cpu-samples[i].cpu}});
+        }
+        llvm::json::Object result{{"pid", getpid()}, {"source", source},
+            {"start_ns", samples[0].wall}, {"end_ns", end.wall},
+            {"unfinalized_instructions", unfinalized_instructions},
+            {"optimized_instructions", optimized_instructions}, {"phases", std::move(phases)}};
+        std::string line;
+        llvm::raw_string_ostream stream(line);
+        stream << "distcc compiler phases: " << llvm::json::Value(std::move(result)) << '\n';
+        llvm::errs() << line;
+    }
+};
 // This is an optional extra CPU, never a queued request. The enclosing
 // compilation already owns one lane and can always finish without another.
 int try_lane() {
@@ -111,7 +190,7 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
         llvm::cl::ParseCommandLineOptions(args.size()-1, args.data(), "", nullptr,
                                           &compiler.getVirtualFileSystem());
     }
-    clang::EmitLLVMOnlyAction action;
+    TimedIRAction action;
     if (!compiler.ExecuteAction(action)) return false;
     auto module = action.takeModule();
     if (!module) return false;
@@ -123,6 +202,7 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler) {
         largest = std::max(largest, size);
         functions += !function.isDeclarationForLinker();
     }
+    action.irReady(total);
     unsigned useful = largest ? std::min<uint64_t>(functions, total/largest) : 1;
     std::vector<int> lanes;
     auto release = llvm::scope_exit([&] { for (int fd : lanes) close(fd); });
