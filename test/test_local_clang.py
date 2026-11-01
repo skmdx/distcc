@@ -258,12 +258,14 @@ int main() {
                 self.env.pop('DISTCC_VERBOSE', None)
             else:
                 self.env['DISTCC_VERBOSE'] = verbose
-            for mode in ('-m32', '-m64'):
+            for mode in ([], ['-m32']):
                 for action in (['-c', '-o', 'conftest.o'],
                                ['-shared', '-fuse-ld=lld', '-o', 'conftest.so']):
                     with self.subTest(verbose=verbose, mode=mode, action=action):
-                        arguments = [mode, '-O2', '-fPIC', '-DPIC', 'conftest.c', *action]
+                        arguments = [*mode, '-O2', '-fPIC', '-DPIC', 'conftest.c', *action]
                         native = self.command(arguments, False)
+                        if mode and native.returncode:
+                            self.skipTest('native compiler lacks 32-bit support: ' + native.stderr.decode())
                         self.assertEqual(native.returncode, 0, native.stderr)
                         self.assertEqual(native.stderr, b'')
                         (self.work/action[-1]).unlink()
