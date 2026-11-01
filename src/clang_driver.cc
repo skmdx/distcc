@@ -40,8 +40,8 @@ class FrontendPlan {
     std::unique_ptr<clang::DiagnosticOptions> diagnostic_options;
     llvm::IntrusiveRefCntPtr<clang::DiagnosticsEngine> diagnostics;
     std::unique_ptr<clang::driver::Driver> driver;
-    std::unique_ptr<clang::driver::Compilation> compilation;
 public:
+    std::unique_ptr<clang::driver::Compilation> compilation;
     llvm::ArrayRef<const char *> cc1;
     std::unique_ptr<clang::CompilerInvocation> compiler;
     explicit FrontendPlan(char **input) {
@@ -160,6 +160,12 @@ extern "C" int dcc_clang_inputs(char **argv, char ***normalized, char ***files) 
     std::set<std::string> used;
     for (const auto &input : plan.compiler->getFrontendOpts().Inputs)
         if (input.isFile()) used.insert(absolute(input.getFile()));
+    // A source-and-link invocation also consumes objects and archives in
+    // later driver jobs. Only inputs unused by the entire plan may be removed.
+    if (plan.compilation)
+        for (const auto &job : plan.compilation->getJobs())
+            for (const auto &input : job.getInputInfos())
+                if (input.isFilename()) used.insert(absolute(input.getFilename()));
     unsigned missing_index = 0, missing_count = 0;
     auto args = clang::getDriverOptTable().ParseArgs(raw, missing_index, missing_count);
     if (missing_count) return -1;

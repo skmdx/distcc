@@ -90,6 +90,40 @@ class LocalClangTest(BrokerTestCase):
         self.assertGreaterEqual(log.count('reused local compiler libraries'),6)
         self.assertEqual(log.count('started local compiler libraries'),1)
 
+    def test_source_and_link_retains_object_and_archive_inputs(self):
+        self.start_local()
+        (self.work/'main.c').write_text(
+            'extern int version(void), extra(void);\n'
+            'int main(void) { return version()+extra()!=42; }\n')
+        (self.work/'version.c').write_text('int version(void) { return 40; }\n')
+        (self.work/'extra.c').write_text('int extra(void) { return 2; }\n')
+        for lto in ([], ['-flto=thin']):
+            for source in ('version', 'extra'):
+                result = self.command(['-O2', *lto, '-c', source+'.c',
+                                       '-o', source+'.o'], False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            archive = self.work/'extra.a'
+            archive.unlink(missing_ok=True)
+            subprocess.run(['llvm-ar', 'rcs', str(archive), 'extra.o'],
+                           cwd=self.work, env=self.env, check=True)
+            for extra, profile in [('extra.o', ['-fprofile-update=atomic',
+                                                 '-fprofile-generate=profiles']),
+                                   ('extra.a', [])]:
+                with self.subTest(lto=lto, extra=extra):
+                    arguments = ['-O2', *lto, *profile, '-fuse-ld=lld',
+                                 'main.c', 'version.o', extra, '-o', 'program']
+                    for reused in (False, True):
+                        (self.work/'program').unlink(missing_ok=True)
+                        result = self.command(arguments, reused)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        subprocess.run([str(self.work/'program')], cwd=self.work,
+                                       check=True, capture_output=True)
+            # An archive really is unused during compilation without a link.
+            result = self.command(['-O2', *lto, '-c', 'main.c', str(archive),
+                                   '-o', 'compiled.o'])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((self.work/'compiled.o').exists())
+
     def test_parallel_commands_and_cancellation(self):
         self.start_local()
         # Input blocks inside the actual cc1, not a stand-in compiler.
