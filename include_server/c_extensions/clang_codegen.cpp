@@ -38,6 +38,11 @@
 LLD_HAS_DRIVER(elf)
 
 namespace {
+bool verbose_enabled() {
+    const char *value = getenv("DISTCC_VERBOSE");
+    return value && !strcmp(value, "1");
+}
+
 struct Measurements {
     std::atomic<uint64_t> codegen_ns{0}, instructions{0}, overhead_ns{0}, parts{0};
 };
@@ -76,7 +81,7 @@ class TimedIRAction : public clang::EmitLLVMOnlyAction {
             action.samples[after ? 2 : 1] = Sample::now();
         }
     };
-    bool enabled = getenv("DISTCC_VERBOSE");
+    bool enabled = verbose_enabled();
     bool ready = false;
     Sample samples[4]{};
     std::string source;
@@ -252,7 +257,7 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler,
         }
         extra = lanes.size();
     }
-    if (getenv("DISTCC_VERBOSE"))
+    if (verbose_enabled())
         llvm::errs() << "distcc codegen plan: serial_ns=" << serial << " overhead_ns=" << overhead
                      << " useful=" << useful << " selected=" << selected
                      << " available=" << extra+1 << '\n';
@@ -354,7 +359,7 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler,
         measured->overhead_ns.fetch_add(prepared+clock_ns()-merge_start);
         measured->parts.fetch_add(parts.size());
     }
-    if (getenv("DISTCC_VERBOSE"))
+    if (verbose_enabled())
         llvm::errs() << "distcc codegen: " << parts.size() << " parts, " << total
                      << " instructions, " << codegen.MainFileName << '\n';
     return true;

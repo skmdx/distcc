@@ -244,6 +244,44 @@ int main() {
     def test_codegen_without_diagnostics_preserves_result(self):
         self.check_codegen(True, verbose=False)
 
+    def test_disabled_verbose_preserves_compiler_diagnostics(self):
+        self.start_local()
+        (self.work/'conftest.c').write_text(
+            'int value;\nint read_value(void) { return value; }\n')
+        (self.work/'warning.c').write_text('#warning keep this diagnostic\n')
+        (self.work/'error.c').write_text('#error keep this error\n')
+        # Libtool rejects PIC and -c -o support if successful probes emit
+        # unexpected stderr. Exercise both prepared input and resident driver
+        # jobs, including environment changes on the same compiler worker.
+        for verbose in ('1', '0', '', None):
+            if verbose is None:
+                self.env.pop('DISTCC_VERBOSE', None)
+            else:
+                self.env['DISTCC_VERBOSE'] = verbose
+            for mode in ('-m32', '-m64'):
+                for action in (['-c', '-o', 'conftest.o'],
+                               ['-shared', '-fuse-ld=lld', '-o', 'conftest.so']):
+                    with self.subTest(verbose=verbose, mode=mode, action=action):
+                        arguments = [mode, '-O2', '-fPIC', '-DPIC', 'conftest.c', *action]
+                        native = self.command(arguments, False)
+                        self.assertEqual(native.returncode, 0, native.stderr)
+                        self.assertEqual(native.stderr, b'')
+                        (self.work/action[-1]).unlink()
+                        result = self.command(arguments)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertGreater((self.work/action[-1]).stat().st_size, 0)
+                        if verbose == '1' and action[0] == '-c':
+                            self.assertIn(b'distcc compiler phases:', result.stderr)
+                            self.assertIn(b'distcc codegen plan:', result.stderr)
+                        elif verbose != '1':
+                            self.assertEqual(result.stderr, native.stderr)
+            for source, diagnostic, success in (('warning.c', b'warning:', True),
+                                                 ('error.c', b'error:', False)):
+                with self.subTest(verbose=verbose, source=source):
+                    result = self.command(['-c', source, '-o', 'diagnostic.o'])
+                    self.assertEqual(result.returncode == 0, success, result.stderr)
+                    self.assertIn(diagnostic, result.stderr)
+
     def test_codegen_cpp_preserves_exceptions_and_static_initialization(self):
         self.check_codegen(False, True)
 
