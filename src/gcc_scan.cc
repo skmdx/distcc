@@ -102,7 +102,11 @@ void finish(void *, void *)
     // A terminator is published only after every dependency has been collected.
     // Unsupported inputs never yield a usable manifest. Source diagnostics can
     // still be replayed by the worker when input collection was complete.
-    if (!precompiled && append("DCGS2", 6) &&
+    // A PCH can replace a header that does not exist, so ordinary -E is not
+    // a valid fallback. It also depends on the creating GCC executable.
+    // Ask the client to run the original compilation, not preprocessing.
+    if (precompiled) append("DCGL1", 6);
+    else if (append("DCGS2", 6) &&
         distcc_gcc_inputs(parse_in, input, nullptr) && !fflush(output)) append("", 1);
     fclose(output);
 }

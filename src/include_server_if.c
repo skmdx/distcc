@@ -108,6 +108,13 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
         goto out;
     }
 
+    if (dcc_argv_len(*files) == 1 && !strcmp((*files)[0], "LOCAL")) {
+        rs_trace("include server requested original local compilation");
+        dcc_free_argv(*files);
+        *files = NULL;
+        ret = EXIT_LOCAL_COMPILE;
+        goto out;
+    }
     if (dcc_argv_len(*files) == 0) {
         rs_log_warning("include server gave up analyzing");
         goto out;

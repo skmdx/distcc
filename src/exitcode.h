@@ -63,7 +63,8 @@ enum dcc_exitcode {
 #ifdef HAVE_GSSAPI
     EXIT_GSSAPI_FAILED            = 119, /**< GSS-API - Catchall error code for GSS-API related errors. */
 #endif
-    EXIT_LOCAL_CPP                = 120
+    EXIT_LOCAL_CPP                = 120,
+    EXIT_LOCAL_COMPILE            = 121
 };
 
 

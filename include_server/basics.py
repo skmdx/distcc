@@ -278,6 +278,10 @@ class Error(Exception):
   pass
 
 
+class LocalCompilation(Error):
+  """The compiler requires the original compilation, not a separate -E pass."""
+
+
 class NotCoveredError(Error):
   """Exception for included file not covered by include processing."""
 

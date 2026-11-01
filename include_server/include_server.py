@@ -363,6 +363,11 @@ def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
         files_and_links = include_analyzer.DoCompilationCommand(
             cmd, currdir, include_analyzer.client_root_keeper, compression)
 
+      except basics.LocalCompilation as inst:
+        # File entries are absolute paths; LOCAL is a control response. This
+        # is a supported local job, not an analysis or remote-worker failure.
+        Debug(DEBUG_TRACE, 'Compiling locally: %s', inst)
+        distcc_pump_c_extensions.XArgv(self.wfile.fileno(), ['LOCAL'])
       except NotCoveredError as inst:
         # Warn user. The 'Preprocessing locally' message is meant to
         # assure the user that the build process is otherwise intact.

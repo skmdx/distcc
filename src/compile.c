@@ -913,6 +913,7 @@ dcc_build_somewhere(char *argv[],
         }
         if (count && same_format) {
             ret = dcc_talk_to_include_server(argv, &files, compr);
+            if (ret == EXIT_LOCAL_COMPILE) goto lock_local;
         }
         if (!ret && files && compr == DCC_COMPRESS_LZ4_STREAM) {
             prepared_job = dcc_job_describe(argv, NULL, -1, files);
@@ -1016,6 +1017,10 @@ dcc_build_somewhere(char *argv[],
     }
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
         if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
+            if (ret == EXIT_LOCAL_COMPILE) {
+                release_host(host, &cpu_lock_fd, &local_cpu_lock_fd, 0);
+                goto lock_local;
+            }
             /* Fallback to doing cpp locally */
             /* It's unfortunate that the variable that controls that is in the
              * "host" datastructure, even though in this case it's the client

@@ -5,6 +5,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest import mock
 
@@ -39,8 +40,24 @@ class IncludeServerTest(unittest.TestCase):
     with (mock.patch.object(include_server.socketserver, 'StreamRequestHandler', StreamHandler),
           mock.patch.object(distcc_pump_c_extensions, 'RCwd', return_value=str(self.root)),
           mock.patch.object(distcc_pump_c_extensions, 'RArgv', return_value=(['gcc', source], 'lzo')),
-          mock.patch.object(distcc_pump_c_extensions, 'XArgv')):
+          mock.patch.object(distcc_pump_c_extensions, 'XArgv') as reply):
       include_server.DistccIncludeHandlerGenerator(self.analyzer)().handle()
+      return reply.call_args.args[1]
+
+  def test_pch_requests_original_compilation_without_warning(self):
+    header = self.root/'header.h'
+    header.write_text('#define VALUE 23\n')
+    subprocess.run(['gcc', '-x', 'c-header', str(header)], check=True,
+                   capture_output=True)
+    header.unlink()
+    (self.root/'source.c').write_text('#include "header.h"\nint value = VALUE;\n')
+    self.assertEqual(self.handle('source.c'), ['LOCAL'])
+    self.assertEqual(self.reports, [])
+    # The disposition belongs to this compilation, not the following request.
+    (self.root/'ordinary.c').write_text('int ordinary;\n')
+    files = self.handle('ordinary.c')
+    self.assertTrue(files)
+    self.assertTrue(all(path.startswith('/') for path in files))
 
   def test_missing_input_reports_compiler_failure(self):
     with self.assertRaises(basics.NotCoveredError):

@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import distcc_pump_c_extensions
+import basics
 
 
 def scan(command, cwd, library):
@@ -19,7 +20,7 @@ def scan(command, cwd, library):
     # Dependency-only mode skips ordinary tokens, including __COUNTER__ uses
     # that can change a later include condition. Run the full preprocessor;
     # the module consumes its tokens without serializing preprocessed text.
-    invocation = [*command, '-E', '-P', '-ftrack-macro-expansion=0',
+    invocation = [*command, '-E', '-P', '-fpch-preprocess', '-ftrack-macro-expansion=0',
                   '-fplugin=' + library,
                   '-fplugin-arg-' + Path(library).stem + '-output-fd=' + str(fd)]
     # Full preprocessing can outlive a fixed wall-clock deadline under load.
@@ -28,6 +29,8 @@ def scan(command, cwd, library):
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     output.seek(0)
     data = output.read()
+  if result.returncode >= 0 and data == b'DCGL1\0':
+    raise basics.LocalCompilation('GCC selected a precompiled header')
   # Source diagnostics (for example #error) need not prevent input collection.
   # A completed manifest lets the worker reproduce both diagnostics and partial
   # output. Startup failures, signals and incomplete collection remain failures.

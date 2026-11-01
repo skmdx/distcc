@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import gcc_scan
+import basics
 import distcc_pump_c_extensions as native
 
 
@@ -89,6 +90,42 @@ class GccScanTest(unittest.TestCase):
     wrapper.chmod(0o755)
     result = gcc_scan.scan([str(wrapper), str(self.source)], str(self.root), self.library)
     self.assertIn(str(self.source), result['dependencies'])
+
+  def test_pch_without_text_header_and_directory_variants(self):
+    header = self.root/'original.hpp'
+    header.write_text('#define PCH_BRANCH 1\nstruct Value { int n; };\n')
+    selected = self.root/'selected.h'
+    selected.write_text('int selected;\n')
+    self.source.write_text('#if PCH_BRANCH\n#include "selected.h"\n#endif\n'
+                           'Value value;\n')
+    options = ['-x', 'c++', '-std=c++20', '-O3']
+    for directory in (False, True):
+      with self.subTest(directory=directory):
+        forced = self.root/('directory.hpp' if directory else 'missing.hpp')
+        pch = Path(str(forced) + '.gch')
+        if directory:
+          pch.mkdir()
+          pch = pch/'variant'
+        subprocess.run([self.compiler, *options, '-x', 'c++-header', str(header),
+                        '-o', str(pch)], check=True, capture_output=True)
+        with self.assertRaises(basics.LocalCompilation):
+          self.scan(*options, '-include', str(forced))
+        subprocess.run([self.compiler, *options, '-include', str(forced),
+                        '-c', str(self.source), '-o', str(self.root/'source.o')],
+                       check=True, capture_output=True)
+
+  def test_invalid_pch_uses_text_header(self):
+    header = self.root/'header.h'
+    header.write_text('#if MODE == 1\n#define VALUE 1\n#else\n'
+                      '#include "selected.h"\n#endif\n')
+    selected = self.root/'selected.h'
+    selected.write_text('#define VALUE 2\n')
+    self.source.write_text('int value = VALUE;\n')
+    subprocess.run([self.compiler, '-DMODE=1', '-x', 'c-header', str(header)],
+                   check=True, capture_output=True)
+    result = self.scan('-DMODE=2', '-include', str(header))
+    self.assertIn(str(header), result['dependencies'])
+    self.assertIn(str(selected), result['dependencies'])
 
   def test_native_feature_branch_and_existence_only_inputs(self):
     (self.root/'gcc.h').write_text('int gcc_only;\n')

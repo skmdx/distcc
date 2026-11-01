@@ -125,7 +125,13 @@ One full GCC preprocessing process runs per request. Dependency-only mode is
 insufficient: ordinary macro expansion can affect later include conditions
 through __COUNTER__. Collected records use bounded buffered output; diagnostic
 macro-expansion provenance is disabled during collection only.
-PCH and embed directives require local preprocessing. Compiler module and
+GCC selects PCH candidates with its native `-fpch-preprocess` support during
+analysis. A selected PCH requires the original local compilation, even when
+`DISTCC_FALLBACK=0`: PCH files depend on the creating GCC executable, and the
+text header they replace need not exist. This is not an analysis failure and
+does not mark a worker unavailable. Invalid PCH candidates that GCC ignores
+leave ordinary header distribution enabled. Embed directives require local
+preprocessing. Compiler module and
 dependency-scanner flags require local compilation because their sidecar outputs
 are not part of the remote job protocol. GCC workers use
 the same module's libcpp search callback to resolve absolute include operands
