@@ -51,6 +51,9 @@ public:
                 std::string *error, bool *failed) const override {
         if (!redirects.empty())
             return Command::Execute(redirects, error, failed);
+        // Clang reads this output even when the linker returns success.
+        // A stale true value makes it treat a null command as a failed job.
+        if (failed) *failed = false;
         auto link = [&] {
             llvm::SmallVector<const char *> command{getExecutable()};
             command.append(getArguments());

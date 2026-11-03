@@ -124,6 +124,28 @@ class LocalClangTest(BrokerTestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((self.work/'compiled.o').exists())
 
+    def test_resident_linker_reports_success_and_failure(self):
+        self.start_local()
+        self.env['DISTCC_VERBOSE'] = '0'
+        (self.work/'main.c').write_text('int main(void) { return 0; }\n')
+        cases = [
+            ['-Wl,--version'], ['-Wl,--help'],
+            ['main.c', '-Wl,--no-such-distcc-option', '-o', 'program'],
+            ['main.c', '-o', 'program'],
+            ['-Wl,--version'],
+        ]
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                native = self.command(['-fuse-ld=lld', *arguments], False)
+                result = self.command(['-fuse-ld=lld', *arguments])
+                self.assertEqual(result.returncode, native.returncode, result.stderr)
+                self.assertEqual(result.stdout, native.stdout)
+                if '--no-such-distcc-option' in ' '.join(arguments):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(b'unknown argument', result.stderr)
+                elif 'main.c' in arguments:
+                    subprocess.run([str(self.work/'program')], check=True)
+
     def test_parallel_commands_and_cancellation(self):
         self.start_local()
         # Input blocks inside the actual cc1, not a stand-in compiler.
