@@ -665,6 +665,9 @@ int main(void) {
     assert(dcc_resource_input_bytes(&profiled) == 2048);
     profiled.kind = DCC_JOB_COMPILE;
     assert(dcc_resource_class(&profiled) == large);
+    profiled.kind = DCC_JOB_FRONTEND;
+    assert(dcc_resource_class(&profiled) == 1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS);
+    assert(dcc_resource_input_bytes(&profiled) == 0);
     profiled.kind = DCC_JOB_RUST;
     assert(dcc_resource_input_bytes(&profiled) == 80*M + 2048);
     profiled.kind = DCC_JOB_LINK;

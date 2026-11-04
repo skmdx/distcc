@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -40,6 +41,30 @@ static int within(const char *path, const char *root)
     return !strncmp(path, root, n) && (!path[n] || path[n] == '/' || !strcmp(root, "/"));
 }
 enum { PATH_METADATA = 1, PATH_CONTENTS = 2 };
+int dcc_frontend_fs_add_roots(struct dcc_job *job, const char *paths)
+{
+    if (!paths || !*paths) return 0;
+    char *copy = strdup(paths), *save = NULL;
+    if (!copy) return -1;
+    size_t count = dcc_argv_len(job->fs_roots);
+    for (char *path = strtok_r(copy, ":", &save); path; path = strtok_r(NULL, ":", &save)) {
+        char *absolute = NULL;
+        if (*path != '/' && asprintf(&absolute, "%s/%s", job->cwd, path) < 0) goto failed;
+        char *root = normalized(absolute ? absolute : path);
+        free(absolute);
+        if (!root) goto failed;
+        char **roots = realloc(job->fs_roots, (count + 2) * sizeof(*roots));
+        if (!roots) { free(root); goto failed; }
+        job->fs_roots = roots;
+        roots[count++] = root;
+        roots[count] = NULL;
+    }
+    free(copy);
+    return 0;
+failed:
+    free(copy);
+    return -1;
+}
 static int allowed(const struct dcc_job *job, const char *path)
 {
     char *name = normalized(path);

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <sys/uio.h>
 #ifdef __linux__
@@ -68,6 +69,20 @@ static int cache_shard(const unsigned char *hash, char key[17], const char *tmp)
     return fd;
 }
 
+static int verify_snapshot(int from, const unsigned char *expected)
+{
+    struct stat st;
+    if (fstat(from, &st) || (uint64_t)st.st_size > SIZE_MAX) return -1;
+    /* Cache publication replaces names, never the opened inode. The other
+     * caller owns a private reflink. Both stay immutable during verification. */
+    void *data = st.st_size ? mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, from, 0) : NULL;
+    if (data == MAP_FAILED) return -1;
+    XXH64_canonical_t hash;
+    XXH64_canonicalFromHash(&hash, XXH3_64bits(data, st.st_size));
+    if (st.st_size) munmap(data, st.st_size);
+    return memcmp(hash.digest, expected, DCC_FILE_HASH_SIZE) ? -1 : 0;
+}
+
 static int copy_snapshot(int from, int to, const unsigned char *expected)
 {
     char buffer[65536];
@@ -75,8 +90,8 @@ static int copy_snapshot(int from, int to, const unsigned char *expected)
     int ret = -1;
     ssize_t n;
 #ifdef __linux__
-    if (to >= 0 && !ioctl(to, FICLONE, from))
-        return expected ? copy_snapshot(to, -1, expected) : 0;
+    if (!ioctl(to, FICLONE, from))
+        return expected ? verify_snapshot(to, expected) : 0;
 #endif
     if (lseek(from, 0, SEEK_SET) < 0) goto done;
     if (expected) {
@@ -86,7 +101,7 @@ static int copy_snapshot(int from, int to, const unsigned char *expected)
     while ((n = read(from, buffer, sizeof(buffer))) != 0) {
         if (n < 0) { if (errno == EINTR) continue; goto done; }
         if ((xxh && XXH3_64bits_update(xxh, buffer, n) != XXH_OK) ||
-            (to >= 0 && dcc_writex(to, buffer, n))) goto done;
+            dcc_writex(to, buffer, n)) goto done;
     }
     if (xxh) {
         XXH64_canonical_t canonical;
@@ -105,7 +120,7 @@ static int snapshot(int from, const char *destination, const unsigned char *hash
     if (dcc_mk_tmp_ancestor_dirs(destination)) return 0;
     if (shared) {
         char source[64];
-        if (hash && copy_snapshot(from, -1, hash)) return 0;
+        if (hash && verify_snapshot(from, hash)) return 0;
         snprintf(source, sizeof(source), "/proc/self/fd/%d", from);
         if (!linkat(AT_FDCWD, source, AT_FDCWD, destination, AT_SYMLINK_FOLLOW)) return 1;
         /* A separately configured cache can be on another filesystem; an
@@ -212,7 +227,7 @@ void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared,
     if (to >= 0) {
         struct stat existing;
         int present = !fstat(to, &existing) && S_ISREG(existing.st_mode) &&
-                      existing.st_size == st.st_size && !copy_snapshot(to, -1, hash);
+                      existing.st_size == st.st_size && !verify_snapshot(to, hash);
         close(to);
         to = -1;
         if (present) goto done;

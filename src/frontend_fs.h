@@ -13,6 +13,7 @@ enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LI
  * releases borrowed CPUs. The reply contains the granted count. */
 #define DCC_FS_CODEGEN 5
 struct dcc_job;
+int dcc_frontend_fs_add_roots(struct dcc_job *job, const char *paths);
 /* An owned metadata prefix followed by an optional open file extent. No
  * temporary file is needed to concatenate them for the transport. */
 struct dcc_frontend_reply {

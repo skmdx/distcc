@@ -146,6 +146,33 @@ class FileCacheTest(unittest.TestCase):
         self.assertEqual(self.get(b'key'), b'complete')
         self.assertFalse(list(self.cache_path.glob('*/.tmp-*')))
 
+    def test_shared_snapshots_verify_empty_large_and_corrupt_contents(self):
+        library = ctypes.CDLL(self.module.__file__)
+        library.dcc_file_cache_put.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                               ctypes.c_int, ctypes.c_char_p]
+        library.dcc_file_cache_put.restype = None
+        library.dcc_file_cache_get.argtypes = library.dcc_file_cache_put.argtypes
+        library.dcc_file_cache_get.restype = ctypes.c_int
+        root = self.cache_path.parent
+        for index, payload in enumerate((b'', bytes(range(256))*513)):
+            with self.subTest(size=len(payload)):
+                source, output = root/f'source-{index}', root/f'output-{index}'
+                source.write_bytes(payload)
+                digest = xxhash.xxh3_64_digest(payload)
+                library.dcc_file_cache_put(digest, os.fsencode(source), 1, os.fsencode(root))
+                self.assertEqual(library.dcc_file_cache_get(
+                    digest, os.fsencode(output), 1, os.fsencode(root)), 1)
+                self.assertEqual(output.read_bytes(), payload)
+                self.assertEqual(output.stat().st_ino, source.stat().st_ino)
+                output.unlink()
+                cached = next(self.cache_path.glob('*/'+digest.hex()))
+                cached.chmod(0o600)
+                cached.write_bytes(b'corrupt'+payload)
+                cached.chmod(0o400)
+                self.assertEqual(library.dcc_file_cache_get(
+                    digest, os.fsencode(output), 1, os.fsencode(root)), 0)
+                self.assertFalse(output.exists())
+
     def test_retained_shards_prune_after_fork_and_publish_atomic_snapshots(self):
         keys = []
         candidate = 0
@@ -357,11 +384,19 @@ class FrontendTest(BrokerTestCase):
     def test_remote_frontend_advertises_its_learned_memory_class(self):
         clang = self.start_frontend(DISTCC_JOB_MEMORY='1536', DISTCC_MEMORY_LEARNING='1')
         source = self.work/'frontend-memory.c'
-        source.write_text('int answer(void) { return 42; }\n')
+        source.write_text('int main(void) { return 0; }\n')
+        instrumented, profile = self.work/'instrumented', self.work/'default.profdata'
+        subprocess.run([clang, '-fprofile-generate='+str(self.work), str(source),
+                        '-o', str(instrumented)], check=True, capture_output=True)
+        subprocess.run([str(instrumented)], check=True)
+        subprocess.run([str(Path(clang).parent/'llvm-profdata'), 'merge',
+                        *map(str, self.work.glob('*.profraw')), '-o', str(profile)],
+                       check=True, capture_output=True)
         before = self.get_stats(self.stats_ports[0])
         self.assertIn('dcc_frontend_memory 1610612736\n', before)
         for index in range(2):
             result = subprocess.run([str(self.build/'distcc'), clang, '-O3', '-c', str(source),
+                                     '-fprofile-use='+str(profile),
                                      '-o', str(self.work/f'frontend-memory-{index}.o')],
                                     env=self.env, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -597,6 +632,42 @@ class FrontendTest(BrokerTestCase):
                 if value == 7:
                     self.assertLess(transfers[0], first_bytes, 'unchanged headers were retransmitted')
                 self.assertGreater(transfers[1], transfers[0], 'corrupt cache was accepted')
+
+    def test_remote_frontend_explicit_roots_support_generated_sources(self):
+        clang = self.start_frontend()
+        generated = self.work/'build'
+        sources = self.work/'source tree'
+        private = self.work/'unrelated'
+        for directory in (generated, sources, private): directory.mkdir()
+        (sources/'implementation.c').write_text('int value(void) { return 42; }\n')
+        (private/'secret.h').write_text('#define SECRET 1\n')
+        source = generated/'unified.c'
+        source.write_text('#include "../source tree/implementation.c"\n')
+        output, dependencies = generated/'unified.o', generated/'unified.d'
+        command = [clang, '-O2', '-c', str(source), '-o', str(output),
+                   '-MMD', '-MF', str(dependencies)]
+        subprocess.run(command, check=True, capture_output=True, cwd=generated)
+        expected = output.read_bytes(), dependencies.read_bytes()
+        output.unlink(); dependencies.unlink()
+        denied = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                cwd=generated, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn('Permission denied', denied.stderr)
+        self.assertFalse(output.exists())
+        for roots in (str(sources), ':../source tree/.:'):
+            with self.subTest(roots=roots):
+                result = subprocess.run([str(self.build/'distcc'), *command],
+                                        env=dict(self.env, DISTCC_FRONTEND_ROOTS=roots),
+                                        cwd=generated, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr[-6000:])
+                self.assertIn('frontend filesystem:', result.stderr)
+                self.assertEqual((output.read_bytes(), dependencies.read_bytes()), expected)
+        source.write_text('#include "../unrelated/secret.h"\n')
+        denied = subprocess.run([str(self.build/'distcc'), *command],
+                                env=dict(self.env, DISTCC_FRONTEND_ROOTS=str(sources)),
+                                cwd=generated, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn('Permission denied', denied.stderr)
 
     def test_remote_frontend_preserves_symlink_parent_and_trailing_slash(self):
         clang = self.start_frontend()

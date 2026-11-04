@@ -422,6 +422,11 @@ digest before exposing its contents. Atomic replacement and eviction preserve
 the opened inode, so large headers can remain mapped instead of being copied
 into a new heap allocation for every compilation. The compiler's shared buffer
 owns that storage and its trailing NUL independently of the cache handle.
+Shared auxiliary snapshots, including PGO profiles, verify their complete digest
+directly through a read-only mapping of the immutable opened inode. This avoids
+copying the file into a checksum buffer on every cache hit; atomic replacement
+and eviction leave the mapping valid. Private snapshot creation still combines
+copying and verification in one pass when reflinks are unavailable.
 
 Local and remote resident helpers share native descriptor dispatch and child
 ownership. Python selects and loads the configured frontend once; invocation

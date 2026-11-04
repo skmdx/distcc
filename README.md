@@ -690,6 +690,12 @@ both include-server analysis and local IR generation. Use matching Clang
 frontend libraries on the client and workers. GCC and offload compilation
 continue using their existing input preparation.
 
+Builds whose generated sources include files outside the compiler's source and
+include directories can set `DISTCC_FRONTEND_ROOTS` to a colon-separated list
+of additional source/build trees. Relative roots use the compiler's working
+directory. These extend the job's read-only filesystem access without changing
+the compiler's include search order or exposing unrelated directories.
+
 Client driver planning shares the automatic local input-preparation budget.
 Its lease is released before worker selection, so completed planning does not
 keep the client apparently busy or reserve a worker while awaiting a local CPU.

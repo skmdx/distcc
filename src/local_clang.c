@@ -162,6 +162,7 @@ int dcc_frontend_prepare(char **argv, struct dcc_job **result)
         ret = capture ? capture(argv, &job->argv, &job->fs_roots) : -1;
         if (handle) dlclose(handle);
     }
+    if (!ret) ret = dcc_frontend_fs_add_roots(job, getenv("DISTCC_FRONTEND_ROOTS"));
     if (ret) { dcc_job_free(job); return EXIT_DISTCC_FAILED; }
     *result = job;
     return 0;
