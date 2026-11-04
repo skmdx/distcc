@@ -166,8 +166,11 @@ int dcc_frontend_fs_reply(const struct dcc_job *job, const void *data, size_t si
     if (!path || append(&writer, header, 8)) goto failed;
     int access = allowed(job, path);
     int required = operation == DCC_FS_STAT || operation == DCC_FS_REALPATH ? PATH_METADATA : PATH_CONTENTS;
-    if (!(access & required)) error = EACCES;
-    else if (operation == DCC_FS_STAT) {
+    if (!(access & required)) {
+        /* Missing include candidates must retain their lookup error so Clang
+         * can continue searching. Existing unexported files stay inaccessible. */
+        error = stat(path, &st) ? errno : EACCES;
+    } else if (operation == DCC_FS_STAT) {
         if (stat(path, &st) || metadata(&writer, &st) ||
             (S_ISDIR(st.st_mode) && (access & PATH_CONTENTS) && directory(&writer, path, 1))) error = errno;
     } else if (operation == DCC_FS_READ) {

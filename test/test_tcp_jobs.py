@@ -633,6 +633,27 @@ class FrontendTest(BrokerTestCase):
                     self.assertLess(transfers[0], first_bytes, 'unchanged headers were retransmitted')
                 self.assertGreater(transfers[1], transfers[0], 'corrupt cache was accepted')
 
+    def test_remote_frontend_skips_missing_candidates_outside_roots(self):
+        clang = self.start_frontend()
+        source_root = self.work/'project'/'source'
+        (source_root/'deep').mkdir(parents=True)
+        (source_root/'headers').mkdir()
+        (source_root/'headers'/'value.h').write_text('#define VALUE 42\n')
+        (source_root/'main.c').write_text('#include "../headers/value.h"\nint value(void) { return VALUE; }\n')
+        output, dependencies = source_root/'main.o', source_root/'main.d'
+        command = [clang, '-I', str(source_root/'deep'), '-O2', '-c', 'main.c',
+                   '-o', str(output), '-MMD', '-MF', str(dependencies)]
+        # The first candidate is missing outside the source root; a later -I
+        # candidate finds the permitted header. A synthetic EACCES stops Clang.
+        subprocess.run(command, check=True, capture_output=True, cwd=source_root)
+        expected = output.read_bytes(), dependencies.read_bytes()
+        output.unlink(); dependencies.unlink()
+        result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                cwd=source_root, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr[-6000:])
+        self.assertIn('frontend filesystem:', result.stderr)
+        self.assertEqual((output.read_bytes(), dependencies.read_bytes()), expected)
+
     def test_remote_frontend_explicit_roots_support_generated_sources(self):
         clang = self.start_frontend()
         generated = self.work/'build'
@@ -784,8 +805,10 @@ int main(int argc, char **argv) {
     if (dcc_frontend_fs_reply(&job, query, length + 4, &reply)) return 2;
     free(query);
     unsigned error = dcc_tcp_get32(reply.data);
-    if (!strcmp(argv[3], "denied")) {
-        int ok = error == EACCES && reply.size == 8 && reply.fd < 0 && !reply.file_size;
+    unsigned expected_error = !strcmp(argv[3], "denied") ? EACCES :
+        !strcmp(argv[3], "missing") ? ENOENT : !strcmp(argv[3], "notdir") ? ENOTDIR : 0;
+    if (expected_error) {
+        int ok = error == expected_error && reply.size == 8 && reply.fd < 0 && !reply.file_size;
         dcc_frontend_fs_clear(&reply); return ok ? 0 : 3;
     }
     if (error) return 4;
@@ -839,6 +862,9 @@ int main(int argc, char **argv) {
         path.write_bytes(b'truncated source')
         subprocess.run([str(executable), str(self.work), str(path), 'truncate'], check=True, timeout=5)
         subprocess.run([str(executable), str(self.work/'other-root'), str(path), 'denied'], check=True, timeout=5)
+        for candidate, expected in ((self.work/'absent'/'header.h', 'missing'), (path/'header.h', 'notdir')):
+            subprocess.run([str(executable), str(self.work/'other-root'), str(candidate), expected],
+                           check=True, timeout=5)
         listing = self.work/'listing'
         listing.mkdir()
         (listing/'file').write_bytes(b'')
