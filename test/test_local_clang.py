@@ -30,6 +30,47 @@ class LocalClangTest(BrokerTestCase):
                               [self.compiler, *arguments], env=self.env, cwd=self.work,
                               capture_output=True, timeout=30, **options)
 
+    def test_driver_alias_preserves_target_and_explicit_overrides(self):
+        self.start_local()
+        target = subprocess.check_output([self.compiler, '-dumpmachine'], text=True).strip()
+        if not target.startswith(('x86_64', 'i686')):
+            self.skipTest('x86 compiler required')
+        compiler = self.compiler
+        (self.work/'source.S').write_text('.text\n.globl probe\nprobe:\nret\n')
+        cases = [('i686', [], 1), ('i686', ['--target=x86_64-pc-linux-gnu'], 2),
+                 ('i686', ['-m64'], 2), ('x86_64', ['-m32'], 1)]
+        for target, flags, elf_class in cases:
+            with self.subTest(target=target, flags=flags):
+                alias = self.work/(target + '-pc-linux-gnu-clang')
+                if not alias.exists():
+                    alias.symlink_to(compiler)
+                self.compiler = str(alias)
+                artifacts = []
+                for reused in (False, True):
+                    result = self.command(['-march=native', '-mtune=native', *flags,
+                                           '-c', 'source.S', '-o', 'out'], reused)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    artifacts.append((self.work/'out').read_bytes())
+                    (self.work/'out').unlink()
+                self.assertEqual(artifacts[0][:5], b'\x7fELF' + bytes([elf_class]))
+                self.assertEqual(artifacts[1], artifacts[0])
+        self.assertIn('reused local compiler libraries', (self.work/'client.log').read_text())
+
+    def test_driver_alias_selects_cxx_mode(self):
+        self.start_local()
+        compiler = shutil.which('clang++')
+        if not compiler:
+            self.skipTest('Clang C++ driver unavailable')
+        self.compiler = compiler
+        (self.work/'source.cc').write_text('#include <vector>\n'
+            'int main() { std::vector<int> values{42}; return values.at(0) != 42; }\n')
+        for reused in (False, True):
+            result = self.command(['source.cc', '-o', 'out'], reused)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            subprocess.run([self.work/'out'], check=True, capture_output=True)
+            (self.work/'out').unlink()
+        self.assertIn('reused local compiler libraries', (self.work/'client.log').read_text())
+
     def test_large_command_preserves_driver_arguments(self):
         self.start_local()
         source = self.work/'source with spaces.c'

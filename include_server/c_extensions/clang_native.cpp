@@ -7,6 +7,7 @@
 #include <clang/Driver/ToolChain.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/FrontendTool/Utils.h>
+#include <clang/Tooling/Tooling.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/Support/TargetSelect.h>
@@ -64,7 +65,12 @@ public:
     }
 };
 
-int run(llvm::ArrayRef<const char *> args) {
+int run(llvm::ArrayRef<const char *> original) {
+    // Let Clang expand driver-name defaults before explicit options override them.
+    std::vector<std::string> command(original.begin(), original.end());
+    clang::tooling::addTargetAndModeForProgramName(command, original.front());
+    llvm::SmallVector<const char *> args;
+    for (const auto &argument : command) args.push_back(argument.c_str());
     int status = 1;
     {
         clang::DiagnosticOptions options;
