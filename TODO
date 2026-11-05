@@ -2,6 +2,15 @@ TODO list for distcc
 
 --> See also TODO and FIXME comments in source files and doc/todo/
 
+Python PGO integration follow-ups
+
+    A Python 3.14.10_p1 build on tmpfs reported two test_file assertions
+    (read1 returned 2097152 bytes; the test expected 131072) and profile
+    merger counter mismatches. The Gentoo PGO workload tolerates test
+    failures and continued into the optimized build. Determine the causes
+    independently of the fixed helper-import and bytecode-cache failures;
+    these diagnostics must not be reported as passing PGO tests.
+
 type-check TCP integration tests
 
     test/test_tcp_jobs.py has existing Pyright diagnostics for unchecked
