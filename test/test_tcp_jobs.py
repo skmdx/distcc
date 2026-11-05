@@ -670,6 +670,61 @@ class FrontendTest(BrokerTestCase):
         self.assertIn('frontend filesystem:', result.stderr)
         self.assertEqual((output.read_bytes(), dependencies.read_bytes()), expected)
 
+    def test_portage_frontend_exports_package_work_tree(self):
+        clang = self.start_frontend()
+        package = self.work/'package work'
+        source_dir = package/'source'/'src'
+        platform = package/'source'/'mkspecs'/'platform'
+        common = platform.parent/'common'
+        generated = package/'build'
+        extra, private = self.work/'extra', self.work/'private'
+        for directory in (source_dir, platform, common, generated, extra, private):
+            directory.mkdir(parents=True, exist_ok=True)
+        (common/'value.h').write_text('#define VALUE 42\n')
+        (platform/'platform.h').write_text('#include "../common/value.h"\n')
+        (private/'secret.h').write_text('#define SECRET 1\n')
+        source = source_dir/'main.c'
+        source.write_text('#include <platform.h>\nint value(void) { return VALUE; }\n')
+        output, deps = generated/'main.o', generated/'main.d'
+        command = [clang, '-I', str(platform), '-O2', '-c', str(source),
+                   '-o', str(output), '-MMD', '-MF', str(deps)]
+        subprocess.run(command, check=True, capture_output=True, cwd=generated)
+        expected = output.read_bytes(), deps.read_bytes()
+        hook = self.build/'packaging/gentoo/pump.bashrc'
+        script = '''
+has() { local word=$1; shift; [[ " $* " == *" $word "* ]]; }
+register_die_hook() { :; }
+die() { echo "$*" >&2; exit 1; }
+source "$1"
+shift
+trap distcc_pump_stop EXIT
+distcc_pump_start
+distcc_pump_start
+[[ $DISTCC_FRONTEND_ROOTS == "$EXPECTED_ROOTS" ]] || exit 98
+"$@"
+'''
+        for pump in ('0', '1'):
+            with self.subTest(pump=pump):
+                output.unlink(missing_ok=True); deps.unlink(missing_ok=True)
+                env = dict(self.env, WORKDIR=str(package), T=str(generated), FEATURES='distcc',
+                           DISTCC_PUMP=pump, DISTCC_FRONTEND_ROOTS=str(extra),
+                           EXPECTED_ROOTS=str(extra) + ':' + str(package),
+                           PATH=str(self.build) + os.pathsep + self.env['PATH'])
+                result = subprocess.run(['bash', '-c', script, 'portage-frontend', str(hook),
+                                         str(self.build/'distcc'), *command],
+                                        env=env, cwd=generated, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('frontend filesystem:', result.stderr)
+                self.assertEqual((output.read_bytes(), deps.read_bytes()), expected)
+        source.write_text('#include "../../../private/secret.h"\n')
+        output.unlink()
+        result = subprocess.run(['bash', '-c', script, 'portage-frontend', str(hook),
+                                 str(self.build/'distcc'), *command],
+                                env=env, cwd=generated, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Permission denied', result.stderr)
+        self.assertFalse(output.exists())
+
     def test_remote_frontend_explicit_roots_support_generated_sources(self):
         clang = self.start_frontend()
         generated = self.work/'build'

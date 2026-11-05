@@ -695,6 +695,9 @@ include directories can set `DISTCC_FRONTEND_ROOTS` to a colon-separated list
 of additional source/build trees. Relative roots use the compiler's working
 directory. These extend the job's read-only filesystem access without changing
 the compiler's include search order or exposing unrelated directories.
+The Portage phase hook adds the package's `WORKDIR` automatically, retaining
+explicit roots. This covers sibling headers and generated sources even when
+the pump analyzer is disabled.
 
 Client driver planning shares the automatic local input-preparation budget.
 Its lease is released before worker selection, so completed planning does not

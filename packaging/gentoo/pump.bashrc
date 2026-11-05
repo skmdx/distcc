@@ -9,6 +9,12 @@ distcc_pump_remove_root() {
 }
 
 distcc_pump_start() {
+    # Headers may include siblings outside any individual -I directory.
+    # Portage owns the package work tree, including generated sources, even
+    # when Clang's lazy frontend is used without the pump analyzer.
+    if [[ -n ${WORKDIR:-} && :${DISTCC_FRONTEND_ROOTS-}: != *:"${WORKDIR}":* ]]; then
+        export DISTCC_FRONTEND_ROOTS="${DISTCC_FRONTEND_ROOTS:+${DISTCC_FRONTEND_ROOTS}:}${WORKDIR}"
+    fi
     [[ ${DISTCC_PUMP:-0} == 1 ]] || return 0
     [[ -z ${INCLUDE_SERVER_PORT} ]] || return 0
     has distcc ${FEATURES} || die "DISTCC_PUMP requires FEATURES=distcc"
