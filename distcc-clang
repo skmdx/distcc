@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import distcc_python
 
 
 def load_frontend(compiler, module='clang_compile'):

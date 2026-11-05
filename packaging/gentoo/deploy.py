@@ -51,6 +51,7 @@ def release(overlay):
     run(['git', '-C', ROOT, 'diff', '--exit-code', match[1], '--', 'src', 'include_server',
          'configure.ac', 'Makefile.in', 'pump.in', 'distcc-link', 'distcc-clang', 'distcc-rust',
          'distcc-thinlto', 'distcc-offload', 'distcc-offload-link', 'distcc_lto.py', 'distcc_job.py',
+         'distcc_python.py',
          'packaging/systemd', 'packaging/gentoo/*.bashrc'])
     return version, ebuild
 

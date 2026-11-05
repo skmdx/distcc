@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import distcc_python
 import xxhash
 
 from distcc_job import LocalOnly, fingerprint, snapshot, write_metadata

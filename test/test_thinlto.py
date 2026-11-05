@@ -515,7 +515,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
                                   for i in range(2)), name='ranked')
         planner = self.work / 'planner'
         planner.mkdir()
-        for name in ('distcc-thinlto', 'distcc_lto.py', 'distcc_job.py'):
+        for name in ('distcc-thinlto', 'distcc_lto.py', 'distcc_job.py', 'distcc_python.py'):
             shutil.copy2(self.build / name, planner / name)
         proxy = planner / 'distcc'
         proxy.write_text('#!/usr/bin/env python3\nimport os, sys, time\n'

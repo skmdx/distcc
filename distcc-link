@@ -26,6 +26,7 @@ import sys
 import tarfile
 import tempfile
 import uuid
+import distcc_python
 
 
 class LocalOnly(Exception):

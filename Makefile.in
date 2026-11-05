@@ -231,6 +231,7 @@ dist_extra =							\
 	src/llvm-linker-wrapper.patch \
 	distcc-offload \
 	distcc_job.py \
+	distcc_python.py \
 	src/rust_native.cc \
 	src/clang_driver.cc \
 	src/argv_file.h \
@@ -271,6 +272,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_rust.py \
 	test/test_thinlto.py \
 	test/test_link.py \
+	test/test_python_runtime.py \
 	test/test_native.py \
 	test/test_offload.py \
 	test/test_protocol.py \
@@ -925,6 +927,7 @@ adaptive-check: distcc distccd h_hosts h_compile include-server
 	$(PYTHON) "$(srcdir)/test/test_rust.py" -v
 	$(PYTHON) "$(srcdir)/test/test_thinlto.py" -v
 	$(PYTHON) "$(srcdir)/test/test_link.py" -v
+	$(PYTHON) "$(srcdir)/test/test_python_runtime.py" -v
 	$(PYTHON) "$(srcdir)/test/test_native.py" -v
 	$(PYTHON) "$(srcdir)/test/test_offload.py" -v
 	$(PYTHON) "$(srcdir)/test/test_protocol.py" -v
@@ -1228,6 +1231,7 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	fi
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-offload" "$(DESTDIR)$(bindir)/distcc-offload"
 	$(INSTALL_DATA) "$(srcdir)/distcc_job.py" "$(DESTDIR)$(bindir)/distcc_job.py"
+	$(INSTALL_DATA) "$(srcdir)/distcc_python.py" "$(DESTDIR)$(bindir)/distcc_python.py"
 	if test -n "$(RUST_NATIVE_TARGET)"; then \
 	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
 	  $(INSTALL_PROGRAM) distcc-rust-native.so "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"; \
@@ -1373,6 +1377,7 @@ uninstall-programs:
 	rm -f "$(DESTDIR)$(bindir)/distcc-link"
 	rm -f "$(DESTDIR)$(bindir)/distcc-rust"
 	rm -f "$(DESTDIR)$(bindir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc_job.py"
+	rm -f "$(DESTDIR)$(bindir)/distcc_python.py"
 	rm -f "$(DESTDIR)$(bindir)/distcc-offload-link" "$(DESTDIR)$(bindir)/distcc_lto.py" "$(DESTDIR)$(bindir)/distcc-linker-wrapper"
 	rm -f "$(DESTDIR)$(bindir)/distcc-offload"
 	rm -f "$(DESTDIR)$(bindir)/distcc-clang"

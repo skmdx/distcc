@@ -5,6 +5,7 @@ import os
 import shutil
 import struct
 
+import distcc_python
 import xxhash
 
 
