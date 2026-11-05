@@ -71,6 +71,30 @@ class LocalClangTest(BrokerTestCase):
             (self.work/'out').unlink()
         self.assertIn('reused local compiler libraries', (self.work/'client.log').read_text())
 
+    def test_verbose_link_preserves_implicit_library_diagnostics(self):
+        self.start_local()
+        saved = dict(self.env)
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='verbose-link')
+        saved.update({key: self.env[key] for key in ('DISTCC_HOSTS', 'DISTCC_BROKER')})
+        self.env = saved
+        self.env.pop('DISTCC_VERBOSE', None)
+        (self.work/'openmp.c').write_text('#include <omp.h>\n'
+            'int main(void) { return omp_get_max_threads() < 1; }\n')
+        compiled = self.command(['-fopenmp', '-c', 'openmp.c', '-o', 'openmp.o'])
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        for reused in (False, True):
+            result = self.command(['-v', '-fopenmp', '-fuse-ld=lld', 'openmp.o', '-o', 'out'], reused)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b'clang version', result.stderr)
+            self.assertIn(b'-lomp', result.stderr)
+            self.assertIn(b'ld.lld', result.stderr)
+            subprocess.run([self.work/'out'], check=True, capture_output=True)
+        (self.work/'out').unlink()
+        result = self.command(['-###', '-fopenmp', '-fuse-ld=lld', 'openmp.o', '-o', 'out'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b'-lomp', result.stderr)
+        self.assertFalse((self.work/'out').exists())
+
     def test_large_command_preserves_driver_arguments(self):
         self.start_local()
         source = self.work/'source with spaces.c'

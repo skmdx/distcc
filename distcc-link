@@ -229,11 +229,9 @@ def clang_link_command(command, *, offload=False):
         linker = invocation[0]
     if not re.fullmatch(r'ld\.lld(?:-\d+)?', Path(linker).name):
         raise LocalOnly('Clang remote links require LLD')
-    return invocation
-
-
-def clang_link_args(command):
-    return clang_link_command(command)[1:]
+    # Configure probes parse the driver's verbose link line to discover
+    # implicit runtimes. Keep it with the plan until that plan is executed.
+    return invocation, result.stderr if '-v' in command[1:] else ''
 
 
 def lld_for(compiler):
@@ -315,9 +313,11 @@ def prepare_job(command, profile, identity=None):
         raise LocalOnly('GCC native object links require client-side CPU expansion')
     if not KEY.fullmatch(profile['key']):
         raise LocalOnly('invalid sysroot key')
+    diagnostics = ''
     if compiler_family(compiler) == 'clang':
-        args = clang_link_args([compiler, *args])
-    return map_link_job(compiler, args, profile, identity)
+        invocation, diagnostics = clang_link_command([compiler, *args])
+        args = invocation[1:]
+    return (*map_link_job(compiler, args, profile, identity), diagnostics)
 
 
 def map_link_job(compiler, args, profile, identity, source_root=None):
@@ -1178,9 +1178,11 @@ def main():
         print('usage: distcc-link COMPILER [link options]\n'
               '       distcc-link --sync|--refresh SNAPSHOT COMPILER PROFILE CACHE_DIRECTORY...', file=sys.stderr)
         return 1
+    if '-###' in command[1:]:
+        os.execvp(command[0], command)
     try:
         if os.environ.get('DISTCC_BROKER') and compiler_family(command[0]) == 'clang':
-            invocation = clang_link_command(command, offload=True)
+            invocation, diagnostics = clang_link_command(command, offload=True)
             args = invocation[1:]
             offload = Path(invocation[0]).name == 'clang-linker-wrapper'
             distributed = any(arg.startswith('--thinlto-distributor=') for arg in args)
@@ -1200,6 +1202,8 @@ def main():
                         '--device-compiler-path=' + compiler, *args, *options]
                 else:
                     invocation.extend(options)
+                sys.stderr.write(diagnostics)
+                sys.stderr.flush()
                 result = subprocess.call(invocation)
                 if not result or os.environ.get('DISTCC_FALLBACK') == '0':
                     return result
@@ -1210,7 +1214,9 @@ def main():
             path /= compiler_family(command[0]) + '.json'
         profile = json.loads(path.read_text())
         check_source(profile)
-        job, inputs, output = prepare_job(command, profile)
+        job, inputs, output, diagnostics = prepare_job(command, profile)
+        sys.stderr.write(diagnostics)
+        sys.stderr.flush()
         result = remote_link(job, inputs, output)
         if not result or os.environ.get('DISTCC_FALLBACK') == '0':
             return result

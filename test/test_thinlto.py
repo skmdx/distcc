@@ -679,6 +679,34 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
             self.assertEqual(actual.stdout, '0\n1\n2\n')
 
     @unittest.skipUnless(shutil.which('cmake') and shutil.which('ninja'), 'CMake and Ninja required')
+    def test_cmake_discovers_openmp_with_link_launcher(self):
+        (self.work / 'main.c').write_text('#include <omp.h>\n'
+            'int main(void) { return omp_get_max_threads() < 1; }\n')
+        (self.work / 'main.cpp').write_text((self.work / 'main.c').read_text())
+        (self.work / 'CMakeLists.txt').write_text(
+            'cmake_minimum_required(VERSION 3.21)\nproject(openmp_probe C CXX)\n'
+            'find_package(OpenMP REQUIRED)\n'
+            'add_executable(check_c main.c)\n'
+            'target_link_libraries(check_c PRIVATE OpenMP::OpenMP_C)\n'
+            'add_executable(check_cxx main.cpp)\n'
+            'target_link_libraries(check_cxx PRIVATE OpenMP::OpenMP_CXX)\n')
+        for language in ('C', 'CXX'):
+            self.env[f'CMAKE_{language}_COMPILER_LAUNCHER'] = str(self.build / 'distcc')
+            self.env[f'CMAKE_{language}_LINKER_LAUNCHER'] = str(self.build / 'distcc')
+        compiler, cxx = shutil.which('clang'), shutil.which('clang++')
+        assert compiler is not None and cxx is not None
+        build = self.work / 'build'
+        result = self.run_command(['cmake', '-S', self.work, '-B', build, '-G', 'Ninja',
+                                  '-DCMAKE_C_COMPILER=' + compiler,
+                                  '-DCMAKE_CXX_COMPILER=' + cxx,
+                                  '-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.run_command(['cmake', '--build', build])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for program in ('check_c', 'check_cxx'):
+            self.assertEqual(self.run_command([build / program]).returncode, 0)
+
+    @unittest.skipUnless(shutil.which('cmake') and shutil.which('ninja'), 'CMake and Ninja required')
     def test_cmake_link_launcher(self):
         for language, suffix, driver in (('C', 'c', 'clang'), ('HIP', 'hip', 'clang++')):
             with self.subTest(language=language):
