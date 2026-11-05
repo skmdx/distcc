@@ -266,6 +266,10 @@ class FrontendTest(BrokerTestCase):
     def test_remote_codegen_shares_ipc_and_preserves_cpp_results(self):
         self.check_remote_codegen(4)
 
+    @unittest.skipUnless(os.uname().machine in ('x86_64', 'i686'), 'x86 target required')
+    def test_remote_codegen_preserves_32bit_shared_library_calls(self):
+        self.check_remote_codegen(4, shared=True)
+
     def test_remote_codegen_respects_single_cpu_limit(self):
         self.check_remote_codegen(1)
 
@@ -328,7 +332,7 @@ class FrontendTest(BrokerTestCase):
         recovered = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
 
-    def check_remote_codegen(self, jobs, compiler=None):
+    def check_remote_codegen(self, jobs, compiler=None, shared=False):
         clang = self.start_frontend(jobs=jobs, DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
         if compiler: clang = compiler
         source = self.work/'partition.cpp'
@@ -343,13 +347,25 @@ class FrontendTest(BrokerTestCase):
                                     'try { if (n&1) throw n; return n+values[0]+bias; } '
                                     'catch (unsigned v) { return v+values[1]; }}' for i in range(8)) +
                           '\nint main() { std::printf("%u\\n", ' +
-                          '+'.join(f'f{i}(2)' for i in range(8)) + '); }\n')
+                          '+'.join(f'f{i}(2)' for i in range(8)) + '); return 0; }\n')
+        flags = ['-m32', '-fPIC', '-fno-semantic-interposition'] if shared else []
+        if shared:
+            source.write_text(source.read_text().replace('int main()', 'int entry()'))
+            (self.work/'main.cpp').write_text('int entry(); int main() { return entry(); }\n')
         output, deps = self.work/'partition.o', self.work/'partition.d'
-        command = [clang, '--driver-mode=g++', '-O3', '-g', '-ffunction-sections', '-fdata-sections',
+        command = [clang, '--driver-mode=g++', *flags, '-O3', '-g', '-ffunction-sections', '-fdata-sections',
                    '-MMD', '-MF', str(deps), '-c', str(source), '-o', str(output)]
         executable = self.work/'partition'
         def result():
-            subprocess.run([clang, '--driver-mode=g++', str(output), '-o', str(executable)],
+            link_input = [str(output)]
+            if shared:
+                linked = subprocess.run([clang, '--driver-mode=g++', *flags, '-fuse-ld=lld',
+                                         '-shared', '-Wl,-z,text', str(output), '-o', 'libpartition.so'],
+                                        cwd=self.work, capture_output=True, timeout=30)
+                self.assertEqual(linked.returncode, 0, linked.stderr)
+                link_input = ['main.cpp', '-L.', '-lpartition', '-Wl,-rpath,$ORIGIN']
+            subprocess.run([clang, '--driver-mode=g++', *flags, *link_input, '-o', str(executable)],
+                           cwd=self.work,
                            check=True, capture_output=True, timeout=30)
             return subprocess.check_output([str(executable)]), deps.read_bytes()
         subprocess.run(command, check=True, capture_output=True, timeout=30)

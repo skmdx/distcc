@@ -252,6 +252,16 @@ class LocalClangTest(BrokerTestCase):
     def test_codegen_uses_spare_leases_and_preserves_result(self):
         self.check_codegen(False)
 
+    def test_codegen_shared_library_preserves_local_calls(self):
+        self.check_codegen(False, shared_flags=['-fPIC', '-fno-semantic-interposition'])
+
+    def test_codegen_shared_library_preserves_interposition(self):
+        self.check_codegen(False, shared_flags=['-fPIC', '-fsemantic-interposition'])
+
+    @unittest.skipUnless(os.uname().machine in ('x86_64', 'i686'), 'x86 target required')
+    def test_codegen_32bit_shared_library_preserves_local_calls(self):
+        self.check_codegen(False, shared_flags=['-m32', '-fPIC', '-fno-semantic-interposition'])
+
     def test_codegen_selects_the_fastest_predicted_partition_count(self):
         self.start_local()
         header = self.build/'include_server/c_extensions/clang_codegen.h'
@@ -386,7 +396,7 @@ int main() {
         leases = [self.request(15) for _ in range(4)]
         for lease in leases: self.assertEqual(self.receive(lease), (0, 1, []))
 
-    def check_codegen(self, occupied, cpp=False, compiler=None, verbose=True):
+    def check_codegen(self, occupied, cpp=False, compiler=None, verbose=True, shared_flags=None):
         self.start_local()
         if compiler: self.compiler = compiler
         if cpp:
@@ -415,19 +425,35 @@ int main() {
                               source.read_text().replace('_Thread_local', 'thread_local')
                               .replace('return n; }', 'try { if (n&1) throw n; return n+values[0]; } '
                                        'catch (unsigned v) { return v+values[1]; } }'))
+        flags = shared_flags or []
+        if shared_flags:
+            source.write_text(source.read_text().replace('int main(void)', 'int entry(void)'))
+            (self.work/'main.c').write_text('unsigned f1(unsigned n) { return n + 9001; }\n'
+                                          'int entry(void); int main(void) { return entry(); }\n')
         # The first serial job supplies measured codegen cost to the shared
         # compiler parent. No guessed throughput or fixed size cutoff is used.
-        warm = self.command(['-O3', '-c', 'codegen.c', '-o', 'codegen.o'])
+        warm = self.command([*flags, '-O3', '-c', 'codegen.c', '-o', 'codegen.o'])
         self.assertEqual(warm.returncode, 0, warm.stderr)
         expected = None
         for reused in (False, True):
-            result = self.command(['-O3', '-g', '-ffunction-sections', '-fdata-sections',
+            result = self.command([*flags, '-O3', '-g', '-ffunction-sections', '-fdata-sections',
                                    '-MMD', '-MF', 'codegen.d', '-c', 'codegen.c', '-o', 'codegen.o'], reused)
             self.assertEqual(result.returncode, 0, result.stderr)
-            subprocess.run([self.compiler, 'codegen.o', '-o', 'codegen'], cwd=self.work,
+            link_input = ['codegen.o']
+            if shared_flags:
+                linked = subprocess.run([self.compiler, *flags, '-fuse-ld=lld', '-shared',
+                                         '-Wl,-z,text', 'codegen.o', '-o', 'libcodegen.so'],
+                                        cwd=self.work, capture_output=True)
+                self.assertEqual(linked.returncode, 0, linked.stderr)
+                link_input = ['main.c', '-L.', '-lcodegen', '-Wl,-rpath,$ORIGIN']
+            subprocess.run([self.compiler, *flags, *link_input, '-o', 'codegen'], cwd=self.work,
                            capture_output=True, check=True)
             actual = (subprocess.check_output([str(self.work/'codegen')]),
                       (self.work/'codegen.d').read_bytes())
+            if shared_flags:
+                symbols = subprocess.check_output(['nm', '-D', '--defined-only', '--format=posix',
+                                                   'libcodegen.so'], cwd=self.work, text=True)
+                actual += (sorted(tuple(line.split()[:2]) for line in symbols.splitlines()),)
             if expected is None: expected = actual
             else: self.assertEqual(actual, expected)
         self.assertEqual(b'distcc codegen:' in result.stderr, not occupied,

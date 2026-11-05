@@ -1,5 +1,6 @@
 #include "lto_partition.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -7,6 +8,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
 #include <algorithm>
 #include <memory>
 #include <vector>
@@ -52,6 +54,28 @@ dcc_split_module(Module &module, unsigned count,
     if (auto error = emit(module, true))
       return std::move(error);
   } else {
+    // AsmPrinter normally uses a local alias for these definitions. After
+    // splitting, a caller only sees a declaration, so that alias is no longer
+    // available (and i386 emits an invalid PC32 relocation for a shared DSO).
+    // Keep the definition internal and export its original name as an alias.
+    // LLVM then preserves local binding across parts, and the usual merge
+    // restores the promoted internal name without hiding the public symbol.
+    if (Triple(module.getTargetTriple()).isOSBinFormatELF() &&
+        module.getPICLevel() != PICLevel::NotPIC &&
+        module.getPIELevel() == PIELevel::Default) {
+      std::vector<GlobalValue *> definitions;
+      for (auto &global : module.global_values())
+        if (global.isDSOLocal() && global.canBenefitFromLocalAlias())
+          definitions.push_back(&global);
+      for (auto *global : definitions) {
+        std::string name = global->getName().str();
+        global->setName(name + ".distcc.local");
+        auto *alias = GlobalAlias::create(name, global);
+        alias->setDSOLocal(true);
+        alias->setThreadLocalMode(global->getThreadLocalMode());
+        global->setLinkage(GlobalValue::InternalLinkage);
+      }
+    }
     std::vector<GlobalValue *> locals;
     for (auto &global : module.global_values())
       if (global.hasLocalLinkage())
