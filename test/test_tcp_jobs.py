@@ -617,6 +617,31 @@ class FrontendTest(BrokerTestCase):
                 self.assertTrue(deps.is_file(), 'Remote compile lost the default dependency path')
                 self.assertEqual((output.read_bytes(), deps.read_bytes()), expected)
 
+    def test_remote_frontend_preserves_warning_errors(self):
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        source = self.work/'source.c'
+        output = self.work/'source.o'
+        for flags in ([], ['-flto=thin']):
+            with self.subTest(flags=flags):
+                source.write_text('int value(void) { return 42; }\n')
+                command = [clang, *flags, '-c', 'source.c', '-o', str(output)]
+                valid = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                       cwd=self.work, capture_output=True, timeout=30)
+                self.assertEqual(valid.returncode, 0, valid.stderr)
+                self.assertIn(b'frontend filesystem:', valid.stderr)
+                if not flags: self.assertIn(b'distcc codegen plan:', valid.stderr)
+                source.write_text('#warning remote diagnostic must be an error\nint value;\n')
+                command += ['-Werror']
+                results = []
+                for distributed in (False, True):
+                    output.unlink(missing_ok=True)
+                    result = subprocess.run(([str(self.build/'distcc')] if distributed else []) + command,
+                                            env=self.env, cwd=self.work, capture_output=True, timeout=30)
+                    self.assertIn(b'error: remote diagnostic must be an error', result.stderr)
+                    if distributed: self.assertIn(b'frontend filesystem:', result.stderr)
+                    results.append((result.returncode, output.exists()))
+                self.assertEqual(results, [(1, False), (1, False)])
+
     def test_remote_frontend_owns_preprocessing_and_dependency_output(self):
         clang = self.start_frontend()
         include = self.work / 'headers'

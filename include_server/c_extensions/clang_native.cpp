@@ -87,9 +87,8 @@ int run(llvm::ArrayRef<const char *> original) {
             auto compile = [&] {
                 auto invocation = std::make_shared<clang::CompilerInvocation>();
                 DccChildCompiler instance(new clang::CompilerInstance(invocation));
-                instance->createDiagnostics();
-                if (!clang::CompilerInvocation::CreateFromArgs(*invocation,
-                    llvm::ArrayRef(command).drop_front(2), instance->getDiagnostics(), args[0])) return 1;
+                if (!dcc_parse_compiler_invocation(*instance,
+                    llvm::ArrayRef(command).drop_front(2), args[0])) return 1;
                 if (auto result = dcc_clang_codegen(*instance)) return *result ? 0 : 1;
                 return clang::ExecuteCompilerInvocation(instance.get()) ? 0 : 1;
             };

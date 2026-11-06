@@ -167,8 +167,7 @@ static int compile_file(int request, int fd) {
     bool ok = false;
     auto invocation = std::make_shared<clang::CompilerInvocation>();
     DccChildCompiler compiler(new clang::CompilerInstance(invocation, std::make_shared<clang::PCHContainerOperations>()));
-    compiler->createDiagnostics();
-    if (clang::CompilerInvocation::CreateFromArgs(*invocation, args, compiler->getDiagnostics())) {
+    if (dcc_parse_compiler_invocation(*compiler, args)) {
         invocation->getFrontendOpts().OutputFile = output;
         auto &deps = invocation->getDependencyOutputOpts();
         if (!deps.OutputFile.empty()) deps.OutputFile = dependencies;

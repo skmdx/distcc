@@ -173,6 +173,9 @@ class LocalClangTest(BrokerTestCase):
             ['-cc1','-help'],
             ['-c', 'source.c', '/wd4189', '-o', 'out'],
             ['-c', 'source.c', '-fno-such-distcc-option', '-o', 'out'],
+            ['-c', 'source.c', '-Werror=unknown-warning-option',
+             '-Wdistcc-unknown-warning', '-o', 'out'],
+            ['-c', 'warning.c', '-Werror', '-o', 'out'],
             ['-c', 'warning.c', '-o', 'out', '-serialize-diagnostics', 'out.dia'],
             ['-c', 'error.c', '-o', 'out', '-serialize-diagnostics', 'out.dia'],
         ]
@@ -316,6 +319,28 @@ class LocalClangTest(BrokerTestCase):
 
     def test_codegen_uses_spare_leases_and_preserves_result(self):
         self.check_codegen(False)
+
+    def test_codegen_preserves_warning_option_errors(self):
+        self.start_local()
+        saved = dict(self.env)
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='diagnostics')
+        saved.update({key: self.env[key] for key in ('DISTCC_HOSTS', 'DISTCC_BROKER')})
+        self.env = saved
+        (self.work/'source.c').write_text('int value(void) { return 42; }\n')
+        valid = self.command(['-c', 'source.c', '-o', 'source.o'])
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        self.assertIn(b'distcc codegen plan:', valid.stderr)
+        for flags in (['-Werror=unknown-warning-option', '-Wdistcc-unknown-warning'],
+                      ['-Werror', '-Wdistcc-unknown-warning']):
+            with self.subTest(flags=flags):
+                results = []
+                for reused in (False, True):
+                    (self.work/'source.o').unlink(missing_ok=True)
+                    result = self.command(['-c', 'source.c', *flags, '-o', 'source.o'], reused)
+                    results.append((result.returncode, (self.work/'source.o').exists()))
+                    self.assertIn(b'error: unknown warning option', result.stderr)
+                self.assertEqual(results[0], (1, False))
+                self.assertEqual(results[1], results[0])
 
     def test_codegen_shared_library_preserves_local_calls(self):
         self.check_codegen(False, shared_flags=['-fPIC', '-fno-semantic-interposition'])

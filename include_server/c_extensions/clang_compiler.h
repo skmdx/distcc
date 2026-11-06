@@ -4,6 +4,7 @@
 #define DCC_CLANG_COMPILER_H
 
 #include <clang/Frontend/CompilerInstance.h>
+#include <clang/Frontend/TextDiagnosticBuffer.h>
 #include <llvm/Support/BuryPointer.h>
 #include <memory>
 
@@ -20,5 +21,19 @@ struct DccCompilerDeleter {
     }
 };
 using DccChildCompiler = std::unique_ptr<clang::CompilerInstance, DccCompilerDeleter>;
+
+inline bool dcc_parse_compiler_invocation(clang::CompilerInstance &compiler,
+    llvm::ArrayRef<const char *> args, const char *argv0 = nullptr) {
+    // Like cc1_main, buffer argument diagnostics until the invocation supplies
+    // the warning policy and diagnostic output settings for the real engine.
+    clang::DiagnosticOptions options;
+    clang::TextDiagnosticBuffer buffer;
+    clang::DiagnosticsEngine diagnostics(clang::DiagnosticIDs::create(), options, &buffer, false);
+    bool parsed = clang::CompilerInvocation::CreateFromArgs(
+        compiler.getInvocation(), args, diagnostics, argv0);
+    compiler.createDiagnostics();
+    buffer.FlushDiagnostics(compiler.getDiagnostics());
+    return parsed && !compiler.getDiagnostics().hasErrorOccurred();
+}
 
 #endif
