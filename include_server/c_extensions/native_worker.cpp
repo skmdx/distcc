@@ -35,6 +35,10 @@ bool child_descriptors(int *fds) {
 }
 
 int dcc_native_worker(int control, int (*execute)(int, bool)) {
+    // This service outlives its caller. Retain only stdio and its control
+    // channel; inherited pipes and locks would keep the caller's jobs alive.
+    if (dup2(control, 3) < 0 || close_range(4, ~0U, 0)) return 1;
+    control = 3;
     int events = -1, signals = -1;
     struct job { int peer; pid_t group; };
     std::map<pid_t, job> jobs;

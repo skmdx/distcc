@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -29,6 +30,46 @@ class LocalClangTest(BrokerTestCase):
         return subprocess.run(([str(self.build/'distcc')] if reused else [])+
                               [self.compiler, *arguments], env=self.env, cwd=self.work,
                               capture_output=True, timeout=30, **options)
+
+    def test_resident_worker_releases_inherited_caller_pipe(self):
+        self.start_local()
+        reader, writer = os.pipe()
+        try:
+            result = self.command(['-dumpversion'], pass_fds=(writer,))
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            os.close(writer)
+        try:
+            self.assertTrue(select.select([reader], [], [], 2)[0],
+                            'A completed command must not keep its caller waiting for EOF')
+            self.assertEqual(os.read(reader, 1), b'')
+            again = self.command(['-dumpversion'])
+            self.assertEqual((again.returncode, again.stdout), (0, result.stdout))
+            self.assertEqual((self.work/'client.log').read_text().count(
+                'started local compiler libraries'), 1)
+        finally:
+            os.close(reader)
+
+    def test_ccache_compiler_query_completes_with_resident_worker(self):
+        self.start_local()
+        ccache = shutil.which('ccache')
+        if not ccache:
+            self.skipTest('ccache unavailable')
+        wrappers = self.work/'wrappers'
+        wrappers.mkdir()
+        name = Path(self.compiler).name
+        (wrappers/name).symlink_to(self.build/'distcc')
+        self.env.update(CCACHE_DIR=str(self.work/'ccache'),
+                        CCACHE_CONFIGPATH=str(self.work/'ccache.conf'),
+                        CCACHE_COMPILERCHECK='%compiler% -dumpversion',
+                        PATH=str(wrappers)+os.pathsep+str(Path(self.compiler).parent)+
+                             os.pathsep+self.env['PATH'])
+        (self.work/'source.c').write_text('int answer(void) { return 42; }\n')
+        result = subprocess.run([ccache, name, '-c', 'source.c', '-o', 'source.o'],
+                                env=self.env, cwd=self.work, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.work/'source.o').is_file())
+        self.assertIn('reused local compiler libraries', (self.work/'client.log').read_text())
 
     def test_driver_alias_preserves_target_and_explicit_overrides(self):
         self.start_local()
