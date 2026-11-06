@@ -614,6 +614,8 @@ class DotD_Case(SimpleDistCC_Case):
 
         cases = [
           ("foo.c -o hello.o -MD", "*.d", 1, None),
+          ("foo.c -ohello.o -MD", "*.d", 1, None),
+          ("foo.c -ofoo.c.26.o -MMD", "*.d", 1, None),
           ("foo.c -o hello.. -MD", "*.d", 1, None),
           ("foo.c -o hello.bar.foo -MD", "*.d", 1, None),
           ("foo.c -o hello.o", "*.d", 0, None),
@@ -2402,6 +2404,8 @@ if __name__ == '__main__':
     elif sys.argv[1] == "--pump":
       _server_options = ",lzo,cpp"
       del sys.argv[1]
+    else:
+      break
 
   # Some of these tests need lots of file descriptors (especially to fork),
   # but sometimes the os only supplies a few.  Try to raise that if we can.
