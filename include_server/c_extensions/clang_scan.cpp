@@ -20,6 +20,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/Path.h>
+#include <llvm/Support/Program.h>
 #include <sys/stat.h>
 #include <map>
 #include <memory>
@@ -604,8 +605,26 @@ PyObject *tokenize_command(PyObject *, PyObject *args) {
     return result;
 }
 
+PyObject *format_command(PyObject *, PyObject *args) {
+    PyObject *arguments;
+    if (!PyArg_ParseTuple(args, "O!", &PyList_Type, &arguments)) return nullptr;
+    std::string text;
+    llvm::raw_string_ostream output(text);
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(arguments); ++i) {
+        PyObject *word = PyUnicode_EncodeFSDefault(PyList_GET_ITEM(arguments, i));
+        if (!word) return nullptr;
+        output << ' ';
+        // Command::Print always quotes the executable, but -v leaves ordinary
+        // operands unquoted. LLVM owns quoting of special characters.
+        llvm::sys::printArg(output, PyBytes_AS_STRING(word), i == 0);
+        Py_DECREF(word);
+    }
+    return PyUnicode_DecodeFSDefaultAndSize(text.data(), text.size());
+}
+
 PyMethodDef methods[] = {
     {"tokenize_command", tokenize_command, METH_VARARGS, "Decode Clang driver diagnostics with LLVM's argument parser."},
+    {"format_command", format_command, METH_VARARGS, "Format a Clang verbose command with LLVM's argument printer."},
     {"compile", dcc_clang_compile, METH_VARARGS, "Compile once with the client's source identity."},
     {"scan", scan, METH_VARARGS, "Scan using libclang-cpp; return immutable inputs and lookup paths."},
     {nullptr, nullptr, 0, nullptr}};

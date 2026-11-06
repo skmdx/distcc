@@ -229,9 +229,12 @@ def clang_link_command(command, *, offload=False):
         linker = invocation[0]
     if not re.fullmatch(r'ld\.lld(?:-\d+)?', Path(linker).name):
         raise LocalOnly('Clang remote links require LLD')
-    # Configure probes parse the driver's verbose link line to discover
-    # implicit runtimes. Keep it with the plan until that plan is executed.
-    return invocation, result.stderr if '-v' in command[1:] else ''
+    # -### quotes every operand, unlike -v. Libtool parses the latter to find
+    # implicit runtimes, so use LLVM's printer to preserve that output contract.
+    verbose = ''.join(clang_scan.format_command(invocation) + '\n'
+                      if line.lstrip().startswith('"') else line
+                      for line in result.stderr.splitlines(keepends=True)) if '-v' in command[1:] else ''
+    return invocation, verbose
 
 
 def lld_for(compiler):

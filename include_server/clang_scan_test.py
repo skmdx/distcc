@@ -37,6 +37,8 @@ class ClangScanTest(unittest.TestCase):
                        if line.lstrip().startswith('"')]
         linker = next(args for args in invocations if '-rpath' in args)
         self.assertEqual(linker[linker.index('-rpath') + 1], value)
+        verbose = clang_scan.format_command(linker)
+        self.assertEqual(clang_scan.tokenize_command(verbose), linker)
 
   def test_file_stamps_with_repeated_root_separators(self):
     # Run separately so a regression cannot hang the test runner or grow its

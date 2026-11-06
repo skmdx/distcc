@@ -123,12 +123,21 @@ class LocalClangTest(BrokerTestCase):
             'int main(void) { return omp_get_max_threads() < 1; }\n')
         compiled = self.command(['-fopenmp', '-c', 'openmp.c', '-o', 'openmp.o'])
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        expected_link_line = None
         for reused in (False, True):
             result = self.command(['-v', '-fopenmp', '-fuse-ld=lld', 'openmp.o', '-o', 'out'], reused)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(b'clang version', result.stderr)
             self.assertIn(b'-lomp', result.stderr)
             self.assertIn(b'ld.lld', result.stderr)
+            link_line, = [line for line in result.stderr.splitlines()
+                          if b'ld.lld' in line and b'openmp.o' in line]
+            # Libtool filters for an unquoted -L and then splits this line on
+            # whitespace to find implicit objects and runtime libraries.
+            self.assertIn(b' -L', link_line)
+            self.assertIn(b'-lc', link_line.split())
+            if expected_link_line is None: expected_link_line = link_line
+            self.assertEqual(link_line, expected_link_line)
             subprocess.run([self.work/'out'], check=True, capture_output=True)
         (self.work/'out').unlink()
         result = self.command(['-###', '-fopenmp', '-fuse-ld=lld', 'openmp.o', '-o', 'out'])
