@@ -991,7 +991,9 @@ dcc_build_somewhere(char *argv[],
     if (prepared_job && prepared_job->kind == DCC_JOB_FRONTEND) {
         if (!host->broker_managed || host->compr != DCC_COMPRESS_LZ4_STREAM) goto fallback;
         char *target = NULL;
-        dcc_get_dotd_info(argv, &deps_fname, &needs_dotd, &sets_dotd_target, &target);
+        if ((ret = dcc_get_dotd_info(argv, &deps_fname, &needs_dotd,
+                                     &sets_dotd_target, &target)))
+            goto fallback;
         ret = dcc_compile_direct(host, prepared_job, prepared_job->argv, NULL, -1, NULL, auxiliary,
                                 output_fname, needs_dotd ? deps_fname : NULL,
                                 &server_stderr, &server_stdout, status);
@@ -1077,8 +1079,9 @@ dcc_build_somewhere(char *argv[],
         /* remotecpp_server_argv may already be processed from a previous bad host */
         if (remotecpp_server_argv == NULL) {
             char *dotd_target = NULL;
-            dcc_get_dotd_info(argv, &deps_fname, &needs_dotd,
-                              &sets_dotd_target, &dotd_target);
+            if ((ret = dcc_get_dotd_info(argv, &deps_fname, &needs_dotd,
+                                         &sets_dotd_target, &dotd_target)))
+                goto fallback;
             if ((ret = dcc_copy_argv(argv, &remotecpp_server_argv, 2)))
                 goto fallback;
             if (needs_dotd && !sets_dotd_target && (!preprocess_only || dotd_target)) {

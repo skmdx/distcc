@@ -252,7 +252,9 @@ int dcc_get_dotd_info(char **argv, char **dotd_fname,
 
         char *extension;
         char *tmp_dotd_fname;
-        ret = dcc_scan_args(argv, &input_file, &output_file, &new_args, 0);
+        /* This only derives filenames. Native flags are resolved by the
+         * compilation path, including the remote frontend's driver. */
+        ret = dcc_scan_args(argv, &input_file, &output_file, &new_args, 1);
         if (ret) {
           dcc_free_argv(new_args);
           return ret;

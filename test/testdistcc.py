@@ -616,6 +616,7 @@ class DotD_Case(SimpleDistCC_Case):
           ("foo.c -o hello.o -MD", "*.d", 1, None),
           ("foo.c -ohello.o -MD", "*.d", 1, None),
           ("foo.c -ofoo.c.26.o -MMD", "*.d", 1, None),
+          ("foo.c -ofoo.c.26.o -MMD -march=native -mtune=native", "*.d", 1, None),
           ("foo.c -o hello.. -MD", "*.d", 1, None),
           ("foo.c -o hello.bar.foo -MD", "*.d", 1, None),
           ("foo.c -o hello.o", "*.d", 0, None),

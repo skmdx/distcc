@@ -4,6 +4,7 @@ import concurrent.futures
 import array
 import ctypes
 import importlib.util
+import itertools
 import os
 from pathlib import Path
 import re
@@ -597,23 +598,24 @@ class FrontendTest(BrokerTestCase):
         source = source_dir/'input.c'
         source.write_text('#include "value.h"\nint value(void) { return VALUE; }\n')
         (source_dir/'value.h').write_text('#define VALUE 42\n')
-        for joined in (False, True):
-            for absolute in (False, True):
-                with self.subTest(joined=joined, absolute=absolute):
-                    output = output_dir/'input.c.26.o'
-                    deps = output.with_suffix('.d')
-                    name = str(output if absolute else output.relative_to(self.work))
-                    output_args = ['-o' + name] if joined else ['-o', name]
-                    command = [clang, '-MMD', '-c', 'sources/input.c', *output_args]
-                    subprocess.run(command, cwd=self.work, check=True, capture_output=True)
-                    expected = output.read_bytes(), deps.read_bytes()
-                    output.unlink(); deps.unlink()
-                    result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
-                                            cwd=self.work, capture_output=True, text=True, timeout=30)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn('frontend filesystem:', result.stderr)
-                    self.assertTrue(deps.is_file(), 'Remote compile lost the default dependency path')
-                    self.assertEqual((output.read_bytes(), deps.read_bytes()), expected)
+        for flags, joined, absolute in itertools.product(
+                ([], ['-march=native', '-mtune=native', '-flto=thin']),
+                (False, True), (False, True)):
+            with self.subTest(flags=flags, joined=joined, absolute=absolute):
+                output = output_dir/'input.c.26.o'
+                deps = output.with_suffix('.d')
+                name = str(output if absolute else output.relative_to(self.work))
+                output_args = ['-o' + name] if joined else ['-o', name]
+                command = [clang, *flags, '-MMD', '-c', 'sources/input.c', *output_args]
+                subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+                expected = output.read_bytes(), deps.read_bytes()
+                output.unlink(); deps.unlink()
+                result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                        cwd=self.work, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('frontend filesystem:', result.stderr)
+                self.assertTrue(deps.is_file(), 'Remote compile lost the default dependency path')
+                self.assertEqual((output.read_bytes(), deps.read_bytes()), expected)
 
     def test_remote_frontend_owns_preprocessing_and_dependency_output(self):
         clang = self.start_frontend()
