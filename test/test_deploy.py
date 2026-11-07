@@ -157,6 +157,15 @@ class ReleaseTest(unittest.TestCase):
     def test_committed_release(self):
         self.assertEqual(deploy.release(self.overlay), ('distcc-9.0-r1', self.ebuild))
 
+    def test_unrelated_editor_file_does_not_block_release(self):
+        (self.source / '.deploy.swp').write_bytes(b'editor state')
+        self.assertEqual(deploy.release(self.overlay), ('distcc-9.0-r1', self.ebuild))
+
+    def test_untracked_implementation_is_not_omitted(self):
+        (self.source / 'src/new_input.c').write_text('int added;\n')
+        with self.assertRaisesRegex(RuntimeError, 'uncommitted'):
+            deploy.release(self.overlay)
+
     def test_dirty_source(self):
         (self.source / 'src/input.c').write_text('int changed;\n')
         with self.assertRaisesRegex(RuntimeError, 'uncommitted'):

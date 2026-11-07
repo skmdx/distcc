@@ -43,16 +43,16 @@ def release(overlay):
     match = re.search(r'^DISTCC_COMMIT="([0-9a-f]{40})"$', ebuild.read_text(), re.M)
     if not match:
         raise RuntimeError('release must pin a full source commit')
+    inputs = ['src', 'include_server', 'configure.ac', 'Makefile.in', 'pump.in',
+              'distcc-link', 'distcc-multi', 'distcc-clang', 'distcc-rust',
+              'distcc-thinlto', 'distcc-offload', 'distcc-offload-link',
+              'distcc_lto.py', 'distcc_job.py', 'distcc_python.py',
+              'packaging/systemd', 'packaging/gentoo/*.bashrc']
     # Do not silently deploy an older implementation over pending changes.
-    for tree in (ROOT, Path(overlay)):
-        if run(['git', '-C', tree, 'status', '--porcelain', '--',
-                '.' if tree == ROOT else 'sys-devel/distcc']):
+    for tree, paths in ((ROOT, inputs), (Path(overlay), ['sys-devel/distcc'])):
+        if run(['git', '-C', tree, 'status', '--porcelain', '--', *paths]):
             raise RuntimeError(f'uncommitted deployment inputs: {tree}')
-    run(['git', '-C', ROOT, 'diff', '--exit-code', match[1], '--', 'src', 'include_server',
-         'configure.ac', 'Makefile.in', 'pump.in', 'distcc-link', 'distcc-multi', 'distcc-clang', 'distcc-rust',
-         'distcc-thinlto', 'distcc-offload', 'distcc-offload-link', 'distcc_lto.py', 'distcc_job.py',
-         'distcc_python.py',
-         'packaging/systemd', 'packaging/gentoo/*.bashrc'])
+    run(['git', '-C', ROOT, 'diff', '--exit-code', match[1], '--', *inputs])
     return version, ebuild
 
 
