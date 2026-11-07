@@ -16,6 +16,9 @@ aliases and profile identities come from Clang's own frontend; dependency files
 are produced on the client. The worker must accept the client's LLVM bitcode
 and requested target and options. GCC retains pump header discovery and remote
 preprocessing; standalone preprocessing and include scans also retain that path.
+GCC-only analyzers load the lightweight pump extension and the selected GCC
+plugin. Clang/LLVM libraries are loaded only when a Clang analysis is requested,
+avoiding unused mappings in GCC scan subprocesses.
 
 Clang HIP and direct AMDGPU C/C++/OpenCL jobs use full client preprocessing,
 even under pump. HIP compilation follows the selected driver's action graph,

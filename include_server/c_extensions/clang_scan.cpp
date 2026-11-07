@@ -658,7 +658,6 @@ PyMODINIT_FUNC PyInit_clang_scan() {
         snapshot_type = reinterpret_cast<PyTypeObject *>(type);
         Py_DECREF(type);
         PyModule_AddStringConstant(result, "version", CLANG_VERSION_STRING);
-        PyModule_AddStringConstant(result, "gcc_scan_dir", DCC_GCC_SCAN_DIR);
     }
     return result;
 }

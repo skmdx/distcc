@@ -496,6 +496,7 @@ PyInit_distcc_pump_c_extensions(void) {
       PyModule_AddObjectRef(module, "Error", st->error) < 0 ||
       PyModule_AddStringConstant(module, "__author__", "Nils Klarlund") < 0 ||
       PyModule_AddStringConstant(module, "__version__", version) < 0 ||
+      PyModule_AddStringConstant(module, "gcc_scan_dir", DCC_GCC_SCAN_DIR) < 0 ||
       PyModule_AddStringConstant(module, "cpp_lookup_library", DCC_CPP_LOOKUP_LIBRARY) < 0) {
     Py_DECREF(module);
     return NULL;

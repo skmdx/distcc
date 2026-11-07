@@ -11,7 +11,7 @@ import time
 import xxhash
 
 import basics
-import clang_scan
+import distcc_pump_c_extensions
 import gcc_scan
 import compress_files
 import include_analyzer
@@ -141,7 +141,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
         if gcc_library is None:
           target = run([compiler, '-dumpmachine']).stdout.decode().strip()
           version = run([compiler, '-dumpfullversion']).stdout.decode().strip()
-          gcc_library = os.path.join(clang_scan.gcc_scan_dir, target, version, 'distcc_gcc_scan.so')
+          gcc_library = os.path.join(distcc_pump_c_extensions.gcc_scan_dir, target, version, 'distcc_gcc_scan.so')
           self.frontends[identity_key] = (False, gcc_library)
         options = gcc_library
       if not os.path.isfile(options):
@@ -150,6 +150,9 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       # Separate empty-source probes duplicated frontend startup for every new
       # combination of job macros and include paths.
       return False, options, ()
+    # GCC scans fork the selected compiler. Keep unused Clang/LLVM mappings
+    # out of those processes and load the native Clang backend only on demand.
+    import clang_scan
     language = 'none'
     probe = []
     args = iter(command[1:])
@@ -258,7 +261,11 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     try:
       compiler = shutil.which(command[0]) or command[0]
       if clang:
-        result = clang_scan.scan([compiler, *command[1:], *options, '-c'], currdir)
+        import clang_scan
+        try:
+          result = clang_scan.scan([compiler, *command[1:], *options, '-c'], currdir)
+        except clang_scan.InputChangedError as error:
+          raise include_analyzer.CacheInvalidated(str(error)) from error
         statistics.preamble_hits += result['preamble_hit']
         statistics.preamble_builds += result['preamble_built']
         statistics.preamble_bytes = result['preamble_bytes']
@@ -279,8 +286,6 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
             (classes[kind], path) for path, kind in defaults.items()),
             *((3, name) for name in native['implicit']))
         result = native
-    except clang_scan.InputChangedError as error:
-      raise include_analyzer.CacheInvalidated(str(error)) from error
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
       raise basics.NotCoveredError(str(error), send_email=False) from error
     finally:

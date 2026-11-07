@@ -6,6 +6,7 @@ import shlex
 import shutil
 import select
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -70,6 +71,36 @@ class InputMetadataTest(unittest.TestCase):
 
 
 class GccScanTest(unittest.TestCase):
+  def test_gcc_analysis_loads_only_the_selected_backend(self):
+    self.source.write_text('#include "selected.h"\nint value;\n')
+    (self.root / 'selected.h').write_text('/* shared header */\n')
+    code = '''
+import os, sys
+from pathlib import Path
+import basics, compiler_analyzer
+keeper = basics.ClientRootKeeper()
+try:
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    for index, compiler in enumerate(sys.argv[2:]):
+        files = analyzer.DoCompilationCommand(
+            [compiler, '-c', sys.argv[1]], os.path.dirname(sys.argv[1]), keeper, 'lz4s')
+        assert files
+        assert any(path.endswith('/selected.h') for path in analyzer.current_input_paths)
+        if index == 0:
+            assert 'clang_scan' not in sys.modules
+            assert 'libclang-cpp' not in Path('/proc/self/maps').read_text()
+        else:
+            assert 'clang_scan' in sys.modules
+finally:
+    keeper.CleanOutClientRoots()
+'''
+    subprocess.run([sys.executable, '-c', code, str(self.source), self.compiler],
+                   check=True, timeout=30)
+    clang = shutil.which('clang')
+    if clang:
+      subprocess.run([sys.executable, '-c', code, str(self.source),
+                      self.compiler, clang, self.compiler], check=True, timeout=30)
+
   def setUp(self):
     compiler = shutil.which('gcc')
     library = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')

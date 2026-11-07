@@ -1,7 +1,6 @@
 from typing import Sequence, TypedDict
 
 version: str
-gcc_scan_dir: str
 
 class InputChangedError(RuntimeError): ...
 

@@ -168,6 +168,7 @@ ext = setuptools.Extension(
     include_dirs=cpp_flags_includes,
     depends=[__file__, *glob.glob(os.path.join(srcdir, 'src', '*.h'))],
     define_macros=[('_GNU_SOURCE', '1'),
+                   ('DCC_GCC_SCAN_DIR', '"' + libdir + '/distcc/gcc-scan"'),
                    ('DCC_CPP_LOOKUP_LIBRARY', '"' + libdir + '/distcc/cpp_lookup.so"')],
     library_dirs=[],
     libraries=['lz4', 'xxhash'],
@@ -208,7 +209,6 @@ scanner = setuptools.Extension(
     language='c++', include_dirs=[llvm_option('--includedir')],
     library_dirs=[llvm_lib], runtime_library_dirs=[llvm_runtime_lib],
     libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
-    define_macros=[('DCC_GCC_SCAN_DIR', '"' + libdir + '/distcc/gcc-scan"')],
 )
 
 # Worker code generation must use the requested compiler's LLVM release.

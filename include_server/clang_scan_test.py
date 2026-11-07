@@ -20,6 +20,7 @@ import cache_basics
 import compiler_analyzer
 import compiler_defaults
 import compress_files
+import distcc_pump_c_extensions
 
 
 class ClangScanTest(unittest.TestCase):
@@ -490,7 +491,7 @@ with tempfile.TemporaryDirectory() as directory:
       environment.start()
       self.addCleanup(environment.stop)
       del os.environ['DISTCC_GCC_SCAN_LIBRARY']
-      modules = mock.patch.object(clang_scan, 'gcc_scan_dir', str(Path(library).parents[2]))
+      modules = mock.patch.object(distcc_pump_c_extensions, 'gcc_scan_dir', str(Path(library).parents[2]))
       modules.start()
       self.addCleanup(modules.stop)
     gcc = shutil.which('gcc')
