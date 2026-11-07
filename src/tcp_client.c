@@ -192,11 +192,51 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
             if (!outgoing) goto done;
             sent = 0;
         }
+        /* Prepared replies can be sent immediately. Register POLLOUT only
+         * after a nonblocking write leaves bytes pending. */
+        for (unsigned turn = 0; turn < 4 && outgoing; ++turn) {
+            ssize_t n;
+            if (send_input_fd) {
+                struct iovec iov = {outgoing + sent, length - sent};
+                union { struct cmsghdr align; char data[CMSG_SPACE(sizeof(int))]; } control = {0};
+                struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1,
+                    .msg_control = control.data, .msg_controllen = sizeof(control)};
+                struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+                c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+                memcpy(CMSG_DATA(c), &shared_input, sizeof(int));
+                n = sendmsg(host->broker_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+                if (n > 0) send_input_fd = 0; /* Rights accompany the first byte, even on a short write. */
+            } else if (sent < length)
+                n = send(host->broker_fd, outgoing + sent, length - sent,
+                         MSG_NOSIGNAL | MSG_DONTWAIT | (file_left ? MSG_MORE : 0));
+            else {
+                n = sendfile(host->broker_fd, stream.fd, &file_offset, file_left);
+                if (!n) goto done; /* Never accept a truncated source extent. */
+                if (n > 0) file_left -= n;
+            }
+            if (n < 0 && errno != EAGAIN && errno != EINTR) goto done;
+            if (n < 0) break;
+            if (!n) goto done;
+            if (n > 0) {
+                active = time(NULL);
+                if (sent < length) sent += n;
+                if (sent == length && !file_left) {
+                    if (dcc_tcp_get32(outgoing) & DCC_TCP_FINAL) {
+                        unsigned type = dcc_tcp_get32(outgoing) & ~DCC_TCP_FLAGS;
+                        if (type == DCC_TCP_FS_REPLY) dcc_frontend_fs_clear(&filesystem);
+                        else if (type == DCC_TCP_INPUT) { close(stream.fd); stream.fd = -1; }
+                    }
+                    free(outgoing); outgoing = NULL; sent = 0;
+                }
+            }
+        }
         int timeout = dcc_get_io_timeout() - (time(NULL) - active);
         if (timeout <= 0) { ret = EXIT_TIMEOUT; goto done; }
+        int pending = !outgoing && (filesystem.data || stream.fd >= 0 || read_request < count);
         struct pollfd p = {host->broker_fd, POLLIN | (outgoing ? POLLOUT : 0), 0};
-        int ready = poll(&p, 1, timeout * 1000);
+        int ready = poll(&p, 1, pending ? 0 : timeout * 1000);
         if (ready < 0 && errno == EINTR) continue;
+        if (!ready && pending) continue; /* Prepare the next chunk without waiting for I/O. */
         if (ready <= 0) goto done;
         for (unsigned turn = 0; turn < 4 && (p.revents & (POLLIN | POLLHUP | POLLERR)); ++turn) {
             size_t before = incoming.used;
@@ -289,42 +329,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     ret = 0; goto done;
                 } else goto done;
                 dcc_tcp_frame_next(&incoming);
-            }
-        }
-        for (unsigned turn = 0; turn < 4 && (p.revents & POLLOUT) && outgoing; ++turn) {
-            ssize_t n;
-            if (send_input_fd) {
-                struct iovec iov = {outgoing + sent, length - sent};
-                union { struct cmsghdr align; char data[CMSG_SPACE(sizeof(int))]; } control = {0};
-                struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1,
-                    .msg_control = control.data, .msg_controllen = sizeof(control)};
-                struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-                c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
-                memcpy(CMSG_DATA(c), &shared_input, sizeof(int));
-                n = sendmsg(host->broker_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
-                if (n > 0) send_input_fd = 0; /* Rights accompany the first byte, even on a short write. */
-            } else if (sent < length)
-                n = send(host->broker_fd, outgoing + sent, length - sent,
-                         MSG_NOSIGNAL | MSG_DONTWAIT | (file_left ? MSG_MORE : 0));
-            else {
-                n = sendfile(host->broker_fd, stream.fd, &file_offset, file_left);
-                if (!n) goto done; /* Never accept a truncated source extent. */
-                if (n > 0) file_left -= n;
-            }
-            if (n < 0 && errno != EAGAIN && errno != EINTR) goto done;
-            if (n < 0) break;
-            if (!n) goto done;
-            if (n > 0) {
-                active = time(NULL);
-                if (sent < length) sent += n;
-                if (sent == length && !file_left) {
-                    if (dcc_tcp_get32(outgoing) & DCC_TCP_FINAL) {
-                        unsigned type = dcc_tcp_get32(outgoing) & ~DCC_TCP_FLAGS;
-                        if (type == DCC_TCP_FS_REPLY) dcc_frontend_fs_clear(&filesystem);
-                        else if (type == DCC_TCP_INPUT) { close(stream.fd); stream.fd = -1; }
-                    }
-                    free(outgoing); outgoing = NULL; sent = 0;
-                }
+                if (type == DCC_TCP_FS_QUERY) break; /* The compiler awaits this reply. */
             }
         }
     }
