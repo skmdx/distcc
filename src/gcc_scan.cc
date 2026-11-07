@@ -20,6 +20,11 @@ extern "C" bool distcc_gcc_inputs(cpp_reader *, const char *,
                                   bool (*)(const char *, const struct stat *, int, void *), void *);
 extern "C" bool distcc_gcc_input_root(cpp_reader *, const char *);
 extern "C" void distcc_gcc_cxx_system(cpp_reader *, const char *);
+// The optional negative-lookup cache delegates validation only after a complete
+// native manifest exists. Ordinary preprocessing and incomplete scans still
+// need its replay because they have no usable per-input snapshot to validate.
+extern "C" __attribute__((weak, visibility("default")))
+void dcc_cpp_lookup_manifest_complete(void);
 
 namespace {
 FILE *output = nullptr;
@@ -157,11 +162,13 @@ void finish(void *, void *)
     // A PCH can replace a header that does not exist, so ordinary -E is not
     // a valid fallback. It also depends on the creating GCC executable.
     // Ask the client to run the original compilation, not preprocessing.
+    bool complete = false;
     if (precompiled) append("DCGL1", 6);
-    else if (append("DCGS3", 6) &&
-        distcc_gcc_inputs(parse_in, targetcm.c_preinclude(), input, nullptr) &&
-        !fflush(output)) append("", 1);
-    fclose(output);
+    else complete = append("DCGS3", 6) &&
+        distcc_gcc_inputs(parse_in, targetcm.c_preinclude(), input, nullptr) && append("", 1);
+    if (fclose(output)) complete = false;
+    if (complete && dcc_cpp_lookup_manifest_complete)
+        dcc_cpp_lookup_manifest_complete();
 }
 }
 

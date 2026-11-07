@@ -1,8 +1,10 @@
 """Check native GCC preprocessing and dependency probes, without syntax emulation."""
 import os
+import ctypes
 from pathlib import Path
 import shlex
 import shutil
+import select
 import subprocess
 import tempfile
 import threading
@@ -354,6 +356,56 @@ class GccScanTest(unittest.TestCase):
 
   def test_lookup_cache_replaces_the_manifest_after_namespace_change(self):
     self.check_lookup_cache_replaces_the_manifest_after_namespace_change(False)
+
+  def test_unrelated_directory_write_does_not_reexecute_native_scan(self):
+    tracer = shutil.which('strace')
+    libc = ctypes.CDLL(None, use_errno=True)
+    if not tracer or not hasattr(libc, 'inotify_init1'):
+      self.skipTest('Linux inotify and strace are required')
+    lookup = str(Path(__file__).resolve().parents[1] / 'cpp_lookup.so')
+    work, headers = self.root/'build', self.root/'headers'
+    work.mkdir()
+    headers.mkdir()
+    search = []
+    for i in range(300):
+      directory = self.root/('empty-' + str(i))
+      directory.mkdir()
+      search.append('-I' + str(directory))
+    header = headers/'input.h'
+    header.write_text(''.join('int token_%d;\n' % i for i in range(150000)))
+    self.source.write_text('#if __has_include("absent.h")\n#error unexpected\n#endif\n'
+                           '#include "input.h"\n')
+    fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+    self.assertGreaterEqual(fd, 0)
+    self.addCleanup(os.close, fd)
+    # Closing the enumerated directory means the cache has its old stamp.
+    watched = Path(search[-1][2:])
+    self.assertGreaterEqual(libc.inotify_add_watch(fd, os.fsencode(watched), 0x10), 0)
+    errors, changed = [], []
+    def write_unrelated():
+      try:
+        if not select.select([fd], [], [], 10)[0]:
+          raise RuntimeError('lookup cache did not enumerate the watched directory')
+        os.read(fd, 4096)
+        (watched/'unrelated.o').write_bytes(b'not an input')
+        changed.append(True)
+      except Exception as error:
+        errors.append(error)
+    thread = threading.Thread(target=write_unrelated, daemon=True)
+    thread.start()
+    trace = self.root/'exec.trace'
+    try:
+      with mock.patch.dict(os.environ, DISTCC_CPP_LOOKUP_LIBRARY=lookup, DISTCC_CPP_LOOKUP='1'):
+        result = gcc_scan.scan([tracer, '-f', '-e', 'trace=execve', '-o', str(trace),
+                               self.compiler, *search, '-I' + str(headers), str(self.source)],
+                              str(work), self.library)
+    finally:
+      thread.join(timeout=12)
+    self.assertFalse(thread.is_alive())
+    self.assertFalse(errors, errors)
+    self.assertTrue(changed)
+    self.assertIn(str(header), result['dependencies'])
+    self.assertNotIn('execve("/proc/self/exe"', trace.read_text())
 
   def test_relative_lookup_cache_replaces_manifest_after_namespace_change(self):
     self.check_lookup_cache_replaces_the_manifest_after_namespace_change(True)

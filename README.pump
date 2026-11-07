@@ -131,6 +131,11 @@ One full GCC preprocessing process runs per request. Dependency-only mode is
 insufficient: ordinary macro expansion can affect later include conditions
 through __COUNTER__. Collected records use bounded buffered output; diagnostic
 macro-expansion provenance is disabled during collection only.
+For complete native manifests, the include server owns validation of positive
+inputs and failed lookups before publication. The negative-lookup cache does
+not also replay the compiler merely because an unrelated file changed a
+directory timestamp. Plain preprocessing and incomplete manifests still use
+the cache's replay, since they provide no complete input snapshot to validate.
 GCC selects PCH candidates with its native `-fpch-preprocess` support during
 analysis. A selected PCH requires the original local compilation, even when
 `DISTCC_FALLBACK=0`: PCH files depend on the creating GCC executable, and the

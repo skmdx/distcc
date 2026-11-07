@@ -41,12 +41,23 @@ static _Atomic unsigned failed_lookups;
 static int saved_output = -1;
 static int saved_stdout = -1;
 static int output_fd = STDOUT_FILENO;
+static int native_manifest_complete;
 static char *working_directory, *command;
 static char **arguments;
 static int (*next_open)(const char *, int, ...);
 static int (*next_chdir)(const char *);
 static int (*next_fchdir)(int);
 static pthread_once_t bindings = PTHREAD_ONCE_INIT;
+
+void dcc_cpp_lookup_manifest_complete(void);
+void dcc_cpp_lookup_manifest_complete(void)
+{
+    /* The native manifest records each failed candidate as well as positive
+     * inputs. The include server validates these identities before publication,
+     * including namespace changes during the scan. Rechecking whole directory
+     * timestamps here would replay scans for unrelated generated files. */
+    native_manifest_complete = 1;
+}
 
 static void bind_libc(void)
 {
@@ -285,6 +296,10 @@ __attribute__((destructor)) static void validate(void)
 {
     pthread_mutex_lock(&lock);
     enabled = 0;
+    if (native_manifest_complete) {
+        pthread_mutex_unlock(&lock);
+        return;
+    }
     int changed = 0;
     for (unsigned i = 0; i < BUCKETS; ++i) {
         for (struct directory *d = directories[i]; d; d = d->next) {
