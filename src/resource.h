@@ -6,6 +6,7 @@ double dcc_memory_pressure(void);
 int dcc_resource_slots(int maximum);
 int dcc_resource_cpus(void);
 int dcc_resource_analysis_slots(int maximum);
+void dcc_resource_analysis_wait(int occupied, unsigned timeout_ms);
 struct dcc_job;
 unsigned dcc_resource_bucket(unsigned long long bytes);
 unsigned dcc_resource_class(const struct dcc_job *);

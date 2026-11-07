@@ -47,7 +47,9 @@ shares these slots with local compilation. An explicit limit remains effective.
 Native analysis can use the available CPUs and publishes
 its observed resident plus frontend peak memory. One initial request calibrates
 demand before parallel scans are admitted using that peak and the existing
-memory headroom policy. Imports happen before forking so immutable library pages
+memory headroom policy. Waiting broker clients recheck admission as soon as
+the measured peak is published, with a timed retry for unrelated budget changes.
+Imports happen before forking so immutable library pages
 are shared. Memory budgets and pressure are checked
 in the requesting client's cgroup. Busy clients wait for capacity
 without switching preprocessing mode, including `-E` and `--scan-includes`.

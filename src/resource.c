@@ -8,8 +8,10 @@
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <poll.h>
 #ifdef __linux__
 #include <sched.h>
+#include <sys/inotify.h>
 #endif
 #include "resource.h"
 #include "job.h"
@@ -369,14 +371,19 @@ int dcc_resource_admit(unsigned memory_class, unsigned long long reserved)
     return reserved <= budget - job - spare;
 }
 
-int dcc_resource_analysis_slots(int maximum)
+static int analysis_memory_path(char path[PATH_MAX])
 {
     const char *port = getenv("INCLUDE_SERVER_PORT");
+    return port && snprintf(path, PATH_MAX, "%s.memory", port) < PATH_MAX;
+}
+
+int dcc_resource_analysis_slots(int maximum)
+{
     char path[PATH_MAX];
     uint64_t peak = 0;
     /* The build-scoped pool publishes its observed resident+frontend peak.
      * Compilation and ordinary preprocessing continue using their own model. */
-    if (port && snprintf(path, sizeof(path), "%s.memory", port) < (int)sizeof(path)) {
+    if (analysis_memory_path(path)) {
         int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (fd >= 0) {
             struct flock lock = {.l_type = F_RDLCK, .l_whence = SEEK_SET};
@@ -398,4 +405,25 @@ int dcc_resource_analysis_slots(int maximum)
     /* Persistent caches can leave room for one measured scan but not a second
      * peak as reserve. Keep the per-job margin and serialize that case. */
     return slots ? slots : resource_slots(1, job, 0, 0);
+}
+
+void dcc_resource_analysis_wait(int occupied, unsigned timeout_ms)
+{
+    struct pollfd ready = {.fd = -1, .events = POLLIN};
+#ifdef __linux__
+    char path[PATH_MAX];
+    if (analysis_memory_path(path)) {
+        ready.fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+        if (ready.fd >= 0 && inotify_add_watch(ready.fd, path, IN_MODIFY | IN_DELETE_SELF) < 0) {
+            close(ready.fd);
+            ready.fd = -1;
+        }
+    }
+#endif
+    /* Install the watch before rechecking admission: calibration may finish
+     * between releasing the rejected lease and starting this wait. The
+     * timeout still covers unrelated changes in the client's memory budget. */
+    if (occupied > dcc_resource_analysis_slots(dcc_resource_cpus()))
+        poll(&ready, 1, timeout_ms > INT_MAX ? INT_MAX : (int)timeout_ms);
+    if (ready.fd >= 0) close(ready.fd);
 }

@@ -151,6 +151,16 @@ class LinkTestCase(BrokerTestCase):
 
 
 class LinkTest(LinkTestCase):
+    def test_gcc_undefined_symbol_policy_is_forwarded(self):
+        output, result = self.link(['-Wl,-no-undefined,--undefined-version'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-link: linked on ', result.stderr)
+        self.assertEqual(subprocess.check_output([output], text=True), 'linked\n')
+        output, result = self.link(['-Wl,--no-undefined-version'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-link: linked on ', result.stderr)
+        self.assertEqual(subprocess.check_output([output], text=True), 'linked\n')
+
     def test_refresh_skips_unchanged_and_publishes_changed_or_missing_cache(self):
         snapshot = self.work / 'snapshot'
         subprocess.run(['cp', '-a', '--reflink=auto', str(self.snapshot), str(snapshot)], check=True)

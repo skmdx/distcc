@@ -84,7 +84,7 @@
 static int dcc_lock_one(struct dcc_hostdef *hostlist,
                         struct dcc_hostdef **buildhost,
                         int *cpu_lock_fd, int analysis);
-static void dcc_lock_pause(void);
+static void dcc_lock_pause(int analysis_occupied);
 
 
 void dcc_read_localslots_configuration(void)
@@ -130,7 +130,7 @@ int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
         if (h->stats_port || h->speed) {
             while ((ret = dcc_lock_adaptive(hostlist, buildhost, cpu_lock_fd))
                    == EXIT_BUSY)
-                dcc_lock_pause();
+                dcc_lock_pause(0);
             return ret;
         }
     }
@@ -140,7 +140,7 @@ int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
 }
 
 
-static void dcc_lock_pause(void)
+static void dcc_lock_pause(int analysis_occupied)
 {
     /* This could do with some tuning.
      *
@@ -164,6 +164,12 @@ static void dcc_lock_pause(void)
 	/*	This call to dcc_note_state() is made before the host is known, so it
 		does not make sense and does nothing useful as far as I can tell.	*/
     /*	dcc_note_state(DCC_PHASE_BLOCKED, NULL, NULL, DCC_UNKNOWN);	*/
+
+    if (analysis_occupied) {
+        rs_trace("waiting for analyzer memory admission (up to %ums)...", pause_time_ms);
+        dcc_resource_analysis_wait(analysis_occupied, pause_time_ms);
+        return;
+    }
 
     rs_trace("nothing available, sleeping %ums...", pause_time_ms);
 
@@ -222,7 +228,7 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
                 break;
         }
 
-        dcc_lock_pause();
+        dcc_lock_pause(0);
     }
 }
 
@@ -257,7 +263,7 @@ static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
                                                    chosen->n_slots : dcc_resource_cpus()))) break;
             dcc_unlock(*cpu_lock_fd);
             *cpu_lock_fd = -1;
-            dcc_lock_pause();
+            dcc_lock_pause(analysis ? occupied : 0);
         }
     } else
         ret = dcc_lock_one(dcc_hostdef_local_cpp, &chosen, cpu_lock_fd, analysis);

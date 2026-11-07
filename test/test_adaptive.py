@@ -629,6 +629,61 @@ int open(const char *path, int flags, ...) {
 
 
 class MemoryEstimateTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'inotify admission notification')
+    def test_analysis_memory_publication_wakes_waiter_and_rechecks_admission(self):
+        with tempfile.TemporaryDirectory(prefix='distcc-analysis-wake-') as directory:
+            root = Path(directory)
+            source, executable = root / 'wait.c', root / 'wait'
+            source.write_text('''#include <stdio.h>
+#include "resource.h"
+int main(void) {
+    if (dcc_resource_cpus() < 2) return 77;
+    dcc_resource_analysis_wait(2, 5000);
+    printf("%d\\n", dcc_resource_analysis_slots(dcc_resource_cpus()));
+    return 0;
+}''')
+            subprocess.run(['gcc', '-D_GNU_SOURCE', '-Isrc', str(source),
+                            'src/resource.c', '-o', str(executable)], check=True,
+                           capture_output=True)
+            port = root / 'include-server'
+            memory = Path(str(port) + '.memory')
+            env = dict(os.environ, INCLUDE_SERVER_PORT=str(port))
+            # A notification alone is not admission. A zero measurement keeps
+            # calibration serialized; a measured small scan permits another.
+            for peak in (0, 1024 * 1024):
+                memory.write_bytes((0).to_bytes(8, sys.byteorder))
+                proc = subprocess.Popen([executable], env=env, text=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    deadline = time.monotonic() + 3
+                    while True:
+                        if proc.poll() == 77:
+                            self.skipTest('at least two available CPUs required')
+                        self.assertIsNone(proc.poll())
+                        watches = Path(f'/proc/{proc.pid}/fdinfo')
+                        if any('inotify wd:' in entry.read_text() for entry in watches.iterdir()):
+                            break
+                        self.assertLess(time.monotonic(), deadline, 'memory watch was not installed')
+                        time.sleep(.01)
+                    with memory.open('r+b', buffering=0) as output:
+                        fcntl.lockf(output, fcntl.LOCK_EX)
+                        output.write(peak.to_bytes(8, sys.byteorder))
+                    stdout, stderr = proc.communicate(timeout=2)
+                    self.assertEqual(proc.returncode, 0, stderr)
+                    if peak:
+                        self.assertGreaterEqual(int(stdout), 2)
+                    else:
+                        self.assertLessEqual(int(stdout), 1)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.communicate()
+            # Publication preceding watch registration must also avoid the
+            # five-second timeout: there is no future write to wake it.
+            result = subprocess.run([executable], env=env, capture_output=True,
+                                    text=True, timeout=2, check=True)
+            self.assertGreaterEqual(int(result.stdout), 2)
+
     def test_workload_classes_reserve_their_own_measured_peak(self):
         with tempfile.TemporaryDirectory(prefix='distcc-memory-model-') as directory:
             root = Path(directory)

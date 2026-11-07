@@ -49,6 +49,7 @@ SAFE_LINKER_FLAGS = {
     '--start-group', '--end-group', '-(', '-)', '--whole-archive',
     '--no-whole-archive', '-Bstatic', '-Bdynamic', '--enable-new-dtags',
     '--disable-new-dtags', '--eh-frame-hdr', '--export-dynamic', '--no-undefined',
+    '-no-undefined', '--undefined-version', '--no-undefined-version',
     '--fatal-warnings', '--no-fatal-warnings', '--strip-all', '--strip-debug',
     '--no-add-needed', '--copy-dt-needed-entries', '--no-copy-dt-needed-entries',
 }
