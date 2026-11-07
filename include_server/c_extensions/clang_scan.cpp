@@ -616,7 +616,7 @@ PyObject *format_command(PyObject *, PyObject *args) {
         output << ' ';
         // Command::Print always quotes the executable, but -v leaves ordinary
         // operands unquoted. LLVM owns quoting of special characters.
-        llvm::sys::printArg(output, PyBytes_AS_STRING(word), i == 0);
+        llvm::sys::printArg(output, PyBytes_AS_STRING(word), i == 0 || PyBytes_GET_SIZE(word) == 0);
         Py_DECREF(word);
     }
     return PyUnicode_DecodeFSDefaultAndSize(text.data(), text.size());

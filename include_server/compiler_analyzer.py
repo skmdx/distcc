@@ -140,11 +140,12 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     language = parse_command.CompilerLanguage(command[0], source, language)
     compiler = shutil.which(command[0]) or command[0]
     identity = os.stat(compiler)
-    key = (compiler, identity.st_ino, identity.st_mtime_ns, language, tuple(probe), os.getcwd(),
-           self.quote_dirs, self.angle_dirs,
-           tuple((k, os.environ.get(k)) for k in
-                 ('CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH', 'OBJC_INCLUDE_PATH',
-                  'GCC_EXEC_PREFIX', 'COMPILER_PATH', 'SDKROOT')))
+    environment = tuple((k, os.environ.get(k)) for k in
+                        ('CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH', 'OBJC_INCLUDE_PATH',
+                         'GCC_EXEC_PREFIX', 'COMPILER_PATH', 'SDKROOT'))
+    identity_key = (compiler, identity.st_dev, identity.st_ino, identity.st_size,
+                    identity.st_mtime_ns, identity.st_ctime_ns, environment)
+    key = (identity_key, language, tuple(probe), os.getcwd())
     if key in self.contexts:
       self.contexts.move_to_end(key)
       return self.contexts[key]
@@ -158,16 +159,15 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     # Identify the selected frontend independently of job macro overrides.
     # Shader preprocessing commonly uses -undef; -U/-D can also change the
     # compiler's predefined names without changing the compiler itself.
-    identity_key = (compiler, identity.st_ino, identity.st_mtime_ns)
     if identity_key not in self.frontends:
       macros = run([compiler, '-x', 'c', '-E', '-dM', '/dev/null']).stdout.decode()
       if '#define __clang__ ' in macros:
-        self.frontends[identity_key] = True
+        self.frontends[identity_key] = (True, None)
       elif '#define __GNUC__ ' in macros:
-        self.frontends[identity_key] = False
+        self.frontends[identity_key] = (False, None)
       else:
         raise basics.NotCoveredError('Unsupported compiler for header analysis')
-    clang = self.frontends[identity_key]
+    clang, gcc_library = self.frontends[identity_key]
     # Probe only built-in search directories. Explicit -I/-isystem/-idirafter
     # arguments remain on the worker's command line with their original class
     # and ordering. Target, sysroot and -nostdinc options still apply here.
@@ -208,9 +208,14 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     else:
       options = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
       if not options:
-        target = run([compiler, '-dumpmachine']).stdout.decode().strip()
-        version = run([compiler, '-dumpfullversion']).stdout.decode().strip()
-        options = os.path.join(clang_scan.gcc_scan_dir, target, version, 'distcc_gcc_scan.so')
+        # These queries describe the compiler, not this source's macros or
+        # include paths. Share them across contexts and stat-cache generations.
+        if gcc_library is None:
+          target = run([compiler, '-dumpmachine']).stdout.decode().strip()
+          version = run([compiler, '-dumpfullversion']).stdout.decode().strip()
+          gcc_library = os.path.join(clang_scan.gcc_scan_dir, target, version, 'distcc_gcc_scan.so')
+          self.frontends[identity_key] = (False, gcc_library)
+        options = gcc_library
       if not os.path.isfile(options):
         raise basics.NotCoveredError('GCC dependency module is not installed for this compiler')
       search_entries = [(4, 'gcc')] + [(0, path) for path in directories]

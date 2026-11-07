@@ -483,6 +483,46 @@ with tempfile.TemporaryDirectory() as directory:
         self.assertEqual(b'optional.h' in actual.stdout, present)
     self.assertTrue(all(output.closed for output in outputs))
 
+  def test_gcc_identity_queries_are_shared_across_compilation_contexts(self):
+    gcc = shutil.which('gcc')
+    if not gcc:
+      self.skipTest('GCC is required')
+    self.addCleanup(os.chdir, os.getcwd())
+    self.source.write_text('#include "selected.h"\nint value = CHOICE;\n')
+    first, second = self.root / 'first', self.root / 'second'
+    for directory in (first, second):
+      directory.mkdir()
+      (directory / 'selected.h').write_text('/* selected input */\n')
+    wrapper = self.root / 'gcc'
+    wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(gcc) + ' "$@"\n')
+    wrapper.chmod(0o755)
+    keeper = basics.ClientRootKeeper()
+    self.addCleanup(keeper.CleanOutClientRoots)
+    analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
+    with mock.patch.object(compiler_analyzer, 'run', wraps=compiler_analyzer.run) as probe:
+      for choice in range(10):
+        directory = (first, second)[choice % 2]
+        command = [str(wrapper), '-DCHOICE=%d' % choice, '-I', str(directory),
+                   '-c', str(self.source)]
+        files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+        self.assertTrue(any(path.endswith(str(directory / 'selected.h') + '.lz4s')
+                            for path in files))
+        analyzer.ClearStatCaches()
+      for option in ('-dumpmachine', '-dumpfullversion'):
+        self.assertEqual(sum(call.args[0] == [str(wrapper), option]
+                             for call in probe.call_args_list), 1)
+      # Replacing the selected compiler must retire its cached identity even
+      # when the path and the resulting compiler version remain unchanged.
+      replacement = self.root / 'replacement'
+      replacement.write_text(wrapper.read_text())
+      replacement.chmod(0o755)
+      replacement.replace(wrapper)
+      command = [str(wrapper), '-I', str(first), '-c', str(self.source)]
+      analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
+      for option in ('-dumpmachine', '-dumpfullversion'):
+        self.assertEqual(sum(call.args[0] == [str(wrapper), option]
+                             for call in probe.call_args_list), 2)
+
   def test_gcc_collects_absolute_forwarder_in_native_preprocessing(self):
     gcc = shutil.which('gcc')
     if not gcc:
@@ -549,7 +589,7 @@ with tempfile.TemporaryDirectory() as directory:
     self.assertEqual(frontend.call_count, 0)
     self.assertEqual(probe.call_count, 1)
 
-  def test_gcc_implicit_precompiled_header_requires_local_preprocessing(self):
+  def test_gcc_implicit_precompiled_header_requires_local_compilation(self):
     gcc = shutil.which('gcc')
     if not gcc:
       self.skipTest('GCC is required')
@@ -561,7 +601,7 @@ with tempfile.TemporaryDirectory() as directory:
     keeper = basics.ClientRootKeeper()
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
-    with self.assertRaisesRegex(basics.NotCoveredError, 'unsupported GCC dependency scan'):
+    with self.assertRaisesRegex(basics.LocalCompilation, 'GCC selected a precompiled header'):
       analyzer.DoCompilationCommand([gcc, '-fpch-preprocess', '-c', str(self.source)],
                                     str(self.root), keeper)
 
