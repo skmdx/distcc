@@ -102,7 +102,7 @@ class MultiSourceTest(BrokerTestCase):
         self.assertEqual(subprocess.call([self.output]), 0)
 
     def test_pump_implicit_header_is_injected_once(self):
-        system = self.root / 'system'
+        system = self.root / 'implicit-system'
         system.mkdir()
         (system / 'stdc-predef.h').write_text('#include "child.h"\n#define ANSWER 42\n')
         # Deliberately unguarded: injecting this transitive input again changes
