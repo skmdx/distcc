@@ -101,6 +101,22 @@ class MultiSourceTest(BrokerTestCase):
         subprocess.run(['g++', str(self.last), str(obj), '-o', self.output], check=True)
         self.assertEqual(subprocess.call([self.output]), 0)
 
+    def test_pump_implicit_header_is_injected_once(self):
+        system = self.root / 'system'
+        system.mkdir()
+        (system / 'stdc-predef.h').write_text('#include "child.h"\n#define ANSWER 42\n')
+        # Deliberately unguarded: injecting this transitive input again changes
+        # the program, whereas replaying the root preinclude is correct.
+        (system / 'child.h').write_text('struct implicit_type {};\n')
+        self.first.write_text('int value(){return ANSWER;}\n')
+        self.env.update(TMPDIR=str(self.root), DISTCC_TESTING_INCLUDE_SERVER='1')
+        before = self.completed()
+        result = self.run_compound('-isystem', str(system), pump=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('gave up analyzing', result.stderr)
+        self.assertEqual(subprocess.call([self.output]), 0)
+        self.assertEqual(self.completed() - before, 2)
+
     def test_default_dependency_names_and_option_operands(self):
         include = self.work / 'include.cpp'
         include.mkdir()

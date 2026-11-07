@@ -34,10 +34,11 @@ PyObject *dcc_py_parse_gcc_inputs(PyObject *self, PyObject *args)
     const char *data, *cursor, *end;
     Py_ssize_t length;
     PyObject *cwd, *prefix = NULL, *lookups = NULL, *directories = NULL, *files = NULL;
+    PyObject *defaults = NULL, *implicit = NULL;
     PyObject *path = NULL, *value = NULL, *result = NULL;
     (void)self;
     if (!PyArg_ParseTuple(args, "y#U", &data, &length, &cwd)) return NULL;
-    if (length < 7 || memcmp(data, "DCGS2", 6) || data[length - 1]) {
+    if (length < 7 || memcmp(data, "DCGS3", 6) || data[length - 1]) {
         PyErr_SetString(PyExc_ValueError, "Incomplete or unsupported GCC dependency scan");
         return NULL;
     }
@@ -46,7 +47,9 @@ PyObject *dcc_py_parse_gcc_inputs(PyObject *self, PyObject *args)
     lookups = PyDict_New();
     directories = PyDict_New();
     files = PyList_New(0);
-    if (!prefix || !lookups || !directories || !files) goto done;
+    defaults = PyDict_New();
+    implicit = PyList_New(0);
+    if (!prefix || !lookups || !directories || !files || !defaults || !implicit) goto done;
     cursor = data + 6;
     end = data + length - 1;
     while (cursor < end) {
@@ -58,15 +61,19 @@ PyObject *dcc_py_parse_gcc_inputs(PyObject *self, PyObject *args)
         if (!metadata_end) goto malformed;
         path = PyUnicode_DecodeFSDefaultAndSize(cursor, name_end - cursor);
         if (!path) goto done;
-        if (*cursor != '/') {
+        int preinclude = metadata_end - metadata == 1 && *metadata == 'P';
+        if (*cursor != '/' && !preinclude) {
             PyObject *absolute = PyUnicode_Concat(prefix, path);
             Py_SETREF(path, absolute);
             if (!path) goto done;
         }
-        if (metadata_end - metadata == 2 && metadata[0] == 'D' &&
+        if (preinclude) {
+            if (PyList_Append(implicit, path)) goto done;
+        } else if (metadata_end - metadata == 2 && (metadata[0] == 'D' || metadata[0] == 'B') &&
             metadata[1] >= '0' && metadata[1] <= '2') {
             value = PyLong_FromLong(metadata[1] - '0');
             if (!value || PyDict_SetItem(directories, path, value)) goto done;
+            if (metadata[0] == 'B' && PyDict_SetItem(defaults, path, value)) goto done;
         } else {
             value = metadata_end - metadata == 1 && *metadata == '-' ? Py_NewRef(Py_None) : stamp(metadata);
             if (!value) goto done;
@@ -94,8 +101,9 @@ PyObject *dcc_py_parse_gcc_inputs(PyObject *self, PyObject *args)
         PyErr_SetString(PyExc_ValueError, "GCC dependency scan returned no inputs");
         goto done;
     }
-    result = Py_BuildValue("{s:O,s:O,s:O,s:O}", "files", Py_None, "dependencies", files,
-                           "lookups", lookups, "directories", directories);
+    result = Py_BuildValue("{s:O,s:O,s:O,s:O,s:O,s:O}", "files", Py_None, "dependencies", files,
+                           "lookups", lookups, "directories", directories,
+                           "default_directories", defaults, "implicit", implicit);
     goto done;
 malformed:
     PyErr_SetString(PyExc_ValueError, "Malformed GCC dependency scan");
@@ -106,6 +114,8 @@ done:
     Py_XDECREF(lookups);
     Py_XDECREF(directories);
     Py_XDECREF(files);
+    Py_XDECREF(defaults);
+    Py_XDECREF(implicit);
     return result;
 }
 

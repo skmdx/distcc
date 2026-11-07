@@ -5,6 +5,7 @@
 #include "gcc-plugin.h"
 #include "plugin-version.h"
 #include "c-family/c-pragma.h"
+#include "c-family/c-target.h"
 #include "langhooks.h"
 #include "opts.h"
 #include <cstdio>
@@ -15,7 +16,7 @@
 
 extern "C" __attribute__((visibility("default"))) int plugin_is_GPL_compatible;
 int plugin_is_GPL_compatible;
-extern "C" bool distcc_gcc_inputs(cpp_reader *,
+extern "C" bool distcc_gcc_inputs(cpp_reader *, const char *,
                                   bool (*)(const char *, const struct stat *, int, void *), void *);
 extern "C" bool distcc_gcc_input_root(cpp_reader *, const char *);
 extern "C" void distcc_gcc_cxx_system(cpp_reader *, const char *);
@@ -142,7 +143,8 @@ bool input(const char *path, const struct stat *stamp, int kind, void *)
         static_cast<long long>(stamp->st_mtim.tv_sec) * 1000000000 + stamp->st_mtim.tv_nsec,
         static_cast<long long>(stamp->st_ctim.tv_sec) * 1000000000 + stamp->st_ctim.tv_nsec)
         : kind < 0 ? snprintf(metadata, sizeof metadata, "-")
-                   : snprintf(metadata, sizeof metadata, "D%d", kind);
+        : kind == 6 ? snprintf(metadata, sizeof metadata, "P")
+        : snprintf(metadata, sizeof metadata, "%c%d", kind < 3 ? 'D' : 'B', kind % 3);
     return length > 0 && static_cast<size_t>(length) < sizeof metadata &&
            append(path, strlen(path) + 1) && append(metadata, length + 1);
 }
@@ -156,8 +158,9 @@ void finish(void *, void *)
     // a valid fallback. It also depends on the creating GCC executable.
     // Ask the client to run the original compilation, not preprocessing.
     if (precompiled) append("DCGL1", 6);
-    else if (append("DCGS2", 6) &&
-        distcc_gcc_inputs(parse_in, input, nullptr) && !fflush(output)) append("", 1);
+    else if (append("DCGS3", 6) &&
+        distcc_gcc_inputs(parse_in, targetcm.c_preinclude(), input, nullptr) &&
+        !fflush(output)) append("", 1);
     fclose(output);
 }
 }

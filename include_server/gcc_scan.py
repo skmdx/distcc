@@ -67,7 +67,7 @@ def scan(command, cwd, library):
   # A completed manifest lets the worker reproduce both diagnostics and partial
   # output. Startup failures, signals and incomplete collection remain failures.
   if (result.returncode < 0 or
-      not data.startswith(b'DCGS2\0') or not data.endswith(b'\0\0')):
+      not data.startswith(b'DCGS3\0') or not data.endswith(b'\0\0')):
     raise RuntimeError('Incomplete or unsupported GCC dependency scan (exit=' + str(result.returncode) +
                        ', manifest=' + str(len(data)) + ' bytes, prefix=' + repr(data[:16]) + '): ' +
                        result.stderr.decode(errors='replace')[-2048:])

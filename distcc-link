@@ -7,7 +7,6 @@ the existing local compiler behavior.
 """
 import array
 from contextlib import ExitStack
-from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import io
@@ -25,7 +24,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import uuid
 import distcc_python
 
 
@@ -1020,6 +1018,8 @@ def remote_command(host, args):
 
 
 def publish(stage, key):
+    import uuid
+
     stage = Path(stage)
     if not KEY.fullmatch(key) or not stage.name.startswith('.incoming-' + key + '-'):
         raise ValueError('invalid staged cache path')
@@ -1055,6 +1055,8 @@ def publish(stage, key):
 
 
 def transfer_generation(source, listing, metadata, key, host, base):
+    import uuid
+
     final = base + '/' + key
     if not subprocess.run(remote_command(host, ['test', '-d', final])).returncode:
         return final
@@ -1085,6 +1087,10 @@ def describe_sysroot(root, compiler):
 
 
 def sync_sysroot(root, compiler, profile_path, destinations, *, refresh=False):
+    # Synchronization is a maintenance operation, not part of each object link.
+    # Importing the executor also loads logging/traceback and their helpers.
+    from concurrent.futures import ThreadPoolExecutor
+
     source_host, source_path = destination(root)
     targets = [destination(dest) for dest in destinations]
     profile_path = Path(profile_path).absolute()

@@ -122,6 +122,11 @@ GCC jobs invoke the selected GCC frontend with a dependency-collection plugin.
 The module accesses GCC's own libcpp input state, including existence-only probes
 that ordinary dependency output omits. GCC performs condition evaluation, macro
 expansion, token pasting and header search; Python does not interpret C/C++.
+The same native scan reports default header directories, their C++ system
+classes, and the target's actual implicit preinclude. Compiler identity is
+reused across requests; changing macros or include paths does not start
+additional empty-source discovery processes. Compiler wrappers retain their
+additional default paths through the existing default-path discovery.
 One full GCC preprocessing process runs per request. Dependency-only mode is
 insufficient: ordinary macro expansion can affect later include conditions
 through __COUNTER__. Collected records use bounded buffered output; diagnostic

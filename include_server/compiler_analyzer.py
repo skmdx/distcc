@@ -3,7 +3,6 @@ import collections
 import io
 import os
 import re
-import shlex
 import shutil
 import stat
 import struct
@@ -119,6 +118,38 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     super().ClearStatCaches()
 
   def context(self, command, source):
+    compiler = shutil.which(command[0]) or command[0]
+    identity = os.stat(compiler)
+    environment = tuple((k, os.environ.get(k)) for k in
+                        ('CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH', 'OBJC_INCLUDE_PATH',
+                         'GCC_EXEC_PREFIX', 'COMPILER_PATH', 'SDKROOT'))
+    identity_key = (compiler, identity.st_dev, identity.st_ino, identity.st_size,
+                    identity.st_mtime_ns, identity.st_ctime_ns, environment)
+    if identity_key not in self.frontends:
+      # Job macro overrides do not identify the selected compiler.
+      macros = run([compiler, '-x', 'c', '-E', '-dM', '/dev/null']).stdout.decode()
+      if '#define __clang__ ' in macros:
+        self.frontends[identity_key] = (True, None)
+      elif '#define __GNUC__ ' in macros:
+        self.frontends[identity_key] = (False, None)
+      else:
+        raise basics.NotCoveredError('Unsupported compiler for header analysis')
+    clang, gcc_library = self.frontends[identity_key]
+    if not clang:
+      options = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
+      if not options:
+        if gcc_library is None:
+          target = run([compiler, '-dumpmachine']).stdout.decode().strip()
+          version = run([compiler, '-dumpfullversion']).stdout.decode().strip()
+          gcc_library = os.path.join(clang_scan.gcc_scan_dir, target, version, 'distcc_gcc_scan.so')
+          self.frontends[identity_key] = (False, gcc_library)
+        options = gcc_library
+      if not os.path.isfile(options):
+        raise basics.NotCoveredError('GCC dependency module is not installed for this compiler')
+      # The native scan reports the actual default directories and preinclude.
+      # Separate empty-source probes duplicated frontend startup for every new
+      # combination of job macros and include paths.
+      return False, options, ()
     language = 'none'
     probe = []
     args = iter(command[1:])
@@ -143,36 +174,10 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
         continue
       probe.append(arg)
     language = parse_command.CompilerLanguage(command[0], source, language)
-    compiler = shutil.which(command[0]) or command[0]
-    identity = os.stat(compiler)
-    environment = tuple((k, os.environ.get(k)) for k in
-                        ('CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH', 'OBJC_INCLUDE_PATH',
-                         'GCC_EXEC_PREFIX', 'COMPILER_PATH', 'SDKROOT'))
-    identity_key = (compiler, identity.st_dev, identity.st_ino, identity.st_size,
-                    identity.st_mtime_ns, identity.st_ctime_ns, environment)
     key = (identity_key, language, tuple(probe), os.getcwd())
     if key in self.contexts:
       self.contexts.move_to_end(key)
       return self.contexts[key]
-    result = run([compiler, *probe, '-x', language, '-E', '-dM', '-v',
-                  '-MD', '-MF', '-', '-MT', 'distcc', '/dev/null'])
-    output = result.stdout.decode()
-    sections = re.split(r'^distcc:', output, maxsplit=1, flags=re.M)
-    if len(sections) != 2:
-      raise basics.NotCoveredError('Compiler did not report implicit headers')
-    _, implicit = sections
-    # Identify the selected frontend independently of job macro overrides.
-    # Shader preprocessing commonly uses -undef; -U/-D can also change the
-    # compiler's predefined names without changing the compiler itself.
-    if identity_key not in self.frontends:
-      macros = run([compiler, '-x', 'c', '-E', '-dM', '/dev/null']).stdout.decode()
-      if '#define __clang__ ' in macros:
-        self.frontends[identity_key] = (True, None)
-      elif '#define __GNUC__ ' in macros:
-        self.frontends[identity_key] = (False, None)
-      else:
-        raise basics.NotCoveredError('Unsupported compiler for header analysis')
-    clang, gcc_library = self.frontends[identity_key]
     # Probe only built-in search directories. Explicit -I/-isystem/-idirafter
     # arguments remain on the worker's command line with their original class
     # and ordering. Target, sysroot and -nostdinc options still apply here.
@@ -193,48 +198,23 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
     directories = tuple(line.strip() for line in search[1].splitlines()) if search else ()
     if len(directories) > 4096 or any(not os.path.isabs(path) for path in directories):
       raise basics.NotCoveredError('Unsupported compiler default header search path')
-    if clang:
-      # Clang distinguishes C++ system headers from implicit extern-C system
-      # headers. Plain -isystem loses that distinction (including line flags).
-      invocation = next((clang_scan.tokenize_command(line) for line in defaults.stderr.decode().splitlines()
-                         if ' -cc1 ' in line or ' "-cc1" ' in line), [])
-      kinds = {invocation[i + 1]: (2 if arg == '-internal-externc-isystem' else 1)
-               for i, arg in enumerate(invocation[:-1])
-               if arg in ('-internal-isystem', '-internal-externc-isystem')}
-      if any(path not in kinds for path in directories):
-        raise basics.NotCoveredError('Cannot classify Clang default header directories')
-      search_entries = [(kinds[path], path) for path in directories]
-      # LibTooling may use another Clang release's builtin headers. Scan the
-      # selected compiler's search paths, exactly as the worker will use them.
-      options = ['-nostdinc']
-      for kind, path in search_entries:
-        options.extend(['-Xclang', '-internal-isystem' if kind == 1 else
-                        '-internal-externc-isystem', '-Xclang', path])
-    else:
-      options = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
-      if not options:
-        # These queries describe the compiler, not this source's macros or
-        # include paths. Share them across contexts and stat-cache generations.
-        if gcc_library is None:
-          target = run([compiler, '-dumpmachine']).stdout.decode().strip()
-          version = run([compiler, '-dumpfullversion']).stdout.decode().strip()
-          gcc_library = os.path.join(clang_scan.gcc_scan_dir, target, version, 'distcc_gcc_scan.so')
-          self.frontends[identity_key] = (False, gcc_library)
-        options = gcc_library
-      if not os.path.isfile(options):
-        raise basics.NotCoveredError('GCC dependency module is not installed for this compiler')
-      search_entries = [(4, 'gcc')] + [(0, path) for path in directories]
-      # -nostdinc suppresses GCC's implicit stdc-predef.h inclusion. Restore
-      # the compiler-reported inputs explicitly, using their sent snapshots.
-      for path in shlex.split(implicit.replace('\\\n', '').replace('$$', '$')):
-        if path == '/dev/null':
-          continue
-        directory = next((directory for directory in directories
-                          if path.startswith(directory.rstrip('/') + '/')), None)
-        if directory is None:
-          raise basics.NotCoveredError('Implicit header is outside compiler search paths')
-        search_entries.append((3, path[len(directory.rstrip('/')) + 1:]))
-    context = (clang, options, tuple(search_entries))
+    # Clang distinguishes C++ system headers from implicit extern-C system
+    # headers. Plain -isystem loses that distinction (including line flags).
+    invocation = next((clang_scan.tokenize_command(line) for line in defaults.stderr.decode().splitlines()
+                       if ' -cc1 ' in line or ' "-cc1" ' in line), [])
+    kinds = {invocation[i + 1]: (2 if arg == '-internal-externc-isystem' else 1)
+             for i, arg in enumerate(invocation[:-1])
+             if arg in ('-internal-isystem', '-internal-externc-isystem')}
+    if any(path not in kinds for path in directories):
+      raise basics.NotCoveredError('Cannot classify Clang default header directories')
+    search_entries = [(kinds[path], path) for path in directories]
+    # LibTooling may use another Clang release's builtin headers. Scan the
+    # selected compiler's search paths, exactly as the worker will use them.
+    options = ['-nostdinc']
+    for kind, path in search_entries:
+      options.extend(['-Xclang', '-internal-isystem' if kind == 1 else
+                      '-internal-externc-isystem', '-Xclang', path])
+    context = (True, options, tuple(search_entries))
     self.contexts[key] = context
     if len(self.contexts) > 8:
       self.contexts.popitem(last=False)
@@ -287,12 +267,17 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
         # Preserve GCC's actual default directory classes.
         # -isystem alone changes C++ directories into extern-C system headers.
         classes = {1: 5, 2: 0}
-        if any(kind == 0 and native['directories'].get(path) not in classes
-               for kind, path in self.system_includes):
+        # A compiler wrapper can inject paths absent from the submitted argv.
+        # Reuse the default-path discovery already owned by ParseCommand for
+        # those paths; the native scan supplies their order and current class.
+        defaults = {path: kind for path, kind in native['directories'].items()
+                    if path in native['default_directories'] or
+                    os.path.realpath(path) in self.compiler_defaults.system_dirs_default_all}
+        if any(kind not in classes for kind in defaults.values()):
           raise RuntimeError('GCC reported an unsupported default include directory')
-        self.system_includes = tuple(
-            (classes[native['directories'][path]] if kind == 0 else kind, path)
-            for kind, path in self.system_includes)
+        self.system_includes = ((4, 'gcc'), *(
+            (classes[kind], path) for path, kind in defaults.items()),
+            *((3, name) for name in native['implicit']))
         result = native
     except clang_scan.InputChangedError as error:
       raise include_analyzer.CacheInvalidated(str(error)) from error

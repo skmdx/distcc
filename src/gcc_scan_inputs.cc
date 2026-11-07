@@ -11,7 +11,7 @@
 #include "intl.h"
 #include "files.cc"
 
-// -1 identifies a file record; 0..2 are GCC's directory system-header classes.
+// -1: file; 0..2: explicit directory; 3..5: default directory; 6: preinclude.
 using input_callback = bool (*)(const char *, const struct stat *, int, void *);
 
 static const char *input_root;
@@ -73,7 +73,8 @@ static int missing_input(void **slot, void *opaque)
 }
 
 extern "C" __attribute__((visibility("default")))
-bool distcc_gcc_inputs(cpp_reader *reader, input_callback callback, void *context)
+bool distcc_gcc_inputs(cpp_reader *reader, const char *preinclude,
+                      input_callback callback, void *context)
 {
     if (!reader || !reader->main_file) return false;
     for (const auto *file = reader->all_files; file; file = file->next_file) {
@@ -95,6 +96,10 @@ bool distcc_gcc_inputs(cpp_reader *reader, input_callback callback, void *contex
             stamp.st_ctim.tv_sec != file->st.st_ctim.tv_sec ||
             stamp.st_ctim.tv_nsec != file->st.st_ctim.tv_nsec ||
             !callback(file->path, &stamp, -1, context)) return false;
+        // The target hook names the root preinclude. Descendants also carry
+        // implicit_preinclude, but must not be injected a second time.
+        if (preinclude && file->implicit_preinclude && !strcmp(file->name, preinclude) &&
+            !callback(preinclude, nullptr, 6, context)) return false;
         // GCC may shorten a system header to its canonical path. The worker
         // still needs the original lookup spelling (including symlink names).
         // Reuse libcpp's path construction without changing __FILE__ semantics.
@@ -114,6 +119,7 @@ bool distcc_gcc_inputs(cpp_reader *reader, input_callback callback, void *contex
     htab_traverse(reader->nonexistent_file_hash, missing_input, &visitor);
     if (!visitor.ok) return false;
     for (const auto *dir = reader->quote_include; dir; dir = dir->next)
-        if (!callback(dir->name, nullptr, dir->sysp, context)) return false;
+        if (!callback(dir->name, nullptr, dir->sysp + (dir->user_supplied_p ? 0 : 3), context))
+            return false;
     return visitor.ok;
 }

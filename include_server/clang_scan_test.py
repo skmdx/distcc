@@ -484,6 +484,15 @@ with tempfile.TemporaryDirectory() as directory:
     self.assertTrue(all(output.closed for output in outputs))
 
   def test_gcc_identity_queries_are_shared_across_compilation_contexts(self):
+    library = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
+    if library:
+      environment = mock.patch.dict(os.environ)
+      environment.start()
+      self.addCleanup(environment.stop)
+      del os.environ['DISTCC_GCC_SCAN_LIBRARY']
+      modules = mock.patch.object(clang_scan, 'gcc_scan_dir', str(Path(library).parents[2]))
+      modules.start()
+      self.addCleanup(modules.stop)
     gcc = shutil.which('gcc')
     if not gcc:
       self.skipTest('GCC is required')
@@ -511,6 +520,9 @@ with tempfile.TemporaryDirectory() as directory:
       for option in ('-dumpmachine', '-dumpfullversion'):
         self.assertEqual(sum(call.args[0] == [str(wrapper), option]
                              for call in probe.call_args_list), 1)
+      # All varying macro/search contexts use their real native scan. Only
+      # compiler identity discovery may invoke an extra compiler process.
+      self.assertEqual(len(probe.call_args_list), 3)
       # Replacing the selected compiler must retire its cached identity even
       # when the path and the resulting compiler version remain unchanged.
       replacement = self.root / 'replacement'

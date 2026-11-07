@@ -16,19 +16,22 @@ import distcc_pump_c_extensions as native
 
 class InputMetadataTest(unittest.TestCase):
   def manifest(self, *records):
-    return b'DCGS2\0' + b''.join(path + b'\0' + metadata + b'\0'
+    return b'DCGS3\0' + b''.join(path + b'\0' + metadata + b'\0'
                                 for path, metadata in records) + b'\0'
 
   def test_paths_identities_and_directory_classes(self):
     metadata = b'1 2 33188 13 -7 11'
     data = self.manifest((b'source\xff.c', metadata), (b'source\xff.c', metadata),
                          (b'/missing.h', b'-'), (b'headers', b'D1'),
+                         (b'/defaults', b'B2'), (b'preinclude.h', b'P'),
                          (b'directory', b'1 3 16877 4096 17 19'))
     result = native.ParseGccInputs(data, '/working/')
     source = os.fsdecode(b'/working/source\xff.c')
     self.assertEqual(result, dict(files=None, dependencies=[source],
         lookups={source: (1, 2, 33188, 13, -7, 11), '/missing.h': None,
-                 '/working/directory': (1, 3, 16877)}, directories={'/working/headers': 1}))
+                 '/working/directory': (1, 3, 16877)},
+        directories={'/working/headers': 1, '/defaults': 2},
+        default_directories={'/defaults': 2}, implicit=['preinclude.h']))
 
   def test_rejects_truncation_and_conflicting_identities(self):
     good = self.manifest((b'source.c', b'1 2 33188 13 7 11'))
@@ -153,8 +156,26 @@ class GccScanTest(unittest.TestCase):
     result = self.scan('-I', str(ordinary), '-isystem', str(system))
     self.assertEqual(result['directories'][str(ordinary)], 0)
     self.assertEqual(result['directories'][str(system)], 2)
+    self.assertNotIn(str(ordinary), result['default_directories'])
+    self.assertNotIn(str(system), result['default_directories'])
+    self.assertTrue(result['default_directories'])
     result = self.scan('-x', 'c++')
     self.assertTrue(any(kind == 1 for kind in result['directories'].values()))
+
+  def test_native_search_and_preinclude_follow_each_invocation(self):
+    self.source.write_text('int n;\n')
+    result = self.scan()
+    self.assertTrue(result['implicit'])
+    preinclude = result['implicit'][0]
+    (self.root / preinclude).write_text('#include "child.h"\n')
+    (self.root / 'child.h').write_text('/* indirect implicit input */\n')
+    overridden = self.scan('-isystem', str(self.root))
+    self.assertEqual(overridden['implicit'], [preinclude])
+    self.assertIn(str(self.root / 'child.h'), overridden['dependencies'])
+    self.assertEqual(self.scan('-ffreestanding')['implicit'], [])
+    disabled = self.scan('-nostdinc')
+    self.assertEqual(disabled['default_directories'], {})
+    self.assertEqual(disabled['implicit'], [])
 
   def test_system_header_spelling_survives_canonicalization(self):
     system = self.root/'system'
@@ -283,7 +304,7 @@ class GccScanTest(unittest.TestCase):
           self.assertEqual(scanned.stderr, native.stderr)
           output.seek(0)
           manifest = output.read()
-        self.assertTrue(manifest.startswith(b'DCGS2\0'))
+        self.assertTrue(manifest.startswith(b'DCGS3\0'))
         self.assertTrue(manifest.endswith(b'\0\0'))
         self.assertIn(os.fsencode(selected) + b'\0', manifest)
         self.assertIn(str(selected), self.scan('-x', language, '-include', str(forced))['dependencies'])
