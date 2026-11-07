@@ -51,6 +51,12 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
     env['DISTCC_BROKER'] = str(root/'broker.sock')
     def report_failure(error_type, error, traceback):
         if error_type is not None:
+            if isinstance(error, subprocess.TimeoutExpired):
+                for name, output in (('stdout', error.stdout), ('stderr', error.stderr)):
+                    if output:
+                        if isinstance(output, bytes):
+                            output = output.decode(errors='replace')
+                        print(f'Validation timeout: {name}\n' + output[-16384:], file=sys.stderr)
             for name in ('client.log', 'broker.log'):
                 path = root / name
                 if path.exists():
