@@ -844,6 +844,9 @@ dcc_build_somewhere(char *argv[],
 
     /* Classify before probing: preprocessing and local links need no native
      * expansion. A successful expansion invalidates the scanner's pointers. */
+#ifdef HAVE_FSTATAT
+    if (!getenv("DISTCC_NO_REWRITE_CROSS")) dcc_rewrite_generic_compiler(argv);
+#endif
     ret = dcc_prepare_clang(&argv, &auxiliary);
     if (ret) goto lock_local;
     ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 1);
@@ -863,8 +866,9 @@ dcc_build_somewhere(char *argv[],
     }
     remote_frontend = !ret && !preprocess_only && !dcc_scan_includes &&
         dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) && getenv("DISTCC_BROKER") &&
-        dcc_cpp_ir(argv, input_fname);
-    if (!ret && (dcc_offload_language(argv) || (!remote_frontend && dcc_native_requested(argv)))) {
+        (dcc_cpp_ir(argv, input_fname) || dcc_cpp_gcc(argv, input_fname));
+    if (!ret && (dcc_offload_language(argv) ||
+        ((!remote_frontend || !dcc_cpp_ir(argv, input_fname)) && dcc_native_requested(argv)))) {
         if (dcc_offload_language(argv) ? dcc_prepare_offload(&argv, &auxiliary, &offload_targets) :
                                        dcc_expand_native(&argv, input_fname, output_fname)) {
             ret = EXIT_DISTCC_FAILED;
@@ -881,9 +885,6 @@ dcc_build_somewhere(char *argv[],
          !strcmp(argv[1], "-dumpversion") || !strcmp(argv[1], "-dumpfullversion")))
         goto run_local;
     if (!getenv("DISTCC_NO_REWRITE_CROSS")) {
-#ifdef HAVE_FSTATAT
-        dcc_rewrite_generic_compiler(new_argv);
-#endif
         dcc_add_clang_target(new_argv);
         dcc_gcc_rewrite_fqn(new_argv);
     }
@@ -909,7 +910,8 @@ dcc_build_somewhere(char *argv[],
      * without needing a second preprocessing pass or a header snapshot. */
     if (remote_frontend) {
         if ((ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
-        ret = dcc_frontend_prepare(argv, &prepared_job);
+        ret = dcc_cpp_ir(argv, input_fname) ? dcc_frontend_prepare(argv, &prepared_job) :
+            dcc_gcc_frontend_prepare(argv, input_fname, &prepared_job);
         dcc_unlock(local_cpu_lock_fd);
         local_cpu_lock_fd = -1;
         if (ret) goto fallback;
@@ -981,9 +983,9 @@ dcc_build_somewhere(char *argv[],
 
     if (getenv("DISTCC_BROKER"))
         dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready);
-    if (prepared_job && prepared_job->kind != DCC_JOB_FRONTEND && work.key)
+    if (prepared_job && !dcc_job_frontend(prepared_job) && work.key)
         work.bytes = dcc_resource_input_bytes(prepared_job);
-    else if (!cpp_ready && (!prepared_job || prepared_job->kind != DCC_JOB_FRONTEND))
+    else if (!cpp_ready && (!prepared_job || !dcc_job_frontend(prepared_job)))
         work = (struct dcc_work_hint){0};
     if (prepared_job && work.key)
         work.memory_class = dcc_resource_class(prepared_job);
@@ -998,7 +1000,7 @@ dcc_build_somewhere(char *argv[],
     dcc_free_buffer(&server_stdout);
     remote_completed = 0;
     if ((ret = dcc_pick_host_from_list_and_lock_it(&host, &cpu_lock_fd,
-            cpp_ready || (prepared_job && prepared_job->kind == DCC_JOB_FRONTEND), &work)) != 0) {
+            cpp_ready || (prepared_job && dcc_job_frontend(prepared_job)), &work)) != 0) {
         /* Doesn't happen at the moment: all failures are masked by
            returning localhost. */
         goto fallback;
@@ -1013,7 +1015,7 @@ dcc_build_somewhere(char *argv[],
         goto run_local;
     }
 
-    if (prepared_job && prepared_job->kind == DCC_JOB_FRONTEND) {
+    if (prepared_job && dcc_job_frontend(prepared_job)) {
         if (!host->broker_managed || host->compr != DCC_COMPRESS_LZ4_STREAM) goto fallback;
         char *target = NULL;
         if ((ret = dcc_get_dotd_info(argv, &deps_fname, &needs_dotd,

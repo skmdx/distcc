@@ -218,7 +218,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                         requested[index] = 1; requests[count++] = index;
                     }
                 } else if (type == DCC_TCP_FS_QUERY && incoming.type == DCC_TCP_FS_QUERY &&
-                           job->kind == DCC_JOB_FRONTEND && !have_result &&
+                           dcc_job_frontend(job) && !have_result &&
                            !outgoing && stream.fd < 0 && !filesystem.data && read_request == count) {
                     if (dcc_frontend_fs_reply(job, incoming.data, incoming.size, &filesystem)) goto done;
                     ++fs_requests; fs_bytes += filesystem.size + filesystem.file_size;

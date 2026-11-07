@@ -198,7 +198,8 @@ sysroot = os.environ.get('SYSROOT', '').rstrip('/')
 if sysroot and llvm_lib.startswith(sysroot + '/'):
   llvm_runtime_lib = llvm_lib[len(sysroot):]
 frontend_headers = [os.path.join(srcdir, 'src', name)
-                    for name in ('clang_inputs.h', 'job.h', 'tcp_job.h', 'file_cache.h', 'frontend_fs.h', 'argv_file.h')]
+                    for name in ('clang_inputs.h', 'job.h', 'tcp_job.h', 'file_cache.h', 'frontend_fs.h',
+                                 'remote_files.h', 'frontend_identity.h', 'argv_file.h')]
 frontend_headers.extend(os.path.join(srcdir_include_server, 'c_extensions', name)
                         for name in ('remote_files.h', 'clang_compiler.h', 'compiler_command.h'))
 scanner = setuptools.Extension(
@@ -247,6 +248,7 @@ for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.paths
       sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_native.cpp'),
                os.path.join(srcdir, 'src', 'clang_driver.cc')] + codegen_sources + worker_sources,
       depends=codegen_headers + worker_headers + [os.path.join(srcdir, 'src', 'clang_inputs.h'),
+                                os.path.join(srcdir, 'src', 'frontend_identity.h'),
                                 os.path.join(srcdir, 'src', 'argv_file.h'),
                                 os.path.join(srcdir_include_server, 'c_extensions', 'clang_compiler.h'),
                                 os.path.join(srcdir_include_server, 'c_extensions', 'compiler_command.h')],

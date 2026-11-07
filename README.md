@@ -685,13 +685,16 @@ pump sessions after upgrading. This path requires the Linux broker and the
 daemon's prefork mode. It uses the existing TCP listener and IP access rules;
 SSH and GSSAPI are unsupported with `,tcp`.
 
-For evaluation, `DISTCC_FRONTEND_REMOTE=1` moves ordinary Clang C/C++ frontend
-execution to the selected worker as well. The client's Clang driver resolves
-the invocation and native CPU options; the worker's Clang parser reads source
-files and headers on demand through the existing job connection. This skips
-both include-server analysis and local IR generation. Use matching Clang
-frontend libraries on the client and workers. GCC and offload compilation
-continue using their existing input preparation.
+For evaluation, `DISTCC_FRONTEND_REMOTE=1` moves ordinary GCC and Clang C/C++
+frontend execution to the selected worker. The selected compiler supplies its
+search paths and native CPU options; the worker reads source files and headers
+on demand through the existing job connection and shared snapshot cache. This
+skips include-server analysis and local preprocessing/IR generation. Clang uses
+its VFS interface and matching frontend libraries. GCC uses its native plugin
+to obtain search paths before preprocessing, then a read-only FUSE filesystem
+for the actual remote compiler. GCC workers require libfuse3, `/dev/fuse` and
+permission to create a user and mount namespace. Offload compilation keeps its
+existing input preparation.
 
 Builds whose generated sources include files outside the compiler's source and
 include directories can set `DISTCC_FRONTEND_ROOTS` to a colon-separated list
@@ -710,6 +713,10 @@ Each daemon worker loads the Clang libraries once and forks a separate compiler
 child for each job. This avoids repeated library loading without sharing macro,
 target or compiler state between invocations. The child reports its own peak
 memory; cancellation terminates its worker group before releasing job files.
+GCC jobs isolate their mount in a dedicated child of the persistent worker.
+A single filesystem service handles that job's lookups; it and the compiler
+share cancellation ownership. The mount disappears at job exit. Filesystem
+service CPU and memory are included in the job's resource measurements.
 
 `DISTCC_CLANG_LOCAL=1` also reuses Clang and LLD libraries for local driver
 commands, including configure probes. The existing broker caches a control

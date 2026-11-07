@@ -322,6 +322,7 @@ AC_SEARCH_LIBS(hstrerror, [resolv])
 AC_SEARCH_LIBS(inet_aton, [resolv])
 
 PKG_CHECK_MODULES(POPT, [popt >= 1.7])
+PKG_CHECK_MODULES(FUSE, [fuse3])
 AC_SUBST(POPT_CFLAGS)
 AC_SUBST(POPT_LIBS)
 

@@ -3,6 +3,7 @@
 #include "../../src/tcp_job.h"
 #include "../../src/file_cache.h"
 #include "../../src/frontend_fs.h"
+#include "../../src/remote_files.h"
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/FrontendTool/Utils.h>
 #include <clang/Lex/HeaderSearchOptions.h>
@@ -25,42 +26,7 @@
 #include <cstring>
 #include <array>
 
-static uint64_t number(const char *p, unsigned bytes) {
-    uint64_t n = 0;
-    for (unsigned i = 0; i < bytes; ++i) n = (n << 8) | (unsigned char)p[i];
-    return n;
-}
-static bool receive(int fd, void *data, size_t size) {
-    auto p = static_cast<char *>(data);
-    while (size) {
-        ssize_t n = recv(fd, p, size, 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
-        p += n; size -= n;
-    }
-    return true;
-}
-static bool send_query(int fd, unsigned operation, llvm::StringRef path) {
-    uint32_t header[] = {htonl(DCC_TCP_FS_QUERY), htonl(path.size()+4), htonl(operation)};
-    iovec parts[] = {{header, sizeof(header)}, {const_cast<char *>(path.data()), path.size()}};
-    msghdr message{};
-    message.msg_iov = parts; message.msg_iovlen = path.empty() ? 1 : 2;
-    while (message.msg_iovlen) {
-        ssize_t written = sendmsg(fd, &message, MSG_NOSIGNAL);
-        if (written < 0 && errno == EINTR) continue;
-        if (written <= 0) return false;
-        size_t consumed = written;
-        while (message.msg_iovlen && consumed >= message.msg_iov->iov_len) {
-            consumed -= message.msg_iov->iov_len;
-            ++message.msg_iov; --message.msg_iovlen;
-        }
-        if (message.msg_iovlen) {
-            message.msg_iov->iov_base = static_cast<char *>(message.msg_iov->iov_base)+consumed;
-            message.msg_iov->iov_len -= consumed;
-        }
-    }
-    return true;
-}
+using dccfs::number;
 static llvm::sys::fs::file_type file_type(unsigned mode) {
     using Type = llvm::sys::fs::file_type;
     return S_ISREG(mode) ? Type::regular_file : S_ISDIR(mode) ? Type::directory_file :
@@ -154,13 +120,9 @@ class RemoteFiles : public llvm::vfs::FileSystem {
             contents.reset(); queried = listed = false;
         }
     };
-    int fd;
-    pthread_mutex_t *shared = nullptr;
+    dccfs::Connection connection;
     std::string cwd;
     llvm::StringMap<Entry> entries;
-    const dcc_file_cache_api &cache;
-    dcc_record_cache *records;
-    std::string identity;
     Entry &remember(llvm::StringRef name, const char *bytes) {
         auto [found, inserted] = entries.try_emplace(name, bytes);
         if (!inserted) found->second.update(bytes);
@@ -205,60 +167,16 @@ class RemoteFiles : public llvm::vfs::FileSystem {
         return {};
     }
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> request(unsigned op, llvm::StringRef path) {
-        // Forked backend partitions can still read assembler inputs. One
-        // owner covers the complete exchange, so replies cannot cross jobs.
-        if (shared) {
-            int error = pthread_mutex_lock(shared);
-            if (error) {
-                if (error == EOWNERDEAD) {
-                    shutdown(fd, SHUT_RDWR);
-                    pthread_mutex_unlock(shared); // Leave the broken stream unrecoverable.
-                }
-                return std::error_code(error, std::generic_category());
-            }
-        }
-        auto unlock = llvm::scope_exit([&] { if (shared) pthread_mutex_unlock(shared); });
-        uint32_t header[2];
-        if (!send_query(fd, op, path) || !receive(fd, header, sizeof(header)))
-            return std::make_error_code(std::errc::io_error);
-        unsigned error = ntohl(header[0]), size = ntohl(header[1]);
-        if (size > 512U * 1024 * 1024) return std::make_error_code(std::errc::message_size);
-        // The reply overwrites every byte. LLVM supplies only the trailing
-        // NUL, avoiding a zero-fill pass over each incoming header/source.
-        auto data = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(size);
-        if (!data) return std::make_error_code(std::errc::not_enough_memory);
-        if (!receive(fd, data->getBufferStart(), size)) return std::make_error_code(std::errc::io_error);
-        if (error) return std::error_code(error, std::generic_category());
-        return std::unique_ptr<llvm::MemoryBuffer>(std::move(data));
+        dccfs::Buffer bytes;
+        if (auto error = connection.request(op, {path.data(), path.size()}, bytes)) return error;
+        return std::unique_ptr<llvm::MemoryBuffer>(new SnapshotBuffer(
+            {bytes.data, bytes.size}, path.str(), std::move(bytes.owner)));
     }
 public:
     RemoteFiles(int fd, std::string cwd, const dcc_file_cache_api &cache,
                 std::string identity, std::string cache_root)
-        : fd(fd), cwd(std::move(cwd)), cache(cache), records(cache.open(cache_root.c_str())),
-          identity(std::move(identity)) {}
-    ~RemoteFiles() override {
-        cache.close(records);
-        if (shared) { pthread_mutex_destroy(shared); munmap(shared, sizeof(*shared)); }
-        ::close(fd);
-    }
-    bool share_stream() {
-        if (shared) return true;
-        void *memory = mmap(nullptr, sizeof(pthread_mutex_t), PROT_READ | PROT_WRITE,
-                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-        if (memory == MAP_FAILED) return false;
-        auto mutex = static_cast<pthread_mutex_t *>(memory);
-        pthread_mutexattr_t attributes;
-        int error = pthread_mutexattr_init(&attributes);
-        if (!error) {
-            error = pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED);
-            if (!error) error = pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST);
-            if (!error) error = pthread_mutex_init(mutex, &attributes);
-            pthread_mutexattr_destroy(&attributes);
-        }
-        if (error) { munmap(memory, sizeof(*mutex)); return false; }
-        shared = mutex;
-        return true;
-    }
+        : connection(fd, cache, std::move(identity), cache_root), cwd(std::move(cwd)) {}
+    bool share_stream() { return connection.share_stream(); }
     unsigned codegen_cpus(unsigned requested) {
         if (requested && !share_stream()) return 0;
         uint32_t count = htonl(requested);
@@ -309,7 +227,6 @@ public:
     }
     llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(const llvm::Twine &path) override {
         auto name = absolute(path);
-        std::string key;
         std::array<char, DCC_FS_METADATA> version{};
         auto found = entries.find(name);
         if (found != entries.end()) {
@@ -319,39 +236,15 @@ public:
                 return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));
             if (S_ISREG(record.mode())) {
                 version = record.version;
-                key.reserve(identity.size()+1+version.size()+name.size());
-                key.append(identity); key += '\0'; key.append(version.data(), version.size()); key.append(name.data(), name.size());
-                size_t extent = 0, length = 0;
-                const void *bytes = nullptr;
-                int snapshot = cache.lookup(records, key.data(), key.size(), &extent);
-                if (snapshot >= 0) {
-                    // LLVM chooses read versus mmap and owns the terminator.
-                    // Cache publication replaces inodes, so mapped input stays
-                    // immutable through eviction and subsequent invocations.
-                    auto buffer = llvm::MemoryBuffer::getOpenFile(snapshot, name, extent);
-                    ::close(snapshot);
-                    if (buffer && cache.contents((*buffer)->getBufferStart(), (*buffer)->getBufferSize(),
-                                                  key.data(), key.size(), &bytes, &length) && length == record.size()) {
-                        std::shared_ptr<const llvm::MemoryBuffer> owner(std::move(*buffer));
-                        record.contents = std::make_shared<SnapshotBuffer>(
-                            llvm::StringRef(static_cast<const char *>(bytes), length), name.str().str(), std::move(owner));
-                        return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));
-                    }
-                }
             }
         } else if (auto error = cachedError(name)) return error;
-        auto response = request(DCC_FS_READ, name);
-        if (!response) return remember(name, response.getError());
-        auto answer = (*response)->getBuffer();
-        if (answer.size() < DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
-        if (number(answer.data()+24, 8) != answer.size() - DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
-        bool cacheable = !key.empty() && !memcmp(version.data(), answer.data(), version.size());
-        auto &record = remember(name, answer.data());
-        auto owner = std::shared_ptr<const llvm::MemoryBuffer>(std::move(*response));
-        record.contents = std::make_shared<SnapshotBuffer>(answer.drop_front(DCC_FS_METADATA), name.str().str(), owner);
-        if (cacheable)
-            cache.write(records, key.data(), key.size(), record.contents->getBufferStart(),
-                        record.contents->getBufferSize());
+        dccfs::Snapshot snapshot;
+        if (auto error = connection.read({name.data(), name.size()},
+                found != entries.end() && S_ISREG(found->second.mode()) ? version.data() : nullptr, snapshot))
+            return remember(name, error);
+        auto &record = remember(name, snapshot.version.data());
+        record.contents = std::make_shared<SnapshotBuffer>(
+            llvm::StringRef(snapshot.bytes.data, snapshot.bytes.size), name.str().str(), std::move(snapshot.bytes.owner));
         return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));
     }
     llvm::vfs::directory_iterator dir_begin(const llvm::Twine &path, std::error_code &error) override {

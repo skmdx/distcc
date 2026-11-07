@@ -1219,7 +1219,7 @@ void dcc_tcp_dispatch_ready(void)
         if (!link || !link_waiting) {
             s->run.operation = DCC_TCP_RUN;
             int input = s->job->kind == DCC_JOB_COMPILE && s->job->count == 1 ? s->job->inputs[0].fd : -1;
-            if (s->job->kind == DCC_JOB_FRONTEND) {
+            if (dcc_job_frontend(s->job)) {
                 if (!s->fs_peer) {
                     int pair[2];
                     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) {

@@ -216,7 +216,7 @@ unsigned long long dcc_resource_input_bytes(const struct dcc_job *job)
 {
     /* Lazy frontends read sources on demand. Uploaded auxiliary profiles must
      * not move them out of the class advertised to the scheduling broker. */
-    if (job->kind == DCC_JOB_FRONTEND) return 0;
+    if (dcc_job_frontend(job)) return 0;
     unsigned long long bytes = 0;
     for (unsigned i = 0; i < job->count; ++i) {
         /* Shared code-generation data (for example PGO profiles) does not
@@ -233,7 +233,7 @@ unsigned long long dcc_resource_input_bytes(const struct dcc_job *job)
 
 unsigned dcc_resource_class(const struct dcc_job *job)
 {
-    return 1 + job->kind * DCC_MEMORY_BUCKETS +
+    return 1 + (dcc_job_frontend(job) ? DCC_JOB_FRONTEND : job->kind) * DCC_MEMORY_BUCKETS +
            dcc_resource_bucket(dcc_resource_input_bytes(job));
 }
 

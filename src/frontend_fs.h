@@ -8,12 +8,13 @@
  * dev, ino, mtime_ns, size, mode, uid, gid, ctime_ns. LIST entries expose
  * file types, not permission bits; STAT carries the complete metadata. */
 #define DCC_FS_METADATA 52
-enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LIST };
+enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LIST,
+                       DCC_FS_CODEGEN, DCC_FS_LSTAT, DCC_FS_READLINK };
 /* Compiler-to-daemon only: a requested CPU count replaces the path. Zero
  * releases borrowed CPUs. The reply contains the granted count. */
-#define DCC_FS_CODEGEN 5
 struct dcc_job;
 int dcc_frontend_fs_add_roots(struct dcc_job *job, const char *paths);
+int dcc_frontend_fs_add_root(struct dcc_job *job, const char *path);
 /* An owned metadata prefix followed by an optional open file extent. No
  * temporary file is needed to concatenate them for the transport. */
 struct dcc_frontend_reply {
@@ -22,7 +23,8 @@ struct dcc_frontend_reply {
     int fd;
     uint64_t file_size;
 };
-int dcc_frontend_fs_reply(const struct dcc_job *, const void *, size_t, struct dcc_frontend_reply *);
+int dcc_frontend_fs_reply(struct dcc_job *, const void *, size_t, struct dcc_frontend_reply *);
 void dcc_frontend_fs_clear(struct dcc_frontend_reply *);
 int dcc_frontend_prepare(char **, struct dcc_job **);
+int dcc_gcc_frontend_prepare(char **, const char *, struct dcc_job **);
 #endif

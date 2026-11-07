@@ -212,6 +212,185 @@ class FileCacheTest(unittest.TestCase):
         self.assertTrue(self.get(key) in values)
 
 
+class GccFrontendTest(BrokerTestCase):
+    worker_address = '127.0.0.1'
+
+    def start_frontend(self):
+        self.module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
+        if not self.module:
+            directory = subprocess.check_output([self.cc, '-print-file-name=plugin'], text=True).strip()
+            self.module = str(Path(directory)/'distcc_gcc_scan.so')
+        self.assertTrue(Path(self.module).is_file(), 'GCC native module must be built before testing')
+        self.restart_server(self.build/'distccd', DISTCC_GCC_SCAN_LIBRARY=self.module,
+                            DISTCCD_FILE_CACHE=str(self.work/'cache'))
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
+        self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
+                        DISTCC_TESTING_INCLUDE_SERVER='1',
+                        DISTCC_GCC_SCAN_LIBRARY=self.module, DISTCC_SKIP_LOCAL_RETRY='1',
+                        INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
+
+    def compile(self, command):
+        result = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr + '\n' + Path(self.logs[0].name).read_text())
+        self.assertIn('pooled TCP job completed', result.stderr)
+        return result
+
+    def test_native_gcc_compiles_without_local_dependency_scan(self):
+        self.start_frontend()
+        (self.work/'value.h').write_text('#define VALUE 37\n')
+        self.source.write_text('#include <stdio.h>\n#include "value.h"\n'
+                               'int main(void) { printf("%d %s\\n", VALUE, __FILE__); return 0; }\n')
+        command = [self.cc, '-O2', '-march=native', '-c', 'hello.c', '-o', 'out.o', '-MMD', '-MF', 'out.d']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = [(self.work/name).read_bytes() for name in ('out.o', 'out.d')]
+        for name in ('out.o', 'out.d'): (self.work/name).unlink()
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected[0])
+        self.assertEqual((self.work/'out.d').read_bytes().replace(b'\\\n', b'').split(),
+                         expected[1].replace(b'\\\n', b'').split())
+        subprocess.run([self.cc, 'out.o', '-o', 'program'], cwd=self.work, check=True)
+        self.assertEqual(subprocess.check_output([str(self.work/'program')]), b'37 hello.c\n')
+
+    def test_cpp_search_classes_macros_symlinks_and_warm_cache(self):
+        self.start_frontend()
+        compiler = shutil.which('g++')
+        self.assertIsNotNone(compiler)
+        headers = self.work/'headers'
+        (headers/'inner').mkdir(parents=True)
+        (self.work/'alias').symlink_to('headers/inner')
+        (headers/'value.h').write_text('#define VALUE 39\n')
+        (self.work/'extra.h').write_text('#define EXTRA 3\n')
+        (self.work/'hello.cc').write_text(
+            '#include <vector>\n#include <string>\n'
+            'enum { seed = __COUNTER__ };\n'
+            '#if __COUNTER__ == 1 && __has_include("alias/../value.h")\n'
+            '#include "alias/../value.h"\n#else\n#error lost macro state\n#endif\n'
+            'int main() { std::vector<std::string> v{std::to_string(VALUE+EXTRA)}; '
+            'return v[0] != "42"; }\n')
+        command = [compiler, '-O2', '-c', 'hello.cc', '-o', 'out.o', '-include', 'extra.h',
+                   '-MMD', '-MF', 'out.d']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        for _ in range(2):
+            (self.work/'out.o').unlink()
+            self.compile(command)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+            subprocess.run([compiler, 'out.o', '-o', 'program'], cwd=self.work, check=True)
+            subprocess.run([str(self.work/'program')], check=True)
+
+    def test_source_diagnostic_is_produced_by_remote_gcc(self):
+        self.start_frontend()
+        self.source.write_text('#error remote frontend reached\n')
+        result = subprocess.run([str(self.build/'distcc'), self.cc, '-c', 'hello.c', '-o', 'out.o'],
+                                cwd=self.work, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('remote frontend reached', result.stderr)
+        self.assertIn('pooled TCP job completed', result.stderr)
+        self.assertNotIn('gave up analyzing', result.stderr)
+        self.assertFalse((self.work/'out.o').exists())
+
+    def test_environment_search_path_preserves_user_header_dependencies(self):
+        self.start_frontend()
+        headers = self.work/'environment'
+        headers.mkdir()
+        (headers/'value.h').write_text('#define VALUE 11\nconst char *header_path = __FILE__;\n')
+        self.source.write_text('#include <value.h>\nint value(void) { return VALUE; }\n')
+        self.env['CPATH'] = 'environment/../environment'
+        command = [self.cc, '-c', 'hello.c', '-o', 'out.o', '-MMD', '-MF', 'out.d']
+        subprocess.run(command, cwd=self.work, env=self.env, check=True, capture_output=True)
+        expected = (self.work/'out.d').read_text().replace('\\\n', '').split()
+        expected_object = (self.work/'out.o').read_bytes()
+        (self.work/'out.o').unlink()
+        self.compile(command)
+        self.assertEqual((self.work/'out.d').read_text().replace('\\\n', '').split(), expected)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected_object)
+
+    def test_external_symlink_and_hardlink_header_identity(self):
+        self.start_frontend()
+        external = self.root/(self._testMethodName+'-headers')
+        external.mkdir()
+        (external/'once.h').write_text('#pragma once\nstruct once { int value; };\n')
+        os.link(external/'once.h', external/'again.h')
+        (self.work/'headers').symlink_to(external)
+        self.source.write_text('#include "headers/once.h"\n#include "headers/again.h"\n'
+                               'int main(void) { struct once x = {0}; return x.value; }\n')
+        command = [self.cc, '-O2', '-c', 'hello.c', '-o', 'out.o']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        (self.work/'out.o').unlink()
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
+    def test_precompiled_header_and_cache_invalidation_use_native_gcc(self):
+        self.start_frontend()
+        header = self.work/'prefix.h'
+        header.write_text('#define VALUE 41\n')
+        subprocess.run([self.cc, '-x', 'c-header', 'prefix.h', '-o', 'prefix.h.gch'],
+                       cwd=self.work, check=True, capture_output=True)
+        header.unlink()
+        self.source.write_text('int value(void) { return VALUE; }\n')
+        command = [self.cc, '-include', 'prefix.h', '-Winvalid-pch', '-c', 'hello.c', '-o', 'out.o']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        (self.work/'out.o').unlink()
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        (self.work/'prefix.h.gch').unlink()
+        for value in (42, 43):
+            header.write_text(f'#define VALUE {value}\n')
+            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+            expected = (self.work/'out.o').read_bytes()
+            (self.work/'out.o').unlink()
+            self.compile(command)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
+    def test_disconnect_reaps_gcc_and_filesystem_and_allows_next_job(self):
+        self.start_frontend()
+        compiler = shutil.which('g++')
+        self.assertIsNotNone(compiler)
+        (self.work/'slow.cc').write_text('#include <regex>\nstd::regex expression("[a-z]+[0-9]*");\n')
+        def descendants(pid):
+            try:
+                children = [int(p) for p in Path(f'/proc/{pid}/task/{pid}/children').read_text().split()]
+            except FileNotFoundError:
+                return []
+            return children + [child for parent in children for child in descendants(parent)]
+        with (self.work/'cancel.log').open('wb') as log:
+            process = subprocess.Popen([str(self.build/'distcc'), compiler, '-O2', '-c', 'slow.cc', '-o', 'slow.o'],
+                                       cwd=self.work, env=self.env, stdout=log, stderr=log)
+            stopped = []
+            try:
+                deadline = time.monotonic()+10
+                while not stopped:
+                    self.assertIsNone(process.poll(), log.name)
+                    self.assertLess(time.monotonic(), deadline)
+                    for child in descendants(self.daemons[0].pid):
+                        try:
+                            if Path(f'/proc/{child}/comm').read_text().strip() == 'cc1plus':
+                                os.kill(child, signal.SIGSTOP)
+                                stopped.append(child)
+                        except (FileNotFoundError, ProcessLookupError):
+                            pass
+                    if not stopped: time.sleep(.002)
+                process.kill(); process.wait(timeout=5)
+                deadline = time.monotonic()+5
+                while any(Path(f'/proc/{child}').exists() for child in stopped):
+                    self.assertLess(time.monotonic(), deadline, 'cancelled GCC child remains')
+                    time.sleep(.01)
+                while 'dcc_busy 0\n' not in self.get_stats(self.stats_ports[0]):
+                    self.assertLess(time.monotonic(), deadline, 'cancelled job retains worker capacity')
+                    time.sleep(.01)
+                self.assertFalse(list(self.root.glob('distcc-tcp-*/files')))
+            finally:
+                if process.poll() is None: process.kill()
+                process.wait(timeout=5)
+                for child in stopped:
+                    try: os.kill(child, signal.SIGCONT)
+                    except ProcessLookupError: pass
+        self.compile([self.cc, '-c', 'hello.c', '-o', 'next.o'])
+
+
 class FrontendTest(BrokerTestCase):
     worker_address = '127.0.0.2'
 
@@ -968,10 +1147,11 @@ int main(int argc, char **argv) {
         executable = self.work/'reply'
         compiler = shutil.which('cc')
         assert compiler is not None, 'C compiler required for filesystem reply tests'
-        subprocess.run([compiler, '-D_GNU_SOURCE', '-ffunction-sections', '-fdata-sections',
+        compiled = subprocess.run([compiler, '-D_GNU_SOURCE', '-ffunction-sections', '-fdata-sections',
                         '-I'+str(self.build/'src'), str(source), str(self.build/'src/frontend_fs.c'),
-                        str(self.build/'src/tcp_job.c'), '-Wl,--gc-sections', '-llz4',
-                        '-o', str(executable)], check=True, capture_output=True, timeout=30)
+                        str(self.build/'src/tcp_job.c'), str(self.build/'src/argutil.c'),
+                        '-Wl,--gc-sections', '-llz4', '-o', str(executable)], capture_output=True, timeout=30)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
         path = self.work/'payload'
         for length in (0, 1, 256*1024-60, 256*1024-59, 2*256*1024+13):
             with self.subTest(length=length):
@@ -2220,6 +2400,8 @@ class LocalCrossUidTest(unittest.TestCase):
                             BrokerTestCase.get_stats(stats)
                             break
                         except OSError:
+                            log.flush(); log.seek(0)
+                            self.assertIsNone(processes[0].poll(), log.read())
                             self.assertLess(time.monotonic(), deadline)
                             time.sleep(.02)
                     processes.append(subprocess.Popen([str(build/'distccd'), '--broker', env['DISTCC_BROKER']],

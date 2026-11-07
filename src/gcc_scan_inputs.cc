@@ -9,10 +9,23 @@
 #include <config.h>
 #include "system.h"
 #include "intl.h"
+// Plugin headers already supplied GCC's system layer. A complete source tree
+// also contains libcpp/system.h; do not initialize/poison libc a second time.
+#define LIBCPP_SYSTEM_H
 #include "files.cc"
 
 // -1: file; 0..2: explicit directory; 3..5: default directory; 6: preinclude.
 using input_callback = bool (*)(const char *, const struct stat *, int, void *);
+
+extern "C" bool distcc_gcc_plan(cpp_reader *reader, input_callback callback, void *context)
+{
+    if (!reader || !reader->main_file) return false;
+    if (!callback(reader->main_file->path, nullptr, -1, context)) return false;
+    for (const auto *dir = reader->quote_include; dir; dir = dir->next)
+        if (!callback(dir->name, nullptr, dir->sysp + (dir->user_supplied_p ? 0 : 3), context))
+            return false;
+    return true;
+}
 
 static const char *input_root;
 
@@ -40,6 +53,28 @@ extern "C" void distcc_gcc_cxx_system(cpp_reader *reader, const char *path)
     // use class 1 instead; restore it before any headers are entered.
     for (auto *dir = reader->quote_include; dir; dir = dir->next)
         if (!strcmp(dir->name, path)) dir->sysp = 1;
+}
+
+extern "C" void distcc_gcc_client_search(cpp_reader *reader)
+{
+    // The driver has initialized the complete native search chain. The
+    // client-provided defaults arrived as explicit include options; remove
+    // only the worker's implicit directories. Keeping std_inc unchanged lets
+    // GCC itself handle its target preinclude and PCH initialization order.
+    cpp_dir *quote = nullptr, *bracket = nullptr, **tail = &quote;
+    bool angled = false;
+    for (auto *dir = reader->quote_include; dir;) {
+        auto *next = dir->next;
+        if (dir == reader->bracket_include) angled = true;
+        if (dir->user_supplied_p) {
+            *tail = dir; tail = &dir->next;
+            if (angled && !bracket) bracket = dir;
+        }
+        dir = next;
+    }
+    *tail = nullptr;
+    reader->quote_include = quote;
+    reader->bracket_include = bracket;
 }
 
 static bool unsupported_absolute(const char *path)

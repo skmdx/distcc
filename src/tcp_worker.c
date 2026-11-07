@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <sys/wait.h>
 #include "distcc.h"
 #include "exitcode.h"
 #include "tcp_job.h"
@@ -19,18 +21,33 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
     unsigned count = 0;
     const char *setting = getenv("TMPDIR");
     char *saved_tmp = setting ? strdup(setting) : NULL;
-    int changed_tmp = 0;
+    int changed_tmp = 0, isolated = 0;
     dcc_job_result_init(&result);
     if (setting && !saved_tmp) finished.error = EXIT_OUT_OF_MEMORY;
     else if (!memchr(run->root, 0, sizeof(run->root)) || run->root[0] != '/' ||
         dcc_job_decode(metadata, 0, &job)) finished.error = EXIT_PROTOCOL_ERROR;
-    else if (job->kind == DCC_JOB_FRONTEND ? (input < 0 || frontend < 0) : frontend >= 0)
+    else if ((dcc_job_frontend(job) && input < 0) ||
+        (job->kind == DCC_JOB_FRONTEND ? frontend < 0 : frontend >= 0))
         finished.error = EXIT_PROTOCOL_ERROR;
-    else if (setenv("TMPDIR", run->root, 1)) finished.error = EXIT_OUT_OF_MEMORY;
-    else {
+    if (!finished.error && job->kind == DCC_JOB_GCC_FRONTEND) {
+        pid_t child = fork();
+        if (child < 0) finished.error = EXIT_IO_ERROR;
+        else if (child) {
+            /* The job reports directly on the existing FD protocol. The
+             * persistent parent retains its original mount/user namespace. */
+            close(metadata); close(input);
+            dcc_job_free(job); free(saved_tmp);
+            int status;
+            pid_t waited;
+            do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+            return waited >= 0 && WIFEXITED(status) ? WEXITSTATUS(status) : EXIT_IO_ERROR;
+        } else isolated = 1;
+    }
+    if (!finished.error && setenv("TMPDIR", run->root, 1)) finished.error = EXIT_OUT_OF_MEMORY;
+    if (!finished.error) {
         changed_tmp = 1;
         if (input >= 0) {
-            if (job->kind == DCC_JOB_FRONTEND) {
+            if (dcc_job_frontend(job)) {
                 job->fs_channel = input + 1;
                 job->compiler_channel = frontend + 1;
             } else {
@@ -71,5 +88,7 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
     if (finished.error) finished.retiring = 1;
     ret = dcc_send_fds(channel, &finished, sizeof(finished), fds, count);
     dcc_job_result_free(&result);
-    return ret || finished.error ? EXIT_IO_ERROR : 0;
+    ret = ret || finished.error ? EXIT_IO_ERROR : 0;
+    if (isolated) _exit(ret);
+    return ret;
 }

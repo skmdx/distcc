@@ -29,6 +29,7 @@
 #include <vector>
 #include <unistd.h>
 #include "clang_inputs.h"
+#include "frontend_identity.h"
 
 namespace {
 // Own the driver's plan while callers borrow its cc1 arguments. Parsing the
@@ -122,18 +123,9 @@ extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots) {
     auto &invocation = *plan.compiler;
     const auto &inputs = invocation.getFrontendOpts().Inputs;
     if (inputs.size() != 1 || !inputs[0].isFile()) return -1;
-    auto boot = llvm::MemoryBuffer::getFile("/proc/sys/kernel/random/boot_id");
-    if (!boot) return -1;
-    // Cache identities include the reader's credentials. Stat permission must
-    // never let one user reuse bytes previously read by a different user.
-    std::string identity = "distcc frontend files:" + (*boot)->getBuffer().str() +
-        ':' + std::to_string(geteuid()) + ':' + std::to_string(getegid());
-    int count = getgroups(0, nullptr);
-    if (count < 0) return -1;
-    std::vector<gid_t> groups(count);
-    if (getgroups(count, groups.data()) != count) return -1;
-    std::sort(groups.begin(), groups.end());
-    for (auto group : groups) identity += ':' + std::to_string(group);
+    std::unique_ptr<char, decltype(&free)> credentials(dcc_frontend_identity(), free);
+    if (!credentials) return -1;
+    std::string identity(credentials.get());
     std::vector<std::string> result{plan.executable(), inputs[0].getFile().str(), identity}, directories;
     for (auto arg : plan.cc1) result.emplace_back(arg);
     std::set<std::string> unique;

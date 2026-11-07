@@ -117,7 +117,8 @@ static int dcc_run_job(int in_fd, int out_fd, enum dcc_protover protover,
 
 /* Default include search paths describe the client snapshots, not the worker
  * installation. Preserve their order after explicit -isystem arguments. */
-static int add_system_includes(char ***argv, const char *root)
+#include "gcc_files.h"
+static int add_system_includes(char ***argv, const char *root, char **defaults)
 {
     char *directory = NULL, **args = NULL;
     DIR *dir = NULL;
@@ -126,6 +127,12 @@ static int add_system_includes(char ***argv, const char *root)
     char path[PATH_MAX];
     struct stat st;
     int ret = EXIT_PROTOCOL_ERROR;
+    unsigned count;
+    if (defaults) {
+        count = 0;
+        while (defaults[count] && *defaults[count]) ++count;
+        if (!defaults[count]) goto done;
+    } else {
     if (asprintf(&directory, "%s/" DCC_SYSTEM_HEADERS, root) < 0)
         return EXIT_OUT_OF_MEMORY;
     dir = opendir(directory);
@@ -146,22 +153,47 @@ static int add_system_includes(char ***argv, const char *root)
         if (unlinkat(dirfd(dir), entry->d_name, 0)) goto done;
     }
     if (!manifest || fread(header, 1, 8, manifest) != 8 || memcmp(header, "DCSI", 4)) goto done;
-    unsigned count = dcc_tcp_get32(header + 4);
+    count = dcc_tcp_get32(header + 4);
+    }
     if (count > 4096) goto done;
     ret = dcc_copy_argv(*argv, &args, 4 * count + 1);
     if (ret) goto done;
     ret = EXIT_PROTOCOL_ERROR;
-    char *option = strdup("-nostdinc");
-    if (!option) { ret = EXIT_OUT_OF_MEMORY; goto done; }
-    dcc_argv_append(args, option);
+    char *option;
+    if (!defaults) {
+        option = strdup("-nostdinc");
+        if (!option) { ret = EXIT_OUT_OF_MEMORY; goto done; }
+        dcc_argv_append(args, option);
+    }
+    unsigned preinclude_end = 1;
     for (unsigned i = 0; i < count; ++i) {
-        if (fread(header, 1, 8, manifest) != 8) goto done;
-        unsigned kind = dcc_tcp_get32(header), length = dcc_tcp_get32(header + 4);
-        if (kind > 5 || !length || length >= sizeof(path) ||
-            fread(path, 1, length, manifest) != length ||
-            (kind != 3 && kind != 4 && path[0] != '/') ||
+        unsigned kind, length;
+        if (defaults) {
+            kind = (unsigned char)defaults[i][0] - '0';
+            length = strlen(defaults[i]+1);
+            if (!length || length >= sizeof(path)) goto done;
+            memcpy(path, defaults[i]+1, length);
+        } else {
+            if (fread(header, 1, 8, manifest) != 8) goto done;
+            kind = dcc_tcp_get32(header); length = dcc_tcp_get32(header + 4);
+            if (!length || length >= sizeof(path) || fread(path, 1, length, manifest) != length) goto done;
+        }
+        if ((kind > 5 && !(defaults && kind == 7)) ||
+            (kind != 3 && kind != 4 && path[0] != '/' && !defaults) ||
             memchr(path, 0, length)) goto done;
         path[length] = 0;
+        if (kind == 3) {
+            // GCC's target preinclude precedes user -include operands. In
+            // particular their PCH validation observes its macro definitions.
+            char *flag = strdup("-include"), *name = strdup(path);
+            if (!flag || !name) { free(flag); free(name); ret = EXIT_OUT_OF_MEMORY; goto done; }
+            unsigned argc = dcc_argv_len(args);
+            memmove(args+preinclude_end+2, args+preinclude_end,
+                    (argc-preinclude_end+1)*sizeof(*args));
+            args[preinclude_end++] = flag;
+            args[preinclude_end++] = name;
+            continue;
+        }
         if (kind == 4) {
             if (strcmp(path, "gcc")) goto done;
             /* Resolve through the selected GCC's plugin directory. Only the
@@ -178,29 +210,35 @@ static int add_system_includes(char ***argv, const char *root)
                 goto done;
             }
             dcc_argv_append(args, option);
+            if (defaults) {
+                option = strdup("-fplugin-arg-distcc_gcc_scan-client-search=1");
+                if (!option) { ret = EXIT_OUT_OF_MEMORY; goto done; }
+                dcc_argv_append(args, option);
+            }
             continue;
         }
-        if (asprintf(&option, "%s%s%s", kind == 0 || kind == 5 ? "-isystem" : "",
-                     kind == 3 ? "" : root, path) < 0) {
+        if (asprintf(&option, "%s%s%s", kind == 0 || kind == 5 ? "-isystem" : kind == 7 ? "-I" : "",
+                     defaults && path[0] != '/' ? "" : root, path) < 0) {
             ret = EXIT_OUT_OF_MEMORY;
             goto done;
         }
         const char *prefix[] = {"-Xclang", kind == 1 ? "-internal-isystem" : "-internal-externc-isystem", "-Xclang"};
-        for (unsigned j = 0; j < (kind == 3 ? 1 : kind == 1 || kind == 2 ? 3 : 0); ++j) {
-            char *arg = strdup(kind == 3 ? "-include" : prefix[j]);
+        for (unsigned j = 0; j < (kind == 1 || kind == 2 ? 3 : 0); ++j) {
+            char *arg = strdup(prefix[j]);
             if (!arg) { free(option); ret = EXIT_OUT_OF_MEMORY; goto done; }
             dcc_argv_append(args, arg);
         }
         dcc_argv_append(args, option);
         if (kind == 5) {
-            if (asprintf(&option, "-fplugin-arg-distcc_gcc_scan-cxx-system=%s%s", root, path) < 0) {
+            if (asprintf(&option, "-fplugin-arg-distcc_gcc_scan-cxx-system=%s%s",
+                         path[0] == '/' ? root : "", path) < 0) {
                 ret = EXIT_OUT_OF_MEMORY;
                 goto done;
             }
             dcc_argv_append(args, option);
         }
     }
-    if (fgetc(manifest) != EOF || ferror(manifest) || rmdir(directory)) goto done;
+    if (manifest && (fgetc(manifest) != EOF || ferror(manifest) || rmdir(directory))) goto done;
     dcc_free_argv(*argv);
     *argv = args;
     args = NULL;
@@ -221,7 +259,8 @@ int dcc_execute_job(struct dcc_job *job, const char *root, int cancel_fd,
     dcc_job_result_init(result);
     if (job->kind == DCC_JOB_LINK || dcc_job_tree(job)) version = DCC_VER_LINK;
     else dcc_get_protover_from_features(DCC_COMPRESS_LZ4_STREAM,
-            job->kind == DCC_JOB_PUMP ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT, &version);
+            job->kind == DCC_JOB_PUMP || job->kind == DCC_JOB_GCC_FRONTEND
+            ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT, &version);
     dcc_job_summary_clear();
     ret = dcc_run_job(cancel_fd, -1, version, job, root, result);
     dcc_job_summary();
@@ -1054,6 +1093,8 @@ static int dcc_run_job(int in_fd,
     int changed_directory = 0;
     int preprocess_only = 0;
     int stdout_output = 0;
+    void *filesystem = NULL;
+    char **gcc_defaults = NULL, **job_argv = job ? job->argv : NULL;
 
     gettimeofday(&start, NULL);
 
@@ -1138,12 +1179,28 @@ static int dcc_run_job(int in_fd,
 
     dcc_get_features_from_protover(protover, &compr, &cpp_where);
 
+    if (job && job->kind == DCC_JOB_GCC_FRONTEND) {
+        if (dcc_argv_len(job->argv) < 5 || !job->fs_channel) {
+            ret = EXIT_PROTOCOL_ERROR; goto out_cleanup;
+        }
+        gcc_defaults = job->argv + 3;
+        job_argv = gcc_defaults;
+        while (*job_argv && **job_argv) ++job_argv;
+        if (!*job_argv || !*++job_argv) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
+        if (asprintf(&temp_dir, "%s/files", root) < 0) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
+        filesystem = dcc_gcc_files_start(job->fs_channel-1, temp_dir, job->argv[2], root);
+        if (!filesystem) {
+            rs_log_error("GCC remote filesystem: %s", strerror(errno));
+            ret = EXIT_IO_ERROR; goto out_cleanup;
+        }
+    }
+
     if (cpp_where == DCC_CPP_ON_SERVER) {
         if (job) {
-            temp_dir = strdup(root);
+            if (!temp_dir) temp_dir = strdup(root);
             client_cwd = strdup(job->cwd);
             if (!temp_dir || !client_cwd ||
-                asprintf(&server_cwd, "%s%s", root, job->cwd) < 0) {
+                asprintf(&server_cwd, "%s%s", temp_dir, job->cwd) < 0) {
                 ret = EXIT_OUT_OF_MEMORY;
                 goto out_cleanup;
             }
@@ -1156,7 +1213,7 @@ static int dcc_run_job(int in_fd,
         changed_directory = 1;
     }
 
-    if ((ret = job ? dcc_copy_argv(job->argv, &argv, 0) :
+    if ((ret = job ? dcc_copy_argv(job_argv, &argv, 0) :
                     dcc_r_argv(in_fd, "ARGC", "ARGV", &argv))
         || (ret = dcc_scan_args(argv, &orig_input_tmp, &orig_output_tmp,
                                 &tweaked_argv, 0)))
@@ -1263,7 +1320,7 @@ static int dcc_run_job(int in_fd,
     }
 
     if (cpp_where == DCC_CPP_ON_SERVER &&
-        (ret = add_system_includes(&argv, temp_dir))) {
+        (ret = add_system_includes(&argv, temp_dir, gcc_defaults))) {
         if (ret != EXIT_PROTOCOL_ERROR) goto out_cleanup;
         /* The request arrived intact but its metadata is invalid. Return a
          * completed error instead of making the client quarantine a healthy
@@ -1409,6 +1466,7 @@ out_cleanup:
         ret = EXIT_IO_ERROR;
       }
     }
+    if (filesystem && dcc_gcc_files_stop(filesystem, &result->cpu_ns, &result->peak_bytes)) ret = EXIT_IO_ERROR;
 
     switch (ret) {
     case EXIT_BUSY: /* overloaded */

@@ -2,17 +2,12 @@ TODO list for distcc
 
 --> See also TODO and FIXME comments in source files and doc/todo/
 
-move GCC input preparation to remote workers
+validate GCC remote input preparation across the fleet
 
-    GCC pump still runs complete preprocessing on the client to discover
-    dependencies, which can leave workers idle without any queued jobs.
-    The existing read-only filesystem RPC and shared input cache can be
-    reused, but the current frontend adapter only connects them to Clang.
-    Add an actual GCC filesystem integration rather than interpreting its
-    preprocessing in another parser. Preserve compiler-selected headers,
-    source path semantics, dependency output, access checks and cancellation.
-    Acceptance requires real GCC distributed builds and matched complete-build
-    CPU, elapsed-time and worker-occupancy measurements; dispatch counts alone
+    The native GCC/FUSE path removes the pump dependency scan from the client.
+    Complete cross-target canaries, deployment and matched complete-build CPU,
+    elapsed-time and worker-occupancy measurements before accepting its fleet
+    performance. Local compiler/transport regressions and dispatch counts alone
     do not establish that input preparation is no longer limiting throughput.
 
 type-check TCP integration tests

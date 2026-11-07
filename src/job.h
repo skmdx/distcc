@@ -9,7 +9,7 @@
 #define DCC_JOB_RESULT_COUNT 4
 #define DCC_SYSTEM_HEADERS ".distcc-system"
 enum dcc_job_kind { DCC_JOB_COMPILE, DCC_JOB_PUMP, DCC_JOB_LINK, DCC_JOB_RUST, DCC_JOB_THINLTO,
-                    DCC_JOB_OFFLOAD_LINK, DCC_JOB_FRONTEND, DCC_JOB_KIND_COUNT };
+                    DCC_JOB_OFFLOAD_LINK, DCC_JOB_FRONTEND, DCC_JOB_GCC_FRONTEND, DCC_JOB_KIND_COUNT };
 enum dcc_job_input_kind { DCC_JOB_FILE, DCC_JOB_SYMLINK, DCC_JOB_EMPTY,
                          DCC_JOB_READONLY };
 enum dcc_job_encoding { DCC_JOB_RAW, DCC_JOB_LZ4 };
@@ -40,6 +40,10 @@ struct dcc_job {
 static inline int dcc_job_file(const struct dcc_job_input *in)
 {
     return in->kind == DCC_JOB_FILE || in->kind == DCC_JOB_READONLY;
+}
+static inline int dcc_job_frontend(const struct dcc_job *job)
+{
+    return job->kind == DCC_JOB_FRONTEND || job->kind == DCC_JOB_GCC_FRONTEND;
 }
 static inline int dcc_job_tree(const struct dcc_job *job)
 {

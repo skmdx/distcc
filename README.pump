@@ -123,7 +123,16 @@ it on clients together with the updated worker helper.
 GCC profile generation and profile use remain local because their additional file contracts are not
 part of the compilation RPC.
 
-GCC jobs invoke the selected GCC frontend with a dependency-collection plugin.
+With `DISTCC_FRONTEND_REMOTE=1`, ordinary GCC C/C++ jobs bypass the include
+server. A short native frontend invocation reports search directories without
+preprocessing headers; the selected worker's GCC performs preprocessing and
+compilation once against the client's on-demand filesystem. GCC owns implicit
+preincludes, PCH validation and header lookup. Client default directories replace
+only the worker's implicit directories, retaining their order and system
+classes. Environment include paths retain their relative spelling and dependency
+classification. See README.md for the worker's FUSE prerequisites.
+
+The existing pump path invokes the selected GCC frontend with a dependency-collection plugin.
 The module accesses GCC's own libcpp input state, including existence-only probes
 that ordinary dependency output omits. GCC performs condition evaluation, macro
 expansion, token pasting and header search; Python does not interpret C/C++.

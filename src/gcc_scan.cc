@@ -8,6 +8,7 @@
 #include "c-family/c-target.h"
 #include "langhooks.h"
 #include "opts.h"
+#include "toplev.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,9 @@ extern "C" bool distcc_gcc_inputs(cpp_reader *, const char *,
                                   bool (*)(const char *, const struct stat *, int, void *), void *);
 extern "C" bool distcc_gcc_input_root(cpp_reader *, const char *);
 extern "C" void distcc_gcc_cxx_system(cpp_reader *, const char *);
+extern "C" void distcc_gcc_client_search(cpp_reader *);
+extern "C" bool distcc_gcc_plan(cpp_reader *,
+    bool (*)(const char *, const struct stat *, int, void *), void *);
 // The optional negative-lookup cache delegates validation only after a complete
 // native manifest exists. Ordinary preprocessing and incomplete scans still
 // need its replay because they have no usable per-input snapshot to validate.
@@ -31,6 +35,8 @@ FILE *output = nullptr;
 // Header search produces many short records; write them in bounded batches.
 char output_buffer[64 * 1024];
 bool precompiled = false;
+bool planning = false;
+bool client_search = false;
 std::string input_root;
 std::vector<std::string> cxx_system_dirs;
 void (*read_pch)(cpp_reader *, const char *, int, const char *) = nullptr;
@@ -117,12 +123,54 @@ void read_precompiled(cpp_reader *reader, const char *name, int fd, const char *
     read_pch(reader, name, fd, original);
 }
 
+struct frontend_plan {
+    std::vector<std::string> defaults{"4gcc"}, roots;
+};
+bool plan_entry(const char *path, const struct stat *, int kind, void *context)
+{
+    auto &plan = *static_cast<frontend_plan *>(context);
+    if (!path || !*path) return false;
+    std::string name(path);
+    if (kind < 0) {
+        auto end = name.find_last_of('/');
+        name = end == std::string::npos ? "." : end == 0 ? "/" : name.substr(0, end);
+    }
+    plan.roots.push_back(name);
+    if (kind >= 3) plan.defaults.push_back(std::string(1, kind == 3 ? '7' : kind == 4 ? '5' : '0') + path);
+    return true;
+}
+bool plan_group(const std::vector<std::string> &values)
+{
+    if (fprintf(output, "ARGC%08x", static_cast<unsigned>(values.size())) < 0) return false;
+    for (const auto &value : values)
+        if (fprintf(output, "ARGV%08x", static_cast<unsigned>(value.size())) < 0 ||
+            fwrite(value.data(), 1, value.size(), output) != value.size()) return false;
+    return true;
+}
+
 void entered_file(void *, void *)
 {
+    if (planning) {
+        planning = false;
+        frontend_plan plan;
+        bool ok = distcc_gcc_plan(parse_in, plan_entry, &plan);
+        for (unsigned i = 0; i < save_decoded_options_count; ++i) {
+            const auto &option = save_decoded_options[i];
+            if ((option.opt_index == OPT_include || option.opt_index == OPT_imacros) && option.arg)
+                ok = ok && plan_entry(option.arg, nullptr, -1, &plan);
+        }
+        ok = ok && plan_group(plan.defaults) && plan_group(plan.roots);
+        if (fclose(output)) ok = false;
+        // Search paths are initialized, but no source token or header is
+        // preprocessed. The remote native frontend owns that work once.
+        _exit(ok ? 0 : 1);
+    }
     if (!input_root.empty()) {
-        if (distcc_gcc_input_root(parse_in, input_root.c_str()))
+        if (distcc_gcc_input_root(parse_in, input_root.c_str())) {
+            if (client_search) distcc_gcc_client_search(parse_in);
             for (const auto &path : cxx_system_dirs)
                 distcc_gcc_cxx_system(parse_in, path.c_str());
+        }
         return;
     }
     auto *callbacks = cpp_get_callbacks(parse_in);
@@ -185,7 +233,11 @@ int plugin_init(struct plugin_name_args *arguments, struct plugin_gcc_version *v
         input_root = root;
         for (int i = 1; i < arguments->argc; ++i) {
             const auto &arg = arguments->argv[i];
-            if (strcmp(arg.key, "cxx-system") || !arg.value || arg.value[0] != '/') return 1;
+            if (!strcmp(arg.key, "client-search") && arg.value && !strcmp(arg.value, "1")) {
+                client_search = true;
+                continue;
+            }
+            if (strcmp(arg.key, "cxx-system") || !arg.value || !*arg.value) return 1;
             cxx_system_dirs.emplace_back(arg.value);
         }
         register_callback(arguments->base_name, PLUGIN_INCLUDE_FILE, entered_file, nullptr);
@@ -197,7 +249,8 @@ int plugin_init(struct plugin_name_args *arguments, struct plugin_gcc_version *v
     if (*end || descriptor < 3 || descriptor > INT_MAX) return 1;
     if (!strcmp(arguments->argv[0].key, "driver-fd"))
         return driver_options(descriptor) ? 0 : 1;
-    if (strcmp(arguments->argv[0].key, "output-fd")) return 1;
+    planning = !strcmp(arguments->argv[0].key, "plan-fd");
+    if (!planning && strcmp(arguments->argv[0].key, "output-fd")) return 1;
     struct stat info;
     if (fstat(descriptor, &info) || !S_ISREG(info.st_mode) || lseek(descriptor, 0, SEEK_CUR) != 0) return 1;
     output = fdopen(descriptor, "wb");
@@ -205,8 +258,10 @@ int plugin_init(struct plugin_name_args *arguments, struct plugin_gcc_version *v
     // Module preprocessing has a language-specific token observer and is not
     // supported by the dependency collector. Never replace that observer.
     if (flag_modules) return 1;
-    lang_hooks.preprocess_token = scan_tokens;
-    register_callback(arguments->base_name, PLUGIN_FINISH, finish, nullptr);
+    if (!planning) {
+        lang_hooks.preprocess_token = scan_tokens;
+        register_callback(arguments->base_name, PLUGIN_FINISH, finish, nullptr);
+    }
     register_callback(arguments->base_name, PLUGIN_INCLUDE_FILE, entered_file, nullptr);
     return 0;
 }

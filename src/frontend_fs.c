@@ -41,23 +41,29 @@ static int within(const char *path, const char *root)
     return !strncmp(path, root, n) && (!path[n] || path[n] == '/' || !strcmp(root, "/"));
 }
 enum { PATH_METADATA = 1, PATH_CONTENTS = 2 };
+int dcc_frontend_fs_add_root(struct dcc_job *job, const char *path)
+{
+    char *absolute = NULL;
+    if (*path != '/' && asprintf(&absolute, "%s/%s", job->cwd, path) < 0) return -1;
+    char *root = normalized(absolute ? absolute : path);
+    free(absolute);
+    if (!root) return -1;
+    size_t count = job->fs_roots ? dcc_argv_len(job->fs_roots) : 0;
+    for (size_t i = 0; i < count; ++i)
+        if (within(root, job->fs_roots[i])) { free(root); return 0; }
+    char **roots = realloc(job->fs_roots, (count+2)*sizeof(*roots));
+    if (!roots) { free(root); return -1; }
+    job->fs_roots = roots;
+    roots[count] = root; roots[count+1] = NULL;
+    return 0;
+}
 int dcc_frontend_fs_add_roots(struct dcc_job *job, const char *paths)
 {
     if (!paths || !*paths) return 0;
     char *copy = strdup(paths), *save = NULL;
     if (!copy) return -1;
-    size_t count = dcc_argv_len(job->fs_roots);
     for (char *path = strtok_r(copy, ":", &save); path; path = strtok_r(NULL, ":", &save)) {
-        char *absolute = NULL;
-        if (*path != '/' && asprintf(&absolute, "%s/%s", job->cwd, path) < 0) goto failed;
-        char *root = normalized(absolute ? absolute : path);
-        free(absolute);
-        if (!root) goto failed;
-        char **roots = realloc(job->fs_roots, (count + 2) * sizeof(*roots));
-        if (!roots) { free(root); goto failed; }
-        job->fs_roots = roots;
-        roots[count++] = root;
-        roots[count] = NULL;
+        if (dcc_frontend_fs_add_root(job, path)) goto failed;
     }
     free(copy);
     return 0;
@@ -125,7 +131,7 @@ static int directory(struct reply_writer *writer, const char *path, int statuses
         struct stat st;
         int error = 0;
         if (statuses || entry->d_type == DT_UNKNOWN)
-            error = fstatat(dirfd(dir), entry->d_name, &st, statuses ? 0 : AT_SYMLINK_NOFOLLOW) ? errno : 0;
+            error = fstatat(dirfd(dir), entry->d_name, &st, statuses == 1 ? 0 : AT_SYMLINK_NOFOLLOW) ? errno : 0;
         else st.st_mode = DTTOIF(entry->d_type); /* LIST exposes only the file type. */
         size_t length = strlen(entry->d_name);
         dcc_tcp_put32(header, length);
@@ -151,7 +157,7 @@ void dcc_frontend_fs_clear(struct dcc_frontend_reply *reply)
     free(reply->data);
     *reply = (struct dcc_frontend_reply){.fd = -1};
 }
-int dcc_frontend_fs_reply(const struct dcc_job *job, const void *data, size_t size,
+int dcc_frontend_fs_reply(struct dcc_job *job, const void *data, size_t size,
                           struct dcc_frontend_reply *reply)
 {
     *reply = (struct dcc_frontend_reply){.fd = -1};
@@ -165,14 +171,17 @@ int dcc_frontend_fs_reply(const struct dcc_job *job, const void *data, size_t si
     struct stat st;
     if (!path || append(&writer, header, 8)) goto failed;
     int access = allowed(job, path);
-    int required = operation == DCC_FS_STAT || operation == DCC_FS_REALPATH ? PATH_METADATA : PATH_CONTENTS;
+    int required = operation == DCC_FS_STAT || operation == DCC_FS_LSTAT ||
+        operation == DCC_FS_READLINK || operation == DCC_FS_REALPATH ? PATH_METADATA : PATH_CONTENTS;
     if (!(access & required)) {
         /* Missing include candidates must retain their lookup error so Clang
          * can continue searching. Existing unexported files stay inaccessible. */
-        error = stat(path, &st) ? errno : EACCES;
-    } else if (operation == DCC_FS_STAT) {
-        if (stat(path, &st) || metadata(&writer, &st) ||
-            (S_ISDIR(st.st_mode) && (access & PATH_CONTENTS) && directory(&writer, path, 1))) error = errno;
+        error = (operation == DCC_FS_LSTAT || operation == DCC_FS_READLINK
+                 ? lstat(path, &st) : stat(path, &st)) ? errno : EACCES;
+    } else if (operation == DCC_FS_STAT || operation == DCC_FS_LSTAT) {
+        if ((operation == DCC_FS_STAT ? stat(path, &st) : lstat(path, &st)) || metadata(&writer, &st) ||
+            (S_ISDIR(st.st_mode) && (access & PATH_CONTENTS) &&
+             directory(&writer, path, operation == DCC_FS_STAT ? 1 : 2))) error = errno;
     } else if (operation == DCC_FS_READ) {
         reply->fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (reply->fd < 0 || fstat(reply->fd, &st)) error = errno;
@@ -186,6 +195,31 @@ int dcc_frontend_fs_reply(const struct dcc_job *job, const void *data, size_t si
         free(resolved);
     } else if (operation == DCC_FS_LIST) {
         if (directory(&writer, path, 0)) error = errno;
+    } else if (operation == DCC_FS_READLINK) {
+        char target[PATH_MAX];
+        ssize_t length = readlink(path, target, sizeof(target));
+        if (length < 0 || (size_t)length == sizeof(target)) error = length < 0 ? errno : ENAMETOOLONG;
+        else if (append(&writer, target, length)) error = errno;
+        else {
+            /* The kernel follows the link before its next FUSE request.
+             * Authorize only targets reached through a client-authorized
+             * link, not arbitrary canonical paths proposed by the worker. */
+            if (access & PATH_CONTENTS) {
+                char *resolved = realpath(path, NULL);
+                if (resolved && dcc_frontend_fs_add_root(job, resolved)) error = ENOMEM;
+                free(resolved);
+            } else {
+                /* A symlink above an export grants only the exports below
+                 * it, rather than every file in the symlink's target. */
+                size_t count = dcc_argv_len(job->fs_roots);
+                for (size_t i = 0; i < count && !error; ++i) {
+                    if (!within(job->fs_roots[i], path)) continue;
+                    char *resolved = realpath(job->fs_roots[i], NULL);
+                    if (resolved && dcc_frontend_fs_add_root(job, resolved)) error = ENOMEM;
+                    free(resolved);
+                }
+            }
+        }
     } else error = EINVAL;
     if (error) {
         if (reply->fd >= 0) close(reply->fd);

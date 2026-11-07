@@ -146,6 +146,23 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         subprocess.run([compiler_path, str(obj), str(support_obj), '-o', str(exe)], check=True, timeout=30)
         subprocess.run([str(exe)], check=True, timeout=5)
         results[compiler] = {'distributed': True, 'linked': True, 'executed': True}
+        if 'clang' not in compiler and ',tcp' in env['DISTCC_HOSTS']:
+            # Reach the daemon's GCC filesystem frontend, including when this
+            # validator and the selected daemon run on the same machine.
+            before = (root/'client.log').stat().st_size
+            frontend_env = dict(env, DISTCC_FRONTEND_REMOTE='1')
+            frontend_env.pop('INCLUDE_SERVER_PORT', None)
+            obj.unlink()
+            result = subprocess.run(['distcc', compiler, '-I'+str(root), '-O2', '-fPIC',
+                                     '-c', str(source), '-o', str(obj)],
+                                    env=frontend_env, capture_output=True, timeout=REMOTE_TIMEOUT)
+            assert result.returncode == 0, (compiler, result.stderr.decode(errors='replace'))
+            log = (root/'client.log').read_text()[before:]
+            assert 'frontend filesystem:' in log and 'pooled TCP job completed' in log, log[-6000:]
+            subprocess.run([compiler_path, str(obj), str(support_obj), '-o', str(exe)],
+                           check=True, timeout=30)
+            subprocess.run([str(exe)], check=True, timeout=5)
+            results[compiler]['frontend'] = {'distributed': True, 'linked': True, 'executed': True}
         if 'clang' not in compiler:
             # Compound GCC jobs use source-valued dump operands. The relative
             # main and absolute parent-component support path cover both the

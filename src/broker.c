@@ -359,6 +359,7 @@ int dcc_broker_local_cpp(int *lease, int *occupied, int analysis)
 
 int dcc_broker_try_local(const struct dcc_work_hint *hint)
 {
+    if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) return -1;
     struct reply reply;
     int net, lease = broker_request(TRY_LOCAL, &reply, &net, hint, NULL);
     if (lease >= 0 && !reply.slots) { close(lease); lease = -1; }
@@ -387,7 +388,8 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int
         return EXIT_BAD_HOSTSPEC;
     free_hosts(local);
     int remote_cpp = can_compile_locally && getenv("INCLUDE_SERVER_PORT") != NULL;
-    fd = broker_request((can_compile_locally ? CLIENT_COMPILE : 0) |
+    fd = broker_request((can_compile_locally &&
+                         !dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0) ? CLIENT_COMPILE : 0) |
                         (remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL),
                         &reply, &net, hint, queued_fd);
     if (fd < 0)
