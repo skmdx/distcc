@@ -156,6 +156,18 @@ class GccScanTest(unittest.TestCase):
     result = self.scan('-x', 'c++')
     self.assertTrue(any(kind == 1 for kind in result['directories'].values()))
 
+  def test_system_header_spelling_survives_canonicalization(self):
+    system = self.root/'system'
+    system.mkdir()
+    header, alias = system/'x.h', system/'longer-header-name.h'
+    header.write_text('int selected;\n')
+    alias.symlink_to(header.name)
+    self.source.write_text('#include <longer-header-name.h>\n')
+    result = self.scan('-isystem', str(system))
+    self.assertIn(str(header), result['dependencies'])
+    self.assertIn(str(alias), result['dependencies'])
+    self.assertEqual(result['lookups'][str(alias)], result['lookups'][str(header)])
+
   def test_trigraphs_variadics_and_include_next_use_compiler_semantics(self):
     first, second = self.root/'first', self.root/'second'
     first.mkdir()

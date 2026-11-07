@@ -95,6 +95,20 @@ bool distcc_gcc_inputs(cpp_reader *reader, input_callback callback, void *contex
             stamp.st_ctim.tv_sec != file->st.st_ctim.tv_sec ||
             stamp.st_ctim.tv_nsec != file->st.st_ctim.tv_nsec ||
             !callback(file->path, &stamp, -1, context)) return false;
+        // GCC may shorten a system header to its canonical path. The worker
+        // still needs the original lookup spelling (including symlink names).
+        // Reuse libcpp's path construction without changing __FILE__ semantics.
+        if (file->dir->sysp && CPP_OPTION(reader, canonical_system_headers)) {
+            char *lookup = CPP_OPTION(reader, remap)
+                ? remap_filename(reader, const_cast<_cpp_file *>(file)) : nullptr;
+            if (!lookup)
+                lookup = file->dir->construct ? file->dir->construct(file->name, file->dir)
+                                             : append_file_to_dir(file->name, file->dir);
+            bool ok = lookup && (!strcmp(lookup, file->path) ||
+                                  callback(lookup, &stamp, -1, context));
+            free(lookup);
+            if (!ok) return false;
+        }
     }
     input_visitor visitor{callback, context, true};
     htab_traverse(reader->nonexistent_file_hash, missing_input, &visitor);

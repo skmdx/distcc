@@ -14,8 +14,12 @@ class MultiSourceTest(BrokerTestCase):
         self.start_broker(hosts=' '.join(self.host(i, options) for i in range(len(self.ports))))
         library = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
         if not library:
-            directory = subprocess.check_output(['gcc', '-print-file-name=plugin'], text=True).strip()
-            library = str(Path(directory) / 'distcc_gcc_scan.so')
+            from include_server import clang_scan
+            target = subprocess.check_output(['gcc', '-dumpmachine'], text=True).strip()
+            version = subprocess.check_output(['gcc', '-dumpfullversion'], text=True).strip()
+            library = str(Path(clang_scan.gcc_scan_dir) / target / version / 'distcc_gcc_scan.so')
+        if not Path(library).is_file():
+            self.skipTest('The selected GCC dependency module must be built first')
         self.env = dict(self.env,
                         DISTCC_GCC_SCAN_LIBRARY=library,
                         PATH=str(self.build) + os.pathsep + os.environ['PATH'])
@@ -33,16 +37,17 @@ class MultiSourceTest(BrokerTestCase):
         return subprocess.run(command, env=self.env, cwd=self.root,
                               text=True, capture_output=True, timeout=90)
 
+    def completed(self):
+        return sum(int(line.split()[1]) for port in self.stats_ports
+                   for line in self.get_stats(port).splitlines()
+                   if line.startswith('dcc_compile_ok '))
+
     def test_compiles_sources_remotely_then_links(self):
-        def completed():
-            return sum(int(line.split()[1]) for port in self.stats_ports
-                       for line in self.get_stats(port).splitlines()
-                       if line.startswith('dcc_compile_ok '))
-        before = completed()
+        before = self.completed()
         result = self.run_compound('-O2', '-Wl,--as-needed')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(subprocess.call([self.output]), 0)
-        after = completed()
+        after = self.completed()
         self.assertEqual(after - before, 2, result.stderr)
 
     def test_dependency_publication_matches_native_driver(self):
@@ -59,10 +64,25 @@ class MultiSourceTest(BrokerTestCase):
     def test_pump_compound_command(self):
         self.env['TMPDIR'] = str(self.root)
         self.env['DISTCC_TESTING_INCLUDE_SERVER'] = '1'
+        before = self.completed()
         result = self.run_compound('-O2', pump=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('gave up analyzing', result.stderr)
         self.assertEqual(subprocess.call([self.output]), 0)
+        self.assertEqual(self.completed() - before, 2)
+
+    def test_pump_system_header_aliases(self):
+        system = self.root / 'system'
+        system.mkdir()
+        (system / 'x.h').write_text('#define ANSWER 42\n')
+        (system / 'longer-header-name.h').symlink_to('x.h')
+        self.first.write_text('#include <longer-header-name.h>\nint value(){return ANSWER;}\n')
+        self.env.update(TMPDIR=str(self.root), DISTCC_TESTING_INCLUDE_SERVER='1')
+        before = self.completed()
+        result = self.run_compound('-isystem', str(system), pump=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(subprocess.call([self.output]), 0)
+        self.assertEqual(self.completed() - before, 2)
 
     def test_pump_absolute_source_parent_components(self):
         child = self.root / 'child'
