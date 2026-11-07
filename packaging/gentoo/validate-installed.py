@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -11,6 +12,21 @@ import sys
 import time
 
 REMOTE_TIMEOUT = 180
+
+# Deployment runs as root; compiler helpers must also load as Portage's build
+# user. An executable shared object without group/other read permission passes
+# root-only compilation tests but fails every unprivileged dlopen.
+import include_server
+account = pwd.getpwnam('portage') if os.geteuid() == 0 else None
+package = Path(next(iter(include_server.__path__)))
+for module in package.rglob('*.so'):
+    name = '.'.join(('include_server', *module.relative_to(package).parts[:-1],
+                     module.name.split('.')[0]))
+    subprocess.run([sys.executable, '-I', '-c',
+                    'import importlib,sys; importlib.import_module(sys.argv[1])', name],
+                   check=True, user=account.pw_uid if account else None,
+                   group=account.pw_gid if account else None,
+                   extra_groups=[] if account else None)
 
 wrapper = Path('/usr/lib/distcc/gcc')
 assert wrapper.samefile('/usr/bin/distcc'), 'GCC masquerade wrapper is missing'

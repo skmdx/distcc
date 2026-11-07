@@ -809,7 +809,7 @@ def remote_link(job, inputs, output):
 
 def worker(archive, output):
     root = Path(os.environ['DISTCCD_LINK_ROOT'])
-    with tempfile.TemporaryDirectory(prefix='distcc-link-') as name:
+    with tempfile.TemporaryDirectory(prefix='distcc-link-', dir=Path(output).parent) as name:
         work = Path(name)
         with tarfile.open(archive, mode='r:') as tar:
             names = set()
@@ -885,16 +885,22 @@ def worker(archive, output):
         verify_profile = dict(profile, key=key)
         validation_args = [a for a in args if not a.startswith('-L')]
         map_link_job(compiler, [*validation_args, '-o', output], verify_profile, identity, sysroot)
+        # Let the linker create its output with normal permissions. The RPC
+        # destination is a reserved 0600 file; GNU ld preserves those read
+        # bits, making installed shared libraries unreadable to other users.
+        linked = str(work / 'result')
         # Native client specs can have an empty sysroot_spec; pass the cache
         # to ld explicitly as well as to the GCC driver's library search.
         if clang:
             command = [lld_for(compiler), *args,
-                       '--sysroot=' + str(sysroot), '-o', output]
+                       '--sysroot=' + str(sysroot), '-o', linked]
         else:
             command = [compiler, '--sysroot=' + str(sysroot), '-B' + str(sysroot / gccdir) + '/',
                        '-specs=' + str(sysroot / '.distcc-link.specs'),
-                       *args, '-Wl,--sysroot=' + str(sysroot), '-o', output]
+                       *args, '-Wl,--sysroot=' + str(sysroot), '-o', linked]
         result = subprocess.call(command)
+        if result == 0:
+            os.replace(linked, output)
         return result if result >= 0 else 128 - result
 
 

@@ -129,6 +129,31 @@ class LinkTestCase(BrokerTestCase):
                                 text=True, timeout=15)
         return output, result
 
+    def test_shared_library_permissions_match_local(self):
+        source = self.work / 'library.cc'
+        source.write_text('extern "C" int answer() { return 42; }\n')
+        obj = self.work / 'library.o'
+        subprocess.run([self.compiler, '-fPIC', '-c', str(source), '-o', str(obj)],
+                       check=True, capture_output=True)
+        flags = ['-fuse-ld=lld'] if self.sync_compiler == 'clang' else []
+        command = [self.compiler, *flags, '-shared', str(obj)]
+        for mask in (0o022, 0o077):
+            with self.subTest(umask=oct(mask)):
+                local = self.work / f'local-{mask}.so'
+                remote = self.work / f'remote-{mask}.so'
+                subprocess.run([*command, '-o', str(local)], umask=mask,
+                               check=True, capture_output=True)
+                result = subprocess.run([str(self.build / 'distcc'), *command,
+                                         '-o', str(remote)], env=self.env, umask=mask,
+                                        capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-link: linked on ', result.stderr)
+                self.assertEqual(remote.stat().st_mode & 0o777,
+                                 local.stat().st_mode & 0o777)
+                subprocess.run([sys.executable, '-c',
+                                'import ctypes,sys; assert ctypes.CDLL(sys.argv[1]).answer() == 42',
+                                str(remote)], check=True, capture_output=True)
+
     def test_compatible_sysroot_metadata_and_missing_search_directory(self):
         profile = dict(self.profile, version='0.0-compatible-build')
         triple = profile['target'].split('-')
