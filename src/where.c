@@ -166,8 +166,13 @@ static void dcc_lock_pause(int analysis_occupied)
     /*	dcc_note_state(DCC_PHASE_BLOCKED, NULL, NULL, DCC_UNKNOWN);	*/
 
     if (analysis_occupied) {
+        struct timespec begin, end;
+        clock_gettime(CLOCK_MONOTONIC, &begin);
         rs_trace("waiting for analyzer memory admission (up to %ums)...", pause_time_ms);
         dcc_resource_analysis_wait(analysis_occupied, pause_time_ms);
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        rs_trace("analyzer memory admission waited %.6fs", end.tv_sec - begin.tv_sec +
+                 (end.tv_nsec - begin.tv_nsec) / 1000000000.0);
         return;
     }
 

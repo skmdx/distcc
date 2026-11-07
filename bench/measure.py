@@ -94,7 +94,8 @@ def summarize_samples(samples, names):
 
 def log_summary(paths):
     counts = dict(analysis_warnings=0, io_timeouts=0, sandbox_denials=0, broker_waits=0,
-                  local_slot_waits=0, local_slot_wait_seconds=0.0)
+                  local_slot_waits=0, local_slot_wait_seconds=0.0,
+                  analysis_memory_waits=0, analysis_memory_wait_seconds=0.0)
     timings = []
     waits = []
     assignments = {}
@@ -117,6 +118,10 @@ def log_summary(paths):
                 if local_wait:
                     counts['local_slot_waits'] += 1
                     counts['local_slot_wait_seconds'] += int(local_wait[1]) / 1000
+                analysis_wait = re.search(r'\(dcc_lock_pause\) analyzer memory admission waited ([\d.]+)s', line)
+                if analysis_wait:
+                    counts['analysis_memory_waits'] += 1
+                    counts['analysis_memory_wait_seconds'] += float(analysis_wait[1])
                 if 'job cost:' in line:
                     fields = dict(re.findall(r'(\w+)=(\S+)', line))
                     timings.append({key: float(fields[key]) for key in ('prepare', 'queue', 'execute')})
