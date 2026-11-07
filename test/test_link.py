@@ -151,6 +151,23 @@ class LinkTestCase(BrokerTestCase):
 
 
 class LinkTest(LinkTestCase):
+    def test_worker_prefers_sysroot_target_over_generic_gcc(self):
+        directory = self.work / 'worker-compilers'
+        directory.mkdir()
+        wrong = directory / 'g++'
+        wrong.write_text('#!/bin/sh\necho "wrong worker default target" >&2\nexit 1\n')
+        wrong.chmod(0o755)
+        actual = shutil.which('g++')
+        assert actual
+        (directory / (self.profile['target'] + '-g++')).symlink_to(actual)
+        self.restart_server(self.build / 'distccd',
+                            DISTCCD_PATH=str(directory) + os.pathsep + self.link_path)
+        output, result = self.link()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-link: linked on ', result.stderr)
+        self.assertNotIn('wrong worker default target', result.stderr)
+        self.assertEqual(subprocess.check_output([output], text=True), 'linked\n')
+
     def test_gcc_undefined_symbol_policy_is_forwarded(self):
         output, result = self.link(['-Wl,-no-undefined,--undefined-version'])
         self.assertEqual(result.returncode, 0, result.stderr)

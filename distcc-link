@@ -842,6 +842,14 @@ def worker(archive, output):
         clang = compiler_family(compiler) == 'clang'
         if compiler_family(compiler) != profile.get('family', 'gcc'):
             raise ValueError('compiler family does not match the sysroot')
+        if not clang:
+            # A native client may send just "g++" to a worker of another
+            # architecture. Its target specs must run in the corresponding
+            # driver, while vendor-equivalent requested names remain usable.
+            match = COMPILER.fullmatch(compiler)
+            assert match
+            driver = compiler[match.start('driver'):]
+            compiler = shutil.which(profile['target'] + '-' + driver) or compiler
         identity = compiler_identity(compiler, profile['target'])
         gccdir = profile.get('gccdir', '')
         if not clang and not re.fullmatch(r'usr/lib(?:64)?/gcc/[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+', gccdir):

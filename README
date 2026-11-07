@@ -69,6 +69,8 @@ workers to enable this optional path. A profile directory containing gcc.json
 and clang.json selects the compiler family automatically. Clang links use
 `-fuse-ld=lld` and support LLVM LTO, including ThinLTO. Changed libraries and
 unsupported link options stay local. See distcc(1) for toolchain requirements.
+GCC workers prefer an available target-qualified driver for the cached sysroot,
+so a native client can use a cross compiler on a worker of another architecture.
 
 For GCC and Clang compilation, `-march=native`, `-mtune=native` and
 `-mcpu=native` are resolved by the client compiler before distribution.
