@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Schedule GCC compound compile/link commands through the existing broker."""
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import distcc_python
+
+
+class LocalOnly(Exception):
+    pass
+
+
+def plan(command, directory):
+    from include_server import gcc_scan, clang_scan
+    env = dict(os.environ, LC_ALL='C', _DISTCC_SAFEGUARD='1')
+    result = subprocess.run([*command, '-###'], env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise LocalOnly('compiler rejected the compound command')
+    native = [clang_scan.tokenize_command(line.removesuffix(' |')) for line in result.stderr.splitlines()
+              if line.startswith(' ')]
+    frontends = [args for args in native if args and Path(args[0]).name in ('cc1', 'cc1plus')]
+    # Additional driver stages own visible side outputs (for example split
+    # DWARF). Keep those commands with the driver until they have an executor.
+    if (len(frontends) < 2 or any(not args or Path(args[0]).name not in
+            ('cc1', 'cc1plus', 'as', 'collect2', 'ld', 'ld.bfd', 'ld.gold', 'ld.lld')
+            for args in native)):
+        raise LocalOnly('not a compound C/C++ link')
+    parsed = gcc_scan.driver_options(command[0], [command, *frontends])
+    driver, *stages = parsed
+    if any(args[0] in ('-c', '-S', '-E', '-M', '-MM', '-save-temps', '-save-temps=')
+           or args[0].startswith('-save-temps=') for _, args in driver):
+        raise LocalOnly('driver owns intermediate output files')
+    common = [arg for is_input, args in driver if not is_input and
+              args[0] not in ('-o', '-x', '-MF', '-MT', '-MQ', '-dumpbase', '-dumpbase-ext', '-dumpdir')
+              for arg in args]
+    jobs, replacements = [], defaultdict(deque)
+    for index, (frontend, stage) in enumerate(zip(frontends, stages)):
+        inputs = [args[0] for is_input, args in stage if is_input]
+        if len(inputs) != 1 or inputs[0] == '-':
+            raise LocalOnly('frontend does not read one independent source file')
+        source = inputs[0]
+        language = 'c++' if Path(frontend[0]).name == 'cc1plus' else 'c'
+        if any(args[0] == '-fpreprocessed' for _, args in stage):
+            language = 'c++-cpp-output' if language == 'c++' else 'cpp-output'
+        obj = str(directory / (str(index) + '.o'))
+        extra, dependencies = [], None
+        for is_input, args in stage:
+            if is_input:
+                continue
+            if args[0] in ('-dumpdir', '-dumpbase', '-dumpbase-ext', '-MT', '-MQ'):
+                extra.extend(args)
+            elif args[0] in ('-MD', '-MMD'):
+                if len(args) != 2 or args[1] == '-':
+                    raise LocalOnly('dependency output is not a file')
+                temporary = str(directory / (str(index) + '.d'))
+                extra.extend(['-MF', temporary])
+                dependencies = (temporary, args[1])
+        invocation = [command[0], *common, *extra, '-x', language, '-c', source, '-o', obj]
+        jobs.append((invocation, dependencies))
+        replacements[source].append(obj)
+    link = [command[0]]
+    for is_input, args in driver:
+        if is_input and replacements[args[0]]:
+            link.append(replacements[args[0]].popleft())
+        elif not is_input and args[0] == '-x':
+            continue
+        else:
+            link.extend(args)
+    if any(replacements.values()):
+        raise LocalOnly('driver inputs and frontend jobs do not correspond')
+    return jobs, link
+
+
+def execute(command):
+    distcc = str(Path(__file__).resolve().with_name('distcc'))
+    env = dict(os.environ)
+    env.pop('_DISTCC_SAFEGUARD', None)
+    with tempfile.TemporaryDirectory(prefix='distcc-multi-') as name:
+        try:
+            jobs, link = plan(command, Path(name))
+        except (LocalOnly, OSError, subprocess.SubprocessError) as error:
+            if os.environ.get('DISTCC_VERBOSE') == '1':
+                print('distcc-multi: local: ' + str(error), file=sys.stderr)
+            return subprocess.call([distcc, *command], env=dict(env, _DISTCC_MULTI_LOCAL='1'))
+        slots = int(subprocess.check_output([distcc, '-j'], env=env, text=True))
+        def compile_job(job):
+            return subprocess.call([distcc, *job[0]], env=env)
+        with ThreadPoolExecutor(max_workers=min(slots, len(jobs))) as pool:
+            results = list(pool.map(compile_job, jobs))
+        # GCC writes shared dependency destinations in source order. Give each
+        # concurrent compile its own file, then preserve that publication order.
+        for _, dependency in jobs:
+            if dependency and Path(dependency[0]).exists():
+                shutil.copyfile(*dependency)
+        failure = next((result for result in results if result), 0)
+        return failure or subprocess.call([distcc, *link], env=env)
+
+
+if __name__ == '__main__':
+    sys.exit(execute(sys.argv[1:]))

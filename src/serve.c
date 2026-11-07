@@ -611,7 +611,9 @@ static int tweak_input_argument_for_server(char **argv,
     /* Look for the source file and act if absolute. Note: dcc_scan_args
      * rejects compilations with more than one source file. */
     for (i=0; argv[i]; i++)
-        if (dcc_is_source(argv[i]) && argv[i][0]=='/') {
+        if (dcc_is_literal_option(argv[i]) && argv[i + 1]) {
+            i++;
+        } else if (dcc_is_source(argv[i]) && argv[i][0]=='/') {
             unsigned j = 0;
             char *prefixed_name;
             while (argv[i][j] == '/') j++;

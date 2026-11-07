@@ -6,6 +6,7 @@
 #include "plugin-version.h"
 #include "c-family/c-pragma.h"
 #include "langhooks.h"
+#include "opts.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,55 @@ bool precompiled = false;
 std::string input_root;
 std::vector<std::string> cxx_system_dirs;
 void (*read_pch)(cpp_reader *, const char *, int, const char *) = nullptr;
+
+// Decode the driver's own option language for compound compile/link jobs.
+// The descriptor contains counted, NUL-terminated argv arrays and is replaced
+// with counted canonical option groups. No C/C++ or option grammar is copied.
+bool driver_options(int descriptor)
+{
+    struct stat info;
+    if (fstat(descriptor, &info) || !S_ISREG(info.st_mode) || info.st_size <= 0)
+        return false;
+    std::vector<char> data(info.st_size);
+    size_t received = 0;
+    while (received < data.size()) {
+        ssize_t count = read(descriptor, data.data() + received, data.size() - received);
+        if (count <= 0) return false;
+        received += count;
+    }
+    if (data.back() || ftruncate(descriptor, 0) || lseek(descriptor, 0, SEEK_SET))
+        return false;
+    FILE *stream = fdopen(descriptor, "wb");
+    if (!stream) return false;
+    char *cursor = data.data(), *limit = cursor + data.size();
+    unsigned int command = 0;
+    while (cursor < limit) {
+        char *end;
+        unsigned long argc = strtoul(cursor, &end, 10);
+        if (*end || !argc || argc > UINT_MAX) { fclose(stream); return false; }
+        cursor = end + 1;
+        std::vector<const char *> argv;
+        for (unsigned long i = 0; i < argc; ++i) {
+            if (cursor >= limit) { fclose(stream); return false; }
+            argv.push_back(cursor);
+            cursor += strlen(cursor) + 1;
+        }
+        cl_decoded_option *options;
+        unsigned int count;
+        decode_cmdline_options_to_array(argc, argv.data(),
+            command++ == 0 ? CL_DRIVER : ~CL_DRIVER, &options, &count);
+        fprintf(stream, "%u%c", count - 1, 0);
+        for (unsigned int i = 1; i < count; ++i) {
+            const auto &option = options[i];
+            fprintf(stream, "%c%c%zu%c", option.opt_index == OPT_SPECIAL_input_file ? 'I' : 'O',
+                    0, option.canonical_option_num_elements, 0);
+            for (size_t j = 0; j < option.canonical_option_num_elements; ++j)
+                fwrite(option.canonical_option[j], 1, strlen(option.canonical_option[j]) + 1, stream);
+        }
+        free(options);
+    }
+    return fclose(stream) == 0;
+}
 
 uintptr_t scan_tokens(cpp_reader *reader, const cpp_token *, uintptr_t)
 {
@@ -131,10 +181,13 @@ int plugin_init(struct plugin_name_args *arguments, struct plugin_gcc_version *v
         register_callback(arguments->base_name, PLUGIN_INCLUDE_FILE, entered_file, nullptr);
         return 0;
     }
-    if (arguments->argc != 1 || strcmp(arguments->argv[0].key, "output-fd")) return 1;
+    if (arguments->argc != 1) return 1;
     char *end;
     long descriptor = strtol(arguments->argv[0].value, &end, 10);
     if (*end || descriptor < 3 || descriptor > INT_MAX) return 1;
+    if (!strcmp(arguments->argv[0].key, "driver-fd"))
+        return driver_options(descriptor) ? 0 : 1;
+    if (strcmp(arguments->argv[0].key, "output-fd")) return 1;
     struct stat info;
     if (fstat(descriptor, &info) || !S_ISREG(info.st_mode) || lseek(descriptor, 0, SEEK_CUR) != 0) return 1;
     output = fdopen(descriptor, "wb");

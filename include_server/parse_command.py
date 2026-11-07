@@ -153,6 +153,9 @@ CPP_OPTIONS_ALWAYS_TWO_WORDS = {
   '-Xlinker':       lambda ps, arg: None,
   '-Xclang':        lambda ps, arg: None,
   '-mllvm':         lambda ps, arg: None,
+  '-dumpbase':      lambda ps, arg: None,
+  '-dumpbase-ext':  lambda ps, arg: None,
+  '-dumpdir':       lambda ps, arg: None,
   '-framework':     lambda ps, arg: None,
 }
 

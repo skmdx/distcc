@@ -93,7 +93,7 @@ int dcc_cpp_ir(char **argv, const char *input_fname)
         else if (!strcmp(ext, ".mii")) language = "objective-c++";
     }
     for (i = 1; argv[i]; i++) {
-        if (dcc_is_forward_option(argv[i]) && argv[i + 1]) { i++; continue; }
+        if (dcc_is_literal_option(argv[i]) && argv[i + 1]) { i++; continue; }
         if (!strcmp(argv[i], "-x") && argv[i + 1]) language = argv[++i];
         else if (!strncmp(argv[i], "-x", 2) && argv[i][2]) language = argv[i] + 2;
     }

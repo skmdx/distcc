@@ -726,6 +726,18 @@ static int dcc_link_candidate(char **argv)
     return input;
 }
 
+static int dcc_multi_candidate(char **argv)
+{
+    int inputs = 0;
+    if (!getenv("DISTCC_BROKER") || dcc_getenv_bool("_DISTCC_MULTI_LOCAL", 0)) return 0;
+    for (int i = 1; argv[i]; ++i) {
+        if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "-S") ||
+            !strcmp(argv[i], "-E") || !strcmp(argv[i], "-###")) return 0;
+        if (dcc_is_source(argv[i])) ++inputs;
+    }
+    return inputs > 1;
+}
+
 /**
  * Execute the commands in argv remotely or locally as appropriate.
  *
@@ -797,6 +809,19 @@ dcc_build_somewhere(char *argv[],
         goto lock_local;
     if ((ret = dcc_expand_preprocessor_options(&argv)) != 0)
         goto clean_up;
+
+    if (dcc_multi_candidate(argv)) {
+        int argc = dcc_argv_len(argv);
+        char **command = calloc(argc + 2, sizeof(*command));
+        if (!command) { ret = EXIT_OUT_OF_MEMORY; goto clean_up; }
+        command[0] = "distcc-multi";
+        memcpy(command + 1, argv, (argc + 1) * sizeof(*argv));
+        /* The coordinator must not hold a local slot while waiting for its
+         * children, which acquire capacity through the normal broker path. */
+        ret = dcc_compile_local(command, NULL, NULL, NULL);
+        free(command);
+        goto clean_up;
+    }
 
     /* Links belong to the link driver, not the compile-only Clang scanner. */
     if (dcc_link_candidate(argv)) {

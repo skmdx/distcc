@@ -91,7 +91,7 @@ int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname)
         if (offload && !strncmp(offload, "cl", 2)) to[to_i++] = (char *)"-cl-no-stdinc";
     }
     for (from_i = 1; from[from_i]; from_i++) {
-        if ((dcc_is_forward_option(from[from_i]) || str_equal("-Xarch_host", from[from_i])) && from[from_i + 1]) {
+        if ((dcc_is_literal_option(from[from_i]) || str_equal("-Xarch_host", from[from_i])) && from[from_i + 1]) {
             to[to_i++] = from[from_i++];
             to[to_i++] = from[from_i];
         }
@@ -184,7 +184,7 @@ int dcc_strip_dasho(char **from, char ***out_argv)
     /* skip through argv, copying all arguments but skipping ones that
      * ought to be omitted */
     for (from_i = to_i = 0; from[from_i]; ) {
-        if (dcc_is_forward_option(from[from_i]) && from[from_i + 1]) {
+        if (dcc_is_literal_option(from[from_i]) && from[from_i + 1]) {
             to[to_i++] = from[from_i++];
             to[to_i++] = from[from_i++];
         }

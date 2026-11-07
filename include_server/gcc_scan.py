@@ -2,12 +2,44 @@
 import os
 from pathlib import Path
 import subprocess
-import distcc_pump_c_extensions
-import basics
+
+
+def driver_options(compiler, commands):
+  """Decode driver and frontend arguments using the selected GCC's option tables."""
+  env = dict(os.environ, LC_ALL='C', _DISTCC_SAFEGUARD='1')
+  library = env.get('DISTCC_GCC_SCAN_LIBRARY')
+  if not library:
+    directory = subprocess.check_output([compiler, '-print-file-name=plugin'],
+                                        env=env, text=True).strip()
+    library = str(Path(directory) / 'distcc_gcc_scan.so')
+  with os.fdopen(os.memfd_create('distcc-driver-options', os.MFD_CLOEXEC), 'w+b') as stream:
+    for command in commands:
+      stream.write(str(len(command)).encode() + b'\0')
+      for arg in command:
+        stream.write(os.fsencode(arg) + b'\0')
+    stream.flush()
+    stream.seek(0)
+    subprocess.run([compiler, '-E', '-x', 'c', '/dev/null', '-o', '/dev/null',
+                    '-fplugin=' + library,
+                    '-fplugin-arg-' + Path(library).stem + '-driver-fd=' + str(stream.fileno())],
+                   env=env, pass_fds=(stream.fileno(),), check=True, stderr=subprocess.PIPE)
+    stream.seek(0)
+    fields = iter(stream.read().split(b'\0'))
+    result = []
+    for command in commands:
+      options = []
+      for _ in range(int(next(fields))):
+        kind, count = next(fields), int(next(fields))
+        options.append((kind == b'I', [os.fsdecode(next(fields)) for _ in range(count)]))
+      result.append(options)
+    assert list(fields) == [b''], 'incomplete native GCC option result'
+    return result
 
 
 def scan(command, cwd, library):
   """Use the selected GCC frontend; never interpret C/C++ in Python."""
+  import distcc_pump_c_extensions
+  import basics
   env = dict(os.environ, LC_ALL='C', _DISTCC_SAFEGUARD='1', CCACHE_DISABLE='1')
   with os.fdopen(os.memfd_create('distcc-gcc-inputs', os.MFD_CLOEXEC), 'w+b') as output:
     fd = output.fileno()
