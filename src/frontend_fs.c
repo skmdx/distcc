@@ -106,17 +106,22 @@ static int append(struct reply_writer *writer, const void *bytes, size_t length)
     reply->size = needed;
     return 0;
 }
-static int metadata(struct reply_writer *writer, const struct stat *st)
+static void encode_metadata(unsigned char data[DCC_FS_METADATA], const struct stat *st)
 {
-    unsigned char data[DCC_FS_METADATA];
     dcc_tcp_put64(data, st->st_dev); dcc_tcp_put64(data + 8, st->st_ino);
     dcc_tcp_put64(data + 16, (uint64_t)st->st_mtim.tv_sec * 1000000000 + st->st_mtim.tv_nsec);
     dcc_tcp_put64(data + 24, st->st_size); dcc_tcp_put32(data + 32, st->st_mode);
     dcc_tcp_put32(data + 36, st->st_uid); dcc_tcp_put32(data + 40, st->st_gid);
     dcc_tcp_put64(data + 44, (uint64_t)st->st_ctim.tv_sec * 1000000000 + st->st_ctim.tv_nsec);
+}
+static int metadata(struct reply_writer *writer, const struct stat *st)
+{
+    unsigned char data[DCC_FS_METADATA];
+    encode_metadata(data, st);
     return append(writer, data, sizeof(data));
 }
-static int directory(struct reply_writer *writer, const char *path, int statuses)
+static int directory(struct reply_writer *writer, const char *path, int statuses,
+                     struct stat *snapshot)
 {
     /* STAT (1) batches child attributes for the Clang VFS. LSTAT (2) supplies
      * FUSE's negative-lookup cache without inspecting unused sibling files. */
@@ -145,6 +150,7 @@ static int directory(struct reply_writer *writer, const char *path, int statuses
         errno = 0;
     }
     if (!result && errno) result = -1;
+    if (!result && snapshot && fstat(dirfd(dir), snapshot)) result = -1;
     int error = errno;
     closedir(dir);
     if (!result && statuses) {
@@ -181,9 +187,13 @@ int dcc_frontend_fs_reply(struct dcc_job *job, const void *data, size_t size,
         error = (operation == DCC_FS_LSTAT || operation == DCC_FS_READLINK
                  ? lstat(path, &st) : stat(path, &st)) ? errno : EACCES;
     } else if (operation == DCC_FS_STAT || operation == DCC_FS_LSTAT) {
-        if ((operation == DCC_FS_STAT ? stat(path, &st) : lstat(path, &st)) || metadata(&writer, &st) ||
-            (S_ISDIR(st.st_mode) && (access & PATH_CONTENTS) &&
-             directory(&writer, path, operation == DCC_FS_STAT ? 1 : 2))) error = errno;
+        if ((operation == DCC_FS_STAT ? stat(path, &st) : lstat(path, &st)) || metadata(&writer, &st)) error = errno;
+        else if (S_ISDIR(st.st_mode) && (access & PATH_CONTENTS)) {
+            unsigned char readable[4];
+            dcc_tcp_put32(readable, 1);
+            if (operation == DCC_FS_STAT ? directory(&writer, path, 1, NULL) :
+                append(&writer, readable, sizeof(readable))) error = errno;
+        }
     } else if (operation == DCC_FS_READ) {
         reply->fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (reply->fd < 0 || fstat(reply->fd, &st)) error = errno;
@@ -196,7 +206,17 @@ int dcc_frontend_fs_reply(struct dcc_job *job, const void *data, size_t size,
         if (!resolved || append(&writer, resolved, strlen(resolved))) error = errno;
         free(resolved);
     } else if (operation == DCC_FS_LIST) {
-        if (directory(&writer, path, 0)) error = errno;
+        if (directory(&writer, path, 0, NULL)) error = errno;
+    } else if (operation == DCC_FS_DIRECTORY) {
+        unsigned char placeholder[DCC_FS_METADATA] = {0};
+        if (append(&writer, placeholder, sizeof(placeholder)) ||
+            directory(&writer, path, 2, &st)) error = errno;
+        else {
+            /* The cache publishes only when this post-listing version equals
+             * the caller's earlier LSTAT. Concurrent directory mutations must
+             * not associate the listing with an older directory generation. */
+            encode_metadata(reply->data + 8, &st);
+        }
     } else if (operation == DCC_FS_READLINK) {
         char target[PATH_MAX];
         ssize_t length = readlink(path, target, sizeof(target));
