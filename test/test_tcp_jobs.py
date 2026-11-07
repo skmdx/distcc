@@ -1649,6 +1649,9 @@ ssize_t write(int fd, const void *data, size_t size) {
     def result(self, net, identity=1, expected_status=0):
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
         kind, description = self.frame(net)
+        while kind == 0x54000208:
+            self.assertEqual(description, struct.pack('!Q', identity))
+            kind, description = self.frame(net)
         self.assertEqual(kind, 0x54000203)
         self.assertEqual(len(description), 72)
         status, mode, *sizes = struct.unpack('!II4Q', description[:40])
@@ -1702,6 +1705,26 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.result(waiter)
         hit = self.wire_job(body)
         self.result(hit)  # No NEED on the warm cache path.
+
+    def test_stalled_upload_does_not_expire_healthy_waiter(self):
+        self.restart_server(self.build / 'distccd', DISTCC_IO_TIMEOUT='2')
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        body = b'int recovered_from_stalled_peer(void) { return 904; }\n'
+        owner = self.wire_job(body)
+        self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
+        waiter = self.wire_job(body, identity=2)
+        # The owner stays connected but sends no input, as with a lost network
+        # path. A healthy waiter must receive progress before that owner expires.
+        self.assertEqual(self.frame(waiter), (0x54000208, struct.pack('!Q', 2)))
+        while True:
+            kind, data = self.frame(waiter)
+            if kind == 0x54000201:
+                self.assertEqual(data, bytes(4))
+                break
+            self.assertEqual((kind, data), (0x54000208, struct.pack('!Q', 2)))
+        self.assertEqual(owner.recv(1), b'')
+        self.upload(waiter, body)
+        self.result(waiter, identity=2)
 
     def test_owner_disconnect_during_waiter_lookup_requests_input_once(self):
         body = b'int cancel_during_lookup(void) { return 903; }\n'

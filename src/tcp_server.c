@@ -1059,15 +1059,30 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
         (s->phase == RETURNING && output_available(s) && (!s->head ||
             (s->output_index < DCC_JOB_RESULT_COUNT && !s->head->next))));
 }
+static int awaiting_shared_input(const struct dcc_tcp_server *s)
+{
+    if (s->phase != PREPARING || s->prepared != s->job->count || !s->remaining) return 0;
+    for (unsigned i = 0; i < s->job->count; ++i)
+        if (s->inputs[i].wanted) return 0;
+    return 1;
+}
+
 int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
 {
     time_t now = time(NULL);
-    if (s->failed || now - s->active >= (s->job || s->phase == RETURNING ? dcc_get_io_timeout() : 30)) return -1;
-    /* Once inputs are owned, silence is compiler/queue time, not a stalled
-     * upload. Keep both transport deadlines alive without relaxing them for
-     * unresponsive peers. No heartbeat is queued behind pending output. */
-    if (s->job && (s->phase == RUNNING || s->enqueued) && !s->head &&
-        now - s->active >= (dcc_get_io_timeout() > 1 ? dcc_get_io_timeout() / 2 : 1)) {
+    if (s->failed) return -1;
+    if (now - s->active >= (s->job || s->phase == RETURNING ? dcc_get_io_timeout() : 30)) {
+        rs_trace("TCP idle timeout: phase=%d prepared=%u inputs=%u remaining=%u queued=%zu",
+                 s->phase, s->prepared, s->job ? s->job->count : 0, s->remaining, s->queued);
+        return -1;
+    }
+    /* A client with nothing left to upload may be waiting on another client's
+     * shared input. Keep it alive so it can take over when that uploader times
+     * out. Requested-but-missing input still expires on its original deadline.
+     * No heartbeat is queued behind pending output. */
+    if (s->job && !s->head &&
+        now - s->active >= (dcc_get_io_timeout() > 1 ? dcc_get_io_timeout() / 2 : 1) &&
+        (s->phase == RUNNING || s->enqueued || awaiting_shared_input(s))) {
         unsigned char id[8];
         dcc_tcp_put64(id, s->run.id);
         if (queue(s, DCC_TCP_PROGRESS, id, sizeof(id))) return -1;

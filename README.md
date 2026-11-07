@@ -645,6 +645,9 @@ the broker). A compile tries
 at most three remote jobs even when backoff is disabled, then follows
 `DISTCC_FALLBACK`. Server protocol reads and writes use `DISTCC_IO_TIMEOUT`
 (default 300 seconds), so a silent partial request cannot retain a worker forever.
+Clients waiting for compilation or another client's shared input receive progress
+notifications. If a shared-input uploader times out, a waiting client takes over
+the upload; that dependency does not expire the healthy clients' connections.
 A live broker's refusal when no workers are available follows this bounded retry
 policy immediately; it does not enter the separate broker reconnection wait.
 

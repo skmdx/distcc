@@ -621,7 +621,11 @@ class RustTest(BrokerTestCase):
 
     def test_cached_inputs_and_parallel_crates(self):
         import concurrent.futures
-        self.restart_server(self.build / 'distccd', DISTCC_MEMORY_LEARNING='1')
+        # Earlier cases share the fixture daemon's cache. The cold/warm
+        # comparison requires an empty cache owned by this test.
+        self.restart_server(self.build / 'distccd', DISTCC_MEMORY_LEARNING='1',
+                            DISTCCD_FILE_CACHE=str(self.work / 'cache'))
+        self.addCleanup(self.restart_server, self.build / 'distccd')
         source = self.work / 'cache.rs'
         source.write_text('pub fn answer() -> usize { include_bytes!("data.bin").len() }\n' +
                           '\n'.join(f'pub fn value_{i}(x: usize) -> usize {{ x.wrapping_add({i}) }}'
@@ -664,6 +668,53 @@ class RustTest(BrokerTestCase):
                                '-o', path, remote=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(actual, path.read_bytes())
+
+    def test_client_takes_over_inputs_from_unresponsive_peer(self):
+        import concurrent.futures
+        helper = runpy.run_path(str(self.build / 'distcc-rust'))
+        source, output = self.work / 'recovery.rs', self.work / 'librecovery.rlib'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        job, inputs, outdir, outputs = helper['plan'](self.rustc,
+            ['--crate-name=recovery', '--crate-type=rlib', str(source), '-o', str(output)], self.work)
+        metadata, snapshots = helper['metadata'](job, inputs, self.work)
+        self.restart_server(self.build / 'distccd', DISTCC_IO_TIMEOUT='2')
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        env = dict(self.env, DISTCC_IO_TIMEOUT='2')
+        with socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5) as owner:
+            # Reserve the actual Rust inputs, then stop sending as a disconnected
+            # uploader would. The real file-job client has the same inputs.
+            manifest = struct.pack('!Q', 999) + metadata.read_bytes()[struct.calcsize('!QI'):]
+            owner.sendall(struct.pack('!II', 0x54000200, len(manifest)) + manifest)
+            header = bytearray()
+            while len(header) < 8:
+                part = owner.recv(8 - len(header))
+                self.assertTrue(part)
+                header.extend(part)
+            kind, size = struct.unpack('!II', header)
+            self.assertEqual(kind, 0x54000201)
+            while size:
+                part = owner.recv(size)
+                self.assertTrue(part)
+                size -= len(part)
+            archives = [self.work / f'recovered-{i}.tar' for i in range(3)]
+            def compile(archive):
+                return subprocess.run([self.build / 'distcc', '--file-job', metadata, snapshots, archive],
+                                      env=env, cwd=self.work, capture_output=True, text=True, timeout=30)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(archives)) as pool:
+                results = list(pool.map(compile, archives))
+            for result in results:
+                self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(owner.recv(1), b'')
+        for index, archive in enumerate(archives):
+            received = self.work / f'received-{index}'
+            received.mkdir()
+            helper['install_outputs'](archive, job, outdir, outputs, received)
+        main = self.work / 'recovery-main.rs'
+        main.write_text('fn main() { assert_eq!(recovery::answer(), 42); }')
+        result = self.rust(main, '--extern', 'recovery=' + str(output),
+                           '-o', self.work / 'recovery-check', remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([self.work / 'recovery-check'], check=True, timeout=5)
 
     def reserve_input_space(self, identity):
         def string(value):
