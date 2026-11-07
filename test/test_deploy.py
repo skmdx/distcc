@@ -62,7 +62,7 @@ class RolloutTest(unittest.TestCase):
             visited.append(target)
             raise RuntimeError('installed validation failed')
         with self.assertRaisesRegex(RuntimeError, 'installed validation failed'):
-            deploy.rollout([{'name': 'canary'}, {'name': 'worker'}], action)
+            deploy.rollout([{'name': 'canary'}, {'name': 'worker'}], lambda target: None, action)
         self.assertEqual(visited, [{'name': 'canary'}])
 
     def test_other_targets_start_after_canary_succeeds(self):
@@ -71,9 +71,47 @@ class RolloutTest(unittest.TestCase):
             if target['name'] != 'canary':
                 self.assertIn('canary', visited)
             visited.append(target['name'])
-        deploy.rollout([{'name': name} for name in ('canary', 'first', 'second')], action)
+        deploy.rollout([{'name': name} for name in ('canary', 'first', 'second')], lambda target: None, action)
         self.assertCountEqual(visited, ['canary', 'first', 'second'])
-        deploy.rollout([{'name': 'canary'}], action)
+        deploy.rollout([{'name': 'canary'}], lambda target: None, action)
+
+    def test_all_packages_are_built_before_any_worker_is_upgraded(self):
+        built = set()
+        targets = [{'name': name} for name in ('canary', 'first', 'second')]
+        def prepare(target):
+            built.add(target['name'])
+        def activate(target):
+            self.assertEqual(built, {'canary', 'first', 'second'})
+        deploy.rollout(targets, prepare, activate)
+
+    def test_build_failure_leaves_every_installed_worker_unchanged(self):
+        upgraded = []
+        def prepare(target):
+            if target['name'] == 'worker':
+                raise RuntimeError('package build failed')
+        with self.assertRaisesRegex(RuntimeError, 'package build failed'):
+            deploy.rollout([{'name': 'canary'}, {'name': 'worker'}], prepare,
+                           lambda target: upgraded.append(target['name']))
+        self.assertEqual(upgraded, [])
+
+    def test_native_package_preparation_does_not_install(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            target = {'name': 'worker', 'temporary': temporary, 'repository': str(work/'repo')}
+            with mock.patch.object(deploy, 'run', return_value='sys-devel/distcc-old'), \
+                 mock.patch.object(deploy, 'transfer'), mock.patch.object(deploy, 'bounded') as bounded:
+                deploy.prepare(target, 'distcc-new', work/'distcc-new.ebuild', work, {})
+                args, selected, stage, _ = bounded.call_args.args
+                self.assertIn('--buildpkgonly', args)
+                self.assertIn('--usepkg=n', args)
+                self.assertIn('PKGDIR='+temporary+'/distcc-deploy-binpkgs/distcc-new', args)
+                self.assertEqual((selected, stage), (target, 'build'))
+            with mock.patch.object(deploy, 'run', side_effect=['sys-devel/distcc-old', 'sys-devel/distcc-new']), \
+                 mock.patch.object(deploy, 'bounded') as bounded:
+                deploy.install(target, 'distcc-new', work)
+                args, selected, stage, _ = bounded.call_args.args
+                self.assertIn('--usepkgonly', args)
+                self.assertEqual((selected, stage), (target, 'install'))
 
 
 @unittest.skipUnless(shutil.which('systemd-run') and shutil.which('sudo'), 'systemd and sudo required')

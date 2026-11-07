@@ -84,7 +84,11 @@ def parallel(targets, action):
         raise RuntimeError('\n'.join(errors))
 
 
-def rollout(targets, action):
+def rollout(targets, prepare, action):
+    # Build every package while the installed client/server protocol is still
+    # consistent. Rolling activation must never supply workers to old clients
+    # that are building the remaining upgrade packages.
+    parallel(targets, prepare)
     # The first target must pass installed-path validation before any other
     # target is upgraded. A failed canary leaves the remaining workers intact.
     action(targets[0])
@@ -139,17 +143,17 @@ def bounded(args, target, stage, log, *, cross=False):
     run([*cmd, *args], target if not cross else None, log=log)
 
 
-def install(target, version, ebuild, work, cross):
+def prepare(target, version, ebuild, work, cross):
     name = target['name']
-    print(f'{name}: building/installing {version}', flush=True)
-    with (work / (name + '-install.log')).open('w') as log:
+    print(f'{name}: preparing {version}', flush=True)
+    with (work / (name + '-build.log')).open('w') as log:
         transfer([str(ebuild.parent) + '/'], target['repository'] + '/sys-devel/distcc', target, mirror=True)
         if run(['portageq', 'best_version', '/', 'sys-devel/distcc'], target) == 'sys-devel/' + version:
             print(f'{name}: release already installed', flush=True)
             return
         if target.get('binary'):
-            packages = work / 'binpkgs'
-            packages.mkdir()
+            packages = work / 'binpkgs' / name
+            packages.mkdir(parents=True)
             env = ['ROOT=' + cross['root'], 'SYSROOT=' + cross['root'],
                    'PORTAGE_CONFIGROOT=' + cross['root'], 'PKGDIR=' + str(packages)]
             args = ['env', *env, 'emerge', '--buildpkgonly',
@@ -158,13 +162,24 @@ def install(target, version, ebuild, work, cross):
             bounded(args, builder, 'build', log, cross=True)
             remote_packages = target['temporary'] + '/distcc-deploy-binpkgs/' + version
             transfer([str(packages) + '/'], remote_packages, target)
-            args = ['env', 'PKGDIR=' + remote_packages, 'emerge', '--oneshot', '--nodeps',
-                    '--usepkgonly', '--quiet-build=y', '=sys-devel/' + version]
-            bounded(args, target, 'install', log)
         else:
-            args = ['emerge', '--oneshot', '--nodeps',
+            packages = target['temporary'] + '/distcc-deploy-binpkgs/' + version
+            args = ['env', 'PKGDIR=' + packages, 'emerge', '--buildpkgonly', '--oneshot', '--nodeps',
                     '--usepkg=n', '--quiet-build=y', '=sys-devel/' + version]
             bounded(args, target, 'build', log)
+    print(f'{name}: package ready', flush=True)
+
+
+def install(target, version, work):
+    name = target['name']
+    if run(['portageq', 'best_version', '/', 'sys-devel/distcc'], target) == 'sys-devel/' + version:
+        return
+    print(f'{name}: installing {version}', flush=True)
+    packages = target['temporary'] + '/distcc-deploy-binpkgs/' + version
+    with (work / (name + '-install.log')).open('w') as log:
+        args = ['env', 'PKGDIR=' + packages, 'emerge', '--oneshot', '--nodeps',
+                '--usepkgonly', '--quiet-build=y', '=sys-devel/' + version]
+        bounded(args, target, 'install', log)
     installed = run(['portageq', 'best_version', '/', 'sys-devel/distcc'], target)
     if installed != 'sys-devel/' + version:
         raise RuntimeError(f'{name}: installed version differs: {installed}')
@@ -362,10 +377,11 @@ def main():
                     resume_path.write_text(json.dumps(resume))
                     run(['sudo', '-n', 'systemctl', 'stop', *names], target)
             def deploy_target(target):
-                install(target, version, ebuild, work, settings['cross'])
+                install(target, version, work)
                 configure(target, work)
                 validate(target, work)
-            rollout(targets, deploy_target)
+            rollout(targets, lambda target: prepare(target, version, ebuild, work, settings['cross']),
+                    deploy_target)
             validate_rust_cluster(targets, work)
             validate_thinlto_cluster(targets, work)
             for target in targets:
@@ -373,10 +389,9 @@ def main():
                     run(['sudo', '-n', 'systemctl', 'start', *resume[target['name']]], target)
             resume_path.unlink(missing_ok=True)
             for target in targets:
-                if target.get('binary'):
-                    run(['sudo', '-n', 'sh', '-c',
-                         'if test -d "$1"; then rm -r -- "$1"; fi', 'sh',
-                         target['temporary'] + '/distcc-deploy-binpkgs/' + version], target)
+                run(['sudo', '-n', 'sh', '-c',
+                     'if test -d "$1"; then rm -r -- "$1"; fi', 'sh',
+                     target['temporary'] + '/distcc-deploy-binpkgs/' + version], target)
             # Cross builds create root-owned package subdirectories. Failure to
             # remove them must not be hidden before moving logs across devices.
             if (work / 'binpkgs').exists():

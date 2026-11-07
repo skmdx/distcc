@@ -464,8 +464,10 @@ hard per-job limits or a common scheduler for unrelated build processes.
 For an already configured Gentoo fleet, run `./deploy` without arguments.
 The launcher can also be symlinked into `PATH` as `distcc-deploy`.
 It reads the private `~/.config/distcc/deploy.json` (or `$XDG_CONFIG_HOME`),
-selects the latest committed overlay ebuild, and installs and validates the first
-configured target before upgrading the remaining targets in parallel. Each target
+selects the latest committed overlay ebuild, and builds all target packages before
+changing any installed worker. This keeps upgrade builds on one consistent RPC
+protocol. It then installs and validates the first configured target before
+upgrading the remaining targets in parallel. Each target
 gets service settings and distributed C/C++ compilation with local-object linking
 and execution checks. Different object bytes do not reject compatible toolchains.
 Use names such as `clang` and `clang++` in `compiler_paths` to follow each target's
