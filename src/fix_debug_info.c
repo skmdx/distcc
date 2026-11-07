@@ -368,9 +368,6 @@ static void update_section(const char *path,
       rs_log_info("updated \"%s\" section of file \"%s\": "
                   "replaced %d occurrences of \"%s\" with \"%s\"",
                   desired_section_name, path, count, search, replace);
-      if (count > 1) {
-        rs_log_warning("only expected to replace one occurrence!");
-      }
     }
   } else {
     rs_trace("file %s has no \"%s\" section", path, desired_section_name);
@@ -449,7 +446,9 @@ int dcc_fix_debug_info(const char *path, const char *client_path,
   }
   client_path_plus_slashes[client_path_len] = '\0';
   rs_log_info("client_path_plus_slashes = %s", client_path_plus_slashes);
-  return update_debug_info(path, server_path, client_path_plus_slashes);
+  int ret = update_debug_info(path, server_path, client_path_plus_slashes);
+  free(client_path_plus_slashes);
+  return ret;
 #endif
 }
 
