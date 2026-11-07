@@ -118,6 +118,8 @@ static int metadata(struct reply_writer *writer, const struct stat *st)
 }
 static int directory(struct reply_writer *writer, const char *path, int statuses)
 {
+    /* STAT (1) batches child attributes for the Clang VFS. LSTAT (2) supplies
+     * FUSE's negative-lookup cache without inspecting unused sibling files. */
     DIR *dir = opendir(path);
     if (!dir) return -1;
     size_t offset = writer->reply->size;
@@ -130,14 +132,14 @@ static int directory(struct reply_writer *writer, const char *path, int statuses
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
         struct stat st;
         int error = 0;
-        if (statuses || entry->d_type == DT_UNKNOWN)
+        if (statuses == 1 || (statuses == 0 && entry->d_type == DT_UNKNOWN))
             error = fstatat(dirfd(dir), entry->d_name, &st, statuses == 1 ? 0 : AT_SYMLINK_NOFOLLOW) ? errno : 0;
         else st.st_mode = DTTOIF(entry->d_type); /* LIST exposes only the file type. */
         size_t length = strlen(entry->d_name);
         dcc_tcp_put32(header, length);
         dcc_tcp_put32(header + 4, statuses ? (uint32_t)error : error ? 0 : st.st_mode);
         result = append(writer, header, 8) || append(writer, entry->d_name, length) ||
-            (statuses && !error && metadata(writer, &st));
+            (statuses == 1 && !error && metadata(writer, &st));
         if (result) break;
         ++count;
         errno = 0;

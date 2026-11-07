@@ -45,7 +45,7 @@ public:
         auto [found, inserted] = entries.try_emplace(path);
         auto &entry = found->second;
         result = &entry;
-        if (entry.queried || (!inserted && !S_ISDIR(entry.mode()))) return entry.error;
+        if (entry.queried) return entry.error;
         if (inserted && path != "/") {
             auto separator = path.find_last_of('/');
             auto parent = entries.find(separator == 0 ? "/" : path.substr(0, separator));
@@ -66,20 +66,14 @@ public:
         unsigned count = number(response.data+DCC_FS_METADATA, 4);
         for (unsigned i = 0; i < count; ++i) {
             if (response.size-offset < 8) return entry.error = EPROTO;
-            unsigned length = number(response.data+offset, 4), error = number(response.data+offset+4, 4);
+            unsigned length = number(response.data+offset, 4);
             offset += 8;
             if (!length || length > response.size-offset) return entry.error = EPROTO;
             std::string name(response.data+offset, length);
             if (name.find_first_of("/\0", 0, 2) != std::string::npos || name == "." || name == "..")
                 return entry.error = EPROTO;
             offset += length;
-            auto &child = entries[path == "/" ? path+name : path+'/'+name];
-            child.error = error;
-            if (!error) {
-                if (response.size-offset < DCC_FS_METADATA) return entry.error = EPROTO;
-                memcpy(child.version.data(), response.data+offset, DCC_FS_METADATA);
-                offset += DCC_FS_METADATA;
-            }
+            entries.try_emplace(path == "/" ? path+name : path+'/'+name);
             entry.children.push_back(std::move(name));
         }
         if (offset != response.size) return entry.error = EPROTO;
