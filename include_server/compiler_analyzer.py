@@ -84,6 +84,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
   def DoCompilationCommand(self, cmd, *args, **kwargs):
     self.command = cmd
     try:
+      change = ''
       # Earlier jobs may have observed generated files unrelated to this one.
       # If they change during the native scan, retire the cache generation and
       # restart once. Never reuse path mappings from an invalidated generation.
@@ -91,10 +92,12 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
         try:
           files = super().DoCompilationCommand(cmd, *args, **kwargs)
           break
-        except include_analyzer.CacheInvalidated:
+        except include_analyzer.CacheInvalidated as error:
+          change = str(error)
           self.ClearStatCaches()
       else:
-        raise basics.NotCoveredError('Inputs keep changing during dependency analysis',
+        raise basics.NotCoveredError('Inputs keep changing during dependency analysis' +
+                                     (': ' + change if change else ''),
                                      send_email=False)
       compression = kwargs.get('compression', args[2] if len(args) > 2 else 'lzo')
       directory = os.path.join(self.client_root_keeper.client_root, '.distcc-system')
@@ -133,7 +136,9 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
         continue
       if arg.startswith('-x'):
         language = arg[2:]
-      if arg in ('-include', '-imacros'):
+      if arg in ('-include', '-imacros', '-dumpbase', '-dumpbase-ext', '-dumpdir'):
+        # Auxiliary output names do not affect header lookup. In particular,
+        # -dumpbase may repeat the source name removed from this probe.
         next(args)
         continue
       probe.append(arg)
@@ -317,10 +322,10 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
                         if expected is None else current == expected)
         if matches_scan:
           # Cached bytes/path mappings belong to a previous input generation.
-          raise include_analyzer.CacheInvalidated()
+          raise include_analyzer.CacheInvalidated('Cached input changed: ' + path)
         raise include_analyzer.CacheInvalidated('Input changed after compiler dependency scan: ' + path)
     if stamps.Changed(()):
-      raise include_analyzer.CacheInvalidated()
+      raise include_analyzer.CacheInvalidated('Input namespace changed during dependency scan')
     # Keep source bytes unchanged. A shared header can be reached through both
     # relative and absolute spellings; one injected #line cannot represent both.
     # The worker remaps its private root with compiler prefix-map options.

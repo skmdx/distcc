@@ -68,7 +68,8 @@ def scan(command, cwd, library):
   # output. Startup failures, signals and incomplete collection remain failures.
   if (result.returncode < 0 or
       not data.startswith(b'DCGS2\0') or not data.endswith(b'\0\0')):
-    raise RuntimeError('Incomplete or unsupported GCC dependency scan: ' +
+    raise RuntimeError('Incomplete GCC dependency scan (exit=' + str(result.returncode) +
+                       ', manifest=' + str(len(data)) + ' bytes, prefix=' + repr(data[:16]) + '): ' +
                        result.stderr.decode(errors='replace')[-2048:])
   # Decode in one pass without allocating split-field lists or repeatedly
   # crossing Python's path/identity helpers for every failed header candidate.

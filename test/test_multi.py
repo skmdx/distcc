@@ -10,7 +10,8 @@ from test_broker import BrokerTestCase
 class MultiSourceTest(BrokerTestCase):
     def setUp(self):
         super().setUp()
-        self.start_broker(hosts=' '.join(self.host(i, ',tcp') for i in range(len(self.ports))))
+        options = ',tcp,cpp,lz4' if self._testMethodName == 'test_pump_compound_command' else ',tcp'
+        self.start_broker(hosts=' '.join(self.host(i, options) for i in range(len(self.ports))))
         library = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
         if not library:
             directory = subprocess.check_output(['gcc', '-print-file-name=plugin'], text=True).strip()
@@ -26,7 +27,7 @@ class MultiSourceTest(BrokerTestCase):
 
     def run_compound(self, *options, pump=False):
         command = [str(self.build / 'distcc'), 'g++', '-pipe', *options,
-                   str(self.first), str(self.last), '-o', str(self.output)]
+                   self.first.name, self.last.name, '-o', str(self.output)]
         if pump:
             command.insert(0, str(self.build / 'pump'))
         return subprocess.run(command, env=self.env, cwd=self.root,
@@ -47,7 +48,7 @@ class MultiSourceTest(BrokerTestCase):
     def test_dependency_publication_matches_native_driver(self):
         dependency = self.root / 'compound.d'
         options = ['-MMD', '-MF', str(dependency), '-MQ', 'target with spaces']
-        command = ['g++', *options, str(self.first), str(self.last), '-o', str(self.output)]
+        command = ['g++', *options, self.first.name, self.last.name, '-o', str(self.output)]
         subprocess.run(command, cwd=self.root, check=True)
         expected = dependency.read_bytes()
         dependency.unlink()
@@ -57,6 +58,7 @@ class MultiSourceTest(BrokerTestCase):
 
     def test_pump_compound_command(self):
         self.env['TMPDIR'] = str(self.root)
+        self.env['DISTCC_TESTING_INCLUDE_SERVER'] = '1'
         result = self.run_compound('-O2', pump=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('gave up analyzing', result.stderr)
@@ -66,7 +68,7 @@ class MultiSourceTest(BrokerTestCase):
         include = self.work / 'include.cpp'
         include.mkdir()
         dependency = self.output.with_suffix('.d')
-        command = ['g++', '-MD', '-I', str(include), str(self.first), str(self.last),
+        command = ['g++', '-MD', '-I', str(include), self.first.name, self.last.name,
                    '-o', str(self.output)]
         subprocess.run(command, cwd=self.root, check=True)
         expected = dependency.read_bytes()
