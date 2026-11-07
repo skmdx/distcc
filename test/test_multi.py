@@ -10,7 +10,7 @@ from test_broker import BrokerTestCase
 class MultiSourceTest(BrokerTestCase):
     def setUp(self):
         super().setUp()
-        options = ',tcp,cpp,lz4' if self._testMethodName == 'test_pump_compound_command' else ',tcp'
+        options = ',tcp,cpp,lz4' if self._testMethodName.startswith('test_pump') else ',tcp'
         self.start_broker(hosts=' '.join(self.host(i, options) for i in range(len(self.ports))))
         library = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
         if not library:
@@ -62,6 +62,23 @@ class MultiSourceTest(BrokerTestCase):
         result = self.run_compound('-O2', pump=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('gave up analyzing', result.stderr)
+        self.assertEqual(subprocess.call([self.output]), 0)
+
+    def test_pump_absolute_source_parent_components(self):
+        child = self.root / 'child'
+        child.mkdir(exist_ok=True)
+        source = str(child / '..' / self.first.name)
+        self.first.write_text('const char *source_name = __FILE__;\n')
+        self.last.write_text('#include <cstring>\nextern const char *source_name;\n'
+                             'int main(){return std::strcmp(source_name, "' + source + '");}\n')
+        self.env.update(TMPDIR=str(self.root), DISTCC_TESTING_INCLUDE_SERVER='1')
+        obj = self.root / 'parent.o'
+        result = subprocess.run([self.build / 'pump', self.build / 'distcc', 'g++',
+                                 '-c', source, '-o', obj], cwd=self.root, env=self.env,
+                                text=True, capture_output=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('gave up analyzing', result.stderr)
+        subprocess.run(['g++', str(self.last), str(obj), '-o', self.output], check=True)
         self.assertEqual(subprocess.call([self.output]), 0)
 
     def test_default_dependency_names_and_option_operands(self):

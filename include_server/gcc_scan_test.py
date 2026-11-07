@@ -191,6 +191,13 @@ class GccScanTest(unittest.TestCase):
     result = self.scan('-I' + str(directory/'child'/'..'))
     self.assertIn(str(directory/'child'/'..'/'selected.h'), result['dependencies'])
 
+  def test_absolute_source_keeps_parent_components(self):
+    (self.root/'child').mkdir()
+    self.source.write_text('const char *source_name = __FILE__;\n')
+    spelling = str(self.root/'child'/'..'/'source.c')
+    result = gcc_scan.scan([self.compiler, spelling], str(self.root), self.library)
+    self.assertIn(spelling, result['dependencies'])
+
   def test_worker_absolute_lookup_is_confined_to_input_tree(self):
     header, absent = self.root/'present.h', self.root/'worker-only.h'
     header.write_text('int wrong;\n')

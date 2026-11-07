@@ -77,8 +77,11 @@ bool distcc_gcc_inputs(cpp_reader *reader, input_callback callback, void *contex
 {
     if (!reader || !reader->main_file) return false;
     for (const auto *file = reader->all_files; file; file = file->next_file) {
+        // The main file is a driver input, already rooted by the worker.
+        // Its spelling can contain "..", as generated Makefiles commonly do.
+        // Absolute operands inside source still need the include-root adapter.
         if (file->embed || file->pchname || file->header_unit > 0 ||
-            unsupported_absolute(file->name)) return false;
+            (file != reader->main_file && unsupported_absolute(file->name))) return false;
         if (file->err_no == ENOENT) continue;
         if (file->err_no || !file->path || !S_ISREG(file->st.st_mode)) return false;
         // libcpp replaces st_size with its decoded buffer length (BOM removal

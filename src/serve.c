@@ -623,6 +623,21 @@ static int tweak_input_argument_for_server(char **argv,
                 rs_log_crit("asprintf failed");
                 return EXIT_OUT_OF_MEMORY;
             }
+            if (strstr(argv[i], "/../")) {
+                // Keep the original spelling for __FILE__ and diagnostics,
+                // but resolve through the completed private tree before use.
+                // A symlink followed by .. must not escape that tree.
+                char *root = realpath(root_dir, NULL);
+                char *resolved = realpath(prefixed_name, NULL);
+                int inside = root && resolved && !strncmp(root, resolved, strlen(root)) &&
+                             resolved[strlen(root)] == '/';
+                free(root);
+                free(resolved);
+                if (!inside) {
+                    free(prefixed_name);
+                    return EXIT_DISTCC_FAILED;
+                }
+            }
             rs_trace("changed input from \"%s\" to \"%s\"", argv[i],
                      prefixed_name);
             free(argv[i]);
