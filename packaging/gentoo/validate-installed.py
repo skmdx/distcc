@@ -118,6 +118,25 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         subprocess.run([compiler_path, str(obj), str(support_obj), '-o', str(exe)], check=True, timeout=30)
         subprocess.run([str(exe)], check=True, timeout=5)
         results[compiler] = {'distributed': True, 'linked': True, 'executed': True}
+        if 'clang' not in compiler:
+            # Compound GCC jobs use source-valued dump operands. The relative
+            # main and absolute parent-component support path cover both the
+            # header probe and private input collector used by real builds.
+            before = (root/'client.log').stat().st_size
+            compound = root/(compiler+'-compound')
+            parent_source = str(root/'stdint.h'/'..'/support.name)
+            result = subprocess.run(['pump', 'distcc', compiler, '-I'+str(root),
+                                     '-O2', '-fPIC', source.name, parent_source,
+                                     '-o', str(compound)], cwd=root, env=env,
+                                    capture_output=True, timeout=REMOTE_TIMEOUT)
+            assert result.returncode == 0, (compiler,
+                (result.stdout+result.stderr).decode(errors='replace'))
+            log = (root/'client.log').read_text()[before:]
+            marker = ('pooled TCP job completed' if ',tcp' in env['DISTCC_HOSTS'] else
+                      'client finished sending request to server')
+            assert log.count(marker) >= 2 and 'gave up' not in log, log[-6000:]
+            subprocess.run([str(compound)], check=True, timeout=5)
+            results[compiler]['compound'] = {'distributed': 2, 'executed': True}
     if compilers:
         log = (root/'client.log').read_text()
         assert 'gave up' not in log
