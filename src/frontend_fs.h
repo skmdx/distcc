@@ -6,9 +6,7 @@
 /* QUERY carries an operation u32 and the path. The reply byte stream starts
  * with errno/length u32. All integers use network order. File metadata is
  * dev, ino, mtime_ns, size, mode, uid, gid, ctime_ns. LIST entries expose
- * file types, not permission bits; STAT carries the complete metadata.
- * STAT directory snapshots include child metadata. LSTAT snapshots list only
- * names: FUSE asks for attributes of files actually used by the compiler. */
+ * file types, not permission bits; STAT carries the complete metadata. */
 #define DCC_FS_METADATA 52
 enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LIST,
                        DCC_FS_CODEGEN, DCC_FS_LSTAT, DCC_FS_READLINK };

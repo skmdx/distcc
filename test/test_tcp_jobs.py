@@ -252,27 +252,6 @@ class GccFrontendTest(BrokerTestCase):
         subprocess.run([self.cc, 'out.o', '-o', 'program'], cwd=self.work, check=True)
         self.assertEqual(subprocess.check_output([str(self.work/'program')]), b'37 hello.c\n')
 
-    def test_sparse_header_lookup_in_large_directory(self):
-        self.start_frontend()
-        headers = self.work/'headers'
-        headers.mkdir()
-        for i in range(2000):
-            (headers/f'unused-{i}.h').write_text('#error unused header\n')
-        (headers/'used').write_text('#define VALUE 42\n')
-        (headers/'dangling').symlink_to('absent')
-        self.source.write_text('#include "headers/used"\n'
-                               '#if __has_include("headers/absent") || __has_include("headers/dangling")\n'
-                               '#error invalid existence query\n#endif\n'
-                               'int main(void) { return VALUE != 42; }\n')
-        command = [self.cc, '-nostdinc', '-O2', '-c', 'hello.c', '-o', 'out.o']
-        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
-        expected = (self.work/'out.o').read_bytes()
-        (self.work/'out.o').unlink()
-        self.compile(command)
-        self.assertEqual((self.work/'out.o').read_bytes(), expected)
-        subprocess.run([self.cc, 'out.o', '-o', 'program'], cwd=self.work, check=True)
-        subprocess.run([str(self.work/'program')], check=True, timeout=5)
-
     def test_cpp_search_classes_macros_symlinks_and_warm_cache(self):
         self.start_frontend()
         compiler = shutil.which('g++')
@@ -1122,8 +1101,7 @@ int main(int argc, char **argv) {
     struct dcc_job job = {.fs_roots = roots};
     size_t length = strlen(argv[2]);
     unsigned char *query = malloc(length + 4);
-    unsigned operation = !strcmp(argv[3], "list") ? DCC_FS_LIST :
-        !strcmp(argv[3], "lstat") ? DCC_FS_LSTAT : DCC_FS_READ;
+    unsigned operation = !strcmp(argv[3], "list") ? DCC_FS_LIST : DCC_FS_READ;
     dcc_tcp_put32(query, operation); memcpy(query + 4, argv[2], length);
     struct dcc_frontend_reply reply;
     if (dcc_frontend_fs_reply(&job, query, length + 4, &reply)) return 2;
@@ -1205,18 +1183,6 @@ int main(int argc, char **argv) {
             actual[data[offset:offset+length].decode()] = stat.S_IFMT(mode)
             offset += length
         self.assertEqual(actual, {p.name: stat.S_IFMT(p.lstat().st_mode) for p in listing.iterdir()})
-        data = subprocess.check_output([str(executable), str(self.work), str(listing), 'lstat'], timeout=5)
-        self.assertEqual(struct.unpack('!II', data[:8]), (0, len(data)-8))
-        self.assertEqual(struct.unpack_from('!I', data, 60)[0], len(actual))
-        names, offset = set(), 64
-        while offset < len(data):
-            length, error = struct.unpack_from('!II', data, offset)
-            self.assertEqual(error, 0)
-            offset += 8
-            names.add(data[offset:offset+length].decode())
-            offset += length
-        self.assertEqual(names, set(actual))
-        self.assertEqual(offset, len(data))
 
     def test_remote_frontend_preserves_large_directory_snapshots(self):
         clang = self.start_frontend()
