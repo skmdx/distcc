@@ -20,6 +20,10 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
     (root/'stdint.h').mkdir()
     (root/'counter.h').write_text('#define COUNTER_HEADER_SEEN 1\n')
     (root/'absolute.h').write_text('#define ABSOLUTE_HEADER_SEEN 1\n')
+    system_headers = root/'system-headers'
+    system_headers.mkdir()
+    (system_headers/'x.h').write_text('#define SUPPORT_FIRST 1\n')
+    (system_headers/'longer-system-name.h').symlink_to('x.h')
     env = dict(os.environ, PATH='/usr/lib/distcc:/usr/bin:/bin', TMPDIR=str(root),
                DISTCC_DIR=str(root/'state'),
                DISTCC_HOSTS=os.environ['VALIDATE_DISTCC_HOSTS'], DISTCC_FALLBACK='0',
@@ -84,11 +88,13 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         # On x86-64, these pointer arguments exercise GOT stack-argument
         # relocations across the worker assembler and client linker.
         support = root/('support.'+suffix)
-        support.write_text('int a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8;\n'
+        support.write_text('#include <longer-system-name.h>\n'
+                           'int a=SUPPORT_FIRST,b=2,c=3,d=4,e=5,f=6,g=7,h=8;\n'
                            'int sum(int *a,int *b,int *c,int *d,int *e,int *f,int *g,int *h) '
                            '{ return *a+*b+*c+*d+*e+*f+*g+*h; }\n')
         support_obj = root/(compiler+'-support.o')
-        subprocess.run([compiler_path, '-O2', '-c', str(support), '-o', str(support_obj)],
+        subprocess.run([compiler_path, '-isystem', str(system_headers),
+                        '-O2', '-c', str(support), '-o', str(support_obj)],
                        check=True, capture_output=True, timeout=30)
         source = root/('main.'+suffix)
         probe_header = 'absolute.h' if 'clang' in compiler else str(root/'absolute.h')
@@ -126,7 +132,8 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             compound = root/(compiler+'-compound')
             parent_source = str(root/'stdint.h'/'..'/support.name)
             result = subprocess.run(['pump', 'distcc', compiler, '-I'+str(root),
-                                     '-O2', '-fPIC', source.name, parent_source,
+                                     '-isystem', str(system_headers), '-O2', '-fPIC',
+                                     source.name, parent_source,
                                      '-o', str(compound)], cwd=root, env=env,
                                     capture_output=True, timeout=REMOTE_TIMEOUT)
             assert result.returncode == 0, (compiler,
