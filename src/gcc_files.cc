@@ -61,18 +61,9 @@ public:
         if (response.size < DCC_FS_METADATA) return entry.error = EPROTO;
         memcpy(entry.version.data(), response.data, DCC_FS_METADATA);
         if (response.size == DCC_FS_METADATA) return 0;
-        if (!S_ISDIR(entry.mode()) || response.size != DCC_FS_METADATA+4 ||
-            number(response.data+DCC_FS_METADATA, 4) != 1) return entry.error = EPROTO;
-        dccfs::Snapshot snapshot;
-        if (auto error = connection.read(path, entry.version.data(), snapshot)) {
-            if (error.value() == EACCES) return 0; // Traversal need not permit listing.
-            return entry.error = error.value();
-        }
-        entry.version = snapshot.version;
-        response = std::move(snapshot.bytes);
-        if (response.size < 4) return entry.error = EPROTO;
-        size_t offset = 4;
-        unsigned count = number(response.data, 4);
+        if (!S_ISDIR(entry.mode()) || response.size < DCC_FS_METADATA+4) return entry.error = EPROTO;
+        size_t offset = DCC_FS_METADATA+4;
+        unsigned count = number(response.data+DCC_FS_METADATA, 4);
         for (unsigned i = 0; i < count; ++i) {
             if (response.size-offset < 8) return entry.error = EPROTO;
             unsigned length = number(response.data+offset, 4);

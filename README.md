@@ -696,11 +696,6 @@ for the actual remote compiler. GCC workers require libfuse3, `/dev/fuse` and
 permission to create a user and mount namespace. Offload compilation keeps its
 existing input preparation.
 
-GCC directory listings share the worker cache across jobs. The client checks
-directory metadata and the worker requests names only on a cache miss; individual
-file attributes are fetched when GCC accesses those files. Directory mutations
-invalidate the cached listing, including previously missing header names.
-
 Builds whose generated sources include files outside the compiler's source and
 include directories can set `DISTCC_FRONTEND_ROOTS` to a colon-separated list
 of additional source/build trees. Relative roots use the compiler's working

@@ -268,31 +268,10 @@ class GccFrontendTest(BrokerTestCase):
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
         (self.work/'out.o').unlink()
-        cold = self.compile(command)
-        warm = self.compile(command)
-        def received(result):
-            return int(re.findall(r'frontend filesystem: \d+ requests, (\d+) bytes', result.stderr)[-1])
-        self.assertLess(received(warm), received(cold))
+        self.compile(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
         subprocess.run([self.cc, 'out.o', '-o', 'program'], cwd=self.work, check=True)
         subprocess.run([str(self.work/'program')], check=True, timeout=5)
-        original = self.source.read_text()
-        def cache_records():
-            return sum(path.is_file() and path.name != '.lock'
-                       for path in (self.work/'cache').rglob('*'))
-        cached_files = cache_records()
-        (headers/'absent').write_text('#define GENERATED 42\n')
-        self.source.write_text('#include "headers/absent"\nint main(void) { return GENERATED != 42; }\n')
-        self.compile(command)
-        subprocess.run([self.cc, 'out.o', '-o', 'program'], cwd=self.work, check=True)
-        subprocess.run([str(self.work/'program')], check=True, timeout=5)
-        (headers/'absent').unlink()
-        self.source.write_text(original)
-        self.compile(command)
-        self.assertEqual((self.work/'out.o').read_bytes(), expected)
-        # Two new source snapshots and one generated header may remain.
-        # Directory generations replace records instead of accumulating them.
-        self.assertLessEqual(cache_records(), cached_files+3)
 
     def test_cpp_search_classes_macros_symlinks_and_warm_cache(self):
         self.start_frontend()
@@ -1144,8 +1123,7 @@ int main(int argc, char **argv) {
     size_t length = strlen(argv[2]);
     unsigned char *query = malloc(length + 4);
     unsigned operation = !strcmp(argv[3], "list") ? DCC_FS_LIST :
-        !strcmp(argv[3], "lstat") ? DCC_FS_LSTAT :
-        !strcmp(argv[3], "directory") ? DCC_FS_DIRECTORY : DCC_FS_READ;
+        !strcmp(argv[3], "lstat") ? DCC_FS_LSTAT : DCC_FS_READ;
     dcc_tcp_put32(query, operation); memcpy(query + 4, argv[2], length);
     struct dcc_frontend_reply reply;
     if (dcc_frontend_fs_reply(&job, query, length + 4, &reply)) return 2;
@@ -1228,9 +1206,6 @@ int main(int argc, char **argv) {
             offset += length
         self.assertEqual(actual, {p.name: stat.S_IFMT(p.lstat().st_mode) for p in listing.iterdir()})
         data = subprocess.check_output([str(executable), str(self.work), str(listing), 'lstat'], timeout=5)
-        self.assertEqual(len(data), 64)
-        self.assertEqual(struct.unpack_from('!I', data, 60)[0], 1)
-        data = subprocess.check_output([str(executable), str(self.work), str(listing), 'directory'], timeout=5)
         self.assertEqual(struct.unpack('!II', data[:8]), (0, len(data)-8))
         self.assertEqual(struct.unpack_from('!I', data, 60)[0], len(actual))
         names, offset = set(), 64

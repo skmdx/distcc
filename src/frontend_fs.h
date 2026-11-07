@@ -7,12 +7,11 @@
  * with errno/length u32. All integers use network order. File metadata is
  * dev, ino, mtime_ns, size, mode, uid, gid, ctime_ns. LIST entries expose
  * file types, not permission bits; STAT carries the complete metadata.
- * STAT directory snapshots include child metadata. LSTAT directories carry a
- * readable-listing flag; DIRECTORY returns metadata and names for caching. */
+ * STAT directory snapshots include child metadata. LSTAT snapshots list only
+ * names: FUSE asks for attributes of files actually used by the compiler. */
 #define DCC_FS_METADATA 52
 enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LIST,
-                       DCC_FS_CODEGEN, DCC_FS_LSTAT, DCC_FS_READLINK,
-                       DCC_FS_DIRECTORY };
+                       DCC_FS_CODEGEN, DCC_FS_LSTAT, DCC_FS_READLINK };
 /* Compiler-to-daemon only: a requested CPU count replaces the path. Zero
  * releases borrowed CPUs. The reply contains the granted count. */
 struct dcc_job;

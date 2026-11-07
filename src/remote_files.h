@@ -6,7 +6,6 @@
 #include "frontend_fs.h"
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <pthread.h>
@@ -129,26 +128,10 @@ public:
         return {};
     }
     std::error_code read(std::string_view path, const char *version, Snapshot &out) {
-        bool directory = version && S_ISDIR(number(version+32, 4));
         std::string key;
         if (version) {
-            key.reserve(identity.size()+2+DCC_FS_METADATA+path.size());
-            key.append(identity); key += '\0'; key += directory ? 'd' : 'f';
-            // Directory generations change as build outputs are created.
-            // Keep one atomic record per directory, with its version inside,
-            // rather than accumulating a full listing for every generation.
-            if (!directory) key.append(version, DCC_FS_METADATA);
-            key.append(path);
-            auto accept = [&](std::shared_ptr<const void> owner, const void *data, size_t length) {
-                auto bytes = static_cast<const char *>(data);
-                if (directory) {
-                    if (length < DCC_FS_METADATA || memcmp(bytes, version, DCC_FS_METADATA)) return false;
-                    bytes += DCC_FS_METADATA; length -= DCC_FS_METADATA;
-                } else if (length != number(version+24, 8)) return false;
-                memcpy(out.version.data(), version, DCC_FS_METADATA);
-                out.bytes = {std::move(owner), bytes, length};
-                return true;
-            };
+            key.reserve(identity.size()+1+DCC_FS_METADATA+path.size());
+            key.append(identity); key += '\0'; key.append(version, DCC_FS_METADATA); key.append(path);
             size_t extent = 0, length = 0;
             const void *bytes = nullptr;
             int snapshot = cache.lookup(records, key.data(), key.size(), &extent);
@@ -161,7 +144,11 @@ public:
                     close(snapshot);
                     std::shared_ptr<const void> owner(mapped, [extent](const void *p) { munmap(const_cast<void *>(p), extent); });
                     if (cache.contents(mapped, extent, key.data(), key.size(), &bytes, &length) &&
-                        accept(std::move(owner), bytes, length)) return {};
+                        length == number(version+24, 8)) {
+                        memcpy(out.version.data(), version, DCC_FS_METADATA);
+                        out.bytes = {std::move(owner), static_cast<const char *>(bytes), length};
+                        return {};
+                    }
                 } else {
                     auto data = std::shared_ptr<char[]>(new (std::nothrow) char[extent+1]);
                     size_t used = 0;
@@ -175,22 +162,24 @@ public:
                     if (data && used == extent) {
                         data[extent] = 0;
                         if (cache.contents(data.get(), extent, key.data(), key.size(), &bytes, &length) &&
-                            accept(data, bytes, length)) return {};
+                            length == number(version+24, 8)) {
+                            memcpy(out.version.data(), version, DCC_FS_METADATA);
+                            out.bytes = {data, static_cast<const char *>(bytes), length};
+                            return {};
+                        }
                     }
                 }
             }
         }
         Buffer response;
-        if (auto error = request(directory ? DCC_FS_DIRECTORY : DCC_FS_READ, path, response)) return error;
+        if (auto error = request(DCC_FS_READ, path, response)) return error;
         if (response.size < DCC_FS_METADATA ||
-            (!directory && number(response.data+24, 8) != response.size-DCC_FS_METADATA) ||
-            (directory && !S_ISDIR(number(response.data+32, 4))))
+            number(response.data+24, 8) != response.size-DCC_FS_METADATA)
             return std::make_error_code(std::errc::protocol_error);
         memcpy(out.version.data(), response.data, DCC_FS_METADATA);
         out.bytes = {response.owner, response.data+DCC_FS_METADATA, response.size-DCC_FS_METADATA};
         if (version && !memcmp(version, out.version.data(), DCC_FS_METADATA))
-            cache.write(records, key.data(), key.size(), directory ? response.data : out.bytes.data,
-                        directory ? response.size : out.bytes.size);
+            cache.write(records, key.data(), key.size(), out.bytes.data, out.bytes.size);
         return {};
     }
 };
