@@ -7,14 +7,18 @@
  * with errno/length u32. All integers use network order. File metadata is
  * dev, ino, mtime_ns, size, mode, uid, gid, ctime_ns. LIST entries expose
  * file types, not permission bits; STAT carries the complete metadata.
- * LSTAT carries a NUL-terminated path followed by sorted, unique NUL-terminated
- * child names to prefetch. Directory replies include all names, with fresh
- * metadata only for those children. Hints never establish existence or freshness. */
+ * LSTAT carries a NUL-terminated path, a previous directory version (or zeros),
+ * and sorted, unique NUL-terminated child names to prefetch. Directory replies
+ * add flags/count u32 before their entries. CACHED replies omit unchanged names;
+ * child metadata is always fresh. STABLE permits publishing the name snapshot
+ * after matching the directory version both before and after the lookup. */
 #define DCC_FS_METADATA 52
 #define DCC_FS_QUERY_MAX 65536
 #define DCC_FS_NO_METADATA UINT32_MAX
+#define DCC_FS_DIRECTORY_CACHED 1U
+#define DCC_FS_DIRECTORY_STABLE 2U
 enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LIST,
-                       DCC_FS_CODEGEN, DCC_FS_LSTAT, DCC_FS_READLINK };
+                       DCC_FS_CODEGEN, DCC_FS_READLINK = 7, DCC_FS_LSTAT = 8 };
 /* Compiler-to-daemon only: a requested CPU count replaces the path. Zero
  * releases borrowed CPUs. The reply contains the granted count. */
 struct dcc_job;

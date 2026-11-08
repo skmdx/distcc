@@ -294,30 +294,62 @@ class GccFrontendTest(BrokerTestCase):
         command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'hello.c', '-o', 'out.o']
         cold = self.compile(command)
         trace = self.work/'metadata.trace'
-        result = subprocess.run(['strace', '-f', '-e', 'trace=newfstatat,statx', '-o', str(trace),
+        result = subprocess.run(['strace', '-f', '-yy', '-e', 'trace=newfstatat,statx,getdents64', '-o', str(trace),
                                  str(self.build/'distcc'), *command], cwd=self.work,
                                 env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('pooled TCP job completed', result.stderr)
         self.assertNotIn('unused-', trace.read_text())
         self.assertIn('used.h', trace.read_text())
+        listings = '\n'.join(line for line in trace.read_text().splitlines() if 'getdents64(' in line)
+        self.assertNotIn(f'<{headers}>', listings, 'unchanged header directory was enumerated again')
         counts = [int(n) for n in re.findall(r'frontend filesystem: (\d+) requests',
                                              cold.stderr + result.stderr)]
         self.assertEqual(len(counts), 2)
         # Reusing the two file bodies alone saves two READs. Shared hints must
         # also avoid their individual metadata round trips under default setup.
         self.assertGreater(counts[0] - counts[1], 2, 'directory hints did not survive job cleanup')
-        for action in ('create', 'modify', 'replace', 'delete'):
+        for action in ('create', 'modify', 'replace', 'delete', 'directory'):
+            previous = headers.stat()
             if action == 'create': generated.write_text('#define EXTRA 25\n')
             elif action == 'modify': used.write_text('#define VALUE 19\n')
             elif action == 'replace':
                 (headers/'replacement.h').write_text('#define VALUE 23\n')
                 os.replace(headers/'replacement.h', used)
-            else: generated.unlink()
+            elif action == 'delete': generated.unlink()
+            else:
+                headers.rename(self.work/'old-headers')
+                headers.mkdir()
+                used.write_text('#define VALUE 43\n')
+            # Restoring mtime must not make a changed directory look unchanged.
+            os.utime(headers, ns=(previous.st_atime_ns, previous.st_mtime_ns))
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
             self.compile(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected, action)
+
+    @unittest.skipIf(os.geteuid() == 0, 'root bypasses directory read permission')
+    def test_cached_directory_names_preserve_traversal_and_file_permissions(self):
+        self.start_frontend()
+        headers = self.work/'headers'
+        headers.mkdir()
+        used = headers/'used.h'
+        used.write_text('#define VALUE 17\n')
+        self.source.write_text('#include <used.h>\nint value(void) { return VALUE; }\n')
+        command = [self.cc, '-nostdinc', '-Iheaders', '-c', 'hello.c', '-o', 'out.o']
+        self.compile(command)
+        self.addCleanup(headers.chmod, 0o700)
+        headers.chmod(0o100)
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        used.chmod(0)
+        local = subprocess.run(command, cwd=self.work, capture_output=True, text=True)
+        self.assertNotEqual(local.returncode, 0)
+        remote = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(remote.returncode, 0, remote.stderr)
 
     def test_parallel_directory_hints_preserve_changed_inputs(self):
         self.start_frontend()
@@ -1196,13 +1228,15 @@ int main(int argc, char **argv) {
     size_t length = strlen(argv[2]);
     int lstat_query = !strcmp(argv[3], "lstat") || !strcmp(argv[3], "invalid") ||
                       !strcmp(argv[3], "unterminated");
-    size_t payload = length + (lstat_query && strcmp(argv[3], "unterminated") ? 1 : 0);
+    size_t payload = length + (lstat_query && strcmp(argv[3], "unterminated") ? 1+DCC_FS_METADATA : 0);
     for (int i = 4; i < argc; ++i) payload += strlen(argv[i])+1;
     unsigned char *query = malloc(payload + 4);
     unsigned operation = lstat_query ? DCC_FS_LSTAT : !strcmp(argv[3], "list") ? DCC_FS_LIST : DCC_FS_READ;
     dcc_tcp_put32(query, operation); memcpy(query + 4, argv[2], length);
     size_t offset = 4+length;
-    if (lstat_query && strcmp(argv[3], "unterminated")) query[offset++] = 0;
+    if (lstat_query && strcmp(argv[3], "unterminated")) {
+        memset(query+offset, 0, 1+DCC_FS_METADATA); offset += 1+DCC_FS_METADATA;
+    }
     for (int i = 4; i < argc; ++i) {
         memcpy(query+offset, argv[i], strlen(argv[i])+1); offset += strlen(argv[i])+1;
     }
@@ -1293,8 +1327,8 @@ int main(int argc, char **argv) {
         self.assertEqual(actual, {p.name: stat.S_IFMT(p.lstat().st_mode) for p in listing.iterdir()})
         data = subprocess.check_output([str(executable), str(self.work), str(listing),
                                         'lstat', 'dangling', 'file'], timeout=5)
-        self.assertEqual(struct.unpack_from('!I', data, 60)[0], 4)
-        actual, offset = {}, 64
+        self.assertEqual(struct.unpack_from('!II', data, 60), (2, 4))
+        actual, offset = {}, 68
         while offset < len(data):
             length, error = struct.unpack_from('!II', data, offset)
             offset += 8

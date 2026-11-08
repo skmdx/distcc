@@ -106,56 +106,97 @@ static int append(struct reply_writer *writer, const void *bytes, size_t length)
     reply->size = needed;
     return 0;
 }
-static int metadata(struct reply_writer *writer, const struct stat *st)
+static void encode_metadata(unsigned char data[DCC_FS_METADATA], const struct stat *st)
 {
-    unsigned char data[DCC_FS_METADATA];
     dcc_tcp_put64(data, st->st_dev); dcc_tcp_put64(data + 8, st->st_ino);
     dcc_tcp_put64(data + 16, (uint64_t)st->st_mtim.tv_sec * 1000000000 + st->st_mtim.tv_nsec);
     dcc_tcp_put64(data + 24, st->st_size); dcc_tcp_put32(data + 32, st->st_mode);
     dcc_tcp_put32(data + 36, st->st_uid); dcc_tcp_put32(data + 40, st->st_gid);
     dcc_tcp_put64(data + 44, (uint64_t)st->st_ctim.tv_sec * 1000000000 + st->st_ctim.tv_nsec);
+}
+static int metadata(struct reply_writer *writer, const struct stat *st)
+{
+    unsigned char data[DCC_FS_METADATA];
+    encode_metadata(data, st);
     return append(writer, data, sizeof(data));
 }
 static int compare_names(const void *a, const void *b)
 {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
+static int directory_entry(struct reply_writer *writer, int fd, const char *name,
+                           unsigned type, int statuses, int inspect)
+{
+    struct stat st = {0};
+    int error = 0;
+    if (inspect || (!statuses && type == DT_UNKNOWN))
+        error = fstatat(fd, name, &st, statuses == 1 ? 0 : AT_SYMLINK_NOFOLLOW) ? errno : 0;
+    else if (!statuses) st.st_mode = DTTOIF(type);
+    unsigned char header[8];
+    size_t length = strlen(name);
+    dcc_tcp_put32(header, length);
+    dcc_tcp_put32(header + 4, statuses == 2 && !inspect ? DCC_FS_NO_METADATA :
+                 statuses ? (uint32_t)error : error ? 0 : st.st_mode);
+    return append(writer, header, 8) || append(writer, name, length) ||
+        (inspect && !error && metadata(writer, &st));
+}
 static int directory(struct reply_writer *writer, const char *path, int statuses,
-                     const char **hints, size_t hint_count)
+                     const char **hints, size_t hint_count, const char *previous,
+                     const struct stat *initial)
 {
     DIR *dir = opendir(path);
-    if (!dir) return -1;
+    /* GCC can open a known header in an execute-only directory. Without
+     * listing permission, return its metadata and query children individually. */
+    if (!dir) return statuses == 2 && errno == EACCES ? 0 : -1;
     size_t offset = writer->reply->size;
     unsigned char header[8] = {0};
-    uint32_t count = 0;
-    int result = statuses ? append(writer, header, 4) : 0;
-    struct dirent *entry;
-    if (!result) errno = 0;
-    while (!result && (entry = readdir(dir))) {
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-        struct stat st = {0};
-        int error = 0;
-        const char *name = entry->d_name;
-        int inspect = statuses == 1 || (statuses == 2 && hint_count &&
-            bsearch(&name, hints, hint_count, sizeof(*hints), compare_names));
-        if (inspect || (!statuses && entry->d_type == DT_UNKNOWN))
-            error = fstatat(dirfd(dir), entry->d_name, &st, statuses == 1 ? 0 : AT_SYMLINK_NOFOLLOW) ? errno : 0;
-        else if (!statuses) st.st_mode = DTTOIF(entry->d_type); /* LIST exposes only the file type. */
-        size_t length = strlen(entry->d_name);
-        dcc_tcp_put32(header, length);
-        dcc_tcp_put32(header + 4, statuses == 2 && !inspect ? DCC_FS_NO_METADATA :
-                     statuses ? (uint32_t)error : error ? 0 : st.st_mode);
-        result = append(writer, header, 8) || append(writer, entry->d_name, length) ||
-            (inspect && !error && metadata(writer, &st));
-        if (result) break;
-        ++count;
-        errno = 0;
+    uint32_t count = 0, flags = 0;
+    int result = statuses ? append(writer, header, statuses == 2 ? 8 : 4) : 0;
+    unsigned char version[DCC_FS_METADATA], observed[DCC_FS_METADATA];
+    struct stat snapshot;
+    if (!result && statuses == 2) {
+        encode_metadata(version, initial);
+        result = fstat(dirfd(dir), &snapshot);
+        if (!result) {
+            encode_metadata(observed, &snapshot);
+            if (!memcmp(version, observed, sizeof(version)) &&
+                !memcmp(version, previous, sizeof(version))) flags |= DCC_FS_DIRECTORY_CACHED;
+        }
     }
-    if (!result && errno) result = -1;
+    if (flags & DCC_FS_DIRECTORY_CACHED) {
+        /* Opening the directory still checks the caller's read permission.
+         * Reusing names must never reuse child attributes from a prior job. */
+        for (size_t i = 0; i < hint_count && !result; ++i) {
+            result = directory_entry(writer, dirfd(dir), hints[i], DT_UNKNOWN, statuses, 1);
+            ++count;
+        }
+    } else if (!result) {
+        struct dirent *entry;
+        errno = 0;
+        while (!result && (entry = readdir(dir))) {
+            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+            const char *name = entry->d_name;
+            int inspect = statuses == 1 || (statuses == 2 && hint_count &&
+                bsearch(&name, hints, hint_count, sizeof(*hints), compare_names));
+            result = directory_entry(writer, dirfd(dir), name, entry->d_type, statuses, inspect);
+            if (result) break;
+            ++count;
+            errno = 0;
+        }
+        if (!result && errno) result = -1;
+    }
+    if (!result && statuses == 2) {
+        result = fstat(dirfd(dir), &snapshot);
+        if (!result) {
+            encode_metadata(observed, &snapshot);
+            if (!memcmp(version, observed, sizeof(version))) flags |= DCC_FS_DIRECTORY_STABLE;
+        }
+    }
     int error = errno;
     closedir(dir);
     if (!result && statuses) {
-        dcc_tcp_put32(writer->reply->data + offset, count);
+        if (statuses == 2) dcc_tcp_put32(writer->reply->data + offset, flags);
+        dcc_tcp_put32(writer->reply->data + offset + (statuses == 2 ? 4 : 0), count);
     }
     errno = error;
     return result;
@@ -174,12 +215,13 @@ int dcc_frontend_fs_reply(struct dcc_job *job, const void *data, size_t size,
         ((const char *)data)[4] != '/') return -1;
     unsigned operation = dcc_tcp_get32(data);
     const char *names = (const char *)data + 4, *end = (const char *)data + size;
-    const char *separator = memchr(names, 0, end - names), **hints = NULL;
+    const char *separator = memchr(names, 0, end - names), **hints = NULL, *version = NULL;
     size_t hint_count = 0;
     if (operation == DCC_FS_LSTAT) {
-        if (!separator) return -1;
+        if (!separator || end - separator - 1 < DCC_FS_METADATA) return -1;
+        version = separator + 1;
         const char *previous = NULL;
-        for (const char *name = separator + 1; name < end;) {
+        for (const char *name = version + DCC_FS_METADATA; name < end;) {
             const char *zero = memchr(name, 0, end - name);
             if (!zero || zero == name || memchr(name, '/', zero - name) ||
                 !strcmp(name, ".") || !strcmp(name, "..") ||
@@ -189,7 +231,7 @@ int dcc_frontend_fs_reply(struct dcc_job *job, const void *data, size_t size,
         if (hint_count) {
             hints = malloc(hint_count * sizeof(*hints));
             if (!hints) return -1;
-            const char *name = separator + 1;
+            const char *name = version + DCC_FS_METADATA;
             for (size_t i = 0; i < hint_count; ++i) { hints[i] = name; name += strlen(name) + 1; }
         }
     } else if (separator) return -1;
@@ -210,7 +252,8 @@ int dcc_frontend_fs_reply(struct dcc_job *job, const void *data, size_t size,
     } else if (operation == DCC_FS_STAT || operation == DCC_FS_LSTAT) {
         if ((operation == DCC_FS_STAT ? stat(path, &st) : lstat(path, &st)) || metadata(&writer, &st) ||
             (S_ISDIR(st.st_mode) && (access & PATH_CONTENTS) &&
-             directory(&writer, path, operation == DCC_FS_STAT ? 1 : 2, hints, hint_count))) error = errno;
+             directory(&writer, path, operation == DCC_FS_STAT ? 1 : 2, hints, hint_count,
+                       version, &st))) error = errno;
     } else if (operation == DCC_FS_READ) {
         reply->fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (reply->fd < 0 || fstat(reply->fd, &st)) error = errno;
@@ -223,7 +266,7 @@ int dcc_frontend_fs_reply(struct dcc_job *job, const void *data, size_t size,
         if (!resolved || append(&writer, resolved, strlen(resolved))) error = errno;
         free(resolved);
     } else if (operation == DCC_FS_LIST) {
-        if (directory(&writer, path, 0, NULL, 0)) error = errno;
+        if (directory(&writer, path, 0, NULL, 0, NULL, NULL)) error = errno;
     } else if (operation == DCC_FS_READLINK) {
         char target[PATH_MAX];
         ssize_t length = readlink(path, target, sizeof(target));

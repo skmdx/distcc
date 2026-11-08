@@ -729,9 +729,11 @@ service CPU and memory are included in the job's resource measurements.
 Header snapshots use the worker's shared cache outside the job tree and survive
 job cleanup. Each job obtains fresh metadata before reusing cached contents;
 changes to a header invalidate its snapshot, even with equal size and mtime.
-Directory access hints share that cache. The client enumerates each directory
-afresh and batches attributes for previously used names; other attributes are
-fetched on demand. Hints never establish a file's presence or freshness.
+Directory names and access hints share that cache. The client checks directory
+permissions and its version before reusing names; a new listing is retained only
+when its version also matches after enumeration. Child attributes are always
+fresh, batched for previously used names and fetched on demand for other names.
+Execute-only directories use individual lookups without exposing a listing.
 
 `DISTCC_CLANG_LOCAL=1` also reuses Clang and LLD libraries for local driver
 commands, including configure probes. The existing broker caches a control

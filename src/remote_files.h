@@ -102,7 +102,7 @@ class Connection {
         return {std::move(owner), static_cast<const char *>(bytes), length};
     }
     std::string directory_key(std::string_view path) const {
-        std::string key("directory-uses\0", 15);
+        std::string key("directory-state\0", 16);
         key += identity; key += '\0'; key += path;
         return key;
     }
@@ -164,12 +164,17 @@ public:
         out = {data, data.get(), size};
         return {};
     }
-    Buffer directory_hints(std::string_view path) { return cached(directory_key(path)); }
-    void save_directory_hints(std::string_view path, std::string_view names) {
+    Buffer directory_state(std::string_view path) { return cached(directory_key(path)); }
+    void save_directory_state(std::string_view path, const std::array<char, DCC_FS_METADATA> &version,
+                              std::string_view names, std::string_view hints) {
         auto key = directory_key(path);
-        // Concurrent publications may lose a prefetch hint, never a file or
-        // its metadata. The next job always enumerates and stats afresh.
-        cache.write(records, key.data(), key.size(), names.data(), names.size());
+        std::string data(version.data(), version.size());
+        uint32_t length = htonl(names.size());
+        data.append(reinterpret_cast<const char *>(&length), sizeof(length));
+        data.append(names); data.append(hints);
+        // One atomic record couples names to their observed directory version.
+        // Concurrent publication can lose a hint, never its freshness check.
+        cache.write(records, key.data(), key.size(), data.data(), data.size());
     }
     std::error_code read(std::string_view path, const char *version, Snapshot &out) {
         std::string key;
