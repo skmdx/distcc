@@ -798,7 +798,31 @@ class GccFrontendTest(BrokerTestCase):
             self.assertLess(int(counts[0]), len(directories),
                             'search directories still require individual round trips')
 
-    def test_warm_directory_hints_batch_each_tree_level(self):
+    def test_warm_directory_hints_do_not_wait_for_each_tree_level(self):
+        self.start_frontend()
+        counts = []
+        for depth in (1, 8):
+            context = self.work/f'depth{depth}'
+            headers = context/'headers'
+            nested = headers.joinpath(*('nested' for _ in range(depth)))
+            nested.mkdir(parents=True)
+            (nested/'value.h').write_text('#define VALUE 73\n')
+            source = context/'part.c'
+            source.write_text(f'#include <{(nested/"value.h").relative_to(headers)}>\n'
+                              'int value(void) { return VALUE; }\n')
+            command = [self.cc, '-nostdinc', '-I'+str(headers), '-O2', '-c', str(source), '-o', 'out.o']
+            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+            expected = (self.work/'out.o').read_bytes()
+            self.compile(command)
+            warm = self.compile(command)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+            requests = re.search(r'frontend filesystem: (\d+) requests', warm.stderr)
+            assert requests is not None, warm.stderr
+            counts.append(int(requests[1]))
+        self.assertEqual(counts[0], counts[1], f'depth-dependent directory waits: {counts}')
+        print(f'Warm directory tree RPC counts (1, 8 levels): {counts}')
+
+    def test_warm_directory_hints_split_bounded_batches(self):
         self.start_frontend()
         # The long shared prefix makes the deepest 256 queries exceed the
         # 64 KiB request limit while the short child hint names still fit.
@@ -1069,8 +1093,11 @@ class GccFrontendTest(BrokerTestCase):
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
         (self.work/'out.o').unlink()
-        self.compile(command)
-        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        # A saved external footprint is usable only after this job traverses
+        # the client-authorized link, including on the warm invocation.
+        for _ in range(2):
+            self.compile(command)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_precompiled_header_and_cache_invalidation_use_native_gcc(self):
         self.start_frontend()

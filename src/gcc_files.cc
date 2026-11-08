@@ -249,10 +249,11 @@ public:
         return 0;
     }
     int prefetch(const char *cwd, char *const *directories) {
-        std::set<std::string> paths;
+        std::set<std::string> paths, roots;
         auto add = [&](const char *name) {
             auto path = (std::filesystem::path(cwd)/name).lexically_normal();
             if (path != path.root_path() && !path.has_filename()) path = path.parent_path();
+            roots.insert(path.string());
             for (;;) {
                 paths.insert(path.string());
                 if (path == path.root_path()) break;
@@ -264,6 +265,19 @@ public:
         // the compiler still resolves symlinks and parent traversal through FUSE.
         add(cwd);
         for (auto p = directories; *p && **p; ++p) add(*p);
+        // The complete prior footprint is already loaded. Submit known
+        // descendants now rather than rediscovering one tree level per reply.
+        // Targets outside the current roots still wait for client-authorized
+        // symlink traversal; an early denial must not poison their job entry.
+        for (const auto &[path, hints] : predictions) {
+            for (const auto &root : roots) {
+                if (path == root || (path.compare(0, root.size(), root) == 0 &&
+                                    (root == "/" || path[root.size()] == '/'))) {
+                    paths.insert(path);
+                    break;
+                }
+            }
+        }
         return fetch(std::move(paths));
     }
     int status(const std::string &path, Entry *&result) {
