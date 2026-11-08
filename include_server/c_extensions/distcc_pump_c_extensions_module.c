@@ -38,6 +38,8 @@ const char *rs_program_name = "distcc_include_server";
 #include "argv_file.h"
 #include "exitcode.h"
 #include "file_cache.h"
+#include "broker_protocol.h"
+#include "tcp_job.h"
 
 static PyObject *distcc_pump_c_extensionsError;
 void initdistcc_pump_c_extensions(void);
@@ -496,6 +498,10 @@ PyInit_distcc_pump_c_extensions(void) {
       PyModule_AddObjectRef(module, "Error", st->error) < 0 ||
       PyModule_AddStringConstant(module, "__author__", "Nils Klarlund") < 0 ||
       PyModule_AddStringConstant(module, "__version__", version) < 0 ||
+      PyModule_AddIntConstant(module, "BROKER_VERSION", BROKER_VERSION) < 0 ||
+      PyModule_AddIntConstant(module, "TCP_BEGIN", DCC_TCP_BEGIN) < 0 ||
+      PyModule_AddIntConstant(module, "TCP_RESULT_FD", DCC_TCP_RESULT_FD) < 0 ||
+      PyModule_AddIntConstant(module, "TCP_PROGRESS", DCC_TCP_PROGRESS) < 0 ||
       PyModule_AddStringConstant(module, "gcc_scan_dir", DCC_GCC_SCAN_DIR) < 0 ||
       PyModule_AddStringConstant(module, "cpp_lookup_library", DCC_CPP_LOOKUP_LIBRARY) < 0) {
     Py_DECREF(module);

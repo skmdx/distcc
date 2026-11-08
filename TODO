@@ -25,8 +25,22 @@ reduce client filesystem service cost in remote preprocessing
     fallbacks. Planner diagnostics are now retained, but the failures did not
     recur in either subsequent full build. The affected input variants pass
     6400 cold-start replays under the actual build sandbox/environment, but
-    their original failure cause remains open. Spare capacity also remains
-    unresolved. A successful earlier focused compile reduces
+    their original failure cause remains open. A separate real-GCC regression
+    reproduces a slow-start failure: the broker expired owner/waiter leases
+    at five seconds despite the client's longer startup timeout. Publication
+    now follows the owner connection lifetime, and readers use their configured
+    I/O timeout. This does not establish the cause of the earlier warnings.
+    The next complete run still needs to evaluate local-link admission and
+    compiler metadata queries. Queries with build flags now bypass occupied
+    compiler lanes, and remote link coordinators reserve local capacity only
+    for actual local commands. Sysroot metadata changes verify contents instead
+    of rejecting identical files. Ordinary link IPC and TCP identifiers now
+    come from the native headers; stale Python identifiers previously prevented
+    this route from reaching workers. Progress and local artifact-FD replies
+    are handled, and installed validation exercises configured sysroot links.
+    The focused and regression checks pass, but deployment and complete-build
+    performance acceptance are still pending. Spare capacity remains unresolved.
+    A successful earlier focused compile reduces
     newfstatat calls from 841 to 514 and ENOENT from 355 to 1. Sends, opens and
     mappings remain unchanged. Of its 327 mappings, 316 are anonymous; do not
     mistake this allocation cost for mapping cached file contents.

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Exercise sysroot publication and object linking through real distccd jobs."""
 import json
+import array
+from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import io
 import os
 from pathlib import Path
@@ -8,10 +11,12 @@ import re
 import runpy
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import tarfile
+import time
 import unittest
 
 from test_broker import BrokerTestCase
@@ -20,7 +25,58 @@ from test_broker import BrokerTestCase
 class LinkArchiveTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        extension = str(next(Path.cwd().glob('_include_server/lib.*')))
+        sys.path.insert(0, extension)
+        cls.addClassCleanup(sys.path.remove, extension)
         cls.helper = runpy.run_path(str(Path.cwd() / 'distcc-link'))
+
+    def test_tcp_progress_and_local_artifact_descriptor(self):
+        from include_server.distcc_pump_c_extensions import TCP_BEGIN, TCP_PROGRESS, TCP_RESULT_FD
+        archive = self.helper['LinkArchive']({}, {})
+        payload = b'linked artifact\n' * 4096
+        client, server = socket.socketpair()
+        client.settimeout(5)
+        server.settimeout(5)
+
+        def peer():
+            def exact(size):
+                data = bytearray()
+                while len(data) < size:
+                    chunk = server.recv(size - len(data))
+                    if not chunk:
+                        raise EOFError('client disconnected')
+                    data.extend(chunk)
+                return bytes(data)
+
+            kind, size = struct.unpack('!II', exact(8))
+            self.assertEqual(kind, TCP_BEGIN)
+            identity = exact(size)[:8]
+            while True:
+                kind, size = struct.unpack('!II', exact(8))
+                exact(size)
+                if kind & 0x20000:
+                    break
+            server.sendall(struct.pack('!II', TCP_PROGRESS, 8) + identity)
+            result = struct.pack('!II8Q', 0, 0o755, 0, 0, len(payload), 0, 0, 0, 0, 0)
+            server.sendall(struct.pack('!II', TCP_BEGIN + 3, len(result)) + result)
+            with tempfile.TemporaryFile() as artifact:
+                artifact.write(payload)
+                artifact.flush()
+                fd = os.open('/proc/self/fd/' + str(artifact.fileno()), os.O_RDONLY)
+                try:
+                    os.lseek(fd, len(payload), os.SEEK_SET)
+                    server.sendmsg([struct.pack('!III', TCP_RESULT_FD, 4, 2)],
+                                   [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [fd]))])
+                finally:
+                    os.close(fd)
+            server.sendall(struct.pack('!II', TCP_BEGIN + 5, 8) + identity)
+
+        with client, server, tempfile.TemporaryDirectory() as directory, ThreadPoolExecutor(1) as pool:
+            future = pool.submit(peer)
+            output = Path(directory) / 'linked'
+            self.assertEqual(self.helper['tcp_link'](client, archive, output), 0)
+            future.result(timeout=5)
+            self.assertEqual(output.read_bytes(), payload)
 
     def test_changed_input_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -128,6 +184,61 @@ class LinkTestCase(BrokerTestCase):
                                  *args, '-o', str(output)], env=self.env, capture_output=True,
                                 text=True, timeout=15)
         return output, result
+
+    def test_remote_link_bypasses_occupied_local_slot(self):
+        self.env['DISTCC_HOSTS'] += ' --localslots=1'
+        locks = Path(self.env['DISTCC_DIR']) / 'lock'
+        locks.mkdir(exist_ok=True)
+        with (locks / 'cpu_localhost_0').open('w') as held:
+            fcntl.lockf(held, fcntl.LOCK_EX)
+            output, result = self.link()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('distcc-link: linked on ', result.stderr)
+            subprocess.run([str(output)], check=True, capture_output=True)
+
+    def test_local_fallback_acquires_local_slot(self):
+        self.env['DISTCC_HOSTS'] += ' --localslots=1'
+        locks = Path(self.env['DISTCC_DIR']) / 'lock'
+        locks.mkdir(exist_ok=True)
+        log, output = self.work / 'fallback.log', self.work / 'fallback'
+        self.env['DISTCC_LOG'] = str(log)
+        with (locks / 'cpu_localhost_0').open('w') as held:
+            fcntl.lockf(held, fcntl.LOCK_EX)
+            proc = subprocess.Popen([str(self.build / 'distcc'), self.compiler, str(self.obj),
+                                     '-Wl,-Map=' + str(self.work / 'link.map'), '-o', str(output)],
+                                    env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 5
+                while not log.exists() or 'cpu_localhost_0 is busy' not in log.read_text():
+                    self.assertIsNone(proc.poll())
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                self.assertFalse(output.exists())
+                fcntl.lockf(held, fcntl.LOCK_UN)
+                _, error = proc.communicate(timeout=15)
+                self.assertEqual(proc.returncode, 0, error)
+                self.assertIn(b'distcc-link: local:', error)
+                subprocess.run([str(output)], check=True, capture_output=True)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+
+    def test_metadata_only_sysroot_change_keeps_remote_link(self):
+        snapshot = self.work / 'metadata-snapshot'
+        subprocess.run(['cp', '-a', '--reflink=auto', str(self.snapshot), str(snapshot)], check=True)
+        path = self.work / 'metadata.json'
+        subprocess.run([str(self.helper), '--sync', str(snapshot), self.sync_compiler,
+                        str(path), str(self.cache)], env=self.link_env,
+                       check=True, capture_output=True, timeout=30)
+        self.env.update(DISTCC_LINK_SYSROOT=str(path), DISTCC_LINK_SOURCE=str(snapshot))
+        file = snapshot / self.profile['gccdir'] / 'crtbegin.o'
+        os.chmod(file, file.stat().st_mode ^ 0o200)
+        for _ in range(2):
+            output, result = self.link()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('distcc-link: linked on ', result.stderr)
+            subprocess.run([str(output)], check=True, capture_output=True)
 
     def test_shared_library_permissions_match_local(self):
         source = self.work / 'library.cc'

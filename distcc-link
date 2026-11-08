@@ -153,21 +153,18 @@ def query_fingerprint(command):
     return json.dumps([command, os.getcwd(), environment, states], sort_keys=True)
 
 
-def compiler_query(command):
-    """Share successful metadata probes across short-lived link helpers.
+def cached_query(fingerprint, query):
+    """Share metadata results across short-lived link helpers.
 
     The server has no scheduling broker. A private, bounded on-disk cache with
     per-slot flock works on both ends without adding a daemon or subprocess.
     Errors and unfamiliar toolchains take the ordinary query path.
     """
-    def query():
-        return subprocess.check_output(command, text=True)
-
     try:
-        fingerprint = query_fingerprint(command)
-        if fingerprint is None:
+        key = fingerprint()
+        if key is None:
             return query()
-        digest = hashlib.sha256(fingerprint.encode()).hexdigest()
+        digest = hashlib.sha256(key.encode()).hexdigest()
         directory = Path(tempfile.gettempdir()) / ('distcc-query-' + str(os.geteuid()))
         directory.mkdir(mode=0o700, exist_ok=True)
         info = directory.lstat()
@@ -188,13 +185,18 @@ def compiler_query(command):
             except (ValueError, AttributeError):
                 pass
             value = query()
-            if len(value) < 32768 and query_fingerprint(command) == fingerprint:
+            if len(value) < 32768 and fingerprint() == key:
                 stream.seek(0)
                 stream.truncate()
                 json.dump({'key': digest, 'value': value}, stream)
             return value
     except (OSError, ValueError):
         return query()
+
+
+def compiler_query(command):
+    return cached_query(lambda: query_fingerprint(command),
+                        lambda: subprocess.check_output(command, text=True))
 
 
 def compiler_identity(compiler, target=None):
@@ -438,15 +440,35 @@ def file_state(path):
 
 def check_source(profile, root=None):
     root = Path(root if root is not None else os.environ.get('DISTCC_LINK_SOURCE', '/'))
-    for name, expected in profile['state'].items():
+    for name in profile['state']:
         if Path(name).is_absolute() or '..' in Path(name).parts:
             raise ValueError('invalid sysroot state path')
+    current = {}
+
+    def fingerprint():
+        for name in profile['state']:
+            try:
+                current[name] = file_state(root / name)
+            except FileNotFoundError:
+                current[name] = None
+        if current == profile['state']:
+            return None
+        return json.dumps([str(root.absolute()), profile['key'], current], sort_keys=True)
+
+    def contents_match():
+        if current == profile['state']:
+            return 'valid'
+        # Metadata is an invalidation hint. Preserve the published identity
+        # while comparing actual contents, including added/removed libraries.
+        identity = {key: value for key, value in profile.items() if key != 'key'}
         try:
-            current = file_state(root / name)
+            digest = sysroot_digest(identity, root, library_files(root, profile))
         except FileNotFoundError:
-            current = None
-        if current != expected:
-            raise LocalOnly('sysroot changed; synchronize a new snapshot before remote linking')
+            return 'changed'
+        return 'valid' if digest == profile['key'] else 'changed'
+
+    if cached_query(fingerprint, contents_match) != 'valid':
+        raise LocalOnly('sysroot changed; synchronize a new snapshot before remote linking')
 
 
 def receive_exact(sock, size):
@@ -603,7 +625,9 @@ class LinkArchive:
 
 def tcp_link(net, archive, output):
     """Stream a link archive and receive one bounded pooled TCP transaction."""
-    begin, need, incoming, result_type, outgoing, complete = range(0x54000200, 0x54000206)
+    from include_server.distcc_pump_c_extensions import TCP_BEGIN, TCP_RESULT_FD, TCP_PROGRESS
+
+    begin, need, incoming, result_type, outgoing, complete = range(TCP_BEGIN, TCP_BEGIN + 6)
     compressed, final = 0x10000, 0x20000
     codec = Lz4Chunks()
     identity = int.from_bytes(os.urandom(8), 'big') or 1
@@ -615,20 +639,39 @@ def tcp_link(net, archive, output):
     def send(kind, body):
         net.sendall(struct.pack('!II', kind, len(body)) + body)
 
-    def exact(size):
+    def exact(size, descriptors):
         chunks = bytearray()
         while len(chunks) < size:
-            part = net.recv(size - len(chunks))
+            part, ancillary, flags, _ = net.recvmsg(size - len(chunks), socket.CMSG_SPACE(4),
+                                                  socket.MSG_CMSG_CLOEXEC)
+            for level, kind, data in ancillary:
+                if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
+                    descriptors.extend(array.array('i', data))
+            if flags & socket.MSG_CTRUNC:
+                raise OSError('truncated TCP link descriptors')
             if not part:
                 raise OSError('truncated TCP link response')
             chunks.extend(part)
         return bytes(chunks)
 
     def receive():
-        kind, size = struct.unpack('!II', exact(8))
-        if size > codec.chunk_size + 8:
-            raise OSError('oversized TCP link response')
-        return kind, exact(size)
+        while True:
+            descriptors = []
+            try:
+                kind, size = struct.unpack('!II', exact(8, descriptors))
+                if size > codec.chunk_size + 8:
+                    raise OSError('oversized TCP link response')
+                data = exact(size, descriptors)
+                if len(descriptors) != (1 if kind == TCP_RESULT_FD else 0):
+                    raise OSError('invalid TCP link descriptors')
+                if kind == TCP_PROGRESS:
+                    if data != struct.pack('!Q', identity):
+                        raise OSError('invalid TCP link progress')
+                    continue
+                return kind, data, descriptors.pop() if descriptors else None
+            finally:
+                for descriptor in descriptors:
+                    os.close(descriptor)
 
     metadata = (struct.pack('!3Q', 2, 1, 1) + string(os.getcwd()) + string('distcc-link') +
                 struct.pack('!5Q', 0, 0, 0, archive.size, archive.size) + bytes(8) +
@@ -664,7 +707,10 @@ def tcp_link(net, archive, output):
         writer.flush_chunk(len(writer.pending))
     if writer.sent != archive.size:
         raise OSError('link input length changed')
-    kind, body = receive()
+    kind, body, descriptor = receive()
+    if descriptor is not None:
+        os.close(descriptor)
+        raise OSError('unexpected TCP link result descriptor')
     if kind != result_type or len(body) != 72:
         raise OSError('invalid TCP link result')
     status, mode, *sizes = struct.unpack('!II4Q', body[:40])
@@ -677,7 +723,32 @@ def tcp_link(net, archive, output):
             received = [0] * 4
             finished = [size == 0 for size in sizes]
             while True:
-                kind, body = receive()
+                kind, body, descriptor = receive()
+                if kind == TCP_RESULT_FD:
+                    with os.fdopen(descriptor, 'rb') as source:
+                        if len(body) != 4:
+                            raise OSError('invalid TCP link artifact descriptor')
+                        index, = struct.unpack('!I', body)
+                        info = os.fstat(source.fileno())
+                        if (index >= 3 or finished[index] or received[index] or
+                                not stat.S_ISREG(info.st_mode) or info.st_size != sizes[index] or
+                                fcntl.fcntl(source.fileno(), fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY):
+                            raise OSError('invalid TCP link artifact file')
+                        target = (sys.stderr.buffer, sys.stdout.buffer, artifact)[index]
+                        if index == 2:
+                            offset = 0
+                            while offset < sizes[index]:
+                                sent = os.sendfile(target.fileno(), source.fileno(), offset,
+                                                   sizes[index] - offset)
+                                if not sent:
+                                    raise OSError('truncated TCP link artifact file')
+                                offset += sent
+                        else:
+                            source.seek(0)
+                            shutil.copyfileobj(source, target, codec.chunk_size)
+                        received[index] = sizes[index]
+                        finished[index] = True
+                    continue
                 if kind == complete:
                     if body != struct.pack('!Q', identity) or not all(finished):
                         raise OSError('incomplete TCP link result')
@@ -721,11 +792,13 @@ def tcp_link(net, archive, output):
 
 
 def remote_link(job, inputs, output):
+    from include_server.distcc_pump_c_extensions import BROKER_VERSION
+
     archive = LinkArchive(job, inputs)
     with ExitStack() as stack:
         lease = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
         lease.connect(os.environ['DISTCC_BROKER'])
-        lease.sendall(struct.pack('=II', 2, 8))
+        lease.sendall(struct.pack('=II', BROKER_VERSION, 8))
         reply, ancillary, flags, _ = lease.recvmsg(1032, socket.CMSG_SPACE(4),
                                                    socket.MSG_CMSG_CLOEXEC)
         descriptors = []
@@ -743,14 +816,14 @@ def remote_link(job, inputs, output):
             host = reply[8:].split(b'\0', 1)[0].decode()
             if ',auth' in host:
                 raise LocalOnly('authenticated link protocol is not supported')
-            lease.sendall(struct.pack('=II', 2, 3))
+            lease.sendall(struct.pack('=II', BROKER_VERSION, 3))
             options = set(host.split(','))
             if 'tcp' in options:
                 with socket.socket(fileno=descriptors.pop()) as net:
                     net.settimeout(float(os.environ.get('DISTCC_IO_TIMEOUT', '300')))
                     status = tcp_link(net, archive, output)
                     try:
-                        lease.sendmsg([struct.pack('=II4Q', 2, 7, 0, 0, 0, 0)],
+                        lease.sendmsg([struct.pack('=II4Q', BROKER_VERSION, 7, 0, 0, 0, 0)],
                                       [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                         array.array('i', [net.fileno()]))])
                     except OSError:
@@ -791,7 +864,7 @@ def remote_link(job, inputs, output):
                         temporary.unlink(missing_ok=True)
                 if capabilities & (1 << 30):
                     try:
-                        lease.sendmsg([struct.pack('=II4Q', 2, 7, 0, 0, 0, 0)],
+                        lease.sendmsg([struct.pack('=II4Q', BROKER_VERSION, 7, 0, 0, 0, 0)],
                                       [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                         array.array('i', [net.fileno()]))])
                     except OSError:
@@ -1204,6 +1277,7 @@ def main():
         return 1
     if '-###' in command[1:]:
         os.execvp(command[0], command)
+    local = [str(Path(__file__).resolve().with_name('distcc')), '--local-command']
     try:
         if os.environ.get('DISTCC_BROKER') and compiler_family(command[0]) == 'clang':
             invocation, diagnostics = clang_link_command(command, offload=True)
@@ -1211,7 +1285,7 @@ def main():
             offload = Path(invocation[0]).name == 'clang-linker-wrapper'
             distributed = any(arg.startswith('--thinlto-distributor=') for arg in args)
             if distributed and not offload:
-                os.execvp(command[0], command)
+                os.execv(local[0], [*local, *command])
             if ((offload or '-plugin-opt=thinlto' in args or not os.environ.get('DISTCC_LINK_SYSROOT'))
                     and thinlto_pool()):
                 helper = str(Path(__file__).resolve().with_name('distcc-thinlto'))
@@ -1228,17 +1302,17 @@ def main():
                     invocation.extend(options)
                 sys.stderr.write(diagnostics)
                 sys.stderr.flush()
-                result = subprocess.call(invocation)
+                result = subprocess.call([*local, *invocation])
                 if not result or os.environ.get('DISTCC_FALLBACK') == '0':
                     return result
                 print('distcc-link: distributed link failed; retrying locally', file=sys.stderr)
-                os.execvp(command[0], command)
+                os.execv(local[0], [*local, *command])
         path = Path(os.environ['DISTCC_LINK_SYSROOT'])
         if path.is_dir():
             path /= compiler_family(command[0]) + '.json'
         profile = json.loads(path.read_text())
-        check_source(profile)
         job, inputs, output, diagnostics = prepare_job(command, profile)
+        check_source(profile)
         sys.stderr.write(diagnostics)
         sys.stderr.flush()
         result = remote_link(job, inputs, output)
@@ -1252,8 +1326,7 @@ def main():
         print('distcc-link: ' + str(error), file=sys.stderr)
         if os.environ.get('DISTCC_FALLBACK') == '0':
             return 1
-    os.environ['DISTCC_LINK_SYSROOT'] = ''
-    os.execvp(command[0], command)
+    os.execv(local[0], [*local, *command])
 
 
 if __name__ == '__main__':

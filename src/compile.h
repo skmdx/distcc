@@ -51,6 +51,8 @@ int dcc_compile_remote(char **argv,
 
 extern int dcc_scan_includes;
 
+int dcc_run_local_command(char **argv);
+
 int dcc_build_somewhere_timed(char *argv[],
                               int sg_level,
                               int *status);

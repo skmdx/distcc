@@ -270,6 +270,10 @@ int main(int argc, char **argv)
     if (argc > 2 && !strcmp(argv[1], "--gcc-plan"))
         dcc_exit(dcc_gcc_plan_execute(argv + 2));
 
+    /* Link coordinators have no local lease until they choose local work. */
+    if (argc > 2 && !strcmp(argv[1], "--local-command"))
+        dcc_exit(dcc_run_local_command(argv + 2));
+
     /* Private transport entry point used by file-based compiler planners. */
     if ((argc == 5 || argc == 6) && !strcmp(argv[1], "--file-job")) {
         long queued_fd = -1;

@@ -306,10 +306,12 @@ int open(const char *path, int flags, ...) {
             if clang:
                 compilers.extend([clang, 'clang'])
             for compiler in compilers:
-                for flag in ('--version', '-dumpmachine', '-dumpversion', '-dumpfullversion'):
-                    with self.subTest(compiler=compiler, flag=flag):
-                        expected = subprocess.run([compiler, flag], env=env, capture_output=True, timeout=5)
-                        actual = subprocess.run([str(self.build / 'distcc'), compiler, flag],
+                for flags in (['--version'], ['-dumpmachine'], ['-dumpversion'], ['-dumpfullversion'],
+                              ['-O3', '-pipe', '-Wl,--as-needed', '-print-file-name=libgcc_s.so.1'],
+                              ['-print-prog-name=ld'], ['-print-search-dirs']):
+                    with self.subTest(compiler=compiler, flags=flags):
+                        expected = subprocess.run([compiler, *flags], env=env, capture_output=True, timeout=5)
+                        actual = subprocess.run([str(self.build / 'distcc'), compiler, *flags],
                                                 env=env, capture_output=True, timeout=5)
                         self.assertEqual(actual.returncode, expected.returncode, actual.stderr)
                         self.assertEqual(actual.stdout, expected.stdout)

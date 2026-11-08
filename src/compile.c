@@ -400,7 +400,8 @@ int dcc_fresh_dependency_exists(const char *dotd_fname,
  * can't clean up our temporary files, and (not so important) we can't
  * log our resource usage.
  *
- * This is called with a lock on localhost already held.
+ * Callers reserve local capacity for compiler work; coordinators acquire
+ * capacity for their children instead of occupying a local compiler lane.
  **/
 static int dcc_compile_local(char *argv[],
                              char *input_name, const char *prepared, uint64_t *cpu_ns)
@@ -426,6 +427,18 @@ static int dcc_compile_local(char *argv[],
 
     return dcc_critique_status(status, "compile", input_name,
                                dcc_hostdef_local, 1);
+}
+
+/* Helpers reserve local capacity only for work that actually runs locally.
+ * Keep the lock in the waiting parent: a compiler may close inherited fds. */
+int dcc_run_local_command(char **argv)
+{
+    int fd = -1, ret;
+    dcc_read_localslots_configuration();
+    if ((ret = dcc_lock_local(&fd))) return ret;
+    ret = dcc_compile_local(argv, NULL, NULL, NULL);
+    dcc_close(fd);
+    return ret;
 }
 
 static int dcc_compile_local_ir(char **argv, char *input, const char *prepared, int fd, uint64_t *cpu_ns)
@@ -708,7 +721,7 @@ static int dcc_get_max_retries(void)
 }
 
 /* Only pure object/archive links are candidates. The helper validates options
- * and runs unsupported commands locally under the existing local slot lock. */
+ * and acquires a local slot only when it falls back to a local command. */
 static int dcc_link_candidate(char **argv)
 {
     int i, input = 0;
@@ -736,6 +749,22 @@ static int dcc_multi_candidate(char **argv)
         if (dcc_is_source(argv[i])) ++inputs;
     }
     return inputs > 1;
+}
+
+static int dcc_metadata_query(char **argv)
+{
+    int query = 0;
+    for (int i = 1; argv[i]; ++i) {
+        /* Do not treat operands of other options as terminal driver flags. */
+        if (argv[i][0] != '-') return 0;
+        if (!strcmp(argv[i], "--version") || !strcmp(argv[i], "-dumpmachine") ||
+            !strcmp(argv[i], "-dumpversion") || !strcmp(argv[i], "-dumpfullversion") ||
+            !strcmp(argv[i], "-print-search-dirs") ||
+            !strncmp(argv[i], "-print-file-name=", 17) ||
+            !strncmp(argv[i], "-print-prog-name=", 17))
+            query = 1;
+    }
+    return query;
 }
 
 /**
@@ -810,6 +839,10 @@ dcc_build_somewhere(char *argv[],
     if ((ret = dcc_expand_preprocessor_options(&argv)) != 0)
         goto clean_up;
 
+    /* Build-system metadata queries do not consume a compilation lane, even
+     * when the build appends its usual optimization/target/linker flags. */
+    if (dcc_metadata_query(argv)) goto run_local;
+
     if (dcc_multi_candidate(argv)) {
         int argc = dcc_argv_len(argv);
         char **command = calloc(argc + 2, sizeof(*command));
@@ -835,7 +868,7 @@ dcc_build_somewhere(char *argv[],
         memcpy(link_argv + 1, argv, (argc + 1) * sizeof(*argv));
         free(argv);
         argv = link_argv;
-        goto lock_local;
+        goto run_local;
     }
 
     /* TODO: Perhaps tidy up these gotos. */
@@ -882,12 +915,6 @@ dcc_build_somewhere(char *argv[],
             argv = new_argv;
         }
     }
-    /* Configure probes must not wait behind a build's local compilation
-     * backlog. Only standalone metadata queries bypass CPU admission. */
-    if (argv[1] && !argv[2] &&
-        (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-dumpmachine") ||
-         !strcmp(argv[1], "-dumpversion") || !strcmp(argv[1], "-dumpfullversion")))
-        goto run_local;
     if (!getenv("DISTCC_NO_REWRITE_CROSS")) {
         dcc_add_clang_target(new_argv);
         dcc_gcc_rewrite_fqn(new_argv);

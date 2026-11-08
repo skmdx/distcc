@@ -31,7 +31,7 @@ sys.path.insert(0, root)
 environment = dict(os.environ)
 entry = runpy.run_path(root + '/' + helper)
 if helper == 'distcc-link':
-    command = entry['clang_link_command']([compiler, '-shared', '-fuse-ld=lld', obj, '-o', output])
+    command, diagnostics = entry['clang_link_command']([compiler, '-shared', '-fuse-ld=lld', obj, '-o', output])
     subprocess.run(command, check=True)
     assert ctypes.CDLL(output).answer() == 42
 elif helper == 'distcc-clang':

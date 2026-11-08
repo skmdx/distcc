@@ -214,6 +214,22 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         marker = ('pooled TCP job completed' if ',tcp' in env['DISTCC_HOSTS'] else
                   'client finished sending request to server')
         assert log.count(marker) >= len(set(compilers)), log[-6000:]
+        profile = subprocess.run(['portageq', 'envvar', 'DISTCC_LINK_SYSROOT'],
+                                 text=True, capture_output=True)
+        if profile.returncode != 1 or profile.stdout.strip() or profile.stderr.strip():
+            profile.check_returncode()
+        if profile.stdout.strip():
+            source, obj, output = root/'sysroot-link.c', root/'sysroot-link.o', root/'sysroot-link'
+            source.write_text('int main(void) { return 0; }\n')
+            subprocess.run(['/usr/bin/gcc', '-c', str(source), '-o', str(obj)],
+                           check=True, capture_output=True, timeout=30)
+            linked = subprocess.run(['distcc', '/usr/bin/gcc', str(obj), '-o', str(output)],
+                                    env=dict(env, DISTCC_LINK_SYSROOT=profile.stdout.strip()),
+                                    text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+            assert linked.returncode == 0, linked.stdout + linked.stderr
+            assert 'distcc-link: linked on ' in linked.stderr, linked.stderr
+            subprocess.run([output], check=True, timeout=10)
+            results['sysroot_link'] = {'distributed': True, 'executed': True}
     if ',tcp' in env['DISTCC_HOSTS']:
         clang = next((p for p in compilers if 'clang' in Path(p).name), None)
         if clang:
