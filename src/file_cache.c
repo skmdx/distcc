@@ -9,8 +9,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/uio.h>
@@ -21,11 +23,22 @@
 #include "distcc.h"
 #include "file_cache.h"
 
-/* Separate shard locks bound both directory scans and concurrent storage.
- * FIFO eviction avoids a metadata write on every cache hit. */
+/* Separate shard locks bound concurrent storage. Capacity counts allocated
+ * bytes: small headers must not exhaust an entry quota or escape the storage
+ * budget just because their payload occupies a fraction of a filesystem block. */
 #define CACHE_SHARDS DCC_FILE_CACHE_SHARDS
-#define CACHE_FILES 64
 #define CACHE_BYTES DCC_FILE_CACHE_MAX
+
+static void accessed(int fd, const struct stat *st)
+{
+    struct timespec now;
+    /* Record use at most once per timestamp second. Keep mtime unchanged:
+     * shared inputs can be hardlinked into a running compiler's filesystem. */
+    if (!clock_gettime(CLOCK_REALTIME_COARSE, &now) && st->st_atim.tv_sec < now.tv_sec) {
+        const struct timespec times[2] = {{.tv_nsec = UTIME_NOW}, {.tv_nsec = UTIME_OMIT}};
+        (void)futimens(fd, times); /* Recency is best effort, like admission. */
+    }
+}
 
 static int private_directory(int parent, const char *name)
 {
@@ -156,21 +169,35 @@ int dcc_file_cache_get(const unsigned char *hash, const char *destination, int s
     /* An open entry survives concurrent eviction. Verify the private snapshot
      * too, so a corrupt cache entry is a miss, never a wrong compilation. */
     ok = snapshot(from, destination, hash, shared);
+    if (ok) accessed(from, &st);
 done:
     if (from >= 0) close(from);
     close(shard);
     return ok;
 }
 
-struct entry { char key[17]; off_t size; time_t age; };
+struct entry { char key[17]; off_t size; struct timespec age; };
+
+static int oldest_first(const void *left, const void *right)
+{
+    const struct timespec *a = &((const struct entry *)left)->age;
+    const struct timespec *b = &((const struct entry *)right)->age;
+    if (a->tv_sec != b->tv_sec) return (a->tv_sec > b->tv_sec) - (a->tv_sec < b->tv_sec);
+    return (a->tv_nsec > b->tv_nsec) - (a->tv_nsec < b->tv_nsec);
+}
 
 static int make_room(int shard, off_t size, const char *replaced)
 {
-    struct entry entries[CACHE_FILES];
+    struct entry *entries = NULL;
     struct dirent *de;
     struct stat st;
     off_t bytes = 0;
-    int count = 0, i, oldest;
+    size_t count = 0, capacity = 0;
+    int result = -1;
+    struct statvfs space;
+    if (fstatvfs(shard, &space)) return -1;
+    off_t block = space.f_frsize;
+    size = ((size + block - 1) / block) * block;
     /* A retained shard can be shared by forked compilers. Each scan needs
      * its own open file description, rather than dup's shared offset. */
     int iterator = openat(shard, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -179,7 +206,7 @@ static int make_room(int shard, off_t size, const char *replaced)
     if (!dir) { close(iterator); return -1; }
     while ((de = readdir(dir))) {
         if (!strncmp(de->d_name, ".tmp-", 5)) {
-            if (unlinkat(shard, de->d_name, 0)) { closedir(dir); return -1; }
+            if (unlinkat(shard, de->d_name, 0)) goto done;
             continue;
         }
         if (strlen(de->d_name) != 16 || strspn(de->d_name, "0123456789abcdef") != 16)
@@ -189,25 +216,37 @@ static int make_room(int shard, off_t size, const char *replaced)
         /* Active read-only jobs pin their entries with hard links. The idle
          * cache bound must not evict and retransmit those same live inputs. */
         if (S_ISREG(st.st_mode) && st.st_nlink > 1) continue;
-        if (!S_ISREG(st.st_mode) || count == CACHE_FILES) {
-            if (unlinkat(shard, de->d_name, 0)) { closedir(dir); return -1; }
+        if (!S_ISREG(st.st_mode)) {
+            if (unlinkat(shard, de->d_name, 0)) goto done;
             continue;
         }
+        if (count == capacity) {
+            size_t next = capacity ? capacity * 2 : 64;
+            void *grown = realloc(entries, next * sizeof(*entries));
+            if (!grown) goto done;
+            entries = grown; capacity = next;
+        }
         strcpy(entries[count].key, de->d_name);
-        entries[count].size = st.st_size;
-        entries[count++].age = st.st_mtime;
-        bytes += st.st_size;
+        entries[count].size = st.st_blocks * 512;
+        entries[count].age = st.st_atim;
+        if (st.st_mtim.tv_sec > st.st_atim.tv_sec ||
+            (st.st_mtim.tv_sec == st.st_atim.tv_sec && st.st_mtim.tv_nsec > st.st_atim.tv_nsec))
+            entries[count].age = st.st_mtim;
+        ++count;
+        bytes += entries[count-1].size;
     }
+    if (count && bytes + size > CACHE_BYTES) {
+        qsort(entries, count, sizeof(*entries), oldest_first);
+        for (size_t i = 0; i < count && bytes + size > CACHE_BYTES; ++i) {
+            if (unlinkat(shard, entries[i].key, 0)) goto done;
+            bytes -= entries[i].size;
+        }
+    }
+    result = 0;
+done:
     closedir(dir);
-    while (count && (count + (*replaced != 0) > CACHE_FILES || bytes + size > CACHE_BYTES)) {
-        oldest = 0;
-        for (i = 1; i < count; ++i)
-            if (entries[i].age < entries[oldest].age) oldest = i;
-        if (unlinkat(shard, entries[oldest].key, 0)) return -1;
-        bytes -= entries[oldest].size;
-        entries[oldest] = entries[--count];
-    }
-    return 0;
+    free(entries);
+    return result;
 }
 
 void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared, const char *tmp)
@@ -315,6 +354,7 @@ static int record_lookup(struct dcc_record_cache *cache, const void *key, size_t
         return -1;
     }
     *record_size = st.st_size;
+    accessed(fd, &st);
     return fd;
 }
 static int record_contents(const void *record, size_t record_size, const void *key, size_t key_size,

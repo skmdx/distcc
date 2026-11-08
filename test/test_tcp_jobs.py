@@ -99,6 +99,39 @@ class FileCacheTest(unittest.TestCase):
         self.assertEqual(ctypes.string_at(data.value+size, 1), b'\0')
         return ctypes.string_at(data, size)
 
+    def shard_keys(self, count):
+        candidates = (f'header-{index}'.encode() for index in itertools.count())
+        return list(itertools.islice((key for key in candidates
+                    if (xxhash.xxh3_64_intdigest(key) >> 56) % 64 == 0), count))
+
+    def test_small_records_use_byte_capacity_instead_of_entry_count(self):
+        keys = self.shard_keys(128)
+        value = b'#define SHARED_HEADER 17\n' * 128
+        for key in keys:
+            self.write(key, value)
+        for key in keys:
+            self.assertEqual(self.get(key), value, key)
+
+    def test_byte_pressure_retains_recent_reads_without_changing_mtime(self):
+        keys = self.shard_keys(4)
+        value = b'x' * (1024 * 1024)
+        paths = []
+        for index, key in enumerate(keys[:3]):
+            self.write(key, value)
+            path = self.cache_path/'00'/f'{xxhash.xxh3_64_intdigest(key):016x}'
+            os.utime(path, ns=((index+1)*10**9, (index+1)*10**9))
+            paths.append(path)
+        # The first insertion is old, but it is still actively used.
+        self.assertEqual(self.get(keys[0]), value)
+        self.assertEqual(paths[0].stat().st_mtime_ns, 10**9)
+        self.write(keys[3], value)
+        self.assertEqual(self.get(keys[0]), value)
+        self.assertIsNone(self.get(keys[1]))
+        self.assertEqual(self.get(keys[2]), value)
+        self.assertEqual(self.get(keys[3]), value)
+        self.assertLessEqual(sum(p.stat().st_blocks * 512 for p in paths[0].parent.iterdir()),
+                             4 * 1024 * 1024)
+
     def test_binary_records_and_open_snapshots_outlive_replacement_and_cache(self):
         for value in (b'', bytes(range(256))*16, os.urandom(131072)):
             self.write(b'binary', value)
@@ -164,12 +197,14 @@ class FileCacheTest(unittest.TestCase):
             with self.subTest(size=len(payload)):
                 source, output = root/f'source-{index}', root/f'output-{index}'
                 source.write_bytes(payload)
+                os.utime(source, ns=(10**9, 10**9))
                 digest = xxhash.xxh3_64_digest(payload)
                 library.dcc_file_cache_put(digest, os.fsencode(source), 1, os.fsencode(root))
                 self.assertEqual(library.dcc_file_cache_get(
                     digest, os.fsencode(output), 1, os.fsencode(root)), 1)
                 self.assertEqual(output.read_bytes(), payload)
                 self.assertEqual(output.stat().st_ino, source.stat().st_ino)
+                self.assertEqual(output.stat().st_mtime_ns, 10**9)
                 output.unlink()
                 cached = next(self.cache_path.glob('*/'+digest.hex()))
                 cached.chmod(0o600)
@@ -180,26 +215,22 @@ class FileCacheTest(unittest.TestCase):
                 self.assertFalse(output.exists())
 
     def test_retained_shards_prune_after_fork_and_publish_atomic_snapshots(self):
-        keys = []
-        candidate = 0
-        while len(keys) < 80:
-            key = ('entry-%d' % candidate).encode()
-            if (xxhash.xxh3_64_intdigest(key) >> 56) % 64 == 0: keys.append(key)
-            candidate += 1
-        self.write(keys[0], b'entry')
+        keys = self.shard_keys(80)
+        payload = b'entry'.ljust(65536, b'\0')
+        self.write(keys[0], payload)
         oldest = next(p for p in self.cache_path.glob('*/*') if len(p.name) == 16)
         # Eviction compares file ages; creation within one timestamp tick
         # does not establish an order between otherwise equal-age entries.
         os.utime(oldest, (1, 1))
-        for key in keys[1:40]: self.write(key, b'entry')
+        for key in keys[1:40]: self.write(key, payload)
         pid = os.fork()
         if not pid:
-            for key in keys[40:]: self.write(key, b'entry')
+            for key in keys[40:]: self.write(key, payload)
             self.close_cache()
             os._exit(0)
         self.assertEqual(os.waitpid(pid, 0)[1], 0)
         self.assertIsNone(self.get(keys[0]))
-        self.assertEqual(self.get(keys[-1]), b'entry')
+        self.assertEqual(self.get(keys[-1]), payload)
         key, values = b'atomic', (b'A'*65536, b'B'*65536)
         self.write(key, values[0])
         children = []
