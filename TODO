@@ -12,29 +12,27 @@ reduce client filesystem service cost in remote preprocessing
     256 branches split into four requests. Parent queries now omit attributes
     supplied by a scheduled child's own query, including across batch splits;
     each child still checks its current identity and permissions. All 57
-    GCC/frontend checks and five-host installed validation pass. The initial
-    and warm full builds take 316.286 and 315.083 seconds versus 315.584 and
-    307.956; client CPU takes 939.008 and 894.387 seconds versus 938.617 and
-    900.668. Each run completes 6400 remote jobs with matching
+    GCC/frontend checks and five-host installed validation pass. After fixing
+    module build flags and ordering FUSE shutdown, the initial and warm full
+    builds take 315.250 and 312.476 seconds. Compared with the preceding
+    317.350 and 316.414 seconds, client CPU rises from 930.467/882.436 to
+    941.092/899.132 seconds. Each run completes 6400 remote jobs with matching
     hashes, valid statistics and no errors, timeouts, disconnects or fallback
-    warnings. Warm client CPU falls 0.70%, but wall time rises 2.31%; no full
-    build speedup is established. The warm focused compile reduces newfstatat
+    warnings. Single pairs do not establish a stable speedup range. Earlier
+    warm focused compilation reduced newfstatat
     calls from 442 to 351, with unchanged sends/polls (8/6), directory opens
     (119) and output. This trace does not count every metadata syscall. The
     post-deployment cold trace is not comparable to that warm measurement.
     Most anonymous mappings are small allocations, not cached file
     bodies. File service, path resolution and teardown still cost client CPU;
     batching requests alone does not remove them. Warm remote occupancy is
-    4.702 cores. Occupancy samples do not support a large slow-worker-only
+    4.498 cores. The warm capture assigns 41.89% of sampled CPU to clients;
+    exchange/filesystem service appears in 22.45 of 36.84 client CPU seconds.
+    Occupancy samples do not support a large slow-worker-only
     tail, but do not identify client readiness or build dependencies.
     Continue matched complete builds and workload attribution;
     dispatch counts or small tests do not establish resolution of spare
     capacity. Do not add overlapping inclusive profile costs.
-    A later complete build records one FUSE ECONNABORTED after successful
-    compilation. Regular unmount can race the kernel's pending-to-in-flight
-    read transition. The service now exits through libfuse's SIGTERM handler
-    and is reaped before unmount; startup, live-read, failed-prefetch and
-    cancellation checks pass. Installed full-build validation is pending.
     Two earlier pre-dispatch fallbacks remain unexplained. The affected
     variants pass 6400 cold-start replays in the real sandbox, and diagnostics
     are now retained. A separate real-GCC slow-start regression reproduced
