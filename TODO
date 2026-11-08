@@ -4,32 +4,28 @@ TODO list for distcc
 
 reduce client filesystem service cost in remote preprocessing
 
-    Native GCC/FUSE removes the pump scan, reuses loaded planner images and
-    immutable contents, and batches fresh metadata with source-scoped hints.
-    Assembly with preprocessing now uses the same remote filesystem, and
-    planning stops before opening the source. Cross-target execution passes.
-    Warm directory replies now use one descriptor for fresh metadata and
-    child lookups without allocating a DIR. The latest matched full build
-    completes the same 6400 remote jobs. Buffered TCP client reads then
-    reduce receive syscalls from 42 to 20-21 in the focused test. Reusing the
-    loaded GCC driver improves focused client CPU by 5.80%. Reply storage is
-    now reused, directory batches append directly, and writable chunks drain
-    within the existing bounded send turn. The latest full-build pair takes
-    429.000 versus 428.402 seconds (+0.14%), with client CPU down 0.54% and
-    remote occupancy 3.021 versus 2.966 cores. All 6400 jobs
-    succeed with matching outputs and no timeouts, disconnects or failed
-    samples. This does not demonstrate a full-build speedup or resolve idle
-    capacity; client supply remains the limiting concern. The installed
-    masquerade-path regression and shared-upload timeout race are repaired.
-    The client filesystem/transport processes consume 46.19% of sampled CPU;
-    planning uses 16.24%, ordinary cc1 9.76% and GCC drivers 7.69%. Capture
-    intervals differ, so these shares do not establish causal savings.
-    Executable-attributed DWARF caller chains locate 31.72% of total sampled
-    CPU in the client TCP exchange. Path resolution, TCP sends and teardown
-    remain significant. Separate identical process names using executable
-    mappings and distinguish planner mappings from ordinary cc1. Inclusive
-    caller costs overlap; process-name aggregates mix clients and GCC drivers.
-    Continue matched full builds; dispatch counts and microbenchmarks do not establish
+    Native GCC/FUSE reuses loaded planners and immutable contents, batches
+    fresh metadata using source-directory hints, and avoids a second scan.
+    Buffered transport reuses reply storage and drains writable chunks.
+    The cache's entry quota is removed; allocated storage and read recency
+    now govern eviction. A full build retains 13314 records instead of 4096.
+    The latest full pair takes 423.462 versus 429.000 seconds (-1.29%), with
+    client CPU down 0.55% and remote occupancy 2.997 versus 3.021 cores.
+    All 6400 jobs succeed with matching outputs, zero compile errors/timeouts/
+    disconnects and valid statistics. The small single-pair difference, also
+    overlapping a temporary-storage relocation, does not establish a causal
+    speedup. Spare capacity remains unresolved; client supply still limits it.
+    Client filesystem/transport consumes 45.46% of sampled CPU; planning uses
+    16.36%, ordinary cc1 9.92% and GCC drivers 7.63%. Executable-attributed
+    caller chains put 32.09% of total CPU in the client TCP exchange.
+    In a focused trace with additional warm replays, filesystem requests fall
+    from 424 to 85, while newfstatat calls increase from 338 to 841. Investigate
+    the fresh attribute work in speculative directory batches; do not infer
+    a causal saving from these differently warmed captures.
+    Path resolution, sends and teardown remain significant. Separate identical
+    process names using executable mappings, distinguish planner mappings from
+    ordinary cc1, and do not add overlapping inclusive caller costs. Continue
+    complete matched builds; dispatch counts and microbenchmarks do not prove
     that idle capacity or the client supply bottleneck has been resolved.
 
 recognize arbitrary input suffixes with explicit compiler language
