@@ -176,7 +176,10 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
         }
         if (!result && errno) result = -1;
     }
-    if (!result && statuses == 2) {
+    /* Only freshly enumerated names need a publication stability check.
+     * Cached names were matched to the fresh descriptor identity above and
+     * are never republished; child attributes still come from this query. */
+    if (!result && statuses == 2 && !(flags & DCC_FS_DIRECTORY_CACHED)) {
         result = fstat(fd, &snapshot);
         if (!result) {
             encode_metadata(observed, &snapshot);

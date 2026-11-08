@@ -3,10 +3,11 @@
 #include "frontend_fs.c"
 #include <assert.h>
 
-static int mutate;
+static int mutate, descriptor_stats;
 int __real_fstat(int, struct stat *);
 int __wrap_fstat(int fd, struct stat *st)
 {
+    ++descriptor_stats;
     int result = __real_fstat(fd, st);
     if (!result && mutate && S_ISDIR(st->st_mode)) {
         mutate = 0;
@@ -121,8 +122,10 @@ int main(int argc, char **argv)
     dcc_frontend_fs_clear(&reply);
     unsigned repeat = argc == 3 ? (unsigned)strtoul(argv[2], NULL, 10) : 1;
     for (unsigned i = 0; i < repeat; ++i) {
+        descriptor_stats = 0;
         reply = query(&job, directory_path, DCC_FS_LSTAT, previous);
-        assert(dcc_tcp_get32(reply.data + 60) == (DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_STABLE));
+        assert(descriptor_stats == 1);
+        assert(dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_CACHED);
         assert(header_size(&reply) == 3);
         dcc_frontend_fs_clear(&reply);
     }
@@ -132,15 +135,15 @@ int main(int argc, char **argv)
     /* Cached directory names never freeze an existing child's attributes. */
     contents(header, "changed contents");
     reply = query(&job, directory_path, DCC_FS_LSTAT, previous);
-    assert(dcc_tcp_get32(reply.data + 60) == (DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_STABLE));
+    assert(dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_CACHED);
     assert(header_size(&reply) == strlen("changed contents"));
     dcc_frontend_fs_clear(&reply);
 
     /* A real namespace mutation after the initial descriptor snapshot must
      * prevent publication of a stable directory version. */
     mutate = 1;
-    reply = query(&job, directory_path, DCC_FS_LSTAT, previous);
-    assert(!mutate && !(dcc_tcp_get32(reply.data + 60) & DCC_FS_DIRECTORY_STABLE));
+    reply = query(&job, directory_path, DCC_FS_LSTAT, NULL);
+    assert(!mutate && !dcc_tcp_get32(reply.data + 60));
     dcc_frontend_fs_clear(&reply);
     reply = query(&job, directory_path, DCC_FS_LSTAT, previous);
     assert(dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_STABLE);
