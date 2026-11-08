@@ -6,6 +6,7 @@
 #include <fuse3/fuse_lowlevel.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
@@ -420,11 +421,26 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
     fuse_opt_free_args(&args);
     if (!state->fs) { errno = EINVAL; return nullptr; }
     if (fuse_mount(state->fs, mountpoint)) { fuse_destroy(state->fs); return nullptr; }
+    // Shutdown may arrive before the child installs libfuse's handler. Keep it
+    // pending across fork, without changing the worker's own signal policy.
+    sigset_t stop_signal, previous_mask;
+    sigemptyset(&stop_signal); sigaddset(&stop_signal, SIGTERM);
+    sigprocmask(SIG_BLOCK, &stop_signal, &previous_mask);
     state->child = fork();
+    if (state->child) sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
     if (state->child < 0) {
         fuse_unmount(state->fs); fuse_destroy(state->fs); return nullptr;
     }
     if (!state->child) {
+        auto session = fuse_get_session(state->fs);
+        struct sigaction action{};
+        action.sa_handler = SIG_DFL;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGTERM, &action, nullptr) || fuse_set_signal_handlers(session)) {
+            perror("distcc GCC filesystem signal handlers"); _exit(1);
+        }
+        sigdelset(&previous_mask, SIGTERM);
+        sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
         // This service must not keep the worker's cancellation/result sockets
         // alive. It owns only the FUSE device and its filesystem RPC stream.
         int device = fuse_session_fd(fuse_get_session(state->fs));
@@ -440,8 +456,12 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
         if (result) {
             fprintf(stderr, "distcc GCC directory prefetch: %s\n", strerror(result));
             fuse_unmount(state->fs);
-        } else result = fuse_loop(state->fs);
+        } else {
+            result = fuse_loop(state->fs);
+            if (result == SIGTERM) result = 0;
+        }
         state->files.reset();
+        fuse_remove_signal_handlers(session);
         fuse_destroy(state->fs);
         _exit(result ? 1 : 0);
     }
@@ -454,16 +474,20 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
 extern "C" int dcc_gcc_files_stop(void *opaque, uint64_t *cpu_ns, unsigned long long *peak_bytes) {
     std::unique_ptr<Mount> state(static_cast<Mount *>(opaque));
     int error = 0;
-    if (umount2(state->mountpoint.c_str(), MNT_DETACH) && errno != EINVAL && errno != ENOENT) {
+    // Stop the reader before detaching. Linux can return ECONNABORTED when a
+    // regular unmount races its transition from pending to in-flight reads.
+    if (kill(state->child, SIGTERM) && errno != ESRCH) {
         error = errno;
-        fprintf(stderr, "distcc GCC filesystem unmount: %s\n", strerror(error));
-        // Do not wait for an event loop that could not be detached.
-        kill(state->child, SIGTERM);
+        fprintf(stderr, "distcc GCC filesystem stop: %s\n", strerror(error));
     }
     int status;
     struct rusage usage{};
     pid_t result;
     do { result = wait4(state->child, &status, 0, &usage); } while (result < 0 && errno == EINTR);
+    if (umount2(state->mountpoint.c_str(), MNT_DETACH) && errno != EINVAL && errno != ENOENT) {
+        error = errno;
+        fprintf(stderr, "distcc GCC filesystem unmount: %s\n", strerror(error));
+    }
     if (result >= 0) {
         *cpu_ns += (uint64_t)(usage.ru_utime.tv_sec+usage.ru_stime.tv_sec)*1000000000 +
                    (uint64_t)(usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)*1000;

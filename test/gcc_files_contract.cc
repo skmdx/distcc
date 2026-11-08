@@ -1,6 +1,18 @@
 /* Exercise directory batching through the real GCC filesystem service.
  * SPDX-License-Identifier: GPL-2.0-or-later */
+#include <sys/mount.h>
+#include <sys/syscall.h>
+#include <signal.h>
+#include <unistd.h>
+static pid_t mounted_child;
+static bool reader_alive_at_unmount;
+static int checked_unmount(const char *path, int flags) {
+    if (mounted_child && !kill(mounted_child, 0)) reader_alive_at_unmount = true;
+    return syscall(SYS_umount2, path, flags);
+}
+#define umount2 checked_unmount
 #include "src/gcc_files.cc"
+#undef umount2
 #include <thread>
 
 // These framing tests inspect published hints but do not retain snapshots.
@@ -173,11 +185,66 @@ static void disconnected_mount(const char *root)
     require(!rmdir(mountpoint.c_str()), "mount cleanup");
 }
 
+static void clean_mount(const char *root, bool lookup)
+{
+    int pair[2];
+    require(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair), "clean mount socketpair");
+    pid_t peer = fork();
+    require(peer >= 0, "clean mount peer fork");
+    if (!peer) {
+        close(pair[0]); read_query(pair[1]);
+        std::string payload;
+        for (unsigned i = 0; i < 3; ++i) {
+            std::string stamp(DCC_FS_METADATA, '\0');
+            uint32_t permissions = htonl(S_IFDIR | 0755);
+            memcpy(stamp.data()+32, &permissions, sizeof(permissions));
+            integer(payload, 0); integer(payload, stamp.size()); payload += stamp;
+        }
+        std::string response;
+        integer(response, 0); integer(response, payload.size()); response += payload;
+        require(send(pair[1], response.data(), response.size(), MSG_NOSIGNAL) ==
+                static_cast<ssize_t>(response.size()), "clean mount reply");
+        close(pair[1]); _exit(0);
+    }
+    close(pair[1]);
+    // The worker's own signal policy must survive starting the service, while
+    // the service needs an interruptible event loop for ordered shutdown.
+    auto previous_handler = signal(SIGTERM, SIG_IGN);
+    sigset_t stop_signal, previous_mask, current_mask;
+    sigemptyset(&stop_signal); sigaddset(&stop_signal, SIGTERM);
+    sigprocmask(SIG_BLOCK, &stop_signal, &previous_mask);
+    std::string mountpoint = std::string(root)+"/clean-files";
+    void *mount = dcc_gcc_files_start(pair[0], mountpoint.c_str(), "fixture", root,
+                                     "/tree", "part.c", directories);
+    require(mount, "clean FUSE mount");
+    require(signal(SIGTERM, previous_handler) == SIG_IGN, "worker signal policy changed");
+    sigprocmask(SIG_SETMASK, nullptr, &current_mask);
+    require(sigismember(&current_mask, SIGTERM), "worker signal mask changed");
+    sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+    close(pair[0]);
+    struct stat info;
+    if (lookup) require(!lstat((mountpoint+"/tree").c_str(), &info), "live FUSE lookup");
+    mounted_child = static_cast<Mount *>(mount)->child;
+    uint64_t cpu = 0;
+    unsigned long long peak = 0;
+    int result = dcc_gcc_files_stop(mount, &cpu, &peak);
+    mounted_child = 0;
+    require(!result, "clean shutdown reported failure");
+    // Detaching while the kernel read is in flight can return ECONNABORTED,
+    // even for a regular unmount. The reader must have exited first.
+    require(!reader_alive_at_unmount, "unmount raced the live FUSE reader");
+    int status;
+    require(waitpid(peer, &status, 0) == peer && WIFEXITED(status) && !WEXITSTATUS(status), "clean peer exit");
+    require(!rmdir(mountpoint.c_str()), "clean mount cleanup");
+}
+
 int main(int argc, char **argv)
 {
     negative_hints();
     for (const char *mode : {"valid", "denied", "short", "length", "flags", "missing",
                              "trailing", "bad-error", "disconnect"}) replies(mode);
     require(argc == 2, "temporary root argument");
+    clean_mount(argv[1], true);
+    clean_mount(argv[1], false);
     disconnected_mount(argv[1]);
 }

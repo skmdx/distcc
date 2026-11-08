@@ -30,6 +30,11 @@ reduce client filesystem service cost in remote preprocessing
     Continue matched complete builds and workload attribution;
     dispatch counts or small tests do not establish resolution of spare
     capacity. Do not add overlapping inclusive profile costs.
+    A later complete build records one FUSE ECONNABORTED after successful
+    compilation. Regular unmount can race the kernel's pending-to-in-flight
+    read transition. The service now exits through libfuse's SIGTERM handler
+    and is reaped before unmount; startup, live-read, failed-prefetch and
+    cancellation checks pass. Installed full-build validation is pending.
     Two earlier pre-dispatch fallbacks remain unexplained. The affected
     variants pass 6400 cold-start replays in the real sandbox, and diagnostics
     are now retained. A separate real-GCC slow-start regression reproduced
