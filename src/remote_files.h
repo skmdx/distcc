@@ -69,6 +69,43 @@ class Connection {
         }
         return true;
     }
+    Buffer cached(const std::string &key) {
+        size_t extent = 0, length = 0;
+        const void *bytes = nullptr;
+        int snapshot = cache.lookup(records, key.data(), key.size(), &extent);
+        if (snapshot < 0) return {};
+        // LLVM also consumes these records. A page-aligned EOF has no readable
+        // trailing NUL, so that uncommon record needs an owned buffer.
+        void *mapped = extent && extent % sysconf(_SC_PAGESIZE)
+            ? mmap(nullptr, extent, PROT_READ, MAP_PRIVATE, snapshot, 0) : MAP_FAILED;
+        std::shared_ptr<const void> owner;
+        const void *record;
+        if (mapped != MAP_FAILED) {
+            close(snapshot);
+            owner = {mapped, [extent](const void *p) { munmap(const_cast<void *>(p), extent); }};
+            record = mapped;
+        } else {
+            auto data = std::shared_ptr<char[]>(new (std::nothrow) char[extent+1]);
+            size_t used = 0;
+            while (data && used < extent) {
+                ssize_t n = pread(snapshot, data.get()+used, extent-used, used);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                used += n;
+            }
+            close(snapshot);
+            if (!data || used != extent) return {};
+            data[extent] = 0;
+            record = data.get(); owner = std::move(data);
+        }
+        if (!cache.contents(record, extent, key.data(), key.size(), &bytes, &length)) return {};
+        return {std::move(owner), static_cast<const char *>(bytes), length};
+    }
+    std::string directory_key(std::string_view path) const {
+        std::string key("directory-uses\0", 15);
+        key += identity; key += '\0'; key += path;
+        return key;
+    }
 public:
     Connection(int fd, const dcc_file_cache_api &cache, std::string identity,
                const std::string &cache_root)
@@ -127,48 +164,23 @@ public:
         out = {data, data.get(), size};
         return {};
     }
+    Buffer directory_hints(std::string_view path) { return cached(directory_key(path)); }
+    void save_directory_hints(std::string_view path, std::string_view names) {
+        auto key = directory_key(path);
+        // Concurrent publications may lose a prefetch hint, never a file or
+        // its metadata. The next job always enumerates and stats afresh.
+        cache.write(records, key.data(), key.size(), names.data(), names.size());
+    }
     std::error_code read(std::string_view path, const char *version, Snapshot &out) {
         std::string key;
         if (version) {
             key.reserve(identity.size()+1+DCC_FS_METADATA+path.size());
             key.append(identity); key += '\0'; key.append(version, DCC_FS_METADATA); key.append(path);
-            size_t extent = 0, length = 0;
-            const void *bytes = nullptr;
-            int snapshot = cache.lookup(records, key.data(), key.size(), &extent);
-            if (snapshot >= 0) {
-                // A page-aligned EOF has no readable trailing NUL. LLVM's
-                // parser requires one, so that uncommon record uses a buffer.
-                void *mapped = extent && extent % sysconf(_SC_PAGESIZE)
-                    ? mmap(nullptr, extent, PROT_READ, MAP_PRIVATE, snapshot, 0) : MAP_FAILED;
-                if (mapped != MAP_FAILED) {
-                    close(snapshot);
-                    std::shared_ptr<const void> owner(mapped, [extent](const void *p) { munmap(const_cast<void *>(p), extent); });
-                    if (cache.contents(mapped, extent, key.data(), key.size(), &bytes, &length) &&
-                        length == number(version+24, 8)) {
-                        memcpy(out.version.data(), version, DCC_FS_METADATA);
-                        out.bytes = {std::move(owner), static_cast<const char *>(bytes), length};
-                        return {};
-                    }
-                } else {
-                    auto data = std::shared_ptr<char[]>(new (std::nothrow) char[extent+1]);
-                    size_t used = 0;
-                    while (data && used < extent) {
-                        ssize_t n = pread(snapshot, data.get()+used, extent-used, used);
-                        if (n < 0 && errno == EINTR) continue;
-                        if (n <= 0) break;
-                        used += n;
-                    }
-                    close(snapshot);
-                    if (data && used == extent) {
-                        data[extent] = 0;
-                        if (cache.contents(data.get(), extent, key.data(), key.size(), &bytes, &length) &&
-                            length == number(version+24, 8)) {
-                            memcpy(out.version.data(), version, DCC_FS_METADATA);
-                            out.bytes = {data, static_cast<const char *>(bytes), length};
-                            return {};
-                        }
-                    }
-                }
+            auto bytes = cached(key);
+            if (bytes.owner && bytes.size == number(version+24, 8)) {
+                memcpy(out.version.data(), version, DCC_FS_METADATA);
+                out.bytes = std::move(bytes);
+                return {};
             }
         }
         Buffer response;
