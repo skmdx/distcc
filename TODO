@@ -67,7 +67,14 @@ reduce client filesystem service cost in remote preprocessing
     A real-compiler regression reproduces and removes eleven unused branches
     from the next job while preserving on-demand changes. All 55 GCC/frontend
     checks pass, including a separate final framing-contract run. Deployment
-    and complete-build performance validation for this change remain pending.
+    succeeds, but the full build takes 322.937 versus 316.397 seconds (+2.07%),
+    with client CPU up 3.22%. The focused replay reduces attribute calls from
+    501 to 442, but sends rise from eight to ten. No full-build speedup is
+    established. Per-source footprints now retain useful predictions across
+    different nearby files; unseen sources bootstrap from the last nearby job.
+    One compact record replaces per-directory hint cache accesses. All 55
+    GCC/frontend checks pass; rollout and complete-build performance validation
+    remain pending for this replacement.
 
 recognize arbitrary input suffixes with explicit compiler language
 

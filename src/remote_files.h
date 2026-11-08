@@ -101,10 +101,9 @@ class Connection {
         if (!cache.contents(record, extent, key.data(), key.size(), &bytes, &length)) return {};
         return {std::move(owner), static_cast<const char *>(bytes), length};
     }
-    std::string directory_key(std::string_view path, std::string_view scope = {}) const {
-        std::string key(scope.empty() ? "directory-names" : "directory-hints");
+    std::string cache_key(std::string_view kind, std::string_view path) const {
+        std::string key(kind);
         key += '\0'; key += identity; key += '\0';
-        if (!scope.empty()) { key += scope; key += '\0'; }
         key += path;
         return key;
     }
@@ -166,20 +165,20 @@ public:
         out = {data, data.get(), size};
         return {};
     }
-    Buffer directory_names(std::string_view path) { return cached(directory_key(path)); }
-    Buffer directory_hints(std::string_view path, std::string_view scope) {
-        return cached(directory_key(path, scope));
+    Buffer directory_names(std::string_view path) { return cached(cache_key("directory-names", path)); }
+    Buffer source_hints(std::string_view source) {
+        return cached(cache_key("gcc-source-hints", source));
     }
     void save_directory_names(std::string_view path, const std::array<char, DCC_FS_METADATA> &version,
                               std::string_view names) {
-        auto key = directory_key(path);
+        auto key = cache_key("directory-names", path);
         std::string data(version.data(), version.size());
         data.append(names);
         // One atomic record couples names to their observed directory version.
         cache.write(records, key.data(), key.size(), data.data(), data.size());
     }
-    void save_directory_hints(std::string_view path, std::string_view scope, std::string_view hints) {
-        auto key = directory_key(path, scope);
+    void save_source_hints(std::string_view source, std::string_view hints) {
+        auto key = cache_key("gcc-source-hints", source);
         // Hints only batch fresh attribute queries. Concurrent publication can
         // lose a prefetch opportunity, never a filesystem freshness check.
         cache.write(records, key.data(), key.size(), hints.data(), hints.size());

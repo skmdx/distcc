@@ -852,15 +852,20 @@ class GccFrontendTest(BrokerTestCase):
             directory.mkdir(parents=True)
             (directory/'value.h').write_text(f'#define VALUE_{index} {index + 1}\n')
         command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'hello.c', '-o', 'out.o']
-        self.source.write_text(
+        wide = (
             ''.join(f'#include <branch{i}/nested/value.h>\n' for i in range(branches)) +
             'int value(void) { return ' + '+'.join(f'VALUE_{i}' for i in range(branches)) + '; }\n')
+        self.source.write_text(wide)
         self.compile(command)
         # Keep the same context but stop using the other subtrees. Predictions
         # from the preceding job must not become observations of this one.
         self.source.write_text('#include <branch0/nested/value.h>\n'
                                'int value(void) { return VALUE_0; }\n')
         self.compile(command)
+        # A different source in the same directory must not overwrite this
+        # source's learned footprint with its much wider one.
+        (self.work/'other.c').write_text(wide)
+        self.compile([*command[:5], 'other.c', *command[6:]])
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
         trace = self.work/'unused-subtrees.trace'

@@ -12,8 +12,8 @@ extern "C" const dcc_file_cache_api dcc_file_cache_records = {
     [](dcc_record_cache *, const void *, size_t, size_t *) { return -1; },
     [](const void *, size_t, const void *, size_t, const void **, size_t *) { return 0; },
     [](dcc_record_cache *, const void *key, size_t key_size, const void *data, size_t size) {
-        if (key_size >= sizeof("directory-hints") &&
-            !memcmp(key, "directory-hints", sizeof("directory-hints")))
+        if (key_size >= sizeof("gcc-source-hints") &&
+            !memcmp(key, "gcc-source-hints", sizeof("gcc-source-hints")))
             published_hints.emplace_back(static_cast<const char *>(data), size);
     }
 };
@@ -143,7 +143,7 @@ static void negative_hints()
 {
     published_hints.clear();
     negative_hint_queries();
-    require(published_hints == std::vector<std::string>{""},
+    require(published_hints == std::vector<std::string>{"", ""},
             "absent metadata hint was published for the next job");
 }
 

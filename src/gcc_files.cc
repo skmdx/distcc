@@ -37,7 +37,10 @@ struct Query {
 };
 class Files {
     dccfs::Connection connection;
-    std::string scope;
+    std::string source, scope;
+    dccfs::Buffer previous_hints;
+    std::map<std::string, std::set<std::string>> predictions;
+    int hints_error = 0;
     std::map<std::string, Entry> entries;
     std::map<std::pair<uint64_t, uint64_t>, ino_t> inodes;
     static bool valid_name(std::string_view name) {
@@ -52,21 +55,56 @@ class Files {
         }
         return result;
     }
+    int load_hints(const dccfs::Buffer &snapshot) {
+        if (!snapshot.owner) return 0;
+        std::string_view bytes(snapshot.data, snapshot.size);
+        while (!bytes.empty()) {
+            auto end = bytes.find('\0');
+            if (!end || end == std::string_view::npos || bytes.front() != '/') return EPROTO;
+            auto [entry, inserted] = predictions.try_emplace(std::string(bytes.substr(0, end)));
+            if (!inserted) return EPROTO;
+            bytes.remove_prefix(end+1);
+            for (;;) {
+                end = bytes.find('\0');
+                if (end == std::string_view::npos) return EPROTO;
+                auto name = bytes.substr(0, end);
+                bytes.remove_prefix(end+1);
+                if (name.empty()) break;
+                if (!valid_name(name) || !entry->second.emplace(name).second) return EPROTO;
+            }
+        }
+        return 0;
+    }
 public:
     std::string root;
     Files(int fd, std::string root, const char *identity, const char *cache_root,
           const char *cwd, const char *input)
         : connection(fd, dcc_file_cache_records, identity, cache_root),
-          scope((std::filesystem::path(cwd)/input).lexically_normal().parent_path().string()),
-          root(std::move(root)) {}
+          source((std::filesystem::path(cwd)/input).lexically_normal().string()),
+          scope(std::filesystem::path(source).parent_path().string()), root(std::move(root)) {
+        previous_hints = connection.source_hints(source);
+        // A known source retains its own footprint. A new source can bootstrap
+        // from a nearby job without overwriting either source's future hints.
+        hints_error = load_hints(previous_hints.owner ? previous_hints : connection.source_hints(scope));
+    }
     ~Files() {
+        if (hints_error) return;
+        std::string snapshot;
+        snapshot.reserve(previous_hints.size);
         for (const auto &[path, entry] : entries) {
-            if (!entry.listed || entry.hints == entry.observed) continue;
+            if (!entry.listed || entry.observed.empty()) continue;
             // Speculative queries do not teach the next job to repeat them.
             // Retain only children the compiler actually requested this time.
-            connection.save_directory_hints(path, scope,
-                pack_hints(entry.observed, DCC_FS_QUERY_MAX-5-DCC_FS_METADATA-path.size()));
+            snapshot += path; snapshot += '\0';
+            for (const auto &name : entry.observed) { snapshot += name; snapshot += '\0'; }
+            snapshot += '\0';
         }
+        if (!previous_hints.owner || snapshot.size() != previous_hints.size ||
+            memcmp(snapshot.data(), previous_hints.data, snapshot.size()))
+            connection.save_source_hints(source, snapshot);
+        // One atomic record replaces hundreds of per-directory cache accesses.
+        // Concurrent jobs may change only the next cold source's prediction.
+        connection.save_source_hints(scope, snapshot);
     }
     ino_t inode(uint64_t device, uint64_t number) {
         // One FUSE mount represents several client devices. Preserve hardlink
@@ -75,6 +113,7 @@ public:
     }
     int prepare(const std::string &path, Query &query) {
         auto &entry = entries[path];
+        if (hints_error) return entry.error = hints_error;
         query.path = path;
         auto &previous = query.previous = connection.directory_names(path);
         std::array<char, DCC_FS_METADATA> listing_version{};
@@ -82,18 +121,10 @@ public:
             if (previous.size < DCC_FS_METADATA) return entry.error = EPROTO;
             memcpy(listing_version.data(), previous.data, DCC_FS_METADATA);
         }
-        // Nearby sources reuse their observed header set. A global union would
-        // stat unrelated headers on every job as a large build progresses.
-        // Directory names and immutable file bodies remain shared by all jobs.
-        auto prefetched = connection.directory_hints(path, scope);
-        std::string_view hints = prefetched.owner
-            ? std::string_view(prefetched.data, prefetched.size) : std::string_view{};
-        while (!hints.empty()) {
-            auto end = hints.find('\0');
-            if (end == std::string_view::npos || !valid_name(hints.substr(0, end)))
-                return entry.error = EPROTO;
-            entry.hints.emplace(hints.substr(0, end));
-            hints.remove_prefix(end+1);
+        auto predicted = predictions.find(path);
+        if (predicted != predictions.end()) {
+            entry.hints = std::move(predicted->second);
+            predictions.erase(predicted);
         }
         query.bytes = path; query.bytes += '\0';
         query.bytes.append(listing_version.data(), DCC_FS_METADATA);
