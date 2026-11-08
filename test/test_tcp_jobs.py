@@ -2670,6 +2670,64 @@ with open(args[args.index('-o') + 1], 'ab') as output:
         subprocess.run([self.cc, str(obj), '-o', str(executable)], check=True, capture_output=True)
         subprocess.run([str(executable)], check=True)
 
+    def test_coalesced_results_cross_receive_turns(self):
+        self.coalesced_result(False)
+
+    def test_unsolicited_result_tail_preserves_previous_object(self):
+        self.coalesced_result(True)
+
+    def coalesced_result(self, trailing):
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        listener.bind(('127.0.0.1', 0))
+        listener.listen()
+        listener.settimeout(5)
+        errors = []
+        payload = b''.join(bytes([i])*31 for i in range(12))
+
+        def server():
+            try:
+                with listener.accept()[0] as net:
+                    net.settimeout(5)
+                    kind, manifest = self.frame(net)
+                    self.assertEqual(kind, 0x54000300)
+                    while True:
+                        kind, body = self.frame(net)
+                        self.assertEqual(kind & ~0x30000, 0x54000302)
+                        if kind & 0x20000:
+                            break
+                    response = struct.pack('!IIII8Q', 0x54000303, 72, 0, 0,
+                                           0, 0, len(payload), 0, 0, 0, 0, 0)
+                    for i in range(12):
+                        kind = 0x54020304 if i == 11 else 0x54000304
+                        response += struct.pack('!IIII', kind, 39, 2, 31) + payload[i*31:(i+1)*31]
+                    response += struct.pack('!II', 0x54000305, 8) + manifest[:8]
+                    if trailing:
+                        response += b'unsolicited bytes'
+                    net.sendall(response)
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=server)
+        thread.start()
+        self.start_broker(f'127.0.0.1:{listener.getsockname()[1]}/1,tcp')
+        self.env.update(DISTCC_MAX_RETRIES='1', DISTCC_SKIP_LOCAL_RETRY='1',
+                        DISTCC_RECONNECT_TIMEOUT='0')
+        output = self.work/'coalesced.o'
+        output.write_bytes(b'previous object')
+        result = subprocess.run([str(self.build/'distcc'), 'gcc', '-c', str(self.source),
+                                 '-o', str(output)], env=self.env, capture_output=True, timeout=10)
+        thread.join(timeout=6)
+        self.assertFalse(thread.is_alive())
+        if errors:
+            raise errors[0]
+        if trailing:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(output.read_bytes(), b'previous object')
+        else:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_bytes(), payload)
+
     def test_missing_complete_preserves_previous_object(self):
         listener = socket.socket()
         self.addCleanup(listener.close)

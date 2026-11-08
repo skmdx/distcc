@@ -77,6 +77,18 @@ void dcc_tcp_frame_next(struct dcc_tcp_frame *f)
     f->type = 0;
     f->fd_plus_one = 0;
 }
+int dcc_tcp_frame_header(struct dcc_tcp_frame *f, size_t available)
+{
+    f->type = dcc_tcp_get32(f->header);
+    f->size = dcc_tcp_get32(f->header + 4);
+    uint32_t kind = f->type & ~DCC_TCP_FLAGS;
+    return kind < DCC_TCP_BEGIN || kind > DCC_TCP_FS_REPLY ||
+        f->size > available ||
+        f->size > (kind == DCC_TCP_BEGIN ? DCC_JOB_METADATA_MAX + 8U :
+                   kind == DCC_TCP_NEED ? DCC_JOB_INPUT_MAX * 4U : DCC_TCP_CHUNK + 8U) ||
+        ((f->type & DCC_TCP_FLAGS) && kind != DCC_TCP_INPUT &&
+         kind != DCC_TCP_OUTPUT && kind != DCC_TCP_FS_REPLY) ? -1 : 0;
+}
 int dcc_tcp_frame_read(int fd, struct dcc_tcp_frame *f, size_t available)
 {
     for (;;) {
@@ -87,17 +99,7 @@ int dcc_tcp_frame_read(int fd, struct dcc_tcp_frame *f, size_t available)
             where = f->header + f->used;
         } else {
             if (f->used == 8) {
-                uint32_t kind;
-                f->type = dcc_tcp_get32(f->header);
-                f->size = dcc_tcp_get32(f->header + 4);
-                kind = f->type & ~DCC_TCP_FLAGS;
-                if (kind < DCC_TCP_BEGIN || kind > DCC_TCP_FS_REPLY ||
-                    f->size > available ||
-                    f->size > (kind == DCC_TCP_BEGIN ? DCC_JOB_METADATA_MAX + 8U :
-                               kind == DCC_TCP_NEED ? DCC_JOB_INPUT_MAX * 4U : DCC_TCP_CHUNK + 8U) ||
-                    ((f->type & DCC_TCP_FLAGS) && kind != DCC_TCP_INPUT &&
-                     kind != DCC_TCP_OUTPUT && kind != DCC_TCP_FS_REPLY))
-                    return -1;
+                if (dcc_tcp_frame_header(f, available)) return -1;
                 size_t needed = f->size ? f->size : 1;
                 if (needed > f->capacity) {
                     if (needed > available) return -1;

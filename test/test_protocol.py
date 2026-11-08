@@ -229,6 +229,14 @@ class ProtocolTest(DistccTestCase):
                         '-llz4', '-o', str(executable)], check=True, capture_output=True, timeout=30)
         subprocess.run([str(executable)], check=True, timeout=10)
 
+    def test_buffered_tcp_frame_lifetimes(self):
+        executable = self.work/'tcp-client-frames'
+        subprocess.run([self.cc, '-D_GNU_SOURCE', '-ffunction-sections', '-fdata-sections',
+                        '-I'+str(self.build/'src'), str(self.build/'test/tcp_client_frames.c'),
+                        str(self.build/'src/tcp_job.c'), '-Wl,--gc-sections', '-llz4',
+                        '-o', str(executable)], check=True, capture_output=True, timeout=30)
+        subprocess.run([str(executable)], check=True, timeout=10)
+
     def setUp(self):
         super().setUp()
         self.env = dict(self.base_env, DISTCC_HOSTS=self.host(0),

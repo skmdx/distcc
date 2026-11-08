@@ -20,6 +20,43 @@
 #include "frontend_fs.h"
 
 struct input_stream { int fd, immutable; unsigned index; uint64_t offset, plain; };
+/* TCP has no ancillary descriptors. Read ahead into one maximum wire chunk;
+ * frames borrow its payload until consumed. Local IPC retains exact recvmsg
+ * boundaries so SCM_RIGHTS stays attached to its own frame. */
+struct tcp_input { unsigned char *wire; size_t begin, end; };
+static int read_remote(int fd, struct tcp_input *input, struct dcc_tcp_frame *frame)
+{
+    for (;;) {
+        size_t available = input->end - input->begin;
+        if (available >= 8 && frame->used < 8) {
+            memcpy(frame->header, input->wire + input->begin, 8);
+            if (dcc_tcp_frame_header(frame, DCC_TCP_CHUNK + 8U)) return -1;
+        }
+        /* Bytes already examined do not constitute internal readiness when
+         * the rest of the frame has yet to arrive. */
+        frame->used = available;
+        if (available >= 8 && available >= frame->size + 8) {
+            frame->data = input->wire + input->begin + 8;
+            return 1;
+        }
+        if (input->end == DCC_TCP_CHUNK + 16U) {
+            memmove(input->wire, input->wire + input->begin, available);
+            input->begin = 0; input->end = available;
+        }
+        ssize_t n = recv(fd, input->wire + input->end,
+                         DCC_TCP_CHUNK + 16U - input->end, MSG_DONTWAIT);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        if (n <= 0) return -1;
+        input->end += n;
+    }
+}
+static void consume_remote(struct tcp_input *input, struct dcc_tcp_frame *frame)
+{
+    input->begin += frame->size + 8;
+    if (input->begin == input->end) input->begin = input->end = 0;
+    *frame = (struct dcc_tcp_frame){0};
+}
 static int local_snapshot(int source, uint64_t size)
 {
     if (size > DCC_TCP_BYTES) return -1;
@@ -141,6 +178,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     socklen_t address_size = sizeof(address);
     int local = !getsockname(host->broker_fd, (struct sockaddr *)&address, &address_size) &&
         address.ss_family == AF_UNIX;
+    struct tcp_input input = {.wire = local ? NULL : malloc(DCC_TCP_CHUNK + 16U)};
     int local_input = local && job->kind == DCC_JOB_COMPILE && job->count == 1 &&
         job->inputs[0].encoding == DCC_JOB_RAW && job->inputs[0].fd >= 0;
     int send_input_fd = local_input;
@@ -150,6 +188,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     time_t active = time(NULL);
     dcc_job_result_init(result);
     if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested || !buffer ||
+        (!local && !input.wire) ||
         getrandom(&id, sizeof(id), 0) != sizeof(id) || !id) goto done;
     if (local_input && (shared_input = local_snapshot(job->inputs[0].fd, job->inputs[0].plain_size)) < 0)
         goto done;
@@ -234,13 +273,17 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         if (timeout <= 0) { ret = EXIT_TIMEOUT; goto done; }
         int pending = !outgoing && (filesystem.data || stream.fd >= 0 || read_request < count);
         struct pollfd p = {host->broker_fd, POLLIN | (outgoing ? POLLOUT : 0), 0};
-        int ready = poll(&p, 1, pending ? 0 : timeout * 1000);
+        int buffered = input.end - input.begin > incoming.used;
+        int ready;
+        if (buffered) { p.revents = POLLIN; ready = 1; }
+        else ready = poll(&p, 1, pending ? 0 : timeout * 1000);
         if (ready < 0 && errno == EINTR) continue;
         if (!ready && pending) continue; /* Prepare the next chunk without waiting for I/O. */
         if (ready <= 0) goto done;
         for (unsigned turn = 0; turn < 4 && (p.revents & (POLLIN | POLLHUP | POLLERR)); ++turn) {
             size_t before = incoming.used;
-            int complete = dcc_tcp_frame_read(host->broker_fd, &incoming, DCC_TCP_CHUNK + 8U);
+            int complete = local ? dcc_tcp_frame_read(host->broker_fd, &incoming, DCC_TCP_CHUNK + 8U) :
+                                   read_remote(host->broker_fd, &input, &incoming);
             if (before != incoming.used) active = time(NULL);
             if (complete < 0) goto done;
             if (!complete) break;
@@ -326,9 +369,13 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                 } else if (type == DCC_TCP_COMPLETE && have_result && incoming.size == 8 &&
                            dcc_tcp_get64(incoming.data) == id && finals == (1U << DCC_JOB_RESULT_COUNT) - 1 &&
                            !outgoing && stream.fd < 0 && !filesystem.data && read_request == count) {
+                    /* No next job exists until this connection is returned
+                     * to the pool. Unsolicited trailing bytes are not a result. */
+                    if (!local && input.end - input.begin != incoming.size + 8) goto done;
                     ret = 0; goto done;
                 } else goto done;
-                dcc_tcp_frame_next(&incoming);
+                if (local) dcc_tcp_frame_next(&incoming);
+                else consume_remote(&input, &incoming);
                 if (type == DCC_TCP_FS_QUERY) break; /* The compiler awaits this reply. */
             }
         }
@@ -351,7 +398,8 @@ done:
     if (stream.fd >= 0) close(stream.fd);
     dcc_frontend_fs_clear(&filesystem);
     free(requests); free(requested); free(buffer); free(outgoing);
-    dcc_tcp_frame_clear(&incoming);
+    if (local) dcc_tcp_frame_clear(&incoming);
+    free(input.wire);
     if (ret) dcc_job_result_free(result);
     return ret;
 }

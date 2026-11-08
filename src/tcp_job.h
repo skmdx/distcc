@@ -40,6 +40,8 @@ void dcc_tcp_frame_clear(struct dcc_tcp_frame *);
 /* Consume one frame. Retain bounded payload storage until clear/destroy;
  * payload views remain valid until the next read, unless oversized metadata. */
 void dcc_tcp_frame_next(struct dcc_tcp_frame *);
+/* Parse the eight wire header bytes and establish payload bounds. */
+int dcc_tcp_frame_header(struct dcc_tcp_frame *, size_t);
 /* 1 complete, 0 would block, -1 malformed/closed. Caller consumes after use. */
 int dcc_tcp_frame_read(int, struct dcc_tcp_frame *, size_t);
 /* Encode at most one chunk; raw input and precompressed pump blocks share
