@@ -260,6 +260,28 @@ class GccFrontendTest(BrokerTestCase):
         subprocess.run([self.cc, 'out.o', '-o', 'program'], cwd=self.work, check=True)
         self.assertEqual(subprocess.check_output([str(self.work/'program')]), b'37 hello.c\n')
 
+    def test_driver_resolves_subprograms_with_masquerade_path(self):
+        self.start_frontend()
+        aliases = self.work/'distcc-masquerade'
+        aliases.mkdir()
+        target = subprocess.check_output([self.cc, '-dumpmachine'], text=True).strip()
+        for name in ('gcc', 'g++', target+'-gcc', target+'-g++'):
+            (aliases/name).symlink_to(self.build/'distcc')
+        self.env['PATH'] = str(aliases)+os.pathsep+self.env['PATH']
+        for compiler, source in (('gcc', '#include <stddef.h>\nint value;\n'),
+                                 ('g++', '#include <vector>\nstd::vector<int> value;\n')):
+            with self.subTest(compiler=compiler):
+                self.source.write_text(source)
+                real = shutil.which(compiler)
+                assert real is not None
+                args = ['-c', str(self.source), '-o', 'out.o']
+                subprocess.run([real, *args], cwd=self.work, check=True, capture_output=True)
+                expected = (self.work/'out.o').read_bytes()
+                (self.work/'out.o').unlink()
+                result = self.compile([compiler, *args])
+                self.assertIn('reused GCC driver status=0', result.stderr)
+                self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
     def test_planner_does_not_open_the_source(self):
         self.start_frontend()
         self.source.write_text('#error only the remote frontend should read this\n')

@@ -159,8 +159,15 @@ static int plan_driver(char **argv, int output)
             const char *guard = getenv("_DISTCC_SAFEGUARD");
             char *previous = guard ? strdup(guard) : NULL;
             if (!guard || previous) {
-                if (!dcc_increment_safeguard())
+                if (!dcc_increment_safeguard()) {
+                    /* GCC locates cc1 relative to argv[0]. A bare alias would
+                     * find the masquerade wrapper in PATH again, although
+                     * compiler already names the executable we selected. */
+                    char *alias = argv[0];
+                    argv[0] = compiler;
                     ret = run_planner(compiler, argv, output, standard, "driver");
+                    argv[0] = alias;
+                }
                 if (previous ? setenv("_DISTCC_SAFEGUARD", previous, 1) : unsetenv("_DISTCC_SAFEGUARD"))
                     ret = EXIT_OUT_OF_MEMORY;
             }
