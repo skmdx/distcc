@@ -177,6 +177,12 @@ downstream changes to libcpp, and that compiler's installed plugin headers:
     python3 include_server/build_gcc_scan.py --gcc gcc --source /path/to/gcc-source \
         --output build/gcc
 
+The builder uses CXXFLAGS for compilation and linking, and LDFLAGS for linking.
+When CXXFLAGS is unset it defaults to -O2; an explicitly empty value is honored.
+The module's required C++ dialect, PIC, RTTI and exception settings take
+precedence. CPPFLAGS is not inherited because distcc's config.h and include
+paths must not replace GCC's build headers.
+
 Install the resulting target/version/distcc_gcc_scan.so under
 LIBDIR/distcc/gcc-scan, and register a symlink to it as distcc_gcc_scan.so in
 the directory reported by that GCC's -print-file-name=plugin. Both clients and

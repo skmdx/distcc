@@ -37,7 +37,9 @@ def main():
   output.mkdir(parents=True, exist_ok=True)
   compiler = shlex.split(args.cxx)
   # Do not inherit distcc's include paths: its config.h is not GCC's config.h.
-  flags = ['-std=gnu++17', '-O2', '-fPIC', '-fno-rtti', '-fno-exceptions',
+  # Required module ABI options also apply to code generation during LTO linking.
+  flags = [*shlex.split(os.environ.get('CXXFLAGS', '-O2')),
+           '-std=gnu++17', '-fPIC', '-fno-rtti', '-fno-exceptions',
            '-fvisibility=hidden', '-ffunction-sections', '-fdata-sections',
            '-DDCC_GCC_SOURCE_DATE="' + date + '"',
            '-I' + str(headers), '-I' + str(source / 'libcpp'),
@@ -50,7 +52,8 @@ def main():
                     '-o', str(obj)], check=True)
     objects.append(str(obj))
   module = output / 'distcc_gcc_scan.so'
-  subprocess.run([*compiler, '-shared', '-Wl,--gc-sections', *objects,
+  subprocess.run([*compiler, *flags, '-shared', '-Wl,--gc-sections', *objects,
+                  *shlex.split(os.environ.get('LDFLAGS', '')),
                   '-o', str(module)], check=True)
   print(module)
 

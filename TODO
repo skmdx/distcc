@@ -44,12 +44,6 @@ recognize arbitrary input suffixes with explicit compiler language
     -x selects the language. Such jobs remain local. Delegate operand discovery
     to the compiler's native option decoder instead of adding another grammar.
 
-honor caller optimization flags in GCC module builds
-
-    include_server/build_gcc_scan.py hardcodes -O2 and ignores CXXFLAGS and
-    LDFLAGS, including when invoked by the Portage ebuild. Preserve the module's
-    ABI/PIC requirements while using the caller's compilation and link flags.
-
 type-check TCP integration tests
 
     test/test_tcp_jobs.py has existing Pyright diagnostics for unchecked

@@ -279,6 +279,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_thinlto.py \
 	test/test_link.py \
 	test/test_python_runtime.py \
+	test/test_gcc_module_build.py \
 	test/test_native.py \
 	test/test_offload.py \
 	test/test_protocol.py \
@@ -947,6 +948,7 @@ adaptive-check: distcc distccd h_hosts h_compile include-server
 	$(PYTHON) "$(srcdir)/test/test_link.py" -v
 	$(PYTHON) "$(srcdir)/test/test_multi.py" -v
 	$(PYTHON) "$(srcdir)/test/test_python_runtime.py" -v
+	$(PYTHON) "$(srcdir)/test/test_gcc_module_build.py" -v
 	$(PYTHON) "$(srcdir)/test/test_native.py" -v
 	$(PYTHON) "$(srcdir)/test/test_offload.py" -v
 	$(PYTHON) "$(srcdir)/test/test_protocol.py" -v
