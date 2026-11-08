@@ -1188,7 +1188,8 @@ static int dcc_run_job(int in_fd,
         while (*job_argv && **job_argv) ++job_argv;
         if (!*job_argv || !*++job_argv) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
         if (asprintf(&temp_dir, "%s/files", root) < 0) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
-        filesystem = dcc_gcc_files_start(job->fs_channel-1, temp_dir, job->argv[2], root);
+        filesystem = dcc_gcc_files_start(job->fs_channel-1, temp_dir, job->argv[2], root,
+                                       job->cwd, job->argv[1]);
         if (!filesystem) {
             rs_log_error("GCC remote filesystem: %s", strerror(errno));
             ret = EXIT_IO_ERROR; goto out_cleanup;

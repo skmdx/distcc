@@ -25,9 +25,8 @@ using dccfs::number;
 struct Entry {
     int error = 0;
     std::array<char, DCC_FS_METADATA> version{};
-    std::array<char, DCC_FS_METADATA> listing_version{};
     bool queried = false, listed = false;
-    bool cache_changed = false;
+    bool hints_changed = false;
     std::vector<std::string> children;
     std::set<std::string> hints;
     dccfs::Buffer bytes;
@@ -35,6 +34,7 @@ struct Entry {
 };
 class Files {
     dccfs::Connection connection;
+    std::string scope;
     std::map<std::string, Entry> entries;
     std::map<std::pair<uint64_t, uint64_t>, ino_t> inodes;
     static bool valid_name(std::string_view name) {
@@ -51,15 +51,15 @@ class Files {
     }
 public:
     std::string root;
-    Files(int fd, std::string root, const char *identity, const char *cache_root)
-        : connection(fd, dcc_file_cache_records, identity, cache_root), root(std::move(root)) {}
+    Files(int fd, std::string root, const char *identity, const char *cache_root,
+          const char *cwd, const char *input)
+        : connection(fd, dcc_file_cache_records, identity, cache_root),
+          scope((std::filesystem::path(cwd)/input).lexically_normal().parent_path().string()),
+          root(std::move(root)) {}
     ~Files() {
         for (const auto &[path, entry] : entries) {
-            if (!entry.listed || !entry.cache_changed) continue;
-            std::string names;
-            if (S_ISDIR(number(entry.listing_version.data()+32, 4)))
-                for (const auto &name : entry.children) { names += name; names += '\0'; }
-            connection.save_directory_state(path, entry.listing_version, names,
+            if (!entry.listed || !entry.hints_changed) continue;
+            connection.save_directory_hints(path, scope,
                 pack_hints(entry, DCC_FS_QUERY_MAX-5-DCC_FS_METADATA-path.size()));
         }
     }
@@ -81,20 +81,24 @@ public:
                     return entry.error = ENOENT;
                 }
                 if (parent->second.hints.insert(path.substr(separator+1)).second)
-                    parent->second.cache_changed = true;
+                    parent->second.hints_changed = true;
             }
         }
         if (entry.queried) return entry.error;
-        auto previous = connection.directory_state(path);
-        std::string_view names, hints;
+        auto previous = connection.directory_names(path);
+        std::array<char, DCC_FS_METADATA> listing_version{};
+        std::string_view names;
         if (previous.owner) {
-            if (previous.size < DCC_FS_METADATA+4) return entry.error = EPROTO;
-            size_t length = number(previous.data+DCC_FS_METADATA, 4);
-            if (length > previous.size-DCC_FS_METADATA-4) return entry.error = EPROTO;
-            memcpy(entry.listing_version.data(), previous.data, DCC_FS_METADATA);
-            names = {previous.data+DCC_FS_METADATA+4, length};
-            hints = {names.data()+names.size(), previous.size-DCC_FS_METADATA-4-length};
+            if (previous.size < DCC_FS_METADATA) return entry.error = EPROTO;
+            memcpy(listing_version.data(), previous.data, DCC_FS_METADATA);
+            names = {previous.data+DCC_FS_METADATA, previous.size-DCC_FS_METADATA};
         }
+        // Nearby sources reuse their observed header set. A global union would
+        // stat unrelated headers on every job as a large build progresses.
+        // Directory names and immutable file bodies remain shared by all jobs.
+        auto prefetched = connection.directory_hints(path, scope);
+        std::string_view hints = prefetched.owner
+            ? std::string_view(prefetched.data, prefetched.size) : std::string_view{};
         while (!hints.empty()) {
             auto end = hints.find('\0');
             if (end == std::string_view::npos || !valid_name(hints.substr(0, end)))
@@ -103,7 +107,7 @@ public:
             hints.remove_prefix(end+1);
         }
         std::string query = path; query += '\0';
-        query.append(entry.listing_version.data(), DCC_FS_METADATA);
+        query.append(listing_version.data(), DCC_FS_METADATA);
         if (query.size() > DCC_FS_QUERY_MAX-4) return entry.error = ENAMETOOLONG;
         query += pack_hints(entry, DCC_FS_QUERY_MAX-4-query.size());
         dccfs::Buffer response;
@@ -118,7 +122,7 @@ public:
         if (flags & ~(DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_STABLE)) return entry.error = EPROTO;
         bool reused = flags & DCC_FS_DIRECTORY_CACHED;
         if (reused) {
-            if (!previous.owner || entry.version != entry.listing_version) return entry.error = EPROTO;
+            if (!previous.owner || entry.version != listing_version) return entry.error = EPROTO;
             while (!names.empty()) {
                 auto end = names.find('\0');
                 if (end == std::string_view::npos || !valid_name(names.substr(0, end)))
@@ -129,9 +133,6 @@ public:
                 names.remove_prefix(end+1);
             }
         }
-        if (!(flags & DCC_FS_DIRECTORY_STABLE)) entry.listing_version = {};
-        else entry.listing_version = entry.version;
-        entry.cache_changed = !reused || !(flags & DCC_FS_DIRECTORY_STABLE);
         size_t offset = DCC_FS_METADATA+8;
         unsigned count = number(response.data+DCC_FS_METADATA+4, 4);
         std::set<std::string> retained;
@@ -158,9 +159,14 @@ public:
             if (!reused) entry.children.push_back(std::move(name));
         }
         if (offset != response.size) return entry.error = EPROTO;
-        if (entry.hints.size() != retained.size()) entry.cache_changed = true;
+        if (entry.hints.size() != retained.size()) entry.hints_changed = true;
         entry.hints = std::move(retained);
         entry.listed = true;
+        if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) {
+            std::string names;
+            for (const auto &name : entry.children) { names += name; names += '\0'; }
+            connection.save_directory_names(path, entry.version, names);
+        }
         return 0;
     }
     int open(const char *path, Entry *&entry) {
@@ -251,7 +257,8 @@ bool mapping(const char *path, const std::string &value) {
 }
 }
 extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
-                                      const char *identity, const char *job_root) {
+                                      const char *identity, const char *job_root,
+                                      const char *cwd, const char *input) {
     uid_t uid = getuid(); gid_t gid = getgid();
     if (mkdir(mountpoint, 0700) || unshare(CLONE_NEWUSER | CLONE_NEWNS) ||
         !mapping("/proc/self/setgroups", "deny") ||
@@ -288,7 +295,7 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
         // TMPDIR is already the job root here. Like the Clang frontend, keep
         // immutable snapshots in its parent so job cleanup cannot remove them.
         auto cache_root = std::filesystem::path(job_root).parent_path().string();
-        state->files = std::make_unique<Files>(channel, mountpoint, identity, cache_root.c_str());
+        state->files = std::make_unique<Files>(channel, mountpoint, identity, cache_root.c_str(), cwd, input);
         int result = fuse_loop(state->fs);
         state->files.reset();
         fuse_destroy(state->fs);

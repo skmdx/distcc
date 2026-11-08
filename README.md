@@ -740,7 +740,9 @@ service CPU and memory are included in the job's resource measurements.
 Header snapshots use the worker's shared cache outside the job tree and survive
 job cleanup. Each job obtains fresh metadata before reusing cached contents;
 changes to a header invalidate its snapshot, even with equal size and mtime.
-Directory names and access hints share that cache. The client checks directory
+Directory names are shared across source contexts. Attribute prefetch hints
+are scoped to the source's parent directory, so unrelated translation units
+cannot grow one global metadata batch. The client checks directory
 permissions and its version before reusing names; a new listing is retained only
 when its version also matches after enumeration. Child attributes are always
 fresh, batched for previously used names and fetched on demand for other names.

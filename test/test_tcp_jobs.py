@@ -402,6 +402,50 @@ class GccFrontendTest(BrokerTestCase):
             subprocess.run([str(self.work/'program')], check=True)
 
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_directory_hints_follow_source_context_and_share_names_and_bodies(self):
+        self.start_frontend()
+        headers = self.work/'headers'
+        headers.mkdir()
+        for index in range(200):
+            (headers/f'first-{index}.h').write_text(f'#define FIRST_{index} {index}\n')
+        (headers/'common.h').write_text('#define COMMON 7\n')
+        (headers/'second.h').write_text('#define SECOND 13\n')
+        for name in ('first', 'second'):
+            (self.work/name).mkdir()
+        (self.work/'first/part.c').write_text(
+            ''.join(f'#include <first-{index}.h>\n' for index in range(200)) +
+            '#include <common.h>\nint value(void) { return FIRST_0 + COMMON; }\n')
+        (self.work/'second/part.c').write_text(
+            '#include <second.h>\n#include <common.h>\n'
+            'int value(void) { return SECOND + COMMON; }\n')
+        command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'first/part.c', '-o', 'out.o']
+        first = self.compile(command)
+        second = [*command[:5], 'second/part.c', *command[6:]]
+        subprocess.run(second, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        trace = self.work/'contexts.trace'
+        result = subprocess.run(['strace', '-f', '-yy', '-e',
+                                 'trace=newfstatat,statx,getdents64,openat', '-o', str(trace),
+                                 str(self.build/'distcc'), *second], cwd=self.work,
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('pooled TCP job completed', result.stderr)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        lines = trace.read_text().splitlines()
+        metadata = '\n'.join(line for line in lines if 'newfstatat(' in line or 'statx(' in line)
+        self.assertEqual(metadata.count('first-'), 0, 'another source context expanded this metadata batch')
+        listings = '\n'.join(line for line in lines if 'getdents64(' in line)
+        self.assertNotIn(f'<{headers}>', listings, 'directory names stopped being shared')
+        reads = '\n'.join(line for line in lines if 'openat(' in line)
+        self.assertNotIn('common.h', reads, 'an unchanged shared header was transferred again')
+        again = self.compile(command)
+        counts = [int(n) for n in re.findall(r'frontend filesystem: (\d+) requests',
+                                             first.stderr + again.stderr)]
+        self.assertEqual(len(counts), 2)
+        self.assertGreater(counts[0] - counts[1], 200,
+                           'another source context discarded the first context\'s hints')
+
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
     def test_directory_hints_skip_unused_attributes_and_refresh_each_job(self):
         self.start_frontend()
         headers = self.work/'headers'

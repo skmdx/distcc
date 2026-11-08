@@ -13,8 +13,11 @@ reduce client filesystem service cost in remote preprocessing
     communication and compiler search-plan startup remain prominent in profiles.
     Retaining loaded GCC planner images reduces full-build time and client CPU,
     but metadata lookup, symlink resolution and TCP send costs still dominate
-    client service. Preserve complete syscall caller chains in the next profile
-    before choosing further caching or process-lifecycle changes.
+    client service. A real compile trace identified global prefetch hints
+    accumulating unrelated headers; hints now follow the source directory,
+    while directory names and immutable contents remain shared. Measure this
+    change through full builds before choosing further caching or
+    process-lifecycle changes.
     Continue measuring full-build CPU and occupancy; dispatch
     counts alone do not establish that client input service is no longer limiting.
 
