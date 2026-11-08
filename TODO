@@ -5,7 +5,7 @@ TODO list for distcc
 reduce client filesystem service cost in remote preprocessing
 
     Native GCC/FUSE reuses loaded planners and immutable contents, batches
-    fresh metadata using source-directory hints, and avoids a second scan.
+    fresh metadata using per-source hints, and avoids a second scan.
     Buffered transport reuses reply storage and drains writable chunks.
     The cache's entry quota is removed; allocated storage and read recency
     now govern eviction. A full build retains 13314 records instead of 4096.
@@ -73,8 +73,13 @@ reduce client filesystem service cost in remote preprocessing
     established. Per-source footprints now retain useful predictions across
     different nearby files; unseen sources bootstrap from the last nearby job.
     One compact record replaces per-directory hint cache accesses. All 55
-    GCC/frontend checks pass; rollout and complete-build performance validation
-    remain pending for this replacement.
+    GCC/frontend checks and installed validation on five hosts pass. Initial
+    and warm full builds take 319.080 and 312.397 seconds versus 316.397;
+    client CPU takes 940.715 and 893.487 seconds versus 927.034. Both complete
+    6400 remote jobs with matching hashes, valid statistics and no errors,
+    timeouts, disconnects or fallback warnings. The warm run is 1.26% faster,
+    but the initial run is 0.85% slower: these runs do not establish a stable
+    speedup. Warm remote occupancy is 4.864 cores, so spare capacity remains.
 
 recognize arbitrary input suffixes with explicit compiler language
 
