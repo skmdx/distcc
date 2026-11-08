@@ -4,86 +4,33 @@ TODO list for distcc
 
 reduce client filesystem service cost in remote preprocessing
 
-    Native GCC/FUSE reuses loaded planners and immutable contents, batches
-    fresh metadata using per-source hints, and avoids a second scan.
-    Buffered transport reuses reply storage and drains writable chunks.
-    The cache's entry quota is removed; allocated storage and read recency
-    now govern eviction. A full build retains 13314 records instead of 4096.
-    Repeated negative lookups no longer become metadata hints, and fresh
-    ENOENT replies remove absent hints. Learned descendant directories now
-    share bounded batches. The complete learned footprint under current
-    compiler roots now starts together: the eight-level regression falls
-    from nine RPCs to one, and 256 branches split into four requests. External
-    link targets retain on-demand authorization. All 56 GCC/frontend tests
-    pass; rollout and complete-build performance validation remain pending.
-    Per-invocation build flags and logging no
-    longer fragment loaded GCC image identity; each request still restores
-    its environment and arguments. New driver/planner images fall from
-    258/285 to 1/4 in the sampled windows. Before the link changes, a full pair takes 410.973
-    versus 410.497 seconds (+0.12%), with client CPU down 7.60% and remote
-    occupancy 3.829 versus 3.186 cores. Remote CPU time rises 20.33%; there
-    is no demonstrated complete-build speedup from this last change. All
-    6400 jobs succeed with matching input multisets and output hashes,
-    valid statistics and zero errors/timeouts/disconnects/fallback warnings.
-    However, an earlier 414.019-second run had two unexplained pre-dispatch
-    fallbacks. Planner diagnostics are now retained, but the failures did not
-    recur in either subsequent full build. The affected input variants pass
-    6400 cold-start replays under the actual build sandbox/environment, but
-    their original failure cause remains open. A separate real-GCC regression
-    reproduces a slow-start failure: the broker expired owner/waiter leases
-    at five seconds despite the client's longer startup timeout. Publication
-    now follows the owner connection lifetime, and readers use their configured
-    I/O timeout. This does not establish the cause of the earlier warnings.
-    Queries with build flags now bypass occupied
-    compiler lanes, and remote link coordinators reserve local capacity only
-    for actual local commands. Sysroot metadata changes verify contents instead
-    of rejecting identical files. Ordinary link IPC and TCP identifiers now
-    come from the native headers; stale Python identifiers previously prevented
-    this route from reaching workers. Progress and local artifact-FD replies
-    are handled, and installed validation exercises configured sysroot links.
-    All 102 regression checks pass, and deployment validation passes on five
-    hosts, including actual sysroot-link execution where configured. The full
-    build takes 316.397 versus 411.221 seconds (-23.06%), with matching hashes,
-    6400 remote jobs and zero errors/timeouts/disconnects/fallback warnings.
-    Client CPU rises 5.04%; remote occupancy increases from 3.845 to 4.571
-    cores. A 253-output local-link replay falls from 160.220 to 67.465 seconds,
-    with matching outputs, while CPU rises 19.48%. These are single-run pairs;
-    RAM cache/log placement and a missing server sysroot were also corrected.
-    Spare capacity remains unresolved.
-    A successful earlier focused compile reduces
-    newfstatat calls from 841 to 514 and ENOENT from 355 to 1. Sends, opens and
-    mappings remain unchanged. Of its 327 mappings, 316 are anonymous; do not
-    mistake this allocation cost for mapping cached file contents.
-    The latest focused compile reduces sends from 89 to 8 and polls from 87
-    to 6, but opens rise from 360 to 410 and mappings from 327 to 367. The
-    object hash matches; different cache histories limit causal attribution.
-    Client processes consume 43.97% of sampled CPU; planning uses 15.47%,
-    ordinary cc1 9.97% and GCC drivers 8.95%. Matching private client symbols
-    identify the exchange/filesystem service in 24.90 of 39.61 client CPU
-    seconds. Capture workloads differ; do not infer causal savings from shares.
-    Allocation, path resolution, sends and teardown remain significant. Separate identical
-    process names using executable mappings, distinguish planner mappings from
-    ordinary cc1, and do not add overlapping inclusive caller costs. Continue
-    complete matched builds; dispatch counts and microbenchmarks do not prove
-    that idle capacity or the client supply bottleneck has been resolved.
-    Directory predictions now retain only children actually requested by the
-    last job, instead of accumulating every previously prefetched subtree.
-    A real-compiler regression reproduces and removes eleven unused branches
-    from the next job while preserving on-demand changes. All 55 GCC/frontend
-    checks pass, including a separate final framing-contract run. Deployment
-    succeeds, but the full build takes 322.937 versus 316.397 seconds (+2.07%),
-    with client CPU up 3.22%. The focused replay reduces attribute calls from
-    501 to 442, but sends rise from eight to ten. No full-build speedup is
-    established. Per-source footprints now retain useful predictions across
-    different nearby files; unseen sources bootstrap from the last nearby job.
-    One compact record replaces per-directory hint cache accesses. All 55
-    GCC/frontend checks and installed validation on five hosts pass. Initial
-    and warm full builds take 319.080 and 312.397 seconds versus 316.397;
-    client CPU takes 940.715 and 893.487 seconds versus 927.034. Both complete
-    6400 remote jobs with matching hashes, valid statistics and no errors,
-    timeouts, disconnects or fallback warnings. The warm run is 1.26% faster,
-    but the initial run is 0.85% slower: these runs do not establish a stable
-    speedup. Warm remote occupancy is 4.864 cores, so spare capacity remains.
+    Native GCC/FUSE shares immutable bodies and directory names, refreshes
+    metadata and permissions per job, and reuses loaded planners. Per-source
+    footprints now submit known descendants under current compiler roots in
+    the first bounded batch. External symlink targets retain on-demand client
+    authorization. The eight-level regression falls from nine RPCs to one;
+    256 branches split into four requests. All 56 GCC/frontend checks and
+    installed validation on five hosts pass.
+    Initial and warm complete builds take 315.584 and 307.956 seconds versus
+    319.080 and 312.397; client CPU takes 938.617 and 900.668 seconds versus
+    940.715 and 893.487. Each run completes 6400 remote jobs with matching
+    hashes, valid statistics and no errors, timeouts, disconnects or fallback
+    warnings. These single runs do not establish a stable speedup range.
+    The real focused compile reduces sends/polls from 10/8 to 8/6, but still
+    performs 442 attribute queries and opens 119 directories. Its output
+    matches. Most anonymous mappings are small allocations, not cached file
+    bodies. File service, path resolution and teardown still cost client CPU;
+    batching requests alone does not remove them. Warm remote occupancy is
+    4.559 cores. Continue matched complete builds and workload attribution;
+    dispatch counts or small tests do not establish resolution of spare
+    capacity. Do not add overlapping inclusive profile costs.
+    Two earlier pre-dispatch fallbacks remain unexplained. The affected
+    variants pass 6400 cold-start replays in the real sandbox, and diagnostics
+    are now retained. A separate real-GCC slow-start regression reproduced
+    five-second owner/waiter expiry; publication now follows owner lifetime
+    and readers use their I/O timeout. That repair does not establish the
+    cause of the original warnings, which have not recurred in later builds.
+
 
 recognize arbitrary input suffixes with explicit compiler language
 
