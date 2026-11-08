@@ -11,6 +11,10 @@ reduce client filesystem service cost in remote preprocessing
     default cache lifetime and retaining fresh metadata batching. Reusing
     versioned directory names reduces enumeration, but fresh metadata queries,
     communication and compiler search-plan startup remain prominent in profiles.
+    Retaining loaded GCC planner images reduces full-build time and client CPU,
+    but metadata lookup, symlink resolution and TCP send costs still dominate
+    client service. Preserve complete syscall caller chains in the next profile
+    before choosing further caching or process-lifecycle changes.
     Continue measuring full-build CPU and occupancy; dispatch
     counts alone do not establish that client input service is no longer limiting.
 
