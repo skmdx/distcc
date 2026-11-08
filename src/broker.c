@@ -97,7 +97,7 @@ static int memo_get(const char *key, char **value, int *worker)
     struct request request = { BROKER_VERSION, worker ? WORKER_GET : MEMO_GET };
     struct iovec parts[2] = {{ &request, sizeof(request) }, { (void *)key, strlen(key) + 1 }};
     struct msghdr msg = { .msg_iov = parts, .msg_iovlen = 2 };
-    struct timeval timeout = { 5, 0 };
+    struct timeval timeout = { dcc_get_io_timeout(), 0 };
     char *buffer;
     int fd;
     ssize_t size;
@@ -642,7 +642,6 @@ static void memo_request(struct broker *broker, struct client *client,
                 } else {
                     client->state = MEMO_WAIT;
                     client->memo = i;
-                    client->deadline = now + 5;
                 }
                 return;
             }
@@ -659,7 +658,6 @@ static void memo_request(struct broker *broker, struct client *client,
             if (memo->key && send(client->fd, "", 1, MSG_NOSIGNAL) == 1) {
                 client->memo = slot;
                 client->state = MEMO_OWNER;
-                client->deadline = now + 5;
                 return;
             }
             free(memo->key);
@@ -1701,7 +1699,7 @@ int dcc_broker_serve(const char *path)
             control_index[i] = net_index[i] = -1;
             if (c->fd < 0)
                 continue;
-            if ((c->state == REQUEST || c->state == MEMO_OWNER || c->state == MEMO_WAIT) && now >= c->deadline) {
+            if (c->state == REQUEST && now >= c->deadline) {
                 release_client(broker, c);
                 continue;
             }
@@ -1732,8 +1730,7 @@ int dcc_broker_serve(const char *path)
             if (c->state == WAITING && c->deadline > now && c->deadline < wake_at)
                 wake_at = c->deadline;
             if ((c->state == REQUEST || c->state == CONNECTING || c->state == HELLO_SEND || c->state == HELLO_READ ||
-                 c->state == RESERVE_SEND || c->state == RESERVE_READ ||
-                 c->state == MEMO_OWNER || c->state == MEMO_WAIT) && c->deadline < wake_at)
+                 c->state == RESERVE_SEND || c->state == RESERVE_READ) && c->deadline < wake_at)
                 wake_at = c->deadline;
             control_index[i] = n;
             polls[n++] = (struct pollfd){ c->fd, POLLIN, 0 };

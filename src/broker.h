@@ -22,7 +22,9 @@ int dcc_broker_jobs(char **capacity);
 void dcc_broker_cpp_done(const struct dcc_hostdef *host);
 
 /* A cache miss returns a publishing lease; closing it abandons the probe.
- * Concurrent readers wait for that lease, never for work in the broker. */
+ * Concurrent readers wait with their configured I/O timeout. The broker
+ * retains live owners and waiters until publication or EOF; compiler startup
+ * must not be cut short by the initial IPC request's handshake deadline. */
 #define DCC_MEMO_LIMIT 65536
 int dcc_broker_memo_get(const char *key, char **value);
 void dcc_broker_memo_put(int lease, const char *value);

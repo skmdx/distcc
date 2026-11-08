@@ -516,6 +516,42 @@ class GccFrontendTest(BrokerTestCase):
         self.assertNotIn('pooled TCP job completed', result.stderr)
         self.assertTrue((self.work/'out.o').is_file())
 
+    def test_slow_planner_startup_keeps_owner_and_waiters(self):
+        self.start_frontend()
+        # ELF constructors finish before the retained GCC image reports ready.
+        # Six seconds crosses the broker's former five-second lease expiry,
+        # while staying within this client's configured startup timeout.
+        delay = self.work/'startup.c'
+        delay.write_text('#include <stdlib.h>\n#include <time.h>\n'
+                         '__attribute__((constructor)) static void startup(void) {\n'
+                         ' if (getenv("DISTCC_GCC_PLAN_CONTROL")) {\n'
+                         '  struct timespec left = {6, 0};\n'
+                         '  while (nanosleep(&left, &left)) {}\n'
+                         ' }\n}\n')
+        library = self.work/'startup.so'
+        subprocess.run([self.cc, '-shared', '-fPIC', str(delay), '-o', str(library)],
+                       check=True, capture_output=True)
+        self.source.write_text('int answer(void) { return 42; }\n')
+        command = [self.cc, '-c', str(self.source)]
+        subprocess.run([*command, '-o', 'expected.o'], cwd=self.work,
+                       check=True, capture_output=True)
+        expected = (self.work/'expected.o').read_bytes()
+        log = self.work/'startup.log'
+        self.env.update(LD_PRELOAD=str(library), DISTCC_IO_TIMEOUT='20', DISTCC_LOG=str(log))
+        def compile_case(number):
+            result = subprocess.run([str(self.build/'distcc'), *command, '-o', f'{number}.o'],
+                                    cwd=self.work, env=self.env, capture_output=True,
+                                    text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr + log.read_text())
+            self.assertEqual((self.work/f'{number}.o').read_bytes(), expected)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(compile_case, range(2)))
+        compile_case(2)
+        trace = log.read_text()
+        self.assertEqual(trace.count('pooled TCP job completed'), 3)
+        self.assertEqual(trace.count('started reusable GCC driver pid='), 1)
+        self.assertEqual(trace.count('started reusable GCC planner pid='), 1)
+
     def test_planner_preserves_explicit_gcc_wrapper(self):
         self.start_frontend()
         wrapper = self.work/'wrap'
