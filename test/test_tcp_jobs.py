@@ -254,6 +254,103 @@ class GccFrontendTest(BrokerTestCase):
         subprocess.run([self.cc, 'out.o', '-o', 'program'], cwd=self.work, check=True)
         self.assertEqual(subprocess.check_output([str(self.work/'program')]), b'37 hello.c\n')
 
+    def test_planner_does_not_open_the_source(self):
+        self.start_frontend()
+        self.source.write_text('#error only the remote frontend should read this\n')
+        libc = ctypes.CDLL(None, use_errno=True)
+        descriptor = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+        self.assertGreaterEqual(descriptor, 0, os.strerror(ctypes.get_errno()))
+        self.addCleanup(os.close, descriptor)
+        self.assertGreaterEqual(libc.inotify_add_watch(descriptor, os.fsencode(self.source), 0x20), 0)
+        with os.fdopen(os.memfd_create('gcc-plan-no-read', os.MFD_CLOEXEC), 'w+b') as output:
+            result = subprocess.run([self.cc, '-E', str(self.source), '-o', '/dev/null',
+                                     '-fplugin='+self.module,
+                                     f'-fplugin-arg-distcc_gcc_scan-plan-fd={output.fileno()}'],
+                                    env=self.env, pass_fds=(output.fileno(),),
+                                    capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output.seek(0)
+            self.assertEqual(output.read(4), b'ARGC')
+        try:
+            events = os.read(descriptor, 4096)
+        except BlockingIOError:
+            events = b''
+        self.assertEqual(events, b'', 'search planning opened the source')
+
+    def test_gcc_assembler_preprocessing_and_assembler_inputs_are_remote(self):
+        self.start_frontend()
+        (self.work/'values.h').write_text('#ifndef __ASSEMBLER__\n#error wrong language\n#endif\n#define VALUE 42\n')
+        (self.work/'tail.inc').write_text('.long 7\n')
+        (self.work/'bytes.bin').write_bytes(struct.pack('=I', 9))
+        (self.work/'values.S').write_text('#include "values.h"\n.data\n.globl values\n'
+            'values:\n.long VALUE\n.include "tail.inc"\n.incbin "bytes.bin"\n')
+        command = [self.cc, '-march=native', '-mtune=native', '-c', 'values.S',
+                   '-o', 'out.o', '-MMD', '-MF', 'out.d']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = [(self.work/name).read_bytes() for name in ('out.o', 'out.d')]
+        result = self.compile(command)
+        self.assertIn('frontend filesystem:', result.stderr)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected[0])
+        self.assertEqual((self.work/'out.d').read_bytes().replace(b'\\\n', b'').split(),
+                         expected[1].replace(b'\\\n', b'').split())
+        (self.work/'check.c').write_text('extern unsigned values[]; int main(void) { '
+                                       'return values[0]!=42 || values[1]!=7 || values[2]!=9; }\n')
+        subprocess.run([self.cc, 'check.c', 'out.o', '-o', 'program'], cwd=self.work,
+                       check=True, capture_output=True)
+        subprocess.run([str(self.work/'program')], check=True)
+
+    def test_assembler_explicit_language_sysroot_and_symlink_refresh(self):
+        self.start_frontend()
+        headers = self.work/'root/usr/include'
+        headers.mkdir(parents=True)
+        (self.work/'alias').symlink_to(headers, target_is_directory=True)
+        (self.work/'part.c').write_text('#include <value.h>\n.data\n.globl value\nvalue:\n.long VALUE\n')
+        command = [self.cc, '-x', 'assembler-with-cpp', '--sysroot='+str(self.work/'root'),
+                   '-Ialias', '-c', 'part.c', '-o', 'out.o']
+        for value in (41, 42):
+            if value == 42:
+                headers = self.work/'replacement'
+                headers.mkdir()
+                (self.work/'alias').unlink()
+                (self.work/'alias').symlink_to(headers, target_is_directory=True)
+            (headers/'value.h').write_text(f'#define VALUE {value}\n')
+            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+            expected = (self.work/'out.o').read_bytes()
+            result = self.compile(command)
+            self.assertIn('frontend filesystem:', result.stderr)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
+    def test_remote_assembly_reports_preprocessor_and_assembler_errors(self):
+        self.start_frontend()
+        source = self.work/'broken.S'
+        for contents, diagnostic in (('#include "missing.h"\n', 'missing.h'),
+                                      ('.data\n.incbin "missing.bin"\n', 'missing.bin')):
+            with self.subTest(diagnostic=diagnostic):
+                source.write_text(contents)
+                result = subprocess.run([str(self.build/'distcc'), self.cc, '-c', str(source),
+                                         '-o', str(self.work/'out.o')], cwd=self.work,
+                                        env=self.env, capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertIn('pooled TCP job completed', result.stderr)
+                self.assertNotIn('retrying locally', result.stderr)
+                self.assertFalse((self.work/'out.o').exists())
+
+    def test_assembly_stays_local_without_the_native_filesystem(self):
+        self.start_frontend()
+        (self.work/'part.s').write_text('.data\n.globl value\nvalue:\n.incbin "bytes.bin"\n')
+        (self.work/'part.S').write_text('#define VALUE 41\n.data\n.globl value\nvalue:\n.long VALUE\n')
+        (self.work/'bytes.bin').write_bytes(struct.pack('=I', 42))
+        for name, enabled in (('part.s', '1'), ('part.S', '0')):
+            command = [self.cc, '-c', name, '-o', 'out.o']
+            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+            expected = (self.work/'out.o').read_bytes()
+            result = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
+                env=dict(self.env, DISTCC_FRONTEND_REMOTE=enabled), capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('pooled TCP job completed', result.stderr)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
     def test_planner_shares_loaded_gcc_and_isolates_fresh_search_paths(self):
         self.start_frontend()
         log = self.work/'planner.log'

@@ -35,8 +35,8 @@ FILE *output = nullptr;
 // Header search produces many short records; write them in bounded batches.
 char output_buffer[64 * 1024];
 bool precompiled = false;
-bool planning = false;
 bool client_search = false;
+void (*preprocess_options)(cpp_reader *) = nullptr;
 std::string input_root;
 std::vector<std::string> cxx_system_dirs;
 void (*read_pch)(cpp_reader *, const char *, int, const char *) = nullptr;
@@ -148,23 +148,27 @@ bool plan_group(const std::vector<std::string> &values)
     return true;
 }
 
+void plan_options(cpp_reader *reader)
+{
+    if (preprocess_options) preprocess_options(reader);
+    frontend_plan plan;
+    bool ok = true;
+    for (unsigned i = 0; i < save_decoded_options_count; ++i) {
+        const auto &option = save_decoded_options[i];
+        if ((option.opt_index == OPT_SPECIAL_input_file || option.opt_index == OPT_include ||
+             option.opt_index == OPT_imacros) && option.arg)
+            ok = ok && plan_entry(option.arg, nullptr, -1, &plan);
+    }
+    ok = ok && distcc_gcc_plan(reader, plan_entry, &plan) &&
+         plan_group(plan.defaults) && plan_group(plan.roots);
+    if (fclose(output)) ok = false;
+    // GCC has registered its include chains. Stop before opening the source;
+    // preprocessing and its diagnostics belong to the actual remote compiler.
+    _exit(ok ? 0 : 1);
+}
+
 void entered_file(void *, void *)
 {
-    if (planning) {
-        planning = false;
-        frontend_plan plan;
-        bool ok = distcc_gcc_plan(parse_in, plan_entry, &plan);
-        for (unsigned i = 0; i < save_decoded_options_count; ++i) {
-            const auto &option = save_decoded_options[i];
-            if ((option.opt_index == OPT_include || option.opt_index == OPT_imacros) && option.arg)
-                ok = ok && plan_entry(option.arg, nullptr, -1, &plan);
-        }
-        ok = ok && plan_group(plan.defaults) && plan_group(plan.roots);
-        if (fclose(output)) ok = false;
-        // Search paths are initialized, but no source token or header is
-        // preprocessed. The remote native frontend owns that work once.
-        _exit(ok ? 0 : 1);
-    }
     if (!input_root.empty()) {
         if (distcc_gcc_input_root(parse_in, input_root.c_str())) {
             if (client_search) distcc_gcc_client_search(parse_in);
@@ -249,7 +253,7 @@ int plugin_init(struct plugin_name_args *arguments, struct plugin_gcc_version *v
     if (*end || descriptor < 3 || descriptor > INT_MAX) return 1;
     if (!strcmp(arguments->argv[0].key, "driver-fd"))
         return driver_options(descriptor) ? 0 : 1;
-    planning = !strcmp(arguments->argv[0].key, "plan-fd");
+    bool planning = !strcmp(arguments->argv[0].key, "plan-fd");
     if (!planning && strcmp(arguments->argv[0].key, "output-fd")) return 1;
     struct stat info;
     if (fstat(descriptor, &info) || !S_ISREG(info.st_mode) || lseek(descriptor, 0, SEEK_CUR) != 0) return 1;
@@ -258,10 +262,13 @@ int plugin_init(struct plugin_name_args *arguments, struct plugin_gcc_version *v
     // Module preprocessing has a language-specific token observer and is not
     // supported by the dependency collector. Never replace that observer.
     if (flag_modules) return 1;
-    if (!planning) {
+    if (planning) {
+        preprocess_options = lang_hooks.preprocess_options;
+        lang_hooks.preprocess_options = plan_options;
+    } else {
         lang_hooks.preprocess_token = scan_tokens;
         register_callback(arguments->base_name, PLUGIN_FINISH, finish, nullptr);
+        register_callback(arguments->base_name, PLUGIN_INCLUDE_FILE, entered_file, nullptr);
     }
-    register_callback(arguments->base_name, PLUGIN_INCLUDE_FILE, entered_file, nullptr);
     return 0;
 }

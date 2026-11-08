@@ -220,11 +220,9 @@ int dcc_is_preprocessed(const char *sfile)
     if (!strcmp(ext, "hipi") || !strcmp(ext, "cli") || !strcmp(ext, "clii")) return 1;
 
     switch (ext[0]) {
-#ifdef ENABLE_REMOTE_ASSEMBLE
     case 's':
         /* .S needs to be run through cpp; .s does not */
         return !strcmp(ext, "s");
-#endif
     case 'i':
         return !strcmp(ext, "i")
             || !strcmp(ext, "ii");
@@ -275,12 +273,10 @@ int dcc_is_source(const char *sfile)
             || !strcmp(ext,"mii");
     case 'M':
         return !strcmp(ext, "M");
-#ifdef ENABLE_REMOTE_ASSEMBLE
     case 's':
         return !strcmp(ext, "s");
     case 'S':
         return !strcmp(ext, "S");
-#endif
     default:
         return 0;
     }

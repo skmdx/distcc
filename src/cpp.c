@@ -74,27 +74,33 @@ static int spawn_preprocessor(char **argv, pid_t *pid, const char *output)
 /* Clang preserves macro diagnostics and source identity in LLVM IR. Running
  * its frontend once avoids both a dependency scan and repeated preprocessing.
  * Offload drivers already prepare each device translation unit separately. */
+enum { FRONTEND_C = 1, FRONTEND_ASSEMBLER, FRONTEND_RAW_ASSEMBLER };
 static int frontend_language(char **argv, const char *input_fname, int cxx)
 {
     const char *ext, *language = NULL;
     int i;
-    if (dcc_offload_language(argv) || dcc_is_preprocessed(input_fname)) return 0;
+    if (dcc_offload_language(argv)) return 0;
     ext = dcc_find_extension_const(input_fname);
+    int preprocessed = dcc_is_preprocessed(input_fname);
+    if (preprocessed && (!ext || strcmp(ext, ".s"))) return 0;
     if (ext) ext = dcc_preproc_exten(ext);
     if (ext) {
         if (!strcmp(ext, ".i")) language = cxx ? "c++" : "c";
         else if (!strcmp(ext, ".ii")) language = "c++";
         else if (!strcmp(ext, ".mi")) language = "objective-c";
         else if (!strcmp(ext, ".mii")) language = "objective-c++";
+        else if (!strcmp(ext, ".s")) language = preprocessed ? "assembler" : "assembler-with-cpp";
     }
     for (i = 1; argv[i]; i++) {
         if (dcc_is_literal_option(argv[i]) && argv[i + 1]) { i++; continue; }
         if (!strcmp(argv[i], "-x") && argv[i + 1]) language = argv[++i];
         else if (!strncmp(argv[i], "-x", 2) && argv[i][2]) language = argv[i] + 2;
     }
-    return language && (!strcmp(language, "c") || !strcmp(language, "c++") ||
-                       !strcmp(language, "objective-c") ||
-                       !strcmp(language, "objective-c++"));
+    if (!language) return 0;
+    if (!strcmp(language, "assembler-with-cpp")) return FRONTEND_ASSEMBLER;
+    if (!strcmp(language, "assembler")) return FRONTEND_RAW_ASSEMBLER;
+    return (!strcmp(language, "c") || !strcmp(language, "c++") ||
+            !strcmp(language, "objective-c") || !strcmp(language, "objective-c++")) ? FRONTEND_C : 0;
 }
 
 int dcc_cpp_ir(char **argv, const char *input_fname)
@@ -102,7 +108,7 @@ int dcc_cpp_ir(char **argv, const char *input_fname)
     const char *name = dcc_find_basename(argv[0]), *clang = strstr(name, "clang");
     return clang && (clang == name || clang[-1] == '-') &&
         (!clang[5] || clang[5] == '-' || !strcmp(clang+5, "++") || !strncmp(clang+5, "++-", 3)) &&
-        frontend_language(argv, input_fname, !strncmp(clang+5, "++", 2));
+        frontend_language(argv, input_fname, !strncmp(clang+5, "++", 2)) == FRONTEND_C;
 }
 
 int dcc_cpp_gcc(char **argv, const char *input_fname)
@@ -110,8 +116,15 @@ int dcc_cpp_gcc(char **argv, const char *input_fname)
     const char *name = dcc_find_basename(argv[0]);
     const char *gcc = strstr(name, "gcc"), *cxx = strstr(name, "g++");
     const char *match = gcc ? gcc : cxx;
-    return match && (match == name || match[-1] == '-') && (!match[3] || match[3] == '-') &&
-        frontend_language(argv, input_fname, cxx != NULL);
+    if (!match || (match != name && match[-1] != '-') || (match[3] && match[3] != '-')) return 0;
+    int language = frontend_language(argv, input_fname, cxx != NULL);
+    return language == FRONTEND_C || language == FRONTEND_ASSEMBLER;
+}
+
+int dcc_cpp_assembly(char **argv, const char *input_fname)
+{
+    int language = frontend_language(argv, input_fname, 0);
+    return language == FRONTEND_ASSEMBLER || language == FRONTEND_RAW_ASSEMBLER;
 }
 
 /**

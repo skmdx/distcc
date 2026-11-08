@@ -701,7 +701,10 @@ on demand through the existing job connection and shared snapshot cache. This
 skips include-server analysis and local preprocessing/IR generation. Clang uses
 its VFS interface and matching frontend libraries. GCC uses its native plugin
 to obtain search paths before preprocessing, then a read-only FUSE filesystem
-for the actual remote compiler. GCC workers require libfuse3, `/dev/fuse` and
+for the actual remote compiler. GCC assembly with preprocessing (`.S` or
+`-x assembler-with-cpp`) uses the same filesystem, including assembler
+`.include` and `.incbin` reads. Plain assembly and assembly without this
+filesystem remain local. GCC workers require libfuse3, `/dev/fuse` and
 permission to create a user and mount namespace. Offload compilation keeps its
 existing input preparation.
 
@@ -721,7 +724,8 @@ For GCC on x86_64/aarch64 glibc, the native driver supplies frontend arguments
 through its `-wrapper` interface. A client-owned helper retains the loaded GCC
 image before its main function runs, then forks a fresh planner for each job.
 Only library loading is shared: every invocation parses its own arguments,
-environment and current search directories. No search-plan result is cached.
+environment and current search directories. Planning stops after GCC registers
+its include chains, before opening the source. No search-plan result is cached.
 The broker scopes helpers to the caller, executable, namespaces, credentials
 and loader environment; replacing the compiler or helper selects a new image.
 The existing native worker loop owns concurrent invocations, cancellation and

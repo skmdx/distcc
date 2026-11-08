@@ -508,8 +508,8 @@ class IsSource_Case(SimpleDistCC_Case):
                  ( ".foo",             "not-source",   "not-preprocessed" ),
                  ( "gcc",              "not-source",   "not-preprocessed" ),
                  ( "hello.ii",         "source",       "preprocessed" ),
-                 ( "boot.s",           "not-source",   "not-preprocessed" ),
-                 ( "boot.S",           "not-source",   "not-preprocessed" ))
+                 ( "boot.s",           "source",       "preprocessed" ),
+                 ( "boot.S",           "source",       "not-preprocessed" ))
         for f, issrc, iscpp in cases:
             o, err = self.runcmd("h_issource '%s'" % f)
             expected = ("%s %s\n" % (issrc, iscpp))
@@ -531,8 +531,8 @@ class ScanArgs_Case(SimpleDistCC_Case):
                  ("ccache gcc -c hello.c", "distribute", "hello.c", "hello.o"),
                  ("gcc hello.o", "local"),
                  ("gcc -o hello.o hello.c", "local"),
-                 ("gcc -o hello.o -c hello.s", "local"),
-                 ("gcc -o hello.o -c hello.S", "local"),
+                 ("gcc -o hello.o -c hello.s", "distribute", "hello.s", "hello.o"),
+                 ("gcc -o hello.o -c hello.S", "distribute", "hello.S", "hello.o"),
                  ("gcc -fprofile-arcs -ftest-coverage -c hello.c", "local", "hello.c", "hello.o"),
                  ("gcc -S hello.c", "distribute", "hello.c", "hello.s"),
                  ("gcc -c -S hello.c", "distribute", "hello.c", "hello.s"),
@@ -564,8 +564,8 @@ class ScanArgs_Case(SimpleDistCC_Case):
                  # Produce .rpo files
                  ("g++ -frepo foo.C", "local"),
 
-                 ("gcc -xassembler-with-cpp -c foo.c", "local"),
-                 ("gcc -x assembler-with-cpp -c foo.c", "local"),
+                 ("gcc -xassembler-with-cpp -c foo.c", "distribute", "foo.c", "foo.o"),
+                 ("gcc -x assembler-with-cpp -c foo.c", "distribute", "foo.c", "foo.o"),
 
                  ("gcc -specs=foo.specs -c foo.c", "distribute", "foo.c", "foo.o"),
 

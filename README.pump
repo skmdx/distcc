@@ -123,9 +123,10 @@ it on clients together with the updated worker helper.
 GCC profile generation and profile use remain local because their additional file contracts are not
 part of the compilation RPC.
 
-With `DISTCC_FRONTEND_REMOTE=1`, ordinary GCC C/C++ jobs bypass the include
-server. A short native frontend invocation reports search directories without
-preprocessing headers; the selected worker's GCC performs preprocessing and
+With `DISTCC_FRONTEND_REMOTE=1`, ordinary GCC C/C++ and preprocessed assembly
+jobs bypass the include server. A short native frontend invocation reports
+search directories without opening the source or preprocessing headers;
+the selected worker's GCC performs preprocessing and
 compilation once against the client's on-demand filesystem. GCC owns implicit
 preincludes, PCH validation and header lookup. Client default directories replace
 only the worker's implicit directories, retaining their order and system

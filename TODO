@@ -28,6 +28,12 @@ reduce client filesystem service cost in remote preprocessing
     Continue measuring full-build CPU and occupancy; dispatch
     counts alone do not establish that client input service is no longer limiting.
 
+recognize arbitrary input suffixes with explicit compiler language
+
+    The argument scanner still identifies source operands by suffix even when
+    -x selects the language. Such jobs remain local. Delegate operand discovery
+    to the compiler's native option decoder instead of adding another grammar.
+
 type-check TCP integration tests
 
     test/test_tcp_jobs.py has existing Pyright diagnostics for unchecked

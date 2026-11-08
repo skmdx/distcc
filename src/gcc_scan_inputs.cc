@@ -19,8 +19,7 @@ using input_callback = bool (*)(const char *, const struct stat *, int, void *);
 
 extern "C" bool distcc_gcc_plan(cpp_reader *reader, input_callback callback, void *context)
 {
-    if (!reader || !reader->main_file) return false;
-    if (!callback(reader->main_file->path, nullptr, -1, context)) return false;
+    if (!reader) return false;
     for (const auto *dir = reader->quote_include; dir; dir = dir->next)
         if (!callback(dir->name, nullptr, dir->sysp + (dir->user_supplied_p ? 0 : 3), context))
             return false;

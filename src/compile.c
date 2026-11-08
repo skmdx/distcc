@@ -867,6 +867,10 @@ dcc_build_somewhere(char *argv[],
     remote_frontend = !ret && !preprocess_only && !dcc_scan_includes &&
         dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) && getenv("DISTCC_BROKER") &&
         (dcc_cpp_ir(argv, input_fname) || dcc_cpp_gcc(argv, input_fname));
+    /* Assembly may read .include/.incbin after preprocessing. Only the
+     * native frontend's filesystem carries those reads to the client. */
+    if (!ret && !remote_frontend && dcc_cpp_assembly(argv, input_fname))
+        ret = EXIT_LOCAL_CPP;
     if (!ret && (dcc_offload_language(argv) ||
         ((!remote_frontend || !dcc_cpp_ir(argv, input_fname)) && dcc_native_requested(argv)))) {
         if (dcc_offload_language(argv) ? dcc_prepare_offload(&argv, &auxiliary, &offload_targets) :

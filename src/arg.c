@@ -58,17 +58,9 @@
  * @todo Perhaps make the argument parser driven by a data table.  (Would that
  * actually be clearer?)  Perhaps use regexps to recognize strings.
  *
- * @todo We could also detect options like "-x cpp-output" or "-x
- * assembler-with-cpp", because they should override language detection based
- * on extension.  I haven't seen anyone use them yet though.  In fact, since
- * we don't assemble remotely it is moot for the only reported case, the
- * Darwin C library.  We would also need to update the option when passing it
- * to the server.
- *
- * @todo Perhaps assume that assembly code will not use both #include and
- * .include, and therefore if we preprocess locally we can distribute the
- * compilation?  Assembling is so cheap that it's not necessarily worth
- * distributing.
+ * Assembly requires the native remote filesystem: .include and .incbin may
+ * read additional files after preprocessing. The compile dispatcher keeps
+ * assembly local when that filesystem is unavailable.
  **/
 
 
@@ -336,6 +328,7 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
                 if (!language ||
                     (!str_startswith("c", language) &&
                      !str_startswith("objective-c", language) &&
+                     strcmp("assembler", language) && strcmp("assembler-with-cpp", language) &&
                      strcmp("ir", language) &&
                      !str_startswith("go", language) &&
                      !str_startswith("hip", language))) {

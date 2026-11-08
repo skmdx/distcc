@@ -163,6 +163,28 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                            check=True, timeout=30)
             subprocess.run([str(exe)], check=True, timeout=5)
             results[compiler]['frontend'] = {'distributed': True, 'linked': True, 'executed': True}
+            assembly = root/'values.S'
+            assembly.write_text('#define VALUE 42\n.data\n.globl assembly_values\n'
+                                'assembly_values:\n.long VALUE\n.include "tail.inc"\n'
+                                '.incbin "bytes.bin"\n')
+            (root/'tail.inc').write_text('.long 7\n')
+            (root/'bytes.bin').write_bytes((9).to_bytes(4, sys.byteorder))
+            check = root/'assembly-check.c'
+            check.write_text('extern "C" { extern unsigned assembly_values[]; }\n'
+                             if suffix == 'cc' else 'extern unsigned assembly_values[];\n')
+            with check.open('a') as output:
+                output.write('int main(void) { return assembly_values[0]!=42 || '
+                             'assembly_values[1]!=7 || assembly_values[2]!=9; }\n')
+            before = (root/'client.log').stat().st_size
+            result = subprocess.run(['distcc', compiler, '-c', str(assembly), '-o', str(obj)],
+                                    cwd=root, env=frontend_env, capture_output=True, timeout=REMOTE_TIMEOUT)
+            assert result.returncode == 0, (compiler, result.stderr.decode(errors='replace'))
+            log = (root/'client.log').read_text()[before:]
+            assert 'frontend filesystem:' in log and 'pooled TCP job completed' in log, log[-6000:]
+            subprocess.run([compiler_path, str(check), str(obj), '-o', str(exe)],
+                           check=True, timeout=30)
+            subprocess.run([str(exe)], check=True, timeout=5)
+            results[compiler]['assembly'] = {'distributed': True, 'linked': True, 'executed': True}
         if 'clang' not in compiler:
             # Compound GCC jobs use source-valued dump operands. The relative
             # main and absolute parent-component support path cover both the
