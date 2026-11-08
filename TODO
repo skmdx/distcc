@@ -4,29 +4,19 @@ TODO list for distcc
 
 reduce client filesystem service cost in remote preprocessing
 
-    The native GCC/FUSE path removes the pump dependency scan from the client.
-    Cross-target compilation, linkage and execution pass, and matched full
-    builds demonstrate reduced elapsed time and client CPU. Client filesystem
-    responses and communication still limit worker occupancy after repairing
-    default cache lifetime and retaining fresh metadata batching. Reusing
-    versioned directory names reduces enumeration, but fresh metadata queries,
-    communication and compiler search-plan startup remain prominent in profiles.
-    Retaining loaded GCC planner images reduces full-build time and client CPU,
-    but metadata lookup, symlink resolution and TCP send costs still dominate
-    client service. A real compile trace identified global prefetch hints
-    accumulating unrelated headers; hints now follow the source directory,
-    while directory names and immutable contents remain shared. The first full
-    comparison shows only a small CPU reduction, with wall time and worker
-    occupancy essentially unchanged. Native GCC search directories and their
-    ancestors now use bounded metadata batches, removing their individual
-    round trips without relaxing per-path permission or freshness checks.
-    The first matched full build reduces client CPU by 4.55% and elapsed time
-    by 2.23%, but remote CPU occupancy is unchanged. Client kernel work,
-    filesystem path resolution, TCP sends and planner process teardown remain
-    prominent. Batch-request microbenchmarks alone do not establish that idle
-    workers have been fixed.
-    Continue measuring full-build CPU and occupancy; dispatch
-    counts alone do not establish that client input service is no longer limiting.
+    Native GCC/FUSE removes the pump scan, reuses loaded planner images and
+    immutable contents, and batches fresh metadata with source-scoped hints.
+    Assembly with preprocessing now uses the same remote filesystem, and
+    planning stops before opening the source. Cross-target execution passes.
+    The latest matched full build has 6400 instead of 6304 remote jobs and
+    6.67% more remote CPU occupancy, but elapsed time is unchanged (+0.09%)
+    and client CPU falls only 0.37%. This is not a demonstrated speedup.
+    The client filesystem/transport processes still consume about half the
+    sampled CPU. GCC planning, other local cc1 invocations, driver startup,
+    path resolution, TCP sends and teardown remain significant. Distinguish
+    planner mappings from ordinary cc1 when attributing profiles. Continue
+    matched full builds; dispatch counts and microbenchmarks do not establish
+    that idle capacity or the client supply bottleneck has been resolved.
 
 recognize arbitrary input suffixes with explicit compiler language
 
