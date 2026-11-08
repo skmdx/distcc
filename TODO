@@ -20,6 +20,11 @@ reduce client filesystem service cost in remote preprocessing
     occupancy essentially unchanged. Native GCC search directories and their
     ancestors now use bounded metadata batches, removing their individual
     round trips without relaxing per-path permission or freshness checks.
+    The first matched full build reduces client CPU by 4.55% and elapsed time
+    by 2.23%, but remote CPU occupancy is unchanged. Client kernel work,
+    filesystem path resolution, TCP sends and planner process teardown remain
+    prominent. Batch-request microbenchmarks alone do not establish that idle
+    workers have been fixed.
     Continue measuring full-build CPU and occupancy; dispatch
     counts alone do not establish that client input service is no longer limiting.
 
