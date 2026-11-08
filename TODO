@@ -15,7 +15,7 @@ reduce client filesystem service cost in remote preprocessing
     in the 12-branch regression. Per-invocation build flags and logging no
     longer fragment loaded GCC image identity; each request still restores
     its environment and arguments. New driver/planner images fall from
-    258/285 to 1/4 in the sampled windows. The latest full pair takes 410.973
+    258/285 to 1/4 in the sampled windows. Before the link changes, a full pair takes 410.973
     versus 410.497 seconds (+0.12%), with client CPU down 7.60% and remote
     occupancy 3.829 versus 3.186 cores. Remote CPU time rises 20.33%; there
     is no demonstrated complete-build speedup from this last change. All
@@ -30,16 +30,22 @@ reduce client filesystem service cost in remote preprocessing
     at five seconds despite the client's longer startup timeout. Publication
     now follows the owner connection lifetime, and readers use their configured
     I/O timeout. This does not establish the cause of the earlier warnings.
-    The next complete run still needs to evaluate local-link admission and
-    compiler metadata queries. Queries with build flags now bypass occupied
+    Queries with build flags now bypass occupied
     compiler lanes, and remote link coordinators reserve local capacity only
     for actual local commands. Sysroot metadata changes verify contents instead
     of rejecting identical files. Ordinary link IPC and TCP identifiers now
     come from the native headers; stale Python identifiers previously prevented
     this route from reaching workers. Progress and local artifact-FD replies
     are handled, and installed validation exercises configured sysroot links.
-    The focused and regression checks pass, but deployment and complete-build
-    performance acceptance are still pending. Spare capacity remains unresolved.
+    All 102 regression checks pass, and deployment validation passes on five
+    hosts, including actual sysroot-link execution where configured. The full
+    build takes 316.397 versus 411.221 seconds (-23.06%), with matching hashes,
+    6400 remote jobs and zero errors/timeouts/disconnects/fallback warnings.
+    Client CPU rises 5.04%; remote occupancy increases from 3.845 to 4.571
+    cores. A 253-output local-link replay falls from 160.220 to 67.465 seconds,
+    with matching outputs, while CPU rises 19.48%. These are single-run pairs;
+    RAM cache/log placement and a missing server sysroot were also corrected.
+    Spare capacity remains unresolved.
     A successful earlier focused compile reduces
     newfstatat calls from 841 to 514 and ENOENT from 355 to 1. Sends, opens and
     mappings remain unchanged. Of its 327 mappings, 316 are anonymous; do not
@@ -47,9 +53,9 @@ reduce client filesystem service cost in remote preprocessing
     The latest focused compile reduces sends from 89 to 8 and polls from 87
     to 6, but opens rise from 360 to 410 and mappings from 327 to 367. The
     object hash matches; different cache histories limit causal attribution.
-    Client processes consume 46.38% of sampled CPU; planning uses 15.60%,
-    ordinary cc1 9.92% and GCC drivers 8.06%. Matching private client symbols
-    identify the exchange/filesystem service in 24.27 of 37.69 client CPU
+    Client processes consume 43.97% of sampled CPU; planning uses 15.47%,
+    ordinary cc1 9.97% and GCC drivers 8.95%. Matching private client symbols
+    identify the exchange/filesystem service in 24.90 of 39.61 client CPU
     seconds. Capture workloads differ; do not infer causal savings from shares.
     Allocation, path resolution, sends and teardown remain significant. Separate identical
     process names using executable mappings, distinguish planner mappings from
