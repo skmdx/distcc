@@ -10,14 +10,19 @@ reduce client filesystem service cost in remote preprocessing
     planning stops before opening the source. Cross-target execution passes.
     Warm directory replies now use one descriptor for fresh metadata and
     child lookups without allocating a DIR. The latest matched full build
-    completes the same 6400 remote jobs: elapsed time falls 0.60% and client
-    CPU 0.53%, but remote CPU occupancy falls 4.38%. One pair with such a
-    small elapsed difference does not establish a sustained speedup or
-    resolution of idle capacity.
+    completes the same 6400 remote jobs. Buffered TCP client reads then
+    reduce receive syscalls from 42 to 20-21 in the focused test. The latest
+    matched full-build pair takes 426.634 versus 438.846 seconds (-2.78%),
+    with client CPU down 4.13% and remote occupancy 2.991 versus 2.905 cores.
+    Outputs match and all jobs succeed without timeouts or failed samples.
+    This single pair does not establish a sustained speedup or resolve idle
+    capacity; client supply remains the limiting concern.
     The client filesystem/transport processes still consume about half the
     sampled CPU. GCC planning, other local cc1 invocations, driver startup,
     path resolution, TCP sends and teardown remain significant. Distinguish
-    planner mappings from ordinary cc1 when attributing profiles. Continue
+    planner mappings from ordinary cc1 when attributing profiles. Frame-pointer
+    capture gives more useful user caller chains than the current DWARF unwind.
+    Continue
     matched full builds; dispatch counts and microbenchmarks do not establish
     that idle capacity or the client supply bottleneck has been resolved.
 
