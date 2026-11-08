@@ -842,6 +842,49 @@ class GccFrontendTest(BrokerTestCase):
             self.compile(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected, action)
 
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_directory_hints_forget_unused_subtrees(self):
+        self.start_frontend()
+        headers = self.work/'headers'
+        branches = 12
+        for index in range(branches):
+            directory = headers/f'branch{index}/nested'
+            directory.mkdir(parents=True)
+            (directory/'value.h').write_text(f'#define VALUE_{index} {index + 1}\n')
+        command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'hello.c', '-o', 'out.o']
+        self.source.write_text(
+            ''.join(f'#include <branch{i}/nested/value.h>\n' for i in range(branches)) +
+            'int value(void) { return ' + '+'.join(f'VALUE_{i}' for i in range(branches)) + '; }\n')
+        self.compile(command)
+        # Keep the same context but stop using the other subtrees. Predictions
+        # from the preceding job must not become observations of this one.
+        self.source.write_text('#include <branch0/nested/value.h>\n'
+                               'int value(void) { return VALUE_0; }\n')
+        self.compile(command)
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        trace = self.work/'unused-subtrees.trace'
+        result = subprocess.run(['strace', '-f', '-yy', '-e',
+                                 'trace=newfstatat,statx,openat', '-o', str(trace),
+                                 str(self.build/'distcc'), *command], cwd=self.work,
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('pooled TCP job completed', result.stderr)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        operations = trace.read_text().splitlines()
+        for index in range(1, branches):
+            unexpected = [line for line in operations
+                          if f'"branch{index}"' in line or f'/branch{index}/' in line]
+            self.assertEqual(unexpected, [], 'unused subtree remained in the next prediction')
+        # A pruned branch is still available on demand, with fresh contents.
+        (headers/'branch11/nested/value.h').write_text('#define VALUE_11 73\n')
+        self.source.write_text('#include <branch11/nested/value.h>\n'
+                               'int value(void) { return VALUE_11; }\n')
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
     def test_directory_batch_replies_and_failed_prefetch_release_mount(self):
         compiler = shutil.which('c++')
         assert compiler is not None, 'C++ compiler required'

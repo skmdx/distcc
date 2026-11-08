@@ -3,14 +3,19 @@
 #include "src/gcc_files.cc"
 #include <thread>
 
-// These framing tests deliberately have no persistent snapshots. The native
-// compiler integration tests exercise the shared cache and its invalidation.
+// These framing tests inspect published hints but do not retain snapshots.
+// Native compiler integration tests exercise the shared cache and invalidation.
+static std::vector<std::string> published_hints;
 extern "C" const dcc_file_cache_api dcc_file_cache_records = {
     [](const char *) -> dcc_record_cache * { return nullptr; },
     [](dcc_record_cache *) {},
     [](dcc_record_cache *, const void *, size_t, size_t *) { return -1; },
     [](const void *, size_t, const void *, size_t, const void **, size_t *) { return 0; },
-    [](dcc_record_cache *, const void *, size_t, const void *, size_t) {}
+    [](dcc_record_cache *, const void *key, size_t key_size, const void *data, size_t size) {
+        if (key_size >= sizeof("directory-hints") &&
+            !memcmp(key, "directory-hints", sizeof("directory-hints")))
+            published_hints.emplace_back(static_cast<const char *>(data), size);
+    }
 };
 
 static void require(bool ok, const char *message)
@@ -105,7 +110,7 @@ static void replies(const std::string &mode)
     } else require(result == (mode == "disconnect" ? EIO : EPROTO), "bad reply accepted");
 }
 
-static void negative_hints()
+static void negative_hint_queries()
 {
     Files files(-1, "/sandbox", "fixture", "/cache", "/tree", "part.c");
     Query query;
@@ -131,7 +136,15 @@ static void negative_hints()
     integer(reply, DCC_FS_DIRECTORY_STABLE); integer(reply, 1);
     integer(reply, 7); integer(reply, ENOENT); reply += "missing";
     require(!files.accept(query, {{}, reply.data(), reply.size()}), "disappeared child reply");
-    require(entry->hints.empty(), "absent metadata hint survived its fresh lookup");
+    require(files.status("/tree/missing", entry) == ENOENT, "fresh negative lookup");
+}
+
+static void negative_hints()
+{
+    published_hints.clear();
+    negative_hint_queries();
+    require(published_hints == std::vector<std::string>{""},
+            "absent metadata hint was published for the next job");
 }
 
 static void disconnected_mount(const char *root)

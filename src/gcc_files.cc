@@ -26,9 +26,8 @@ struct Entry {
     int error = 0;
     std::array<char, DCC_FS_METADATA> version{};
     bool queried = false, listed = false;
-    bool hints_changed = false;
     std::vector<std::string> children;
-    std::set<std::string> hints;
+    std::set<std::string> hints, observed;
     dccfs::Buffer bytes;
     unsigned mode() const { return number(version.data()+32, 4); }
 };
@@ -45,9 +44,9 @@ class Files {
         return !name.empty() && name != "." && name != ".." &&
             name.find_first_of("/\0", 0, 2) == std::string_view::npos;
     }
-    static std::string pack_hints(const Entry &entry, size_t limit) {
+    static std::string pack_hints(const std::set<std::string> &hints, size_t limit) {
         std::string result;
-        for (const auto &name : entry.hints) {
+        for (const auto &name : hints) {
             if (name.size()+1 > limit-result.size()) break;
             result += name; result += '\0';
         }
@@ -62,9 +61,11 @@ public:
           root(std::move(root)) {}
     ~Files() {
         for (const auto &[path, entry] : entries) {
-            if (!entry.listed || !entry.hints_changed) continue;
+            if (!entry.listed || entry.hints == entry.observed) continue;
+            // Speculative queries do not teach the next job to repeat them.
+            // Retain only children the compiler actually requested this time.
             connection.save_directory_hints(path, scope,
-                pack_hints(entry, DCC_FS_QUERY_MAX-5-DCC_FS_METADATA-path.size()));
+                pack_hints(entry.observed, DCC_FS_QUERY_MAX-5-DCC_FS_METADATA-path.size()));
         }
     }
     ino_t inode(uint64_t device, uint64_t number) {
@@ -98,7 +99,7 @@ public:
         query.bytes.append(listing_version.data(), DCC_FS_METADATA);
         // Reserve the outer operation and the batch entry's length/operation.
         if (query.bytes.size() > DCC_FS_QUERY_MAX-12) return entry.error = ENAMETOOLONG;
-        query.bytes += pack_hints(entry, DCC_FS_QUERY_MAX-12-query.bytes.size());
+        query.bytes += pack_hints(entry.hints, DCC_FS_QUERY_MAX-12-query.bytes.size());
         return 0;
     }
     int accept(const Query &query, const dccfs::Buffer &response) {
@@ -130,7 +131,6 @@ public:
         }
         size_t offset = DCC_FS_METADATA+8;
         unsigned count = number(response.data+DCC_FS_METADATA+4, 4);
-        std::set<std::string> retained;
         for (unsigned i = 0; i < count; ++i) {
             if (response.size-offset < 8) return entry.error = EPROTO;
             unsigned length = number(response.data+offset, 4), error = number(response.data+offset+4, 4);
@@ -150,12 +150,9 @@ public:
                 }
                 child.queried = error || !S_ISDIR(child.mode());
             }
-            if (error != ENOENT && entry.hints.count(name)) retained.insert(name);
             if (!reused) entry.children.push_back(std::move(name));
         }
         if (offset != response.size) return entry.error = EPROTO;
-        if (entry.hints.size() != retained.size()) entry.hints_changed = true;
-        entry.hints = std::move(retained);
         entry.listed = true;
         if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) {
             std::string names;
@@ -252,9 +249,8 @@ public:
                 }
                 // A listed parent already proves absence. Repeated failed
                 // lookups must not turn that into a fresh stat on every job.
-                if ((!entry.queried || entry.error != ENOENT) &&
-                    parent->second.hints.insert(path.substr(separator+1)).second)
-                    parent->second.hints_changed = true;
+                if (!entry.queried || entry.error != ENOENT)
+                    parent->second.observed.insert(path.substr(separator+1));
             }
         }
         if (entry.queried) return entry.error;

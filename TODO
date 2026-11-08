@@ -62,6 +62,12 @@ reduce client filesystem service cost in remote preprocessing
     ordinary cc1, and do not add overlapping inclusive caller costs. Continue
     complete matched builds; dispatch counts and microbenchmarks do not prove
     that idle capacity or the client supply bottleneck has been resolved.
+    Directory predictions now retain only children actually requested by the
+    last job, instead of accumulating every previously prefetched subtree.
+    A real-compiler regression reproduces and removes eleven unused branches
+    from the next job while preserving on-demand changes. All 55 GCC/frontend
+    checks pass, including a separate final framing-contract run. Deployment
+    and complete-build performance validation for this change remain pending.
 
 recognize arbitrary input suffixes with explicit compiler language
 
