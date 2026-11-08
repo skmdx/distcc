@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <map>
+#include <filesystem>
 #include <vector>
 #include <algorithm>
 extern "C" {
@@ -174,7 +175,7 @@ bool mapping(const char *path, const std::string &value) {
 }
 }
 extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
-                                      const char *identity, const char *cache_root) {
+                                      const char *identity, const char *job_root) {
     uid_t uid = getuid(); gid_t gid = getgid();
     if (mkdir(mountpoint, 0700) || unshare(CLONE_NEWUSER | CLONE_NEWNS) ||
         !mapping("/proc/self/setgroups", "deny") ||
@@ -208,7 +209,10 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
         if (first > 3) close_range(3, first-1, 0);
         if (last > first+1) close_range(first+1, last-1, 0);
         close_range(last+1, ~0U, 0);
-        state->files = std::make_unique<Files>(channel, mountpoint, identity, cache_root);
+        // TMPDIR is already the job root here. Like the Clang frontend, keep
+        // immutable snapshots in its parent so job cleanup cannot remove them.
+        auto cache_root = std::filesystem::path(job_root).parent_path().string();
+        state->files = std::make_unique<Files>(channel, mountpoint, identity, cache_root.c_str());
         int result = fuse_loop(state->fs);
         state->files.reset();
         fuse_destroy(state->fs);

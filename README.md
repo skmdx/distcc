@@ -723,6 +723,9 @@ GCC jobs isolate their mount in a dedicated child of the persistent worker.
 A single filesystem service handles that job's lookups; it and the compiler
 share cancellation ownership. The mount disappears at job exit. Filesystem
 service CPU and memory are included in the job's resource measurements.
+Header snapshots use the worker's shared cache outside the job tree and survive
+job cleanup. Each job obtains fresh metadata before reusing cached contents;
+changes to a header invalidate its snapshot, even with equal size and mtime.
 
 `DISTCC_CLANG_LOCAL=1` also reuses Clang and LLD libraries for local driver
 commands, including configure probes. The existing broker caches a control

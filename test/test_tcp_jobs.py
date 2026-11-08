@@ -215,14 +215,13 @@ class FileCacheTest(unittest.TestCase):
 class GccFrontendTest(BrokerTestCase):
     worker_address = '127.0.0.1'
 
-    def start_frontend(self):
+    def start_frontend(self, **settings):
         self.module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
         if not self.module:
             directory = subprocess.check_output([self.cc, '-print-file-name=plugin'], text=True).strip()
             self.module = str(Path(directory)/'distcc_gcc_scan.so')
         self.assertTrue(Path(self.module).is_file(), 'GCC native module must be built before testing')
-        self.restart_server(self.build/'distccd', DISTCC_GCC_SCAN_LIBRARY=self.module,
-                            DISTCCD_FILE_CACHE=str(self.work/'cache'))
+        self.restart_server(self.build/'distccd', DISTCC_GCC_SCAN_LIBRARY=self.module, **settings)
         self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
         self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
                         DISTCC_TESTING_INCLUDE_SERVER='1',
@@ -253,7 +252,7 @@ class GccFrontendTest(BrokerTestCase):
         self.assertEqual(subprocess.check_output([str(self.work/'program')]), b'37 hello.c\n')
 
     def test_cpp_search_classes_macros_symlinks_and_warm_cache(self):
-        self.start_frontend()
+        self.start_frontend(DISTCCD_FILE_CACHE=str(self.work/'cache'))
         compiler = shutil.which('g++')
         self.assertIsNotNone(compiler)
         headers = self.work/'headers'
@@ -289,6 +288,40 @@ class GccFrontendTest(BrokerTestCase):
         self.assertIn('pooled TCP job completed', result.stderr)
         self.assertNotIn('gave up analyzing', result.stderr)
         self.assertFalse((self.work/'out.o').exists())
+
+    def test_default_cache_survives_jobs_and_refreshes_changed_headers(self):
+        self.start_frontend()
+        header = self.work/'value.h'
+        header.write_text('#define VALUE 41\n/*' + 'header contents\n' * 8192 + '*/\n')
+        self.source.write_text('#include "value.h"\nint value(void) { return VALUE; }\n')
+        command = [self.cc, '-nostdinc', '-c', 'hello.c', '-o', 'out.o']
+
+        def compile_and_measure():
+            result = self.compile(command)
+            match = re.search(r'frontend filesystem: (\d+) requests, (\d+) bytes', result.stderr)
+            self.assertIsNotNone(match, result.stderr)
+            assert match is not None
+            return tuple(map(int, match.groups()))
+
+        cold = compile_and_measure()
+        expected = (self.work/'out.o').read_bytes()
+        warm = compile_and_measure()
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        self.assertLess(warm[0], cold[0], 'default cache did not survive job cleanup')
+        self.assertGreater(cold[1] - warm[1], header.stat().st_size)
+
+        # Equal size and restored mtime must not hide a changed header.
+        before = header.stat()
+        header.write_text(header.read_text().replace('VALUE 41', 'VALUE 42'))
+        os.utime(header, ns=(before.st_atime_ns, before.st_mtime_ns))
+        changed = compile_and_measure()
+        self.assertGreater(changed[1] - warm[1], before.st_size)
+        actual = (self.work/'out.o').read_bytes()
+        self.assertNotEqual(actual, expected)
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        self.assertEqual(actual, (self.work/'out.o').read_bytes())
+        refreshed = compile_and_measure()
+        self.assertLess(refreshed[0], changed[0])
 
     def test_environment_search_path_preserves_user_header_dependencies(self):
         self.start_frontend()
