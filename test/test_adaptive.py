@@ -661,7 +661,13 @@ int main(void) {
                             self.skipTest('at least two available CPUs required')
                         self.assertIsNone(proc.poll())
                         watches = Path(f'/proc/{proc.pid}/fdinfo')
-                        if any('inotify wd:' in entry.read_text() for entry in watches.iterdir()):
+                        installed = False
+                        for entry in watches.iterdir():
+                            # The child can close an unrelated descriptor
+                            # between directory enumeration and inspection.
+                            with contextlib.suppress(FileNotFoundError):
+                                installed |= 'inotify wd:' in entry.read_text()
+                        if installed:
                             break
                         self.assertLess(time.monotonic(), deadline, 'memory watch was not installed')
                         time.sleep(.01)
@@ -759,13 +765,16 @@ int main(void) {
     unsigned long long heavy = dcc_resource_estimate(large);
     assert(dcc_resource_class_slots(16, large, 2*light) >=
            dcc_resource_class_slots(16, large, 2*heavy));
-    /* Every job kind must learn its own memory estimate, including the last
-     * bucket, instead of permanently inheriting unrelated job peaks. */
+    /* Workload classes learn their own estimates, including the last bucket.
+     * Both lazy frontends intentionally share one admission class. */
     input.plain_size = ULLONG_MAX;
     for (unsigned kind = 0; kind < DCC_JOB_KIND_COUNT; ++kind) {
         job.kind = kind;
         unsigned memory_class = dcc_resource_class(&job);
-        assert(!dcc_resource_known(memory_class));
+        if (kind == DCC_JOB_GCC_FRONTEND) {
+            assert(memory_class == 1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS);
+            assert(dcc_resource_known(memory_class));
+        } else assert(!dcc_resource_known(memory_class));
         dcc_resource_observe(memory_class, 64*M, 1);
         assert(dcc_resource_known(memory_class));
         assert(dcc_resource_estimate(memory_class) == 256*M);
@@ -855,17 +864,6 @@ class CpuPerfTest(DistccTestCase):
                 os.killpg(process.pid, signal.SIGKILL)
             process.communicate()
 
-    def test_stats_eof_when_request_arrives_after_response(self):
-        for unused in range(50):
-            with socket.create_connection(('127.0.0.1', self.stats_ports[0]), timeout=1) as sock:
-                # The stats endpoint also serves clients that send no request.
-                # Race a late request against closing the response socket.
-                response = sock.recv(4096)
-                sock.sendall(b'GET / HTTP/1.0\r\n\r\n')
-                while chunk := sock.recv(4096):
-                    response += chunk
-                self.assertIn(b'</distccstats>', response)
-
     def test_live_sampling_idle_and_global_recovery(self):
         if not list(Path('/sys/devices/system/cpu/cpufreq').glob('policy*/cpuinfo_avg_freq')):
             self.skipTest('hardware frequency feedback is unavailable')
@@ -922,6 +920,67 @@ class CpuPerfTest(DistccTestCase):
         self.assertEqual(expired['dcc_cpu_probe'], '0')
         self.assertGreater(int(expired['dcc_capacity']), 1)
         self.assertGreater(int(expired['dcc_capacity']), 1)
+
+
+class StatsTest(DistccTestCase):
+    worker_count = 1
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'prefork child descriptors')
+    def test_replacement_worker_does_not_keep_statistics_connections_open(self):
+        parent = self.daemons[0].pid
+        children = Path(f'/proc/{parent}/task/{parent}/children')
+        original = set(map(int, children.read_text().split()))
+        self.assertTrue(original)
+        with socket.create_connection(('127.0.0.1', self.stats_ports[0]), timeout=2) as sock:
+            sock.sendall(b'GET / HTTP/1.0\r\n')
+            # A second completed request proves the first was accepted before
+            # a worker is replaced and inherits the parent's descriptor table.
+            self.assertIn('</distccstats>', self.get_stats(self.stats_ports[0]))
+            os.kill(next(iter(original)), signal.SIGTERM)
+            deadline = time.monotonic() + 3
+            while not set(map(int, children.read_text().split())) - original:
+                self.assertLess(time.monotonic(), deadline, 'worker was not replaced')
+                time.sleep(.01)
+            sock.sendall(b'\r\n')
+            response = b''
+            while chunk := sock.recv(4096):
+                response += chunk
+            self.assertIn(b'</distccstats>', response)
+
+    def test_fragmented_request_and_small_receive_window(self):
+        with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+            sock.settimeout(.05)
+            sock.connect(('127.0.0.1', self.stats_ports[0]))
+            # Replying before the request arrives used to reset the connection
+            # with most of the response still queued behind the receive window.
+            with self.assertRaises(socket.timeout):
+                sock.recv(1)
+            sock.sendall(b'GET / HTTP/1.0\r\nX-Padding: ' + b'x' * 4096 + b'\r\n\r')
+            with self.assertRaises(socket.timeout):
+                sock.recv(1)
+            sock.sendall(b'\n')
+            sock.settimeout(2)
+            response = b''
+            while chunk := sock.recv(4096):
+                response += chunk
+            self.assertIn(b'</distccstats>', response)
+
+    def test_incomplete_queries_do_not_block_compilation_or_other_queries(self):
+        with contextlib.ExitStack() as stack:
+            peers = [stack.enter_context(socket.create_connection(
+                ('127.0.0.1', self.stats_ports[0]), timeout=2)) for _ in range(32)]
+            for peer in peers:
+                peer.sendall(b'GET / HTTP/1.0\r\n')
+            self.assertIn('</distccstats>', self.get_stats(self.stats_ports[0]))
+            self.compile(self.host(0), 'while-stats-pending')
+            for peer in peers:
+                peer.sendall(b'\r\n')
+                response = b''
+                while chunk := peer.recv(4096):
+                    response += chunk
+                self.assertIn(b'</distccstats>', response)
+        self.assertIn('</distccstats>', self.get_stats(self.stats_ports[0]))
 
 
 class CpuCalibrationTest(DistccTestCase):

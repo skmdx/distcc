@@ -664,7 +664,10 @@ and use configured slots/speed until the next refresh. The broker probes hosts
 in parallel once per second and retains the last valid response for at most
 five seconds after failures. The stats endpoint must
 be reachable from the client and uses the daemon's existing access rules; it is
-plain HTTP, including when compilation uses GSSAPI. `stats` requires a TCP host.
+plain HTTP, including when compilation uses GSSAPI. Send a complete bodyless HTTP
+request, such as `GET / HTTP/1.0\r\n\r\n`; the server waits for the header terminator
+before replying. Partial requests and slow readers do not block compiler dispatch
+or other statistics clients. `stats` requires a TCP host.
 `speed` alone also enables weighted selection and can be used with SSH hosts.
 In mixed lists, entries without metrics use their configured slots and speed 1.
 Final ties follow list order (`--randomize` can change that order). Repeated entries for

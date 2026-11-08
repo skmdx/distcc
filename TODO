@@ -7,9 +7,10 @@ reduce client filesystem service cost in remote preprocessing
     The native GCC/FUSE path removes the pump dependency scan from the client.
     Cross-target compilation, linkage and execution pass, and matched full
     builds demonstrate reduced elapsed time and client CPU. Client filesystem
-    responses and communication still limit worker occupancy. Sparse attribute
-    queries and shared directory-name caching did not improve complete builds
-    and were removed. Continue measuring full-build CPU and occupancy; dispatch
+    responses and communication still limit worker occupancy after repairing
+    default cache lifetime and retaining fresh metadata batching. Directory
+    enumeration and compiler search-plan startup remain prominent in profiles.
+    Continue measuring full-build CPU and occupancy; dispatch
     counts alone do not establish that client input service is no longer limiting.
 
 type-check TCP integration tests

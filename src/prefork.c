@@ -92,6 +92,7 @@ struct pending {
 };
 static struct worker *workers;
 static struct pollfd *parent_polls;
+static int parent_poll_capacity;
 static struct pending pending[MAX_PENDING];
 static int worker_channel = -1;
 static int worker_count;
@@ -326,6 +327,12 @@ static void receive_worker_message(struct worker *w)
 int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout)
 {
     if (shutdown_signal) finish_shutdown();
+    int needed = count + worker_count + 3 * MAX_PENDING + 3;
+    if (needed > parent_poll_capacity) {
+        parent_polls = realloc(parent_polls, needed * sizeof(*parent_polls));
+        if (!parent_polls) dcc_exit(EXIT_OUT_OF_MEMORY);
+        parent_poll_capacity = needed;
+    }
     struct pollfd *polls = parent_polls;
     int i, j, result, base = count + 1, sockets = base + worker_count;
     int total = sockets + MAX_PENDING;
@@ -494,8 +501,7 @@ int dcc_preforking_parent(int listen_fd)
 #ifdef __linux__
     worker_count = dcc_max_kids;
     workers = calloc(worker_count, sizeof(*workers));
-    parent_polls = calloc(worker_count + 3 * MAX_PENDING + 5, sizeof(*parent_polls));
-    if (!workers || !parent_polls) return EXIT_OUT_OF_MEMORY;
+    if (!workers) return EXIT_OUT_OF_MEMORY;
     for (ret = 0; ret < worker_count; ++ret) workers[ret].fd = -1;
     for (ret = 0; ret < MAX_PENDING; ++ret) pending[ret].fd = -1;
     if (getenv("DISTCC_LOCAL_SOCKET")) {

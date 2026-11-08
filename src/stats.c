@@ -28,12 +28,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
-#include <signal.h>
 #include <string.h>
 #include <time.h>
 
 #include <sys/socket.h>
-#include <sys/select.h>
 #include <sys/statvfs.h>
 
 #include "exitcode.h"
@@ -57,6 +55,18 @@
 #endif
 
 int dcc_statspipe[2];
+
+/* Accepted HTTP connections belong to the parent event loop. A partial
+ * request must neither stall compiler dispatch nor trigger an early reply. */
+static int stats_listener = -1;
+static struct stats_client {
+    int fd, newline;
+    time_t since;
+    char *reply;
+    size_t length, sent;
+} *stats_clients;
+static int stats_count, stats_capacity;
+static struct pollfd *stats_polls;
 
 #define MAX_FILENAME_LEN 1024
 
@@ -111,6 +121,17 @@ int dcc_stats_init(void) {
 void dcc_stats_init_kid(void) {
     if (arg_stats) {
         close(dcc_statspipe[0]);
+        if (stats_listener >= 0) close(stats_listener);
+        for (int i = 0; i < stats_count; ++i) {
+            close(stats_clients[i].fd);
+            free(stats_clients[i].reply);
+        }
+        free(stats_clients);
+        free(stats_polls);
+        stats_clients = NULL;
+        stats_polls = NULL;
+        stats_count = stats_capacity = 0;
+        stats_listener = -1;
     }
 }
 
@@ -377,13 +398,10 @@ static void format_capacity(char *buffer, size_t size, char *memory, size_t memo
     }
 }
 
-/** Accept a connection and send statistics, including to request-less peers. */
-static void dcc_service_stats_request(int http_fd) {
-    int acc_fd;
+/** Collect one coherent statistics response after receiving its request. */
+static size_t dcc_stats_reply(char reply[DCC_STATS_SIZE]) {
     int *ct;
     size_t reply_len;
-    char challenge[1024];
-    char reply[DCC_STATS_SIZE];
     char compile_capacity[DCC_MEMORY_BUCKETS * 12];
     char pump_capacity[DCC_MEMORY_BUCKETS * 12];
     char rust_capacity[DCC_MEMORY_BUCKETS * 12];
@@ -394,8 +412,6 @@ static void dcc_service_stats_request(int http_fd) {
     char rust_memory[DCC_MEMORY_BUCKETS * 21];
     char thinlto_memory[DCC_MEMORY_BUCKETS * 21];
     char offload_memory[DCC_MEMORY_BUCKETS * 21];
-    struct dcc_sockaddr_storage cli_addr;
-    socklen_t cli_len = sizeof(cli_addr);
     double loadavg[3];
     int free_space_mb;
     int free_mem_mb;
@@ -409,7 +425,6 @@ static void dcc_service_stats_request(int http_fd) {
     unsigned long long ready_idle_ns = 0;
     unsigned long parallel_tasks = 0;
     unsigned parallel_peak = 0;
-    ssize_t ret;
 
     const char replytemplate[] = "\
 HTTP/1.0 200 OK\n\
@@ -526,18 +541,14 @@ dcc_free_mem %d MB\n\
     if (dcc_stats.longest_job_compiler[0] == 0)
         strcpy(dcc_stats.longest_job_compiler, "none");
 
-    acc_fd = accept(http_fd, (struct sockaddr *) &cli_addr, &cli_len);
-    if (acc_fd < 0) return;
-    if (dcc_check_client((struct sockaddr *)&cli_addr,
-                         (int) cli_len,
-                         opt_allowed) == 0) {
+    {
         /* Resource queries can outlast short client jobs. Sample load near
          * reply construction, and report both fields from the same instant. */
         int current_load = dcc_getcurrentload(), running = current_load;
 #ifdef __linux__
         if (running > 0) running--; /* Exclude this statistics request itself. */
 #endif
-        reply_len = snprintf(reply, sizeof(reply), replytemplate,
+        reply_len = snprintf(reply, DCC_STATS_SIZE, replytemplate,
                                dcc_stats.counters[STATS_TCP_ACCEPT],
                                dcc_stats.counters[STATS_REJ_BAD_REQ],
                                dcc_stats.counters[STATS_REJ_OVERLOAD],
@@ -578,20 +589,60 @@ dcc_free_mem %d MB\n\
                                free_space_mb,
                                free_mem_mb
                                );
-        if (reply_len >= sizeof(reply)) {
+        if (reply_len >= DCC_STATS_SIZE) {
             rs_log_warning("statistics response truncated");
-            reply_len = sizeof(reply) - 1;
+            reply_len = DCC_STATS_SIZE - 1;
         }
-        dcc_set_nonblocking(acc_fd);
-        ret = read(acc_fd, challenge, 1024); /* empty the receive queue */
-        if (ret < 0) rs_log_info("read on acc_fd failed");
-        dcc_writex(acc_fd, reply, reply_len);
     }
+    return reply_len;
+}
 
-    /* A request can arrive after the nonblocking drain. Send EOF after the
-     * response before close can reset a socket with unread incoming bytes. */
-    shutdown(acc_fd, SHUT_WR);
-    dcc_close(acc_fd);
+static void dcc_stats_accept(void)
+{
+    struct dcc_sockaddr_storage address;
+    socklen_t size = sizeof(address);
+    int fd = accept(stats_listener, (struct sockaddr *)&address, &size);
+    if (fd < 0) return;
+    if (dcc_check_client((struct sockaddr *)&address, size, opt_allowed) ||
+        fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+        close(fd);
+        return;
+    }
+    dcc_set_nonblocking(fd);
+    if (stats_count == stats_capacity) {
+        stats_capacity = stats_capacity ? stats_capacity * 2 : 8;
+        stats_clients = realloc(stats_clients, stats_capacity * sizeof(*stats_clients));
+        stats_polls = realloc(stats_polls, (stats_capacity + 2) * sizeof(*stats_polls));
+        if (!stats_clients || !stats_polls) dcc_exit(EXIT_OUT_OF_MEMORY);
+    }
+    stats_clients[stats_count++] = (struct stats_client){ .fd = fd, .since = time(NULL) };
+}
+
+/* Return true when the connection is finished. All I/O stays nonblocking,
+ * including replies to clients that stop reading. HTTP statistics use a
+ * bodyless request; consume its complete header before sending or closing. */
+static int dcc_stats_client_event(struct stats_client *client)
+{
+    ssize_t n;
+    if (!client->reply) {
+        char input[4096];
+        n = read(client->fd, input, sizeof(input));
+        if (n <= 0) return !n || (errno != EAGAIN && errno != EINTR);
+        for (ssize_t i = 0; i < n; ++i) {
+            if (input[i] == '\n' && client->newline) {
+                client->reply = malloc(DCC_STATS_SIZE);
+                if (!client->reply) dcc_exit(EXIT_OUT_OF_MEMORY);
+                client->length = dcc_stats_reply(client->reply);
+                break;
+            }
+            if (input[i] != '\r') client->newline = input[i] == '\n';
+        }
+        if (!client->reply) return 0;
+    }
+    n = write(client->fd, client->reply + client->sent, client->length - client->sent);
+    if (n < 0) return errno != EAGAIN && errno != EINTR;
+    client->sent += n;
+    return client->sent == client->length;
 }
 
 
@@ -631,13 +682,7 @@ static void dcc_stats_process(struct statsdata *sd) {
  **/
 int dcc_stats_server(int listen_fd)
 {
-    int http_fd;
-#ifndef __linux__
-    int max_fd;
-    struct timeval timeout;
-#endif
     int i, ret;
-    fd_set fds, fds_master;
     struct statsdata sd;
 
     /* clear stats data */
@@ -647,56 +692,51 @@ int dcc_stats_server(int listen_fd)
     dcc_stats.longest_job_name[0] = 0;
     dcc_stats.io_rate = -1;
 
-    if ((ret = dcc_socket_listen(arg_stats_port, &http_fd,
+    if ((ret = dcc_socket_listen(arg_stats_port, &stats_listener,
                                     opt_listen_addr)) != 0) {
         return ret;
     }
     rs_log_info("HTTP server started on port %d\n", arg_stats_port);
 
     /* We don't want children to inherit this FD */
-    fcntl(http_fd, F_SETFD, FD_CLOEXEC);
-
-#ifndef __linux__
-    max_fd = (http_fd > dcc_statspipe[0]) ? (http_fd + 1)
-                                           : (dcc_statspipe[0] + 1);
-#endif
-
-    FD_ZERO(&fds_master);
-    FD_SET(dcc_statspipe[0], &fds_master);
-    FD_SET(http_fd, &fds_master);
+    fcntl(stats_listener, F_SETFD, FD_CLOEXEC);
+    stats_polls = malloc(2 * sizeof(*stats_polls));
+    if (!stats_polls) return EXIT_OUT_OF_MEMORY;
 
     while (1) {
         dcc_stats_minutely_update();
         dcc_stats_calc_kid_avg();
 
-#ifndef __linux__
-        timeout.tv_sec = 60;
-        timeout.tv_usec = 0;
-#endif
-        fds = fds_master;
+        stats_polls[0] = (struct pollfd){ dcc_statspipe[0], POLLIN, 0 };
+        stats_polls[1] = (struct pollfd){ stats_listener, POLLIN, 0 };
+        for (i = 0; i < stats_count; ++i)
+            stats_polls[i + 2] = (struct pollfd){stats_clients[i].fd,
+                stats_clients[i].reply ? POLLOUT : POLLIN, 0};
+        int timeout = stats_count ? 1000 : 60000;
 #ifdef __linux__
-        {
-            struct pollfd extra[2] = {{ dcc_statspipe[0], POLLIN, 0 }, { http_fd, POLLIN, 0 }};
-            ret = dcc_prefork_poll(listen_fd, extra, 2, 60000);
-            FD_ZERO(&fds);
-            if (extra[0].revents & POLLIN) FD_SET(dcc_statspipe[0], &fds);
-            if (extra[1].revents & POLLIN) FD_SET(http_fd, &fds);
-        }
+        ret = dcc_prefork_poll(listen_fd, stats_polls, stats_count + 2, timeout);
 #else
-        ret = select(max_fd, &fds, NULL, NULL, &timeout);
+        ret = poll(stats_polls, stats_count + 2, timeout);
 #endif
         if (ret != -1) {
-            if (FD_ISSET(dcc_statspipe[0], &fds)) {
+            if (stats_polls[0].revents & POLLIN) {
                 /* Received stats report from a child */
                 if (read(dcc_statspipe[0], &sd, sizeof(sd)) != -1) {
                     dcc_stats_process(&sd);
                 }
             }
 
-            if (FD_ISSET(http_fd, &fds)) {
-                /* Received request on stats reporting port */
-                dcc_service_stats_request(http_fd);
+            time_t now = time(NULL);
+            for (i = stats_count - 1; i >= 0; --i) {
+                struct stats_client *client = &stats_clients[i];
+                if (now - client->since >= dcc_get_io_timeout() ||
+                    (stats_polls[i + 2].revents && dcc_stats_client_event(client))) {
+                    close(client->fd);
+                    free(client->reply);
+                    *client = stats_clients[--stats_count];
+                }
             }
+            if (stats_polls[1].revents & POLLIN) dcc_stats_accept();
         } else {
             if (errno == EINTR) {
                 /* Interrupted -- SIGCHLD? */
