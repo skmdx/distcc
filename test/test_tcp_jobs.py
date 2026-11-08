@@ -1523,6 +1523,20 @@ int main(int argc, char **argv) {
                         '-o', str(executable)], check=True, capture_output=True, timeout=30)
         subprocess.run([str(executable)], check=True, timeout=10)
 
+    def test_frontend_directory_snapshots_keep_freshness_and_permissions(self):
+        if os.geteuid() == 0:
+            self.skipTest('directory read permissions require an unprivileged caller')
+        compiler = shutil.which('cc')
+        assert compiler is not None, 'C compiler required for filesystem reply tests'
+        executable = self.work/'metadata'
+        compiled = subprocess.run([compiler, '-D_GNU_SOURCE', '-ffunction-sections', '-fdata-sections',
+                        '-I'+str(self.build/'src'), str(self.build/'test/frontend_metadata_contract.c'),
+                        str(self.build/'src/tcp_job.c'), str(self.build/'src/argutil.c'),
+                        '-Wl,--gc-sections,--wrap=fstat', '-llz4', '-o', str(executable)],
+                        capture_output=True, timeout=30)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        subprocess.run([str(executable), str(self.work)], check=True, timeout=5)
+
     def test_frontend_reply_stream_owns_open_file_and_checks_truncation(self):
         # Exercise the actual reply producer, chunk encoder and decoder,
         # including binary payloads that a C source fixture cannot contain.
