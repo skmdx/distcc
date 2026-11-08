@@ -8,8 +8,9 @@ reduce client filesystem service cost in remote preprocessing
     Cross-target compilation, linkage and execution pass, and matched full
     builds demonstrate reduced elapsed time and client CPU. Client filesystem
     responses and communication still limit worker occupancy after repairing
-    default cache lifetime and retaining fresh metadata batching. Directory
-    enumeration and compiler search-plan startup remain prominent in profiles.
+    default cache lifetime and retaining fresh metadata batching. Reusing
+    versioned directory names reduces enumeration, but fresh metadata queries,
+    communication and compiler search-plan startup remain prominent in profiles.
     Continue measuring full-build CPU and occupancy; dispatch
     counts alone do not establish that client input service is no longer limiting.
 
