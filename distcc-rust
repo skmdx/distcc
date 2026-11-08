@@ -345,12 +345,18 @@ def worker(root, archive):
     # Bypass user PATH wrappers: namespace isolation and separate diagnostic
     # streams are part of the worker contract.
     sandbox = [shutil.which('bwrap', path=os.defpath) or '/usr/bin/bwrap',
-               '--unshare-all', '--die-with-parent', '--bind', str(root), '/',
-               '--bind', str(rooted(str(output))), str(output)]
+               '--unshare-all', '--die-with-parent', '--bind', str(root), '/']
     for path in RUNTIME:
         if Path(path).exists():
             sandbox.extend(['--ro-bind', path, path])
-    sandbox.extend(['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+    sandbox.extend(['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp'])
+    # A private scratch directory must not hide uploaded /tmp inputs. Mount
+    # their top-level trees read-only, then make the output subtree writable.
+    temporary = rooted('/tmp')
+    if temporary.is_dir():
+        for child in temporary.iterdir():
+            sandbox.extend(['--ro-bind', str(child), '/tmp/'+child.name])
+    sandbox.extend(['--bind', str(rooted(str(output))), str(output),
                     '--chdir', str(cwd), '--clearenv'])
     for name, value in job['environment'].items():
         if name.startswith(('LD_', 'DYLD_')) or name in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):

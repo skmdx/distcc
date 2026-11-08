@@ -21,6 +21,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @unittest.skipUnless(shutil.which('rustc') and shutil.which('bwrap'), 'rustc and bubblewrap required')
 class RustTest(BrokerTestCase):
+    def test_source_and_output_below_tmp_survive_worker_isolation(self):
+        helper = runpy.run_path(str(self.build/'distcc-rust'))
+        source = self.work/'temporary.rs'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        job, _, _, _ = helper['plan'](self.rustc, ['--crate-type=rlib', str(source)], self.work)
+        logical = '/tmp/distcc-client'
+        root = self.work/'worker'
+        staged = root/logical.lstrip('/')
+        staged.mkdir(parents=True)
+        shutil.copyfile(source, staged/source.name)
+        job.update(cwd=logical, output=logical+'/out', args=['--crate-name', 'temporary',
+            '--crate-type=rlib', logical+'/temporary.rs', '-o', logical+'/out/libtemporary.rlib'])
+        control = root/helper['CONTROL'].lstrip('/')
+        control.mkdir(parents=True)
+        (control/'job.json').write_text(json.dumps(job))
+        result = subprocess.run([str(self.build/'distcc-rust'), '--worker', str(root),
+            str(self.work/'result.tar')], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        main = self.work/'main.rs'
+        main.write_text('fn main() { assert_eq!(temporary::answer(), 42); }')
+        executable = self.work/'main'
+        result = self.rust(main, '--extern', 'temporary='+str(staged/'out/libtemporary.rlib'),
+                           '-o', executable, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([executable], check=True, timeout=5)
+
     def test_memory_refusal_reschedules_rust_without_fallback(self):
         self.start_memory_refusal()
         source = self.work / 'rescheduled.rs'
