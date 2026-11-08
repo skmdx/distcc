@@ -822,6 +822,37 @@ class GccFrontendTest(BrokerTestCase):
         self.assertEqual(counts[0], counts[1], f'depth-dependent directory waits: {counts}')
         print(f'Warm directory tree RPC counts (1, 8 levels): {counts}')
 
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_warm_prefetch_reads_directory_metadata_once(self):
+        self.start_frontend()
+        headers = self.work/'headers'
+        nested = headers/'branch/nested'
+        nested.mkdir(parents=True)
+        (nested/'value.h').write_text('#define VALUE 73\n')
+        self.source.write_text('#include <branch/nested/value.h>\n'
+                               'int value(void) { return VALUE; }\n')
+        command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'hello.c', '-o', 'out.o']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        self.compile(command)
+        trace = self.work/'directory-metadata.trace'
+        result = subprocess.run(['strace', '-f', '-yy', '-e',
+                                 'trace=newfstatat,statx,openat', '-o', str(trace),
+                                 str(self.build/'distcc'), *command], cwd=self.work,
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('pooled TCP job completed', result.stderr)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        lines = trace.read_text().splitlines()
+        for directory in (headers/'branch', nested):
+            duplicate = [line for line in lines
+                         if f'<{directory.parent}>, "{directory.name}"' in line
+                         and ('newfstatat(' in line or 'statx(' in line)]
+            self.assertEqual(duplicate, [], 'parent repeated a separately requested directory status')
+            self.assertTrue(any(f'"{directory}"' in line and 'openat(' in line and
+                                'O_DIRECTORY' in line for line in lines),
+                            'directory permissions and identity were not refreshed')
+
     def test_warm_directory_hints_split_bounded_batches(self):
         self.start_frontend()
         # The long shared prefix makes the deepest 256 queries exceed the

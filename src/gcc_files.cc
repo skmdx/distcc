@@ -47,14 +47,6 @@ class Files {
         return !name.empty() && name != "." && name != ".." &&
             name.find_first_of("/\0", 0, 2) == std::string_view::npos;
     }
-    static std::string pack_hints(const std::set<std::string> &hints, size_t limit) {
-        std::string result;
-        for (const auto &name : hints) {
-            if (name.size()+1 > limit-result.size()) break;
-            result += name; result += '\0';
-        }
-        return result;
-    }
     int load_hints(const dccfs::Buffer &snapshot) {
         if (!snapshot.owner) return 0;
         std::string_view bytes(snapshot.data, snapshot.size);
@@ -111,7 +103,8 @@ public:
         // identity without aliasing equal inode numbers on distinct devices.
         return inodes.try_emplace({device, number}, inodes.size()+1).first->second;
     }
-    int prepare(const std::string &path, Query &query) {
+    int prepare(const std::set<std::string> &scheduled, Query &query) {
+        const auto &path = *scheduled.begin();
         auto &entry = entries[path];
         if (hints_error) return entry.error = hints_error;
         query.path = path;
@@ -130,7 +123,16 @@ public:
         query.bytes.append(listing_version.data(), DCC_FS_METADATA);
         // Reserve the outer operation and the batch entry's length/operation.
         if (query.bytes.size() > DCC_FS_QUERY_MAX-12) return entry.error = ENAMETOOLONG;
-        query.bytes += pack_hints(entry.hints, DCC_FS_QUERY_MAX-12-query.bytes.size());
+        std::string child = path == "/" ? path : path+'/';
+        size_t prefix = child.size();
+        for (const auto &name : entry.hints) {
+            child.resize(prefix); child += name;
+            // This child's own query will refresh its identity and permissions.
+            // Do not ask the parent to stat it again, even across batch splits.
+            if (scheduled.count(child)) continue;
+            if (name.size()+1 > DCC_FS_QUERY_MAX-12-query.bytes.size()) break;
+            query.bytes += name; query.bytes += '\0';
+        }
         return 0;
     }
     int accept(const Query &query, const dccfs::Buffer &response) {
@@ -237,7 +239,7 @@ public:
                 continue;
             }
             Query query;
-            if (int error = prepare(*paths.begin(), query)) return error;
+            if (int error = prepare(paths, query)) return error;
             if (payload.size()+8+query.bytes.size() > DCC_FS_QUERY_MAX-4)
                 if (int error = flush()) return error;
             paths.erase(query.path);

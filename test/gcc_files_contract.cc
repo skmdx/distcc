@@ -114,7 +114,7 @@ static void negative_hint_queries()
 {
     Files files(-1, "/sandbox", "fixture", "/cache", "/tree", "part.c");
     Query query;
-    require(!files.prepare("/tree", query), "prepare empty directory");
+    require(!files.prepare({"/tree"}, query), "prepare empty directory");
     std::string reply(DCC_FS_METADATA, '\0');
     uint32_t mode = htonl(S_IFDIR | 0755);
     memcpy(reply.data()+32, &mode, sizeof(mode));
@@ -124,7 +124,7 @@ static void negative_hint_queries()
     for (unsigned i = 0; i < 3; ++i)
         require(files.status("/tree/missing", entry) == ENOENT, "cached negative lookup");
     Query next;
-    require(!files.prepare("/tree", next), "prepare subsequent query");
+    require(!files.prepare({"/tree"}, next), "prepare subsequent query");
     require(next.bytes.size() == strlen("/tree")+1+DCC_FS_METADATA,
             "negative lookup became a metadata hint");
 

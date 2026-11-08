@@ -9,9 +9,12 @@ reduce client filesystem service cost in remote preprocessing
     footprints now submit known descendants under current compiler roots in
     the first bounded batch. External symlink targets retain on-demand client
     authorization. The eight-level regression falls from nine RPCs to one;
-    256 branches split into four requests. All 56 GCC/frontend checks and
-    installed validation on five hosts pass.
-    Initial and warm complete builds take 315.584 and 307.956 seconds versus
+    256 branches split into four requests. Parent queries now omit attributes
+    supplied by a scheduled child's own query, including across batch splits;
+    each child still checks its current identity and permissions. All 57
+    GCC/frontend checks pass. Installed and full-build validation of this
+    metadata deduplication remain pending.
+    The preceding initial and warm builds take 315.584 and 307.956 seconds versus
     319.080 and 312.397; client CPU takes 938.617 and 900.668 seconds versus
     940.715 and 893.487. Each run completes 6400 remote jobs with matching
     hashes, valid statistics and no errors, timeouts, disconnects or fallback
