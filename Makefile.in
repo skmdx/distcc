@@ -315,10 +315,12 @@ distnews = $(PACKAGE_TARNAME)-$(VERSION).NEWS
 rpm_glob_pattern = "$(PACKAGE)"*[-_.]"$(VERSION)"[-_.]*.rpm
 deb_glob_pattern = "$(PACKAGE)"*[-_.]"$(VERSION)"[-_.]*.deb
 
+rpc_obj = src/rpc.o src/argv_file.o
+
 common_obj = src/arg.o src/argutil.o					\
 	src/cleanup.o src/compress.o src/compress_stream.o					\
 	src/trace.o src/util.o src/io.o src/exec.o			\
-	src/rpc.o src/argv_file.o src/tempfile.o src/bulk.o src/help.o src/filename.o	\
+	$(rpc_obj) src/tempfile.o src/bulk.o src/help.o src/filename.o	\
 	src/lock.o src/resource.o					\
 	src/netutil.o							\
 	src/pump.o							\
@@ -370,7 +372,7 @@ mon_obj =								\
 	src/mon.o							\
 	src/netutil.o							\
 	src/argutil.o							\
-	src/rpc.o							\
+	$(rpc_obj)							\
 	src/snprintf.o src/state.o 					\
 	src/tempfile.o src/trace.o src/traceenv.o			\
 	src/util.o
