@@ -38,7 +38,7 @@ static struct dcc_frontend_reply query(struct dcc_job *job, const char *path,
         if (previous) memcpy(bytes + 5 + length, previous, DCC_FS_METADATA);
         memcpy(bytes + 5 + length + DCC_FS_METADATA, "header", sizeof("header"));
     }
-    struct dcc_frontend_reply reply;
+    struct dcc_frontend_reply reply = {.fd = -1};
     assert(!dcc_frontend_fs_reply(job, bytes, size, &reply));
     free(bytes);
     assert(reply.size >= 8 && dcc_tcp_get32(reply.data) == 0);
@@ -68,6 +68,40 @@ static uint64_t header_size(const struct dcc_frontend_reply *reply)
     abort();
 }
 
+static void reuse_reply(struct dcc_job *job, const char *path)
+{
+    size_t size = 4 + strlen(path);
+    unsigned char *request = malloc(size);
+    assert(request);
+    dcc_tcp_put32(request, DCC_FS_READ);
+    memcpy(request + 4, path, size - 4);
+    struct dcc_frontend_reply reply = {.fd = -1};
+    unsigned char *storage = NULL;
+    const char *versions[] = {"one", "a fresh longer file"};
+    for (unsigned i = 0; i < 2; ++i) {
+        contents(path, versions[i]);
+        assert(!dcc_frontend_fs_reply(job, request, size, &reply));
+        assert(!dcc_tcp_get32(reply.data) && reply.file_size == strlen(versions[i]));
+        if (storage) assert(storage == reply.data);
+        storage = reply.data;
+        char bytes[32];
+        assert(pread(reply.fd, bytes, reply.file_size, 0) == (ssize_t)reply.file_size);
+        assert(!memcmp(bytes, versions[i], reply.file_size));
+        int fd = reply.fd;
+        dcc_frontend_fs_reset(&reply);
+        assert(reply.data == storage && reply.capacity >= 60 && !reply.size && !reply.file_size);
+        assert(reply.fd == -1 && fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+    }
+    assert(!dcc_frontend_fs_reply(job, request, size, &reply));
+    int fd = reply.fd;
+    assert(dcc_frontend_fs_reply(job, request, 4, &reply) == -1);
+    assert(!reply.size && reply.fd == -1 && reply.data == storage);
+    assert(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+    dcc_frontend_fs_clear(&reply);
+    assert(!reply.data && !reply.capacity && !reply.size && reply.fd == -1);
+    free(request);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2 || argc == 3);
@@ -93,6 +127,7 @@ int main(int argc, char **argv)
         dcc_frontend_fs_clear(&reply);
     }
     if (argc == 3) return 0;
+    reuse_reply(&job, header);
 
     /* Cached directory names never freeze an existing child's attributes. */
     contents(header, "changed contents");

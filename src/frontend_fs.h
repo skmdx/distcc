@@ -28,14 +28,16 @@ struct dcc_job;
 int dcc_frontend_fs_add_roots(struct dcc_job *job, const char *paths);
 int dcc_frontend_fs_add_root(struct dcc_job *job, const char *path);
 /* An owned metadata prefix followed by an optional open file extent. No
- * temporary file is needed to concatenate them for the transport. */
+ * temporary file is needed to concatenate them for the transport. Initialize
+ * with {.fd = -1}; reset releases the extent but retains metadata storage. */
 struct dcc_frontend_reply {
     unsigned char *data;
-    size_t size;
+    size_t size, capacity;
     int fd;
     uint64_t file_size;
 };
 int dcc_frontend_fs_reply(struct dcc_job *, const void *, size_t, struct dcc_frontend_reply *);
+void dcc_frontend_fs_reset(struct dcc_frontend_reply *);
 void dcc_frontend_fs_clear(struct dcc_frontend_reply *);
 int dcc_frontend_prepare(char **, struct dcc_job **);
 int dcc_gcc_frontend_prepare(char **, const char *, struct dcc_job **);

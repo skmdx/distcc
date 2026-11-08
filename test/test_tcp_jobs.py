@@ -220,14 +220,14 @@ class FileCacheTest(unittest.TestCase):
 class GccFrontendTest(BrokerTestCase):
     worker_address = '127.0.0.1'
 
-    def start_frontend(self, **settings):
+    def start_frontend(self, backoff=60, **settings):
         self.module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
         if not self.module:
             directory = subprocess.check_output([self.cc, '-print-file-name=plugin'], text=True).strip()
             self.module = str(Path(directory)/'distcc_gcc_scan.so')
         self.assertTrue(Path(self.module).is_file(), 'GCC native module must be built before testing')
         self.restart_server(self.build/'distccd', DISTCC_GCC_SCAN_LIBRARY=self.module, **settings)
-        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), backoff=backoff)
         self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
                         DISTCC_GCC_PLAN_LIBRARY=str(self.build/'gcc_plan.so'),
                         DISTCC_TESTING_INCLUDE_SERVER='1',
@@ -281,6 +281,40 @@ class GccFrontendTest(BrokerTestCase):
                 result = self.compile([compiler, *args])
                 self.assertIn('reused GCC driver status=0', result.stderr)
                 self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
+    def test_frontend_replies_survive_short_writes_and_disconnect(self):
+        # Exercise the client's bounded retries, without the broker's separate
+        # host-quarantine delay after the injected disconnect.
+        self.start_frontend(backoff=0)
+        library = self.work/'send-faults.so'
+        subprocess.run([self.cc, '-shared', '-fPIC', '-I'+str(self.build/'src'),
+                        str(self.build/'test/tcp_send_faults.c'), '-ldl', '-o', str(library)],
+                       check=True, capture_output=True)
+        header = self.work/'large.h'
+        header.write_text('/*'+base64.b64encode(random.Random(91).randbytes(600000)).decode()+'*/\n')
+        self.source.write_text('#include "large.h"\nint value = 42;\n')
+        command = [self.cc, '-O2', '-c', str(self.source), '-o', 'out.o']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        marker = self.work/'send-events'
+        self.env.update(LD_PRELOAD=str(library), DISTCC_TEST_SEND_LOG=str(marker))
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        self.assertTrue({'B', 'S'} <= set(marker.read_text()))
+        # A new file version forces another file reply, even with a warm cache.
+        with header.open('a') as text:
+            text.write('/* changed */\n')
+        marker.unlink()
+        self.env['DISTCC_TEST_SEND_DROP'] = '1'
+        failed = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(failed.returncode, 0, failed.stderr)
+        self.assertIn('D', marker.read_text())
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        for name in ('LD_PRELOAD', 'DISTCC_TEST_SEND_LOG', 'DISTCC_TEST_SEND_DROP'):
+            self.env.pop(name)
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_planner_does_not_open_the_source(self):
         self.start_frontend()
@@ -1662,6 +1696,7 @@ int main(int argc, char **argv) {
             dcc_tcp_put32(combined+at, entry);
             memcpy(combined+at+4, query, entry);
         }
+        if (!strcmp(argv[3], "batch-mixed")) combined[4+(4+entry)+8+length-1] = '!';
         if (!strcmp(argv[3], "batch-invalid-short")) --total;
         if (!strcmp(argv[3], "batch-invalid-tail")) combined[total++] = 0;
         if (!strcmp(argv[3], "batch-invalid-size")) dcc_tcp_put32(combined+4, UINT_MAX);
@@ -1670,12 +1705,12 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[3], "batch-invalid-empty")) total = 4;
         free(query); query = combined; payload = total-4;
     }
-    struct dcc_frontend_reply reply;
+    struct dcc_frontend_reply reply = {.fd = -1};
     int rejected = dcc_frontend_fs_reply(&job, query, payload + 4, &reply);
     free(query);
     if (!strcmp(argv[3], "invalid") || !strcmp(argv[3], "unterminated") ||
         !strncmp(argv[3], "batch-invalid-", 14)) {
-        if (!rejected) dcc_frontend_fs_clear(&reply);
+        dcc_frontend_fs_clear(&reply);
         return rejected ? 0 : 2;
     }
     if (rejected) return 2;
@@ -1695,23 +1730,24 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[3], "unlink") && unlink(argv[2])) return 5;
     if (!strcmp(argv[3], "truncate") && truncate(argv[2], 0)) return 6;
     unsigned char raw[DCC_TCP_CHUNK], decoded[DCC_TCP_CHUNK];
+    unsigned char *chunk = NULL;
+    size_t capacity = 0;
     uint64_t stream_offset = 0, total = reply.size + reply.file_size;
     while (stream_offset < total) {
         size_t size = 0;
-        unsigned char *chunk = next_fs_chunk(&reply, &stream_offset, raw, &size);
+        int failed = next_fs_chunk(&reply, &stream_offset, raw, &chunk, &capacity, &size);
         if (!strcmp(argv[3], "truncate")) {
-            int rejected = !chunk;
             free(chunk); dcc_frontend_fs_clear(&reply);
-            return rejected ? 0 : 7;
+            return failed ? 0 : 7;
         }
-        if (!chunk || size != 8 + dcc_tcp_get32(chunk + 4)) return 8;
+        if (failed || size != 8 + dcc_tcp_get32(chunk + 4)) return 8;
         struct dcc_tcp_frame frame = {.type = dcc_tcp_get32(chunk), .data = chunk + 8, .size = size - 8};
         const void *data; size_t plain; unsigned index;
         if (dcc_tcp_unpack(&frame, &index, decoded, &data, &plain) || index != UINT_MAX ||
             !!(frame.type & DCC_TCP_FINAL) != (stream_offset == total) ||
             fwrite(data, 1, plain, stdout) != plain) return 9;
-        free(chunk);
     }
+    free(chunk);
     int fd = reply.fd;
     dcc_frontend_fs_clear(&reply);
     return reply.data || reply.fd != -1 || fcntl(fd, F_GETFD) != -1 || errno != EBADF ? 10 : 0;
@@ -1776,6 +1812,10 @@ int main(int argc, char **argv) {
                                          'batch', 'dangling', 'file'], timeout=5)
         self.assertEqual(struct.unpack_from('!II', batch), (0, len(batch)-8))
         self.assertEqual(batch[8:], data+data)
+        mixed = subprocess.check_output([str(executable), str(self.work), str(listing),
+                                         'batch-mixed', 'dangling', 'file'], timeout=5)
+        self.assertEqual(struct.unpack_from('!II', mixed), (0, len(mixed)-8))
+        self.assertEqual(mixed[8:], data+struct.pack('!II', errno.ENOENT, 0))
         for root, requested, error in ((self.work/'other-root', listing, errno.EACCES),
                                        (self.work, self.work/'absent', errno.ENOENT)):
             batch = subprocess.check_output([str(executable), str(root), str(requested), 'batch'], timeout=5)

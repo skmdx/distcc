@@ -133,13 +133,19 @@ static unsigned char *next_chunk(struct input_stream *stream, const struct dcc_j
 /* Metadata is already in memory. A READ joins its prefix and open file into
  * the same existing chunk stream, taking a private snapshot of mutable bytes
  * before compression/send. This does not introduce an extra frame or wait. */
-static unsigned char *next_fs_chunk(const struct dcc_frontend_reply *reply,
-                                    uint64_t *offset, unsigned char *buffer, size_t *size)
+static int next_fs_chunk(const struct dcc_frontend_reply *reply, uint64_t *offset,
+                         unsigned char *buffer, unsigned char **storage,
+                         size_t *capacity, size_t *size)
 {
     uint64_t total = reply->size + reply->file_size;
     size_t amount = total - *offset < DCC_TCP_CHUNK ? total - *offset : DCC_TCP_CHUNK;
     size_t prefix = *offset < reply->size ? reply->size - *offset : 0;
     if (prefix > amount) prefix = amount;
+    if (*capacity < amount + 16) {
+        void *p = realloc(*storage, amount + 16);
+        if (!p) return -1;
+        *storage = p; *capacity = amount + 16;
+    }
     const void *data;
     if (prefix == amount) data = reply->data + *offset;
     else {
@@ -148,17 +154,16 @@ static unsigned char *next_fs_chunk(const struct dcc_frontend_reply *reply,
         while (used < amount) {
             ssize_t n = pread(reply->fd, buffer + used, amount - used, *offset + used - reply->size);
             if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) return NULL; /* A truncated source must fail the job. */
+            if (n <= 0) return -1; /* A truncated source must fail the job. */
             used += n;
         }
         data = buffer;
     }
-    unsigned char *p = malloc(amount + 16);
-    if (!p) return NULL;
+    unsigned char *p = *storage;
     *size = dcc_tcp_encode(DCC_TCP_FS_REPLY, UINT_MAX, data, amount, *offset + amount == total, p);
     if (*size == 16) { memcpy(p + 16, data, amount); *size += amount; }
     *offset += amount;
-    return p;
+    return 0;
 }
 int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files,
                       const char *cpp, const char *output, const char *deps, struct dcc_job_result *result)
@@ -167,10 +172,10 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     struct input_stream stream = {.fd = -1};
     unsigned *requests = calloc(job->count ? job->count : 1, sizeof(*requests));
     unsigned char *requested = calloc(job->count ? job->count : 1, 1);
-    unsigned char *buffer = malloc(DCC_TCP_CHUNK), *outgoing = NULL;
+    unsigned char *outgoing = NULL;
     uint64_t received[DCC_JOB_RESULT_COUNT] = {0}, id;
     unsigned finals = 0, read_request = 0, count = 0;
-    size_t length = 0, sent = 0;
+    size_t length = 0, sent = 0, outgoing_capacity = 0;
     size_t file_left = 0;
     off_t file_offset = 0;
     int ret = EXIT_IO_ERROR, have_result = 0;
@@ -178,7 +183,10 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     socklen_t address_size = sizeof(address);
     int local = !getsockname(host->broker_fd, (struct sockaddr *)&address, &address_size) &&
         address.ss_family == AF_UNIX;
-    struct tcp_input input = {.wire = local ? NULL : malloc(DCC_TCP_CHUNK + 16U)};
+    /* Scratch and remote receive storage have the same exchange lifetime.
+     * One allocation avoids a second anonymous mapping in each new client. */
+    unsigned char *buffer = malloc(DCC_TCP_CHUNK + (local ? 0 : DCC_TCP_CHUNK + 16U));
+    struct tcp_input input = {.wire = local || !buffer ? NULL : buffer + DCC_TCP_CHUNK};
     int local_input = local && job->kind == DCC_JOB_COMPILE && job->count == 1 &&
         job->inputs[0].encoding == DCC_JOB_RAW && job->inputs[0].fd >= 0;
     int send_input_fd = local_input;
@@ -188,7 +196,6 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     time_t active = time(NULL);
     dcc_job_result_init(result);
     if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested || !buffer ||
-        (!local && !input.wire) ||
         getrandom(&id, sizeof(id), 0) != sizeof(id) || !id) goto done;
     if (local_input && (shared_input = local_snapshot(job->inputs[0].fd, job->inputs[0].plain_size)) < 0)
         goto done;
@@ -197,6 +204,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     if (!manifest) goto done;
     length = metadata_size + 16;
     outgoing = malloc(length);
+    outgoing_capacity = length;
     if (outgoing) {
         dcc_tcp_put32(outgoing, DCC_TCP_BEGIN);
         dcc_tcp_put32(outgoing + 4, metadata_size + 8);
@@ -210,30 +218,35 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
             requested[i] = 1; requests[count++] = i;
         }
     for (;;) {
-        if (!outgoing && filesystem.data) {
-            outgoing = next_fs_chunk(&filesystem, &fs_offset, buffer, &length);
-            if (!outgoing) goto done;
-            sent = 0;
-        }
-        if (!outgoing && (stream.fd >= 0 || read_request < count)) {
-            if (stream.fd < 0) {
-                stream.index = requests[read_request++]; stream.offset = stream.plain = 0;
-                int retained = job->inputs[stream.index].fd;
-                stream.fd = retained >= 0 ? fcntl(retained, F_DUPFD_CLOEXEC, 0) :
-                    open(files ? files[stream.index] : cpp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-                if (stream.fd < 0) goto done;
-                int seals = fcntl(stream.fd, F_GET_SEALS);
-                int immutable = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
-                stream.immutable = seals >= 0 && (seals & immutable) == immutable;
+        /* A bounded send turn also prepares the next chunk. Poll only after
+         * this turn, rather than after every immediately writable chunk. */
+        for (unsigned turn = 0; turn < 4; ++turn) {
+            if (!length && filesystem.size) {
+                if (next_fs_chunk(&filesystem, &fs_offset, buffer, &outgoing,
+                                  &outgoing_capacity, &length)) goto done;
+                sent = 0;
             }
-            outgoing = next_chunk(&stream, &job->inputs[stream.index],
-                                  &length, &file_offset, &file_left);
-            if (!outgoing) goto done;
-            sent = 0;
-        }
-        /* Prepared replies can be sent immediately. Register POLLOUT only
-         * after a nonblocking write leaves bytes pending. */
-        for (unsigned turn = 0; turn < 4 && outgoing; ++turn) {
+            if (!length && (stream.fd >= 0 || read_request < count)) {
+                if (stream.fd < 0) {
+                    stream.index = requests[read_request++]; stream.offset = stream.plain = 0;
+                    int retained = job->inputs[stream.index].fd;
+                    stream.fd = retained >= 0 ? fcntl(retained, F_DUPFD_CLOEXEC, 0) :
+                        open(files ? files[stream.index] : cpp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+                    if (stream.fd < 0) goto done;
+                    int seals = fcntl(stream.fd, F_GET_SEALS);
+                    int immutable = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
+                    stream.immutable = seals >= 0 && (seals & immutable) == immutable;
+                }
+                free(outgoing);
+                outgoing = next_chunk(&stream, &job->inputs[stream.index],
+                                      &length, &file_offset, &file_left);
+                if (!outgoing) goto done;
+                outgoing_capacity = length;
+                sent = 0;
+            }
+            if (!length) break;
+            /* Prepared replies can be sent immediately. Register POLLOUT only
+             * after a nonblocking write leaves bytes pending. */
             ssize_t n;
             if (send_input_fd) {
                 struct iovec iov = {outgoing + sent, length - sent};
@@ -262,17 +275,17 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                 if (sent == length && !file_left) {
                     if (dcc_tcp_get32(outgoing) & DCC_TCP_FINAL) {
                         unsigned type = dcc_tcp_get32(outgoing) & ~DCC_TCP_FLAGS;
-                        if (type == DCC_TCP_FS_REPLY) dcc_frontend_fs_clear(&filesystem);
+                        if (type == DCC_TCP_FS_REPLY) dcc_frontend_fs_reset(&filesystem);
                         else if (type == DCC_TCP_INPUT) { close(stream.fd); stream.fd = -1; }
                     }
-                    free(outgoing); outgoing = NULL; sent = 0;
+                    length = 0; sent = 0;
                 }
             }
         }
         int timeout = dcc_get_io_timeout() - (time(NULL) - active);
         if (timeout <= 0) { ret = EXIT_TIMEOUT; goto done; }
-        int pending = !outgoing && (filesystem.data || stream.fd >= 0 || read_request < count);
-        struct pollfd p = {host->broker_fd, POLLIN | (outgoing ? POLLOUT : 0), 0};
+        int pending = !length && (filesystem.size || stream.fd >= 0 || read_request < count);
+        struct pollfd p = {host->broker_fd, POLLIN | (length ? POLLOUT : 0), 0};
         int buffered = input.end - input.begin > incoming.used;
         int ready;
         if (buffered) { p.revents = POLLIN; ready = 1; }
@@ -302,7 +315,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     }
                 } else if (type == DCC_TCP_FS_QUERY && incoming.type == DCC_TCP_FS_QUERY &&
                            dcc_job_frontend(job) && !have_result &&
-                           !outgoing && stream.fd < 0 && !filesystem.data && read_request == count) {
+                           !length && stream.fd < 0 && !filesystem.size && read_request == count) {
                     if (dcc_frontend_fs_reply(job, incoming.data, incoming.size, &filesystem)) goto done;
                     ++fs_requests; fs_bytes += filesystem.size + filesystem.file_size;
                     fs_offset = 0;
@@ -364,11 +377,11 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     }
                 } else if (type == DCC_TCP_RETRY && !have_result && incoming.size == 8 &&
                            dcc_tcp_get64(incoming.data) == id &&
-                           !outgoing && stream.fd < 0 && !filesystem.data && read_request == count) {
+                           !length && stream.fd < 0 && !filesystem.size && read_request == count) {
                     ret = EXIT_BUSY; goto done;
                 } else if (type == DCC_TCP_COMPLETE && have_result && incoming.size == 8 &&
                            dcc_tcp_get64(incoming.data) == id && finals == (1U << DCC_JOB_RESULT_COUNT) - 1 &&
-                           !outgoing && stream.fd < 0 && !filesystem.data && read_request == count) {
+                           !length && stream.fd < 0 && !filesystem.size && read_request == count) {
                     /* No next job exists until this connection is returned
                      * to the pool. Unsolicited trailing bytes are not a result. */
                     if (!local && input.end - input.begin != incoming.size + 8) goto done;
@@ -399,7 +412,6 @@ done:
     dcc_frontend_fs_clear(&filesystem);
     free(requests); free(requested); free(buffer); free(outgoing);
     if (local) dcc_tcp_frame_clear(&incoming);
-    free(input.wire);
     if (ret) dcc_job_result_free(result);
     return ret;
 }
