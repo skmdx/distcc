@@ -11,19 +11,21 @@ reduce client filesystem service cost in remote preprocessing
     Warm directory replies now use one descriptor for fresh metadata and
     child lookups without allocating a DIR. The latest matched full build
     completes the same 6400 remote jobs. Buffered TCP client reads then
-    reduce receive syscalls from 42 to 20-21 in the focused test. The latest
-    matched full-build pair takes 426.634 versus 438.846 seconds (-2.78%),
-    with client CPU down 4.13% and remote occupancy 2.991 versus 2.905 cores.
-    Outputs match and all jobs succeed without timeouts or failed samples.
-    This single pair does not establish a sustained speedup or resolve idle
-    capacity; client supply remains the limiting concern.
-    The client filesystem/transport processes still consume about half the
-    sampled CPU. GCC planning, other local cc1 invocations, driver startup,
-    path resolution, TCP sends and teardown remain significant. Distinguish
+    reduce receive syscalls from 42 to 20-21 in the focused test. Reusing the
+    loaded GCC driver improves focused client CPU by 5.80%, but the latest
+    full-build pair takes 428.402 versus 426.634 seconds (+0.41%), with client
+    CPU up 0.80% and remote occupancy 2.966 versus 2.991 cores. All 6400 jobs
+    succeed with matching outputs and no timeouts, disconnects or failed
+    samples. This does not demonstrate a full-build speedup or resolve idle
+    capacity; client supply remains the limiting concern. The installed
+    masquerade-path regression and shared-upload timeout race are repaired.
+    The client filesystem/transport processes consume 46.63% of sampled CPU;
+    planning uses 15.07%, ordinary cc1 9.69% and GCC drivers 7.95%. Capture
+    intervals differ, so these shares do not establish causal savings.
+    Path resolution, TCP sends and teardown remain significant. Distinguish
     planner mappings from ordinary cc1 when attributing profiles. Frame-pointer
     capture gives more useful user caller chains than the current DWARF unwind.
-    Continue
-    matched full builds; dispatch counts and microbenchmarks do not establish
+    Continue matched full builds; dispatch counts and microbenchmarks do not establish
     that idle capacity or the client supply bottleneck has been resolved.
 
 recognize arbitrary input suffixes with explicit compiler language
