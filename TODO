@@ -9,20 +9,24 @@ reduce client filesystem service cost in remote preprocessing
     Buffered transport reuses reply storage and drains writable chunks.
     The cache's entry quota is removed; allocated storage and read recency
     now govern eviction. A full build retains 13314 records instead of 4096.
-    The latest full pair takes 423.462 versus 429.000 seconds (-1.29%), with
-    client CPU down 0.55% and remote occupancy 2.997 versus 3.021 cores.
+    Repeated negative lookups no longer become metadata hints, and fresh
+    ENOENT replies remove absent hints. The latest full pair takes 425.235
+    versus 423.462 seconds (+0.42%), with client CPU down 1.17% and remote
+    occupancy 2.970 versus 2.997 cores.
     All 6400 jobs succeed with matching outputs, zero compile errors/timeouts/
-    disconnects and valid statistics. The small single-pair difference, also
-    overlapping a temporary-storage relocation, does not establish a causal
-    speedup. Spare capacity remains unresolved; client supply still limits it.
-    Client filesystem/transport consumes 45.46% of sampled CPU; planning uses
-    16.36%, ordinary cc1 9.92% and GCC drivers 7.63%. Executable-attributed
-    caller chains put 32.09% of total CPU in the client TCP exchange.
-    In a focused trace with additional warm replays, filesystem requests fall
-    from 424 to 85, while newfstatat calls increase from 338 to 841. Investigate
-    the fresh attribute work in speculative directory batches; do not infer
-    a causal saving from these differently warmed captures.
-    Path resolution, sends and teardown remain significant. Separate identical
+    disconnects and valid statistics. This single pair does not establish a
+    causal speedup. Spare capacity remains unresolved; client supply still
+    limits it. A successful focused compile with identical output reduces
+    newfstatat calls from 841 to 514 and ENOENT from 355 to 1. Sends, opens and
+    mappings remain unchanged. Of its 327 mappings, 316 are anonymous; do not
+    mistake this allocation cost for mapping cached file contents.
+    Client processes consume 47.54% of sampled CPU; planning uses 16.87%,
+    ordinary cc1 9.21% and GCC drivers 8.52%. Inclusive client syscall shares
+    include sendto 5.56%, mmap 4.18%, readlinkat 3.68%, munmap 3.51%, openat
+    3.13%, ppoll 2.71% and newfstatat 1.84%. Capture workloads differ and the
+    latest client image lacks private symbols; do not infer causal savings
+    from sample shares or attribute unresolved user frames to a guessed caller.
+    Allocation, path resolution, sends and teardown remain significant. Separate identical
     process names using executable mappings, distinguish planner mappings from
     ordinary cc1, and do not add overlapping inclusive caller costs. Continue
     complete matched builds; dispatch counts and microbenchmarks do not prove
