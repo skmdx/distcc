@@ -725,6 +725,50 @@ class GccFrontendTest(BrokerTestCase):
             self.assertLess(int(counts[0]), len(directories),
                             'search directories still require individual round trips')
 
+    def test_warm_directory_hints_batch_each_tree_level(self):
+        self.start_frontend()
+        # The long shared prefix makes the deepest 256 queries exceed the
+        # 64 KiB request limit while the short child hint names still fit.
+        headers = self.work/'headers'/('h' * 240)
+        branches = 256
+        for index in range(branches):
+            directory = headers/f'branch{index}/nested'
+            directory.mkdir(parents=True)
+            (directory/'value.h').write_text(f'#define VALUE_{index} {index + 1}\n')
+        counts = []
+        for name, width in (('narrow', 1), ('wide', 12), ('split', branches)):
+            directory = self.work/name
+            directory.mkdir()
+            (directory/'part.c').write_text(
+                ''.join(f'#include <branch{i}/nested/value.h>\n' for i in range(width)) +
+                'int value(void) { return ' + '+'.join(f'VALUE_{i}' for i in range(width)) + '; }\n')
+            command = [self.cc, '-nostdinc', '-I'+str(headers), '-O2', '-c', f'{name}/part.c', '-o', 'out.o']
+            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+            expected = (self.work/'out.o').read_bytes()
+            self.compile(command)
+            warm = self.compile(command)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+            requests = re.search(r'frontend filesystem: (\d+) requests', warm.stderr)
+            assert requests is not None, warm.stderr
+            counts.append(int(requests[1]))
+        # Both trees have the same depth. Their previously observed directories
+        # should require the same round trips regardless of the branch count.
+        self.assertEqual(counts[0], counts[1], f'width-dependent directory waits: {counts}')
+        self.assertGreater(counts[2], counts[1], 'fixture did not reach request splitting')
+        self.assertLess(counts[2], branches, 'split batches reverted to per-directory requests')
+        print(f'Warm directory tree RPC counts (1, 12, 256 branches): {counts}')
+        nested = headers/'branch0/nested'
+        for action in ('modify', 'symlink'):
+            if action == 'modify':
+                (nested/'value.h').write_text('#define VALUE_0 73\n')
+            else:
+                nested.rename(nested.with_name('moved'))
+                nested.symlink_to('moved', target_is_directory=True)
+            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+            expected = (self.work/'out.o').read_bytes()
+            self.compile(command)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected, action)
+
     def test_directory_batch_replies_and_failed_prefetch_release_mount(self):
         compiler = shutil.which('c++')
         assert compiler is not None, 'C++ compiler required'

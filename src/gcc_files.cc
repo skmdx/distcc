@@ -164,19 +164,7 @@ public:
         }
         return 0;
     }
-    int prefetch(const char *cwd, char *const *directories) {
-        std::set<std::string> paths;
-        auto add = [&](const char *name) {
-            auto path = (std::filesystem::path(cwd)/name).lexically_normal();
-            if (path != path.root_path() && !path.has_filename()) path = path.parent_path();
-            for (;;) {
-                paths.insert(path.string());
-                if (path == path.root_path()) break;
-                path = path.parent_path();
-            }
-        };
-        add(cwd);
-        for (auto p = directories; *p && **p; ++p) add(*p);
+    int fetch(std::set<std::string> paths) {
         std::vector<Query> pending;
         std::string payload;
         auto flush = [&]() -> int {
@@ -197,23 +185,58 @@ public:
                 offset += length;
             }
             if (offset != response.size) return EPROTO;
+            // Every reply in this batch must be applied before scheduling
+            // children: some are already queried by another batch entry.
+            // Only freshly observed directories from this source's hints
+            // expand the next batch, never every name in a directory.
+            for (const auto &query : pending) {
+                const auto &entry = entries[query.path];
+                if (entry.error || !entry.listed) continue;
+                for (const auto &name : entry.hints) {
+                    auto path = query.path == "/" ? query.path+name : query.path+'/'+name;
+                    auto child = entries.find(path);
+                    if (child != entries.end() && !child->second.queried &&
+                        !child->second.error && S_ISDIR(child->second.mode()))
+                        paths.insert(std::move(path));
+                }
+            }
             pending.clear(); payload.clear();
             return 0;
         };
-        // Native GCC supplied these paths; no command-line option parsing is
-        // duplicated here. Lexical spellings are only speculative cache keys:
-        // the compiler still resolves symlinks and parent traversal through FUSE.
-        for (const auto &path : paths) {
+        while (!paths.empty() || !pending.empty()) {
+            if (paths.empty()) {
+                if (int error = flush()) return error;
+                continue;
+            }
             Query query;
-            if (int error = prepare(path, query)) return error;
+            if (int error = prepare(*paths.begin(), query)) return error;
             if (payload.size()+8+query.bytes.size() > DCC_FS_QUERY_MAX-4)
                 if (int error = flush()) return error;
+            paths.erase(query.path);
             uint32_t header[] = {htonl(query.bytes.size()+4), htonl(DCC_FS_LSTAT)};
             payload.append(reinterpret_cast<const char *>(header), sizeof(header));
             payload += query.bytes;
             pending.push_back(std::move(query));
         }
-        return pending.empty() ? 0 : flush();
+        return 0;
+    }
+    int prefetch(const char *cwd, char *const *directories) {
+        std::set<std::string> paths;
+        auto add = [&](const char *name) {
+            auto path = (std::filesystem::path(cwd)/name).lexically_normal();
+            if (path != path.root_path() && !path.has_filename()) path = path.parent_path();
+            for (;;) {
+                paths.insert(path.string());
+                if (path == path.root_path()) break;
+                path = path.parent_path();
+            }
+        };
+        // Native GCC supplied these paths; no command-line option parsing is
+        // duplicated here. Lexical spellings are only speculative cache keys:
+        // the compiler still resolves symlinks and parent traversal through FUSE.
+        add(cwd);
+        for (auto p = directories; *p && **p; ++p) add(*p);
+        return fetch(std::move(paths));
     }
     int status(const std::string &path, Entry *&result) {
         auto [found, inserted] = entries.try_emplace(path);
@@ -235,14 +258,11 @@ public:
             }
         }
         if (entry.queried) return entry.error;
-        Query query;
-        if (int error = prepare(path, query)) return error;
-        dccfs::Buffer response;
-        if (auto error = connection.request(DCC_FS_LSTAT, query.bytes, response)) {
+        if (int error = fetch({path})) {
             entry.queried = true;
-            return entry.error = error.value();
+            entry.error = error;
         }
-        return accept(query, response);
+        return entry.error;
     }
     int open(const char *path, Entry *&entry) {
         if (int error = status(path, entry)) return error;
