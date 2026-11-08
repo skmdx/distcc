@@ -698,6 +698,12 @@ for the actual remote compiler. GCC workers require libfuse3, `/dev/fuse` and
 permission to create a user and mount namespace. Offload compilation keeps its
 existing input preparation.
 
+GCC workers remember which children of each directory earlier jobs accessed.
+The client enumerates directories anew and batches fresh attributes for those
+names, leaving unused children as names only. New lookups fetch their attributes
+on demand. Shared hints affect prefetching only: file existence, attributes and
+contents are never trusted merely because an earlier job used them.
+
 Builds whose generated sources include files outside the compiler's source and
 include directories can set `DISTCC_FRONTEND_ROOTS` to a colon-separated list
 of additional source/build trees. Relative roots use the compiler's working
