@@ -12,23 +12,30 @@ reduce client filesystem service cost in remote preprocessing
     Repeated negative lookups no longer become metadata hints, and fresh
     ENOENT replies remove absent hints. Learned descendant directories now
     share batches by tree level, reducing same-depth lookup RPCs from 25 to 3
-    in the 12-branch regression. The latest full pair takes 410.497 versus
-    425.235 seconds (-3.47%), with client CPU down 8.80% and remote occupancy
-    3.186 versus 2.970 cores. All 6400 jobs succeed with matching output hashes,
+    in the 12-branch regression. Per-invocation build flags and logging no
+    longer fragment loaded GCC image identity; each request still restores
+    its environment and arguments. New driver/planner images fall from
+    258/285 to 1/4 in the sampled windows. The latest full pair takes 410.973
+    versus 410.497 seconds (+0.12%), with client CPU down 7.60% and remote
+    occupancy 3.829 versus 3.186 cores. Remote CPU time rises 20.33%; there
+    is no demonstrated complete-build speedup from this last change. All
+    6400 jobs succeed with matching input multisets and output hashes,
     valid statistics and zero errors/timeouts/disconnects/fallback warnings.
     However, an earlier 414.019-second run had two unexplained pre-dispatch
     fallbacks. Planner diagnostics are now retained, but the failures did not
-    recur in the diagnostic run; their cause remains open. Spare capacity also
-    remains unresolved. A successful earlier focused compile reduces
+    recur in either subsequent full build. The affected input variants pass
+    6400 cold-start replays under the actual build sandbox/environment, but
+    their original failure cause remains open. Spare capacity also remains
+    unresolved. A successful earlier focused compile reduces
     newfstatat calls from 841 to 514 and ENOENT from 355 to 1. Sends, opens and
     mappings remain unchanged. Of its 327 mappings, 316 are anonymous; do not
     mistake this allocation cost for mapping cached file contents.
     The latest focused compile reduces sends from 89 to 8 and polls from 87
     to 6, but opens rise from 360 to 410 and mappings from 327 to 367. The
     object hash matches; different cache histories limit causal attribution.
-    Client processes consume 40.37% of sampled CPU; planning uses 18.52%,
-    ordinary cc1 9.63% and GCC drivers 9.23%. Matching private client symbols
-    identify the exchange/filesystem service in 26.14 of 41.33 client CPU
+    Client processes consume 46.38% of sampled CPU; planning uses 15.60%,
+    ordinary cc1 9.92% and GCC drivers 8.06%. Matching private client symbols
+    identify the exchange/filesystem service in 24.27 of 37.69 client CPU
     seconds. Capture workloads differ; do not infer causal savings from shares.
     Allocation, path resolution, sends and teardown remain significant. Separate identical
     process names using executable mappings, distinguish planner mappings from
