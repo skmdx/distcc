@@ -95,6 +95,7 @@ AC_ARG_ENABLE(pump-mode,
 
 AM_PATH_PYTHON([3.1],,[:])
 AC_ARG_VAR(PYTHON, [Python interpreter])
+AC_ARG_VAR(DISTCC_CLANG_CONFIGS, [Colon-separated llvm-config paths for native helper modules])
 AC_SUBST(PYTHON_RELATIVE_LIB)
 AC_SUBST([cross_compiling])
 

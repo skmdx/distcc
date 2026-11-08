@@ -11,14 +11,17 @@
  * and sorted, unique NUL-terminated child names to prefetch. Directory replies
  * add flags/count u32 before their entries. CACHED replies omit unchanged names;
  * child metadata is always fresh. STABLE permits publishing the name snapshot
- * after matching the directory version both before and after the lookup. */
+ * after matching the directory version both before and after the lookup.
+ * DIRECTORIES contains length-u32/LSTAT-query pairs; its reply contains the
+ * corresponding ordinary errno/length/body replies, in request order. */
 #define DCC_FS_METADATA 52
 #define DCC_FS_QUERY_MAX 65536
 #define DCC_FS_NO_METADATA UINT32_MAX
 #define DCC_FS_DIRECTORY_CACHED 1U
 #define DCC_FS_DIRECTORY_STABLE 2U
 enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LIST,
-                       DCC_FS_CODEGEN, DCC_FS_READLINK = 7, DCC_FS_LSTAT = 8 };
+                       DCC_FS_CODEGEN, DCC_FS_READLINK = 7, DCC_FS_LSTAT = 8,
+                       DCC_FS_DIRECTORIES };
 /* Compiler-to-daemon only: a requested CPU count replaces the path. Zero
  * releases borrowed CPUs. The reply contains the granted count. */
 struct dcc_job;

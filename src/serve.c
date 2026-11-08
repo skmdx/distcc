@@ -1180,16 +1180,19 @@ static int dcc_run_job(int in_fd,
     dcc_get_features_from_protover(protover, &compr, &cpp_where);
 
     if (job && job->kind == DCC_JOB_GCC_FRONTEND) {
-        if (dcc_argv_len(job->argv) < 5 || !job->fs_channel) {
+        if (dcc_argv_len(job->argv) < 6 || !job->fs_channel) {
             ret = EXIT_PROTOCOL_ERROR; goto out_cleanup;
         }
         gcc_defaults = job->argv + 3;
         job_argv = gcc_defaults;
         while (*job_argv && **job_argv) ++job_argv;
         if (!*job_argv || !*++job_argv) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
+        char **gcc_directories = job_argv;
+        while (*job_argv && **job_argv) ++job_argv;
+        if (!*job_argv || !*++job_argv) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
         if (asprintf(&temp_dir, "%s/files", root) < 0) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
         filesystem = dcc_gcc_files_start(job->fs_channel-1, temp_dir, job->argv[2], root,
-                                       job->cwd, job->argv[1]);
+                                       job->cwd, job->argv[1], gcc_directories);
         if (!filesystem) {
             rs_log_error("GCC remote filesystem: %s", strerror(errno));
             ret = EXIT_IO_ERROR; goto out_cleanup;

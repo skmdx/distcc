@@ -13,7 +13,7 @@
 /* 'T' distinguishes this protocol on the existing ACL-protected listener.
  * One framing layer; flags never introduce an inner RPC stream. */
 enum dcc_tcp_type {
-    DCC_TCP_BEGIN = 0x54000200, DCC_TCP_NEED, DCC_TCP_INPUT,
+    DCC_TCP_BEGIN = 0x54000300, DCC_TCP_NEED, DCC_TCP_INPUT,
     DCC_TCP_RESULT, DCC_TCP_OUTPUT, DCC_TCP_COMPLETE, DCC_TCP_RESULT_FD, DCC_TCP_RETRY,
     DCC_TCP_PROGRESS, DCC_TCP_FS_QUERY, DCC_TCP_FS_REPLY
 };

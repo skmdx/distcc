@@ -17,8 +17,9 @@ reduce client filesystem service cost in remote preprocessing
     accumulating unrelated headers; hints now follow the source directory,
     while directory names and immutable contents remain shared. The first full
     comparison shows only a small CPU reduction, with wall time and worker
-    occupancy essentially unchanged. Identify the remaining syscall costs
-    before choosing further caching or process-lifecycle changes.
+    occupancy essentially unchanged. Native GCC search directories and their
+    ancestors now use bounded metadata batches, removing their individual
+    round trips without relaxing per-path permission or freshness checks.
     Continue measuring full-build CPU and occupancy; dispatch
     counts alone do not establish that client input service is no longer limiting.
 

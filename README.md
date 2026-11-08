@@ -740,6 +740,11 @@ service CPU and memory are included in the job's resource measurements.
 Header snapshots use the worker's shared cache outside the job tree and survive
 job cleanup. Each job obtains fresh metadata before reusing cached contents;
 changes to a header invalidate its snapshot, even with equal size and mtime.
+GCC's native search directories and their ancestors are queried in bounded
+batches before filesystem lookups begin. The client checks each path with the
+same permissions and freshness rules as an individual request; unexpected
+paths still use on-demand queries. The filesystem service alone owns the FUSE
+device, so its exit also releases any pending compiler lookup.
 Directory names are shared across source contexts. Attribute prefetch hints
 are scoped to the source's parent directory, so unrelated translation units
 cannot grow one global metadata batch. The client checks directory
@@ -838,6 +843,11 @@ admission. Wire details and limits are in [the protocol specification](doc/proto
 Build using the usual `./autogen.sh`, `./configure`, and `make` steps, with the
 LZ4 and xxHash (with XXH3 support) libraries and
 development headers installed. Pump also requires Python `xxhash>=3.0.0`.
+To build native helpers for several installed LLVM releases, pass their
+colon-separated `llvm-config` paths as `DISTCC_CLANG_CONFIGS` to `./configure`.
+The selected SDKs are retained for incremental `make` invocations; environment
+or make command-line assignments can override them. Without this setting,
+the helper build uses the selected `LLVM_CONFIG` or `llvm-config` from `PATH`.
 `make adaptive-check` runs real GCC compiles through two local daemons, checks
 the linked executables, and exercises controlled load/error responses and slot
 locking. Set `TMPDIR` to a suitable temporary directory. `make check` includes

@@ -207,13 +207,41 @@ void dcc_frontend_fs_clear(struct dcc_frontend_reply *reply)
     free(reply->data);
     *reply = (struct dcc_frontend_reply){.fd = -1};
 }
+static int directory_batch(struct dcc_job *job, const unsigned char *data, size_t size,
+                           struct dcc_frontend_reply *reply)
+{
+    struct reply_writer writer = {.reply = reply};
+    unsigned char header[8] = {0};
+    if (!size || append(&writer, header, sizeof(header))) goto failed;
+    while (size) {
+        if (size < 4) goto failed;
+        unsigned length = dcc_tcp_get32(data);
+        data += 4; size -= 4;
+        /* Only metadata queries belong here: no nesting or open file bodies. */
+        if (length < 4 || length > size || dcc_tcp_get32(data) != DCC_FS_LSTAT) goto failed;
+        struct dcc_frontend_reply item;
+        if (dcc_frontend_fs_reply(job, data, length, &item)) goto failed;
+        int error = append(&writer, item.data, item.size);
+        dcc_frontend_fs_clear(&item);
+        if (error) goto failed;
+        data += length; size -= length;
+    }
+    dcc_tcp_put32(reply->data + 4, reply->size - 8);
+    return 0;
+failed:
+    dcc_frontend_fs_clear(reply);
+    return -1;
+}
+
 int dcc_frontend_fs_reply(struct dcc_job *job, const void *data, size_t size,
                           struct dcc_frontend_reply *reply)
 {
     *reply = (struct dcc_frontend_reply){.fd = -1};
-    if (!job->fs_roots || size < 5 || size > DCC_FS_QUERY_MAX ||
-        ((const char *)data)[4] != '/') return -1;
+    if (!job->fs_roots || size < 5 || size > DCC_FS_QUERY_MAX) return -1;
     unsigned operation = dcc_tcp_get32(data);
+    if (operation == DCC_FS_DIRECTORIES)
+        return directory_batch(job, (const unsigned char *)data + 4, size - 4, reply);
+    if (((const char *)data)[4] != '/') return -1;
     const char *names = (const char *)data + 4, *end = (const char *)data + size;
     const char *separator = memchr(names, 0, end - names), **hints = NULL, *version = NULL;
     size_t hint_count = 0;

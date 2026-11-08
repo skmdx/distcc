@@ -225,7 +225,7 @@ codegen_headers.append(os.path.join(srcdir_include_server, 'c_extensions', 'clan
 worker_sources = [os.path.join(srcdir, 'src', 'native_worker.cc')]
 worker_headers = [os.path.join(srcdir, 'src', 'native_worker.h'),
                   os.path.join(srcdir, 'src', 'clang_worker.h')]
-for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.pathsep):
+for config in (os.environ.get('DISTCC_CLANG_CONFIGS') or llvm_config).split(os.pathsep):
   major = llvm_option('--version', config).split('.')[0]
   if major not in ('22', '23'):
     sys.exit('Clang worker frontends require LLVM 22 or 23.')

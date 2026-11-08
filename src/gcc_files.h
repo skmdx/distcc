@@ -6,9 +6,10 @@
 extern "C" {
 #endif
 /* The caller is a dedicated job child. Its mount namespace cannot be reused
- * by the persistent worker. The service is a child in the same process group. */
+ * by the persistent worker. The service is a child in the same process group.
+ * directories is the native planner's empty-string-terminated search list. */
 void *dcc_gcc_files_start(int channel, const char *mountpoint, const char *identity, const char *job_root,
-                         const char *cwd, const char *input);
+                         const char *cwd, const char *input, char *const *directories);
 int dcc_gcc_files_stop(void *, uint64_t *cpu_ns, unsigned long long *peak_bytes);
 #ifdef __cplusplus
 }

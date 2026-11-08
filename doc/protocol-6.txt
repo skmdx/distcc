@@ -94,7 +94,7 @@ RAW and already encoded immutable file extents can use sendfile.
 
 The host option is ,tcp (or ,cpp,tcp under pump). It requires the Linux broker
 and prefork daemon, uses the existing ACL-protected TCP listener, and does not
-support SSH or GSSAPI. BEGIN is type 0x54000200, followed
+support SSH or GSSAPI. BEGIN is type 0x54000300, followed
 by NEED, INPUT, RESULT, OUTPUT and COMPLETE in numeric order. The eight-byte
 frame header contains a uint32 type/flags and uint32 payload length. Flag
 0x10000 means compressed; 0x20000 means final, both valid only on data frames.

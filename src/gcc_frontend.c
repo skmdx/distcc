@@ -157,17 +157,26 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
     if (!job) goto done;
     job->kind = DCC_JOB_GCC_FRONTEND;
     job->cwd = getcwd(NULL, 0);
-    unsigned defaults = dcc_argv_len(groups[0]), argc = dcc_argv_len(argv);
-    job->argv = calloc(defaults + argc + 5, sizeof(*job->argv));
+    unsigned defaults = dcc_argv_len(groups[0]), directories = dcc_argv_len(groups[1]);
+    unsigned argc = dcc_argv_len(argv);
+    job->argv = calloc(defaults + directories + argc + 6, sizeof(*job->argv));
     if (!job->cwd || !job->argv) goto done;
     job->argv[0] = strdup(argv[0]);
     job->argv[1] = strdup(input);
     job->argv[2] = dcc_frontend_identity();
     if (!job->argv[0] || !job->argv[1] || !job->argv[2]) goto done;
-    for (unsigned i = 0; i < defaults + argc + 1; ++i) {
-        const char *value = i < defaults ? groups[0][i] : i == defaults ? "" : argv[i-defaults-1];
-        job->argv[i+3] = strdup(value);
-        if (!job->argv[i+3]) goto done;
+    unsigned position = 3;
+    for (unsigned group = 0; group < 2; ++group) {
+        for (char **value = groups[group]; *value; ++value) {
+            job->argv[position] = strdup(*value);
+            if (!job->argv[position++]) goto done;
+        }
+        job->argv[position] = strdup("");
+        if (!job->argv[position++]) goto done;
+    }
+    for (unsigned i = 0; i < argc; ++i) {
+        job->argv[position] = strdup(argv[i]);
+        if (!job->argv[position++]) goto done;
     }
     // GCC's native planner reports exact directory spellings. Preserve them
     // for filesystem lookup; authorization normalizes only its comparison.

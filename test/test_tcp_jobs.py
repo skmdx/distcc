@@ -3,6 +3,7 @@
 import concurrent.futures
 import array
 import ctypes
+import errno
 import importlib.util
 import itertools
 import os
@@ -14,6 +15,7 @@ import runpy
 import signal
 import stat
 import shutil
+import shlex
 import socket
 import base64
 import struct
@@ -444,6 +446,40 @@ class GccFrontendTest(BrokerTestCase):
         self.assertEqual(len(counts), 2)
         self.assertGreater(counts[0] - counts[1], 200,
                            'another source context discarded the first context\'s hints')
+
+    def test_native_search_directories_use_bounded_batches(self):
+        self.start_frontend()
+        directories = [self.work/'search'/str(index)/'nested'/'leaf' for index in range(256)]
+        for directory in directories:
+            directory.mkdir(parents=True)
+        header = directories[-1]/'value.h'
+        header.write_text('#define VALUE 41\n')
+        (self.work/'part.c').write_text('#include <value.h>\nint value(void) { return VALUE; }\n')
+        command = [self.cc, '-nostdinc', *('-I'+str(path) for path in directories),
+                   '-O2', '-c', 'part.c', '-o', 'out.o']
+        self.compile(command)
+        for value in (41, 42):
+            header.write_text(f'#define VALUE {value}\n')
+            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+            expected = (self.work/'out.o').read_bytes()
+            result = self.compile(command)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+            counts = re.findall(r'frontend filesystem: (\d+) requests', result.stderr)
+            self.assertEqual(len(counts), 1)
+            self.assertLess(int(counts[0]), len(directories),
+                            'search directories still require individual round trips')
+
+    def test_directory_batch_replies_and_failed_prefetch_release_mount(self):
+        compiler = shutil.which('c++')
+        assert compiler is not None, 'C++ compiler required'
+        flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'fuse3'], text=True))
+        executable = self.work/'gcc-files'
+        result = subprocess.run([compiler, '-std=c++17', '-I'+str(self.build), '-I'+str(self.build/'src'),
+                                 str(self.build/'test/gcc_files_contract.cc'), *flags, '-pthread',
+                                 '-o', str(executable)], capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run([str(executable), str(self.work)], capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
     def test_directory_hints_skip_unused_attributes_and_refresh_each_job(self):
@@ -1396,7 +1432,8 @@ int main(int argc, char **argv) {
     char *roots[] = {argv[1], NULL};
     struct dcc_job job = {.fs_roots = roots};
     size_t length = strlen(argv[2]);
-    int lstat_query = !strcmp(argv[3], "lstat") || !strcmp(argv[3], "invalid") ||
+    int batch = !strncmp(argv[3], "batch", 5);
+    int lstat_query = batch || !strcmp(argv[3], "lstat") || !strcmp(argv[3], "invalid") ||
                       !strcmp(argv[3], "unterminated");
     size_t payload = length + (lstat_query && strcmp(argv[3], "unterminated") ? 1+DCC_FS_METADATA : 0);
     for (int i = 4; i < argc; ++i) payload += strlen(argv[i])+1;
@@ -1410,10 +1447,29 @@ int main(int argc, char **argv) {
     for (int i = 4; i < argc; ++i) {
         memcpy(query+offset, argv[i], strlen(argv[i])+1); offset += strlen(argv[i])+1;
     }
+    if (batch) {
+        size_t entry = payload+4, total = 4+2*(4+entry);
+        unsigned char *combined = malloc(total+1);
+        operation = DCC_FS_DIRECTORIES;
+        dcc_tcp_put32(combined, operation);
+        for (unsigned i = 0; i < 2; ++i) {
+            size_t at = 4+i*(4+entry);
+            dcc_tcp_put32(combined+at, entry);
+            memcpy(combined+at+4, query, entry);
+        }
+        if (!strcmp(argv[3], "batch-invalid-short")) --total;
+        if (!strcmp(argv[3], "batch-invalid-tail")) combined[total++] = 0;
+        if (!strcmp(argv[3], "batch-invalid-size")) dcc_tcp_put32(combined+4, UINT_MAX);
+        if (!strcmp(argv[3], "batch-invalid-kind")) dcc_tcp_put32(combined+8, DCC_FS_READ);
+        if (!strcmp(argv[3], "batch-invalid-nested")) dcc_tcp_put32(combined+8, DCC_FS_DIRECTORIES);
+        if (!strcmp(argv[3], "batch-invalid-empty")) total = 4;
+        free(query); query = combined; payload = total-4;
+    }
     struct dcc_frontend_reply reply;
     int rejected = dcc_frontend_fs_reply(&job, query, payload + 4, &reply);
     free(query);
-    if (!strcmp(argv[3], "invalid") || !strcmp(argv[3], "unterminated")) {
+    if (!strcmp(argv[3], "invalid") || !strcmp(argv[3], "unterminated") ||
+        !strncmp(argv[3], "batch-invalid-", 14)) {
         if (!rejected) dcc_frontend_fs_clear(&reply);
         return rejected ? 0 : 2;
     }
@@ -1511,6 +1567,17 @@ int main(int argc, char **argv) {
             else: self.assertEqual(error, 0xffffffff)
         self.assertEqual(actual, {'file': stat.S_IFREG, 'dangling': stat.S_IFLNK,
                                   'directory': None, 'fifo': None})
+        batch = subprocess.check_output([str(executable), str(self.work), str(listing),
+                                         'batch', 'dangling', 'file'], timeout=5)
+        self.assertEqual(struct.unpack_from('!II', batch), (0, len(batch)-8))
+        self.assertEqual(batch[8:], data+data)
+        for root, requested, error in ((self.work/'other-root', listing, errno.EACCES),
+                                       (self.work, self.work/'absent', errno.ENOENT)):
+            batch = subprocess.check_output([str(executable), str(root), str(requested), 'batch'], timeout=5)
+            self.assertEqual(batch, struct.pack('!IIIIII', 0, 16, error, 0, error, 0))
+        for invalid in ('short', 'tail', 'size', 'kind', 'nested', 'empty'):
+            subprocess.run([str(executable), str(self.work), str(listing), 'batch-invalid-'+invalid],
+                           check=True, timeout=5)
         for names in (['z', 'a'], ['file', 'file'], ['../file'], [''], ['.'], ['..']):
             subprocess.run([str(executable), str(self.work), str(listing), 'invalid', *names],
                            check=True, timeout=5)
@@ -1640,7 +1707,7 @@ class TcpJobsTest(TcpJobTestCase):
         for identity in (37, 38):
             net = self.wire_job(body, cached=False, identity=identity, net=net)
             self.upload(net, body)
-            self.assertEqual(self.frame(net), (0x54000207, struct.pack('!Q', identity)))
+            self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', identity)))
         stats = self.get_stats(self.stats_ports[0])
         self.assertIn('dcc_compile_ok 0\n', stats)
         self.assertIn('dcc_busy 0\n', stats)
@@ -1804,7 +1871,7 @@ int ioctl(int fd, unsigned long request, ...) {
                 body = f'int asynchronous_{kind};\n'.encode()
                 if kind == 'cache':
                     first = self.wire_job(body)
-                    self.assertEqual(self.frame(first), (0x54000201, bytes(4)))
+                    self.assertEqual(self.frame(first), (0x54000301, bytes(4)))
                     self.upload(first, body)
                     self.result(first)
                     first.close()
@@ -1820,7 +1887,7 @@ int ioctl(int fd, unsigned long request, ...) {
                 if kind == 'copy':
                     before = int(re.search(r'dcc_tcp_parallel_tasks (\d+)', self.get_stats(self.stats_ports[0]))[1])
                     owner = self.wire_job(body)
-                    self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
+                    self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
                 net = self.wire_job(body, cached=kind != 'cleanup')
                 if owner:
                     deadline = time.monotonic() + 5
@@ -1832,7 +1899,7 @@ int ioctl(int fd, unsigned long request, ...) {
                         time.sleep(.01)
                     self.upload(owner, body)
                 if kind == 'store':
-                    self.assertEqual(self.frame(net), (0x54000201, bytes(4)))
+                    self.assertEqual(self.frame(net), (0x54000301, bytes(4)))
                 if kind in ('store', 'cleanup'): self.upload(net, body)
                 try:
                     deadline = time.monotonic() + 5
@@ -1899,7 +1966,7 @@ int ioctl(int fd, unsigned long request, ...) {
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as net, (self.work/'bad.i').open('w+b') as f:
             f.write(body); f.flush()
             net.settimeout(3); net.connect(f'{prefix}-{self.ports[0]}.sock')
-            net.sendmsg([struct.pack('!II', 0x54000200, len(manifest)) + manifest],
+            net.sendmsg([struct.pack('!II', 0x54000300, len(manifest)) + manifest],
                         [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [f.fileno()]))])
             self.assertEqual(net.recv(1), b'')
         self.job('after-invalid-local-fd')
@@ -2018,7 +2085,7 @@ time_t time(time_t *out) {
             reservations.append(net)
         body = b'int phase_accounting;\n'
         net = self.wire_job(body)
-        self.assertEqual(self.frame(net), (0x54000201, bytes(4)))
+        self.assertEqual(self.frame(net), (0x54000301, bytes(4)))
         stats = self.get_stats(self.stats_ports[0])
         self.assertIn('dcc_preparing 1\n', stats)
         self.assertIn('dcc_queued 0\n', stats)
@@ -2076,8 +2143,8 @@ ssize_t write(int fd, const void *data, size_t size) {
         streams = [self.wire_job(body, cached=False) for _ in range(6)]
         cancelled = self.wire_job(body, cached=False)
         first = codec.encode(body[:262144])
-        self.send(cancelled, 0x54010202, struct.pack('!II', 0, 262144) + first[8:])
-        self.send(cancelled, 0x54010202, struct.pack('!II', 0, 262144) + first[8:])
+        self.send(cancelled, 0x54010302, struct.pack('!II', 0, 262144) + first[8:])
+        self.send(cancelled, 0x54010302, struct.pack('!II', 0, 262144) + first[8:])
         deadline = time.monotonic() + 3
         while not int(re.search(r'dcc_tcp_input_prefetch_bytes (\d+)',
                                self.get_stats(self.stats_ports[0]))[1]):
@@ -2089,7 +2156,7 @@ ssize_t write(int fd, const void *data, size_t size) {
             packed = codec.encode(chunk)
             plain, size = struct.unpack('!II', packed[:8])
             self.assertGreater(size, 0)
-            kind = 0x54010202 | (0x20000 if offset + plain == len(body) else 0)
+            kind = 0x54010302 | (0x20000 if offset + plain == len(body) else 0)
             for net in streams:
                 self.send(net, kind, struct.pack('!II', 0, plain) + packed[8:])
         for net in streams:
@@ -2105,7 +2172,7 @@ ssize_t write(int fd, const void *data, size_t size) {
             for _ in range(8):
                 net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=2)
                 sockets.append(net)
-                net.sendall(struct.pack('!II', 0x54000200, 100) + b'partial')
+                net.sendall(struct.pack('!II', 0x54000300, 100) + b'partial')
             self.job('while-receiving')
         finally:
             for net in sockets:
@@ -2135,7 +2202,7 @@ ssize_t write(int fd, const void *data, size_t size) {
         if receive_buffer:
             net.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
         self.addCleanup(net.close)
-        self.send(net, 0x54000200, manifest)
+        self.send(net, 0x54000300, manifest)
         if verification is not None:
             self.upload(net, verification, len(paths))
         return net
@@ -2157,15 +2224,15 @@ ssize_t write(int fd, const void *data, size_t size) {
         return kind, read(size)
 
     def upload(self, net, body, index=0):
-        self.send(net, 0x54000202 | 0x20000, struct.pack('!II', index, len(body)) + body)
+        self.send(net, 0x54000302 | 0x20000, struct.pack('!II', index, len(body)) + body)
 
     def result(self, net, identity=1, expected_status=0):
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
         kind, description = self.frame(net)
-        while kind == 0x54000208:
+        while kind == 0x54000308:
             self.assertEqual(description, struct.pack('!Q', identity))
             kind, description = self.frame(net)
-        self.assertEqual(kind, 0x54000203)
+        self.assertEqual(kind, 0x54000303)
         self.assertEqual(len(description), 72)
         status, mode, *sizes = struct.unpack('!II4Q', description[:40])
         prepare, queued, execute, cpu = struct.unpack('!4Q', description[40:])
@@ -2176,10 +2243,10 @@ ssize_t write(int fd, const void *data, size_t size) {
         outputs = [bytearray() for _ in sizes]
         while True:
             kind, body = self.frame(net)
-            if kind == 0x54000205:
+            if kind == 0x54000305:
                 self.assertEqual(body, struct.pack('!Q', identity))
                 break
-            self.assertEqual(kind & ~0x30000, 0x54000204)
+            self.assertEqual(kind & ~0x30000, 0x54000304)
             index, plain = struct.unpack('!II', body[:8])
             data = codec.decode(body[8:], plain) if kind & 0x10000 else body[8:]
             outputs[index].extend(data)
@@ -2206,14 +2273,14 @@ ssize_t write(int fd, const void *data, size_t size) {
     def test_single_upload_and_owner_disconnect(self):
         body = b'int cache_owner_recovery(void) { return 901; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
         waiter = self.wire_job(body)
         waiter.settimeout(.15)
         with self.assertRaises(socket.timeout):
             waiter.recv(8)
         owner.close()
         waiter.settimeout(5)
-        self.assertEqual(self.frame(waiter), (0x54000201, bytes(4)))
+        self.assertEqual(self.frame(waiter), (0x54000301, bytes(4)))
         self.upload(waiter, body)
         self.result(waiter)
         hit = self.wire_job(body)
@@ -2224,17 +2291,17 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.addCleanup(self.restart_server, self.build / 'distccd')
         body = b'int recovered_from_stalled_peer(void) { return 904; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
         waiter = self.wire_job(body, identity=2)
         # The owner stays connected but sends no input, as with a lost network
         # path. A healthy waiter must receive progress before that owner expires.
-        self.assertEqual(self.frame(waiter), (0x54000208, struct.pack('!Q', 2)))
+        self.assertEqual(self.frame(waiter), (0x54000308, struct.pack('!Q', 2)))
         while True:
             kind, data = self.frame(waiter)
-            if kind == 0x54000201:
+            if kind == 0x54000301:
                 self.assertEqual(data, bytes(4))
                 break
-            self.assertEqual((kind, data), (0x54000208, struct.pack('!Q', 2)))
+            self.assertEqual((kind, data), (0x54000308, struct.pack('!Q', 2)))
         self.assertEqual(owner.recv(1), b'')
         self.upload(waiter, body)
         self.result(waiter, identity=2)
@@ -2242,7 +2309,7 @@ ssize_t write(int fd, const void *data, size_t size) {
     def test_owner_disconnect_during_waiter_lookup_requests_input_once(self):
         body = b'int cancel_during_lookup(void) { return 903; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
         paths = [b'/anchor/source.c', b'/progress/source.c']
         paths += [f'/remaining_{i}/source.c'.encode() for i in range(3000)]
         paths += [b'/done/source.c']
@@ -2256,7 +2323,7 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.assertFalse((roots[0].parent / 'done').exists())
         owner.close()
         kind, requested = self.frame(waiter)
-        self.assertEqual(kind, 0x54000201)
+        self.assertEqual(kind, 0x54000301)
         self.assertEqual(len(requested), 4)
         self.upload(waiter, body, struct.unpack('!I', requested)[0])
         self.result(waiter)  # A duplicate NEED is a protocol error here.
@@ -2264,7 +2331,7 @@ ssize_t write(int fd, const void *data, size_t size) {
     def test_parallel_cache_waiters_share_upload(self):
         body = b'int single_upload_for_all(void) { return 902; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
         waiters = [self.wire_job(body) for _ in range(7)]
         self.upload(owner, body)
         self.result(owner)
@@ -2279,21 +2346,21 @@ ssize_t write(int fd, const void *data, size_t size) {
     def test_bad_digest_discards_connection_and_releases_waiter(self):
         body = b'int verified_upload;\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000201, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
         waiter = self.wire_job(body)
         self.upload(owner, b'x' * len(body))
         self.assertEqual(owner.recv(8), b'')
-        self.assertEqual(self.frame(waiter), (0x54000201, bytes(4)))
+        self.assertEqual(self.frame(waiter), (0x54000301, bytes(4)))
         self.upload(waiter, body)
         self.result(waiter)
 
     def test_invalid_chunks_close_connection_without_dispatch(self):
         body = b'int bounded_input;\n'
         cases = [
-            (0x54020202, struct.pack('!II', 0, 262145)),
-            (0x54020202, struct.pack('!II', 1, len(body)) + body),
-            (0x54030202, struct.pack('!II', 0, len(body)) + b'\xff'),
-            (0x54020202, struct.pack('!II', 0, len(body)) + body[:-1]),
+            (0x54020302, struct.pack('!II', 0, 262145)),
+            (0x54020302, struct.pack('!II', 1, len(body)) + body),
+            (0x54030302, struct.pack('!II', 0, len(body)) + b'\xff'),
+            (0x54020302, struct.pack('!II', 0, len(body)) + body[:-1]),
         ]
         for kind, data in cases:
             with self.subTest(kind=kind, payload=len(data)):
@@ -2375,7 +2442,7 @@ Path(args[args.index('-o') + 1]).write_bytes(random.Random(543).randbytes(4 * 10
                 stalled.append(net)
                 self.upload(net, body)
                 kind, description = self.frame(net)
-                self.assertEqual(kind, 0x54000203)
+                self.assertEqual(kind, 0x54000303)
                 self.assertEqual(struct.unpack('!II4Q', description[:40])[4], 4 * 1024 * 1024)
             wrapper.write_text(original)
             stats = self.get_stats(self.stats_ports[0])
@@ -2501,18 +2568,18 @@ with open(args[args.index('-o') + 1], 'ab') as output:
                 with listener.accept()[0] as net:
                     net.settimeout(5)
                     kind, manifest = self.frame(net)
-                    self.assertEqual(kind, 0x54000200)
+                    self.assertEqual(kind, 0x54000300)
                     while True:
                         kind, body = self.frame(net)
-                        self.assertEqual(kind & ~0x30000, 0x54000202)
+                        self.assertEqual(kind & ~0x30000, 0x54000302)
                         if kind & 0x20000:
                             break
                     # Deliberately fragment the response header.
-                    response = struct.pack('!IIII8Q', 0x54000203, 72, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0)
+                    response = struct.pack('!IIII8Q', 0x54000303, 72, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0)
                     net.sendall(response[:3])
                     time.sleep(.01)
                     net.sendall(response[3:])
-                    self.send(net, 0x54020204, struct.pack('!II', 2, 4) + b'FAKE')
+                    self.send(net, 0x54020304, struct.pack('!II', 2, 4) + b'FAKE')
                     reached.set()  # Close after a complete artifact, before COMPLETE.
             except BaseException as error:
                 errors.append(error)

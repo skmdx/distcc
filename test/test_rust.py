@@ -259,7 +259,7 @@ class RustTest(BrokerTestCase):
             first, _ = listener.accept()
             with first:
                 first.settimeout(10)
-                self.assertEqual(first.recv(4, socket.MSG_WAITALL), struct.pack('!I', 0x54000200))
+                self.assertEqual(first.recv(4, socket.MSG_WAITALL), struct.pack('!I', 0x54000300))
             second, _ = listener.accept()
             with second, socket.create_connection(('127.0.0.1', self.ports[0]), timeout=10) as worker:
                 peers = {second: worker, worker: second}
@@ -684,14 +684,14 @@ class RustTest(BrokerTestCase):
             # Reserve the actual Rust inputs, then stop sending as a disconnected
             # uploader would. The real file-job client has the same inputs.
             manifest = struct.pack('!Q', 999) + metadata.read_bytes()[struct.calcsize('!QI'):]
-            owner.sendall(struct.pack('!II', 0x54000200, len(manifest)) + manifest)
+            owner.sendall(struct.pack('!II', 0x54000300, len(manifest)) + manifest)
             header = bytearray()
             while len(header) < 8:
                 part = owner.recv(8 - len(header))
                 self.assertTrue(part)
                 header.extend(part)
             kind, size = struct.unpack('!II', header)
-            self.assertEqual(kind, 0x54000201)
+            self.assertEqual(kind, 0x54000301)
             while size:
                 part = owner.recv(size)
                 self.assertTrue(part)
@@ -730,7 +730,7 @@ class RustTest(BrokerTestCase):
                      string(b'/src/marker') + string(b''))
         net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
         self.addCleanup(net.close)
-        net.sendall(struct.pack('!II', 0x54000200, len(manifest)) + manifest)
+        net.sendall(struct.pack('!II', 0x54000300, len(manifest)) + manifest)
         return net
 
     def test_shared_inputs_survive_cancel_and_eviction_and_are_read_only(self):
@@ -776,7 +776,7 @@ pub fn read_only() -> bool {
             for offset in range(0, len(data) or 1, 256 * 1024):
                 chunk = data[offset:offset + 256 * 1024]
                 final = offset + len(chunk) == len(data)
-                send(net, 0x54000202 | (0x20000 if final else 0),
+                send(net, 0x54000302 | (0x20000 if final else 0),
                      struct.pack('!II', index, len(chunk)) + chunk)
 
         sockets = []
@@ -787,11 +787,11 @@ pub fn read_only() -> bool {
             sockets.append(net)
             # The planner's scheduling hint is consumed locally, before the
             # transport encodes the unchanged worker job description.
-            send(net, 0x54000200, struct.pack('!Q', identity) +
+            send(net, 0x54000300, struct.pack('!Q', identity) +
                  metadata.read_bytes()[struct.calcsize('!QI'):])
             if identity == 1:
                 kind, requested = frame(net)
-                self.assertEqual(kind, 0x54000201)
+                self.assertEqual(kind, 0x54000301)
                 for (index,) in struct.iter_unpack('!I', requested):
                     if index != manifest_index:
                         upload(net, index)
@@ -807,7 +807,7 @@ pub fn read_only() -> bool {
                 # Leave only 8 MiB of unreserved capacity. The other jobs fit
                 # only if admission counts shared files as already stored.
                 held = self.reserve_input_space(999)
-                self.assertEqual(frame(held), (0x54000201, struct.pack('!I', 1)))
+                self.assertEqual(frame(held), (0x54000301, struct.pack('!I', 1)))
 
         deadline = time.monotonic() + 10
         relative = str(payload).lstrip('/')
@@ -834,20 +834,20 @@ pub fn read_only() -> bool {
         sockets[0].close()
         promoted = select.select(sockets[1:], [], [], 5)[0]
         self.assertEqual(len(promoted), 1)
-        self.assertEqual(frame(promoted[0]), (0x54000201, struct.pack('!I', manifest_index)))
+        self.assertEqual(frame(promoted[0]), (0x54000301, struct.pack('!I', manifest_index)))
         upload(promoted[0], manifest_index)
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
         for identity, net in enumerate(sockets[1:], 2):
             kind, description = frame(net)
-            self.assertEqual(kind, 0x54000203)
+            self.assertEqual(kind, 0x54000303)
             status, mode, *sizes = struct.unpack('!II4Q', description[:40])
             buffers = [bytearray() for _ in sizes]
             while True:
                 kind, data = frame(net)
-                if kind == 0x54000205:
+                if kind == 0x54000305:
                     self.assertEqual(data, struct.pack('!Q', identity))
                     break
-                self.assertEqual(kind & ~0x30000, 0x54000204)
+                self.assertEqual(kind & ~0x30000, 0x54000304)
                 index, plain = struct.unpack('!II', data[:8])
                 buffers[index].extend(codec.decode(data[8:], plain) if kind & 0x10000 else data[8:])
             self.assertEqual(status, 0, buffers[0].decode(errors='replace'))
@@ -889,7 +889,7 @@ pub fn read_only() -> bool {
                 time.sleep(.01)
 
         held = self.reserve_input_space(101)
-        self.assertEqual(held.recv(12, socket.MSG_WAITALL), struct.pack('!3I', 0x54000201, 4, 1))
+        self.assertEqual(held.recv(12, socket.MSG_WAITALL), struct.pack('!3I', 0x54000301, 4, 1))
         cancelled = self.reserve_input_space(102)
         preparing(2)
         cancelled.close()

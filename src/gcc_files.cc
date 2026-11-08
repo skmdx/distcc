@@ -32,6 +32,10 @@ struct Entry {
     dccfs::Buffer bytes;
     unsigned mode() const { return number(version.data()+32, 4); }
 };
+struct Query {
+    std::string path, bytes;
+    dccfs::Buffer previous;
+};
 class Files {
     dccfs::Connection connection;
     std::string scope;
@@ -68,30 +72,14 @@ public:
         // identity without aliasing equal inode numbers on distinct devices.
         return inodes.try_emplace({device, number}, inodes.size()+1).first->second;
     }
-    int status(const std::string &path, Entry *&result) {
-        auto [found, inserted] = entries.try_emplace(path);
-        auto &entry = found->second;
-        result = &entry;
-        if (path != "/") {
-            auto separator = path.find_last_of('/');
-            auto parent = entries.find(separator == 0 ? "/" : path.substr(0, separator));
-            if (parent != entries.end() && parent->second.listed) {
-                if (inserted) {
-                    entry.queried = true;
-                    return entry.error = ENOENT;
-                }
-                if (parent->second.hints.insert(path.substr(separator+1)).second)
-                    parent->second.hints_changed = true;
-            }
-        }
-        if (entry.queried) return entry.error;
-        auto previous = connection.directory_names(path);
+    int prepare(const std::string &path, Query &query) {
+        auto &entry = entries[path];
+        query.path = path;
+        auto &previous = query.previous = connection.directory_names(path);
         std::array<char, DCC_FS_METADATA> listing_version{};
-        std::string_view names;
         if (previous.owner) {
             if (previous.size < DCC_FS_METADATA) return entry.error = EPROTO;
             memcpy(listing_version.data(), previous.data, DCC_FS_METADATA);
-            names = {previous.data+DCC_FS_METADATA, previous.size-DCC_FS_METADATA};
         }
         // Nearby sources reuse their observed header set. A global union would
         // stat unrelated headers on every job as a large build progresses.
@@ -106,14 +94,19 @@ public:
             entry.hints.emplace(hints.substr(0, end));
             hints.remove_prefix(end+1);
         }
-        std::string query = path; query += '\0';
-        query.append(listing_version.data(), DCC_FS_METADATA);
-        if (query.size() > DCC_FS_QUERY_MAX-4) return entry.error = ENAMETOOLONG;
-        query += pack_hints(entry, DCC_FS_QUERY_MAX-4-query.size());
-        dccfs::Buffer response;
-        auto error = connection.request(DCC_FS_LSTAT, query, response);
+        query.bytes = path; query.bytes += '\0';
+        query.bytes.append(listing_version.data(), DCC_FS_METADATA);
+        // Reserve the outer operation and the batch entry's length/operation.
+        if (query.bytes.size() > DCC_FS_QUERY_MAX-12) return entry.error = ENAMETOOLONG;
+        query.bytes += pack_hints(entry, DCC_FS_QUERY_MAX-12-query.bytes.size());
+        return 0;
+    }
+    int accept(const Query &query, const dccfs::Buffer &response) {
+        const auto &path = query.path;
+        auto &entry = entries[path];
+        const auto &previous = query.previous;
         entry.queried = true;
-        if (error) return entry.error = error.value();
+        entry.error = 0;
         if (response.size < DCC_FS_METADATA) return entry.error = EPROTO;
         memcpy(entry.version.data(), response.data, DCC_FS_METADATA);
         if (response.size == DCC_FS_METADATA) return 0;
@@ -122,7 +115,9 @@ public:
         if (flags & ~(DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_STABLE)) return entry.error = EPROTO;
         bool reused = flags & DCC_FS_DIRECTORY_CACHED;
         if (reused) {
-            if (!previous.owner || entry.version != listing_version) return entry.error = EPROTO;
+            if (!previous.owner || memcmp(entry.version.data(), previous.data, DCC_FS_METADATA))
+                return entry.error = EPROTO;
+            std::string_view names(previous.data+DCC_FS_METADATA, previous.size-DCC_FS_METADATA);
             while (!names.empty()) {
                 auto end = names.find('\0');
                 if (end == std::string_view::npos || !valid_name(names.substr(0, end)))
@@ -169,6 +164,83 @@ public:
         }
         return 0;
     }
+    int prefetch(const char *cwd, char *const *directories) {
+        std::set<std::string> paths;
+        auto add = [&](const char *name) {
+            auto path = (std::filesystem::path(cwd)/name).lexically_normal();
+            if (path != path.root_path() && !path.has_filename()) path = path.parent_path();
+            for (;;) {
+                paths.insert(path.string());
+                if (path == path.root_path()) break;
+                path = path.parent_path();
+            }
+        };
+        add(cwd);
+        for (auto p = directories; *p && **p; ++p) add(*p);
+        std::vector<Query> pending;
+        std::string payload;
+        auto flush = [&]() -> int {
+            dccfs::Buffer response;
+            if (auto error = connection.request(DCC_FS_DIRECTORIES, payload, response))
+                return error.value();
+            size_t offset = 0;
+            for (const auto &query : pending) {
+                if (response.size-offset < 8) return EPROTO;
+                unsigned error = number(response.data+offset, 4), length = number(response.data+offset+4, 4);
+                offset += 8;
+                if (length > response.size-offset || error > INT_MAX) return EPROTO;
+                if (error) {
+                    auto &entry = entries[query.path];
+                    entry.queried = true; entry.error = error;
+                } else if (int invalid = accept(query, {response.owner, response.data+offset, length}))
+                    return invalid;
+                offset += length;
+            }
+            if (offset != response.size) return EPROTO;
+            pending.clear(); payload.clear();
+            return 0;
+        };
+        // Native GCC supplied these paths; no command-line option parsing is
+        // duplicated here. Lexical spellings are only speculative cache keys:
+        // the compiler still resolves symlinks and parent traversal through FUSE.
+        for (const auto &path : paths) {
+            Query query;
+            if (int error = prepare(path, query)) return error;
+            if (payload.size()+8+query.bytes.size() > DCC_FS_QUERY_MAX-4)
+                if (int error = flush()) return error;
+            uint32_t header[] = {htonl(query.bytes.size()+4), htonl(DCC_FS_LSTAT)};
+            payload.append(reinterpret_cast<const char *>(header), sizeof(header));
+            payload += query.bytes;
+            pending.push_back(std::move(query));
+        }
+        return pending.empty() ? 0 : flush();
+    }
+    int status(const std::string &path, Entry *&result) {
+        auto [found, inserted] = entries.try_emplace(path);
+        auto &entry = found->second;
+        result = &entry;
+        if (path != "/") {
+            auto separator = path.find_last_of('/');
+            auto parent = entries.find(separator == 0 ? "/" : path.substr(0, separator));
+            if (parent != entries.end() && parent->second.listed) {
+                if (inserted) {
+                    entry.queried = true;
+                    return entry.error = ENOENT;
+                }
+                if (parent->second.hints.insert(path.substr(separator+1)).second)
+                    parent->second.hints_changed = true;
+            }
+        }
+        if (entry.queried) return entry.error;
+        Query query;
+        if (int error = prepare(path, query)) return error;
+        dccfs::Buffer response;
+        if (auto error = connection.request(DCC_FS_LSTAT, query.bytes, response)) {
+            entry.queried = true;
+            return entry.error = error.value();
+        }
+        return accept(query, response);
+    }
     int open(const char *path, Entry *&entry) {
         if (int error = status(path, entry)) return error;
         if (!S_ISREG(entry->mode())) return EINVAL;
@@ -193,6 +265,7 @@ public:
 struct Mount {
     std::unique_ptr<Files> files;
     struct fuse *fs = nullptr;
+    std::string mountpoint;
     pid_t child = -1;
 };
 Files &files() { return *static_cast<Mount *>(fuse_get_context()->private_data)->files; }
@@ -258,7 +331,7 @@ bool mapping(const char *path, const std::string &value) {
 }
 extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
                                       const char *identity, const char *job_root,
-                                      const char *cwd, const char *input) {
+                                      const char *cwd, const char *input, char *const *directories) {
     uid_t uid = getuid(); gid_t gid = getgid();
     if (mkdir(mountpoint, 0700) || unshare(CLONE_NEWUSER | CLONE_NEWNS) ||
         !mapping("/proc/self/setgroups", "deny") ||
@@ -266,6 +339,7 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
         !mapping("/proc/self/gid_map", "0 "+std::to_string(gid)+" 1\n") ||
         mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr)) return nullptr;
     auto state = std::make_unique<Mount>();
+    state->mountpoint = mountpoint;
     struct fuse_operations operations{};
     operations.init = initialize;
     operations.getattr = attributes;
@@ -296,16 +370,30 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
         // immutable snapshots in its parent so job cleanup cannot remove them.
         auto cache_root = std::filesystem::path(job_root).parent_path().string();
         state->files = std::make_unique<Files>(channel, mountpoint, identity, cache_root.c_str(), cwd, input);
-        int result = fuse_loop(state->fs);
+        int result = state->files->prefetch(cwd, directories);
+        if (result) {
+            fprintf(stderr, "distcc GCC directory prefetch: %s\n", strerror(result));
+            fuse_unmount(state->fs);
+        } else result = fuse_loop(state->fs);
         state->files.reset();
         fuse_destroy(state->fs);
         _exit(result ? 1 : 0);
     }
+    // Destroying the parent's handle closes its device fd without unmounting.
+    // The service is the sole owner: its death must abort pending kernel reads.
+    fuse_destroy(state->fs);
+    state->fs = nullptr;
     return state.release();
 }
 extern "C" int dcc_gcc_files_stop(void *opaque, uint64_t *cpu_ns, unsigned long long *peak_bytes) {
     std::unique_ptr<Mount> state(static_cast<Mount *>(opaque));
-    fuse_unmount(state->fs);
+    int error = 0;
+    if (umount2(state->mountpoint.c_str(), MNT_DETACH) && errno != EINVAL && errno != ENOENT) {
+        error = errno;
+        fprintf(stderr, "distcc GCC filesystem unmount: %s\n", strerror(error));
+        // Do not wait for an event loop that could not be detached.
+        kill(state->child, SIGTERM);
+    }
     int status;
     struct rusage usage{};
     pid_t result;
@@ -315,6 +403,5 @@ extern "C" int dcc_gcc_files_stop(void *opaque, uint64_t *cpu_ns, unsigned long 
                    (uint64_t)(usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)*1000;
         *peak_bytes += (unsigned long long)usage.ru_maxrss*1024;
     }
-    fuse_destroy(state->fs);
-    return result >= 0 && WIFEXITED(status) && !WEXITSTATUS(status) ? 0 : -1;
+    return !error && result >= 0 && WIFEXITED(status) && !WEXITSTATUS(status) ? 0 : -1;
 }
