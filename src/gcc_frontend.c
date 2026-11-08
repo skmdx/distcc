@@ -63,12 +63,20 @@ static int run_planner(const char *compiler, char **argv, int output,
 {
     const char *library = getenv("DISTCC_GCC_PLAN_LIBRARY");
     if (!library) library = GCC_PLAN_LIBRARY;
-    const char *const generated_environment[] = {"COLLECT_GCC_OPTIONS", NULL};
+    /* This key shares a loaded image, not an argument or preprocessing
+     * result. Build flags are parsed from each request's argv; its complete
+     * environment is also restored before GCC main. Make's exported copies
+     * and distcc's per-request logging do not change the retained image.
+     * Loader, allocator and sandbox configuration still belong to the key. */
+    const char *const invocation_environment[] = {
+        "COLLECT_GCC_OPTIONS", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
+        "DISTCC_LOG", "DISTCC_VERBOSE", NULL
+    };
     char key[80], *cwd = NULL;
     int worker = -1, lease = -1, input = -1, pair[2] = {-1, -1};
     int ret = EXIT_IO_ERROR;
     const char *stage = "worker lookup";
-    if (dcc_local_worker_key(compiler, library, generated_environment, key, sizeof(key))) goto out;
+    if (dcc_local_worker_key(compiler, library, invocation_environment, key, sizeof(key))) goto out;
     lease = dcc_broker_worker_get(key, &worker);
     if (worker < 0 && lease >= 0) {
         stage = "worker startup";

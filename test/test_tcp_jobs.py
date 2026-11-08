@@ -467,8 +467,14 @@ class GccFrontendTest(BrokerTestCase):
             cases.append((directory, command, (directory/'out.o').read_bytes()))
         def compile_case(case):
             directory, command, expected = case
+            # Make exports target-specific flags even though the driver has
+            # already received the complete options in argv. These values
+            # must not create another copy of the same loaded compiler image.
+            environment = dict(self.env, CFLAGS=' '.join(command[1:]),
+                               CXXFLAGS=' '.join(command[1:]),
+                               CPPFLAGS=command[-1], LDFLAGS=str(directory))
             result = subprocess.run([str(self.build/'distcc'), *command], cwd=directory,
-                                    env=self.env, capture_output=True, timeout=30)
+                                    env=environment, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((directory/'out.o').read_bytes(), expected)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -514,17 +520,33 @@ class GccFrontendTest(BrokerTestCase):
         self.start_frontend()
         wrapper = self.work/'wrap'
         marker = self.work/'wrapped'
-        wrapper.write_text(f'#!/bin/sh\necho "${{_DISTCC_SAFEGUARD:-unset}}" >> "{marker}"\nexec "$@"\n')
+        environment_marker = self.work/'wrapper-environment'
+        wrapper.write_text(f'#!/bin/sh\necho "${{_DISTCC_SAFEGUARD:-unset}}" >> "{marker}"\n'
+                           f'printf "%s\\n" "$CFLAGS" >> "{environment_marker}"\nexec "$@"\n')
         wrapper.chmod(0o755)
         self.source.write_text('int answer(void) { return 42; }\n')
         command = [self.cc, '-wrapper', str(wrapper), '-c', str(self.source), '-o', 'out.o']
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
         marker.unlink()
-        self.compile(command)
-        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        environment_marker.unlink()
+        logs = []
+        observed = 0
+        for value in ('first-request', 'second-request'):
+            log = self.work/(value+'.log')
+            self.env.update(CFLAGS=value, DISTCC_LOG=str(log))
+            self.compile(command)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+            values = environment_marker.read_text().splitlines()
+            # Planning finishes before the remote compiler/as invocations.
+            # Only the local driver receives this client build environment.
+            self.assertEqual(values[observed], value)
+            observed = len(values)
+            logs.append(log.read_text())
         self.assertTrue(marker.read_text().strip())
         self.assertEqual(marker.read_text().splitlines()[0], '1')
+        self.assertEqual(''.join(logs).count('started reusable GCC driver pid='), 1)
+        self.assertTrue(all('reused GCC driver status=0' in log for log in logs))
 
     def test_planner_cancels_only_its_request_and_recovers_dead_parent(self):
         self.start_frontend()
