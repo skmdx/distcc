@@ -30,7 +30,10 @@ class PoolTest(BrokerTestCase):
         self.job('after-admission-cancel')
 
     def accepts(self):
-        return int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
+        match = re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))
+        if match is None:
+            self.fail('worker statistics omitted the TCP acceptance counter')
+        return int(match[1])
 
     def pooled_lease(self):
         lease = self.request(6)
@@ -73,7 +76,7 @@ class PoolTest(BrokerTestCase):
         lease, net = self.pooled_lease()
         before = self.accepts()
         net.shutdown(socket.SHUT_RDWR)
-        lease.sendmsg([struct.pack('=II', 2, 7)],
+        lease.sendmsg([struct.pack('=II', self.protocol_version, 7)],
                       [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
         net.close()
         lease.close()

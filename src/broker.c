@@ -62,10 +62,10 @@ struct peer {
 enum client_state { REQUEST, WAITING, CONNECTING, HELLO_SEND, HELLO_READ,
                     RESERVE_SEND, RESERVE_READ, ACTIVE, MEMO_OWNER, MEMO_WAIT };
 struct client {
-    int fd, net, peer, cpp_reserved, direct, can_compile_locally;
+    int fd, net, peer, cpp_reserved, direct, can_compile_locally, denied;
     uint64_t serial;
     enum client_state state;
-    uint32_t command;
+    uint32_t command, local_limit;
     double deadline;
     int memo;
     int pooled;
@@ -191,12 +191,16 @@ static int send_reply(int fd, const struct reply *reply, int net)
 }
 
 static int broker_request_once(uint32_t command, struct reply *reply, int *net,
-                               const struct dcc_work_hint *hint, double deadline, int *queued_fd)
+                               const struct dcc_work_hint *hint, double deadline, int *queued_fd,
+                               unsigned local_limit)
 {
     struct sockaddr_un address;
     struct { struct request header; struct dcc_work_hint hint; } request = {{ BROKER_VERSION, command }, {0}};
+    struct local_cpp_request local = {{BROKER_VERSION, command}, local_limit};
+    const void *message = &request;
     size_t request_size = sizeof(request.header);
     if (hint) { request.hint = *hint; request_size = sizeof(request); }
+    if (command == LOCAL_CPP) { message = &local; request_size = sizeof(local); }
     union {
         struct cmsghdr align;
         char bytes[CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))];
@@ -232,7 +236,7 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
     }
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)))
         goto failed;
-    ssize_t sent = send(fd, &request, request_size, MSG_NOSIGNAL);
+    ssize_t sent = send(fd, message, request_size, MSG_NOSIGNAL);
     if (sent != (ssize_t)request_size &&
         errno != EPIPE && errno != ECONNRESET)
         goto failed;
@@ -322,7 +326,7 @@ failed:
 }
 
 static int broker_request(uint32_t command, struct reply *reply, int *net,
-                          const struct dcc_work_hint *hint, int *queued_fd)
+                          const struct dcc_work_hint *hint, int *queued_fd, unsigned local_limit)
 {
     double deadline = 0;
     int delay = 100, fd;
@@ -330,7 +334,7 @@ static int broker_request(uint32_t command, struct reply *reply, int *net,
     int timeout = setting ? atoi(setting) : 90;
     /* Closing a failed control socket releases its lease. No compiler request
      * has been sent yet, so reconnecting cannot replay a completed job. */
-    while ((fd = broker_request_once(command, reply, net, hint, deadline, queued_fd)) < 0) {
+    while ((fd = broker_request_once(command, reply, net, hint, deadline, queued_fd, local_limit)) < 0) {
         int error = errno;
         if (error != ENOENT && error != ECONNREFUSED &&
             error != ECONNRESET && error != EPIPE &&
@@ -348,11 +352,11 @@ static int broker_request(uint32_t command, struct reply *reply, int *net,
     return fd;
 }
 
-int dcc_broker_local_cpp(int *lease, int *occupied, int analysis)
+int dcc_broker_local_cpp(int *lease, int *occupied, int analysis, unsigned limit)
 {
     struct reply reply;
     int net;
-    *lease = broker_request(analysis ? LOCAL_ANALYSIS : LOCAL_CPP, &reply, &net, NULL, NULL);
+    *lease = broker_request(analysis ? LOCAL_ANALYSIS : LOCAL_CPP, &reply, &net, NULL, NULL, limit);
     if (*lease >= 0) *occupied = reply.slots;
     return *lease < 0 ? EXIT_CONNECT_FAILED : 0;
 }
@@ -361,7 +365,7 @@ int dcc_broker_try_local(const struct dcc_work_hint *hint)
 {
     if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) return -1;
     struct reply reply;
-    int net, lease = broker_request(TRY_LOCAL, &reply, &net, hint, NULL);
+    int net, lease = broker_request(TRY_LOCAL, &reply, &net, hint, NULL, 0);
     if (lease >= 0 && !reply.slots) { close(lease); lease = -1; }
     return lease;
 }
@@ -391,7 +395,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int
     fd = broker_request((can_compile_locally &&
                          !dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0) ? CLIENT_COMPILE : 0) |
                         (remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL),
-                        &reply, &net, hint, queued_fd);
+                        &reply, &net, hint, queued_fd, 0);
     if (fd < 0)
         return EXIT_CONNECT_FAILED;
     *host = NULL;
@@ -447,7 +451,7 @@ void dcc_broker_defer(const struct dcc_hostdef *host)
 int dcc_broker_jobs(char **capacity)
 {
     struct reply reply;
-    int net, fd = broker_request(JOBS, &reply, &net, NULL, NULL);
+    int net, fd = broker_request(JOBS, &reply, &net, NULL, NULL, 0);
     if (fd < 0)
         return -1;
     close(fd);
@@ -986,6 +990,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     struct reply reply = {0};
     if (client->command == LOCAL_CPP || client->command == LOCAL_ANALYSIS) {
         int limit = client->command == LOCAL_ANALYSIS ? dcc_resource_cpus() : cpp_limit(broker);
+        /* Queue against the client's budget before granting a lease. Otherwise
+         * a smaller client rejects the broker's grant and sleeps for a second
+         * even when the next compiler releases its slot immediately. */
+        if (client->command == LOCAL_CPP && client->local_limit < (unsigned)limit)
+            limit = client->local_limit;
         if (broker->cpp_busy < limit) {
             /* Memory calibration belongs to the analyzer pool. IR producers
              * still consume CPU here, but are not resident analyzer workers. */
@@ -1573,17 +1582,12 @@ static void accept_client(struct broker *broker, int listener_fd)
     if (fd < 0)
         return;
     if (!getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size)) {
-        if (credentials.uid != geteuid() && credentials.uid != 0) {
-            struct reply reply = { .status = EXIT_ACCESS_DENIED };
-            send_reply(fd, &reply, -1);
-            close(fd);
-            return;
-        }
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *client = &broker->clients[i];
             if (client->fd < 0) {
                 *client = (struct client){ .fd = fd, .net = -1, .peer = -1,
-                    .state = REQUEST, .deadline = now_seconds() + 3 };
+                    .state = REQUEST, .deadline = now_seconds() + 3,
+                    .denied = credentials.uid != geteuid() && credentials.uid != 0 };
                 return;
             }
         }
@@ -1760,6 +1764,15 @@ int dcc_broker_serve(const char *path)
                 struct { struct request header; char payload[DCC_MEMO_LIMIT]; } packet = {0};
                 int returned;
                 ssize_t length = dcc_recv_fd(c->fd, &packet, sizeof(packet), &returned);
+                if (c->denied) {
+                    /* Consume the request before closing: unread SEQPACKET
+                     * data can reset the peer and hide the permission reply. */
+                    struct reply reply = {.status = EXIT_ACCESS_DENIED};
+                    if (returned >= 0) close(returned);
+                    if (length > 0) send_reply(c->fd, &reply, -1);
+                    release_client(broker, c);
+                    continue;
+                }
                 struct request request = packet.header;
                 int can_compile_locally = request.command & CLIENT_COMPILE;
                 request.command &= ~CLIENT_COMPILE;
@@ -1851,8 +1864,9 @@ int dcc_broker_serve(const char *path)
                 }
                 int compile = request.command == ACQUIRE_POOL || request.command == ACQUIRE_CPP ||
                               request.command == ACQUIRE_READY || request.command == TRY_LOCAL;
+                int local_cpp = request.command == LOCAL_CPP;
                 if (c->state != REQUEST || length != (ssize_t)(sizeof(request) +
-                        (compile ? sizeof(struct dcc_work_hint) : 0)) ||
+                        (compile ? sizeof(struct dcc_work_hint) : local_cpp ? sizeof(uint32_t) : 0)) ||
                     request.version != BROKER_VERSION ||
                     (request.command != ACQUIRE && request.command != ACQUIRE_POOL &&
                      request.command != ACQUIRE_LINK && request.command != ACQUIRE_CPP &&
@@ -1864,6 +1878,12 @@ int dcc_broker_serve(const char *path)
                 if (compile) {
                     memcpy(&c->hint, packet.payload, sizeof(c->hint));
                     if (!dcc_work_valid(&c->hint)) { release_client(broker, c); continue; }
+                }
+                if (local_cpp) {
+                    memcpy(&c->local_limit, packet.payload, sizeof(c->local_limit));
+                    if (!c->local_limit || c->local_limit > INT_MAX) {
+                        release_client(broker, c); continue;
+                    }
                 }
                 c->command = request.command;
                 c->can_compile_locally = can_compile_locally != 0;
@@ -1916,9 +1936,10 @@ void dcc_broker_worker_put(int lease, int worker)
     (void)lease;
     (void)worker;
 }
-int dcc_broker_local_cpp(int *lease, int *occupied, int analysis)
+int dcc_broker_local_cpp(int *lease, int *occupied, int analysis, unsigned limit)
 {
     (void)analysis;
+    (void)limit;
     (void)occupied;
     *lease = -1;
     return EXIT_CONNECT_FAILED;

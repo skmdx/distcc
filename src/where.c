@@ -260,12 +260,17 @@ static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
     if (broker && *broker) {
         int occupied;
         for (;;) {
-            ret = dcc_broker_local_cpp(cpu_lock_fd, &occupied, analysis);
+            int maximum = chosen->slots_specified ? chosen->n_slots : dcc_resource_cpus();
+            int limit = analysis ? 0 : dcc_resource_slots(maximum);
+            if (!analysis && !limit) {
+                dcc_lock_pause(0);
+                continue;
+            }
+            ret = dcc_broker_local_cpp(cpu_lock_fd, &occupied, analysis, limit);
             /* The broker can live in a different cgroup. Keep admission
              * against this client's budget, not the small broker service. */
             if (ret || occupied <= (analysis ? dcc_resource_analysis_slots(dcc_resource_cpus()) :
-                                               dcc_resource_slots(chosen->slots_specified ?
-                                                   chosen->n_slots : dcc_resource_cpus()))) break;
+                                               dcc_resource_slots(maximum))) break;
             dcc_unlock(*cpu_lock_fd);
             *cpu_lock_fd = -1;
             dcc_lock_pause(analysis ? occupied : 0);

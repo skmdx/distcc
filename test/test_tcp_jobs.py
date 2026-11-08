@@ -279,61 +279,6 @@ class GccFrontendTest(BrokerTestCase):
             subprocess.run([compiler, 'out.o', '-o', 'program'], cwd=self.work, check=True)
             subprocess.run([str(self.work/'program')], check=True)
 
-    @unittest.skipUnless(shutil.which('strace'), 'strace required')
-    def test_directory_hints_skip_unused_attributes_and_refresh_each_job(self):
-        self.start_frontend()
-        headers = self.work/'headers'
-        headers.mkdir()
-        for index in range(200):
-            (headers/f'unused-{index}.h').write_text('#error unused header\n')
-        used = headers/'used.h'
-        used.write_text('#define VALUE 17\n')
-        generated = headers/'generated.h'
-        self.source.write_text('#include <used.h>\n#if __has_include(<generated.h>)\n'
-                               '#include <generated.h>\n#else\n#define EXTRA 0\n#endif\n'
-                               'int value(void) { return VALUE + EXTRA; }\n')
-        command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'hello.c', '-o', 'out.o']
-        self.compile(command)
-        trace = self.work/'metadata.trace'
-        result = subprocess.run(['strace', '-f', '-e', 'trace=newfstatat,statx', '-o', str(trace),
-                                 str(self.build/'distcc'), *command], cwd=self.work,
-                                env=self.env, capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('pooled TCP job completed', result.stderr)
-        self.assertNotIn('unused-', trace.read_text())
-        self.assertIn('used.h', trace.read_text())
-        for action in ('create', 'modify', 'replace', 'delete'):
-            if action == 'create': generated.write_text('#define EXTRA 25\n')
-            elif action == 'modify': used.write_text('#define VALUE 19\n')
-            elif action == 'replace':
-                (headers/'replacement.h').write_text('#define VALUE 23\n')
-                os.replace(headers/'replacement.h', used)
-            else: generated.unlink()
-            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
-            expected = (self.work/'out.o').read_bytes()
-            self.compile(command)
-            self.assertEqual((self.work/'out.o').read_bytes(), expected, action)
-
-    def test_parallel_directory_hints_preserve_changed_inputs(self):
-        self.start_frontend()
-        headers = self.work/'headers'
-        headers.mkdir()
-        for phase in range(2):
-            commands, expected = [], []
-            for name, value in (('first', 17+phase), ('second', 42-phase)):
-                (headers/(name+'.h')).write_text(f'#define VALUE {value}\n')
-                (self.work/(name+'.c')).write_text(
-                    f'#include "headers/{name}.h"\nint {name}(void) {{ return VALUE; }}\n')
-                command = [self.cc, '-nostdinc', '-O2', '-c', name+'.c', '-o', name+'.o']
-                subprocess.run(command, cwd=self.work, check=True, capture_output=True)
-                expected.append((self.work/(name+'.o')).read_bytes())
-                commands.append(command)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                results = list(pool.map(self.compile, commands))
-            self.assertEqual(len(results), 2)
-            for name, content in zip(('first', 'second'), expected):
-                self.assertEqual((self.work/(name+'.o')).read_bytes(), content)
-
     def test_source_diagnostic_is_produced_by_remote_gcc(self):
         self.start_frontend()
         self.source.write_text('#error remote frontend reached\n')
@@ -1151,30 +1096,16 @@ int main(int argc, char **argv) {
         source.write_text(r'''
 #include "tcp_client.c"
 int main(int argc, char **argv) {
-    if (argc < 4) return 1;
+    if (argc != 4) return 1;
     char *roots[] = {argv[1], NULL};
     struct dcc_job job = {.fs_roots = roots};
     size_t length = strlen(argv[2]);
-    int lstat_query = !strcmp(argv[3], "lstat") || !strcmp(argv[3], "invalid") ||
-                      !strcmp(argv[3], "unterminated");
-    size_t payload = length + (lstat_query && strcmp(argv[3], "unterminated") ? 1 : 0);
-    for (int i = 4; i < argc; ++i) payload += strlen(argv[i])+1;
-    unsigned char *query = malloc(payload + 4);
-    unsigned operation = lstat_query ? DCC_FS_LSTAT : !strcmp(argv[3], "list") ? DCC_FS_LIST : DCC_FS_READ;
+    unsigned char *query = malloc(length + 4);
+    unsigned operation = !strcmp(argv[3], "list") ? DCC_FS_LIST : DCC_FS_READ;
     dcc_tcp_put32(query, operation); memcpy(query + 4, argv[2], length);
-    size_t offset = 4+length;
-    if (lstat_query && strcmp(argv[3], "unterminated")) query[offset++] = 0;
-    for (int i = 4; i < argc; ++i) {
-        memcpy(query+offset, argv[i], strlen(argv[i])+1); offset += strlen(argv[i])+1;
-    }
     struct dcc_frontend_reply reply;
-    int rejected = dcc_frontend_fs_reply(&job, query, payload + 4, &reply);
+    if (dcc_frontend_fs_reply(&job, query, length + 4, &reply)) return 2;
     free(query);
-    if (!strcmp(argv[3], "invalid") || !strcmp(argv[3], "unterminated")) {
-        if (!rejected) dcc_frontend_fs_clear(&reply);
-        return rejected ? 0 : 2;
-    }
-    if (rejected) return 2;
     unsigned error = dcc_tcp_get32(reply.data);
     unsigned expected_error = !strcmp(argv[3], "denied") ? EACCES :
         !strcmp(argv[3], "missing") ? ENOENT : !strcmp(argv[3], "notdir") ? ENOTDIR : 0;
@@ -1191,10 +1122,10 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[3], "unlink") && unlink(argv[2])) return 5;
     if (!strcmp(argv[3], "truncate") && truncate(argv[2], 0)) return 6;
     unsigned char raw[DCC_TCP_CHUNK], decoded[DCC_TCP_CHUNK];
-    uint64_t stream_offset = 0, total = reply.size + reply.file_size;
-    while (stream_offset < total) {
+    uint64_t offset = 0, total = reply.size + reply.file_size;
+    while (offset < total) {
         size_t size = 0;
-        unsigned char *chunk = next_fs_chunk(&reply, &stream_offset, raw, &size);
+        unsigned char *chunk = next_fs_chunk(&reply, &offset, raw, &size);
         if (!strcmp(argv[3], "truncate")) {
             int rejected = !chunk;
             free(chunk); dcc_frontend_fs_clear(&reply);
@@ -1204,7 +1135,7 @@ int main(int argc, char **argv) {
         struct dcc_tcp_frame frame = {.type = dcc_tcp_get32(chunk), .data = chunk + 8, .size = size - 8};
         const void *data; size_t plain; unsigned index;
         if (dcc_tcp_unpack(&frame, &index, decoded, &data, &plain) || index != UINT_MAX ||
-            !!(frame.type & DCC_TCP_FINAL) != (stream_offset == total) ||
+            !!(frame.type & DCC_TCP_FINAL) != (offset == total) ||
             fwrite(data, 1, plain, stdout) != plain) return 9;
         free(chunk);
     }
@@ -1252,27 +1183,6 @@ int main(int argc, char **argv) {
             actual[data[offset:offset+length].decode()] = stat.S_IFMT(mode)
             offset += length
         self.assertEqual(actual, {p.name: stat.S_IFMT(p.lstat().st_mode) for p in listing.iterdir()})
-        data = subprocess.check_output([str(executable), str(self.work), str(listing),
-                                        'lstat', 'dangling', 'file'], timeout=5)
-        self.assertEqual(struct.unpack_from('!I', data, 60)[0], 4)
-        actual, offset = {}, 64
-        while offset < len(data):
-            length, error = struct.unpack_from('!II', data, offset)
-            offset += 8
-            name = data[offset:offset+length].decode()
-            offset += length
-            actual[name] = None
-            if not error:
-                actual[name] = stat.S_IFMT(struct.unpack_from('!I', data, offset+32)[0])
-                offset += 52
-            else: self.assertEqual(error, 0xffffffff)
-        self.assertEqual(actual, {'file': stat.S_IFREG, 'dangling': stat.S_IFLNK,
-                                  'directory': None, 'fifo': None})
-        for names in (['z', 'a'], ['file', 'file'], ['../file'], [''], ['.'], ['..']):
-            subprocess.run([str(executable), str(self.work), str(listing), 'invalid', *names],
-                           check=True, timeout=5)
-        subprocess.run([str(executable), str(self.work), str(listing), 'unterminated'],
-                       check=True, timeout=5)
 
     def test_remote_frontend_preserves_large_directory_snapshots(self):
         clang = self.start_frontend()
@@ -1745,7 +1655,7 @@ time_t time(time_t *out) {
         # reports a failed RPC; only that pooled connection is known bad.
         with socket.socket(fileno=descriptors[0]) as net:
             net.shutdown(socket.SHUT_RDWR)
-        lease.sendall(struct.pack('=II', 2, 11))
+        lease.sendall(struct.pack('=II', self.protocol_version, 11))
         self.assertEqual(lease.recv(1), b'')
         lease.close()
         self.job('fresh-connection-after-failure')
@@ -1757,7 +1667,7 @@ time_t time(time_t *out) {
         self.assertEqual(status, 0)
         for fd in descriptors:
             os.close(fd)
-        lease.sendall(struct.pack('=II', 2, 11))
+        lease.sendall(struct.pack('=II', self.protocol_version, 11))
         self.assertEqual(lease.recv(1), b'')
         lease.close()
         retry = self.request(6)

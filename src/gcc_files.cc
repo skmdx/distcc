@@ -10,7 +10,6 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <map>
-#include <set>
 #include <vector>
 #include <algorithm>
 extern "C" {
@@ -25,9 +24,7 @@ struct Entry {
     int error = 0;
     std::array<char, DCC_FS_METADATA> version{};
     bool queried = false, listed = false;
-    bool hints_changed = false;
     std::vector<std::string> children;
-    std::set<std::string> hints;
     dccfs::Buffer bytes;
     unsigned mode() const { return number(version.data()+32, 4); }
 };
@@ -35,24 +32,10 @@ class Files {
     dccfs::Connection connection;
     std::map<std::string, Entry> entries;
     std::map<std::pair<uint64_t, uint64_t>, ino_t> inodes;
-    static std::string pack_hints(const Entry &entry, size_t limit) {
-        std::string result;
-        for (const auto &name : entry.hints) {
-            if (name.size()+1 > limit-result.size()) break;
-            result += name; result += '\0';
-        }
-        return result;
-    }
 public:
     std::string root;
     Files(int fd, std::string root, const char *identity, const char *cache_root)
         : connection(fd, dcc_file_cache_records, identity, cache_root), root(std::move(root)) {}
-    ~Files() {
-        for (const auto &[path, entry] : entries)
-            if (entry.listed && entry.hints_changed)
-                connection.save_directory_hints(path,
-                    pack_hints(entry, DCC_FS_QUERY_MAX-5-path.size()));
-    }
     ino_t inode(uint64_t device, uint64_t number) {
         // One FUSE mount represents several client devices. Preserve hardlink
         // identity without aliasing equal inode numbers on distinct devices.
@@ -62,32 +45,17 @@ public:
         auto [found, inserted] = entries.try_emplace(path);
         auto &entry = found->second;
         result = &entry;
-        if (path != "/") {
+        if (entry.queried || (!inserted && !S_ISDIR(entry.mode()))) return entry.error;
+        if (inserted && path != "/") {
             auto separator = path.find_last_of('/');
             auto parent = entries.find(separator == 0 ? "/" : path.substr(0, separator));
             if (parent != entries.end() && parent->second.listed) {
-                if (inserted) {
-                    entry.queried = true;
-                    return entry.error = ENOENT;
-                }
-                if (parent->second.hints.insert(path.substr(separator+1)).second)
-                    parent->second.hints_changed = true;
+                entry.queried = true;
+                return entry.error = ENOENT;
             }
         }
-        if (entry.queried) return entry.error;
-        auto previous = connection.directory_hints(path);
-        std::string_view names(previous.data ? previous.data : "", previous.size);
-        while (!names.empty()) {
-            auto end = names.find('\0');
-            if (end == std::string_view::npos) break; // An incomplete hint is a cache miss.
-            entry.hints.emplace(names.substr(0, end));
-            names.remove_prefix(end+1);
-        }
-        std::string query = path; query += '\0';
-        if (query.size() > DCC_FS_QUERY_MAX-4) return entry.error = ENAMETOOLONG;
-        query += pack_hints(entry, DCC_FS_QUERY_MAX-4-query.size());
         dccfs::Buffer response;
-        auto error = connection.request(DCC_FS_LSTAT, query, response);
+        auto error = connection.request(DCC_FS_LSTAT, path, response);
         entry.queried = true;
         if (error) return entry.error = error.value();
         if (response.size < DCC_FS_METADATA) return entry.error = EPROTO;
@@ -96,7 +64,6 @@ public:
         if (!S_ISDIR(entry.mode()) || response.size < DCC_FS_METADATA+4) return entry.error = EPROTO;
         size_t offset = DCC_FS_METADATA+4;
         unsigned count = number(response.data+DCC_FS_METADATA, 4);
-        std::set<std::string> retained;
         for (unsigned i = 0; i < count; ++i) {
             if (response.size-offset < 8) return entry.error = EPROTO;
             unsigned length = number(response.data+offset, 4), error = number(response.data+offset+4, 4);
@@ -107,21 +74,15 @@ public:
                 return entry.error = EPROTO;
             offset += length;
             auto &child = entries[path == "/" ? path+name : path+'/'+name];
-            if (error != DCC_FS_NO_METADATA) {
-                child.error = error;
-                if (!error) {
-                    if (response.size-offset < DCC_FS_METADATA) return entry.error = EPROTO;
-                    memcpy(child.version.data(), response.data+offset, DCC_FS_METADATA);
-                    offset += DCC_FS_METADATA;
-                }
-                child.queried = error || !S_ISDIR(child.mode());
+            child.error = error;
+            if (!error) {
+                if (response.size-offset < DCC_FS_METADATA) return entry.error = EPROTO;
+                memcpy(child.version.data(), response.data+offset, DCC_FS_METADATA);
+                offset += DCC_FS_METADATA;
             }
-            if (entry.hints.count(name)) retained.insert(name);
             entry.children.push_back(std::move(name));
         }
         if (offset != response.size) return entry.error = EPROTO;
-        if (entry.hints.size() != retained.size()) entry.hints_changed = true;
-        entry.hints = std::move(retained);
         entry.listed = true;
         return 0;
     }

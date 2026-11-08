@@ -21,6 +21,8 @@ from test_adaptive import DistccTestCase, free_port, stats_response
 
 
 class BrokerTestCase(DistccTestCase):
+    protocol_version = 3
+
     def start_memory_refusal(self):
         # The first snapshot fits; before execution the real daemon's memory
         # estimate no longer does. No memory is allocated by this fixture.
@@ -86,11 +88,14 @@ class BrokerTestCase(DistccTestCase):
                         TMPDIR=str(self.work))
         return proc
 
-    def request(self, command=1, work=(0, 0, 0), work_units=0, family=0, memory_class=None):
+    def request(self, command=1, work=(0, 0, 0), work_units=0, family=0, memory_class=None,
+                cpp_limit=2147483647):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
-        payload = struct.pack("=II", 2, command)
+        payload = struct.pack("=II", self.protocol_version, command)
+        if command == 12:
+            payload += struct.pack('=I', cpp_limit)
         if command & 65535 in (6, 9, 10, 15):
             if memory_class is None:
                 kind = {7: 3, 8: 4, 10: 5}.get(work[2], 1 if 4 <= work[2] <= 6 else 0)
@@ -119,7 +124,7 @@ class BrokerTestCase(DistccTestCase):
         self.assertEqual(len(fds), 1)
         net = socket.socket(fileno=fds[0])
         self.addCleanup(net.close)
-        lease.sendall(struct.pack('=II', 2, 3))
+        lease.sendall(struct.pack('=II', self.protocol_version, 3))
         return lease, net
 
 
@@ -341,7 +346,7 @@ class BrokerDirectTest(BrokerTestCase):
         first.close()
         again = self.request(15)
         self.assertEqual(self.receive(again), (0, 1, []))
-        again.sendall(struct.pack('=II4Q', 2, 7, 0, 0, 100_000_000, 0))
+        again.sendall(struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 100_000_000, 0))
         self.assertEqual(again.recv(1032), b'')
         final = self.request(15)
         self.assertEqual(self.receive(final), (0, 1, []))
@@ -404,7 +409,7 @@ class BrokerDirectTest(BrokerTestCase):
         self.assertEqual(self.receive(direct), (0, 1 << 29, []))
         denied = self.request(15)
         self.assertEqual(self.receive(denied), (0, 0, []))
-        direct.sendall(struct.pack('=II4Q', 2, 7, 0, 0, 100_000_000, 0))
+        direct.sendall(struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 100_000_000, 0))
         self.assertEqual(direct.recv(1032), b'')
         # A backend explicitly needs a worker connection, not permission to
         # re-run a driver in its client process.
@@ -457,7 +462,7 @@ class BrokerPlacementTest(BrokerTestCase):
                 self.start_broker(hosts, name=name)
                 work = (1903, 393899298, kind)
                 seed, net = self.acquire_reserved(10, work, 248098)
-                seed.sendmsg([struct.pack('=II4Q', 2, 7, 0, 0, 26_000_000_000, 0)],
+                seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 26_000_000_000, 0)],
                              [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                array.array('i', [net.fileno()]))])
                 # This reproduces a slow tail despite an idle worker queue:
@@ -578,7 +583,7 @@ class BrokerTest(BrokerTestCase):
             with self.subTest(kind=kind):
                 self.start_broker(hosts, name=f'link-wait-{kind}')
                 seed, net = self.acquire_reserved(10, (1901, 4 * 1024**2, kind), 1048576)
-                seed.sendmsg([struct.pack('=II4Q', 2, 7, 0, 0, 2_000_000_000, 0)],
+                seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 2_000_000_000, 0)],
                              [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                array.array('i', [net.fileno()]))])
                 occupied, _ = self.acquire_reserved(10,
@@ -859,6 +864,44 @@ class BrokerTest(BrokerTestCase):
         waiter.close()
         self.assertEqual(self.receive(self.request(12)), (0, 1, []))
 
+    def test_client_memory_limit_queues_until_a_lease_is_released(self):
+        self.start_broker(self.host(0, ',tcp') + ' --localslots_cpp=4')
+        first = self.request(12, cpp_limit=2)
+        second = self.request(12, cpp_limit=2)
+        self.assertEqual(self.receive(first), (0, 1, []))
+        self.assertEqual(self.receive(second), (0, 2, []))
+        waiter = self.request(12, cpp_limit=2)
+        waiter.settimeout(.05)
+        with self.assertRaises(socket.timeout):
+            waiter.recv(1032)
+        # The broker has two spare CPU slots, but this client's memory budget
+        # permits two producers. Release must wake it without a one-second poll.
+        first.close()
+        waiter.settimeout(.5)
+        self.assertEqual(self.receive(waiter), (0, 2, []))
+
+    def test_client_memory_limits_are_independent_and_cancelable(self):
+        self.start_broker(self.host(0, ',tcp') + ' --localslots_cpp=4')
+        first = self.request(12, cpp_limit=1)
+        self.assertEqual(self.receive(first), (0, 1, []))
+        canceled = self.request(12, cpp_limit=1)
+        canceled.settimeout(.05)
+        with self.assertRaises(socket.timeout):
+            canceled.recv(1032)
+        second = self.request(12, cpp_limit=2)
+        self.assertEqual(self.receive(second), (0, 2, []))
+        canceled.close()
+        first.close()
+        second.close()
+        self.assertEqual(self.receive(self.request(12, cpp_limit=1)), (0, 1, []))
+
+    def test_invalid_client_memory_limits_are_rejected(self):
+        self.start_broker(self.host(0, ',tcp') + ' --localslots_cpp=4')
+        for limit in (0, 2147483648, 4294967295):
+            with self.subTest(limit=limit):
+                self.assertEqual(self.request(12, cpp_limit=limit).recv(1032), b'')
+        self.assertEqual(self.receive(self.request(12, cpp_limit=1)), (0, 1, []))
+
 
     def admission_hosts(self):
         # Intentionally stale, idle metrics: admission must still prevent
@@ -998,7 +1041,7 @@ class BrokerTest(BrokerTestCase):
                          for i, p in enumerate(peers))
         self.start_broker(hosts)
         seed, net = self.acquire_reserved(10, (11, 4 * 1024 * 1024, 1))
-        seed.sendmsg([struct.pack('=II4Q', 2, 7, 0, 90_000_000_000, 10_000_000_000, 0)],
+        seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 90_000_000_000, 10_000_000_000, 0)],
                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
         # An exact repeat learns 20 normalized seconds from ten execution
         # seconds on speed=2. The unrelated C++ class remains untrained.
@@ -1020,7 +1063,7 @@ class BrokerTest(BrokerTestCase):
                        if 'assigning host=' in line and f'key={key:x} ' in line)
             cost = float(row.split(' cost=', 1)[1].split()[0])
             if seconds is not None:
-                lease.sendmsg([struct.pack('=II4Q', 2, 7, 0, 0, seconds*1_000_000_000, 0)],
+                lease.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, seconds*1_000_000_000, 0)],
                               [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
                 self.assertEqual(lease.recv(1), b'')
             lease.close()
@@ -1039,7 +1082,7 @@ class BrokerTest(BrokerTestCase):
         for key, units, duration in ((1801, 1048576, 2_000_000_000),
                                      (1804, 4194304, 8_000_000_000)):
             seed, net = self.acquire_reserved(10, (key, 16 * 1024**2, 8), units)
-            seed.sendmsg([struct.pack('=II4Q', 2, 7, 0, 0, duration, 0)],
+            seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, duration, 0)],
                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
         estimates = []
         for key, units in ((1811, 1048576), (1814, 4194304)):
@@ -1160,7 +1203,7 @@ class BrokerTest(BrokerTestCase):
         # Large and small execution costs with the same size and old hash slot.
         for key, duration in ((51, 10_000_000_000), (51 + 4096, 100_000_000)):
             seed, net = self.acquire_reserved(10, (key, 4 * 1024 * 1024, 1))
-            seed.sendmsg([struct.pack('=II4Q', 2, 7, 0, 0, duration, 0)],
+            seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, duration, 0)],
                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
         self.acquire_reserved(10, (51, 4 * 1024 * 1024, 1))
         _, other = self.acquire_reserved(10, (52, 18 * 1024 * 1024, 2))
@@ -1173,7 +1216,7 @@ class BrokerTest(BrokerTestCase):
                          for i, p in enumerate(peers))
         self.start_broker(hosts)
         seed, net = self.acquire_reserved(10, (21, 4 * 1024 * 1024, 1))
-        seed.sendmsg([struct.pack('=II4Q', 2, 7, 0, 90_000_000_000, 100_000_000, 0)],
+        seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 90_000_000_000, 100_000_000, 0)],
                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
         blocker, _ = self.acquire_reserved(10, (24, 40 * 1024 * 1024, 2))
         _, long_job = self.acquire_reserved(10, (23, 20 * 1024 * 1024, 2))
@@ -1202,7 +1245,7 @@ class BrokerTest(BrokerTestCase):
         self.start_broker(hosts)
         for key, size, duration in ((61, 16384, 50_000_000), (62, 1048576, 2_000_000_000)):
             seed, net = self.acquire_reserved(10, (key, 4 * 1024 * 1024, 1), size)
-            seed.sendmsg([struct.pack('=II4Q', 2, 7, 0, 0, duration, 0)],
+            seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, duration, 0)],
                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
         first, _ = self.acquire_reserved(10, (63, 1024 * 1024, 2))
         short, _ = self.acquire_reserved(10, (66, 4 * 1024 * 1024, 1), 16384)
@@ -1234,7 +1277,7 @@ class BrokerTest(BrokerTestCase):
                          for i, p in enumerate(peers))
         self.start_broker(hosts)
         seed, net = self.acquire_reserved(10, (71, 65536, 2))
-        seed.sendmsg([struct.pack('=II4Q', 2, 7, 20_000_000, 0, 10_000_000, 0)],
+        seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 20_000_000, 0, 10_000_000, 0)],
                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
         # A delayed small FD handoff must not imply a slow bulk upload for
         # larger inputs on this otherwise idle, faster local CPU.
@@ -1439,7 +1482,7 @@ class BrokerTest(BrokerTestCase):
         _, net = self.acquire_reserved(10)
         self.assertEqual(net.getpeername()[1], self.ports[1])
         for lease, net in held:
-            lease.sendmsg([struct.pack('=II4Q', 2, 7, 0, 0, 0, 0)],
+            lease.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 0, 0)],
                           [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
             net.close()
         _, net = self.acquire_reserved(10)
@@ -1449,7 +1492,7 @@ class BrokerTest(BrokerTestCase):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(2)
         sock.connect(self.env['DISTCC_BROKER'])
-        sock.sendall(struct.pack('=II', 2, 4) + key + b'\0')
+        sock.sendall(struct.pack('=II', self.protocol_version, 4) + key + b'\0')
         self.addCleanup(sock.close)
         return sock
 
@@ -1461,7 +1504,7 @@ class BrokerTest(BrokerTestCase):
         waiter.settimeout(.1)
         with self.assertRaises(socket.timeout):
             waiter.recv(65536)
-        owner.sendall(struct.pack('=II', 2, 5) + b'resolved\0')
+        owner.sendall(struct.pack('=II', self.protocol_version, 5) + b'resolved\0')
         waiter.settimeout(2)
         self.assertEqual(waiter.recv(65536), b'resolved\0')
         self.assertEqual(self.memo(b'probe').recv(65536), b'resolved\0')
@@ -1536,7 +1579,7 @@ class BrokerTest(BrokerTestCase):
         second.settimeout(.15)
         with self.assertRaises(socket.timeout):
             second.recv(1032)
-        first.sendall(struct.pack("=II", 2, 3))
+        first.sendall(struct.pack("=II", self.protocol_version, 3))
         second.settimeout(2)
         status, _, fds = self.receive(second)
         self.assertEqual(status, 0)
@@ -1710,6 +1753,20 @@ class BrokerIdentityTest(unittest.TestCase):
                                         env=env, input=b'42\n', capture_output=True, timeout=3)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), b'42')
+                # Make the foreign request readable before accept(). A denied
+                # peer must receive the error even when its request is queued.
+                os.kill(broker.pid, signal.SIGSTOP)
+                try:
+                    os.seteuid(65534)
+                    peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                    self.addCleanup(peer.close)
+                    peer.connect(str(path))
+                    peer.sendall(struct.pack('=II', BrokerTestCase.protocol_version, 2))
+                finally:
+                    os.seteuid(0)
+                    os.kill(broker.pid, signal.SIGCONT)
+                peer.settimeout(3)
+                self.assertEqual(struct.unpack('=i', peer.recv(1032)[:4]), (113,))
                 result = subprocess.run([str(build / 'distcc'), '-j'], env=env,
                                         user=65534, capture_output=True, timeout=3)
                 self.assertNotEqual(result.returncode, 0)

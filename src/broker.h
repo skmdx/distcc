@@ -6,7 +6,7 @@ struct dcc_job_result;
 int dcc_broker_serve(const char *path);
 int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int can_compile_locally,
                        const struct dcc_work_hint *, int *queued_fd);
-int dcc_broker_local_cpp(int *lease, int *occupied, int analysis);
+int dcc_broker_local_cpp(int *lease, int *occupied, int analysis, unsigned limit);
 /* Try the ordinary placement policy before preparing remote inputs. A declined
  * request holds no reservation; a granted lease covers client-side execution.
  * An empty hint borrows an extra local codegen lane; there is no movable job. */

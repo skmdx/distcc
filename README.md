@@ -333,6 +333,10 @@ For a distributed Ninja build, bound total jobs with `-j`. A local load limit
 even while other workers are idle. Benchmark with the same explicit job count
 and without that local load limit before tuning memory admission or transport.
 Keep worker memory limits and the local preprocessing slot limit enabled.
+The client sends its memory-limited preprocessing capacity to the broker before
+requesting a CPU lease. Waiting requests wake when a producer releases its lease,
+instead of rejecting an over-budget grant and retrying after a one-second sleep.
+The client still checks its current memory budget after admission.
 The total job count also includes preprocessing and transfer waits: a CPU-sized
 `-j` limit can leave remote workers idle. Compare a larger bounded job count
 while holding preprocessing slots and worker memory limits constant.
@@ -697,12 +701,6 @@ to obtain search paths before preprocessing, then a read-only FUSE filesystem
 for the actual remote compiler. GCC workers require libfuse3, `/dev/fuse` and
 permission to create a user and mount namespace. Offload compilation keeps its
 existing input preparation.
-
-GCC workers remember which children of each directory earlier jobs accessed.
-The client enumerates directories anew and batches fresh attributes for those
-names, leaving unused children as names only. New lookups fetch their attributes
-on demand. Shared hints affect prefetching only: file existence, attributes and
-contents are never trusted merely because an earlier job used them.
 
 Builds whose generated sources include files outside the compiler's source and
 include directories can set `DISTCC_FRONTEND_ROOTS` to a colon-separated list
