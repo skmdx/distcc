@@ -12,19 +12,22 @@ reduce client filesystem service cost in remote preprocessing
     256 branches split into four requests. Parent queries now omit attributes
     supplied by a scheduled child's own query, including across batch splits;
     each child still checks its current identity and permissions. All 57
-    GCC/frontend checks pass. Installed and full-build validation of this
-    metadata deduplication remain pending.
-    The preceding initial and warm builds take 315.584 and 307.956 seconds versus
-    319.080 and 312.397; client CPU takes 938.617 and 900.668 seconds versus
-    940.715 and 893.487. Each run completes 6400 remote jobs with matching
+    GCC/frontend checks and five-host installed validation pass. The initial
+    and warm full builds take 316.286 and 315.083 seconds versus 315.584 and
+    307.956; client CPU takes 939.008 and 894.387 seconds versus 938.617 and
+    900.668. Each run completes 6400 remote jobs with matching
     hashes, valid statistics and no errors, timeouts, disconnects or fallback
-    warnings. These single runs do not establish a stable speedup range.
-    The real focused compile reduces sends/polls from 10/8 to 8/6, but still
-    performs 442 attribute queries and opens 119 directories. Its output
-    matches. Most anonymous mappings are small allocations, not cached file
+    warnings. Warm client CPU falls 0.70%, but wall time rises 2.31%; no full
+    build speedup is established. The warm focused compile reduces newfstatat
+    calls from 442 to 351, with unchanged sends/polls (8/6), directory opens
+    (119) and output. This trace does not count every metadata syscall. The
+    post-deployment cold trace is not comparable to that warm measurement.
+    Most anonymous mappings are small allocations, not cached file
     bodies. File service, path resolution and teardown still cost client CPU;
     batching requests alone does not remove them. Warm remote occupancy is
-    4.559 cores. Continue matched complete builds and workload attribution;
+    4.702 cores. Occupancy samples do not support a large slow-worker-only
+    tail, but do not identify client readiness or build dependencies.
+    Continue matched complete builds and workload attribution;
     dispatch counts or small tests do not establish resolution of spare
     capacity. Do not add overlapping inclusive profile costs.
     Two earlier pre-dispatch fallbacks remain unexplained. The affected
@@ -40,6 +43,12 @@ recognize arbitrary input suffixes with explicit compiler language
     The argument scanner still identifies source operands by suffix even when
     -x selects the language. Such jobs remain local. Delegate operand discovery
     to the compiler's native option decoder instead of adding another grammar.
+
+honor caller optimization flags in GCC module builds
+
+    include_server/build_gcc_scan.py hardcodes -O2 and ignores CXXFLAGS and
+    LDFLAGS, including when invoked by the Portage ebuild. Preserve the module's
+    ABI/PIC requirements while using the caller's compilation and link flags.
 
 type-check TCP integration tests
 
