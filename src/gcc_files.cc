@@ -150,7 +150,7 @@ public:
                 }
                 child.queried = error || !S_ISDIR(child.mode());
             }
-            if (entry.hints.count(name)) retained.insert(name);
+            if (error != ENOENT && entry.hints.count(name)) retained.insert(name);
             if (!reused) entry.children.push_back(std::move(name));
         }
         if (offset != response.size) return entry.error = EPROTO;
@@ -227,7 +227,10 @@ public:
                     entry.queried = true;
                     return entry.error = ENOENT;
                 }
-                if (parent->second.hints.insert(path.substr(separator+1)).second)
+                // A listed parent already proves absence. Repeated failed
+                // lookups must not turn that into a fresh stat on every job.
+                if ((!entry.queried || entry.error != ENOENT) &&
+                    parent->second.hints.insert(path.substr(separator+1)).second)
                     parent->second.hints_changed = true;
             }
         }

@@ -105,6 +105,35 @@ static void replies(const std::string &mode)
     } else require(result == (mode == "disconnect" ? EIO : EPROTO), "bad reply accepted");
 }
 
+static void negative_hints()
+{
+    Files files(-1, "/sandbox", "fixture", "/cache", "/tree", "part.c");
+    Query query;
+    require(!files.prepare("/tree", query), "prepare empty directory");
+    std::string reply(DCC_FS_METADATA, '\0');
+    uint32_t mode = htonl(S_IFDIR | 0755);
+    memcpy(reply.data()+32, &mode, sizeof(mode));
+    integer(reply, DCC_FS_DIRECTORY_STABLE); integer(reply, 0);
+    require(!files.accept(query, {{}, reply.data(), reply.size()}), "empty directory reply");
+    Entry *entry;
+    for (unsigned i = 0; i < 3; ++i)
+        require(files.status("/tree/missing", entry) == ENOENT, "cached negative lookup");
+    Query next;
+    require(!files.prepare("/tree", next), "prepare subsequent query");
+    require(next.bytes.size() == strlen("/tree")+1+DCC_FS_METADATA,
+            "negative lookup became a metadata hint");
+
+    // Previously learned hints may outlive a removed file. A failed fresh
+    // lookup must drop them instead of being repeated in subsequent jobs.
+    require(!files.status("/tree", entry), "parent status");
+    entry->hints.insert("missing");
+    reply.resize(DCC_FS_METADATA);
+    integer(reply, DCC_FS_DIRECTORY_STABLE); integer(reply, 1);
+    integer(reply, 7); integer(reply, ENOENT); reply += "missing";
+    require(!files.accept(query, {{}, reply.data(), reply.size()}), "disappeared child reply");
+    require(entry->hints.empty(), "absent metadata hint survived its fresh lookup");
+}
+
 static void disconnected_mount(const char *root)
 {
     int pair[2];
@@ -133,6 +162,7 @@ static void disconnected_mount(const char *root)
 
 int main(int argc, char **argv)
 {
+    negative_hints();
     for (const char *mode : {"valid", "denied", "short", "length", "flags", "missing",
                              "trailing", "bad-error", "disconnect"}) replies(mode);
     require(argc == 2, "temporary root argument");
