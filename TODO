@@ -8,9 +8,12 @@ reduce client filesystem service cost in remote preprocessing
     immutable contents, and batches fresh metadata with source-scoped hints.
     Assembly with preprocessing now uses the same remote filesystem, and
     planning stops before opening the source. Cross-target execution passes.
-    The latest matched full build has 6400 instead of 6304 remote jobs and
-    6.67% more remote CPU occupancy, but elapsed time is unchanged (+0.09%)
-    and client CPU falls only 0.37%. This is not a demonstrated speedup.
+    Warm directory replies now use one descriptor for fresh metadata and
+    child lookups without allocating a DIR. The latest matched full build
+    completes the same 6400 remote jobs: elapsed time falls 0.60% and client
+    CPU 0.53%, but remote CPU occupancy falls 4.38%. One pair with such a
+    small elapsed difference does not establish a sustained speedup or
+    resolution of idle capacity.
     The client filesystem/transport processes still consume about half the
     sampled CPU. GCC planning, other local cc1 invocations, driver startup,
     path resolution, TCP sends and teardown remain significant. Distinguish
