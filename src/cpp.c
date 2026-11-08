@@ -82,14 +82,14 @@ static int frontend_language(char **argv, const char *input_fname, int cxx)
     if (dcc_offload_language(argv)) return 0;
     ext = dcc_find_extension_const(input_fname);
     int preprocessed = dcc_is_preprocessed(input_fname);
-    if (preprocessed && (!ext || strcmp(ext, ".s"))) return 0;
     if (ext) ext = dcc_preproc_exten(ext);
     if (ext) {
-        if (!strcmp(ext, ".i")) language = cxx ? "c++" : "c";
+        if (!strcmp(ext, ".s")) language = preprocessed ? "assembler" : "assembler-with-cpp";
+        else if (preprocessed) language = NULL;
+        else if (!strcmp(ext, ".i")) language = cxx ? "c++" : "c";
         else if (!strcmp(ext, ".ii")) language = "c++";
         else if (!strcmp(ext, ".mi")) language = "objective-c";
         else if (!strcmp(ext, ".mii")) language = "objective-c++";
-        else if (!strcmp(ext, ".s")) language = preprocessed ? "assembler" : "assembler-with-cpp";
     }
     for (i = 1; argv[i]; i++) {
         if (dcc_is_literal_option(argv[i]) && argv[i + 1]) { i++; continue; }

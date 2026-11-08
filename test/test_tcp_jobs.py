@@ -304,9 +304,9 @@ class GccFrontendTest(BrokerTestCase):
         headers = self.work/'root/usr/include'
         headers.mkdir(parents=True)
         (self.work/'alias').symlink_to(headers, target_is_directory=True)
-        (self.work/'part.c').write_text('#include <value.h>\n.data\n.globl value\nvalue:\n.long VALUE\n')
-        command = [self.cc, '-x', 'assembler-with-cpp', '--sysroot='+str(self.work/'root'),
-                   '-Ialias', '-c', 'part.c', '-o', 'out.o']
+        names = ('part.c', 'part.i', 'part.s')
+        for name in names:
+            (self.work/name).write_text('#include <value.h>\n.data\n.globl value\nvalue:\n.long VALUE\n')
         for value in (41, 42):
             if value == 42:
                 headers = self.work/'replacement'
@@ -314,11 +314,14 @@ class GccFrontendTest(BrokerTestCase):
                 (self.work/'alias').unlink()
                 (self.work/'alias').symlink_to(headers, target_is_directory=True)
             (headers/'value.h').write_text(f'#define VALUE {value}\n')
-            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
-            expected = (self.work/'out.o').read_bytes()
-            result = self.compile(command)
-            self.assertIn('frontend filesystem:', result.stderr)
-            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+            for name in names:
+                command = [self.cc, '-x', 'assembler-with-cpp', '--sysroot='+str(self.work/'root'),
+                           '-Ialias', '-c', name, '-o', 'out.o']
+                subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+                expected = (self.work/'out.o').read_bytes()
+                result = self.compile(command)
+                self.assertIn('frontend filesystem:', result.stderr)
+                self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_remote_assembly_reports_preprocessor_and_assembler_errors(self):
         self.start_frontend()
@@ -340,9 +343,11 @@ class GccFrontendTest(BrokerTestCase):
         self.start_frontend()
         (self.work/'part.s').write_text('.data\n.globl value\nvalue:\n.incbin "bytes.bin"\n')
         (self.work/'part.S').write_text('#define VALUE 41\n.data\n.globl value\nvalue:\n.long VALUE\n')
+        (self.work/'part.i').write_bytes((self.work/'part.S').read_bytes())
         (self.work/'bytes.bin').write_bytes(struct.pack('=I', 42))
-        for name, enabled in (('part.s', '1'), ('part.S', '0')):
-            command = [self.cc, '-c', name, '-o', 'out.o']
+        for name, enabled, language in (('part.s', '1', []), ('part.S', '0', []),
+                                       ('part.i', '0', ['-x', 'assembler-with-cpp'])):
+            command = [self.cc, *language, '-c', name, '-o', 'out.o']
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
             result = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
