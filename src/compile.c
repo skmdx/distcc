@@ -1267,7 +1267,8 @@ dcc_build_somewhere(char *argv[],
                input_fname ? input_fname : "(unknown)",
                host->hostdef_string);
     } else {
-        rs_log_warning("failed to distribute, running locally instead");
+        rs_log_warning("failed to distribute %s (status=%d), running locally instead",
+                       input_fname ? input_fname : "(unknown)", ret);
     }
 
     fallback_unsupported:

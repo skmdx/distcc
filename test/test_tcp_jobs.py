@@ -495,6 +495,21 @@ class GccFrontendTest(BrokerTestCase):
         self.assertEqual(log.read_text().count('started reusable GCC planner pid='), 1)
         self.assertEqual(log.read_text().count('started reusable GCC driver pid='), 1)
 
+    def test_planner_failure_preserves_compiler_diagnostics(self):
+        self.start_frontend()
+        missing = self.work/'missing-distcc_gcc_scan.so'
+        self.env.update(DISTCC_GCC_SCAN_LIBRARY=str(missing), DISTCC_FALLBACK='1')
+        self.source.write_text('int answer(void) { return 42; }\n')
+        result = subprocess.run([str(self.build/'distcc'), self.cc, '-c', str(self.source),
+                                 '-o', 'out.o'], cwd=self.work, env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(missing), result.stderr)
+        self.assertIn('failed during compiler execution', result.stderr)
+        self.assertIn('failed to distribute '+str(self.source), result.stderr)
+        self.assertNotIn('pooled TCP job completed', result.stderr)
+        self.assertTrue((self.work/'out.o').is_file())
+
     def test_planner_preserves_explicit_gcc_wrapper(self):
         self.start_frontend()
         wrapper = self.work/'wrap'

@@ -67,13 +67,17 @@ static int run_planner(const char *compiler, char **argv, int output,
     char key[80], *cwd = NULL;
     int worker = -1, lease = -1, input = -1, pair[2] = {-1, -1};
     int ret = EXIT_IO_ERROR;
+    const char *stage = "worker lookup";
     if (dcc_local_worker_key(compiler, library, generated_environment, key, sizeof(key))) goto out;
     lease = dcc_broker_worker_get(key, &worker);
     if (worker < 0 && lease >= 0) {
+        stage = "worker startup";
         worker = start_planner(compiler, argv, library, role);
         dcc_broker_worker_put(lease, worker); lease = -1;
     }
-    if (worker < 0 || !(cwd = getcwd(NULL, 0)) ||
+    if (worker < 0) goto out;
+    stage = "command preparation";
+    if (!(cwd = getcwd(NULL, 0)) ||
         socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) ||
         (input = dcc_job_memfd("distcc-gcc-command")) < 0) goto out;
     char *directory[] = {cwd, NULL};
@@ -82,14 +86,18 @@ static int run_planner(const char *compiler, char **argv, int output,
         dcc_x_argv(input, "ARGC", "ARGV", environ) || lseek(input, 0, SEEK_SET) < 0) goto out;
     int fds[] = {input, pair[1], standard[0], standard[1], standard[2]};
     struct dcc_native_request request = {'P', 0};
+    stage = "command send";
     if (dcc_send_fds(worker, &request, sizeof(request), fds, 5)) goto out;
     close(pair[1]); pair[1] = -1;
     struct dcc_native_result result;
     ssize_t length;
+    stage = "result receive";
     do { length = recv(pair[0], &result, sizeof(result), MSG_TRUNC); } while (length < 0 && errno == EINTR);
     if (length != sizeof(result) || result.status > 65535) goto out;
     ret = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
+    stage = "compiler execution";
     if (ret) goto out;
+    stage = "plan copy";
     struct stat info;
     if (fstat(input, &info) || ftruncate(output, 0) || lseek(output, 0, SEEK_SET) < 0) {
         ret = EXIT_IO_ERROR; goto out;
@@ -103,6 +111,8 @@ static int run_planner(const char *compiler, char **argv, int output,
     rs_trace("reused GCC %s status=%d cpu_ns=%llu", role, ret,
              (unsigned long long)result.cpu_ns);
 out:
+    if (ret) rs_log_warning("GCC %s failed during %s (status=%d, errno=%d)",
+                            role, stage, ret, errno);
     if (lease >= 0) close(lease);
     if (worker >= 0) close(worker);
     if (input >= 0) close(input);
@@ -136,9 +146,13 @@ static int plan_driver(char **argv, int output)
     else if (dcc_which(argv[0], &compiler)) return EXIT_IO_ERROR;
     if (!compiler) return EXIT_OUT_OF_MEMORY;
     int file = open(compiler, O_RDONLY | O_CLOEXEC), ret = EXIT_IO_ERROR;
+    int diagnostics = dcc_job_memfd("distcc-gcc-diagnostics");
     unsigned char magic[4];
     ssize_t length;
-    if (file < 0) { free(compiler); return ret; }
+    if (file < 0 || diagnostics < 0) {
+        if (file >= 0) close(file);
+        goto out;
+    }
     do { length = read(file, magic, sizeof(magic)); } while (length < 0 && errno == EINTR);
     close(file);
     if (length < 0) goto out;
@@ -147,12 +161,14 @@ static int plan_driver(char **argv, int output)
     if (length != sizeof(magic) || memcmp(magic, "\177ELF", sizeof(magic))) {
         pid_t child;
         int status;
-        if (!dcc_spawn_child(argv, &child, "/dev/null", "/dev/null", "/dev/null") &&
+        char diagnostic_path[64];
+        snprintf(diagnostic_path, sizeof(diagnostic_path), "/proc/self/fd/%d", diagnostics);
+        if (!dcc_spawn_child(argv, &child, "/dev/null", "/dev/null", diagnostic_path) &&
             !dcc_collect_child("gcc frontend plan", child, &status, -1, NULL, NULL) && !status) ret = 0;
     } else {
         int quiet = open("/dev/null", O_RDWR | O_CLOEXEC);
         if (quiet >= 0) {
-            const int standard[] = {quiet, quiet, quiet};
+            const int standard[] = {quiet, quiet, diagnostics};
             /* Ordinary driver spawning increments the recursion guard in its
              * child. Serialize that same environment for the resident driver,
              * then restore this single-threaded client's own environment. */
@@ -176,6 +192,13 @@ static int plan_driver(char **argv, int output)
         }
     }
 out:
+    if (diagnostics >= 0) {
+        struct stat info;
+        if (ret && !fstat(diagnostics, &info) && info.st_size &&
+            lseek(diagnostics, 0, SEEK_SET) >= 0)
+            dcc_pump_readwrite(STDERR_FILENO, diagnostics, info.st_size);
+        close(diagnostics);
+    }
     free(compiler);
     return ret;
 }
