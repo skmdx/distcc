@@ -35,7 +35,6 @@
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
-#include <errno.h>
 #include <ctype.h>
 #include <stdint.h>
 #include <limits.h>
@@ -173,29 +172,6 @@ int dcc_explain_mismatch(const char *buf,
  * @param expected 4-char token that is expected to come in next
  * @param val      receives the parameter value
  **/
-static int parse_token_int(const char *bytes, const char *expected, unsigned *val)
-{
-    char number[9], *end;
-    if (strlen(expected) != 4) {
-        rs_log_error("expected token \"%s\" seems wrong", expected);
-        return EXIT_PROTOCOL_ERROR;
-    }
-
-    if (memcmp(bytes, expected, 4)) {
-        rs_log_error("protocol derailment: expected token \"%s\"", expected);
-        return EXIT_PROTOCOL_ERROR;
-    }
-    memcpy(number, bytes+4, 8);
-    number[8] = '\0';
-    *val = strtoul(number, &end, 16);
-    if (end != number+8) {
-        rs_log_error("failed to parse parameter of token \"%s\"",
-                     expected);
-        return EXIT_PROTOCOL_ERROR;
-    }
-    return 0;
-}
-
 int dcc_r_token_int(int ifd, const char *expected, unsigned *val)
 {
     char buf[13];
@@ -204,7 +180,7 @@ int dcc_r_token_int(int ifd, const char *expected, unsigned *val)
         rs_log_error("read failed while waiting for token \"%s\"", expected);
         return ret;
     }
-    if ((ret = parse_token_int(buf, expected, val))) {
+    if ((ret = dcc_parse_token_int(buf, expected, val))) {
         dcc_explain_mismatch(buf, 12, ifd);
         return ret;
     }
@@ -392,67 +368,6 @@ int dcc_r_argv_body(int ifd, const char *argv_token, unsigned argc, char ***argv
     dcc_trace_argv("got arguments", a);
 
     return 0;
-}
-
-/* Compiler commands are complete files handed off before the receiver runs.
- * Read the remaining extent once and decode all groups with the same token
- * parser as the stream protocol. No persistent buffering or socket read-ahead.
- * Strings stay at their received offsets. Their terminator may overwrite the
- * next token's first byte, so write it only after decoding that token. */
-int dcc_argv_file_read(int fd, unsigned groups, struct dcc_argv_file *file)
-{
-    struct stat info;
-    off_t offset = lseek(fd, 0, SEEK_CUR);
-    memset(file, 0, sizeof(*file));
-    if (offset < 0 || fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size < offset)
-        return EXIT_IO_ERROR;
-    uintmax_t extent = info.st_size-offset;
-    if (extent >= SIZE_MAX) return EXIT_OUT_OF_MEMORY;
-    size_t size = extent, cursor = 0;
-    if (!groups || groups > size/12) return EXIT_PROTOCOL_ERROR;
-    char *bytes = malloc(size+1), *terminator = NULL;
-    if (!bytes) return EXIT_OUT_OF_MEMORY;
-    file->bytes = bytes;
-    file->groups = calloc(groups, sizeof(*file->groups));
-    if (!file->groups) { dcc_argv_file_close(file); return EXIT_OUT_OF_MEMORY; }
-    file->count = groups;
-    int ret = dcc_readx(fd, bytes, size);
-    if (ret) goto out;
-    ret = EXIT_PROTOCOL_ERROR;
-    for (unsigned g = 0; g < groups; ++g) {
-        unsigned argc;
-        if (size-cursor < 12 || parse_token_int(bytes+cursor, "ARGC", &argc)) goto out;
-        if (terminator) { *terminator = '\0'; terminator = NULL; }
-        cursor += 12;
-        if (argc > (size-cursor)/12) goto out;
-        char **argv = file->groups[g] = calloc((size_t)argc+1, sizeof(*argv));
-        if (!argv) { ret = EXIT_OUT_OF_MEMORY; goto out; }
-        for (unsigned a = 0; a < argc; ++a) {
-            unsigned length;
-            if (size-cursor < 12 || parse_token_int(bytes+cursor, "ARGV", &length)) goto out;
-            if (terminator) *terminator = '\0';
-            cursor += 12;
-            if (length > size-cursor || (uintmax_t)length+1 > SIZE_MAX) goto out;
-            argv[a] = bytes+cursor;
-            cursor += length;
-            terminator = bytes+cursor;
-        }
-    }
-    if (cursor == size) {
-        if (terminator) *terminator = '\0';
-        ret = 0;
-    }
-out:
-    if (ret) dcc_argv_file_close(file);
-    return ret;
-}
-
-void dcc_argv_file_close(struct dcc_argv_file *file)
-{
-    for (unsigned g = 0; g < file->count; ++g) free(file->groups[g]);
-    free(file->groups);
-    free(file->bytes);
-    memset(file, 0, sizeof(*file));
 }
 
 /* C callers that modify vectors retain independently owned strings. */

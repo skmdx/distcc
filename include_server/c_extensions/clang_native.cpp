@@ -22,7 +22,7 @@
 #include "clang_codegen.h"
 #include "clang_compiler.h"
 #include "compiler_command.h"
-#include "native_worker.h"
+#include "../../src/native_worker.h"
 
 LLD_HAS_DRIVER(elf)
 
@@ -158,7 +158,12 @@ PyObject *serve(PyObject *, PyObject *input) {
     if (!PyArg_ParseTuple(input, "i", &fd)) return nullptr;
     int status;
     Py_BEGIN_ALLOW_THREADS
-    status = dcc_native_worker(fd, execute);
+    llvm::outs().flush(); llvm::errs().flush();
+    status = dcc_native_worker(fd, [](int request, bool preparing) {
+        int result = execute(request, preparing);
+        llvm::outs().flush(); llvm::errs().flush();
+        return result;
+    });
     Py_END_ALLOW_THREADS
     if (PyErr_CheckSignals() < 0) return nullptr;
     return PyLong_FromLong(status);

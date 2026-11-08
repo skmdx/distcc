@@ -72,6 +72,7 @@ include_server_builddir = $(builddir)/_include_server
 # contain variable expansions written in Make syntax.  Ew.
 DIR_DEFS = -DLIBDIR="\"${prefix}/lib\"" -DSYSCONFDIR="\"${sysconfdir}\"" -DICONDIR="\"${icondir}\""
 DIR_DEFS += -DCPP_LOOKUP_LIBRARY='"$(libdir)/distcc/cpp_lookup.so"'
+DIR_DEFS += -DGCC_PLAN_LIBRARY='"$(libdir)/distcc/gcc_plan.so"'
 CPP_LOOKUP_TARGET = @CPP_LOOKUP_TARGET@
 
 # arguments to pkgconfig
@@ -211,8 +212,8 @@ include_server_SRC = \
 	include_server/c_extensions/clang_native.cpp \
 	include_server/c_extensions/clang_codegen.cpp \
 	include_server/c_extensions/clang_codegen.h \
-	include_server/c_extensions/native_worker.cpp \
-	include_server/c_extensions/native_worker.h
+	src/native_worker.cc \
+	src/native_worker.h
 
 update_distcc_symlinks_PY = update-distcc-symlinks.py
 
@@ -317,7 +318,7 @@ deb_glob_pattern = "$(PACKAGE)"*[-_.]"$(VERSION)"[-_.]*.deb
 common_obj = src/arg.o src/argutil.o					\
 	src/cleanup.o src/compress.o src/compress_stream.o					\
 	src/trace.o src/util.o src/io.o src/exec.o			\
-	src/rpc.o src/tempfile.o src/bulk.o src/help.o src/filename.o	\
+	src/rpc.o src/argv_file.o src/tempfile.o src/bulk.o src/help.o src/filename.o	\
 	src/lock.o src/resource.o					\
 	src/netutil.o							\
 	src/pump.o							\
@@ -542,7 +543,7 @@ check_include_server_PY = \
 
 ## NOTE: "all" must be the first (default) rule, aside from patterns.
 
-all: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) $(LINKER_WRAPPER_TARGET) $(LTO_TARGETS) pump include-server
+all: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) $(LINKER_WRAPPER_TARGET) $(LTO_TARGETS) gcc_plan.so pump include-server
 
 llvm-linker-wrapper/.patched: $(srcdir)/src/llvm-linker-wrapper.patch
 	mkdir -p llvm-linker-wrapper
@@ -596,6 +597,12 @@ distcc-rust-native.so: src/rust_native.o
 
 cpp_lookup.so: $(srcdir)/src/cpp_lookup.c
 	$(CC) $(CFLAGS) -fPIC -shared $(LDFLAGS) -o $@ $< -ldl -pthread
+
+src/argv_file.pic.o: $(srcdir)/src/argv_file.c $(srcdir)/src/argv_file.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
+
+gcc_plan.so: $(srcdir)/src/gcc_plan.cc $(srcdir)/src/native_worker.cc $(srcdir)/src/native_worker.h src/argv_file.pic.o
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=gnu++17 -fPIC -fvisibility=hidden -shared $(LDFLAGS) -o $@ $(srcdir)/src/gcc_plan.cc $(srcdir)/src/native_worker.cc src/argv_file.pic.o -ldl
 
 #  src/config.h.in is used by config.status
 Makefile: Makefile.in src/config.h.in config.status
@@ -1101,7 +1108,7 @@ clean: clean-autoconf clean-lzo clean-include-server
 	rm -f src/*.[od]
 	rm -f test/*.pyc
 	rm -f $(check_PROGRAMS) $(bin_PROGRAMS) $(sbin_PROGRAMS)
-	rm -f cpp_lookup.so distcc-rust-native.so clang_driver.so
+	rm -f cpp_lookup.so distcc-rust-native.so clang_driver.so gcc_plan.so src/argv_file.pic.o
 	rm -rf "$(LTO_BUILD)"
 	rm -f distcc-linker-wrapper
 	rm -rf llvm-linker-wrapper
@@ -1220,7 +1227,9 @@ showpaths:
 install: showpaths install-doc install-man install-programs \
 	install-include-server install-example @INSTALL_GNOME@ install-conf
 
-install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) $(LINKER_WRAPPER_TARGET) install-lto
+install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) $(LINKER_WRAPPER_TARGET) gcc_plan.so install-lto
+	$(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc"
+	$(INSTALL_PROGRAM) gcc_plan.so "$(DESTDIR)$(libdir)/distcc/gcc_plan.so"
 	if test -n "$(CPP_LOOKUP_TARGET)"; then \
 	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
 	  $(INSTALL_PROGRAM) cpp_lookup.so "$(DESTDIR)$(libdir)/distcc/cpp_lookup.so"; \
@@ -1378,6 +1387,7 @@ uninstall: uninstall-man uninstall-programs @UNINSTALL_GNOME@ \
 
 uninstall-programs:
 	rm -f "$(DESTDIR)$(libdir)/distcc/cpp_lookup.so"
+	rm -f "$(DESTDIR)$(libdir)/distcc/gcc_plan.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/clang_driver.so"
 	rm -f "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/lto-prepare.so"
@@ -1461,6 +1471,9 @@ TAGS: $(SRC) $(HEADERS)
 SRC += src/job.c src/remote_job.c
 SRC += src/tcp_job.c src/tcp_client.c src/tcp_server.c src/tcp_worker.c src/tcp_async.c
 SRC += src/frontend_fs.c src/gcc_frontend.c src/gcc_files.cc
+SRC += src/argv_file.c src/gcc_plan.cc src/native_worker.cc src/native_worker.h
+src/rpc.o src/argv_file.o: src/argv_file.h
+src/gcc_frontend.o src/local_clang.o src/clang_worker.o src/distcc.o: src/native_worker.h
 src/frontend_fs.o src/tcp_client.o src/local_clang.o: src/frontend_fs.h
 HEADERS += src/tcp_job.h src/tcp_async.h src/clang_worker.h
 HEADERS += src/job.h

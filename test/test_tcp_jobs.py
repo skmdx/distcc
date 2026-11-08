@@ -224,6 +224,7 @@ class GccFrontendTest(BrokerTestCase):
         self.restart_server(self.build/'distccd', DISTCC_GCC_SCAN_LIBRARY=self.module, **settings)
         self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
         self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
+                        DISTCC_GCC_PLAN_LIBRARY=str(self.build/'gcc_plan.so'),
                         DISTCC_TESTING_INCLUDE_SERVER='1',
                         DISTCC_GCC_SCAN_LIBRARY=self.module, DISTCC_SKIP_LOCAL_RETRY='1',
                         INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
@@ -250,6 +251,128 @@ class GccFrontendTest(BrokerTestCase):
                          expected[1].replace(b'\\\n', b'').split())
         subprocess.run([self.cc, 'out.o', '-o', 'program'], cwd=self.work, check=True)
         self.assertEqual(subprocess.check_output([str(self.work/'program')]), b'37 hello.c\n')
+
+    def test_planner_shares_loaded_gcc_and_isolates_fresh_search_paths(self):
+        self.start_frontend()
+        log = self.work/'planner.log'
+        self.env['DISTCC_LOG'] = str(log)
+        cases = []
+        for index in range(8):
+            directory = self.work/f'job-{index}'
+            directory.mkdir()
+            include = self.work/f'headers-{index}'
+            include.mkdir()
+            (include/'value.h').write_text(f'#define VALUE {index}\n')
+            (directory/'source.c').write_text('#include <value.h>\nint answer(void) { return VALUE+ADD; }\n')
+            command = [self.cc, '-c', 'source.c', '-o', 'out.o', '-nostdinc',
+                       '-I'+str(include), f'-DADD={index+1}']
+            subprocess.run(command, cwd=directory, check=True, capture_output=True)
+            cases.append((directory, command, (directory/'out.o').read_bytes()))
+        def compile_case(case):
+            directory, command, expected = case
+            result = subprocess.run([str(self.build/'distcc'), *command], cwd=directory,
+                                    env=self.env, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((directory/'out.o').read_bytes(), expected)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(compile_case, cases))
+        text = log.read_text()
+        self.assertEqual(text.count('started reusable GCC planner pid='), 1, text)
+        self.assertEqual(text.count('reused GCC planner status=0'), len(cases), text)
+        self.assertEqual(text.count('pooled TCP job completed'), len(cases), text)
+        # An earlier missing search directory must be considered on the next
+        # call, even though the loaded compiler image is the same process.
+        directory, command, _ = cases[0]
+        first = self.work/'generated'
+        command += ['-I'+str(first)]
+        (directory/'source.c').write_text('#include <new.h>\nint answer(void) { return NEW; }\n')
+        failed = subprocess.run([str(self.build/'distcc'), *command], cwd=directory,
+                                env=self.env, capture_output=True, timeout=30)
+        self.assertNotEqual(failed.returncode, 0)
+        first.mkdir()
+        (first/'new.h').write_text('#define NEW 42\n')
+        subprocess.run(command, cwd=directory, check=True, capture_output=True)
+        compile_case((directory, command, (directory/'out.o').read_bytes()))
+        self.assertEqual(log.read_text().count('started reusable GCC planner pid='), 1)
+
+    def test_planner_preserves_explicit_gcc_wrapper(self):
+        self.start_frontend()
+        wrapper = self.work/'wrap'
+        marker = self.work/'wrapped'
+        wrapper.write_text(f'#!/bin/sh\necho invoked >> "{marker}"\nexec "$@"\n')
+        wrapper.chmod(0o755)
+        self.source.write_text('int answer(void) { return 42; }\n')
+        command = [self.cc, '-wrapper', str(wrapper), '-c', str(self.source), '-o', 'out.o']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        marker.unlink()
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        self.assertTrue(marker.read_text().strip())
+
+    def test_planner_cancels_only_its_request_and_recovers_dead_parent(self):
+        self.start_frontend()
+        log = self.work/'planner.log'
+        self.env['DISTCC_LOG'] = str(log)
+        # A real GCC plugin holds one invocation before the plan completes.
+        # It is loaded in the invocation child, never in the shared parent.
+        marker = self.work/'entered'
+        plugin = self.work/'hold.c'
+        plugin.write_text('#include <stdio.h>\n#include <unistd.h>\n'
+                          'int plugin_is_GPL_compatible;\n'
+                          'int plugin_init(void *a, void *b) { '
+                          f'FILE *f=fopen("{marker}.tmp","w"); '
+                          'fprintf(f,"%d",getpid()); fclose(f); '
+                          f'rename("{marker}.tmp","{marker}"); '
+                          'for (;;) pause(); }\n')
+        library = self.work/'hold.so'
+        subprocess.run([self.cc, '-shared', '-fPIC', str(plugin), '-o', str(library)],
+                       check=True, capture_output=True)
+        frontend = subprocess.check_output([self.cc, '-print-prog-name=cc1'], text=True).strip()
+        self.source.write_text('int answer(void) { return 42; }\n')
+        with os.fdopen(os.memfd_create('gcc-plan-test', os.MFD_CLOEXEC), 'w+b') as output:
+            assert self.module is not None
+            command = [str(self.build/'distcc'), '--gcc-plan', frontend, '-E', '-quiet',
+                       str(self.source), '-o', '/dev/null', '-fplugin='+self.module,
+                       f'-fplugin-arg-distcc_gcc_scan-plan-fd={output.fileno()}']
+            held = subprocess.Popen([*command, '-fplugin='+str(library)], env=self.env,
+                                    pass_fds=(output.fileno(),), stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            def stop():
+                if held.poll() is None: held.kill()
+                held.wait(timeout=5)
+            self.addCleanup(stop)
+            deadline = time.monotonic()+10
+            while not marker.exists():
+                self.assertIsNone(held.poll())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            child = int(marker.read_text())
+            match = re.search(r'started reusable GCC planner pid=(\d+)', log.read_text())
+            assert match is not None, log.read_text()
+            parent = int(match[1])
+            # Another job can complete while the first is blocked.
+            result = subprocess.run(command, env=self.env, pass_fds=(output.fileno(),),
+                                    capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(log.read_text().count('started reusable GCC planner pid='), 1)
+            stop()
+            deadline = time.monotonic()+5
+            while Path(f'/proc/{child}').exists():
+                self.assertLess(time.monotonic(), deadline, 'cancelled GCC remains alive')
+                time.sleep(.01)
+            os.kill(parent, signal.SIGKILL)
+            deadline = time.monotonic()+5
+            while Path(f'/proc/{parent}/stat').exists():
+                if Path(f'/proc/{parent}/stat').read_text().rsplit(')', 1)[1].split()[0] == 'Z': break
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            result = subprocess.run(command, env=self.env, pass_fds=(output.fileno(),),
+                                    capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output.seek(0)
+            self.assertEqual(output.read(4), b'ARGC')
+            self.assertEqual(log.read_text().count('started reusable GCC planner pid='), 2)
 
     def test_cpp_search_classes_macros_symlinks_and_warm_cache(self):
         self.start_frontend(DISTCCD_FILE_CACHE=str(self.work/'cache'))
@@ -585,7 +708,10 @@ class FrontendTest(BrokerTestCase):
         self.check_remote_codegen(4, compiler)
 
     def test_remote_codegen_disconnect_reaps_partitions_and_releases_capacity(self):
-        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        # Use the host's real lanes for this lifecycle test. Capping the daemon
+        # at four slots can leave no spare lane under unrelated desktop load.
+        clang = self.start_frontend(jobs=len(os.sched_getaffinity(0)),
+                                   DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
         trace_offset = Path(self.logs[0].name).stat().st_size
         source, output = self.work/'cancel-codegen.c', self.work/'cancel-codegen.o'
         source.write_text('\n'.join(

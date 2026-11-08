@@ -12,6 +12,7 @@ import time
 import unittest
 
 from test_broker import BrokerTestCase
+from test_adaptive import stats_response
 
 
 class LocalClangTest(BrokerTestCase):
@@ -503,7 +504,11 @@ int main() {
             if not cxx: self.skipTest('C++ driver required')
             self.compiler = cxx
         saved = dict(self.env)
-        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='codegen')
+        # These tests exercise compiler isolation and spare-lease ownership,
+        # not host-load estimation. A desktop's unrelated CPU load must not
+        # remove the lanes required to reach the parallel backend under test.
+        capacity = self.peer(stats_response(cpus=4, jobs=4, cores=4))
+        self.start_broker(self.host(0, f',tcp,stats={capacity.port}'), name='codegen')
         saved.update({key: self.env[key] for key in ('DISTCC_HOSTS', 'DISTCC_BROKER')})
         self.env = dict(saved, DISTCC_CLANG_CODEGEN='1')
         if not verbose:

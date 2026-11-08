@@ -144,6 +144,7 @@ ext = setuptools.Extension(
               'src/srvrpc.c',
               'src/pump.c',
               'src/rpc.c',
+              'src/argv_file.c',
               'src/io.c',
               'src/lock.c',
               'src/trace.c',
@@ -221,8 +222,8 @@ codegen_sources = [os.path.join(srcdir_include_server, 'c_extensions', 'clang_co
 codegen_headers = [os.path.join(srcdir, 'src', name) for name in
                    ('broker_protocol.h', 'workload.h', 'lto_partition.h')]
 codegen_headers.append(os.path.join(srcdir_include_server, 'c_extensions', 'clang_codegen.h'))
-worker_sources = [os.path.join(srcdir_include_server, 'c_extensions', 'native_worker.cpp')]
-worker_headers = [os.path.join(srcdir_include_server, 'c_extensions', 'native_worker.h'),
+worker_sources = [os.path.join(srcdir, 'src', 'native_worker.cc')]
+worker_headers = [os.path.join(srcdir, 'src', 'native_worker.h'),
                   os.path.join(srcdir, 'src', 'clang_worker.h')]
 for config in os.environ.get('DISTCC_CLANG_CONFIGS', llvm_config).split(os.pathsep):
   major = llvm_option('--version', config).split('.')[0]

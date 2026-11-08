@@ -194,7 +194,7 @@ static int compile_file(int request, int fd) {
 }
 
 #ifdef DCC_CLANG_COMPILE_MODULE
-#include "native_worker.h"
+#include "../../src/native_worker.h"
 namespace {
 PyObject *compile_request(PyObject *, PyObject *arguments) {
     int request, fd;
@@ -211,8 +211,11 @@ PyObject *serve(PyObject *, PyObject *arguments) {
     if (!PyArg_ParseTuple(arguments, "i", &descriptor)) return nullptr;
     int status;
     Py_BEGIN_ALLOW_THREADS
+    llvm::outs().flush(); llvm::errs().flush();
     status = dcc_native_worker(descriptor, [](int request, bool preparing) {
-        return preparing ? 1 : compile_file(request, STDIN_FILENO);
+        int result = preparing ? 1 : compile_file(request, STDIN_FILENO);
+        llvm::outs().flush(); llvm::errs().flush();
+        return result;
     });
     Py_END_ALLOW_THREADS
     if (PyErr_CheckSignals() < 0) return nullptr;

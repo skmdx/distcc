@@ -118,7 +118,7 @@ int dcc_clang_worker(int session, char **argv, int filesystem, int cancel,
                      int *status, unsigned long long *peak, uint64_t *cpu_ns)
 {
     int ret = 0;
-    struct dcc_clang_request request = {'C', getpgrp()};
+    struct dcc_native_request request = {'C', getpgrp()};
     int reply[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, reply)) return EXIT_IO_ERROR;
     int fds[] = {dcc_job_memfd("distcc-clang-command"), reply[1], filesystem,
@@ -150,7 +150,7 @@ int dcc_clang_worker(int session, char **argv, int filesystem, int cancel,
         if (ready < 0 || polls[1].revents) { ret = EXIT_IO_ERROR; break; }
         if (!ready) { ret = EXIT_TIMEOUT; break; }
         if (polls[0].revents) {
-            struct dcc_clang_result result;
+            struct dcc_native_result result;
             ssize_t length = recv(reply[0], &result, sizeof(result), MSG_TRUNC);
             if (length != sizeof(result) || result.status > 65535) { ret = EXIT_IO_ERROR; break; }
             *status = result.status; *peak = result.peak_bytes;

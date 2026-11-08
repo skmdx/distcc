@@ -717,6 +717,17 @@ the pump analyzer is disabled.
 Client driver planning shares the automatic local input-preparation budget.
 Its lease is released before worker selection, so completed planning does not
 keep the client apparently busy or reserve a worker while awaiting a local CPU.
+For GCC on x86_64/aarch64 glibc, the native driver supplies frontend arguments
+through its `-wrapper` interface. A client-owned helper retains the loaded GCC
+image before its main function runs, then forks a fresh planner for each job.
+Only library loading is shared: every invocation parses its own arguments,
+environment and current search directories. No search-plan result is cached.
+The broker scopes helpers to the caller, executable, namespaces, credentials
+and loader environment; replacing the compiler or helper selects a new image.
+The existing native worker loop owns concurrent invocations, cancellation and
+shutdown for both GCC planning and Clang execution. Helpers release inherited
+caller pipes and stop when their broker-owned control connection closes.
+An explicit GCC `-wrapper` keeps its requested execution path.
 
 Each daemon worker loads the Clang libraries once and forks a separate compiler
 child for each job. This avoids repeated library loading without sharing macro,

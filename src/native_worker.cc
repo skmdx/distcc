@@ -1,9 +1,6 @@
 /* Descriptor dispatch and child ownership for resident local compilers.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include "native_worker.h"
-#include "../../src/clang_worker.h"
-#include <llvm/ADT/ScopeExit.h>
-#include <llvm/Support/raw_ostream.h>
 #include <sys/epoll.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -17,8 +14,18 @@
 #include <climits>
 #include <cstdint>
 #include <map>
+#include <cstdio>
+#include <utility>
 
 namespace {
+// C++17 has no standard scope_exit. The native worker also serves GCC and
+// must not load LLVM merely for descriptor and child-process ownership.
+template<class Action> struct on_exit {
+    Action action;
+    explicit on_exit(Action action) : action(std::move(action)) {}
+    ~on_exit() { action(); }
+    on_exit(const on_exit &) = delete;
+};
 // Received descriptors can occupy a closed standard stream. Move those out of
 // the way before installing stdio and the sole request FD inherited by Clang.
 bool child_descriptors(int *fds) {
@@ -52,7 +59,7 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
     action.sa_handler = SIG_DFL;
     sigemptyset(&action.sa_mask);
     bool installed = !sigaction(SIGCHLD, &action, &previous_action);
-    auto cleanup = llvm::scope_exit([&] {
+    on_exit cleanup([&] {
         for (auto [pid, run] : jobs) { kill(-run.group, SIGKILL); close(run.peer); }
         for (auto [pid, run] : jobs)
             while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
@@ -83,7 +90,7 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                 while (read(signals, &signal, sizeof(signal)) > 0)
                     if (signal.ssi_signo != SIGCHLD) return 128+signal.ssi_signo;
             } else if (id == 0) {
-                dcc_clang_request request;
+                dcc_native_request request;
                 int fds[5], received = 0;
                 alignas(cmsghdr) char ancillary[CMSG_SPACE(sizeof(fds))];
                 iovec bytes{&request, sizeof(request)};
@@ -102,13 +109,13 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                         else { close(descriptors[n]); message.msg_flags |= MSG_CTRUNC; }
                     }
                 }
-                auto close_received = llvm::scope_exit([&] {
+                on_exit close_received([&] {
                     for (int n = 0; n != received; ++n) if (fds[n] >= 0) close(fds[n]);
                 });
                 if (!length) return 0;
                 if (length != sizeof(request) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) || received != 5 ||
                     (request.operation != 'C' && request.operation != 'P') || request.group > INT_MAX) return 1;
-                llvm::outs().flush(); llvm::errs().flush();
+                fflush(nullptr);
                 pid_t parent = getpid(), pid = fork();
                 if (pid < 0) return 1;
                 if (!pid) {
@@ -119,7 +126,7 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                         sigaction(SIGINT, &action, nullptr) ||
                         !child_descriptors(fds)) _exit(1);
                     int status = execute(3, request.operation == 'P');
-                    llvm::outs().flush(); llvm::errs().flush();
+                    fflush(nullptr);
                     _exit(status >= 0 ? status : 128-status);
                 }
                 pid_t group = request.group ? pid_t(request.group) : pid;
@@ -150,7 +157,7 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
             if (found == jobs.end()) return 1;
             uint64_t cpu = uint64_t(usage.ru_utime.tv_sec+usage.ru_stime.tv_sec)*1000000000 +
                 uint64_t(usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)*1000;
-            dcc_clang_result reply{uint64_t(status), uint64_t(usage.ru_maxrss)*1024, cpu};
+                dcc_native_result reply{uint64_t(status), uint64_t(usage.ru_maxrss)*1024, cpu};
             int peer = found->second.peer;
             epoll_ctl(events, EPOLL_CTL_DEL, peer, nullptr);
             send(peer, &reply, sizeof(reply), MSG_NOSIGNAL);

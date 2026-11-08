@@ -56,6 +56,7 @@
 #include "compile.h"
 #include "job.h"
 #include "emaillog.h"
+#include "native_worker.h"
 
 
 /* Name of this program, for trace.c */
@@ -265,6 +266,9 @@ int main(int argc, char **argv)
     /* Ignore SIGPIPE; we consistently check error codes and will
      * see the EPIPE. */
     dcc_ignore_sigpipe(1);
+
+    if (argc > 2 && !strcmp(argv[1], "--gcc-plan"))
+        dcc_exit(dcc_gcc_plan_execute(argv + 2));
 
     /* Private transport entry point used by file-based compiler planners. */
     if ((argc == 5 || argc == 6) && !strcmp(argv[1], "--file-job")) {

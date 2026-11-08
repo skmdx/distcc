@@ -15,7 +15,7 @@
 #include <unistd.h>
 #include <xxhash.h>
 #include "distcc.h"
-#include "clang_worker.h"
+#include "native_worker.h"
 #include "broker.h"
 #include "exec.h"
 #include "exitcode.h"
@@ -27,22 +27,31 @@
 
 extern char **environ;
 
-static int worker_key(const char *compiler, char *key, size_t size)
+int dcc_local_worker_key(const char *compiler, const char *library,
+                         const char *const *omit_environment, char *key, size_t size)
 {
     XXH3_state_t *hash = XXH3_createState();
     if (!hash) return -1;
     XXH3_128bits_reset(hash);
-    const char *paths[] = {compiler, "/proc/self/ns/mnt", "/proc/self/ns/pid", "/proc/self/ns/user"};
+    const char *paths[] = {compiler, library, "/proc/self/ns/mnt", "/proc/self/ns/pid", "/proc/self/ns/user"};
     for (unsigned i = 0; i < sizeof(paths)/sizeof(*paths); ++i) {
+        if (!paths[i]) continue;
         struct stat info;
         if (stat(paths[i], &info)) { XXH3_freeState(hash); return -1; }
         XXH3_128bits_update(hash, &info.st_dev, sizeof(info.st_dev));
         XXH3_128bits_update(hash, &info.st_ino, sizeof(info.st_ino));
-        if (!i) XXH3_128bits_update(hash, &info.st_ctim, sizeof(info.st_ctim));
+        if (i < 2) XXH3_128bits_update(hash, &info.st_ctim, sizeof(info.st_ctim));
     }
     /* Driver aliases of the same executable share libraries. Each request
      * carries its original argv[0], which owns target and C/C++ mode. */
-    for (char **p = environ; *p; ++p) XXH3_128bits_update(hash, *p, strlen(*p)+1);
+    for (char **p = environ; *p; ++p) {
+        int omit = 0;
+        for (const char *const *name = omit_environment; name && *name; ++name) {
+            size_t length = strlen(*name);
+            if (!strncmp(*p, *name, length) && (*p)[length] == '=') { omit = 1; break; }
+        }
+        if (!omit) XXH3_128bits_update(hash, *p, strlen(*p)+1);
+    }
     gid_t groups[NGROUPS_MAX];
     int count = getgroups(NGROUPS_MAX, groups);
     if (count < 0) { XXH3_freeState(hash); return -1; }
@@ -53,7 +62,7 @@ static int worker_key(const char *compiler, char *key, size_t size)
     XXH3_128bits_update(hash, &mask, sizeof(mask));
     XXH128_hash_t value = XXH3_128bits_digest(hash);
     XXH3_freeState(hash);
-    snprintf(key, size, "clang-local:%016llx%016llx", (unsigned long long)value.high64,
+    snprintf(key, size, "compiler-local:%016llx%016llx", (unsigned long long)value.high64,
              (unsigned long long)value.low64);
     return 0;
 }
@@ -90,7 +99,7 @@ static int request(char **argv, char operation, int output, int *status, uint64_
     if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
     else if (dcc_which(argv[0], &compiler)) goto out;
     char key[80];
-    if (!compiler || worker_key(compiler, key, sizeof(key))) goto out;
+    if (!compiler || dcc_local_worker_key(compiler, NULL, NULL, key, sizeof(key))) goto out;
     lease = dcc_broker_worker_get(key, &worker);
     if (worker < 0 && lease >= 0) {
         worker = start_worker(compiler);
@@ -103,10 +112,10 @@ static int request(char **argv, char operation, int output, int *status, uint64_
     if (dcc_x_argv(input, "ARGC", "ARGV", directory) ||
         dcc_x_argv(input, "ARGC", "ARGV", argv) || lseek(input, 0, SEEK_SET) < 0) goto out;
     int fds[] = {input, pair[1], 0, 1, 2};
-    struct dcc_clang_request request = {operation, 0};
+    struct dcc_native_request request = {operation, 0};
     if (dcc_send_fds(worker, &request, sizeof(request), fds, 5)) goto out;
     close(pair[1]); pair[1] = -1;
-    struct dcc_clang_result result;
+    struct dcc_native_result result;
     ssize_t length;
     do { length = recv(pair[0], &result, sizeof(result), MSG_TRUNC); } while (length < 0 && errno == EINTR);
     ret = length == sizeof(result) && result.status <= 65535 ? 0 : EXIT_IO_ERROR;
