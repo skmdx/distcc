@@ -159,6 +159,9 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             assert result.returncode == 0, (compiler, result.stderr.decode(errors='replace'))
             log = (root/'client.log').read_text()[before:]
             assert 'frontend filesystem:' in log and 'pooled TCP job completed' in log, log[-6000:]
+            with open(compiler_path, 'rb') as executable:
+                if executable.read(4) == b'\x7fELF':
+                    assert 'reused GCC driver status=0' in log, log[-6000:]
             subprocess.run([compiler_path, str(obj), str(support_obj), '-o', str(exe)],
                            check=True, timeout=30)
             subprocess.run([str(exe)], check=True, timeout=5)

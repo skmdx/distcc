@@ -22,10 +22,11 @@
 #include "native_worker.h"
 #include "broker.h"
 #include "trace.h"
+#include "util.h"
 
 extern char **environ;
 
-static int start_planner(char **argv, const char *library)
+static int start_planner(const char *compiler, char **argv, const char *library, const char *role)
 {
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair)) return -1;
@@ -38,7 +39,7 @@ static int start_planner(char **argv, const char *library)
             asprintf(&preload, "%s%s%s", library, previous ? ":" : "", previous ? previous : "") < 0 ||
             fcntl(pair[1], F_SETFD, 0) ||
             setenv("LD_PRELOAD", preload, 1) || setenv("DISTCC_GCC_PLAN_CONTROL", descriptor, 1)) _exit(1);
-        execv(argv[0], argv);
+        execv(compiler, argv);
         _exit(1);
     }
     close(pair[1]);
@@ -53,32 +54,23 @@ static int start_planner(char **argv, const char *library)
         }
         return -1;
     }
-    rs_trace("started reusable GCC planner pid=%ld", (long)child);
+    rs_trace("started reusable GCC %s pid=%ld", role, (long)child);
     return pair[0];
 }
 
-/* GCC -wrapper supplies its actual frontend argv: no driver-option parser
- * or cached search result is needed in this process. */
-int dcc_gcc_plan_execute(char **argv)
+static int run_planner(const char *compiler, char **argv, int output,
+                       const int standard[3], const char *role)
 {
     const char *library = getenv("DISTCC_GCC_PLAN_LIBRARY");
     if (!library) library = GCC_PLAN_LIBRARY;
     const char *const generated_environment[] = {"COLLECT_GCC_OPTIONS", NULL};
     char key[80], *cwd = NULL;
-    int worker = -1, lease = -1, input = -1, output = -1, pair[2] = {-1, -1};
+    int worker = -1, lease = -1, input = -1, pair[2] = {-1, -1};
     int ret = EXIT_IO_ERROR;
-    const char option[] = "-fplugin-arg-distcc_gcc_scan-plan-fd=";
-    for (char **arg = argv; *arg; ++arg) if (!strncmp(*arg, option, sizeof(option) - 1)) {
-        const char *value = *arg + sizeof(option) - 1;
-        char *end;
-        long fd = strtol(value, &end, 10);
-        if (!*value || *end || fd < 3 || fd > INT_MAX) goto out;
-        output = fd;
-    }
-    if (output < 0 || dcc_local_worker_key(argv[0], library, generated_environment, key, sizeof(key))) goto out;
+    if (dcc_local_worker_key(compiler, library, generated_environment, key, sizeof(key))) goto out;
     lease = dcc_broker_worker_get(key, &worker);
     if (worker < 0 && lease >= 0) {
-        worker = start_planner(argv, library);
+        worker = start_planner(compiler, argv, library, role);
         dcc_broker_worker_put(lease, worker); lease = -1;
     }
     if (worker < 0 || !(cwd = getcwd(NULL, 0)) ||
@@ -88,7 +80,7 @@ int dcc_gcc_plan_execute(char **argv)
     if (dcc_x_argv(input, "ARGC", "ARGV", directory) ||
         dcc_x_argv(input, "ARGC", "ARGV", argv) ||
         dcc_x_argv(input, "ARGC", "ARGV", environ) || lseek(input, 0, SEEK_SET) < 0) goto out;
-    int fds[] = {input, pair[1], 0, 1, 2};
+    int fds[] = {input, pair[1], standard[0], standard[1], standard[2]};
     struct dcc_native_request request = {'P', 0};
     if (dcc_send_fds(worker, &request, sizeof(request), fds, 5)) goto out;
     close(pair[1]); pair[1] = -1;
@@ -108,7 +100,8 @@ int dcc_gcc_plan_execute(char **argv)
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) { ret = EXIT_IO_ERROR; goto out; }
     }
-    rs_trace("reused GCC planner status=%d", ret);
+    rs_trace("reused GCC %s status=%d cpu_ns=%llu", role, ret,
+             (unsigned long long)result.cpu_ns);
 out:
     if (lease >= 0) close(lease);
     if (worker >= 0) close(worker);
@@ -119,12 +112,72 @@ out:
     return ret;
 }
 
+/* GCC -wrapper supplies its actual frontend argv: no driver-option parser
+ * or cached search result is needed in this process. */
+int dcc_gcc_plan_execute(char **argv)
+{
+    int output = -1;
+    const char option[] = "-fplugin-arg-distcc_gcc_scan-plan-fd=";
+    for (char **arg = argv; *arg; ++arg) if (!strncmp(*arg, option, sizeof(option) - 1)) {
+        const char *value = *arg + sizeof(option) - 1;
+        char *end;
+        long fd = strtol(value, &end, 10);
+        if (!*value || *end || fd < 3 || fd > INT_MAX) return EXIT_IO_ERROR;
+        output = fd;
+    }
+    const int standard[] = {0, 1, 2};
+    return output < 0 ? EXIT_IO_ERROR : run_planner(argv[0], argv, output, standard, "planner");
+}
+
+static int plan_driver(char **argv, int output)
+{
+    char *compiler = NULL;
+    if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
+    else if (dcc_which(argv[0], &compiler)) return EXIT_IO_ERROR;
+    if (!compiler) return EXIT_OUT_OF_MEMORY;
+    int file = open(compiler, O_RDONLY | O_CLOEXEC), ret = EXIT_IO_ERROR;
+    unsigned char magic[4];
+    ssize_t length;
+    if (file < 0) { free(compiler); return ret; }
+    do { length = read(file, magic, sizeof(magic)); } while (length < 0 && errno == EINTR);
+    close(file);
+    if (length < 0) goto out;
+    /* A script's ELF entry belongs to its interpreter and has different argv
+     * semantics. Let exec handle those existing compiler wrappers normally. */
+    if (length != sizeof(magic) || memcmp(magic, "\177ELF", sizeof(magic))) {
+        pid_t child;
+        int status;
+        if (!dcc_spawn_child(argv, &child, "/dev/null", "/dev/null", "/dev/null") &&
+            !dcc_collect_child("gcc frontend plan", child, &status, -1, NULL, NULL) && !status) ret = 0;
+    } else {
+        int quiet = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (quiet >= 0) {
+            const int standard[] = {quiet, quiet, quiet};
+            /* Ordinary driver spawning increments the recursion guard in its
+             * child. Serialize that same environment for the resident driver,
+             * then restore this single-threaded client's own environment. */
+            const char *guard = getenv("_DISTCC_SAFEGUARD");
+            char *previous = guard ? strdup(guard) : NULL;
+            if (!guard || previous) {
+                if (!dcc_increment_safeguard())
+                    ret = run_planner(compiler, argv, output, standard, "driver");
+                if (previous ? setenv("_DISTCC_SAFEGUARD", previous, 1) : unsetenv("_DISTCC_SAFEGUARD"))
+                    ret = EXIT_OUT_OF_MEMORY;
+            }
+            free(previous);
+            close(quiet);
+        }
+    }
+out:
+    free(compiler);
+    return ret;
+}
+
 int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **result)
 {
-    int descriptor = dcc_job_memfd("distcc-gcc-plan"), status, ret = EXIT_IO_ERROR;
+    int descriptor = dcc_job_memfd("distcc-gcc-plan"), ret = EXIT_IO_ERROR;
     char **command = NULL, **groups[2] = {NULL, NULL};
     struct dcc_job *job = NULL;
-    pid_t child;
     if (descriptor < 0 || fcntl(descriptor, F_SETFD, 0) ||
         dcc_copy_argv(argv, &command, 5) || dcc_set_output(command, "/dev/null")) goto done;
     const char *module = getenv("DISTCC_GCC_SCAN_LIBRARY");
@@ -150,8 +203,7 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
         dcc_argv_append(command, strdup("-wrapper"));
         dcc_argv_append(command, wrapper);
     }
-    if (dcc_spawn_child(command, &child, "/dev/null", "/dev/null", "/dev/null") ||
-        dcc_collect_child("gcc frontend plan", child, &status, -1, NULL, NULL) || status ||
+    if (plan_driver(command, descriptor) ||
         lseek(descriptor, 0, SEEK_SET) < 0 || dcc_r_argv_file(descriptor, 2, groups)) goto done;
     job = calloc(1, sizeof(*job));
     if (!job) goto done;

@@ -20,6 +20,7 @@ import socket
 import base64
 import struct
 import subprocess
+import sys
 import threading
 import tempfile
 import pwd
@@ -29,6 +30,8 @@ import xxhash
 
 from test_broker import BrokerTestCase
 from test_adaptive import free_port
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 class FileCacheTest(unittest.TestCase):
@@ -232,10 +235,13 @@ class GccFrontendTest(BrokerTestCase):
                         INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
 
     def compile(self, command):
+        log = Path(self.env['DISTCC_LOG']) if self.env.get('DISTCC_LOG') else None
+        offset = log.stat().st_size if log and log.exists() else 0
         result = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
                                 env=self.env, capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr + '\n' + Path(self.logs[0].name).read_text())
-        self.assertIn('pooled TCP job completed', result.stderr)
+        trace = log.read_bytes()[offset:].decode() if log else result.stderr
+        self.assertEqual(result.returncode, 0, trace + '\n' + Path(self.logs[0].name).read_text())
+        self.assertIn('pooled TCP job completed', trace)
         return result
 
     def test_native_gcc_compiles_without_local_dependency_scan(self):
@@ -381,6 +387,8 @@ class GccFrontendTest(BrokerTestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(compile_case, cases))
         text = log.read_text()
+        self.assertEqual(text.count('started reusable GCC driver pid='), 1, text)
+        self.assertEqual(text.count('reused GCC driver status=0'), len(cases), text)
         self.assertEqual(text.count('started reusable GCC planner pid='), 1, text)
         self.assertEqual(text.count('reused GCC planner status=0'), len(cases), text)
         self.assertEqual(text.count('pooled TCP job completed'), len(cases), text)
@@ -398,12 +406,13 @@ class GccFrontendTest(BrokerTestCase):
         subprocess.run(command, cwd=directory, check=True, capture_output=True)
         compile_case((directory, command, (directory/'out.o').read_bytes()))
         self.assertEqual(log.read_text().count('started reusable GCC planner pid='), 1)
+        self.assertEqual(log.read_text().count('started reusable GCC driver pid='), 1)
 
     def test_planner_preserves_explicit_gcc_wrapper(self):
         self.start_frontend()
         wrapper = self.work/'wrap'
         marker = self.work/'wrapped'
-        wrapper.write_text(f'#!/bin/sh\necho invoked >> "{marker}"\nexec "$@"\n')
+        wrapper.write_text(f'#!/bin/sh\necho "${{_DISTCC_SAFEGUARD:-unset}}" >> "{marker}"\nexec "$@"\n')
         wrapper.chmod(0o755)
         self.source.write_text('int answer(void) { return 42; }\n')
         command = [self.cc, '-wrapper', str(wrapper), '-c', str(self.source), '-o', 'out.o']
@@ -413,6 +422,7 @@ class GccFrontendTest(BrokerTestCase):
         self.compile(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
         self.assertTrue(marker.read_text().strip())
+        self.assertEqual(marker.read_text().splitlines()[0], '1')
 
     def test_planner_cancels_only_its_request_and_recovers_dead_parent(self):
         self.start_frontend()
@@ -477,6 +487,63 @@ class GccFrontendTest(BrokerTestCase):
             output.seek(0)
             self.assertEqual(output.read(4), b'ARGC')
             self.assertEqual(log.read_text().count('started reusable GCC planner pid='), 2)
+
+    def test_driver_cancellation_and_parent_replacement(self):
+        self.start_frontend()
+        log = self.work/'driver.log'
+        self.env['DISTCC_LOG'] = str(log)
+        marker, fifo, wrapper = (self.work/name for name in ('entered', 'gate', 'wrapper'))
+        os.mkfifo(fifo)
+        wrapper.write_text(f'#!/bin/sh\ntouch "{marker}"\nread value < "{fifo}"\nexec "$@"\n')
+        wrapper.chmod(0o755)
+        command = [self.cc, '-wrapper', str(wrapper), '-c', str(self.source), '-o', str(self.work/'out.o')]
+        process = subprocess.Popen([str(self.build/'distcc'), *command], env=self.env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic()+10
+            while not marker.exists():
+                self.assertIsNone(process.poll(), log.read_text() if log.exists() else '')
+                self.assertLess(time.monotonic(), deadline, 'driver did not reach wrapper')
+                time.sleep(.01)
+            match = re.search(r'started reusable GCC driver pid=(\d+)', log.read_text())
+            assert match is not None
+            parent = int(match[1])
+            children = [int(value) for value in Path(f'/proc/{parent}/task/{parent}/children').read_text().split()]
+            self.assertTrue(children)
+            process.kill(); process.wait(timeout=5)
+            while any(Path(f'/proc/{child}').exists() for child in children):
+                self.assertLess(time.monotonic(), deadline, 'cancelled driver remains')
+                time.sleep(.01)
+            self.assertTrue(Path(f'/proc/{parent}').exists(), 'cancellation killed shared driver')
+            self.compile([self.cc, '-c', str(self.source), '-o', 'next.o'])
+            self.assertEqual(log.read_text().count('started reusable GCC driver pid='), 1)
+            os.kill(parent, signal.SIGKILL)
+            deadline = time.monotonic()+5
+            while Path(f'/proc/{parent}/stat').exists():
+                if Path(f'/proc/{parent}/stat').read_text().rsplit(')', 1)[1].split()[0] == 'Z': break
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            self.compile([self.cc, '-c', str(self.source), '-o', 'replacement.o'])
+            self.assertEqual(log.read_text().count('started reusable GCC driver pid='), 2)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+    def test_script_driver_keeps_interpreter_arguments(self):
+        self.start_frontend()
+        log = self.work/'script-driver.log'
+        self.env['DISTCC_LOG'] = str(log)
+        script = self.work/'wrapped-gcc'
+        script.write_text('#!/bin/sh\nexec '+shlex.quote(self.cc)+' "$@"\n')
+        script.chmod(0o755)
+        command = [str(script), '-c', str(self.source), '-o', 'out.o']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        self.assertNotIn('started reusable GCC driver pid=', log.read_text())
+        self.assertIn('pooled TCP job completed', log.read_text())
 
     def test_cpp_search_classes_macros_symlinks_and_warm_cache(self):
         self.start_frontend(DISTCCD_FILE_CACHE=str(self.work/'cache'))
@@ -2403,7 +2470,8 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.result(hit)  # No NEED on the warm cache path.
 
     def test_stalled_upload_does_not_expire_healthy_waiter(self):
-        self.restart_server(self.build / 'distccd', DISTCC_IO_TIMEOUT='2')
+        timeout = 2
+        self.restart_server(self.build / 'distccd', DISTCC_IO_TIMEOUT=str(timeout))
         self.addCleanup(self.restart_server, self.build / 'distccd')
         body = b'int recovered_from_stalled_peer(void) { return 904; }\n'
         owner = self.wire_job(body)
@@ -2412,6 +2480,14 @@ ssize_t write(int fd, const void *data, size_t size) {
         # The owner stays connected but sends no input, as with a lost network
         # path. A healthy waiter must receive progress before that owner expires.
         self.assertEqual(self.frame(waiter), (0x54000308, struct.pack('!Q', 2)))
+        # Simulate a delayed event-loop turn. The owner now expires, but the
+        # queued takeover notification must reach the healthy waiting peer.
+        parent = self.daemons[0].pid
+        os.kill(parent, signal.SIGSTOP)
+        try:
+            time.sleep(timeout)
+        finally:
+            os.kill(parent, signal.SIGCONT)
         while True:
             kind, data = self.frame(waiter)
             if kind == 0x54000301:

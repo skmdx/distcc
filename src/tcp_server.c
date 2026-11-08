@@ -1071,11 +1071,6 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
 {
     time_t now = time(NULL);
     if (s->failed) return -1;
-    if (now - s->active >= (s->job || s->phase == RETURNING ? dcc_get_io_timeout() : 30)) {
-        rs_trace("TCP idle timeout: phase=%d prepared=%u inputs=%u remaining=%u queued=%zu",
-                 s->phase, s->prepared, s->job ? s->job->count : 0, s->remaining, s->queued);
-        return -1;
-    }
     /* A client with nothing left to upload may be waiting on another client's
      * shared input. Keep it alive so it can take over when that uploader times
      * out. Requested-but-missing input still expires on its original deadline.
@@ -1166,7 +1161,11 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         }
     }
     if (s->phase == RETURNING && output(s)) return -1;
-    if (events & POLLOUT) for (unsigned turn = 0; turn < 4; ++turn) {
+    int idle_timeout = s->job || s->phase == RETURNING ? dcc_get_io_timeout() : 30;
+    /* A notification queued after poll was built has no POLLOUT event yet.
+     * At its deadline, attempt that write before expiring the connection.
+     * Ordinary blocked outputs still wait for POLLOUT, without busy retries. */
+    for (unsigned turn = 0; turn < 4 && ((events & POLLOUT) || now - s->active >= idle_timeout); ++turn) {
         struct packet *p = s->head;
         if (!p) break;
         ssize_t n;
@@ -1187,7 +1186,8 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
             n = sendfile(s->socket, p->file, &p->file_offset, p->file_left);
             if (n > 0) p->file_left -= n;
         }
-        if (n < 0 && (errno == EAGAIN || errno == EINTR)) break;
+        if (n < 0 && errno == EINTR) return 0; /* Retry interrupted I/O before deciding expiry. */
+        if (n < 0 && errno == EAGAIN) break;
         if (n <= 0) return -1;
         s->active = now;
         if (p->sent < p->header_size) p->sent += n;
@@ -1197,6 +1197,16 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         s->head = p->next;
         if (!s->head) s->tail = &s->head;
         free(p->data); free(p);
+    }
+    /* Service ready I/O before judging inactivity. An expired uploader can
+     * queue NEED for a waiting peer earlier in this same event-loop turn.
+     * That peer has not been asked to send anything yet. Only an actual
+     * read/write renews its deadline; a blocked notification still expires.
+     * Earlier returns wait on server-owned work or retry interrupted I/O. */
+    if (now - s->active >= idle_timeout) {
+        rs_trace("TCP idle timeout: phase=%d prepared=%u inputs=%u remaining=%u queued=%zu",
+                 s->phase, s->prepared, s->job ? s->job->count : 0, s->remaining, s->queued);
+        return -1;
     }
     return s->failed ? -1 : 0;
 }

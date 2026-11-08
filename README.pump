@@ -125,8 +125,12 @@ part of the compilation RPC.
 
 With `DISTCC_FRONTEND_REMOTE=1`, ordinary GCC C/C++ jobs and assembly jobs
 requiring preprocessing bypass the include server. A short native frontend invocation reports
-search directories without opening the source or preprocessing headers;
-the selected worker's GCC performs preprocessing and
+search directories without opening the source or preprocessing headers.
+Loaded driver and frontend images are shared through the broker, while each
+invocation runs in a fresh child with its own arguments, environment and working
+directory. Compiler and helper changes select a new image. Explicit GCC wrappers
+are preserved, and script drivers retain ordinary interpreter execution.
+The selected worker's GCC performs preprocessing and
 compilation once against the client's on-demand filesystem. GCC owns implicit
 preincludes, PCH validation and header lookup. Client default directories replace
 only the worker's implicit directories, retaining their order and system
