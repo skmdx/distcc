@@ -3,12 +3,14 @@
 #include "frontend_fs.c"
 #include <assert.h>
 
-static int mutate, descriptor_stats;
+static int mutate, descriptor_stats, readable_directory_stats;
 int __real_fstat(int, struct stat *);
 int __wrap_fstat(int fd, struct stat *st)
 {
     ++descriptor_stats;
     int result = __real_fstat(fd, st);
+    if (!result && S_ISDIR(st->st_mode) && !(fcntl(fd, F_GETFL) & O_PATH))
+        ++readable_directory_stats;
     if (!result && mutate && S_ISDIR(st->st_mode)) {
         mutate = 0;
         int child = openat(fd, "changed", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -128,8 +130,10 @@ int main(int argc, char **argv)
     unsigned repeat = argc == 3 ? (unsigned)strtoul(argv[2], NULL, 10) : 1;
     for (unsigned i = 0; i < repeat; ++i) {
         descriptor_stats = 0;
+        readable_directory_stats = 0;
         reply = query(&job, directory_path, DCC_FS_LSTAT, previous);
         assert(descriptor_stats == 1);
+        assert(!readable_directory_stats);
         assert(dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_CACHED);
         assert(header_size(&reply) == 3);
         dcc_frontend_fs_clear(&reply);
@@ -183,6 +187,15 @@ int main(int argc, char **argv)
     dcc_frontend_fs_clear(&reply);
     reply = query(&job, header, DCC_FS_READ, NULL);
     assert(reply.fd >= 0 && reply.file_size == strlen("changed contents"));
+    dcc_frontend_fs_clear(&reply);
+    /* Readable names without search permission cannot answer child lookups,
+     * but an explicit directory enumeration remains legal. */
+    assert(!chmod(directory_path, 0444));
+    reply = query(&job, directory_path, DCC_FS_LSTAT, previous);
+    assert(reply.size == 60 && S_ISDIR(dcc_tcp_get32(reply.data + 40)));
+    dcc_frontend_fs_clear(&reply);
+    reply = query(&job, directory_path, DCC_FS_LIST, NULL);
+    assert(reply.size > 8);
     dcc_frontend_fs_clear(&reply);
     assert(!chmod(directory_path, 0755));
 

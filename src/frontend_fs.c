@@ -153,8 +153,8 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
         if (!memcmp(version, previous, sizeof(version))) flags |= DCC_FS_DIRECTORY_CACHED;
     }
     if (flags & DCC_FS_DIRECTORY_CACHED) {
-        /* Opening the directory still checks the caller's read permission.
-         * Reusing names must never reuse child attributes from a prior job. */
+        /* This is a lookup index, not a readdir result. The caller checked
+         * current search permission; child attributes are never reused. */
         for (size_t i = 0; i < hint_count && !result; ++i) {
             result = directory_entry(reply, fd, hints[i], DT_UNKNOWN, statuses, 1);
             ++count;
@@ -204,24 +204,51 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
     int flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK | (follow ? 0 : O_NOFOLLOW);
     int fd = -1;
     struct stat st;
-    /* The previous type is only a hint. Opening checks current permissions;
-     * fstat obtains a fresh identity from exactly the directory being read.
-     * O_NOFOLLOW keeps LSTAT semantics if the path became a symlink. */
-    if (contents && previous && S_ISDIR(dcc_tcp_get32(previous + 32)))
-        fd = open(path, flags);
-    if (fd < 0) {
-        if ((follow ? stat(path, &st) : lstat(path, &st))) return -1;
-        if (!S_ISDIR(st.st_mode) || !contents) return metadata(reply, &st);
-        fd = open(path, flags);
-        /* Execute-only directories still permit known header lookups. */
-        if (fd < 0) return !follow && errno == EACCES ? metadata(reply, &st) : -1;
+    /* Cached names answer lookups without reading a directory. Pin the same
+     * inode used for child attributes and let the kernel check effective
+     * search permissions (including ACLs). Actual readdir uses LIST and its
+     * ordinary read-permission check, even when lookup names are cached. */
+    if (contents && previous && S_ISDIR(dcc_tcp_get32(previous + 32))) {
+        fd = open(path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd >= 0) {
+            if (fstat(fd, &st)) goto failed;
+            unsigned char version[DCC_FS_METADATA];
+            encode_metadata(version, &st);
+            if (!memcmp(previous, version, sizeof(version))) {
+                if (faccessat(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)) {
+                    if (errno != EACCES) goto failed;
+                    close(fd);
+                    return metadata(reply, &st);
+                }
+                if (metadata(reply, &st)) goto failed;
+                return directory(reply, fd, 2, hints, hint_count, previous, &st);
+            }
+            close(fd);
+        }
     }
-    if ((!follow && fstat(fd, &st)) || metadata(reply, &st)) {
+    if ((follow ? stat(path, &st) : lstat(path, &st))) return -1;
+    if (!S_ISDIR(st.st_mode) || !contents) return metadata(reply, &st);
+    fd = open(path, flags);
+    /* Execute-only directories still permit known header lookups. */
+    if (fd < 0) return !follow && errno == EACCES ? metadata(reply, &st) : -1;
+    if (!follow) {
+        if (fstat(fd, &st)) goto failed;
+        /* Reading names without search permission does not authorize even
+         * negative child lookups. Such names belong only in a LIST reply. */
+        if (faccessat(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)) {
+            if (errno != EACCES) goto failed;
+            close(fd);
+            return metadata(reply, &st);
+        }
+    }
+    if (metadata(reply, &st)) goto failed;
+    return directory(reply, fd, follow ? 1 : 2, hints, hint_count, previous, &st);
+failed:
+    {
         int error = errno;
         close(fd); errno = error;
         return -1;
     }
-    return directory(reply, fd, follow ? 1 : 2, hints, hint_count, previous, &st);
 }
 void dcc_frontend_fs_reset(struct dcc_frontend_reply *reply)
 {

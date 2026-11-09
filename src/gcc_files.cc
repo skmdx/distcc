@@ -28,7 +28,6 @@ struct Entry {
     int error = 0;
     std::array<char, DCC_FS_METADATA> version{};
     bool queried = false, searched = false;
-    std::vector<std::string> children;
     std::set<std::string> hints, observed;
     dccfs::Buffer bytes;
     unsigned mode() const { return number(version.data()+32, 4); }
@@ -155,7 +154,6 @@ public:
         entry.queried = true;
         entry.error = 0;
         entry.listing = query.operation == DCC_FS_ATTRIBUTES ? Entry::Deferred : Entry::Unavailable;
-        entry.children.clear();
         if (response.size < DCC_FS_METADATA) return entry.error = EPROTO;
         memcpy(entry.version.data(), response.data, DCC_FS_METADATA);
         if (response.size == DCC_FS_METADATA) return 0;
@@ -173,12 +171,12 @@ public:
                     return entry.error = EPROTO;
                 std::string name(names.substr(0, end));
                 entries.try_emplace(path == "/" ? path+name : path+'/'+name);
-                entry.children.push_back(std::move(name));
                 names.remove_prefix(end+1);
             }
         }
         size_t offset = DCC_FS_METADATA+8;
         unsigned count = number(response.data+DCC_FS_METADATA+4, 4);
+        std::string names;
         for (unsigned i = 0; i < count; ++i) {
             if (response.size-offset < 8) return entry.error = EPROTO;
             unsigned length = number(response.data+offset, 4), error = number(response.data+offset+4, 4);
@@ -198,13 +196,11 @@ public:
                 }
                 child.queried = true;
             }
-            if (!reused) entry.children.push_back(std::move(name));
+            if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) { names += name; names += '\0'; }
         }
         if (offset != response.size) return entry.error = EPROTO;
         entry.listing = Entry::Ready;
         if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) {
-            std::string names;
-            for (const auto &name : entry.children) { names += name; names += '\0'; }
             connection.save_directory_names(path, entry.version, names);
         }
         return 0;
@@ -335,13 +331,19 @@ public:
         }
         return entry.error;
     }
-    int list(const char *path, Entry *&entry) {
-        if (int error = status(path, entry)) return error;
-        if (!S_ISDIR(entry->mode())) return ENOTDIR;
-        entry->searched = true;
-        if (entry->listing == Entry::Deferred)
-            if (int error = fetch({path})) return error;
-        return entry->listing == Entry::Ready ? 0 : EACCES;
+    int list(const char *path, std::vector<std::string> &names) {
+        dccfs::Buffer reply;
+        if (auto error = connection.request(DCC_FS_LIST, path, reply)) return error.value();
+        size_t offset = 0;
+        while (offset < reply.size) {
+            if (reply.size-offset < 8) return EPROTO;
+            unsigned length = number(reply.data+offset, 4);
+            offset += 8; // LIST's type is not needed by FUSE readdir.
+            if (length > reply.size-offset || !valid_name({reply.data+offset, length})) return EPROTO;
+            names.emplace_back(reply.data+offset, length);
+            offset += length;
+        }
+        return 0;
     }
     int open(const char *path, Entry *&entry) {
         if (int error = status(path, entry)) return error;
@@ -409,15 +411,24 @@ int read_file(const char *, char *buffer, size_t size, off_t offset, struct fuse
     return size;
 }
 int read_link(const char *path, char *buffer, size_t size) { return files().link(path, buffer, size); }
-int read_directory(const char *path, void *buffer, fuse_fill_dir_t fill, off_t offset,
-                   struct fuse_file_info *, enum fuse_readdir_flags) {
-    Entry *entry;
-    if (int error = files().list(path, entry)) return -error;
+int open_directory(const char *path, struct fuse_file_info *info) {
+    auto names = std::make_unique<std::vector<std::string>>();
+    if (int error = files().list(path, *names)) return -error;
+    info->fh = reinterpret_cast<uintptr_t>(names.release());
+    return 0;
+}
+int read_directory(const char *, void *buffer, fuse_fill_dir_t fill, off_t offset,
+                   struct fuse_file_info *info, enum fuse_readdir_flags) {
+    const auto &names = *reinterpret_cast<std::vector<std::string> *>(info->fh);
     if (offset < 0) return -EINVAL;
-    for (size_t i = offset; i < entry->children.size()+2; ++i) {
-        const char *name = i == 0 ? "." : i == 1 ? ".." : entry->children[i-2].c_str();
+    for (size_t i = offset; i < names.size()+2; ++i) {
+        const char *name = i == 0 ? "." : i == 1 ? ".." : names[i-2].c_str();
         if (fill(buffer, name, nullptr, i+1, static_cast<fuse_fill_dir_flags>(0))) break;
     }
+    return 0;
+}
+int close_directory(const char *, struct fuse_file_info *info) {
+    delete reinterpret_cast<std::vector<std::string> *>(info->fh);
     return 0;
 }
 bool mapping(const char *path, const std::string &value) {
@@ -469,7 +480,9 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
     operations.open = open_file;
     operations.read = read_file;
     operations.readlink = read_link;
+    operations.opendir = open_directory;
     operations.readdir = read_directory;
+    operations.releasedir = close_directory;
     char name[] = "distcc-files", options[] = "-oro";
     char *argv[] = {name, options};
     struct fuse_args args = FUSE_ARGS_INIT(2, argv);

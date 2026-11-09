@@ -10,7 +10,9 @@
  * LSTAT carries a NUL-terminated path, a previous directory version (or zeros),
  * and sorted, unique NUL-terminated child names to prefetch. Directory replies
  * add flags/count u32 before their entries. CACHED replies omit unchanged names;
- * child metadata is always fresh. STABLE permits publishing the name snapshot
+ * child metadata and search permissions are always fresh. Names form a lookup
+ * index, not authorization to enumerate a directory: actual readdir uses LIST.
+ * STABLE permits publishing the name snapshot
  * after matching the directory version both before and after the lookup.
  * ATTRIBUTES returns lstat attributes without enumerating directory contents.
  * DIRECTORIES contains length-u32/LSTAT-or-ATTRIBUTES-query pairs; its reply contains the

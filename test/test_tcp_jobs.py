@@ -1122,6 +1122,43 @@ class GccFrontendTest(BrokerTestCase):
         remote = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
                                 env=self.env, capture_output=True, text=True, timeout=30)
         self.assertNotEqual(remote.returncode, 0, remote.stderr)
+        used.chmod(0o600)
+        headers.chmod(0o400)
+        local = subprocess.run(command, cwd=self.work, capture_output=True, text=True)
+        self.assertNotEqual(local.returncode, 0)
+        remote = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(remote.returncode, 0, remote.stderr)
+
+    def test_precompiled_header_directory_uses_real_readdir_permissions(self):
+        self.start_frontend()
+        headers = self.work/'headers'
+        headers.mkdir()
+        header = headers/'value.h'
+        header.write_text('#define VALUE 73\n')
+        precompiled = headers/'value.h.gch'
+        precompiled.mkdir()
+        subprocess.run([self.cc, '-nostdinc', '-O2', '-x', 'c-header', str(header),
+                        '-o', str(precompiled/'valid')], check=True, capture_output=True)
+        self.source.write_text('#include <value.h>\nint value(void) { return VALUE; }\n')
+        command = [self.cc, '-nostdinc', '-O2', '-Iheaders', '-H', '-c', 'hello.c', '-o', 'out.o']
+        local = subprocess.run(command, cwd=self.work, check=True, capture_output=True, text=True)
+        self.assertIn('value.h.gch/valid', local.stderr)
+        expected = (self.work/'out.o').read_bytes()
+        for _ in range(2):
+            result = self.compile(command)
+            self.assertIn('value.h.gch/valid', result.stderr)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        if os.geteuid() != 0:
+            self.addCleanup(precompiled.chmod, 0o700)
+            precompiled.chmod(0o100)
+            local = subprocess.run(command, cwd=self.work, capture_output=True, text=True)
+            remote = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
+                                    env=self.env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(remote.returncode, local.returncode, remote.stderr)
+            self.assertNotIn('! headers/value.h.gch/valid', remote.stderr)
+            if not local.returncode:
+                self.assertIn('pooled TCP job completed', remote.stderr)
 
     def test_parallel_directory_hints_preserve_changed_inputs(self):
         self.start_frontend()
