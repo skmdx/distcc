@@ -11,29 +11,41 @@ reduce client filesystem service cost in remote preprocessing
     authorization. The eight-level regression falls from nine RPCs to one;
     256 branches split into four requests. Parent queries now omit attributes
     supplied by a scheduled child's own query, including across batch splits;
-    each child still checks its current identity and permissions. All 57
-    GCC/frontend checks and five-host installed validation pass. After fixing
-    module build flags and ordering FUSE shutdown, the initial and warm full
-    builds take 315.250 and 312.476 seconds. Compared with the preceding
-    317.350 and 316.414 seconds, client CPU rises from 930.467/882.436 to
-    941.092/899.132 seconds. Each run completes 6400 remote jobs with matching
-    hashes, valid statistics and no errors, timeouts, disconnects or fallback
-    warnings. Single pairs do not establish a stable speedup range. Earlier
-    warm focused compilation reduced newfstatat
-    calls from 442 to 351, with unchanged sends/polls (8/6), directory opens
-    (119) and output. This trace does not count every metadata syscall. The
-    post-deployment cold trace is not comparable to that warm measurement.
+    each child still checks its current identity and permissions. Five-host
+    installed validation passes. Reused names
+    now omit a second, unused descriptor stat; the warm focused trace reduces
+    fstat from 246 to 133, preserving output, newfstatat (351), sends/polls
+    (8/6) and opens. This does not establish a whole-build speedup.
+    Native GCC stdin support adds 242 remote jobs to this workload. Startup
+    reservations now match the admitted-client bound: the previous 32-entry
+    cache rejected the 33rd simultaneous owner. A real broker regression with
+    64 pending driver/frontend keys fails before and passes after the fix.
+    All 93 broker checks (including three root-only identity checks separately)
+    and 60 frontend checks pass. Latest initial/warm full builds take
+    317.852/320.974 seconds with 883.908/847.937 client CPU seconds and 6642
+    remote jobs each. Hashes match and errors, timeouts, disconnects and
+    fallback warnings are zero. The preceding stdin-enabled pair took
+    314.910/312.688 seconds with 916.168/872.795 client CPU seconds; its warm
+    run had one pre-dispatch worker-lookup fallback. CPU fell, but elapsed
+    time rose. No stable whole-build speedup is established.
     Most anonymous mappings are small allocations, not cached file
     bodies. File service, path resolution and teardown still cost client CPU;
     batching requests alone does not remove them. Warm remote occupancy is
-    4.498 cores. The warm capture assigns 41.89% of sampled CPU to clients;
-    exchange/filesystem service appears in 22.45 of 36.84 client CPU seconds.
+    4.703 cores. The warm capture assigns 47.96% of sampled CPU to clients;
+    exchange/filesystem service appears in 20.16 of 33.51 client CPU seconds.
+    One-second correlation finds 73.62 seconds with no remote work observed.
+    Configuration, generated headers, dependency files and links coincide
+    with several gaps; timestamps alone do not establish their causes.
     Occupancy samples do not support a large slow-worker-only
     tail, but do not identify client readiness or build dependencies.
     Continue matched complete builds and workload attribution;
     dispatch counts or small tests do not establish resolution of spare
     capacity. Do not add overlapping inclusive profile costs.
-    Two earlier pre-dispatch fallbacks remain unexplained. The affected
+    The new reservation regression proves a lookup failure mechanism, not
+    the cause of the single observed warm-build warning. Worker identity
+    failures are now distinguished from IPC lookup failures, and EOF records
+    ECONNRESET rather than stale errno. Two earlier pre-dispatch fallbacks
+    also remain unexplained. The affected
     variants pass 6400 cold-start replays in the real sandbox, and diagnostics
     are now retained. A separate real-GCC slow-start regression reproduced
     five-second owner/waiter expiry; publication now follows owner lifetime
