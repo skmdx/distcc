@@ -274,6 +274,7 @@ test_SOURCE = test/comfychair.py \
 	test/gcc_files_contract.cc \
 	test/file_cache.c \
 	test/client_hotpaths.c \
+	test/resource.c \
 	test/frontend_metadata_contract.c \
 	test/tcp_frames.c \
 	test/tcp_client_frames.c \
@@ -619,8 +620,10 @@ gcc_plan.so: $(srcdir)/src/gcc_plan.cc $(srcdir)/src/native_worker.cc $(srcdir)/
 CLIENT_CONTRACT_SOURCES = src/hosts.c src/hostfile.c src/loadfile.c src/lock.c src/io.c src/tempfile.c \
 	src/trace.c src/util.c src/argutil.c src/rpc.c src/filename.c src/snprintf.c src/cleanup.c
 # Host configuration must link without the client-only scheduler, as in distccd.
-h_client_hotpaths: test/client_hotpaths.c src/local_clang.c src/frontend_fs.c src/frontend_identity.h $(CLIENT_CONTRACT_SOURCES)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/local_clang.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
+h_client_hotpaths: test/client_hotpaths.c src/local_clang.c src/broker.c src/argv_file.c src/frontend_fs.c src/frontend_identity.h $(CLIENT_CONTRACT_SOURCES)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/local_clang.c src/broker.c src/argv_file.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
+h_resource: test/resource.c src/resource.c src/resource.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 h_file_cache: test/file_cache.c src/file_cache.c src/file_cache.h $(CLIENT_CONTRACT_SOURCES)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< $(CLIENT_CONTRACT_SOURCES) $(LIBS)
 

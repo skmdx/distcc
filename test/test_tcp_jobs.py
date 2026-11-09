@@ -40,12 +40,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 class ClientHotpathsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        subprocess.run(['make', 'h_client_hotpaths', 'h_file_cache'], check=True,
+        subprocess.run(['make', 'h_client_hotpaths', 'h_file_cache', 'h_resource'], check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
 
     def test_identity_environment_paths_and_localslots(self):
         with tempfile.TemporaryDirectory(prefix='distcc-client-contract-') as work:
             subprocess.run([str(Path.cwd()/'h_client_hotpaths'), '--test'], check=True, cwd=work, timeout=5)
+
+    def test_resource_sampling_skips_unlimited_and_duplicate_reads(self):
+        subprocess.run([str(Path.cwd()/'h_resource')], check=True, timeout=5)
 
     def test_large_input_retention_pinning_and_capacity(self):
         with tempfile.TemporaryDirectory(prefix='distcc-cache-contract-') as work:

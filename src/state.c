@@ -141,11 +141,16 @@ static int dcc_write_state(int fd)
     return EXIT_IO_ERROR;
 }
 
+static int dcc_lock_write_state(int fd)
+{
+    struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    return fcntl(fd, F_SETLK, &lock) < 0 ? EXIT_IO_ERROR : dcc_write_state(fd);
+}
+
 static int dcc_publish_state(void)
 {
     char *dir, *hidden = NULL;
     unsigned long long id;
-    struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
     int ret = dcc_get_state_dir(&dir);
     ssize_t n;
 
@@ -157,24 +162,37 @@ static int dcc_publish_state(void)
     if (asprintf(&state_path, "%s/%s%ld-%016llx", dir, dcc_state_prefix,
                  (long)getpid(), id) < 0)
         return EXIT_OUT_OF_MEMORY;
+    state_owner = getpid();
+    /* Publish only a locked, complete record. Anonymous staging avoids
+     * creating and removing a second directory entry on supported filesystems. */
+#ifdef O_TMPFILE
+    state_fd = open(dir, O_TMPFILE | O_WRONLY | O_CLOEXEC, 0666);
+    if (state_fd >= 0) {
+        ret = dcc_lock_write_state(state_fd);
+        if (ret) goto done;
+        char source[64];
+        snprintf(source, sizeof(source), "/proc/self/fd/%d", state_fd);
+        if (!linkat(AT_FDCWD, source, AT_FDCWD, state_path, AT_SYMLINK_FOLLOW)) goto done;
+        close(state_fd);
+        state_fd = -1;
+    }
+#endif
     if (asprintf(&hidden, "%s/.%s%ld-%016llx", dir, dcc_state_prefix,
                  (long)getpid(), id) < 0) {
-        free(state_path);
-        state_path = NULL;
-        return EXIT_OUT_OF_MEMORY;
+        ret = EXIT_OUT_OF_MEMORY;
+        goto done;
     }
-    state_owner = getpid();
     /* Keep the existing umask/default ACL behavior, including group readers. */
     state_fd = open(hidden, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0666);
     if (state_fd < 0) {
         rs_log_warning("failed to create state: %s", strerror(errno));
         ret = EXIT_IO_ERROR;
     } else {
-        ret = fcntl(state_fd, F_SETLK, &lock) < 0 ? EXIT_IO_ERROR :
-              dcc_write_state(state_fd);
+        ret = dcc_lock_write_state(state_fd);
         if (!ret && link(hidden, state_path)) ret = EXIT_IO_ERROR;
         unlink(hidden);
     }
+done:
     free(hidden);
     if (ret) {
         free(state_path);

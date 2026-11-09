@@ -20,6 +20,49 @@ from typing import Any
 from test_adaptive import DistccTestCase, free_port, stats_response
 
 
+class MemoReconnectTest(unittest.TestCase):
+    def test_reconnect_after_unpublished_request(self):
+        for kind in ('owner', 'memo', 'worker'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix='distcc-memo-') as directory:
+                path = str(Path(directory)/'broker')
+                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+                    listener.bind(path)
+                    listener.listen(4)
+                    listener.settimeout(3)
+                    env = dict(os.environ, DISTCC_BROKER=path, DISTCC_RECONNECT_TIMEOUT='2')
+                    process = subprocess.Popen([str(Path.cwd()/'h_client_hotpaths'),
+                                                '--worker' if kind == 'worker' else '--memo'],
+                                               env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        first, _ = listener.accept()
+                        with first: original = first.recv(128)
+                        second, _ = listener.accept()
+                        with second:
+                            self.assertEqual(second.recv(128), original)
+                            self.assertEqual(original, struct.pack('=II', 3, 16 if kind == 'worker' else 4) + b'retry\0')
+                            if kind == 'worker':
+                                with tempfile.TemporaryFile() as worker:
+                                    worker.write(b'W'); worker.seek(0)
+                                    second.sendmsg([b'W\0'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                                             array.array('i', [worker.fileno()]))])
+                            else: second.sendall(b'\0' if kind == 'owner' else b'memo\0')
+                        output, error = process.communicate(timeout=3)
+                        self.assertEqual(process.returncode, 0, error)
+                        self.assertEqual(output.strip(), kind.encode())
+                    finally:
+                        if process.poll() is None: process.kill()
+                        process.communicate(timeout=3)
+
+    def test_absent_broker_obeys_reconnect_deadline(self):
+        with tempfile.TemporaryDirectory(prefix='distcc-memo-') as directory:
+            env = dict(os.environ, DISTCC_BROKER=str(Path(directory)/'absent'), DISTCC_RECONNECT_TIMEOUT='1')
+            start = time.monotonic()
+            result = subprocess.run([str(Path.cwd()/'h_client_hotpaths'), '--memo'], env=env,
+                                    capture_output=True, timeout=3)
+            self.assertEqual(result.returncode, 1)
+            self.assertGreaterEqual(time.monotonic() - start, .9)
+
+
 class BrokerTestCase(DistccTestCase):
     protocol_version = 3
 
@@ -1567,8 +1610,38 @@ class BrokerTest(BrokerTestCase):
             waiter.recv(65536)
         owner.close()
         waiter.settimeout(2)
-        self.assertEqual(waiter.recv(65536), b'')
-        self.assertEqual(self.memo(b'aborted').recv(65536), b'\0')
+        self.assertEqual(waiter.recv(65536), b'\0')
+        next_waiter = self.memo(b'aborted')
+        waiter.sendall(struct.pack('=II', self.protocol_version, 5) + b'recovered\0')
+        self.assertEqual(next_waiter.recv(65536), b'recovered\0')
+        self.assertEqual(self.memo(b'aborted').recv(65536), b'recovered\0')
+
+    def test_full_broker_preserves_backlog_and_drains_burst(self):
+        self.start_broker()
+        owners = [self.memo(f'full-{i}'.encode(), 16) for i in range(256)]
+        for owner in owners:
+            self.assertEqual(owner.recv(1), b'\0')
+        pending = [self.memo(f'pending-{i}'.encode(), 16) for i in range(8)]
+        for waiter in pending:
+            waiter.settimeout(.02)
+            with self.assertRaises(socket.timeout): waiter.recv(1)
+        for owner in owners[:8]: owner.close()
+        for waiter in pending:
+            waiter.settimeout(2)
+            self.assertEqual(waiter.recv(1), b'\0')
+
+    def test_memo_promotes_past_disconnected_waiter(self):
+        self.start_broker()
+        owner = self.memo(b'promotion', 16)
+        self.assertEqual(owner.recv(1), b'\0')
+        dead = self.memo(b'promotion', 16)
+        dead.close()
+        waiter = self.memo(b'promotion', 16)
+        waiter.settimeout(.05)
+        with self.assertRaises(socket.timeout): waiter.recv(1)
+        owner.close()
+        waiter.settimeout(2)
+        self.assertEqual(waiter.recv(1), b'\0')
 
     def test_empty_setting_uses_direct_path(self):
         self.env = dict(self.base_env, DISTCC_HOSTS=self.host(0), DISTCC_BROKER="",

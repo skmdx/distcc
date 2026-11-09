@@ -57,10 +57,6 @@ void dcc_set_trace_from_env(void)
     int save_errno = 0;
     int level = RS_LOG_WARNING; /* by default, warnings only */
 
-    /* let the decision on what to log rest on the loggers */
-    /* the email-an-error functionality in emaillog.c depends on this */
-    rs_trace_set_level(RS_LOG_DEBUG);
-
     if ((logfile = getenv("DISTCC_LOG")) && logfile[0]) {
         fd = open(logfile, O_WRONLY|O_APPEND|O_CREAT, 0666);
         if (fd != -1) {
@@ -85,6 +81,7 @@ void dcc_set_trace_from_env(void)
         level = RS_LOG_DEBUG;
     }
 
+    rs_trace_set_level(level);
     rs_add_logger(rs_logger_file, level, NULL, fd);
 
     if (failed_to_open_logfile) {

@@ -12,6 +12,14 @@
 #include "argv_file.h"
 #include "exitcode.h"
 
+/* Tokens are four-byte protocol constants; their wire values are eight hex digits. */
+static void encode_token(char *data, const char *token, unsigned value)
+{
+    static const char hex[] = "0123456789abcdef";
+    memcpy(data, token, 4);
+    for (unsigned i = 0; i < 8; ++i) data[4 + i] = hex[(value >> (28 - i * 4)) & 15];
+}
+
 int dcc_argv_encode(const char *argc_token, const char *argv_token, char **argv,
                     char **data, size_t *length)
 {
@@ -19,7 +27,6 @@ int dcc_argv_encode(const char *argc_token, const char *argv_token, char **argv,
     size_t size = 12;
     *data = NULL;
     *length = 0;
-    if (strlen(argc_token) != 4 || strlen(argv_token) != 4) return EXIT_PROTOCOL_ERROR;
     while (argv[argc]) {
         size_t n = strlen(argv[argc]);
         if (argc == UINT_MAX || n > UINT_MAX || n > SIZE_MAX - 13 || size > SIZE_MAX - 13 - n)
@@ -27,13 +34,13 @@ int dcc_argv_encode(const char *argc_token, const char *argv_token, char **argv,
         size += 12 + n;
         ++argc;
     }
-    char *buffer = malloc(size + 1);
+    char *buffer = malloc(size);
     if (!buffer) return EXIT_OUT_OF_MEMORY;
-    snprintf(buffer, 13, "%s%08x", argc_token, argc);
+    encode_token(buffer, argc_token, argc);
     char *p = buffer + 12;
     for (unsigned i = 0; i < argc; ++i) {
         size_t n = strlen(argv[i]);
-        snprintf(p, 13, "%s%08x", argv_token, (unsigned)n);
+        encode_token(p, argv_token, (unsigned)n);
         memcpy(p + 12, argv[i], n);
         p += 12 + n;
     }
@@ -44,12 +51,19 @@ int dcc_argv_encode(const char *argc_token, const char *argv_token, char **argv,
 
 int dcc_parse_token_int(const char *bytes, const char *expected, unsigned *value)
 {
-    char number[9], *end;
-    if (strlen(expected) != 4 || memcmp(bytes, expected, 4)) return EXIT_PROTOCOL_ERROR;
-    memcpy(number, bytes + 4, 8);
-    number[8] = 0;
-    *value = strtoul(number, &end, 16);
-    return end == number + 8 ? 0 : EXIT_PROTOCOL_ERROR;
+    if (memcmp(bytes, expected, 4)) return EXIT_PROTOCOL_ERROR;
+    unsigned result = 0;
+    for (unsigned i = 4; i < 12; ++i) {
+        unsigned digit = (unsigned char)bytes[i] - '0';
+        if (digit > 9) {
+            digit = ((unsigned char)bytes[i] | 32U) - 'a';
+            if (digit > 5) return EXIT_PROTOCOL_ERROR;
+            digit += 10;
+        }
+        result = (result << 4) | digit;
+    }
+    *value = result;
+    return 0;
 }
 
 /* The producer hands off a complete file. Strings borrow their received

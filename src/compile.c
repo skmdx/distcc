@@ -598,7 +598,7 @@ static void dcc_rewrite_generic_compiler(char **argv)
  * TODO: actually probe clang with clang --version, instead of trusting
  * autoheader.
  */
-static void dcc_add_clang_target(char **argv)
+static int dcc_add_clang_target(char **argv)
 {
         /* defined by autoheader */
     const char *target = NATIVE_COMPILER_TRIPLE;
@@ -606,26 +606,27 @@ static void dcc_add_clang_target(char **argv)
 
     /* Frontend invocations already carry their driver's resolved -triple. */
     if (dcc_argv_search(argv, "-cc1"))
-        return;
+        return 0;
 
     if (strcmp(compiler, "clang") == 0 || strncmp(compiler, "clang-", strlen("clang-")) == 0 ||
         strcmp(compiler, "clang++") == 0 || strncmp(compiler, "clang++-", strlen("clang++-")) == 0)
         ;
     else
-        return;
+        return 0;
 
     /* -target aarch64-linux-gnu */
     if (dcc_argv_search(argv, "-target"))
-        return;
+        return 0;
 
     /* --target=aarch64-linux-gnu */
     if (dcc_argv_startswith(argv, "--target"))
-        return;
+        return 0;
 
     rs_log_info("Adding '-target %s' to support clang cross-compilation.",
                 target);
     dcc_argv_append(argv, strdup("-target"));
     dcc_argv_append(argv, strdup(target));
+    return 1;
 }
 
 /*
@@ -917,11 +918,13 @@ dcc_build_somewhere(char *argv[],
             ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 0);
             dcc_free_argv(argv);
             argv = new_argv;
+            work = (struct dcc_work_hint){0};
         }
     }
     if (!getenv("DISTCC_NO_REWRITE_CROSS")) {
-        dcc_add_clang_target(new_argv);
-        dcc_gcc_rewrite_fqn(new_argv);
+        int changed = dcc_add_clang_target(new_argv);
+        changed |= dcc_gcc_rewrite_fqn(new_argv) == 0;
+        if (changed) work = (struct dcc_work_hint){0};
     }
     if (ret != 0) {
         /* we need to scan the arguments even if we already know it's
@@ -1020,7 +1023,8 @@ dcc_build_somewhere(char *argv[],
     }
 
     if (getenv("DISTCC_BROKER"))
-        dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready);
+        if (cpp_ready || !work.key)
+            dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready);
     if (prepared_job && !dcc_job_frontend(prepared_job) && work.key)
         work.bytes = dcc_resource_input_bytes(prepared_job);
     else if (!cpp_ready && (!prepared_job || !dcc_job_frontend(prepared_job)))

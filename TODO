@@ -90,9 +90,13 @@ reduce client filesystem service cost in remote preprocessing
     input cache and relay identity optimizations records one planner worker
     lookup failure (status 107, ECONNRESET), followed by driver failure and
     local compilation of sched_getaffinity.c. The build succeeds with matching
-    output, but this IPC failure remains unresolved. Lower sampled client CPU
-    and passing installed-path validation do not establish an error-free or
-    faster full build.
+    output. Broker saturation now preserves the listen backlog, abandoned
+    memo ownership transfers to a live waiter, and worker/memo lookups retry
+    transient disconnections. Local regressions cover these failure paths;
+    deployment and a matched full build still need to confirm the original
+    warning is gone and the combined client-cost reductions improve runtime.
+    Lower sampled client CPU and passing local tests alone do not establish
+    an error-free or faster full build.
 
 
 recognize arbitrary input suffixes with explicit compiler language

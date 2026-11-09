@@ -94,8 +94,28 @@ struct broker {
 };
 
 static int unix_address(const char *path, struct sockaddr_un *address);
+static double now_seconds(void);
 
-static int memo_get(const char *key, char **value, int *worker)
+struct reconnect { double deadline; int delay; };
+
+static int reconnect_wait(struct reconnect *retry, int error, int allow_unreachable)
+{
+    if (error != ENOENT && error != ECONNREFUSED && error != ECONNRESET &&
+        error != EPIPE && !(allow_unreachable && error == EHOSTUNREACH)) return 0;
+    if (!retry->deadline) {
+        const char *setting = getenv("DISTCC_RECONNECT_TIMEOUT");
+        retry->deadline = now_seconds() + (setting ? atoi(setting) : 90);
+        retry->delay = 100;
+    }
+    double remaining = retry->deadline - now_seconds();
+    if (remaining <= 0) return 0;
+    poll(NULL, 0, remaining * 1000 < retry->delay ? (int)(remaining * 1000) : retry->delay);
+    errno = error;
+    if (retry->delay < 1000) retry->delay *= 2;
+    return 1;
+}
+
+static int memo_get_once(const char *key, char **value, int *worker, double deadline)
 {
     struct sockaddr_un address;
     struct request request = { BROKER_VERSION, worker ? WORKER_GET : MEMO_GET };
@@ -107,10 +127,20 @@ static int memo_get(const char *key, char **value, int *worker)
     ssize_t size;
     if (value) *value = NULL;
     if (worker) *worker = -1;
-    if (strlen(key) >= DCC_MEMO_LIMIT || unix_address(getenv("DISTCC_BROKER"), &address))
-        return -1;
+    if (strlen(key) >= DCC_MEMO_LIMIT) { errno = EINVAL; return -1; }
+    if (unix_address(getenv("DISTCC_BROKER"), &address)) return -1;
     fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
+    if (deadline) {
+        double remaining = deadline - now_seconds();
+        if (remaining <= 0) { close(fd); errno = ETIMEDOUT; return -1; }
+        if (remaining < timeout.tv_sec) {
+            timeout.tv_sec = (time_t)remaining;
+            timeout.tv_usec = (suseconds_t)((remaining - timeout.tv_sec) * 1000000);
+            if (!timeout.tv_sec && !timeout.tv_usec) timeout.tv_usec = 1;
+        }
+    }
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     buffer = malloc(DCC_MEMO_LIMIT);
     if (!buffer || connect(fd, (struct sockaddr *)&address, sizeof(address)) ||
@@ -140,6 +170,17 @@ failed:
     free(buffer);
     close(fd);
     errno = error;
+    return -1;
+}
+
+static int memo_get(const char *key, char **value, int *worker)
+{
+    struct reconnect retry = {0};
+    int fd;
+    do {
+        fd = memo_get_once(key, value, worker, retry.deadline);
+        if (fd >= 0 || (value && *value) || (worker && *worker >= 0)) return fd;
+    } while (reconnect_wait(&retry, errno, 0));
     return -1;
 }
 
@@ -336,25 +377,12 @@ failed:
 static int broker_request(uint32_t command, struct reply *reply, int *net,
                           const struct dcc_work_hint *hint, int *queued_fd, unsigned local_limit)
 {
-    double deadline = 0;
-    int delay = 100, fd;
-    const char *setting = getenv("DISTCC_RECONNECT_TIMEOUT");
-    int timeout = setting ? atoi(setting) : 90;
+    struct reconnect retry = {0};
+    int fd;
     /* Closing a failed control socket releases its lease. No compiler request
      * has been sent yet, so reconnecting cannot replay a completed job. */
-    while ((fd = broker_request_once(command, reply, net, hint, deadline, queued_fd, local_limit)) < 0) {
-        int error = errno;
-        if (error != ENOENT && error != ECONNREFUSED &&
-            error != ECONNRESET && error != EPIPE &&
-            !(error == EHOSTUNREACH && command != JOBS))
-            break;
-        if (!deadline) deadline = now_seconds() + timeout;
-        double remaining = deadline - now_seconds();
-        if (remaining <= 0) break;
-        poll(NULL, 0, remaining * 1000 < delay ? (int)(remaining * 1000) : delay);
-        errno = error;
-        if (delay < 1000) delay *= 2;
-    }
+    while ((fd = broker_request_once(command, reply, net, hint, retry.deadline, queued_fd, local_limit)) < 0)
+        if (!reconnect_wait(&retry, errno, command != JOBS)) break;
     if (fd < 0)
         rs_log_error("local broker request failed (command=%u): %s", command, strerror(errno));
     return fd;
@@ -595,12 +623,19 @@ static void release_client(struct broker *broker, struct client *client)
     if (client->state == MEMO_OWNER && !broker->memos[client->memo].value &&
         !broker->memos[client->memo].socket) {
         int i;
-        free(broker->memos[client->memo].key);
-        broker->memos[client->memo].key = NULL;
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *waiter = &broker->clients[i];
-            if (waiter->fd >= 0 && waiter->state == MEMO_WAIT && waiter->memo == client->memo)
+            if (waiter->fd >= 0 && waiter->state == MEMO_WAIT && waiter->memo == client->memo) {
+                if (send(waiter->fd, "", 1, MSG_NOSIGNAL) == 1) {
+                    waiter->state = MEMO_OWNER;
+                    break;
+                }
                 release_client(broker, waiter);
+            }
+        }
+        if (i == MAX_CLIENTS) {
+            free(broker->memos[client->memo].key);
+            broker->memos[client->memo].key = NULL;
         }
     }
     release_assignment(broker, client);
@@ -1580,23 +1615,24 @@ static int initialize(struct broker *broker, struct dcc_hostdef *hosts)
 
 static void accept_client(struct broker *broker, int listener_fd)
 {
-    struct ucred credentials;
-    socklen_t size = sizeof(credentials);
-    int i, fd = accept4(listener_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if (fd < 0)
-        return;
-    if (!getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size)) {
-        for (i = 0; i < MAX_CLIENTS; i++) {
-            struct client *client = &broker->clients[i];
-            if (client->fd < 0) {
-                *client = (struct client){ .fd = fd, .net = -1, .peer = -1,
-                    .state = REQUEST, .deadline = now_seconds() + 3,
-                    .denied = credentials.uid != geteuid() && credentials.uid != 0 };
-                return;
-            }
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        struct client *client = &broker->clients[i];
+        if (client->fd >= 0) continue;
+        struct ucred credentials;
+        socklen_t size = sizeof(credentials);
+        int fd;
+        do { fd = accept4(listener_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC); }
+        while (fd < 0 && errno == EINTR);
+        if (fd < 0) return;
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size)) {
+            close(fd);
+            --i;
+            continue;
         }
+        *client = (struct client){ .fd = fd, .net = -1, .peer = -1,
+            .state = REQUEST, .deadline = now_seconds() + 3,
+            .denied = credentials.uid != geteuid() && credentials.uid != 0 };
     }
-    close(fd);
 }
 
 int dcc_broker_serve(const char *path)
@@ -1640,6 +1676,7 @@ int dcc_broker_serve(const char *path)
     mask_set = 1;
     ret = 0;
     while (!stopping) {
+        accept_client(broker, fd);
         struct dispatch_batch batch = {0};
         struct pollfd polls[1 + MAX_HOSTS + 2 * MAX_CLIENTS];
         int stats_index[MAX_HOSTS], control_index[MAX_CLIENTS], net_index[MAX_CLIENTS];
@@ -1656,6 +1693,9 @@ int dcc_broker_serve(const char *path)
         }
         for (i = 0; i < MAX_CLIENTS; i++)
             clients += broker->clients[i].fd >= 0;
+        /* A full broker leaves connections in the kernel backlog. Do not
+         * spin on listener readiness until a live client releases capacity. */
+        if (clients == MAX_CLIENTS) polls[0].fd = -1;
         /* An idle period starts after the last client leaves, including
          * leases held through long compiles and requests that time out. */
         if (clients) {
@@ -1714,8 +1754,10 @@ int dcc_broker_serve(const char *path)
         for (i = 0; i < MAX_CLIENTS; ++i) {
             struct client *c = &broker->clients[i];
             control_index[i] = net_index[i] = -1;
-            if (c->fd < 0)
+            if (c->fd < 0) {
+                polls[0].fd = fd;
                 continue;
+            }
             if (c->state == WAITING && c->deadline > now && c->deadline < wake_at)
                 wake_at = c->deadline;
             if ((c->state == REQUEST || c->state == CONNECTING || c->state == HELLO_SEND || c->state == HELLO_READ ||

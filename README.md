@@ -738,6 +738,10 @@ The existing native worker loop owns concurrent invocations, cancellation and
 shutdown for both GCC planning and Clang execution. Helpers release inherited
 caller pipes and stop when their broker-owned control connection closes.
 An explicit GCC `-wrapper` keeps its requested execution path.
+When broker client slots are full, connections remain in the listen backlog.
+An unpublished helper owner that disconnects passes ownership to the next
+live waiter. Worker and memo lookups retry transient connection failures up to
+`DISTCC_RECONNECT_TIMEOUT`, just like ordinary broker requests.
 
 Each daemon worker loads the Clang libraries once and forks a separate compiler
 child for each job. This avoids repeated library loading without sharing macro,

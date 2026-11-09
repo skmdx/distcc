@@ -1,5 +1,6 @@
 /* Resource-aware admission.  SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,36 +22,50 @@ static int processors = 1;
 static unsigned long long available = ULLONG_MAX, budget = ULLONG_MAX;
 
 #ifdef __linux__
+/* These procfs/cgroup records are small. Read a complete snapshot without
+ * allocating a stdio stream and its buffer for every admission sample. */
+static int read_text(const char *path, char *data, size_t capacity)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    size_t used = 0;
+    while (used < capacity - 1) {
+        ssize_t n = read(fd, data + used, capacity - used - 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { close(fd); return -1; }
+        if (!n) { data[used] = 0; close(fd); return 0; }
+        used += n;
+    }
+    close(fd);
+    errno = EOVERFLOW;
+    return -1;
+}
+
 static unsigned long long read_bytes(const char *group, const char *name)
 {
-    char path[PATH_MAX];
+    char path[PATH_MAX], data[64];
     unsigned long long value = ULLONG_MAX;
-    FILE *file;
     if (snprintf(path, sizeof(path), "%s/%s", group, name) >= (int)sizeof(path))
         return value;
-    file = fopen(path, "r");
-    if (file) {
-        if (fscanf(file, "%llu", &value) != 1) value = ULLONG_MAX;
-        fclose(file);
-    }
+    if (!read_text(path, data, sizeof(data)) && sscanf(data, "%llu", &value) != 1)
+        value = ULLONG_MAX;
     return value;
 }
 
 static unsigned long long memory_used(const char *group, unsigned long long *backing)
 {
     unsigned long long used = read_bytes(group, "memory.current"), value, reclaimable = 0;
-    char path[PATH_MAX], name[64];
-    FILE *file;
+    char path[PATH_MAX], name[64], data[16384];
     if (used == ULLONG_MAX ||
         snprintf(path, sizeof(path), "%s/memory.stat", group) >= (int)sizeof(path))
         return used;
-    file = fopen(path, "r");
-    if (file) {
-        while (fscanf(file, "%63s %llu", name, &value) == 2) {
+    if (!read_text(path, data, sizeof(data))) {
+        char *cursor = data, *line;
+        while ((line = strsep(&cursor, "\n"))) {
+            if (sscanf(line, "%63s %llu", name, &value) != 2) continue;
             if (!strcmp(name, "inactive_file")) reclaimable = value;
             else if (backing && !strcmp(name, "shmem")) *backing = value;
         }
-        fclose(file);
     }
     /* Completed jobs leave clean page cache charged to the service. Counting
      * inactive file pages as live jobs could stop admission indefinitely. */
@@ -60,11 +75,10 @@ static unsigned long long memory_used(const char *group, unsigned long long *bac
 static void read_pressure(const char *path)
 {
     double value;
-    FILE *file = fopen(path, "r");
-    if (!file) return;
-    if (fscanf(file, "some avg10=%lf", &value) == 1 && value >= 0 &&
+    char data[512];
+    if (read_text(path, data, sizeof(data))) return;
+    if (sscanf(data, "some avg10=%lf", &value) == 1 && value >= 0 &&
         value <= 100 && value > pressure) pressure = value;
-    fclose(file);
 }
 
 static void sample_resources(void)
@@ -72,9 +86,9 @@ static void sample_resources(void)
     static time_t sampled;
     static char group[PATH_MAX];
     static int located;
-    char path[PATH_MAX], line[PATH_MAX];
+    char path[PATH_MAX], data[16384];
     unsigned long long own = 0, backing = 0, value;
-    FILE *file;
+    unsigned long long own_sample = ULLONG_MAX;
     time_t now = time(NULL);
     if (sampled == now) return;
     sampled = now;
@@ -87,33 +101,30 @@ static void sample_resources(void)
         processors = CPU_COUNT(&allowed);
     if (!located) {
         located = 1;
-        file = fopen("/proc/self/cgroup", "r");
-        if (file) {
-            while (fgets(line, sizeof(line), file)) {
+        if (!read_text("/proc/self/cgroup", data, sizeof(data))) {
+            char *cursor = data, *line;
+            while ((line = strsep(&cursor, "\n"))) {
                 if (strncmp(line, "0::/", 4)) continue;
-                line[strcspn(line, "\n")] = 0;
                 if (strlen(line + 3) + sizeof("/sys/fs/cgroup") <= sizeof(group)) {
                     strcpy(group, "/sys/fs/cgroup");
                     strcat(group, line + 3);
                 }
                 break;
             }
-            fclose(file);
         }
     }
     if (group[0]) {
-        value = memory_used(group, &backing);
-        if (value != ULLONG_MAX) own = value;
+        own_sample = memory_used(group, &backing);
+        if (own_sample != ULLONG_MAX) own = own_sample;
     }
-    file = fopen("/proc/meminfo", "r");
-    if (file) {
-        while (fgets(line, sizeof(line), file))
+    if (!read_text("/proc/meminfo", data, sizeof(data))) {
+        char *cursor = data, *line;
+        while ((line = strsep(&cursor, "\n")))
             if (sscanf(line, "MemAvailable: %llu kB", &value) == 1) {
                 available = value * 1024;
                 budget = available + own;
                 break;
             }
-        fclose(file);
     }
     read_pressure("/proc/pressure/memory");
     if (group[0]) {
@@ -122,17 +133,16 @@ static void sample_resources(void)
             char name[PATH_MAX], *slash;
             if (snprintf(name, sizeof(name), "%s/cpu.max", path) < (int)sizeof(name)) {
                 unsigned long long quota, period;
-                file = fopen(name, "r");
-                if (file) {
-                    if (fscanf(file, "%llu %llu", &quota, &period) == 2 && quota && period) {
+                if (!read_text(name, data, sizeof(data))) {
+                    if (sscanf(data, "%llu %llu", &quota, &period) == 2 && quota && period) {
                         unsigned long long capacity = quota / period + (quota % period != 0);
                         if (capacity < (unsigned)processors) processors = (int)capacity;
                     }
-                    fclose(file);
                 }
             }
             unsigned long long limit = read_bytes(path, "memory.max");
-            unsigned long long used = memory_used(path, NULL);
+            unsigned long long used = limit == ULLONG_MAX ? ULLONG_MAX :
+                                      !strcmp(path, group) ? own_sample : memory_used(path, NULL);
             if (limit != ULLONG_MAX && used != ULLONG_MAX) {
                 unsigned long long free = limit > used ? limit - used : 0;
                 if (free < available) available = free;

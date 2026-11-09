@@ -45,11 +45,12 @@ static int compare_environment(const void *a, const void *b)
     return (x->position > y->position) - (x->position < y->position);
 }
 
-static int omitted_environment(const char *binding, const char *const *names)
+static int omitted_environment(const char *binding, size_t length, const char *const *names)
 {
+    if (binding[length] != '=') return 0;
     for (; names && *names; ++names) {
-        size_t length = strlen(*names);
-        if (!strncmp(binding, *names, length) && binding[length] == '=') return 1;
+        if ((*names)[0] == binding[0] && strlen(*names) == length &&
+            !memcmp(binding, *names, length)) return 1;
     }
     return 0;
 }
@@ -126,7 +127,7 @@ int dcc_local_worker_key(const char *compiler, const char *library,
     size_t capacity = 0, count_environment = 0;
     XXH3_64bits_reset(&environment_state);
     while (environ[capacity]) {
-        if (!omitted_environment(environ[capacity], omit_environment))
+        if (!omitted_environment(environ[capacity], strcspn(environ[capacity], "="), omit_environment))
             XXH3_64bits_update(&environment_state, environ[capacity], strlen(environ[capacity]) + 1);
         ++capacity;
     }
@@ -140,9 +141,10 @@ int dcc_local_worker_key(const char *compiler, const char *library,
     struct dcc_environment_entry *environment = calloc(capacity, sizeof(*environment));
     if (capacity && !environment) return -1;
     for (char **p = environ; *p; ++p) {
-        if (!omitted_environment(*p, omit_environment)) {
+        size_t length = strcspn(*p, "=");
+        if (!omitted_environment(*p, length, omit_environment)) {
             environment[count_environment] = (struct dcc_environment_entry){
-                *p, strcspn(*p, "="), count_environment};
+                *p, length, count_environment};
             ++count_environment;
         }
     }

@@ -3,7 +3,10 @@
 #include "native_worker.h"
 #include "hosts.h"
 #include "frontend_identity.h"
+#include "argv_file.h"
+#include "broker.h"
 #include <assert.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 
 const char *rs_program_name = "client_hotpaths";
@@ -27,6 +30,47 @@ static void sample(const char *name, struct rusage *before)
 int main(int argc, char **argv)
 {
     assert(argc == 2);
+    if (!strcmp(argv[1], "--memo") || !strcmp(argv[1], "--worker")) {
+        char *value = NULL;
+        int worker = -1;
+        int lease = !strcmp(argv[1], "--memo") ? dcc_broker_memo_get("retry", &value) :
+                    dcc_broker_worker_get("retry", &worker);
+        if (lease >= 0) { puts("owner"); close(lease); }
+        else if (value) { puts(value); free(value); }
+        else if (worker >= 0) {
+            char byte;
+            assert(read(worker, &byte, 1) == 1 && byte == 'W');
+            puts("worker"); close(worker);
+        } else { perror("memo_get"); return 1; }
+        return 0;
+    }
+    char token[4] = {'A', 'R', 'G', 'C'};
+    unsigned value = 42;
+    assert(!dcc_parse_token_int("ARGCffffffff", token, &value) && value == UINT_MAX);
+    assert(!dcc_parse_token_int("ARGCABCDEF01", token, &value) && value == 0xabcdef01U);
+    assert(dcc_parse_token_int("ARGV00000001", token, &value));
+    for (unsigned i = 4; i < 12; ++i) {
+        for (const char *bad = "gG-+ /"; *bad; ++bad) {
+            char bytes[12];
+            memcpy(bytes, "ARGC00000001", sizeof(bytes));
+            bytes[i] = *bad;
+            assert(dcc_parse_token_int(bytes, token, &value));
+        }
+    }
+    char strings[][10] = {"cc1", "", "a b", "-DVALUE=1"};
+    char *arguments[] = {strings[0], strings[1], strings[2], strings[3], NULL}, *encoded;
+    size_t length;
+    assert(!dcc_argv_encode(token, "ARGV", arguments, &encoded, &length));
+    assert(!memcmp(encoded, "ARGC00000004ARGV00000003cc1ARGV00000000", 39));
+    int command = memfd_create("argv-test", MFD_CLOEXEC);
+    assert(command >= 0 && write(command, encoded, length) == (ssize_t)length);
+    assert(!lseek(command, 0, SEEK_SET));
+    struct dcc_argv_file decoded;
+    assert(!dcc_argv_file_read(command, 1, &decoded));
+    for (int i = 0; arguments[i]; ++i) assert(!strcmp(arguments[i], decoded.groups[0][i]));
+    assert(!decoded.groups[0][4]);
+    dcc_argv_file_close(&decoded);
+    close(command); free(encoded);
     int bench = !strcmp(argv[1], "--bench");
     char key[80], previous[80];
     static const char *const omitted[] = {"VOLATILE", NULL};

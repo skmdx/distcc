@@ -8,33 +8,34 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 #include "workload.h"
 #include "job.h"
 #include "resource.h"
 
-static uint64_t source_family(const char *path, const char *compiler, unsigned kind)
+static uint64_t source_family(const char *path, const char *compiler, unsigned kind, off_t size)
 {
+    if (size <= 0 || size > 512LL * 1024 * 1024) return 0;
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     struct stat st;
     if (fd < 0) return 0;
+    /* Check the opened object as well: it may have replaced the pathname
+     * described by the caller, and a pipe/device must not block hashing. */
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
         st.st_size > 512LL * 1024 * 1024) { close(fd); return 0; }
     const char *name = strrchr(compiler, '/');
     name = name ? name + 1 : compiler;
     uint64_t seed = XXH3_64bits_withSeed(name, strlen(name), kind), result = 0;
-    XXH3_state_t *hash = XXH3_createState();
-    if (hash) {
-        XXH3_64bits_reset_withSeed(hash, seed);
-        char buffer[65536];
-        ssize_t length;
-        while ((length = read(fd, buffer, sizeof(buffer))) != 0) {
-            if (length < 0) { if (errno == EINTR) continue; break; }
-            XXH3_64bits_update(hash, buffer, length);
-        }
-        if (!length) result = XXH3_64bits_digest(hash);
-        XXH3_freeState(hash);
+    XXH3_state_t hash = {0};
+    XXH3_64bits_reset_withSeed(&hash, seed);
+    char buffer[65536];
+    ssize_t length;
+    while ((length = read(fd, buffer, sizeof(buffer))) != 0) {
+        if (length < 0) { if (errno == EINTR) continue; break; }
+        XXH3_64bits_update(&hash, buffer, length);
     }
+    if (!length) result = XXH3_64bits_digest(&hash);
     close(fd);
     return result;
 }
@@ -80,7 +81,9 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
         key = XXH3_64bits_withSeed(argv[i], strlen(argv[i]) + 1, key);
     }
     hint->bytes = st.st_size;
-    if (!stat(input, &st) && S_ISREG(st.st_mode) && st.st_size > 0 &&
+    int source_known = path == input && (!ready || fd < 0);
+    if ((source_known || !stat(input, &st)) &&
+        S_ISREG(st.st_mode) && st.st_size > 0 &&
         st.st_size <= 512LL * 1024 * 1024)
         hint->work_units = st.st_size;
     hint->kind = gpu && !host_only ? DCC_WORK_OFFLOAD : kind + (ready ? 0 : 3);
@@ -88,7 +91,7 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
                          dcc_resource_bucket(hint->bytes);
     key = XXH3_64bits_withSeed(&hint->kind, sizeof(hint->kind), key);
     hint->key = key ? key : 1;
-    if (!gpu) hint->family = source_family(input, argv[0], hint->kind);
+    if (!gpu) hint->family = source_family(input, argv[0], hint->kind, hint->work_units);
 }
 
 int dcc_work_valid(const struct dcc_work_hint *hint)

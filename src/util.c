@@ -64,25 +64,27 @@
 
 void dcc_exit(int exitcode)
 {
-    struct rusage self_ru, children_ru;
+    if ((rs_trace_level & RS_LOG_PRIMASK) >= RS_LOG_INFO) {
+        struct rusage self_ru, children_ru;
 
-    if (getrusage(RUSAGE_SELF, &self_ru)) {
-        rs_log_warning("getrusage(RUSAGE_SELF) failed: %s", strerror(errno));
-        memset(&self_ru, 0, sizeof self_ru);
-    }
-    if (getrusage(RUSAGE_CHILDREN, &children_ru)) {
-        rs_log_warning("getrusage(RUSAGE_CHILDREN) failed: %s", strerror(errno));
-        memset(&children_ru, 0, sizeof children_ru);
-    }
+        if (getrusage(RUSAGE_SELF, &self_ru)) {
+            rs_log_warning("getrusage(RUSAGE_SELF) failed: %s", strerror(errno));
+            memset(&self_ru, 0, sizeof self_ru);
+        }
+        if (getrusage(RUSAGE_CHILDREN, &children_ru)) {
+            rs_log_warning("getrusage(RUSAGE_CHILDREN) failed: %s", strerror(errno));
+            memset(&children_ru, 0, sizeof children_ru);
+        }
 
-    /* NB fields must match up for microseconds */
-    rs_log(RS_LOG_INFO,
-           "exit: code %d; self: %d.%06d user %d.%06d sys; children: %d.%06d user %d.%06d sys",
-           exitcode,
-           (int) self_ru.ru_utime.tv_sec, (int) self_ru.ru_utime.tv_usec,
-           (int) self_ru.ru_stime.tv_sec, (int) self_ru.ru_stime.tv_usec,
-           (int) children_ru.ru_utime.tv_sec, (int) children_ru.ru_utime.tv_usec,
-           (int) children_ru.ru_stime.tv_sec, (int)  children_ru.ru_stime.tv_usec);
+        /* NB fields must match up for microseconds */
+        rs_log(RS_LOG_INFO,
+               "exit: code %d; self: %d.%06d user %d.%06d sys; children: %d.%06d user %d.%06d sys",
+               exitcode,
+               (int) self_ru.ru_utime.tv_sec, (int) self_ru.ru_utime.tv_usec,
+               (int) self_ru.ru_stime.tv_sec, (int) self_ru.ru_stime.tv_usec,
+               (int) children_ru.ru_utime.tv_sec, (int) children_ru.ru_utime.tv_usec,
+               (int) children_ru.ru_stime.tv_sec, (int) children_ru.ru_stime.tv_usec);
+    }
 
     exit(exitcode);
 }

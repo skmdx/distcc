@@ -74,6 +74,7 @@ int dcc_backoff_is_enabled(void)
  **/
 int dcc_enjoyed_host(const struct dcc_hostdef *host)
 {
+    if (host && host->broker_managed) return 0;
     /* special-case: if DISTCC_BACKOFF_PERIOD==0, don't manage backoff files */
     if (!dcc_backoff_is_enabled())
         return 0;
@@ -83,6 +84,7 @@ int dcc_enjoyed_host(const struct dcc_hostdef *host)
 
 int dcc_disliked_host(const struct dcc_hostdef *host)
 {
+    if (host && host->broker_managed) return 0;
     /* special-case: if DISTCC_BACKOFF_PERIOD==0, don't manage backoff files */
     if (!dcc_backoff_is_enabled())
 	return 0;

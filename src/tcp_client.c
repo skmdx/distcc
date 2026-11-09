@@ -172,10 +172,13 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     struct input_stream stream = {.fd = -1};
     unsigned *requests = calloc(job->count ? job->count : 1, sizeof(*requests));
     unsigned char *requested = calloc(job->count ? job->count : 1, 1);
-    unsigned char *outgoing = NULL;
+    /* The command-line client runs exchanges sequentially, including retries.
+     * Retain only storage; all job state and descriptors are reset below. */
+    static unsigned char *outgoing;
+    static size_t outgoing_capacity;
     uint64_t received[DCC_JOB_RESULT_COUNT] = {0}, id;
     unsigned finals = 0, read_request = 0, count = 0;
-    size_t length = 0, sent = 0, outgoing_capacity = 0;
+    size_t length = 0, sent = 0;
     size_t file_left = 0;
     off_t file_offset = 0;
     int ret = EXIT_IO_ERROR, have_result = 0;
@@ -183,19 +186,17 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     socklen_t address_size = sizeof(address);
     int local = !getsockname(host->broker_fd, (struct sockaddr *)&address, &address_size) &&
         address.ss_family == AF_UNIX;
-    /* Scratch and remote receive storage have the same exchange lifetime.
-     * One allocation avoids a second anonymous mapping in each new client. */
-    unsigned char *buffer = malloc(DCC_TCP_CHUNK + (local ? 0 : DCC_TCP_CHUNK + 16U));
-    struct tcp_input input = {.wire = local || !buffer ? NULL : buffer + DCC_TCP_CHUNK};
+    static unsigned char buffer[2 * DCC_TCP_CHUNK + 16U];
+    struct tcp_input input = {.wire = local ? NULL : buffer + DCC_TCP_CHUNK};
     int local_input = local && job->kind == DCC_JOB_COMPILE && job->count == 1 &&
         job->inputs[0].encoding == DCC_JOB_RAW && job->inputs[0].fd >= 0;
     int send_input_fd = local_input;
     int shared_input = -1;
-    struct dcc_frontend_reply filesystem = {.fd = -1};
+    static struct dcc_frontend_reply filesystem = {.fd = -1};
     uint64_t fs_offset = 0, fs_requests = 0, fs_bytes = 0;
     time_t active = time(NULL);
     dcc_job_result_init(result);
-    if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested || !buffer ||
+    if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested ||
         getrandom(&id, sizeof(id), 0) != sizeof(id) || !id) goto done;
     if (local_input && (shared_input = local_snapshot(job->inputs[0].fd, job->inputs[0].plain_size)) < 0)
         goto done;
@@ -203,16 +204,17 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     unsigned char *manifest = dcc_job_encode_buffer(job, &metadata_size);
     if (!manifest) goto done;
     length = metadata_size + 16;
-    outgoing = malloc(length);
-    outgoing_capacity = length;
-    if (outgoing) {
-        dcc_tcp_put32(outgoing, DCC_TCP_BEGIN);
-        dcc_tcp_put32(outgoing + 4, metadata_size + 8);
-        dcc_tcp_put64(outgoing + 8, id);
-        memcpy(outgoing + 16, manifest, metadata_size);
+    if (outgoing_capacity < length) {
+        void *next = realloc(outgoing, length);
+        if (!next) { free(manifest); goto done; }
+        outgoing = next;
+        outgoing_capacity = length;
     }
+    dcc_tcp_put32(outgoing, DCC_TCP_BEGIN);
+    dcc_tcp_put32(outgoing + 4, metadata_size + 8);
+    dcc_tcp_put64(outgoing + 8, id);
+    memcpy(outgoing + 16, manifest, metadata_size);
     free(manifest);
-    if (!outgoing) goto done;
     for (unsigned i = 0; i < job->count; ++i)
         if (!local_input && dcc_job_file(&job->inputs[i]) && !job->inputs[i].cached) {
             requested[i] = 1; requests[count++] = i;
@@ -238,6 +240,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     stream.immutable = seals >= 0 && (seals & immutable) == immutable;
                 }
                 free(outgoing);
+                outgoing_capacity = 0;
                 outgoing = next_chunk(&stream, &job->inputs[stream.index],
                                       &length, &file_offset, &file_left);
                 if (!outgoing) goto done;
@@ -409,8 +412,8 @@ done:
         if (cached) rs_trace("input cache: %u of %u entries transferred", transferred, job->count);
     }
     if (stream.fd >= 0) close(stream.fd);
-    dcc_frontend_fs_clear(&filesystem);
-    free(requests); free(requested); free(buffer); free(outgoing);
+    dcc_frontend_fs_reset(&filesystem);
+    free(requests); free(requested);
     if (local) dcc_tcp_frame_clear(&incoming);
     if (ret) dcc_job_result_free(result);
     return ret;

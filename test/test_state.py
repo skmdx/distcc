@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import selectors
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -75,6 +76,34 @@ class StateTest(unittest.TestCase):
         os.utime(path, (1, 1))
         self.assertIn('owner.c', self.monitor())
         self.assertTrue(path.exists())
+
+    @unittest.skipUnless(shutil.which('strace'), 'strace required for publication fault injection')
+    def test_unnamed_publication_and_named_fallback(self):
+        try:
+            probe = os.open(self.root, os.O_TMPFILE | os.O_WRONLY, 0o666)
+        except OSError as error:
+            self.skipTest(f'O_TMPFILE unavailable: {error}')
+        os.close(probe)
+        for fail in (False, True):
+            with self.subTest(linkat_fails=fail):
+                trace = self.root/f'trace-{fail}'
+                prefix = ['strace', '--kill-on-exit', '-qq', '-o', str(trace),
+                          '-e', 'trace=openat,fcntl,linkat,link,unlink']
+                if fail: prefix += ['-e', 'inject=linkat:error=EOPNOTSUPP:when=1']
+                process, pid = self.start(prefix)
+                path, = self.files()
+                self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+                self.assertIn('owner.c', self.monitor())
+                self.assertFalse(list((self.root/'state').glob('.binstate_*')))
+                process.communicate('q\n', timeout=5)
+                self.assertEqual(process.returncode, 0)
+                self.assertFalse(self.files())
+                calls = trace.read_text()
+                self.assertIn('O_TMPFILE', calls)
+                self.assertIn('linkat(', calls)
+                self.assertIn('F_SETLK', calls)
+                self.assertEqual('.binstate_' in calls, fail)
+                self.assertEqual('INJECTED' in calls, fail)
 
     def test_fork_cleanup_and_child_updates_preserve_parent(self):
         process, pid = self.start()
