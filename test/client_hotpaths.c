@@ -1,7 +1,6 @@
 /* Exercise actual client hot paths; --bench reports bounded local work. */
 #include "frontend_fs.c"
 #include "native_worker.h"
-#include "where.h"
 #include "hosts.h"
 #include "frontend_identity.h"
 #include <assert.h>
