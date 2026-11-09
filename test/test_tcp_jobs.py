@@ -1143,11 +1143,11 @@ class GccFrontendTest(BrokerTestCase):
         self.source.write_text('#include <value.h>\nint value(void) { return VALUE; }\n')
         command = [self.cc, '-nostdinc', '-O2', '-Iheaders', '-H', '-c', 'hello.c', '-o', 'out.o']
         local = subprocess.run(command, cwd=self.work, check=True, capture_output=True, text=True)
-        self.assertIn('value.h.gch/valid', local.stderr)
+        self.assertIn('! headers/value.h.gch/valid', local.stderr)
         expected = (self.work/'out.o').read_bytes()
         for _ in range(2):
             result = self.compile(command)
-            self.assertIn('value.h.gch/valid', result.stderr)
+            self.assertIn('! headers/value.h.gch/valid', result.stderr)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
         if os.geteuid() != 0:
             self.addCleanup(precompiled.chmod, 0o700)
