@@ -59,7 +59,9 @@ static int start_planner(const char *compiler, char **argv, const char *library,
     return pair[0];
 }
 
-static int run_planner(const char *compiler, char **argv, int output,
+/* The producer owns this complete command file. The worker replaces it with
+ * the plan; a driver's relay can hand the same file straight to cc1. */
+static int request_planner(const char *compiler, char **argv, int input,
                        const int standard[3], const char *role, int capture)
 {
     const char *library = getenv("DISTCC_GCC_PLAN_LIBRARY");
@@ -74,8 +76,8 @@ static int run_planner(const char *compiler, char **argv, int output,
         "COLLECT_AS_OPTIONS", "MAKEFLAGS", "MAKELEVEL", "MFLAGS", "subdir",
         "DISTCC_LOG", "DISTCC_VERBOSE", NULL
     };
-    char key[80], *cwd = NULL;
-    int worker = -1, lease = -1, input = -1, pair[2] = {-1, -1}, relay[2] = {-1, -1};
+    char key[80];
+    int worker = -1, lease = -1, pair[2] = {-1, -1}, relay[2] = {-1, -1};
     int ret = EXIT_IO_ERROR;
     const char *stage = "worker identity";
     if (dcc_local_worker_key(compiler, library, invocation_environment, key, sizeof(key))) goto out;
@@ -88,14 +90,9 @@ static int run_planner(const char *compiler, char **argv, int output,
     }
     if (worker < 0) goto out;
     stage = "command preparation";
-    if (!(cwd = getcwd(NULL, 0)) ||
-        socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) ||
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) ||
         (capture && socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, relay)) ||
-        (input = dcc_job_memfd("distcc-gcc-command")) < 0) goto out;
-    char *directory[] = {cwd, NULL};
-    if (dcc_x_argv(input, "ARGC", "ARGV", directory) ||
-        dcc_x_argv(input, "ARGC", "ARGV", argv) ||
-        dcc_x_argv(input, "ARGC", "ARGV", environ) || lseek(input, 0, SEEK_SET) < 0) goto out;
+        lseek(input, 0, SEEK_SET) < 0) goto out;
     int fds[] = {input, pair[1], standard[0], standard[1], standard[2], relay[1]};
     struct dcc_native_request request = {capture ? 'D' : 'P', 0};
     stage = "command send";
@@ -119,13 +116,13 @@ static int run_planner(const char *compiler, char **argv, int output,
              * sends final status. EOF is not a missing planner request. */
             if (!received) { close(relay[0]); relay[0] = -1; break; }
             if (received != 1 || operation != 'P' || lseek(input, 0, SEEK_SET) < 0) goto out;
-            int status = dcc_argv_file_read(input, 2, &invocation);
-            if (!status && !invocation.groups[0][0]) status = EXIT_PROTOCOL_ERROR;
+            int status = dcc_argv_file_read(input, 3, &invocation);
+            if (!status && !invocation.groups[1][0]) status = EXIT_PROTOCOL_ERROR;
             if (!status) {
                 char **previous_environment = environ;
-                environ = invocation.groups[1];
-                status = run_planner(invocation.groups[0][0], invocation.groups[0],
-                                     input, standard, "planner", 0);
+                environ = invocation.groups[2];
+                status = request_planner(invocation.groups[1][0], invocation.groups[1],
+                                         input, standard, "planner", 0);
                 environ = previous_environment;
             }
             dcc_argv_file_close(&invocation);
@@ -140,17 +137,6 @@ static int run_planner(const char *compiler, char **argv, int output,
     ret = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
     stage = "compiler execution";
     if (ret) goto out;
-    stage = "plan copy";
-    struct stat info;
-    if (fstat(input, &info) || ftruncate(output, 0) || lseek(output, 0, SEEK_SET) < 0) {
-        ret = EXIT_IO_ERROR; goto out;
-    }
-    off_t offset = 0;
-    while (offset < info.st_size) {
-        ssize_t n = sendfile(output, input, &offset, info.st_size - offset);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { ret = EXIT_IO_ERROR; goto out; }
-    }
     rs_trace("reused GCC %s status=%d cpu_ns=%llu", role, ret,
              (unsigned long long)result.cpu_ns);
 out:
@@ -158,11 +144,40 @@ out:
                             role, stage, ret, errno);
     if (lease >= 0) close(lease);
     if (worker >= 0) close(worker);
-    if (input >= 0) close(input);
     if (pair[0] >= 0) close(pair[0]);
     if (pair[1] >= 0) close(pair[1]);
     if (relay[0] >= 0) close(relay[0]);
     if (relay[1] >= 0) close(relay[1]);
+    return ret;
+}
+
+static int run_planner(const char *compiler, char **argv, int output,
+                       const int standard[3], const char *role, int capture)
+{
+    int input = dcc_job_memfd("distcc-gcc-command"), ret = EXIT_IO_ERROR;
+    char *cwd = getcwd(NULL, 0);
+    const char *stage = "command preparation";
+    struct stat info;
+    off_t offset = 0;
+    char *directory[] = {cwd, NULL};
+    if (input < 0 || !cwd || dcc_x_argv(input, "ARGC", "ARGV", directory) ||
+        dcc_x_argv(input, "ARGC", "ARGV", argv) ||
+        dcc_x_argv(input, "ARGC", "ARGV", environ)) goto out;
+    ret = request_planner(compiler, argv, input, standard, role, capture);
+    stage = NULL; // request_planner already reports worker failures.
+    if (ret) goto out;
+    stage = "plan copy";
+    ret = EXIT_IO_ERROR;
+    if (fstat(input, &info) || ftruncate(output, 0) || lseek(output, 0, SEEK_SET) < 0) goto out;
+    while (offset < info.st_size) {
+        ssize_t n = sendfile(output, input, &offset, info.st_size - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) goto out;
+    }
+    ret = 0;
+out:
+    if (ret && stage) rs_log_warning("GCC %s failed during %s (status=%d, errno=%d)", role, stage, ret, errno);
+    if (input >= 0) close(input);
     free(cwd);
     return ret;
 }

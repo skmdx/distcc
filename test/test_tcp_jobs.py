@@ -509,7 +509,7 @@ class GccFrontendTest(BrokerTestCase):
         wrapper, observed = self.work/'capture', self.work/'arguments.json'
         wrapper.write_text('#!' + sys.executable + '\nimport json, os, sys\nfrom pathlib import Path\n'
                            f'with open({str(observed)!r}, "w") as f:\n'
-                           ' json.dump([[ ["@", Path(a[1:]).read_text()] if a.startswith("@") else a\n'
+                           ' json.dump([[os.getcwd()], [ ["@", Path(a[1:]).read_text()] if a.startswith("@") else a\n'
                            '              for a in sys.argv[2:]], dict(os.environ)], f)\n')
         wrapper.chmod(0o755)
         response = self.work/'options.rsp'
@@ -555,7 +555,7 @@ class GccFrontendTest(BrokerTestCase):
                         self.assertEqual(relay.recv(1), b'P')
                         request.seek(0)
                         actual = []
-                        for _ in range(2):
+                        for _ in range(3):
                             token = request.read(12)
                             self.assertEqual(token[:4], b'ARGC')
                             values = []
@@ -565,11 +565,12 @@ class GccFrontendTest(BrokerTestCase):
                                 values.append(os.fsdecode(request.read(int(token[4:], 16))))
                             actual.append(values)
                         self.assertEqual(request.read(), b'')
-                        responses = [Path(arg[1:]) for arg in actual[0] if arg.startswith('@')]
+                        self.assertEqual(actual[0], expected[0])
+                        responses = [Path(arg[1:]) for arg in actual[1] if arg.startswith('@')]
                         self.assertTrue(responses, 'GCC-generated response file path was not exercised')
                         self.assertEqual([['@', Path(a[1:]).read_text()] if a.startswith('@') else a
-                                          for a in actual[0]], expected[0])
-                        self.assertEqual(dict(value.split('=', 1) for value in actual[1]), expected[1])
+                                          for a in actual[1]], expected[1])
+                        self.assertEqual(dict(value.split('=', 1) for value in actual[2]), expected[2])
                         relay.sendall(struct.pack('=I', 0))
                         status, _, _ = struct.unpack('=QQQ', peer.recv(24))
                         self.assertEqual(status, 0)

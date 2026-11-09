@@ -7,6 +7,8 @@
 #include <string>
 #include <dlfcn.h>
 #include <spawn.h>
+#include <sched.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include "native_worker.h"
@@ -24,13 +26,16 @@ bool capturing(const char *file, char *const argv[])
     return !capture_program.empty() && capture_program == file && argv[0] &&
         argv[1] && !strcmp(argv[1], "--gcc-plan-capture");
 }
-[[noreturn]] void relay(char *const argv[], char *const environment[])
+int prepare_relay(char *const argv[], char *const environment[])
 {
     // GCC still owns this child and waits normally. Its generated response
     // files stay live until planning finishes, then GCC removes them itself.
-    if (ftruncate(3, 0) || lseek(3, 0, SEEK_SET) < 0) _exit(1);
+    if (ftruncate(3, 0) || lseek(3, 0, SEEK_SET) < 0) return 1;
+    char *cwd = getcwd(nullptr, 0);
+    if (!cwd) return 1;
+    char *directory[] = {cwd, nullptr};
     int status = 0;
-    for (char *const *group : {argv + 2, environment}) {
+    for (char *const *group : {static_cast<char *const *>(directory), argv + 2, environment}) {
         char *data = nullptr;
         size_t size = 0;
         status = dcc_argv_encode("ARGC", "ARGV", const_cast<char **>(group), &data, &size);
@@ -44,19 +49,46 @@ bool capturing(const char *file, char *const argv[])
         free(data);
         if (status) break;
     }
+    free(cwd);
+    return status;
+}
+int wait_for_plan(void *)
+{
+    // Runs on a separate stack while the driver is suspended. Only IPC and
+    // exit are allowed here: no allocator, stdio or compiler-state mutation.
     uint32_t result = 1;
     ssize_t n = -1;
-    if (!status && send(4, "P", 1, MSG_NOSIGNAL) == 1)
+    if (send(4, "P", 1, MSG_NOSIGNAL) == 1)
         do { n = recv(4, &result, sizeof(result), MSG_TRUNC); } while (n < 0 && errno == EINTR);
-    _exit(n == sizeof(result) && result <= 255 ? result : 1);
+    return n == sizeof(result) && result <= 255 ? result : 1;
+}
+[[noreturn]] void relay(char *const argv[], char *const environment[])
+{
+    _exit(prepare_relay(argv, environment) ? 1 : wait_for_plan(nullptr));
 }
 int spawn_relay(pid_t *pid, char *const argv[], char *const environment[])
 {
-    // No executable, dynamic loader or wrapper initialization is needed here.
-    // Planning uses the driver's inherited diagnostic stream and no source IO.
-    pid_t child = fork();
-    if (child < 0) return errno;
-    if (!child) relay(argv, environment);
+    if (prepare_relay(argv, environment)) return EIO;
+    // Like posix_spawn, share the address space only until this tiny child
+    // exits. Forking the loaded driver copied page tables and tore them down
+    // for an invocation that only sends a notification and waits for status.
+    // The platform's thread-stack minimum supplies a separate aligned stack.
+    long minimum = sysconf(_SC_THREAD_STACK_MIN);
+    if (minimum <= 0) return EINVAL;
+    constexpr size_t alignment = alignof(max_align_t);
+    size_t size = (size_t(minimum) + alignment - 1) & ~(alignment - 1);
+    char *stack = static_cast<char *>(malloc(size));
+    if (!stack) return ENOMEM;
+    sigset_t blocked, previous;
+    sigfillset(&blocked);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous)) { int error = errno; free(stack); return error; }
+    // Block inherited handlers while sharing memory. The existing owner uses
+    // SIGKILL on cancellation, so both the suspended driver and child stop.
+    pid_t child = clone(wait_for_plan, stack + size, CLONE_VM | CLONE_VFORK | SIGCHLD, nullptr);
+    int error = errno;
+    sigprocmask(SIG_SETMASK, &previous, nullptr);
+    free(stack); // CLONE_VFORK returns only after the child releases this memory.
+    if (child < 0) return error;
     *pid = child;
     return 0;
 }
