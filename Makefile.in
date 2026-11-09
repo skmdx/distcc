@@ -272,6 +272,9 @@ test_SOURCE = test/comfychair.py \
 	test/test_tcp_jobs.py \
 	test/remote_files_contract.cc \
 	test/gcc_files_contract.cc \
+	test/file_cache.c \
+	test/client_hotpaths.c \
+	test/frontend_metadata_contract.c \
 	test/tcp_frames.c \
 	test/tcp_client_frames.c \
 	test/test_local_clang.py \
@@ -612,6 +615,13 @@ src/argv_file.pic.o: $(srcdir)/src/argv_file.c $(srcdir)/src/argv_file.h
 
 gcc_plan.so: $(srcdir)/src/gcc_plan.cc $(srcdir)/src/native_worker.cc $(srcdir)/src/native_worker.h src/argv_file.pic.o
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=gnu++17 -fPIC -fvisibility=hidden -shared $(LDFLAGS) -o $@ $(srcdir)/src/gcc_plan.cc $(srcdir)/src/native_worker.cc src/argv_file.pic.o -ldl
+
+CLIENT_CONTRACT_SOURCES = src/hosts.c src/hostfile.c src/loadfile.c src/lock.c src/io.c src/tempfile.c \
+	src/trace.c src/util.c src/argutil.c src/rpc.c src/filename.c src/snprintf.c src/cleanup.c
+h_client_hotpaths: test/client_hotpaths.c src/local_clang.c src/frontend_fs.c src/where.c src/where.h $(CLIENT_CONTRACT_SOURCES)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/local_clang.c src/where.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
+h_file_cache: test/file_cache.c src/file_cache.c src/file_cache.h $(CLIENT_CONTRACT_SOURCES)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< $(CLIENT_CONTRACT_SOURCES) $(LIBS)
 
 #  src/config.h.in is used by config.status
 Makefile: Makefile.in src/config.h.in config.status

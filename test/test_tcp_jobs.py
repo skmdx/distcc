@@ -8,6 +8,7 @@ import fcntl
 import importlib.util
 import itertools
 import json
+import mmap
 import os
 from pathlib import Path
 import re
@@ -36,6 +37,21 @@ from test_adaptive import free_port
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+class ClientHotpathsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        subprocess.run(['make', 'h_client_hotpaths', 'h_file_cache'], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+
+    def test_identity_environment_paths_and_localslots(self):
+        with tempfile.TemporaryDirectory(prefix='distcc-client-contract-') as work:
+            subprocess.run([str(Path.cwd()/'h_client_hotpaths'), '--test'], check=True, cwd=work, timeout=5)
+
+    def test_large_input_retention_pinning_and_capacity(self):
+        with tempfile.TemporaryDirectory(prefix='distcc-cache-contract-') as work:
+            subprocess.run([str(Path.cwd()/'h_file_cache'), work], check=True, timeout=5)
+
+
 class FileCacheTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -57,6 +73,13 @@ class FileCacheTest(unittest.TestCase):
         capsule.argtypes = (ctypes.py_object, ctypes.c_char_p)
         capsule.restype = pointer
         cls.api = Api.from_address(capsule(cls.module.file_cache, b'distcc.file_cache'))
+        cls.library = ctypes.CDLL(cls.module.__file__)
+        cls.library.dcc_file_cache_put.argtypes = [pointer, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
+        cls.library.dcc_file_cache_put.restype = None
+        cls.library.dcc_file_cache_get.argtypes = cls.library.dcc_file_cache_put.argtypes
+        cls.library.dcc_file_cache_get.restype = ctypes.c_int
+        cls.library.dcc_file_cache_prune.argtypes = [ctypes.c_char_p]
+        cls.library.dcc_file_cache_prune.restype = None
 
     def setUp(self):
         directory = tempfile.TemporaryDirectory(prefix='distcc-record-cache-')
@@ -106,6 +129,19 @@ class FileCacheTest(unittest.TestCase):
         return list(itertools.islice((key for key in candidates
                     if (xxhash.xxh3_64_intdigest(key) >> 56) % 64 == 0), count))
 
+    def pin_capacity(self, available):
+        # A real allocated shared input supplies pressure without hundreds of
+        # megabytes of Python buffers or copying it into the cache.
+        source = self.cache_path.parent/'pinned'
+        with source.open('w+b') as stream:
+            os.posix_fallocate(stream.fileno(), 0, 256*1024*1024 - available)
+            with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                digest = xxhash.xxh3_64_digest(data)
+        self.library.dcc_file_cache_put(digest, os.fsencode(source), 1, os.fsencode(source.parent))
+        self.assertEqual(next(self.cache_path.glob('*/'+digest.hex())).stat().st_ino,
+                         source.stat().st_ino)
+        return source
+
     def test_small_records_use_byte_capacity_instead_of_entry_count(self):
         keys = self.shard_keys(128)
         value = b'#define SHARED_HEADER 17\n' * 128
@@ -116,7 +152,7 @@ class FileCacheTest(unittest.TestCase):
 
     def test_byte_pressure_retains_recent_reads_without_changing_mtime(self):
         keys = self.shard_keys(4)
-        value = b'x' * (1024 * 1024)
+        value = b'x' * (4 * 1024 * 1024)
         paths = []
         for index, key in enumerate(keys[:3]):
             self.write(key, value)
@@ -126,13 +162,15 @@ class FileCacheTest(unittest.TestCase):
         # The first insertion is old, but it is still actively used.
         self.assertEqual(self.get(keys[0]), value)
         self.assertEqual(paths[0].stat().st_mtime_ns, 10**9)
+        pinned = self.pin_capacity(sum(p.stat().st_blocks * 512 for p in paths))
         self.write(keys[3], value)
         self.assertEqual(self.get(keys[0]), value)
         self.assertIsNone(self.get(keys[1]))
         self.assertEqual(self.get(keys[2]), value)
         self.assertEqual(self.get(keys[3]), value)
-        self.assertLessEqual(sum(p.stat().st_blocks * 512 for p in paths[0].parent.iterdir()),
-                             4 * 1024 * 1024)
+        self.assertLessEqual(sum(p.stat().st_blocks * 512 for p in self.cache_path.glob('*/*')),
+                             256 * 1024 * 1024)
+        self.assertGreater(pinned.stat().st_nlink, 1)
 
     def test_binary_records_and_open_snapshots_outlive_replacement_and_cache(self):
         for value in (b'', bytes(range(256))*16, os.urandom(131072)):
@@ -188,12 +226,7 @@ class FileCacheTest(unittest.TestCase):
         self.assertFalse(list(self.cache_path.glob('*/.tmp-*')))
 
     def test_shared_snapshots_verify_empty_large_and_corrupt_contents(self):
-        library = ctypes.CDLL(self.module.__file__)
-        library.dcc_file_cache_put.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                               ctypes.c_int, ctypes.c_char_p]
-        library.dcc_file_cache_put.restype = None
-        library.dcc_file_cache_get.argtypes = library.dcc_file_cache_put.argtypes
-        library.dcc_file_cache_get.restype = ctypes.c_int
+        library = self.library
         root = self.cache_path.parent
         for index, payload in enumerate((b'', bytes(range(256))*513)):
             with self.subTest(size=len(payload)):
@@ -216,11 +249,41 @@ class FileCacheTest(unittest.TestCase):
                     digest, os.fsencode(output), 1, os.fsencode(root)), 0)
                 self.assertFalse(output.exists())
 
+    def test_large_idle_input_borrows_capacity_and_survives_reopen(self):
+        source, output = (self.cache_path.parent/name for name in ('source', 'output'))
+        payload = bytes(range(256)) * 32768
+        source.write_bytes(payload)
+        digest = xxhash.xxh3_64_digest(payload)
+        root = os.fsencode(source.parent)
+        self.library.dcc_file_cache_put(digest, os.fsencode(source), 1, root)
+        source.unlink()
+        self.library.dcc_file_cache_prune(root)
+        self.close_cache()
+        self.handle = self.api.open(root)
+        self.assertEqual(self.library.dcc_file_cache_get(digest, os.fsencode(output), 1, root), 1)
+        self.assertEqual(output.read_bytes(), payload)
+
+    def test_quota_contention_and_abandoned_reservation_do_not_block_inputs(self):
+        self.write(b'old', b'complete')
+        quota = self.cache_path/'.quota'
+        with quota.open('r+b') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.write(b'new', b'pending')
+            self.library.dcc_file_cache_prune(os.fsencode(self.cache_path.parent))
+            self.assertEqual(self.get(b'old'), b'complete')
+            self.assertIsNone(self.get(b'new'))
+            # Simulate death after reservation, before the atomic publication.
+            lock.truncate(256*1024*1024+1)
+        self.write(b'new', b'pending')
+        self.assertEqual(self.get(b'new'), b'pending')
+        self.assertLess(quota.stat().st_size, 256*1024*1024)
+
     def test_retained_shards_prune_after_fork_and_publish_atomic_snapshots(self):
         keys = self.shard_keys(80)
         payload = b'entry'.ljust(65536, b'\0')
         self.write(keys[0], payload)
         oldest = next(p for p in self.cache_path.glob('*/*') if len(p.name) == 16)
+        self.pin_capacity(4 * 1024 * 1024)
         # Eviction compares file ages; creation within one timestamp tick
         # does not establish an order between otherwise equal-age entries.
         os.utime(oldest, (1, 1))
@@ -252,6 +315,18 @@ class FileCacheTest(unittest.TestCase):
 
 class GccFrontendTest(BrokerTestCase):
     worker_address = '127.0.0.1'
+
+    def test_planner_preloads_default_scan_plugin_in_parent(self):
+        self.start_frontend()
+        self.env['DISTCC_LOG'] = str(self.work/'client.log')
+        self.env.pop('DISTCC_GCC_SCAN_LIBRARY')
+        source = self.work/'preloaded.c'
+        source.write_text('int preloaded(void) { return 17; }\n')
+        self.compile([self.cc, '-c', str(source), '-o', str(self.work/'preloaded.o')])
+        log = (self.work/'client.log').read_text()
+        planner = re.search(r'started reusable GCC planner pid=(\d+)', log)
+        self.assertIsNotNone(planner, log)
+        self.assertIn('distcc_gcc_scan.so', Path(f'/proc/{planner[1]}/maps').read_text())
 
     def start_frontend(self, backoff=60, **settings):
         self.module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
@@ -2563,6 +2638,23 @@ class TcpJobsTest(TcpJobTestCase):
             if identity != 71:
                 self.assertEqual(uploads, 0, 'retry must exercise cached inputs')
 
+    def test_large_rust_input_is_reused_after_retry_cleanup(self):
+        self.restart_server(self.build/'distccd', DISTCC_JOB_MEMORY='1048576')
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        body = b'/*' + b' '*(8*1024*1024) + b'*/ fn cached_input() {}\n'
+        net = self.wire_job(body, identity=91, verification=None, job_kind=3)
+        kind, data = self.frame(net)
+        self.assertEqual(kind, 0x54000301)
+        for (index,) in struct.iter_unpack('!I', data): self.upload(net, body, index)
+        self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 91)))
+        deadline = time.monotonic() + 5
+        while list(self.root.glob('distcc-tcp-*')):
+            self.assertLess(time.monotonic(), deadline, 'input tree was not reclaimed')
+            time.sleep(.01)
+        self.wire_job(body, identity=92, net=net, verification=None, job_kind=3)
+        # The warm job must reach admission without requesting any input bytes.
+        self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 92)))
+
     def test_rust_retry_progresses_while_cache_maintenance_is_locked(self):
         cache = self.work/'cache'
         self.restart_server(self.build/'distccd', DISTCC_JOB_MEMORY='1048576',
@@ -3112,7 +3204,10 @@ ssize_t write(int fd, const void *data, size_t size) {
         return kind, read(size)
 
     def upload(self, net, body, index=0):
-        self.send(net, 0x54000302 | 0x20000, struct.pack('!II', index, len(body)) + body)
+        for offset in range(0, max(1, len(body)), 256*1024):
+            chunk = body[offset:offset+256*1024]
+            final = 0x20000 if offset + len(chunk) == len(body) else 0
+            self.send(net, 0x54000302 | final, struct.pack('!II', index, len(chunk)) + chunk)
 
     def result(self, net, identity=1, expected_status=0):
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()

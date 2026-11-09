@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 #include "distcc.h"
 #include "native_worker.h"
@@ -47,24 +48,83 @@ static int compare_environment(const void *a, const void *b)
 int dcc_local_worker_key(const char *compiler, const char *library,
                          const char *const *omit_environment, char *key, size_t size)
 {
-    XXH3_state_t *hash = XXH3_createState();
-    if (!hash) return -1;
+    /* Clients keep their credentials and namespaces for the invocation. Forked
+     * clients start a fresh context; driver and cc1 lookups share this one. */
+    static struct {
+        pid_t pid;
+        int context_ready, environment_ready;
+        XXH128_hash_t context, environment;
+        XXH64_hash_t environment_stamp;
+        char **environment_pointer;
+        const char *const *omitted;
+        struct { char *path; struct stat info; } files[2];
+    } cached;
+    pid_t pid = getpid();
+    if (cached.pid != pid) {
+        for (unsigned i = 0; i < 2; ++i) { free(cached.files[i].path); cached.files[i].path = NULL; }
+        cached.pid = pid;
+        cached.context_ready = cached.environment_ready = 0;
+    }
+    XXH3_state_t state = {0}, environment_state = {0};
+    XXH3_state_t *hash = &state;
     XXH3_128bits_reset(hash);
-    const char *paths[] = {compiler, library, "/proc/self/ns/mnt", "/proc/self/ns/pid", "/proc/self/ns/user"};
-    for (unsigned i = 0; i < sizeof(paths)/sizeof(*paths); ++i) {
+    if (!cached.context_ready) {
+        const char *namespaces[] = {"/proc/self/ns/mnt", "/proc/self/ns/pid", "/proc/self/ns/user"};
+        for (unsigned i = 0; i < sizeof(namespaces)/sizeof(*namespaces); ++i) {
+            struct stat info;
+            if (stat(namespaces[i], &info)) return -1;
+            XXH3_128bits_update(hash, &info.st_dev, sizeof(info.st_dev));
+            XXH3_128bits_update(hash, &info.st_ino, sizeof(info.st_ino));
+        }
+        gid_t groups[NGROUPS_MAX];
+        int count = getgroups(NGROUPS_MAX, groups);
+        if (count < 0) return -1;
+        XXH3_128bits_update(hash, groups, count*sizeof(*groups));
+        uid_t uid = geteuid();
+        gid_t gid = getegid();
+        mode_t mask = umask(0); umask(mask);
+        XXH3_128bits_update(hash, &uid, sizeof(uid));
+        XXH3_128bits_update(hash, &gid, sizeof(gid));
+        XXH3_128bits_update(hash, &mask, sizeof(mask));
+        cached.context = XXH3_128bits_digest(hash);
+        cached.context_ready = 1;
+        XXH3_128bits_reset(hash);
+    }
+    XXH3_128bits_update(hash, &cached.context, sizeof(cached.context));
+    const char *paths[] = {compiler, library};
+    for (unsigned i = 0; i < 2; ++i) {
         if (!paths[i]) continue;
-        struct stat info;
-        if (stat(paths[i], &info)) { XXH3_freeState(hash); return -1; }
-        XXH3_128bits_update(hash, &info.st_dev, sizeof(info.st_dev));
-        XXH3_128bits_update(hash, &info.st_ino, sizeof(info.st_ino));
-        if (i < 2) XXH3_128bits_update(hash, &info.st_ctim, sizeof(info.st_ctim));
+        if (!cached.files[i].path || strcmp(cached.files[i].path, paths[i])) {
+            struct stat info;
+            if (stat(paths[i], &info)) return -1;
+            char *path = strdup(paths[i]);
+            if (!path) return -1;
+            free(cached.files[i].path);
+            cached.files[i].path = path;
+            cached.files[i].info = info;
+        }
+        const struct stat *info = &cached.files[i].info;
+        XXH3_128bits_update(hash, &info->st_dev, sizeof(info->st_dev));
+        XXH3_128bits_update(hash, &info->st_ino, sizeof(info->st_ino));
+        XXH3_128bits_update(hash, &info->st_ctim, sizeof(info->st_ctim));
     }
     /* Driver aliases of the same executable share libraries. Each request
      * carries its original argv[0], which owns target and C/C++ mode. */
     size_t capacity = 0, count_environment = 0;
-    while (environ[capacity]) ++capacity;
+    XXH3_64bits_reset(&environment_state);
+    while (environ[capacity]) {
+        XXH3_64bits_update(&environment_state, environ[capacity], strlen(environ[capacity]) + 1);
+        ++capacity;
+    }
+    for (const char *const *name = omit_environment; name && *name; ++name)
+        XXH3_64bits_update(&environment_state, *name, strlen(*name) + 1);
+    XXH64_hash_t stamp = XXH3_64bits_digest(&environment_state);
+    /* Pointer replacement covers the driver relay; the stamp also catches
+     * setenv/putenv changes that keep the same environ allocation. */
+    if (cached.environment_ready && cached.environment_pointer == environ &&
+        cached.omitted == omit_environment && cached.environment_stamp == stamp) goto environment_ready;
     struct dcc_environment_entry *environment = calloc(capacity, sizeof(*environment));
-    if (capacity && !environment) { XXH3_freeState(hash); return -1; }
+    if (capacity && !environment) return -1;
     for (char **p = environ; *p; ++p) {
         int omit = 0;
         for (const char *const *name = omit_environment; name && *name; ++name) {
@@ -81,19 +141,18 @@ int dcc_local_worker_key(const char *compiler, const char *library,
      * unrelated names. Only the identity is sorted; requests stay unchanged. */
     if (count_environment > 1)
         qsort(environment, count_environment, sizeof(*environment), compare_environment);
+    XXH3_128bits_reset(&environment_state);
     for (size_t i = 0; i < count_environment; ++i)
-        XXH3_128bits_update(hash, environment[i].text, strlen(environment[i].text)+1);
+        XXH3_128bits_update(&environment_state, environment[i].text, strlen(environment[i].text)+1);
     free(environment);
-    gid_t groups[NGROUPS_MAX];
-    int count = getgroups(NGROUPS_MAX, groups);
-    if (count < 0) { XXH3_freeState(hash); return -1; }
-    XXH3_128bits_update(hash, groups, count*sizeof(*groups));
-    gid_t gid = getegid();
-    XXH3_128bits_update(hash, &gid, sizeof(gid));
-    mode_t mask = umask(0); umask(mask);
-    XXH3_128bits_update(hash, &mask, sizeof(mask));
+    cached.environment = XXH3_128bits_digest(&environment_state);
+    cached.environment_pointer = environ;
+    cached.omitted = omit_environment;
+    cached.environment_stamp = stamp;
+    cached.environment_ready = 1;
+environment_ready:
+    XXH3_128bits_update(hash, &cached.environment, sizeof(cached.environment));
     XXH128_hash_t value = XXH3_128bits_digest(hash);
-    XXH3_freeState(hash);
     snprintf(key, size, "compiler-local:%016llx%016llx", (unsigned long long)value.high64,
              (unsigned long long)value.low64);
     return 0;

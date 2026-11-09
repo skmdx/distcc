@@ -20,6 +20,7 @@
 
 #include "distcc.h"
 #include "hosts.h"
+#include "where.h"
 #include "adaptive.h"
 #include "broker.h"
 #include "broker_protocol.h"
@@ -392,12 +393,10 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int
                        const struct dcc_work_hint *hint, int *queued_fd)
 {
     struct reply reply;
-    struct dcc_hostdef *local = NULL;
     int count, net, fd;
     /* Preserve the client's --localslots and --localslots_cpp settings. */
-    if (dcc_get_hostlist(&local, &count))
+    if (dcc_read_localslots_configuration())
         return EXIT_BAD_HOSTSPEC;
-    free_hosts(local);
     int remote_cpp = can_compile_locally && getenv("INCLUDE_SERVER_PORT") != NULL;
     fd = broker_request((can_compile_locally &&
                          !dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0) ? CLIENT_COMPILE : 0) |

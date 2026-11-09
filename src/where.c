@@ -87,19 +87,38 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
 static void dcc_lock_pause(int analysis_occupied);
 
 
-void dcc_read_localslots_configuration(void)
+int dcc_read_localslots_configuration(void)
 {
-    struct dcc_hostdef *hostlist;
-    int ret;
-    int n_hosts;
-
-    if ((ret = dcc_get_hostlist(&hostlist, &n_hosts)) == 0) {
-        while (hostlist) {
-            struct dcc_hostdef *l = hostlist;
-            hostlist = hostlist->next;
-            dcc_free_hostdef(l);
-        }
+    static const char *const names[] = {"DISTCC_HOSTS", "DISTCC_DIR", "HOME"};
+    static char *saved[3];
+    static int initialized, result;
+    const char *values[3];
+    int changed = !initialized;
+    for (unsigned i = 0; i < 3; ++i) {
+        values[i] = getenv(names[i]);
+        if (!!values[i] != !!saved[i] || (values[i] && saved[i] && strcmp(values[i], saved[i]))) changed = 1;
     }
+    if (!changed) return result;
+    char *copies[3] = {0};
+    for (unsigned i = 0; i < 3; ++i)
+        if (values[i] && !(copies[i] = strdup(values[i]))) {
+            for (unsigned j = 0; j < 3; ++j) free(copies[j]);
+            return EXIT_OUT_OF_MEMORY;
+        }
+    struct dcc_hostdef *hostlist = NULL;
+    int n_hosts;
+    dcc_hostdef_local->slots_specified = dcc_hostdef_local_cpp->slots_specified = 0;
+    dcc_hostdef_local->n_slots = 4;
+    dcc_hostdef_local_cpp->n_slots = 0;
+    result = dcc_get_hostlist(&hostlist, &n_hosts);
+    while (hostlist) {
+        struct dcc_hostdef *next = hostlist->next;
+        dcc_free_hostdef(hostlist);
+        hostlist = next;
+    }
+    for (unsigned i = 0; i < 3; ++i) { free(saved[i]); saved[i] = copies[i]; }
+    initialized = 1;
+    return result;
 }
 
 
@@ -252,7 +271,8 @@ int dcc_lock_local(int *cpu_lock_fd)
 
 static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
 {
-    int ret;
+    int ret = dcc_read_localslots_configuration();
+    if (ret) return ret;
     struct dcc_hostdef *chosen = dcc_hostdef_local_cpp;
     const char *broker = getenv("DISTCC_BROKER");
     /* A socket lease wakes on release instead of polling all local locks.

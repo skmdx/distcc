@@ -118,16 +118,49 @@ int execute(int fd, bool preparing)
     if (!output || ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) return 1;
     environ = command.groups[2];
     // main has never run in the parent. GCC parses the complete fresh argv
-    // and environment, observes current paths, and loads its plugins anew.
+    // and environment, observes current paths, and initializes its plugins.
     return compiler_main(argc, argv, environ);
 }
 
-int serve(int, char **, char **)
+int serve(int argc, char **argv, char **)
 {
     const char *value = getenv("DISTCC_GCC_PLAN_CONTROL");
     char *end;
     long control = value ? strtol(value, &end, 10) : -1;
     if (!value || !*value || *end || control < 3 || control > 0x7fffffff) return 1;
+    const char *role = getenv("DISTCC_GCC_PLAN_ROLE");
+    if (role && !strcmp(role, "planner")) {
+        const char *plugin = getenv("DISTCC_GCC_SCAN_LIBRARY");
+        const char *directory = nullptr;
+        // These are GCC's finalized private plugin arguments, not a second
+        // interpretation of compiler options or an independent search path.
+        for (int i = 1; i < argc; ++i) {
+            if (!strncmp(argv[i], "-fplugin=", 9)) {
+                const char *name = strrchr(argv[i] + 9, '/');
+                name = name ? name + 1 : argv[i] + 9;
+                if (!strcmp(name, "distcc_gcc_scan") || !strcmp(name, "distcc_gcc_scan.so"))
+                    plugin = argv[i] + 9;
+            }
+            if (!strcmp(argv[i], "-iplugindir") && i + 1 < argc) directory = argv[++i];
+            else if (!strncmp(argv[i], "-iplugindir=", 12)) directory = argv[i] + 12;
+        }
+        std::string resolved;
+        if (plugin && !strchr(plugin, '/') && directory) {
+            resolved = std::string(directory) + "/" + plugin;
+            if (resolved.size() < 3 || resolved.compare(resolved.size() - 3, 3, ".so")) resolved += ".so";
+            plugin = resolved.c_str();
+        }
+        // Resolve relocations once in the untouched parent. plugin_init and
+        // compiler_main still execute only in isolated per-request children.
+        if (!plugin || !dlopen(plugin, RTLD_NOW | RTLD_LOCAL)) {
+            const char *error = dlerror();
+            fprintf(stderr, "distcc: cannot preload GCC scan plugin: %s\n", error ? error : "missing path");
+            return 1;
+        }
+    }
+    // Startup diagnostics belong to the requesting client; a successful
+    // resident worker must release that client's stderr pipe before readiness.
+    if (!freopen("/dev/null", "w", stderr)) return 1;
     return dcc_native_worker(control, execute);
 }
 }

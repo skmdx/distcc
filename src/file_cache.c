@@ -12,7 +12,6 @@
 #include <time.h>
 #include <sys/file.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/uio.h>
@@ -23,9 +22,8 @@
 #include "distcc.h"
 #include "file_cache.h"
 
-/* Separate shard locks bound concurrent storage. Capacity counts allocated
- * bytes: small headers must not exhaust an entry quota or escape the storage
- * budget just because their payload occupies a fraction of a filesystem block. */
+/* Shards serialize preparation, but share the former 64 * 4 MiB budget.
+ * Capacity counts allocated bytes, including filesystem block rounding. */
 #define CACHE_SHARDS DCC_FILE_CACHE_SHARDS
 #define CACHE_BYTES DCC_FILE_CACHE_MAX
 
@@ -176,7 +174,7 @@ done:
     return ok;
 }
 
-struct entry { char key[17]; off_t size; struct timespec age; };
+struct entry { char path[20]; off_t size; struct timespec age; };
 
 static int oldest_first(const void *left, const void *right)
 {
@@ -186,73 +184,121 @@ static int oldest_first(const void *left, const void *right)
     return (a->tv_nsec > b->tv_nsec) - (a->tv_nsec < b->tv_nsec);
 }
 
-static int make_room(int shard, off_t size, const char *replaced)
+/* Called only with the root quota locked, on first use or capacity pressure.
+ * Publication is atomic; readers need neither the shard nor the quota lock. */
+static off_t make_room(int root, off_t size)
 {
     struct entry *entries = NULL;
     struct dirent *de;
     struct stat st;
     off_t bytes = 0;
     size_t count = 0, capacity = 0;
-    int result = -1;
-    struct statvfs space;
-    if (fstatvfs(shard, &space)) return -1;
-    off_t block = space.f_frsize;
-    size = ((size + block - 1) / block) * block;
-    /* A retained shard can be shared by forked compilers. Each scan needs
-     * its own open file description, rather than dup's shared offset. */
-    int iterator = openat(shard, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (iterator < 0) return -1;
-    DIR *dir = fdopendir(iterator);
-    if (!dir) { close(iterator); return -1; }
-    while ((de = readdir(dir))) {
-        if (!strncmp(de->d_name, ".tmp-", 5)) {
-            if (unlinkat(shard, de->d_name, 0)) goto done;
-            continue;
+    off_t result = -1;
+    DIR *dir = NULL;
+    for (unsigned index = 0; index < CACHE_SHARDS; ++index) {
+        char name[3];
+        snprintf(name, sizeof(name), "%02x", index);
+        /* Fresh open descriptions avoid sharing directory offsets after fork. */
+        int shard = openat(root, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (shard < 0) { if (errno == ENOENT) continue; goto done; }
+        dir = fdopendir(shard);
+        if (!dir) { close(shard); goto done; }
+        while ((de = readdir(dir))) {
+            /* Temporary names exist only inside the quota lock. Preparation
+             * uses unnamed inodes, so these are abandoned publications. */
+            if (!strncmp(de->d_name, ".tmp-", 5)) {
+                if (unlinkat(shard, de->d_name, 0)) goto done;
+                continue;
+            }
+            if (strlen(de->d_name) != 16 || strspn(de->d_name, "0123456789abcdef") != 16)
+                continue;
+            if (fstatat(shard, de->d_name, &st, AT_SYMLINK_NOFOLLOW)) goto done;
+            if (!S_ISREG(st.st_mode)) {
+                if (unlinkat(shard, de->d_name, 0)) goto done;
+                continue;
+            }
+            bytes += st.st_blocks * 512;
+            /* Live read-only inputs remain shareable even above the budget. */
+            if (st.st_nlink > 1) continue;
+            if (count == capacity) {
+                size_t next = capacity ? capacity * 2 : 64;
+                void *grown = realloc(entries, next * sizeof(*entries));
+                if (!grown) goto done;
+                entries = grown; capacity = next;
+            }
+            snprintf(entries[count].path, sizeof(entries[count].path), "%s/%.16s", name, de->d_name);
+            entries[count].size = st.st_blocks * 512;
+            entries[count].age = st.st_atim;
+            if (st.st_mtim.tv_sec > st.st_atim.tv_sec ||
+                (st.st_mtim.tv_sec == st.st_atim.tv_sec && st.st_mtim.tv_nsec > st.st_atim.tv_nsec))
+                entries[count].age = st.st_mtim;
+            ++count;
         }
-        if (strlen(de->d_name) != 16 || strspn(de->d_name, "0123456789abcdef") != 16)
-            continue;
-        if (!strcmp(de->d_name, replaced)) continue;
-        if (fstatat(shard, de->d_name, &st, AT_SYMLINK_NOFOLLOW)) continue;
-        /* Active read-only jobs pin their entries with hard links. The idle
-         * cache bound must not evict and retransmit those same live inputs. */
-        if (S_ISREG(st.st_mode) && st.st_nlink > 1) continue;
-        if (!S_ISREG(st.st_mode)) {
-            if (unlinkat(shard, de->d_name, 0)) goto done;
-            continue;
-        }
-        if (count == capacity) {
-            size_t next = capacity ? capacity * 2 : 64;
-            void *grown = realloc(entries, next * sizeof(*entries));
-            if (!grown) goto done;
-            entries = grown; capacity = next;
-        }
-        strcpy(entries[count].key, de->d_name);
-        entries[count].size = st.st_blocks * 512;
-        entries[count].age = st.st_atim;
-        if (st.st_mtim.tv_sec > st.st_atim.tv_sec ||
-            (st.st_mtim.tv_sec == st.st_atim.tv_sec && st.st_mtim.tv_nsec > st.st_atim.tv_nsec))
-            entries[count].age = st.st_mtim;
-        ++count;
-        bytes += entries[count-1].size;
+        closedir(dir);
+        dir = NULL;
     }
     if (count && bytes + size > CACHE_BYTES) {
+        /* Reclaim at least one former shard's allowance to amortize scans. */
+        off_t reserve = !size ? 0 : size > CACHE_BYTES / CACHE_SHARDS ? size : CACHE_BYTES / CACHE_SHARDS;
+        off_t target = reserve < CACHE_BYTES ? CACHE_BYTES - reserve : 0;
         qsort(entries, count, sizeof(*entries), oldest_first);
-        for (size_t i = 0; i < count && bytes + size > CACHE_BYTES; ++i) {
-            if (unlinkat(shard, entries[i].key, 0)) goto done;
+        for (size_t i = 0; i < count && bytes > target; ++i) {
+            if (fstatat(root, entries[i].path, &st, AT_SYMLINK_NOFOLLOW)) goto done;
+            if (st.st_nlink > 1) continue;
+            if (unlinkat(root, entries[i].path, 0)) goto done;
             bytes -= entries[i].size;
         }
     }
-    result = 0;
+    result = bytes;
 done:
-    closedir(dir);
+    if (dir) closedir(dir);
     free(entries);
     return result;
 }
 
+/* The sparse quota file's length is a conservative byte reservation plus one
+ * (zero means uninitialized). ftruncate changes it atomically without a torn
+ * counter write. Reserve before publishing; recount after deleting. Killed
+ * publishers and replaced/compressed entries can overcount, never undercount;
+ * a pressure scan reconciles the reservation with the immutable files. */
+static int quota_lock(int root, off_t *bytes)
+{
+    struct stat st;
+    int fd = openat(root, ".quota", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) || fstat(fd, &st)) { close(fd); return -1; }
+    *bytes = st.st_size - 1;
+    return fd;
+}
+
+static void publish_snapshot(int shard, const char *key, int from)
+{
+    char temporary[40], source[64];
+    struct stat st;
+    off_t bytes;
+    int root = openat(shard, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC), quota = -1;
+    if (root < 0 || fstat(from, &st)) goto done;
+    off_t size = st.st_blocks * 512;
+    quota = quota_lock(root, &bytes);
+    if (quota < 0) goto done;
+    if (bytes < 0 || bytes + size > CACHE_BYTES) bytes = make_room(root, size);
+    if (bytes < 0 || (bytes + size > CACHE_BYTES && !st.st_nlink) ||
+        ftruncate(quota, bytes + size + 1)) goto done;
+    snprintf(temporary, sizeof(temporary), ".tmp-%lu", (unsigned long)getpid());
+    snprintf(source, sizeof(source), "/proc/self/fd/%d", from);
+    if (!linkat(AT_FDCWD, source, shard, temporary, AT_SYMLINK_FOLLOW)) {
+        (void)renameat(shard, temporary, shard, key);
+        (void)unlinkat(shard, temporary, 0);
+    }
+done:
+    if (quota >= 0) close(quota);
+    if (root >= 0) close(root);
+}
+
 void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared, const char *tmp)
 {
-    char key[17], temporary[40];
-    struct stat st;
+    char key[17];
+    struct stat st, directory;
     int shard = -1, lock = -1, from = -1, to = -1;
     from = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (from < 0 || fstat(from, &st) || !S_ISREG(st.st_mode) || (!shared && st.st_size > CACHE_BYTES))
@@ -273,21 +319,16 @@ void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared,
         to = -1;
         if (present) goto done;
     }
-    if (make_room(shard, st.st_size, key)) goto done;
-    snprintf(temporary, sizeof(temporary), ".tmp-%lu", (unsigned long)getpid());
-    if (shared) {
-        if (!fchmod(from, 0400) && !linkat(AT_FDCWD, path, shard, temporary, 0)) {
-            renameat(shard, temporary, shard, key);
-            unlinkat(shard, temporary, 0);
-            goto done;
-        }
-        if (errno != EXDEV || st.st_size > CACHE_BYTES) goto done;
+    if (fstat(shard, &directory)) goto done;
+    if (shared && st.st_dev == directory.st_dev) {
+        if (!fchmod(from, 0400)) publish_snapshot(shard, key, from);
+        goto done;
     }
-    to = openat(shard, temporary, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (st.st_size > CACHE_BYTES) goto done;
+    to = openat(shard, ".", O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
     if (to < 0) goto done;
     if (!copy_snapshot(from, to, NULL) && !fchmod(to, 0400))
-        renameat(shard, temporary, shard, key);
-    unlinkat(shard, temporary, 0);
+        publish_snapshot(shard, key, to);
 done:
     if (to >= 0) close(to);
     if (from >= 0) close(from);
@@ -295,18 +336,21 @@ done:
     if (shard >= 0) close(shard);
 }
 
-void dcc_file_cache_prune(const unsigned char *hash, const char *tmp)
+void dcc_file_cache_prune(const char *tmp)
 {
-    char key[17];
-    int shard = cache_shard(hash, key, tmp), lock;
-    if (shard < 0) return;
-    lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    off_t bytes;
+    int root = cache_root(tmp), quota;
+    if (root < 0) return;
+    quota = quota_lock(root, &bytes);
     /* RETRY cleanup shares the input-I/O workers. Never make retransmission
      * depend on another cache publisher releasing its maintenance lock. The
      * next successful publisher/pruner enforces the idle-cache bound. */
-    if (lock >= 0 && !flock(lock, LOCK_EX | LOCK_NB)) make_room(shard, 0, "");
-    if (lock >= 0) close(lock);
-    close(shard);
+    if (quota >= 0 && (bytes < 0 || bytes > CACHE_BYTES)) {
+        bytes = make_room(root, 0);
+        if (bytes >= 0) (void)ftruncate(quota, bytes + 1);
+    }
+    if (quota >= 0) close(quota);
+    close(root);
 }
 
 struct record_header { uint64_t key_size, size, digest; };
@@ -406,18 +450,15 @@ static void record_write(struct dcc_record_cache *cache, const void *key, size_t
     struct record_header header = {key_size, size, 0};
     if (key_size > CACHE_BYTES - sizeof(header) || size > CACHE_BYTES - sizeof(header) - key_size) return;
     header.digest = XXH3_64bits(data, size);
-    char name[17], temporary[40];
+    char name[17];
     int shard = record_shard(cache, key, key_size, name), lock = -1, fd = -1;
     if (shard < 0) return;
     lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) ||
-        make_room(shard, sizeof(header) + key_size + size, name)) goto done;
-    snprintf(temporary, sizeof(temporary), ".tmp-%lu", (unsigned long)getpid());
-    fd = openat(shard, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB)) goto done;
+    fd = openat(shard, ".", O_WRONLY | O_TMPFILE | O_CLOEXEC, 0600);
     if (fd < 0) goto done;
     if (!write_record(fd, &header, key, data) && !fchmod(fd, 0400))
-        renameat(shard, temporary, shard, name);
-    unlinkat(shard, temporary, 0);
+        publish_snapshot(shard, name, fd);
 done:
     if (fd >= 0) close(fd);
     if (lock >= 0) close(lock);

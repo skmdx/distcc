@@ -36,10 +36,11 @@ static int start_planner(const char *compiler, char **argv, const char *library,
         char descriptor[32], *preload = NULL;
         const char *previous = getenv("LD_PRELOAD");
         snprintf(descriptor, sizeof(descriptor), "%d", pair[1]);
-        if (setpgid(0, 0) || dcc_redirect_fds("/dev/null", "/dev/null", "/dev/null") ||
+        if (setpgid(0, 0) || dcc_redirect_fds("/dev/null", "/dev/null", NULL) ||
             asprintf(&preload, "%s%s%s", library, previous ? ":" : "", previous ? previous : "") < 0 ||
             fcntl(pair[1], F_SETFD, 0) ||
-            setenv("LD_PRELOAD", preload, 1) || setenv("DISTCC_GCC_PLAN_CONTROL", descriptor, 1)) _exit(1);
+            setenv("LD_PRELOAD", preload, 1) || setenv("DISTCC_GCC_PLAN_CONTROL", descriptor, 1) ||
+            setenv("DISTCC_GCC_PLAN_ROLE", role, 1)) _exit(1);
         execv(compiler, argv);
         _exit(1);
     }
@@ -71,7 +72,7 @@ static int request_planner(const char *compiler, char **argv, int input,
      * with each request; its complete environment is restored before GCC main.
      * These exported copies and distcc logging do not change the loaded image.
      * Loader, allocator and sandbox configuration still belong to the key. */
-    const char *const invocation_environment[] = {
+    static const char *const invocation_environment[] = {
         "COLLECT_GCC_OPTIONS", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
         "COLLECT_AS_OPTIONS", "MAKEFLAGS", "MAKELEVEL", "MFLAGS", "subdir",
         "DISTCC_LOG", "DISTCC_VERBOSE", NULL

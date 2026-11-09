@@ -169,8 +169,10 @@ int main(int argc, char **argv)
     assert(!mutate && !dcc_tcp_get32(reply.data + 60));
     dcc_frontend_fs_clear(&reply);
     reply = query(&job, directory_path, DCC_FS_LSTAT, previous);
-    assert(dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_STABLE);
-    assert(dcc_tcp_get32(reply.data + 64) == 2);
+    /* A stale version refreshes the supplied lookup footprint. It does not
+     * enumerate the newly added sibling until the compiler asks for it. */
+    assert(dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_PARTIAL);
+    assert(dcc_tcp_get32(reply.data + 64) == 1);
     memcpy(previous, reply.data + 8, sizeof(previous));
     dcc_frontend_fs_clear(&reply);
 
@@ -182,7 +184,10 @@ int main(int argc, char **argv)
     assert(reply.size == 60 && (dcc_tcp_get32(reply.data + 40) & 0777) == 0111);
     dcc_frontend_fs_clear(&reply);
     reply = query(&job, directory_path, DCC_FS_LSTAT, previous);
-    assert(reply.size == 60 && S_ISDIR(dcc_tcp_get32(reply.data + 40)));
+    assert(S_ISDIR(dcc_tcp_get32(reply.data + 40)));
+    assert(dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_PARTIAL);
+    assert(dcc_tcp_get32(reply.data + 64) == 1);
+    assert(header_size(&reply) == strlen("changed contents"));
     assert((dcc_tcp_get32(reply.data + 40) & 0777) == 0111);
     dcc_frontend_fs_clear(&reply);
     reply = query(&job, header, DCC_FS_READ, NULL);

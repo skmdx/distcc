@@ -158,7 +158,7 @@ int dcc_get_hostlist(struct dcc_hostdef **ret_list,
                      int *ret_nhosts)
 {
     char *env;
-    char *path, *top;
+    char *path = NULL;
     int ret;
 
     *ret_list = NULL;
@@ -170,10 +170,9 @@ int dcc_get_hostlist(struct dcc_hostdef **ret_list,
     }
 
     /* $DISTCC_DIR or ~/.distcc */
-    if ((ret = dcc_get_top_dir(&top)) == 0) {
-        /* if we failed to get it, just warn */
-
-        checked_asprintf(&path, "%s/hosts", top);
+    if ((env = getenv("DISTCC_DIR"))) checked_asprintf(&path, "%s/hosts", env);
+    else if ((env = getenv("HOME"))) checked_asprintf(&path, "%s/.distcc/hosts", env);
+    if (path) {
         if (path != NULL && access(path, R_OK) == 0) {
             ret = dcc_parse_hosts_file(path, ret_list, ret_nhosts);
             free(path);

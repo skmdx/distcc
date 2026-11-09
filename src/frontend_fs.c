@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,24 +17,26 @@
 
 /* Authorization normalizes the spelling, but the syscall keeps the original
  * path: collapsing symlink/.. would change the compiler's lookup semantics. */
-static char *normalized(const char *path)
+static int normalized(const char *path, char result[PATH_MAX])
 {
-    char *copy = strdup(path), *result = malloc(strlen(path) + 2), *save = NULL;
-    if (!copy || !result) { free(copy); free(result); return NULL; }
     size_t used = 0;
-    for (char *part = strtok_r(copy, "/", &save); part; part = strtok_r(NULL, "/", &save)) {
-        if (!strcmp(part, ".")) continue;
-        if (!strcmp(part, "..")) {
+    while (*path) {
+        if (*path == '/') { ++path; continue; }
+        const char *part = path;
+        while (*path && *path != '/') ++path;
+        size_t size = path - part;
+        if (size == 1 && part[0] == '.') continue;
+        if (size == 2 && part[0] == '.' && part[1] == '.') {
             while (used && result[--used] != '/') {}
         } else {
+            if (size >= PATH_MAX - used - 1) { errno = ENAMETOOLONG; return -1; }
             result[used++] = '/';
-            size_t size = strlen(part); memcpy(result + used, part, size); used += size;
+            memcpy(result + used, part, size); used += size;
         }
     }
     if (!used) result[used++] = '/';
     result[used] = 0;
-    free(copy);
-    return result;
+    return 0;
 }
 static int within(const char *path, const char *root)
 {
@@ -43,19 +46,21 @@ static int within(const char *path, const char *root)
 enum { PATH_METADATA = 1, PATH_CONTENTS = 2 };
 int dcc_frontend_fs_add_root(struct dcc_job *job, const char *path)
 {
-    char *absolute = NULL;
-    if (*path != '/' && asprintf(&absolute, "%s/%s", job->cwd, path) < 0) return -1;
-    char *root = normalized(absolute ? absolute : path);
-    free(absolute);
-    if (!root) return -1;
+    char absolute[PATH_MAX], root[PATH_MAX];
+    if (*path != '/') {
+        int n = snprintf(absolute, sizeof(absolute), "%s/%s", job->cwd, path);
+        if (n < 0 || n >= (int)sizeof(absolute)) { errno = ENAMETOOLONG; return -1; }
+        path = absolute;
+    }
+    if (normalized(path, root)) return -1;
     size_t count = job->fs_roots ? dcc_argv_len(job->fs_roots) : 0;
     for (size_t i = 0; i < count; ++i)
-        if (within(root, job->fs_roots[i])) { free(root); return 0; }
+        if (within(root, job->fs_roots[i])) return 0;
     char **roots = realloc(job->fs_roots, (count+2)*sizeof(*roots));
-    if (!roots) { free(root); return -1; }
+    if (!roots) return -1;
     job->fs_roots = roots;
-    roots[count] = root; roots[count+1] = NULL;
-    return 0;
+    roots[count] = strdup(root); roots[count+1] = NULL;
+    return roots[count] ? 0 : -1;
 }
 int dcc_frontend_fs_add_roots(struct dcc_job *job, const char *paths)
 {
@@ -73,14 +78,13 @@ failed:
 }
 static int allowed(const struct dcc_job *job, const char *path)
 {
-    char *name = normalized(path);
-    if (!name) return 0;
+    char name[PATH_MAX];
+    if (normalized(path, name)) return 0;
     int result = 0;
     for (char **p = job->fs_roots; p && *p; ++p) {
         if (within(name, *p)) { result = PATH_METADATA | PATH_CONTENTS; break; }
         if (within(*p, name)) result = PATH_METADATA;
     }
-    free(name);
     return result;
 }
 /* Metadata stays in one owned allocation. File contents are read only when

@@ -307,12 +307,10 @@ struct tree_cleanup {
 };
 static void prune_inputs(const struct dcc_job *job)
 {
-    uint64_t seen = 0;
     if (job) for (unsigned i = 0; i < job->count; ++i) {
-        uint64_t shard = UINT64_C(1) << (job->inputs[i].digest[0] % DCC_FILE_CACHE_SHARDS);
-        if (dcc_job_shared(job, i) && job->inputs[i].cached && !(seen & shard)) {
-            seen |= shard;
-            dcc_file_cache_prune(job->inputs[i].digest, dcc_job_tmp_top(job));
+        if (dcc_job_shared(job, i) && job->inputs[i].cached) {
+            dcc_file_cache_prune(dcc_job_tmp_top(job));
+            break;
         }
     }
 }
