@@ -1689,8 +1689,6 @@ int dcc_broker_serve(const char *path)
             struct peer *p = &broker->peers[i];
             if (clients && p->full_until > now && p->full_until < wake_at) wake_at = p->full_until;
             if (clients && p->link_until > now && p->link_until < wake_at) wake_at = p->link_until;
-            if (p->stats_fd >= 0 && now >= p->deadline)
-                finish_probe(p, now, 0, broker->cpp_busy);
             stats_index[i] = -1;
             if (p->stats_fd >= 0) {
                 if (p->deadline < wake_at)
@@ -1700,22 +1698,6 @@ int dcc_broker_serve(const char *path)
                 polls[n++] = (struct pollfd){ p->stats_fd,
                     p->stats_reading ? POLLIN : POLLOUT, 0 };
             }
-        }
-        for (i = 0; i < MAX_CLIENTS; i++) {
-            struct client *c = &broker->clients[i];
-            control_index[i] = net_index[i] = -1;
-            if (c->fd < 0)
-                continue;
-            if (c->state == REQUEST && now >= c->deadline) {
-                release_client(broker, c);
-                continue;
-            }
-            if (c->state == CONNECTING && now >= c->deadline)
-                connection_event(broker, c, now, 1);
-            if ((c->state == HELLO_SEND || c->state == HELLO_READ) && now >= c->deadline)
-                hello_event(broker, c, 1);
-            if ((c->state == RESERVE_SEND || c->state == RESERVE_READ) && now >= c->deadline)
-                reserve_event(broker, c, now, 1);
         }
         struct waiting_job waiting[MAX_CLIENTS];
         int count_waiting = 0;
@@ -1732,6 +1714,7 @@ int dcc_broker_serve(const char *path)
                 wake_at = now;
         for (i = 0; i < MAX_CLIENTS; ++i) {
             struct client *c = &broker->clients[i];
+            control_index[i] = net_index[i] = -1;
             if (c->fd < 0)
                 continue;
             if (c->state == WAITING && c->deadline > now && c->deadline < wake_at)
@@ -1757,9 +1740,18 @@ int dcc_broker_serve(const char *path)
             break;
         }
         now = now_seconds();
-        for (i = 0; i < broker->count; i++)
-            if (stats_index[i] >= 0 && polls[stats_index[i]].revents)
-                probe_event(&broker->peers[i], now, broker->cpp_busy);
+        /* A delayed/interrupted poll does not make queued data stale. Service
+         * readiness before expiry, including statistics and connection setup;
+         * otherwise scheduler delay can reset a valid local worker request or
+         * discard an already-arrived capacity reply. */
+        for (i = 0; i < broker->count; i++) {
+            if (stats_index[i] < 0) continue;
+            struct peer *p = &broker->peers[i];
+            if (polls[stats_index[i]].revents)
+                probe_event(p, now, broker->cpp_busy);
+            else if (now >= p->deadline)
+                finish_probe(p, now, 0, broker->cpp_busy);
+        }
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *c = &broker->clients[i];
             if (control_index[i] < 0)
@@ -1898,6 +1890,11 @@ int dcc_broker_serve(const char *path)
                 if (c->state == CONNECTING) connection_event(broker, c, now, 0);
                 else if (c->state == HELLO_SEND || c->state == HELLO_READ) hello_event(broker, c, 0);
                 else if (c->state == RESERVE_SEND || c->state == RESERVE_READ) reserve_event(broker, c, now, 0);
+            } else if (c->fd >= 0 && now >= c->deadline) {
+                if (c->state == REQUEST) release_client(broker, c);
+                else if (c->state == CONNECTING) connection_event(broker, c, now, 1);
+                else if (c->state == HELLO_SEND || c->state == HELLO_READ) hello_event(broker, c, 1);
+                else if (c->state == RESERVE_SEND || c->state == RESERVE_READ) reserve_event(broker, c, now, 1);
             }
         }
         if (polls[0].revents)

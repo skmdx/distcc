@@ -64,18 +64,19 @@ class BrokerTestCase(DistccTestCase):
                     raise
                 time.sleep(.02)
 
-    def start_broker(self, hosts=None, idle=10, name="broker", backoff=60):
+    def start_broker(self, hosts=None, idle=10, name="broker", backoff=60, prefix=()):
         path = self.root / f"{name}.sock"
         env = dict(self.base_env, DISTCC_HOSTS=hosts or self.host(0),
                    DISTCC_DIR=str(self.ddir), DISTCC_BROKER_IDLE=str(idle),
                    DISTCC_BACKOFF_PERIOD=str(backoff))
         log = open(self.work / f"{name}.log", "w+")
         self.addCleanup(log.close)
-        proc = subprocess.Popen([str(self.build / "distccd"), "--broker", str(path)],
+        proc = subprocess.Popen([*prefix, str(self.build / "distccd"), "--broker", str(path)],
                                 env=env, stdout=log, stderr=log)
         def stop():
             if proc.poll() is None:
-                proc.terminate()
+                # strace's --kill-on-exit also terminates the traced broker.
+                (proc.kill if prefix else proc.terminate)()
             proc.wait(timeout=5)
         self.addCleanup(stop)
         deadline = time.monotonic() + 5
@@ -1495,6 +1496,27 @@ class BrokerTest(BrokerTestCase):
         sock.sendall(struct.pack('=II', self.protocol_version, command) + key + b'\0')
         self.addCleanup(sock.close)
         return sock
+
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_queued_worker_request_survives_delayed_interrupted_poll(self):
+        # First poll accepts the connection. Interrupt the second poll while
+        # the request is already queued, then delay the broker beyond its
+        # request deadline. The next turn must consume readiness before expiry.
+        trace = self.work/'delayed-poll.trace'
+        self.start_broker(name='delayed-poll', prefix=['strace', '--kill-on-exit', '-qq', '-o', str(trace),
+            '-e', 'trace=ppoll', '-e', 'inject=ppoll:error=EINTR:delay_exit=4s:when=2'])
+        owner = self.memo(b'delayed-driver', 16)
+        owner.settimeout(6)
+        self.assertEqual(owner.recv(65536), b'\0')
+        self.assertIn('INJECTED', trace.read_text())
+        owner.close()
+        # An actually silent requester still expires; this is not a timeout
+        # extension or removal of the stalled-client bound.
+        idle = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(idle.close)
+        idle.settimeout(5)
+        idle.connect(self.env['DISTCC_BROKER'])
+        self.assertEqual(idle.recv(1), b'')
 
     def test_worker_startups_do_not_exhaust_the_completed_cache(self):
         self.start_broker()
