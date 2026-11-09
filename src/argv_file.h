@@ -1,6 +1,7 @@
 /* Complete compiler command files shared by clients and native helpers. */
 #ifndef DCC_ARGV_FILE_H
 #define DCC_ARGV_FILE_H
+#include <stddef.h>
 
 struct dcc_argv_file {
     char *bytes;
@@ -12,6 +13,7 @@ struct dcc_argv_file {
 int dcc_argv_file_read(int, unsigned, struct dcc_argv_file *);
 void dcc_argv_file_close(struct dcc_argv_file *);
 int dcc_parse_token_int(const char *, const char *, unsigned *);
+int dcc_argv_encode(const char *, const char *, char **, char **, size_t *);
 struct dcc_argv_file_api {
     int (*read)(int, unsigned, struct dcc_argv_file *);
     void (*close)(struct dcc_argv_file *);

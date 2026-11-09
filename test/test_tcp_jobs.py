@@ -4,8 +4,10 @@ import concurrent.futures
 import array
 import ctypes
 import errno
+import fcntl
 import importlib.util
 import itertools
+import json
 import os
 from pathlib import Path
 import re
@@ -502,6 +504,85 @@ class GccFrontendTest(BrokerTestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn('pooled TCP job completed', result.stderr)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
+    def test_planner_captures_exact_driver_request_without_executing_wrapper(self):
+        wrapper, observed = self.work/'capture', self.work/'arguments.json'
+        wrapper.write_text('#!' + sys.executable + '\nimport json, os, sys\nfrom pathlib import Path\n'
+                           f'with open({str(observed)!r}, "w") as f:\n'
+                           ' json.dump([[ ["@", Path(a[1:]).read_text()] if a.startswith("@") else a\n'
+                           '              for a in sys.argv[2:]], dict(os.environ)], f)\n')
+        wrapper.chmod(0o755)
+        response = self.work/'options.rsp'
+        response.write_text('-DVALUE=17 -I"headers with spaces" -isystem system -include forced.h\n')
+        command = [self.cc, '-E', '-x', 'c', '@'+str(response), '-nostdinc',
+                   '-fplugin-arg-distcc_gcc_scan-plan-fd=3',
+                   '-wrapper', str(wrapper)+',--gcc-plan-capture', 'source.c']
+        environment = dict(self.base_env, CPATH='environment headers',
+                           CFLAGS='per invocation flags', _DISTCC_SAFEGUARD='1')
+        subprocess.run(command, cwd=self.work, env=environment, check=True, capture_output=True)
+        expected = json.loads(observed.read_text())
+        wrapper.unlink()  # A real spawn/exec of the wrapper must now fail.
+
+        def group(values):
+            encoded = [os.fsencode(value) for value in values]
+            return f'ARGC{len(encoded):08x}'.encode() + b''.join(
+                f'ARGV{len(value):08x}'.encode()+value for value in encoded)
+        with open(os.devnull, 'r+b') as quiet:
+            control, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            native = subprocess.Popen([self.cc], cwd=self.work,
+                env=dict(environment, LD_PRELOAD=str(self.build/'gcc_plan.so'),
+                         DISTCC_GCC_PLAN_CONTROL=str(child.fileno())),
+                pass_fds=(child.fileno(),), stdin=quiet, stdout=quiet, stderr=quiet)
+            child.close()
+            try:
+                control.settimeout(5)
+                self.assertEqual(control.recv(1), b'R')
+                with os.fdopen(os.memfd_create('driver-command', os.MFD_CLOEXEC), 'w+b') as request:
+                    request.write(group([str(self.work)]) + group(command) +
+                                  group([key+'='+value for key, value in environment.items()]))
+                    request.flush(); request.seek(0)
+                    peer, reply = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                    relay, relay_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                    try:
+                        peer.settimeout(5)
+                        relay.settimeout(5)
+                        fds = array.array('i', [request.fileno(), reply.fileno(),
+                                              quiet.fileno(), quiet.fileno(), quiet.fileno(),
+                                              relay_child.fileno()])
+                        control.sendmsg([struct.pack('=II', ord('D'), 0)],
+                            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])
+                        reply.close(); relay_child.close()
+                        self.assertEqual(relay.recv(1), b'P')
+                        request.seek(0)
+                        actual = []
+                        for _ in range(2):
+                            token = request.read(12)
+                            self.assertEqual(token[:4], b'ARGC')
+                            values = []
+                            for _ in range(int(token[4:], 16)):
+                                token = request.read(12)
+                                self.assertEqual(token[:4], b'ARGV')
+                                values.append(os.fsdecode(request.read(int(token[4:], 16))))
+                            actual.append(values)
+                        self.assertEqual(request.read(), b'')
+                        responses = [Path(arg[1:]) for arg in actual[0] if arg.startswith('@')]
+                        self.assertTrue(responses, 'GCC-generated response file path was not exercised')
+                        self.assertEqual([['@', Path(a[1:]).read_text()] if a.startswith('@') else a
+                                          for a in actual[0]], expected[0])
+                        self.assertEqual(dict(value.split('=', 1) for value in actual[1]), expected[1])
+                        relay.sendall(struct.pack('=I', 0))
+                        status, _, _ = struct.unpack('=QQQ', peer.recv(24))
+                        self.assertEqual(status, 0)
+                        self.assertFalse(any(path.exists() for path in responses),
+                                         'GCC did not reclaim its generated response files')
+                    finally:
+                        peer.close(); reply.close()
+                        relay.close(); relay_child.close()
+            finally:
+                control.close()
+                try: native.wait(timeout=5)
+                finally:
+                    if native.poll() is None: native.kill(); native.wait(timeout=5)
 
     def test_planner_shares_loaded_gcc_and_isolates_fresh_search_paths(self):
         self.start_frontend()
@@ -2440,6 +2521,48 @@ class TcpJobsTest(TcpJobTestCase):
             if identity != 71:
                 self.assertEqual(uploads, 0, 'retry must exercise cached inputs')
 
+    def test_rust_retry_progresses_while_cache_maintenance_is_locked(self):
+        cache = self.work/'cache'
+        self.restart_server(self.build/'distccd', DISTCC_JOB_MEMORY='1048576',
+                            DISTCCD_FILE_CACHE=str(cache))
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        body = b'fn cached_input() {}\n'
+        paths = tuple(f'/src/input-{i}.rs'.encode() for i in range(9))
+        net = self.wire_job(body, paths=paths, identity=81, verification=None, job_kind=3)
+        while True:
+            kind, data = self.frame(net)
+            if kind == 0x54000307:
+                self.assertEqual(data, struct.pack('!Q', 81))
+                break
+            self.assertEqual(kind, 0x54000301)
+            for (index,) in struct.iter_unpack('!I', data): self.upload(net, body, index)
+        digest = xxhash.xxh3_64(body).digest()
+        entry = next(cache.glob('*/'+digest.hex()))
+        with (entry.parent/'.lock').open('r+b') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            # Two RETRY cleanups used to block both async workers in flock;
+            # the third cached transaction then had no worker to serve it.
+            for identity in (82, 83, 84):
+                self.wire_job(body, paths=paths, identity=identity, net=net,
+                              verification=None, job_kind=3)
+                self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', identity)))
+            # A cold shared input must also finish without cache publication.
+            entry.unlink()
+            self.wire_job(body, paths=paths, identity=85, net=net,
+                          verification=None, job_kind=3)
+            kind, data = self.frame(net)
+            self.assertEqual(kind, 0x54000301)
+            for (index,) in struct.iter_unpack('!I', data): self.upload(net, body, index)
+            self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 85)))
+            self.assertFalse(entry.exists())
+        self.wire_job(body, paths=paths, identity=86, net=net,
+                      verification=None, job_kind=3)
+        kind, data = self.frame(net)
+        self.assertEqual(kind, 0x54000301)
+        for (index,) in struct.iter_unpack('!I', data): self.upload(net, body, index)
+        self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 86)))
+        self.assertEqual(entry.read_bytes(), body)
+
     @unittest.skipUnless(shutil.which('strace'), 'strace is required')
     def test_sealed_input_maps_and_sends_raw_tail(self):
         self.start_tcp()
@@ -2903,12 +3026,12 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.job('after-cancel')
 
     def wire_job(self, body, cached=True, paths=(b'/src/source.c',), identity=1, receive_buffer=None,
-                 verification: bytes | None = b'DCSI\0\0\0\0', net=None):
+                 verification: bytes | None = b'DCSI\0\0\0\0', net=None, job_kind=1):
         def string(value):
             return struct.pack('!Q', len(value)) + value
         args = [b'gcc', b'-c', paths[0], b'-o', b'/src/result.o']
         count = len(paths) + (verification is not None)
-        manifest = struct.pack('!Q3Q', identity, 1, len(args), count) + string(b'/src')
+        manifest = struct.pack('!Q3Q', identity, job_kind, len(args), count) + string(b'/src')
         manifest += b''.join(map(string, args))
         for path in paths:
             manifest += (struct.pack('!5Q', 0, 0, cached, len(body), len(body)) +

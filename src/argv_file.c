@@ -2,13 +2,45 @@
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "argv_file.h"
 #include "exitcode.h"
+
+int dcc_argv_encode(const char *argc_token, const char *argv_token, char **argv,
+                    char **data, size_t *length)
+{
+    unsigned argc = 0;
+    size_t size = 12;
+    *data = NULL;
+    *length = 0;
+    if (strlen(argc_token) != 4 || strlen(argv_token) != 4) return EXIT_PROTOCOL_ERROR;
+    while (argv[argc]) {
+        size_t n = strlen(argv[argc]);
+        if (argc == UINT_MAX || n > UINT_MAX || n > SIZE_MAX - 13 || size > SIZE_MAX - 13 - n)
+            return EXIT_PROTOCOL_ERROR;
+        size += 12 + n;
+        ++argc;
+    }
+    char *buffer = malloc(size + 1);
+    if (!buffer) return EXIT_OUT_OF_MEMORY;
+    snprintf(buffer, 13, "%s%08x", argc_token, argc);
+    char *p = buffer + 12;
+    for (unsigned i = 0; i < argc; ++i) {
+        size_t n = strlen(argv[i]);
+        snprintf(p, 13, "%s%08x", argv_token, (unsigned)n);
+        memcpy(p + 12, argv[i], n);
+        p += 12 + n;
+    }
+    *data = buffer;
+    *length = size;
+    return 0;
+}
 
 int dcc_parse_token_int(const char *bytes, const char *expected, unsigned *value)
 {

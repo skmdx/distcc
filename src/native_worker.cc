@@ -27,17 +27,20 @@ template<class Action> struct on_exit {
     on_exit(const on_exit &) = delete;
 };
 // Received descriptors can occupy a closed standard stream. Move those out of
-// the way before installing stdio and the sole request FD inherited by Clang.
-bool child_descriptors(int *fds) {
-    for (unsigned i : {0U, 2U, 3U, 4U}) {
-        if (fds[i] < 3) {
-            fds[i] = fcntl(fds[i], F_DUPFD_CLOEXEC, 3);
+// the way before installing stdio, the command and an optional driver relay.
+bool child_descriptors(int *fds, unsigned count) {
+    int first_unused = count == 6 ? 5 : 4;
+    for (unsigned i = 0; i < count; ++i) {
+        if (i == 1) continue;
+        if (fds[i] < first_unused) {
+            fds[i] = fcntl(fds[i], F_DUPFD_CLOEXEC, first_unused);
             if (fds[i] < 0) return false;
         }
     }
     for (unsigned i = 0; i != 3; ++i)
         if (dup2(fds[i+2], i) < 0) return false;
-    return dup2(fds[0], 3) >= 0 && !close_range(4, ~0U, 0);
+    return dup2(fds[0], 3) >= 0 && (count != 6 || dup3(fds[5], 4, O_CLOEXEC) >= 0) &&
+        !close_range(first_unused, ~0U, 0);
 }
 }
 
@@ -91,7 +94,7 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                     if (signal.ssi_signo != SIGCHLD) return 128+signal.ssi_signo;
             } else if (id == 0) {
                 dcc_native_request request;
-                int fds[5], received = 0;
+                int fds[6], received = 0;
                 alignas(cmsghdr) char ancillary[CMSG_SPACE(sizeof(fds))];
                 iovec bytes{&request, sizeof(request)};
                 msghdr message{};
@@ -105,7 +108,7 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                     unsigned amount = (header->cmsg_len-CMSG_LEN(0))/sizeof(int);
                     auto *descriptors = reinterpret_cast<int *>(CMSG_DATA(header));
                     for (unsigned n = 0; n != amount; ++n) {
-                        if (received < 5) fds[received++] = descriptors[n];
+                        if (received < 6) fds[received++] = descriptors[n];
                         else { close(descriptors[n]); message.msg_flags |= MSG_CTRUNC; }
                     }
                 }
@@ -113,8 +116,10 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                     for (int n = 0; n != received; ++n) if (fds[n] >= 0) close(fds[n]);
                 });
                 if (!length) return 0;
-                if (length != sizeof(request) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) || received != 5 ||
-                    (request.operation != 'C' && request.operation != 'P') || request.group > INT_MAX) return 1;
+                if (length != sizeof(request) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) ||
+                    received != (request.operation == 'D' ? 6 : 5) ||
+                    (request.operation != 'C' && request.operation != 'P' && request.operation != 'D') ||
+                    request.group > INT_MAX) return 1;
                 fflush(nullptr);
                 pid_t parent = getpid(), pid = fork();
                 if (pid < 0) return 1;
@@ -124,8 +129,8 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                     if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() != parent ||
                         setpgid(0, request.group) || sigprocmask(SIG_SETMASK, &previous_mask, nullptr) ||
                         sigaction(SIGINT, &action, nullptr) ||
-                        !child_descriptors(fds)) _exit(1);
-                    int status = execute(3, request.operation == 'P');
+                        !child_descriptors(fds, received)) _exit(1);
+                    int status = execute(3, request.operation != 'C');
                     fflush(nullptr);
                     _exit(status >= 0 ? status : 128-status);
                 }

@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 /* group == 0 creates a private invocation group; otherwise join its owner. */
+/* C/P carry command, completion peer and stdio; D adds a driver relay socket. */
 struct dcc_native_request { uint32_t operation, group; };
 struct dcc_native_result { uint64_t status, peak_bytes, cpu_ns; };
 #ifndef __cplusplus

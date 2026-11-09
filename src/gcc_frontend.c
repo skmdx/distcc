@@ -23,6 +23,7 @@
 #include "broker.h"
 #include "trace.h"
 #include "util.h"
+#include "argv_file.h"
 
 extern char **environ;
 
@@ -59,7 +60,7 @@ static int start_planner(const char *compiler, char **argv, const char *library,
 }
 
 static int run_planner(const char *compiler, char **argv, int output,
-                       const int standard[3], const char *role)
+                       const int standard[3], const char *role, int capture)
 {
     const char *library = getenv("DISTCC_GCC_PLAN_LIBRARY");
     if (!library) library = GCC_PLAN_LIBRARY;
@@ -74,7 +75,7 @@ static int run_planner(const char *compiler, char **argv, int output,
         "DISTCC_LOG", "DISTCC_VERBOSE", NULL
     };
     char key[80], *cwd = NULL;
-    int worker = -1, lease = -1, input = -1, pair[2] = {-1, -1};
+    int worker = -1, lease = -1, input = -1, pair[2] = {-1, -1}, relay[2] = {-1, -1};
     int ret = EXIT_IO_ERROR;
     const char *stage = "worker identity";
     if (dcc_local_worker_key(compiler, library, invocation_environment, key, sizeof(key))) goto out;
@@ -89,19 +90,51 @@ static int run_planner(const char *compiler, char **argv, int output,
     stage = "command preparation";
     if (!(cwd = getcwd(NULL, 0)) ||
         socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) ||
+        (capture && socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, relay)) ||
         (input = dcc_job_memfd("distcc-gcc-command")) < 0) goto out;
     char *directory[] = {cwd, NULL};
     if (dcc_x_argv(input, "ARGC", "ARGV", directory) ||
         dcc_x_argv(input, "ARGC", "ARGV", argv) ||
         dcc_x_argv(input, "ARGC", "ARGV", environ) || lseek(input, 0, SEEK_SET) < 0) goto out;
-    int fds[] = {input, pair[1], standard[0], standard[1], standard[2]};
-    struct dcc_native_request request = {'P', 0};
+    int fds[] = {input, pair[1], standard[0], standard[1], standard[2], relay[1]};
+    struct dcc_native_request request = {capture ? 'D' : 'P', 0};
     stage = "command send";
-    if (dcc_send_fds(worker, &request, sizeof(request), fds, 5)) goto out;
+    if (dcc_send_fds(worker, &request, sizeof(request), fds, capture ? 6 : 5)) goto out;
     close(pair[1]); pair[1] = -1;
+    if (relay[1] >= 0) { close(relay[1]); relay[1] = -1; }
     struct dcc_native_result result;
     ssize_t length;
     stage = "result receive";
+    while (relay[0] >= 0) {
+        struct pollfd p[] = {{pair[0], POLLIN, 0}, {relay[0], POLLIN, 0}};
+        int ready;
+        do { ready = poll(p, 2, -1); } while (ready < 0 && errno == EINTR);
+        if (ready < 0) goto out;
+        if (p[1].revents & POLLIN) {
+            char operation;
+            struct dcc_argv_file invocation = {0};
+            ssize_t received;
+            do { received = recv(relay[0], &operation, 1, MSG_TRUNC); } while (received < 0 && errno == EINTR);
+            /* The driver closes its relay before the worker reaps it and
+             * sends final status. EOF is not a missing planner request. */
+            if (!received) { close(relay[0]); relay[0] = -1; break; }
+            if (received != 1 || operation != 'P' || lseek(input, 0, SEEK_SET) < 0) goto out;
+            int status = dcc_argv_file_read(input, 2, &invocation);
+            if (!status && !invocation.groups[0][0]) status = EXIT_PROTOCOL_ERROR;
+            if (!status) {
+                char **previous_environment = environ;
+                environ = invocation.groups[1];
+                status = run_planner(invocation.groups[0][0], invocation.groups[0],
+                                     input, standard, "planner", 0);
+                environ = previous_environment;
+            }
+            dcc_argv_file_close(&invocation);
+            uint32_t reply = status;
+            if (send(relay[0], &reply, sizeof(reply), MSG_NOSIGNAL) != sizeof(reply)) goto out;
+        }
+        if (p[0].revents) break;
+        if (p[1].revents & (POLLHUP | POLLERR)) { close(relay[0]); relay[0] = -1; }
+    }
     do { length = recv(pair[0], &result, sizeof(result), MSG_TRUNC); } while (length < 0 && errno == EINTR);
     if (length != sizeof(result) || result.status > 65535) goto out;
     ret = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
@@ -128,6 +161,8 @@ out:
     if (input >= 0) close(input);
     if (pair[0] >= 0) close(pair[0]);
     if (pair[1] >= 0) close(pair[1]);
+    if (relay[0] >= 0) close(relay[0]);
+    if (relay[1] >= 0) close(relay[1]);
     free(cwd);
     return ret;
 }
@@ -146,10 +181,10 @@ int dcc_gcc_plan_execute(char **argv)
         output = fd;
     }
     const int standard[] = {0, 1, 2};
-    return output < 0 ? EXIT_IO_ERROR : run_planner(argv[0], argv, output, standard, "planner");
+    return output < 0 ? EXIT_IO_ERROR : run_planner(argv[0], argv, output, standard, "planner", 0);
 }
 
-static int plan_driver(char **argv, int output)
+static int plan_driver(char **argv, int output, int capture)
 {
     char *compiler = NULL;
     if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
@@ -176,6 +211,17 @@ static int plan_driver(char **argv, int output)
         if (!dcc_spawn_child(argv, &child, "/dev/null", "/dev/null", diagnostic_path) &&
             !dcc_collect_child("gcc frontend plan", child, &status, -1, NULL, NULL) && !status) ret = 0;
     } else {
+        if (capture) {
+            /* The preload returns GCC's finalized argv/environment in place
+             * of executing our wrapper. Script drivers still use the actual
+             * wrapper above, and an explicit user wrapper is never replaced. */
+            for (char **arg = argv; *arg; ++arg) if (!strcmp(*arg, "-wrapper")) {
+                char *wrapper;
+                if (asprintf(&wrapper, "%s-capture", arg[1]) < 0) goto out;
+                free(arg[1]); arg[1] = wrapper;
+                break;
+            }
+        }
         int quiet = open("/dev/null", O_RDWR | O_CLOEXEC);
         if (quiet >= 0) {
             const int standard[] = {quiet, quiet, diagnostics};
@@ -191,7 +237,7 @@ static int plan_driver(char **argv, int output)
                      * compiler already names the executable we selected. */
                     char *alias = argv[0];
                     argv[0] = compiler;
-                    ret = run_planner(compiler, argv, output, standard, "driver");
+                    ret = run_planner(compiler, argv, output, standard, "driver", capture);
                     argv[0] = alias;
                 }
                 if (previous ? setenv("_DISTCC_SAFEGUARD", previous, 1) : unsetenv("_DISTCC_SAFEGUARD"))
@@ -243,7 +289,7 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
         dcc_argv_append(command, strdup("-wrapper"));
         dcc_argv_append(command, wrapper);
     }
-    if (plan_driver(command, descriptor) ||
+    if (plan_driver(command, descriptor, !wrapped) ||
         lseek(descriptor, 0, SEEK_SET) < 0 || dcc_r_argv_file(descriptor, 2, groups)) goto done;
     job = calloc(1, sizeof(*job));
     if (!job) goto done;

@@ -260,8 +260,10 @@ void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared,
     shard = cache_shard(hash, key, tmp);
     if (shard < 0) goto done;
     lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
-    /* Publish shared inputs reliably; private cache insertion is best effort. */
-    if (lock < 0 || flock(lock, LOCK_EX | (shared ? 0 : LOCK_NB))) goto done;
+    /* The verified private input already belongs to the job. Cache publication
+     * is optional even for shared inputs: blocking here can occupy every TCP
+     * worker behind maintenance and prevent other jobs from reading the cache. */
+    if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB)) goto done;
     to = openat(shard, key, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (to >= 0) {
         struct stat existing;
@@ -299,7 +301,10 @@ void dcc_file_cache_prune(const unsigned char *hash, const char *tmp)
     int shard = cache_shard(hash, key, tmp), lock;
     if (shard < 0) return;
     lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (lock >= 0 && !flock(lock, LOCK_EX)) make_room(shard, 0, "");
+    /* RETRY cleanup shares the input-I/O workers. Never make retransmission
+     * depend on another cache publisher releasing its maintenance lock. The
+     * next successful publisher/pruner enforces the idle-cache bound. */
+    if (lock >= 0 && !flock(lock, LOCK_EX | LOCK_NB)) make_room(shard, 0, "");
     if (lock >= 0) close(lock);
     close(shard);
 }
