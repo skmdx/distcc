@@ -140,8 +140,8 @@ static void negative_hint_queries()
     require(next.bytes.size() == strlen("/tree")+1+DCC_FS_METADATA,
             "negative lookup became a metadata hint");
 
-    // A removed file remains part of the compiler's footprint. The next job
-    // must refresh its absence in the directory batch if it uses that footprint.
+    // Previously learned hints may outlive a removed file. A failed fresh
+    // lookup must drop them instead of being repeated in subsequent jobs.
     require(!files.status("/tree", entry), "parent status");
     entry->hints.insert("missing");
     reply.resize(DCC_FS_METADATA);
@@ -155,10 +155,9 @@ static void negative_hints()
 {
     published_hints.clear();
     negative_hint_queries();
-    const char snapshot[] = "/tree\0missing\0\0";
-    std::string searched(snapshot, sizeof(snapshot)-1);
+    std::string searched("/tree\0\0", 7);
     require(published_hints == std::vector<std::string>{searched, searched},
-            "searched directory or negative lookup was forgotten");
+            "searched directory was forgotten or absent child metadata was retained");
 }
 
 static void disconnected_mount(const char *root)
