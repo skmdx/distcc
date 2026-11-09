@@ -94,8 +94,6 @@ public:
             if (!entry.searched) continue;
             // Speculative queries do not teach the next job to repeat them.
             // Retain only children the compiler actually requested this time.
-            // An empty footprint still records a searched directory: its fresh
-            // names can answer absent-header lookups without individual RPCs.
             snapshot += path; snapshot += '\0';
             for (const auto &name : entry.observed) { snapshot += name; snapshot += '\0'; }
             snapshot += '\0';
@@ -123,18 +121,25 @@ public:
             query.bytes = path;
             return query.bytes.size() <= DCC_FS_QUERY_MAX-12 ? 0 : (entry.error = ENAMETOOLONG);
         }
-        auto &previous = query.previous = connection.directory_names(path);
-        std::array<char, DCC_FS_METADATA> listing_version{};
-        if (previous.owner) {
-            if (previous.size < DCC_FS_METADATA) return entry.error = EPROTO;
-            memcpy(listing_version.data(), previous.data, DCC_FS_METADATA);
-        }
         if (predicted != predictions.end()) {
             entry.hints = std::move(predicted->second);
             predictions.erase(predicted);
         }
         query.bytes = path; query.bytes += '\0';
-        query.bytes.append(listing_version.data(), DCC_FS_METADATA);
+        if (previous_hints.owner && !entry.hints.empty()) {
+            // An exact source footprint needs fresh child attributes, not a
+            // mapped/decoded directory-name cache. Cold source predictions
+            // still use the full index for their unknown negative lookups.
+            query.operation = DCC_FS_ATTRIBUTES;
+        } else {
+            auto &previous = query.previous = connection.directory_names(path);
+            std::array<char, DCC_FS_METADATA> listing_version{};
+            if (previous.owner) {
+                if (previous.size < DCC_FS_METADATA) return entry.error = EPROTO;
+                memcpy(listing_version.data(), previous.data, DCC_FS_METADATA);
+            }
+            query.bytes.append(listing_version.data(), DCC_FS_METADATA);
+        }
         // Reserve the outer operation and the batch entry's length/operation.
         if (query.bytes.size() > DCC_FS_QUERY_MAX-12) return entry.error = ENAMETOOLONG;
         std::string child = path == "/" ? path : path+'/';
@@ -155,7 +160,8 @@ public:
         const auto &previous = query.previous;
         entry.queried = true;
         entry.error = 0;
-        entry.listing = query.operation == DCC_FS_ATTRIBUTES ? Entry::Deferred : Entry::Unavailable;
+        entry.listing = query.operation == DCC_FS_ATTRIBUTES && query.bytes.size() == path.size()
+            ? Entry::Deferred : Entry::Unavailable;
         if (response.size < DCC_FS_METADATA) return entry.error = EPROTO;
         memcpy(entry.version.data(), response.data, DCC_FS_METADATA);
         if (response.size == DCC_FS_METADATA) return 0;
@@ -327,16 +333,15 @@ public:
                 (parent->second.listing == Entry::Ready || parent->second.listing == Entry::Partial)) {
                 parent->second.searched = true;
                 std::string_view name(path.data()+separator+1, path.size()-separator-1);
+                // The next job can use just this footprint, so retain failed
+                // lookups too and refresh them in its directory batch.
+                parent->second.observed.insert(std::string(name));
                 if (!entry.queried && parent->second.listing == Entry::Ready &&
                     !std::binary_search(parent->second.names.begin(),
                                                         parent->second.names.end(), name)) {
                     entry.queried = true;
                     return entry.error = ENOENT;
                 }
-                // A listed parent already proves absence. Repeated failed
-                // lookups must not turn that into a fresh stat on every job.
-                if (parent->second.listing == Entry::Partial || !entry.queried || entry.error != ENOENT)
-                    parent->second.observed.insert(path.substr(separator+1));
             }
         }
         if (entry.queried) return entry.error;

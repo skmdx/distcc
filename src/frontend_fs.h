@@ -12,12 +12,14 @@
  * add flags/count u32 before their entries. CACHED replies omit unchanged names;
  * child metadata and search permissions are always fresh. Names form a lookup
  * index, not authorization to enumerate a directory: actual readdir uses LIST.
- * PARTIAL returns only hinted child attributes after the directory changes;
+ * PARTIAL returns only hinted child attributes;
  * it does not establish absence of any unreturned name. A query without a
  * previous version requests the complete name index when actually needed.
  * STABLE permits publishing the name snapshot
  * after matching the directory version both before and after the lookup.
  * ATTRIBUTES returns lstat attributes without enumerating directory contents.
+ * An optional NUL and sorted child names request a PARTIAL directory reply,
+ * with fresh attributes for that known footprint and no cached name index.
  * DIRECTORIES contains length-u32/LSTAT-or-ATTRIBUTES-query pairs; its reply contains the
  * corresponding ordinary errno/length/body replies, in request order. */
 #define DCC_FS_METADATA 52

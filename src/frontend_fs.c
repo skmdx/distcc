@@ -139,20 +139,18 @@ static int directory_entry(struct dcc_frontend_reply *reply, int fd, const char 
  * the extra descriptor stat that opendir/fdopendir performs. */
 static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
                      const char **hints, size_t hint_count, const char *previous,
-                     const struct stat *initial)
+                     const struct stat *initial, int footprint)
 {
     DIR *dir = NULL;
     size_t offset = reply->size;
     unsigned char header[8] = {0};
-    uint32_t count = 0, flags = 0;
+    uint32_t count = 0, flags = footprint ? DCC_FS_DIRECTORY_PARTIAL : 0;
     int result = statuses ? append(reply, header, statuses == 2 ? 8 : 4) : 0;
     unsigned char version[DCC_FS_METADATA], observed[DCC_FS_METADATA];
     struct stat snapshot;
-    if (!result && statuses == 2) {
+    if (!result && statuses == 2 && !footprint) {
         encode_metadata(version, initial);
         if (!memcmp(version, previous, sizeof(version))) flags |= DCC_FS_DIRECTORY_CACHED;
-        else if (hint_count && S_ISDIR(dcc_tcp_get32(previous + 32)))
-            flags |= DCC_FS_DIRECTORY_PARTIAL;
     }
     if (flags & (DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_PARTIAL)) {
         /* This is a lookup index, not a readdir result. The caller checked
@@ -201,7 +199,7 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
 
 static int query_metadata(struct dcc_frontend_reply *reply, const char *path, int follow,
                           int contents, const char **hints, size_t hint_count,
-                          const char *previous)
+                          const char *previous, int footprint)
 {
     int flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK | (follow ? 0 : O_NOFOLLOW);
     int fd = -1;
@@ -210,20 +208,20 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
      * Pin the same inode used for child attributes and check effective
      * search permissions (including ACLs). Actual readdir uses LIST and its
      * ordinary read-permission check, even when lookup names are cached. */
-    if (contents && previous && S_ISDIR(dcc_tcp_get32(previous + 32))) {
+    if (contents && (footprint || (previous && S_ISDIR(dcc_tcp_get32(previous + 32))))) {
         fd = open(path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (fd >= 0) {
             if (fstat(fd, &st)) goto failed;
             unsigned char version[DCC_FS_METADATA];
             encode_metadata(version, &st);
-            if (!memcmp(previous, version, sizeof(version)) || hint_count) {
+            if (footprint || !memcmp(previous, version, sizeof(version))) {
                 if (faccessat(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)) {
                     if (errno != EACCES) goto failed;
                     close(fd);
                     return metadata(reply, &st);
                 }
                 if (metadata(reply, &st)) goto failed;
-                return directory(reply, fd, 2, hints, hint_count, previous, &st);
+                return directory(reply, fd, 2, hints, hint_count, previous, &st, footprint);
             }
             close(fd);
         }
@@ -244,7 +242,7 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
         }
     }
     if (metadata(reply, &st)) goto failed;
-    return directory(reply, fd, follow ? 1 : 2, hints, hint_count, previous, &st);
+    return directory(reply, fd, follow ? 1 : 2, hints, hint_count, previous, &st, footprint);
 failed:
     {
         int error = errno;
@@ -294,11 +292,16 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
     const char *names = (const char *)data + 4, *end = (const char *)data + size;
     const char *separator = memchr(names, 0, end - names), **hints = NULL, *version = NULL;
     size_t hint_count = 0;
-    if (operation == DCC_FS_LSTAT) {
-        if (!separator || end - separator - 1 < DCC_FS_METADATA) return -1;
-        version = separator + 1;
+    int footprint = operation == DCC_FS_ATTRIBUTES && separator;
+    if (operation == DCC_FS_LSTAT || footprint) {
+        if (!separator) return -1;
+        const char *begin = separator + 1;
+        if (operation == DCC_FS_LSTAT) {
+            if (end - begin < DCC_FS_METADATA) return -1;
+            version = begin; begin += DCC_FS_METADATA;
+        }
         const char *previous = NULL;
-        for (const char *name = version + DCC_FS_METADATA; name < end;) {
+        for (const char *name = begin; name < end;) {
             const char *zero = memchr(name, 0, end - name);
             if (!zero || zero == name || memchr(name, '/', zero - name) ||
                 !strcmp(name, ".") || !strcmp(name, "..") ||
@@ -308,7 +311,7 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
         if (hint_count) {
             hints = malloc(hint_count * sizeof(*hints));
             if (!hints) return -1;
-            const char *name = version + DCC_FS_METADATA;
+            const char *name = begin;
             for (size_t i = 0; i < hint_count; ++i) { hints[i] = name; name += strlen(name) + 1; }
         }
     } else if (separator) return -1;
@@ -328,8 +331,8 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
                  ? lstat(path, &st) : stat(path, &st)) ? errno : EACCES;
     } else if (operation == DCC_FS_STAT || operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES) {
         if (query_metadata(reply, path, operation == DCC_FS_STAT,
-                           operation == DCC_FS_ATTRIBUTES ? 0 : access & PATH_CONTENTS,
-                           hints, hint_count, version)) error = errno;
+                           operation == DCC_FS_ATTRIBUTES && !footprint ? 0 : access & PATH_CONTENTS,
+                           hints, hint_count, version, footprint)) error = errno;
     } else if (operation == DCC_FS_READ || operation == DCC_FS_STDIN) {
         reply->fd = operation == DCC_FS_STDIN ? fcntl(job->stdin_fd - 1, F_DUPFD_CLOEXEC, 3) :
             open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
@@ -344,7 +347,7 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
         free(resolved);
     } else if (operation == DCC_FS_LIST) {
         int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK);
-        if (fd < 0 || directory(reply, fd, 0, NULL, 0, NULL, NULL)) error = errno;
+        if (fd < 0 || directory(reply, fd, 0, NULL, 0, NULL, NULL, 0)) error = errno;
     } else if (operation == DCC_FS_READLINK) {
         char target[PATH_MAX];
         ssize_t length = readlink(path, target, sizeof(target));
