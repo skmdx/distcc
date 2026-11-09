@@ -86,7 +86,13 @@ reduce client filesystem service cost in remote preprocessing
     are now retained. A separate real-GCC slow-start regression reproduced
     five-second owner/waiter expiry; publication now follows owner lifetime
     and readers use their I/O timeout. That repair does not establish the
-    cause of the original warnings, which have not recurred in later builds.
+    cause of the original warnings. A later clean glibc build with the pooled
+    input cache and relay identity optimizations records one planner worker
+    lookup failure (status 107, ECONNRESET), followed by driver failure and
+    local compilation of sched_getaffinity.c. The build succeeds with matching
+    output, but this IPC failure remains unresolved. Lower sampled client CPU
+    and passing installed-path validation do not establish an error-free or
+    faster full build.
 
 
 recognize arbitrary input suffixes with explicit compiler language
