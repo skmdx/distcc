@@ -64,12 +64,13 @@ static int run_planner(const char *compiler, char **argv, int output,
     const char *library = getenv("DISTCC_GCC_PLAN_LIBRARY");
     if (!library) library = GCC_PLAN_LIBRARY;
     /* This key shares a loaded image, not an argument or preprocessing
-     * result. Build flags are parsed from each request's argv; its complete
-     * environment is also restored before GCC main. Make's exported copies
-     * and distcc's per-request logging do not change the retained image.
+     * result. Build flags and make's invocation/subdirectory metadata arrive
+     * with each request; its complete environment is restored before GCC main.
+     * These exported copies and distcc logging do not change the loaded image.
      * Loader, allocator and sandbox configuration still belong to the key. */
     const char *const invocation_environment[] = {
         "COLLECT_GCC_OPTIONS", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
+        "COLLECT_AS_OPTIONS", "MAKEFLAGS", "MAKELEVEL", "MFLAGS", "subdir",
         "DISTCC_LOG", "DISTCC_VERBOSE", NULL
     };
     char key[80], *cwd = NULL;

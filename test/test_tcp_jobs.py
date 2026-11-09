@@ -526,7 +526,11 @@ class GccFrontendTest(BrokerTestCase):
             # must not create another copy of the same loaded compiler image.
             environment = dict(self.env, CFLAGS=' '.join(command[1:]),
                                CXXFLAGS=' '.join(command[1:]),
-                               CPPFLAGS=command[-1], LDFLAGS=str(directory))
+                               CPPFLAGS=command[-1], LDFLAGS=str(directory),
+                               MAKEFLAGS='BUILD_SUBDIR='+directory.name,
+                               MAKELEVEL=directory.name.removeprefix('job-'),
+                               MFLAGS='-C '+str(directory), subdir=directory.name,
+                               COLLECT_AS_OPTIONS="'--defsym' '"+directory.name+"=1'")
             result = subprocess.run([str(self.build/'distcc'), *command], cwd=directory,
                                     env=environment, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -554,6 +558,42 @@ class GccFrontendTest(BrokerTestCase):
         compile_case((directory, command, (directory/'out.o').read_bytes()))
         self.assertEqual(log.read_text().count('started reusable GCC planner pid='), 1)
         self.assertEqual(log.read_text().count('started reusable GCC driver pid='), 1)
+
+    def test_planner_normalizes_environment_order_but_preserves_startup_settings(self):
+        self.start_frontend()
+        source = self.work/'startup-context.c'
+        source.write_text('#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n'
+                          '__attribute__((constructor)) static void startup(void) {\n'
+                          ' const char *value = getenv("DISTCC_TEST_STARTUP");\n'
+                          ' if (getenv("DISTCC_GCC_PLAN_CONTROL") && value && !strcmp(value, "reject"))\n'
+                          '  _exit(17);\n}\n')
+        library = self.work/'startup-context.so'
+        subprocess.run([self.cc, '-shared', '-fPIC', str(source), '-o', str(library)],
+                       check=True, capture_output=True)
+        self.source.write_text('int answer(void) { return 42; }\n')
+        command = [self.cc, '-c', str(self.source), '-o', 'out.o']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        log = self.work/'startup-context.log'
+        self.env.update(LD_PRELOAD=str(library), DISTCC_TEST_STARTUP='allow', DISTCC_LOG=str(log))
+        self.compile(command)
+        self.env = dict(reversed(list(self.env.items())))
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        trace = log.read_text()
+        self.assertEqual(trace.count('started reusable GCC driver pid='), 1, trace)
+        self.assertEqual(trace.count('started reusable GCC planner pid='), 1, trace)
+        # A library constructor still receives a distinct startup environment.
+        # Reusing the allow-context here would incorrectly compile successfully.
+        self.env['DISTCC_TEST_STARTUP'] = 'reject'
+        (self.work/'out.o').unlink()
+        failed = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(failed.returncode, 0, failed.stderr)
+        self.assertFalse((self.work/'out.o').exists())
+        self.env['DISTCC_TEST_STARTUP'] = 'allow'
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_planner_failure_preserves_compiler_diagnostics(self):
         self.start_frontend()

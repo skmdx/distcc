@@ -27,6 +27,23 @@
 
 extern char **environ;
 
+struct dcc_environment_entry {
+    const char *text;
+    size_t name_length, position;
+};
+
+static int compare_environment(const void *a, const void *b)
+{
+    const struct dcc_environment_entry *x = a, *y = b;
+    size_t length = x->name_length < y->name_length ? x->name_length : y->name_length;
+    int order = memcmp(x->text, y->text, length);
+    if (order) return order;
+    if (x->name_length != y->name_length)
+        return (x->name_length > y->name_length) - (x->name_length < y->name_length);
+    /* Retain the order of duplicate names: getenv observes the first one. */
+    return (x->position > y->position) - (x->position < y->position);
+}
+
 int dcc_local_worker_key(const char *compiler, const char *library,
                          const char *const *omit_environment, char *key, size_t size)
 {
@@ -44,14 +61,29 @@ int dcc_local_worker_key(const char *compiler, const char *library,
     }
     /* Driver aliases of the same executable share libraries. Each request
      * carries its original argv[0], which owns target and C/C++ mode. */
+    size_t capacity = 0, count_environment = 0;
+    while (environ[capacity]) ++capacity;
+    struct dcc_environment_entry *environment = calloc(capacity, sizeof(*environment));
+    if (capacity && !environment) { XXH3_freeState(hash); return -1; }
     for (char **p = environ; *p; ++p) {
         int omit = 0;
         for (const char *const *name = omit_environment; name && *name; ++name) {
             size_t length = strlen(*name);
             if (!strncmp(*p, *name, length) && (*p)[length] == '=') { omit = 1; break; }
         }
-        if (!omit) XXH3_128bits_update(hash, *p, strlen(*p)+1);
+        if (!omit) {
+            environment[count_environment] = (struct dcc_environment_entry){
+                *p, strcspn(*p, "="), count_environment};
+            ++count_environment;
+        }
     }
+    /* Bindings determine startup behavior, not the order a parent exported
+     * unrelated names. Only the identity is sorted; requests stay unchanged. */
+    if (count_environment > 1)
+        qsort(environment, count_environment, sizeof(*environment), compare_environment);
+    for (size_t i = 0; i < count_environment; ++i)
+        XXH3_128bits_update(hash, environment[i].text, strlen(environment[i].text)+1);
+    free(environment);
     gid_t groups[NGROUPS_MAX];
     int count = getgroups(NGROUPS_MAX, groups);
     if (count < 0) { XXH3_freeState(hash); return -1; }
