@@ -84,6 +84,7 @@ extern struct dcc_hostdef *dcc_hostdef_local;
 extern struct dcc_hostdef *dcc_hostdef_local_cpp;
 
 /* hosts.c */
+int dcc_read_localslots_configuration(void);
 int dcc_get_hostlist(struct dcc_hostdef **ret_list,
                      int *ret_nhosts);
 

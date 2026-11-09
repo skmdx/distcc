@@ -113,6 +113,42 @@
 
 const int dcc_default_port = DISTCC_DEFAULT_PORT;
 
+/* Configuration is shared by broker client code linked into both binaries.
+ * Keep it with host parsing, not the client-only scheduling object. */
+int dcc_read_localslots_configuration(void)
+{
+    static const char *const names[] = {"DISTCC_HOSTS", "DISTCC_DIR", "HOME"};
+    static char *saved[3];
+    static int initialized, result;
+    const char *values[3];
+    int changed = !initialized;
+    for (unsigned i = 0; i < 3; ++i) {
+        values[i] = getenv(names[i]);
+        if (!!values[i] != !!saved[i] || (values[i] && saved[i] && strcmp(values[i], saved[i]))) changed = 1;
+    }
+    if (!changed) return result;
+    char *copies[3] = {0};
+    for (unsigned i = 0; i < 3; ++i)
+        if (values[i] && !(copies[i] = strdup(values[i]))) {
+            for (unsigned j = 0; j < 3; ++j) free(copies[j]);
+            return EXIT_OUT_OF_MEMORY;
+        }
+    struct dcc_hostdef *hostlist = NULL;
+    int n_hosts;
+    dcc_hostdef_local->slots_specified = dcc_hostdef_local_cpp->slots_specified = 0;
+    dcc_hostdef_local->n_slots = 4;
+    dcc_hostdef_local_cpp->n_slots = 0;
+    result = dcc_get_hostlist(&hostlist, &n_hosts);
+    while (hostlist) {
+        struct dcc_hostdef *next = hostlist->next;
+        dcc_free_hostdef(hostlist);
+        hostlist = next;
+    }
+    for (unsigned i = 0; i < 3; ++i) { free(saved[i]); saved[i] = copies[i]; }
+    initialized = 1;
+    return result;
+}
+
 /***
  * A simple container which would hold a host -> rand int pair
  ***/
