@@ -26,20 +26,17 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <time.h>
 
 #include <dirent.h>
 
 #include "types.h"
 #include "distcc.h"
-#include "rpc.h"
 #include "trace.h"
 #include "exitcode.h"
 #include "snprintf.h"
@@ -65,49 +62,22 @@
  */
 
 
-/*
- * State files older than this are assumed to be leftovers from
- * compilers that died off.  It's possible for a remote compilation to
- * take a very long time, and combined with the check that the process
- * exists we can allow this to be reasonably large.
- */
-const int dcc_phase_max_age = 60;
-
-
-/**
- * Check if the state file @p fd is too old to be believed -- probably
- * because it was left over from a client that was killed.
- *
- * If so, close @p fd, unlink the file, and return EXIT_GONE.
- *
- * fd is closed on failure.
- **/
-static int dcc_mon_kill_old(int fd,
-                            char *fullpath)
+/* The writer locks before publication and never reacquires an abandoned file.
+ * Unlike PID probes and timeouts, this also works across PID namespaces and
+ * does not discard slow compilations. Readers never wait for the writer. */
+static int dcc_mon_check_owner(int fd, const char *fullpath)
 {
-    struct stat st;
-    time_t now;
-
-    /* Check if the file is old. */
-    if (fstat(fd, &st) == -1) {
-        dcc_close(fd);
-        rs_log_warning("error statting %s: %s", fullpath, strerror(errno));
+    struct flock lock = { .l_type = F_RDLCK, .l_whence = SEEK_SET };
+    if (fcntl(fd, F_GETLK, &lock) < 0) {
+        rs_log_warning("failed to query state owner: %s", strerror(errno));
         return EXIT_IO_ERROR;
     }
-    time(&now);
-
-    /* Time you hear the siren / it's already too late */
-    if (now - st.st_mtime > dcc_phase_max_age) {
-        dcc_close(fd);          /* close first for windoze */
-        rs_trace("unlink %s", fullpath);
-        if (unlink(fullpath) == -1) {
-            rs_log_warning("unlink %s failed: %s", fullpath, strerror(errno));
-            return EXIT_IO_ERROR;
-        }
-        return EXIT_GONE;
+    if (lock.l_type != F_UNLCK) return 0;
+    if (unlink(fullpath) && errno != ENOENT) {
+        rs_log_warning("unlink %s failed: %s", fullpath, strerror(errno));
+        return EXIT_IO_ERROR;
     }
-
-    return 0;
+    return EXIT_GONE;
 }
 
 
@@ -159,29 +129,6 @@ static int dcc_mon_read_state(int fd, char *fullpath,
 
 
 /**
- * Check that the process named by the file still exists; if not,
- * return EXIT_GONE.
- **/
-static int dcc_mon_check_orphans(struct dcc_task_state *monl)
-{
-    /* signal 0 just checks if it exists */
-    if (!kill(monl->cpid, 0)) {
-        return 0;               /* it's here */
-    } else if (errno == EPERM) {
-        /* It's here, but it's not ours.  Assume it's still a real
-         * distcc process. */
-        return 0;
-    } else if (errno == ESRCH) {
-        return EXIT_GONE;       /* no such pid */
-    } else {
-        rs_log_warning("kill %ld, 0 failed: %s", (long) monl->cpid,
-                       strerror(errno));
-        return EXIT_GONE;
-    }
-}
-
-
-/**
  * Read state.  If loaded successfully, store a pointer to the newly
  * allocated structure into *ppl.
  */
@@ -203,15 +150,6 @@ static int dcc_mon_load_state(int fd,
         dcc_task_state_free(tl);
         *ppl = NULL;
         return ret;
-    }
-
-    if (tl->curr_phase != DCC_PHASE_DONE) {
-        ret = dcc_mon_check_orphans(tl);
-        if (ret) {
-            dcc_task_state_free(tl);
-            *ppl = NULL;
-            return ret;
-        }
     }
 
     *ppl = tl;
@@ -280,12 +218,8 @@ static int dcc_mon_do_file(char *dirname, char *filename,
         }
     }
 
-    if ((ret = dcc_mon_kill_old(fd, fullpath))) {
-        /* closes fd on failure */
-        goto out_free;
-    }
-
-    ret = dcc_mon_load_state(fd, fullpath, lp);
+    ret = dcc_mon_check_owner(fd, fullpath);
+    if (!ret) ret = dcc_mon_load_state(fd, fullpath, lp);
 
     dcc_close(fd);
 

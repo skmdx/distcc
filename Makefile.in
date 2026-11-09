@@ -283,6 +283,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_native.py \
 	test/test_offload.py \
 	test/test_protocol.py \
+	test/test_state.py src/h_state.c \
 	test/test_pool.py \
 	test/test_retry.py \
 	test/test_admission.py \
@@ -521,6 +522,7 @@ check_PROGRAMS = \
 	h_strip@EXEEXT@ \
 	h_dotd@EXEEXT@ \
 	h_compile@EXEEXT@ \
+	h_state@EXEEXT@ \
 	h_getline@EXEEXT@
 
 check_include_server_PY = \
@@ -659,6 +661,9 @@ src/gcc_files.o: $(srcdir)/src/gcc_files.cc $(srcdir)/src/remote_files.h $(srcdi
 
 distccmon-text@EXEEXT@: $(mon_obj) src/mon-text.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(mon_obj) src/mon-text.o $(LIBS)
+
+h_state@EXEEXT@: $(mon_obj) src/h_state.o
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(mon_obj) src/h_state.o $(LIBS)
 
 lsdistcc@EXEEXT@: $(lsdistcc_obj)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(lsdistcc_obj) $(LIBS)
@@ -937,7 +942,8 @@ pump-maintainer-check: pump include-server check_programs
 maintainer-check: distcc-maintainer-check include-server-maintainer-check preprocess-check \
 	pump-maintainer-check
 
-adaptive-check: distcc distccd h_hosts h_compile include-server
+adaptive-check: distcc distccd distccmon-text h_hosts h_compile h_state include-server
+	$(PYTHON) "$(srcdir)/test/test_state.py" -v
 	$(PYTHON) "$(srcdir)/test/test_portage_jobs.py" -v
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v
 	$(PYTHON) "$(srcdir)/test/test_broker.py" -v

@@ -24,12 +24,13 @@
 #ifndef _DISTCC_STATE_H
 #define _DISTCC_STATE_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 int dcc_get_state_dir (char **p);
-int dcc_open_state_file (int *p_fd);
 
 
 /* Note that these must be in the order in which they are encountered
