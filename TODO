@@ -2,101 +2,34 @@ TODO list for distcc
 
 --> See also TODO and FIXME comments in source files and doc/todo/
 
-reduce client filesystem service cost in remote preprocessing
+reduce remaining client filesystem service cost in remote preprocessing
 
-    Native GCC/FUSE shares immutable bodies and directory names, refreshes
-    metadata and permissions per job, and reuses loaded planners. Per-source
-    footprints now submit known descendants under current compiler roots in
-    the first bounded batch. External symlink targets retain on-demand client
-    authorization. The eight-level regression falls from nine RPCs to one;
-    256 branches split into four requests. Parent queries now omit attributes
-    supplied by a scheduled child's own query, including across batch splits;
-    each child still checks its current identity and permissions. Five-host
-    installed validation passes. Unused search roots now receive fresh
-    attributes without opening or listing them. Actual child/readdir requests
-    trigger a deferred listing; directories searched only for absent headers
-    remain in the next footprint without retaining absent child metadata.
-    The real-GCC regression verifies 32 unused directories remain unopened,
-    then uses a formerly unused directory after changing the source.
-    Cached names now authorize only lookup: O_PATH pins a fresh directory
-    identity and faccessat checks effective search permission. Actual
-    enumeration requests LIST through the ordinary read-permission path.
-    The metadata regression fails before the change and verifies zero warm
-    directory read opens after it. All 64 frontend checks pass, including
-    read-only/no-search directories and real GCC precompiled-header directory
-    selection with changed permissions. Directory snapshots belong to the
-    open handle; the lookup map no longer duplicates its child-name vector.
-    Native GCC stdin support adds 242 remote jobs to this workload. Startup
-    reservations now match the admitted-client bound: the previous 32-entry
-    cache rejected the 33rd simultaneous owner. A real broker regression with
-    64 pending driver/frontend keys fails before and passes after the fix.
-    All 93 broker checks previously passed, including three root-only
-    identity checks separately. Worker keys now canonicalize environment
-    bindings and omit observed per-invocation make/assembler metadata; each
-    child still receives its complete fresh environment. Real compiler
-    regressions verify reuse and isolation of arbitrary startup settings.
-    All 27 local-Clang checks also pass. Full-build observation confirms 183
-    preparation services become 48 (-73.77%). The ordinary-observation
-    before/warm pair for that change takes 312.579/310.355 seconds; client
-    CPU rises 2.47%. The subsequent GCC directory-index change borrows sorted
-    name views from immutable snapshots instead of constructing full-path
-    entries for every sibling. Only lookups and fresh attributes need child
-    state. Cold/warm, previously unused cached names, added/deleted headers,
-    permissions and PCH regressions pass. A focused 256-job real-RPC pair
-    falls 6.507 to 6.208 seconds; its former tree-walk hotspot disappears
-    below the report cutoff. Its peak child RSS is unchanged.
-    Latest matched full builds take 310.355/303.676 seconds (-2.15%) with
-    805.366/811.015 client CPU seconds (+0.70%) and 6642 remote jobs each.
-    Hashes match; errors, timeouts, disconnects and fallback warnings are
-    zero. Remote CPU falls 7.62%, with changed dispatch counts. The first
-    post-installation build takes 312.546 seconds and 838.915 client CPU
-    seconds, also with matching hashes and zero failures. Retain the
-    verified reduction in directory state and the observed improvements;
-    single pairs and changed allocation do not establish a stable speedup.
-    The matched installed object trace removes 113 directory read opens;
-    mmap falls 327 to 101, munmap 308 to 82 and readlinkat 161 to 48. Effective
-    access checks replace the unnecessary read opens. Sends/polls vary
-    between the two traces, so this is not evidence of fewer RPCs.
-    Most anonymous mappings are small allocations, not cached file
-    bodies. File service, path resolution and teardown still cost client CPU;
-    batching requests alone does not remove them. Warm remote occupancy is
-    4.924 cores. The warm capture assigns 41.32% of sampled CPU to clients;
-    exchange/filesystem service appears in 9.98 of 24.73 client CPU seconds.
-    Planner samples take 13.49 seconds (22.54%). One-second correlation
-    finds 74.78 seconds with no remote work observed, versus 76.46 before.
-    Ready-job idle-slot time falls from 1.278 to 1.126 slot seconds; this
-    counter does not establish client-side readiness or attribution of all
-    unoccupied time.
-    An additional unchanged build records per-process commands and wait
-    states. Its longest gaps contain unpacking, configure checks, syscall
-    generation, archive creation and local links. These are not evidence of
-    pending remote compilation. Detailed process observation itself consumes
-    CPU and is now optional; do not compare its runtime as a speedup result.
-    Occupancy samples do not support a large slow-worker-only
-    tail, but do not identify client readiness or build dependencies.
-    Continue matched complete builds and workload attribution;
-    dispatch counts or small tests do not establish resolution of spare
-    capacity. Do not add overlapping inclusive profile costs.
-    The new reservation regression proves a lookup failure mechanism, not
-    the cause of the single observed warm-build warning. Worker identity
-    failures are now distinguished from IPC lookup failures, and EOF records
-    ECONNRESET rather than stale errno. Two earlier pre-dispatch fallbacks
-    also remain unexplained. The affected
-    variants pass 6400 cold-start replays in the real sandbox, and diagnostics
-    are now retained. A separate real-GCC slow-start regression reproduced
-    five-second owner/waiter expiry; publication now follows owner lifetime
-    and readers use their I/O timeout. That repair does not establish the
-    cause of the original warnings. A later clean glibc build with the pooled
-    input cache and relay identity optimizations records one planner worker
-    lookup failure (status 107, ECONNRESET), followed by driver failure and
-    local compilation of sched_getaffinity.c. The build succeeds with matching
-    output. Broker saturation now preserves the listen backlog, abandoned
-    memo ownership transfers to a live waiter, and worker/memo lookups retry
-    transient disconnections. Local regressions cover these failure paths;
-    deployment and a matched full build still need to confirm the original
-    warning is gone and the combined client-cost reductions improve runtime.
-    Lower sampled client CPU and passing local tests alone do not establish
-    an error-free or faster full build.
+    r227 combines the client overhead and admission changes in 9df3164 and
+    e20547a. All five deployed nodes pass C/C++ and Rust execution checks;
+    the 25 Rust client/worker pairs and all five ThinLTO clients pass.
+    One clean glibc build completes all 6642 jobs remotely with zero worker
+    errors, timeouts, disconnects, planner warnings or local fallbacks.
+    Compiler flags, automatic -j32, ebuild hash and libc.so hash match the
+    retained r220/r223/r226 builds.
+
+    Wall time is 284.251 seconds versus 296.422 / 304.547 / 313.258 seconds
+    for r220 / r223 / r226: reductions of 4.11% / 6.66% / 9.26%.
+    Against r226, client build CPU falls 802.960 to 701.395 seconds (-12.65%).
+    Whole-client average CPU use changes from 2.636 to 2.560 cores; total
+    remote use rises from 4.793 to 5.828 cores (+21.60%). Remote CPU time
+    rises 9.96% with changed placement, so lower wall time is not evidence
+    of less total worker CPU work.
+
+    The matched 30-second profile window records 60.143 to 55.204 CPU
+    seconds (-8.21%). Native planner cost falls 13.020 to 11.469 seconds
+    and GCC driver cost falls 7.388 to 6.816 seconds. The distcc-client role
+    remains the main target: its sampled CPU is effectively unchanged
+    at 28.531 versus 28.633 seconds (51.87% of the latest sampled CPU).
+    Keep the combined improvements; use the retained profile to guide any
+    further client-service changes. A single complete run does not isolate
+    individual patch contributions, establish stable speedup, or prove
+    intermittent IPC failures impossible. The previous warning did not recur;
+    full elimination of waiting and spare capacity remains unverified.
 
 
 recognize arbitrary input suffixes with explicit compiler language
