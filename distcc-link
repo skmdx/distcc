@@ -309,7 +309,6 @@ def prepare_job(command, profile, identity=None):
             target = args[index + 1]
         elif arg.startswith(('--target=', '-target=')):
             target = arg.split('=', 1)[1]
-    identity = identity or compiler_identity(compiler, target)
     if compiler_family(compiler) != profile.get('family', 'gcc'):
         raise LocalOnly('compiler family and sysroot profile differ')
     if compiler_family(compiler) == 'gcc' and any(
@@ -321,10 +320,10 @@ def prepare_job(command, profile, identity=None):
     if compiler_family(compiler) == 'clang':
         invocation, diagnostics = clang_link_command([compiler, *args])
         args = invocation[1:]
-    return (*map_link_job(compiler, args, profile, identity), diagnostics)
+    return (*map_link_job(compiler, args, profile, identity, target=target), diagnostics)
 
 
-def map_link_job(compiler, args, profile, identity, source_root=None):
+def map_link_job(compiler, args, profile, identity=None, source_root=None, *, target=None):
     clang = compiler_family(compiler) == 'clang'
     mapped, inputs, file_names, library_dirs = [], {}, {}, {}
     output = 'a.out'
@@ -427,6 +426,7 @@ def map_link_job(compiler, args, profile, identity, source_root=None):
             raise LocalOnly('unsupported link option: ' + arg)
     if not inputs or output == '-' or len(mapped) > 10000:
         raise LocalOnly('not a supported file-producing object link')
+    identity = identity or compiler_identity(compiler, target)
     job = dict(identity, key=profile['key'], compiler=Path(compiler).name, args=mapped)
     return job, inputs, Path(output)
 

@@ -458,12 +458,15 @@ and can queue at the server. The server's `--jobs` limit applies to both.
 Link requests bypass local preprocessing slots. Admission permits one link
 per server at a time. Linux admission for both compiles and links checks host
 available memory, accessible cgroup memory limits and memory PSI once per second.
-`DISTCC_JOB_MEMORY` sets the estimated memory per job in MiB (default 1024),
-with an additional quarter-job margin. New work waits when PSI is at least 10%
+`DISTCC_JOB_MEMORY` sets the estimated memory per job in MiB, with an additional
+quarter-job margin. Without an explicit setting, workers start at 1024 MiB;
+client local compile and preprocessing slots use 256 MiB plus a 64 MiB margin.
+Short-lived clients do not learn the worker's backend compilation peaks.
+New work waits when PSI is at least 10%
 or available headroom is too small. After a PSI stop, admission resumes below
-5% once memory headroom is sufficient. The same check limits local compile and
-preprocessing slots. Existing work finishes normally; these estimates are not
-hard per-job limits or a common scheduler for unrelated build processes.
+5% once memory headroom is sufficient. Existing work finishes normally; these
+estimates are not hard per-job limits or a common scheduler for unrelated build
+processes.
 
 For an already configured Gentoo fleet, run `./deploy` without arguments.
 The launcher can also be symlinked into `PATH` as `distcc-deploy`.

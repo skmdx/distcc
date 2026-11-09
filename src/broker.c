@@ -1059,6 +1059,16 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         struct prediction forecast;
     } best = {.peer = -1}, ready = {.peer = -1};
     int direct = client->command == TRY_LOCAL;
+    if (direct) {
+        for (i = 0; i < broker->count; ++i)
+            if (broker->peers[i].local && broker->peers[i].host->tcp_jobs) break;
+        if (i == broker->count) {
+            reply.slots = 0;
+            send_reply(client->fd, &reply, -1);
+            release_client(broker, client);
+            return 0;
+        }
+    }
     double cost = direct ? 0 : dcc_work_predict(&broker->model, &client->hint);
     int link = client->command == ACQUIRE_LINK;
     int link_backend = client->hint.kind == DCC_WORK_THINLTO ||

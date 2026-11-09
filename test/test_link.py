@@ -18,6 +18,7 @@ import tempfile
 import tarfile
 import time
 import unittest
+from unittest import mock
 
 from test_broker import BrokerTestCase
 
@@ -29,6 +30,37 @@ class LinkArchiveTest(unittest.TestCase):
         sys.path.insert(0, extension)
         cls.addClassCleanup(sys.path.remove, extension)
         cls.helper = runpy.run_path(str(Path.cwd() / 'distcc-link'))
+
+    def test_identity_is_queried_only_after_link_validation(self):
+        prepare = self.helper['prepare_job']
+        globals_ = prepare.__globals__
+        identity = {'target': 'test-target', 'version': 'test-version'}
+        with tempfile.TemporaryDirectory(prefix='distcc-link-map-') as directory:
+            obj = Path(directory)/'input.o'
+            obj.write_bytes(b'\x7fELF' + bytes(60))
+            profile = {'key': '0' * 64, 'family': 'gcc', 'state': {}}
+            query = mock.Mock(return_value=identity)
+            with mock.patch.dict(globals_, compiler_identity=query):
+                for suffix in ('.os', '.so', '.so.1'):
+                    other = obj.with_suffix(suffix)
+                    other.write_bytes(obj.read_bytes())
+                    with self.assertRaises(self.helper['LocalOnly']):
+                        prepare(['gcc', str(obj), str(other), '-o', 'out'], profile)
+                with self.assertRaises(self.helper['LocalOnly']):
+                    prepare(['gcc', str(obj), '-funsupported-link-option', '-o', 'out'], profile)
+                query.assert_not_called()
+                job, _, output, _ = prepare(['gcc', str(obj), '-o', 'out.so'], profile)
+                self.assertEqual((job['target'], job['version'], output),
+                                 (identity['target'], identity['version'], Path('out.so')))
+                query.assert_called_once_with('gcc', None)
+                query.reset_mock()
+                prepare(['gcc', str(obj)], profile, identity=identity)
+                query.assert_not_called()
+                target = 'aarch64-unknown-linux-gnu'
+                with mock.patch.dict(globals_, clang_link_command=mock.Mock(
+                        return_value=(['ld.lld', str(obj), '-o', 'out'], ''))):
+                    prepare(['clang', '--target=' + target, str(obj)], dict(profile, family='clang'))
+                query.assert_called_once_with('clang', target)
 
     def test_tcp_progress_and_local_artifact_descriptor(self):
         from include_server.distcc_pump_c_extensions import TCP_BEGIN, TCP_PROGRESS, TCP_RESULT_FD
@@ -198,6 +230,7 @@ class LinkTestCase(BrokerTestCase):
 
     def test_local_fallback_acquires_local_slot(self):
         self.env['DISTCC_HOSTS'] += ' --localslots=1'
+        self.env.pop('DISTCC_PAUSE_TIME_MSEC', None)
         locks = Path(self.env['DISTCC_DIR']) / 'lock'
         locks.mkdir(exist_ok=True)
         log, output = self.work / 'fallback.log', self.work / 'fallback'
@@ -218,11 +251,42 @@ class LinkTestCase(BrokerTestCase):
                 _, error = proc.communicate(timeout=15)
                 self.assertEqual(proc.returncode, 0, error)
                 self.assertIn(b'distcc-link: local:', error)
+                self.assertIn('nothing available, sleeping 20ms', log.read_text())
                 subprocess.run([str(output)], check=True, capture_output=True)
             finally:
                 if proc.poll() is None:
                     proc.kill()
                     proc.communicate()
+
+    def test_input_suffixes_bypass_helper_only_for_gcc(self):
+        probe = self.work/'link-probe'
+        probe.mkdir()
+        helper = probe/'distcc-link'
+        helper.write_text('#!/bin/sh\n: > "$DISTCC_LINK_PROBE"\nexit 77\n')
+        helper.chmod(0o755)
+        marker = probe/'called'
+        self.env.update(PATH=str(probe) + os.pathsep + self.link_path,
+                        DISTCC_LINK_PROBE=str(marker))
+        # An output named .so must not disqualify an ordinary object link.
+        result = subprocess.run([str(self.build/'distcc'), self.compiler, '-o', str(self.work/'out.so'),
+                                 str(self.obj)], env=self.env, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 77, result.stderr)
+        self.assertTrue(marker.exists())
+        for suffix in ('.os', '.so', '.so.1'):
+            with self.subTest(suffix=suffix):
+                marker.unlink(missing_ok=True)
+                extra = self.work/('extra' + suffix)
+                subprocess.run([self.compiler, '-x', 'c++', '-fPIC',
+                                '-c' if suffix == '.os' else '-shared', '-', '-o', str(extra)],
+                               input=b'int extra() { return 42; }\n', check=True, capture_output=True, timeout=10)
+                output, result = self.link([str(extra)])
+                if self.sync_compiler == 'gcc':
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(marker.exists())
+                    subprocess.run([str(output)], check=True, capture_output=True, timeout=5)
+                else:
+                    self.assertEqual(result.returncode, 77, result.stderr)
+                    self.assertTrue(marker.exists())
 
     def test_metadata_only_sysroot_change_keeps_remote_link(self):
         snapshot = self.work / 'metadata-snapshot'
@@ -364,7 +428,10 @@ class LinkTest(LinkTestCase):
         self.assertIn('distcc-link: linked on ', result.stderr)
         self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
         calls = trace.read_text()
-        self.assertNotIn('O_TMPFILE', calls)
+        # Anonymous state publication is independent of link input transport.
+        state = str(Path(self.env['DISTCC_DIR'])/'state')
+        anonymous = [call for call in calls.splitlines() if 'O_TMPFILE' in call]
+        self.assertTrue(all('"' + state + '"' in call for call in anonymous), anonymous)
         # tempfile's directory probe and the compiler-query cache remain valid.
         self.assertNotRegex(calls, re.escape(str(spool)) + r'/tmp[\w-]{8}"')
 

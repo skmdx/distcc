@@ -188,6 +188,19 @@ class BrokerTestCase(DistccTestCase):
         return obj.read_bytes()
 
 class BrokerDirectTest(BrokerTestCase):
+    def test_without_local_tcp_worker_declines_and_releases_client(self):
+        # A local legacy worker is not eligible for TRY_LOCAL reservations.
+        self.start_broker(self.host(0) + ' --localslots_cpp=1')
+        for _ in range(16):
+            request = self.request(15)
+            self.assertEqual(self.receive(request), (0, 0, []))
+            self.assertEqual(request.recv(1), b'')
+            request.close()
+        frontend = self.request(12)
+        self.assertEqual(self.receive(frontend), (0, 1, []))
+        frontend.close()
+        self.job(0)
+
     def test_completed_direct_jobs_do_not_become_external_load(self):
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
         def snapshot(running):

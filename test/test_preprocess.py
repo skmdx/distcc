@@ -34,8 +34,16 @@ class PumpTestCase(BrokerTestCase):
         cls.daemon_env = {'DISTCC_CLANG_DRIVER': str(Path.cwd() / 'distcc-clang')}
         cls.daemon_env['PYTHONPATH'] = str(next(Path.cwd().glob('_include_server/lib.*')))
         module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
-        if module:
-            cls.daemon_env['DISTCC_GCC_SCAN_LIBRARY'] = module
+        if not module:
+            compiler = shutil.which('gcc')
+            if not compiler:
+                raise unittest.SkipTest('GCC is required')
+            directory = subprocess.check_output([compiler, '-print-file-name=plugin'], text=True).strip()
+            module = str(Path(directory)/'distcc_gcc_scan.so')
+        if not Path(module).is_file():
+            raise RuntimeError('Build the GCC dependency module before testing: ' + module)
+        cls.gcc_module = module
+        cls.daemon_env['DISTCC_GCC_SCAN_LIBRARY'] = module
         super().setUpClass()
 
     def setUp(self):
@@ -52,10 +60,7 @@ class PumpTestCase(BrokerTestCase):
             self.env['PYTHONUNBUFFERED'] = '1'
         # The isolated broker fixture drops production DISTCC settings. This
         # path selects a build artifact and is required before pump starts.
-        module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
-        if module:
-            self.assertTrue(Path(module).is_file(), 'Build the GCC dependency module first')
-            self.env['DISTCC_GCC_SCAN_LIBRARY'] = module
+        self.env['DISTCC_GCC_SCAN_LIBRARY'] = self.gcc_module
         result = subprocess.run([str(self.build / 'pump'), '--startup'],
                                 cwd=self.work, env=self.env, capture_output=True,
                                 text=True, timeout=15)
@@ -1899,11 +1904,14 @@ class TcpPreprocessTest(PreprocessTest):
         self.compare(args=['-P'])
         self.assertEqual(self.cache_counts()[0], 0)
 
-    def test_uncacheable_input_skips_lookup(self):
+    def test_large_input_is_reused(self):
         self.source.write_text('/*' + random.Random(61).randbytes(3 * 1024 * 1024).hex() + '*/\nint n;\n')
-        for _ in range(2):
-            self.compare(args=['-P'])
-        self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
+        # The cache now shares its total capacity across entries; inputs over
+        # the former 4 MiB shard budget must survive the end of their first job.
+        self.compare(args=['-P'])
+        self.assertGreater(self.cache_counts()[0], 0)
+        self.compare(args=['-P'])
+        self.assertEqual(self.cache_counts()[0], 0)
 
     def test_mixed_uncacheable_and_cached_inputs(self):
         (self.work / 'large.h').write_bytes(b'/*' + b' ' * (5 * 1024 * 1024) + b'*/\n')

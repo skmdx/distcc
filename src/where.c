@@ -126,20 +126,9 @@ int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
 
 static void dcc_lock_pause(int analysis_occupied)
 {
-    /* This could do with some tuning.
-     *
-     * My assumption basically is that polling a little too often is
-     * relatively cheap; sleeping when we should be working is bad.  However,
-     * if we hit this code at all we're overloaded, so sleeping a while is
-     * perhaps OK.
-     *
-     * We don't use exponential backoff, because that would tend to prefer
-     * later arrivals and penalize jobs that have been waiting for a long
-     * time.  This would mean more compiler processes hanging around than is
-     * really necessary, and also by making jobs complete very-out-of-order is
-     * more likely to find Makefile bugs. */
-
-    unsigned pause_time_ms = 1000;
+    /* File locks have no release notification; revisit short local links
+     * promptly. Analyzer admission wakes through inotify instead. */
+    unsigned pause_time_ms = analysis_occupied ? 1000 : 20;
 
     char *pt = getenv("DISTCC_PAUSE_TIME_MSEC");
     if (pt)
@@ -196,7 +185,7 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
 
                 i_cpu_is_usable = 1;
                 if (h->mode == DCC_MODE_LOCAL && i_cpu >=
-                    (analysis ? dcc_resource_analysis_slots(limit) : dcc_resource_slots(limit)))
+                    (analysis ? dcc_resource_analysis_slots(limit) : dcc_resource_local_slots(limit)))
                     continue;
 
                 ret = dcc_lock_host("cpu", h, i_cpu, 0, cpu_lock_fd);
@@ -246,7 +235,7 @@ static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
         int occupied;
         for (;;) {
             int maximum = chosen->slots_specified ? chosen->n_slots : dcc_resource_cpus();
-            int limit = analysis ? 0 : dcc_resource_slots(maximum);
+            int limit = analysis ? 0 : dcc_resource_local_slots(maximum);
             if (!analysis && !limit) {
                 dcc_lock_pause(0);
                 continue;
@@ -255,7 +244,7 @@ static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
             /* The broker can live in a different cgroup. Keep admission
              * against this client's budget, not the small broker service. */
             if (ret || occupied <= (analysis ? dcc_resource_analysis_slots(dcc_resource_cpus()) :
-                                               dcc_resource_slots(maximum))) break;
+                                               dcc_resource_local_slots(maximum))) break;
             dcc_unlock(*cpu_lock_fd);
             *cpu_lock_fd = -1;
             dcc_lock_pause(analysis ? occupied : 0);

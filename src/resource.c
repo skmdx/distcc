@@ -348,6 +348,13 @@ int dcc_resource_slots(int maximum)
     return resource_slots(maximum, dcc_resource_job_bytes(), dcc_resource_spare_bytes(), 1);
 }
 
+int dcc_resource_local_slots(int maximum)
+{
+    const char *setting = getenv("DISTCC_JOB_MEMORY");
+    unsigned long long job = setting && *setting ? configured_job_bytes() : 256ULL * 1024 * 1024;
+    return resource_slots(maximum, job, job / 4, 0);
+}
+
 int dcc_resource_class_slots(int maximum, unsigned memory_class,
                              unsigned long long reserved)
 {

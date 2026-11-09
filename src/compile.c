@@ -731,6 +731,10 @@ static int dcc_link_candidate(char **argv)
     if (!broker || !*broker || ((!profile || !*profile) && !strstr(argv[0], "clang")))
         return 0;
     for (i = 1; argv[i]; i++) {
+        if (!strcmp(argv[i], "-o")) { if (argv[i + 1]) i++; continue; }
+        if (!strstr(argv[0], "clang") && argv[i][0] != '-' &&
+            (str_endswith(".os", argv[i]) || str_endswith(".so", argv[i]) || strstr(argv[i], ".so.")))
+            return 0;
         if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "-S") ||
             !strcmp(argv[i], "-E") || dcc_is_source(argv[i]))
             return 0;
