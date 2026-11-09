@@ -14,6 +14,63 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
+VALIDATION_FILES = ['validate-installed.py', 'deploy.py']
+
+
+def validation_snapshot(pids):
+    """Read only the supplied processes and their descendants, without ptrace."""
+    pending = list(pids)
+    records = {}
+    while pending:
+        pid = pending.pop()
+        if pid in records:
+            continue
+        process = Path('/proc') / str(pid)
+        record = records[pid] = {}
+        for name in ('comm', 'status', 'wchan', 'syscall', 'stack'):
+            try:
+                record[name] = (process/name).read_text().strip()
+            except OSError as error:
+                record[name] = {'error': str(error)}
+        try:
+            record['fds'] = {fd.name: os.readlink(fd) for fd in (process/'fd').iterdir()}
+        except OSError as error:
+            record['fds_error'] = str(error)
+        try:
+            children = set()
+            for task in (process/'task').iterdir():
+                children.update(map(int, (task/'children').read_text().split()))
+            record['children'] = sorted(children)
+            pending.extend(children)
+        except OSError as error:
+            record['children_error'] = str(error)
+    return records
+
+
+def run_observed(args, *, env, timeout, observe=(), input=None, cwd=None,
+                 text: bool = False, check=False) -> subprocess.CompletedProcess:
+    """Keep live process evidence without changing validation failure semantics."""
+    with subprocess.Popen(args, env=env, cwd=cwd, text=text,
+                          stdin=subprocess.PIPE if input is not None else None,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        try:
+            stdout, stderr = process.communicate(input=input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                print('Validation timeout live processes: ' +
+                      json.dumps(validation_snapshot([process.pid, *observe])), file=sys.stderr, flush=True)
+            finally:
+                process.kill()
+                process.communicate()
+            raise
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        result = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+        if check:
+            result.check_returncode()
+        return result
 
 
 def command(args, target=None):
@@ -243,16 +300,16 @@ for line in brokers.splitlines():
 
 def validate(target, work):
     remote = target['temporary'] + '/distcc-deploy-check'
-    transfer([str(ROOT / 'packaging/gentoo/validate-installed.py')], remote, target)
+    transfer([str(ROOT / 'packaging/gentoo'/name) for name in VALIDATION_FILES], remote, target)
     args = ['env', 'TMPDIR=' + target['temporary'],
             'VALIDATE_DISTCC_HOSTS=' + target['validation_hosts'],
             'VALIDATE_DISTCC_COMPILERS=' + json.dumps(target.get('compiler_paths', [])),
-            'python3', remote + '/validate-installed.py']
+            'python3', '-B', remote + '/validate-installed.py']
     with (work / (target['name'] + '-validation.log')).open('w') as log:
         for hosts in dict.fromkeys([target['server_hosts'], target['validation_hosts']]):
             args[2] = 'VALIDATE_DISTCC_HOSTS=' + hosts
             bounded(args, target, 'check', log)
-    run(['sudo', '-n', 'rm', '--', remote + '/validate-installed.py'], target)
+    run(['sudo', '-n', 'rm', '--', *[remote+'/'+name for name in VALIDATION_FILES]], target)
     run(['sudo', '-n', 'rmdir', remote], target)
     print(f"{target['name']}: C/C++ and Rust remote compilation and execution passed", flush=True)
 
@@ -263,7 +320,7 @@ def validate_rust_cluster(targets, work):
 
     try:
         parallel(targets, lambda target: transfer(
-            [str(ROOT / 'packaging/gentoo/validate-installed.py')], path(target), target))
+            [str(ROOT / 'packaging/gentoo'/name) for name in VALIDATION_FILES], path(target), target))
         # Exercise every client against each worker concurrently. Self tests
         # alone miss cross-architecture, access-control and input-budget errors.
         for worker in targets:
@@ -272,7 +329,7 @@ def validate_rust_cluster(targets, work):
                 with (work / ('rust-' + name + '.log')).open('w') as log:
                     bounded(['env', 'TMPDIR=' + client['temporary'],
                              'VALIDATE_DISTCC_HOSTS=' + worker['server_hosts'],
-                             'python3', path(client) + '/validate-installed.py', '--rust-only'],
+                             'python3', '-B', path(client) + '/validate-installed.py', '--rust-only'],
                             client, 'rust-' + worker['name'], log)
                 print(f'Rust {name}: distributed compilation and execution passed', flush=True)
             parallel(targets, validate_client)
@@ -332,13 +389,13 @@ def validate_thinlto_cluster(targets, work):
         directory = client['temporary'] + '/distcc-thinlto-cluster-check'
         script = directory + '/validate-installed.py'
         try:
-            transfer([str(ROOT / 'packaging/gentoo/validate-installed.py')], directory, client)
+            transfer([str(ROOT / 'packaging/gentoo'/name) for name in VALIDATION_FILES], directory, client)
             with (work / ('thinlto-' + client['name'] + '.log')).open('w') as log:
                 bounded(['env', 'TMPDIR=' + client['temporary'], 'VALIDATE_DISTCC_HOSTS=' + hosts,
-                         'python3', script, '--thinlto-only'], client, 'thinlto', log)
+                         'python3', '-B', script, '--thinlto-only'], client, 'thinlto', log)
             print(f"ThinLTO {client['name']}: multiple workers and executable results passed", flush=True)
         finally:
-            run(['sudo', '-n', 'rm', '-f', '--', script], client)
+            run(['sudo', '-n', 'rm', '-f', '--', *[directory+'/'+name for name in VALIDATION_FILES]], client)
             run(['sudo', '-n', 'rmdir', '--', directory], client)
     parallel(targets, validate_client)
 

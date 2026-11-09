@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import sys
 import time
+from deploy import run_observed
 
 REMOTE_TIMEOUT = 180
 
@@ -72,6 +73,8 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         broker.terminate()
         broker.wait(timeout=10)
     resources.callback(stop_broker)
+    def remote(args, **kwargs):
+        return run_observed(args, observe=(broker.pid,), **kwargs)
     deadline = time.monotonic() + 5
     while not Path(env['DISTCC_BROKER']).exists():
         assert broker.poll() is None and time.monotonic() < deadline, 'Validation broker failed to start'
@@ -133,9 +136,9 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                           'int main(void) { return sum(&a,&b,&c,&d,&e,&f,&g,&h) != 36 || '
                           'sizeof(uint64_t) != 8 || COUNTER_HEADER_SEEN != 1 || ABSOLUTE_HEADER_SEEN != 1; }\n')
         obj = root/(compiler+'-remote.o')
-        result = subprocess.run(['pump', 'distcc', compiler, '-I'+str(root), '-O2', '-fPIC',
+        result = remote(['pump', 'distcc', compiler, '-I'+str(root), '-O2', '-fPIC',
                                  '-c', str(source), '-o', str(obj)],
-                                env=env, capture_output=True, timeout=90)
+                                env=env, timeout=90)
         assert result.returncode == 0, (compiler, result.returncode,
             (result.stdout+result.stderr).decode(errors='replace'),
             (root/'client.log').read_text()[-5000:] if (root/'client.log').exists() else '')
@@ -153,9 +156,9 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             frontend_env = dict(env, DISTCC_FRONTEND_REMOTE='1')
             frontend_env.pop('INCLUDE_SERVER_PORT', None)
             obj.unlink()
-            result = subprocess.run(['distcc', compiler, '-I'+str(root), '-O2', '-fPIC',
+            result = remote(['distcc', compiler, '-I'+str(root), '-O2', '-fPIC',
                                      '-c', str(source), '-o', str(obj)],
-                                    env=frontend_env, capture_output=True, timeout=REMOTE_TIMEOUT)
+                                    env=frontend_env, timeout=REMOTE_TIMEOUT)
             assert result.returncode == 0, (compiler, result.stderr.decode(errors='replace'))
             log = (root/'client.log').read_text()[before:]
             assert 'frontend filesystem:' in log and 'pooled TCP job completed' in log, log[-6000:]
@@ -167,10 +170,10 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             subprocess.run([str(exe)], check=True, timeout=5)
             results[compiler]['frontend'] = {'distributed': True, 'linked': True, 'executed': True}
             before = (root/'client.log').stat().st_size
-            result = subprocess.run(['distcc', compiler, '-x', 'c++' if suffix == 'cc' else 'c',
+            result = remote(['distcc', compiler, '-x', 'c++' if suffix == 'cc' else 'c',
                                      '-I'+str(root), '-O2', '-fPIC', '-c', '-', '-o', str(obj)],
                                     input=source.read_bytes(), env=frontend_env,
-                                    capture_output=True, timeout=REMOTE_TIMEOUT)
+                                    timeout=REMOTE_TIMEOUT)
             assert result.returncode == 0, (compiler, result.stderr.decode(errors='replace'))
             log = (root/'client.log').read_text()[before:]
             assert 'frontend filesystem:' in log and 'pooled TCP job completed' in log, log[-6000:]
@@ -191,8 +194,8 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                 output.write('int main(void) { return assembly_values[0]!=42 || '
                              'assembly_values[1]!=7 || assembly_values[2]!=9; }\n')
             before = (root/'client.log').stat().st_size
-            result = subprocess.run(['distcc', compiler, '-c', str(assembly), '-o', str(obj)],
-                                    cwd=root, env=frontend_env, capture_output=True, timeout=REMOTE_TIMEOUT)
+            result = remote(['distcc', compiler, '-c', str(assembly), '-o', str(obj)],
+                                    cwd=root, env=frontend_env, timeout=REMOTE_TIMEOUT)
             assert result.returncode == 0, (compiler, result.stderr.decode(errors='replace'))
             log = (root/'client.log').read_text()[before:]
             assert 'frontend filesystem:' in log and 'pooled TCP job completed' in log, log[-6000:]
@@ -207,11 +210,11 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             before = (root/'client.log').stat().st_size
             compound = root/(compiler+'-compound')
             parent_source = str(root/'stdint.h'/'..'/support.name)
-            result = subprocess.run(['pump', 'distcc', compiler, '-I'+str(root),
+            result = remote(['pump', 'distcc', compiler, '-I'+str(root),
                                      '-isystem', str(system_headers), '-O2', '-fPIC',
                                      source.name, parent_source,
                                      '-o', str(compound)], cwd=root, env=env,
-                                    capture_output=True, timeout=REMOTE_TIMEOUT)
+                                    timeout=REMOTE_TIMEOUT)
             assert result.returncode == 0, (compiler,
                 (result.stdout+result.stderr).decode(errors='replace'))
             log = (root/'client.log').read_text()[before:]
@@ -235,9 +238,9 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             source.write_text('int main(void) { return 0; }\n')
             subprocess.run(['/usr/bin/gcc', '-c', str(source), '-o', str(obj)],
                            check=True, capture_output=True, timeout=30)
-            linked = subprocess.run(['distcc', '/usr/bin/gcc', str(obj), '-o', str(output)],
+            linked = remote(['distcc', '/usr/bin/gcc', str(obj), '-o', str(output)],
                                     env=dict(env, DISTCC_LINK_SYSROOT=profile.stdout.strip()),
-                                    text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+                                    text=True, timeout=REMOTE_TIMEOUT)
             assert linked.returncode == 0, linked.stdout + linked.stderr
             assert 'distcc-link: linked on ' in linked.stderr, linked.stderr
             subprocess.run([output], check=True, timeout=10)
@@ -249,10 +252,10 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             source.write_text('int device_add(int a, int b) { return a + b; }\n')
             obj = root / 'device.o'
             before = (root / 'client.log').stat().st_size
-            result = subprocess.run(['distcc', clang, '--target=amdgcn-amd-amdhsa',
+            result = remote(['distcc', clang, '--target=amdgcn-amd-amdhsa',
                                      '-mcpu=gfx900', '-nogpulib', '-O2', '-x', 'c',
                                      '-c', str(source), '-o', str(obj)],
-                                    env=env, capture_output=True, timeout=REMOTE_TIMEOUT)
+                                    env=env, timeout=REMOTE_TIMEOUT)
             assert result.returncode == 0, result.stderr.decode(errors='replace')
             assert 'pooled TCP job completed' in (root / 'client.log').read_text()[before:]
             header = subprocess.check_output(['readelf', '-h', str(obj)], text=True, env=dict(env, LC_ALL='C'))
@@ -271,22 +274,22 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                                  f'{{ volatile int v=n; return v*{i+1}; }}' for i in range(32))
                 code += '\nint part0(int n) { return ' + '+'.join(f'leaf{i}(n)' for i in range(32)) + '; }'
             source.write_text(code)
-            subprocess.run(['distcc', clang, '-O2', '-flto=thin', '-c', source, '-o', obj],
-                           env=env, check=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+            remote(['distcc', clang, '-O2', '-flto=thin', '-c', source, '-o', obj],
+                           env=env, check=True, timeout=REMOTE_TIMEOUT)
             objects.append(obj)
         source, main = root / 'thin-main.c', root / 'thin-main.o'
         source.write_text('#include <stdio.h>\n' +
                           '\n'.join(f'int part{i}(int);' for i in range(12)) +
                           '\nint main(int n,char **v) { printf("%d\\n", ' +
                           '+'.join(f'part{i}(n*23)' for i in range(12)) + '); }')
-        subprocess.run(['distcc', clang, '-O2', '-flto=thin', '-c', source, '-o', main],
-                       env=env, check=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+        remote(['distcc', clang, '-O2', '-flto=thin', '-c', source, '-o', main],
+                       env=env, check=True, timeout=REMOTE_TIMEOUT)
         executable, reference = root / 'thin-remote', root / 'thin-local'
         command = [clang, '-flto=thin', '-fuse-ld=lld', main, *objects]
         subprocess.run([*command, '-o', reference], check=True, capture_output=True, timeout=30)
         started = time.monotonic()
-        result = subprocess.run(['distcc', *command, '-o', executable], env=env,
-                                text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+        result = remote(['distcc', *command, '-o', executable], env=env,
+                                text=True, timeout=REMOTE_TIMEOUT)
         assert result.returncode == 0, result.stderr
         workers = re.findall(r'^distcc-thinlto: compiled on (.+)$', result.stderr, re.M)
         partitions = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
@@ -316,8 +319,8 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             'args': [clang, '--target=amdgcn-amd-amdhsa', '-nogpulib', '-Wl,--no-undefined'],
             'inputs': []}, 'jobs': jobs}))
         started = time.monotonic()
-        result = subprocess.run(['distcc-offload-link', description], env=env,
-                                text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+        result = remote(['distcc-offload-link', description], env=env,
+                                text=True, timeout=REMOTE_TIMEOUT)
         assert result.returncode == 0, result.stderr
         workers = re.findall(r'^distcc-offload-link: compiled on (.+)$', result.stderr, re.M)
         assert len(workers) == len(jobs), result.stderr
@@ -332,10 +335,10 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         source, obj = root / 'device.hip', root / 'device.o'
         source.write_text('__attribute__((global)) void increment(int *p) { p[0] += 1; }\n')
         started = time.monotonic()
-        result = subprocess.run(['distcc', clang, '--offload-new-driver', '--offload-device-only',
+        result = remote(['distcc', clang, '--offload-new-driver', '--offload-device-only',
                                  '--offload-arch=gfx900', '--offload-arch=gfx1030',
                                  '-nogpuinc', '-nogpulib', '-O2', '-c', source, '-o', obj],
-                                env=env, text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+                                env=env, text=True, timeout=REMOTE_TIMEOUT)
         assert result.returncode == 0, result.stderr
         workers = re.findall(r'^distcc-offload-link: compiled on (.+)$', result.stderr, re.M)
         assert len(workers) == 4, result.stderr
@@ -355,10 +358,10 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         rust_env = dict(env, DISTCC_RUST_INPUT=str(root))
         library = root / 'librust_test.rlib'
         remote_ir, local_ir = root / 'rust-remote.ll', root / 'rust-local.ll'
-        rust = subprocess.run(['distcc', 'rustc', '--crate-name=rust_test', '--crate-type=rlib',
+        rust = remote(['distcc', 'rustc', '--crate-name=rust_test', '--crate-type=rlib',
                                '-Ctarget-cpu=native', '--emit=link=' + str(library) +
                                ',dep-info=' + str(root / 'rust.d') + ',llvm-ir=' + str(remote_ir), str(source)],
-                              env=rust_env, text=True, capture_output=True, timeout=REMOTE_TIMEOUT)
+                            env=rust_env, text=True, timeout=REMOTE_TIMEOUT)
         assert rust.returncode == 0, (rust.stdout + rust.stderr,
             (root/'client.log').read_text()[-6000:] if (root/'client.log').exists() else '')
         assert 'distcc-rust: compiled on ' in rust.stderr, rust.stderr

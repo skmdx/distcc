@@ -1,5 +1,8 @@
 """Release preconditions must fail before deployment can modify a worker."""
 import importlib.util
+import contextlib
+import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,6 +17,54 @@ spec = importlib.util.spec_from_file_location('deploy', Path(__file__).resolve()
 assert spec is not None and spec.loader is not None
 deploy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(deploy)
+
+class TimeoutEvidenceTest(unittest.TestCase):
+    def test_timeout_records_live_waiter_and_preserves_failure(self):
+        log = io.StringIO()
+        command = [sys.executable, '-c',
+                   'import os,time; print(os.getpid(),flush=True); time.sleep(60)']
+        with contextlib.redirect_stderr(log), self.assertRaises(subprocess.TimeoutExpired) as caught:
+            deploy.run_observed(command, env=os.environ, timeout=1, observe=(os.getpid(),))
+        assert caught.exception.stdout is not None
+        pid = int(caught.exception.stdout.strip())
+        records = json.loads(log.getvalue().split(': ', 1)[1])
+        self.assertIn(str(os.getpid()), records)
+        child = records[str(pid)]
+        self.assertIn('State:', child['status'])
+        self.assertIn('S (sleeping)', child['status'])
+        self.assertTrue(child['wchan'])
+        self.assertIn('0', child['fds'])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_success_and_nonzero_exit_keep_output_without_diagnostics(self):
+        for code in (0, 7):
+            with self.subTest(code=code), contextlib.redirect_stderr(io.StringIO()) as log:
+                result = deploy.run_observed([sys.executable, '-c',
+                    f'import sys; print("output"); print("error",file=sys.stderr); sys.exit({code})'],
+                    env=os.environ, timeout=5, text=True)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (code, 'output\n', 'error\n'))
+                self.assertFalse(log.getvalue())
+
+    def test_process_exit_during_observation_is_recorded(self):
+        process = subprocess.Popen([sys.executable, '-c', 'pass'])
+        process.wait(timeout=5)
+        record = deploy.validation_snapshot([process.pid])[process.pid]
+        self.assertIn('error', record['status'])
+
+    def test_binary_stdin_cwd_and_checked_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = deploy.run_observed([sys.executable, '-c',
+                'import os,sys; assert os.getcwd()==os.environ["EXPECTED_CWD"]; '
+                'sys.stdout.buffer.write(sys.stdin.buffer.read())'],
+                env=dict(os.environ, EXPECTED_CWD=directory), cwd=directory,
+                input=b'\0\xffpayload\n', timeout=5, check=True)
+            self.assertEqual(result.stdout, b'\0\xffpayload\n')
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            deploy.run_observed([sys.executable, '-c', 'import sys; sys.exit(9)'],
+                                 env=os.environ, timeout=5, check=True)
+        self.assertEqual(caught.exception.returncode, 9)
 
 
 class TransportTest(unittest.TestCase):
