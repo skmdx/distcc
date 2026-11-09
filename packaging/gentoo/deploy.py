@@ -276,6 +276,9 @@ if COMPILERS:
     commands.write_text('\\n'.join(dict.fromkeys(existing + COMPILERS)) + '\\n')
 p=Path('/etc/systemd/system/distccd.service.d')
 p.mkdir(parents=True,exist_ok=True)
+# Restarts replace workers, not the boot-scoped immutable input cache. A real
+# stop still releases the runtime directory and its RAM through systemd.
+(p/'cache-lifetime.conf').write_text('[Service]\\nRuntimeDirectoryPreserve=restart\\n')
 if AUTO:
     # Apply the finite bound before removing the old setting on a live service.
     # Stopped services get their cgroup and bound through ExecStartPre instead.
