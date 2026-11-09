@@ -245,7 +245,9 @@ static int directory_batch(struct dcc_job *job, const unsigned char *data, size_
         unsigned length = dcc_tcp_get32(data);
         data += 4; size -= 4;
         /* Only metadata queries belong here: no nesting or open file bodies. */
-        if (length < 4 || length > size || dcc_tcp_get32(data) != DCC_FS_LSTAT ||
+        if (length < 4 || length > size) return -1;
+        unsigned operation = dcc_tcp_get32(data);
+        if ((operation != DCC_FS_LSTAT && operation != DCC_FS_ATTRIBUTES) ||
             append_query(job, data, length, reply)) return -1;
         data += length; size -= length;
     }
@@ -288,16 +290,17 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
     struct stat st;
     if (!path || append(reply, header, 8)) goto failed;
     int access = operation == DCC_FS_STDIN ? PATH_CONTENTS : allowed(job, path);
-    int required = operation == DCC_FS_STAT || operation == DCC_FS_LSTAT ||
+    int required = operation == DCC_FS_STAT || operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES ||
         operation == DCC_FS_READLINK || operation == DCC_FS_REALPATH ? PATH_METADATA : PATH_CONTENTS;
     if (!(access & required)) {
         /* Missing include candidates must retain their lookup error so Clang
          * can continue searching. Existing unexported files stay inaccessible. */
-        error = (operation == DCC_FS_LSTAT || operation == DCC_FS_READLINK
+        error = (operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES || operation == DCC_FS_READLINK
                  ? lstat(path, &st) : stat(path, &st)) ? errno : EACCES;
-    } else if (operation == DCC_FS_STAT || operation == DCC_FS_LSTAT) {
+    } else if (operation == DCC_FS_STAT || operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES) {
         if (query_metadata(reply, path, operation == DCC_FS_STAT,
-                           access & PATH_CONTENTS, hints, hint_count, version)) error = errno;
+                           operation == DCC_FS_ATTRIBUTES ? 0 : access & PATH_CONTENTS,
+                           hints, hint_count, version)) error = errno;
     } else if (operation == DCC_FS_READ || operation == DCC_FS_STDIN) {
         reply->fd = operation == DCC_FS_STDIN ? fcntl(job->stdin_fd - 1, F_DUPFD_CLOEXEC, 3) :
             open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);

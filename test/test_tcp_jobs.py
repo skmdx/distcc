@@ -877,6 +877,45 @@ class GccFrontendTest(BrokerTestCase):
         print(f'Warm directory tree RPC counts (1, 8 levels): {counts}')
 
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_warm_prefetch_does_not_list_unused_search_directories(self):
+        self.start_frontend()
+        used = self.work/'used'
+        used.mkdir()
+        (used/'value.h').write_text('#define VALUE 73\n')
+        unused = [self.work/f'unused-{index}' for index in range(32)]
+        for directory in unused:
+            directory.mkdir()
+            (directory/'other.h').write_text('#define OTHER 19\n')
+        self.source.write_text('#include <value.h>\nint value(void) { return VALUE; }\n')
+        command = [self.cc, '-nostdinc', '-Iused', *('-I'+str(p) for p in unused),
+                   '-O2', '-c', 'hello.c', '-o', 'out.o']
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        self.compile(command)
+        trace = self.work/'unused-directories.trace'
+        result = subprocess.run(['strace', '-f', '-yy', '-e',
+                                 'trace=newfstatat,statx,openat', '-o', str(trace),
+                                 str(self.build/'distcc'), *command], cwd=self.work,
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('pooled TCP job completed', result.stderr)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        lines = trace.read_text().splitlines()
+        for directory in unused:
+            accesses = [line for line in lines if f'"{directory}"' in line]
+            self.assertFalse(any('openat(' in line and 'O_DIRECTORY' in line for line in accesses),
+                             'unused directory was still opened for listing')
+            self.assertTrue(any('newfstatat(' in line or 'statx(' in line for line in accesses),
+                            'unused directory identity was not refreshed')
+        # A changed source may use a previously unvisited search directory.
+        # Fresh lookup must work before its footprint can predict that access.
+        self.source.write_text('#include <other.h>\nint value(void) { return OTHER; }\n')
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
     def test_warm_prefetch_reads_directory_metadata_once(self):
         self.start_frontend()
         headers = self.work/'headers'

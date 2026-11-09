@@ -24,15 +24,17 @@ extern "C" {
 namespace {
 using dccfs::number;
 struct Entry {
+    enum Listing { Deferred, Unavailable, Ready } listing = Deferred;
     int error = 0;
     std::array<char, DCC_FS_METADATA> version{};
-    bool queried = false, listed = false;
+    bool queried = false, searched = false;
     std::vector<std::string> children;
     std::set<std::string> hints, observed;
     dccfs::Buffer bytes;
     unsigned mode() const { return number(version.data()+32, 4); }
 };
 struct Query {
+    unsigned operation = DCC_FS_LSTAT;
     std::string path, bytes;
     dccfs::Buffer previous;
 };
@@ -42,6 +44,7 @@ class Files {
     dccfs::Buffer previous_hints;
     std::map<std::string, std::set<std::string>> predictions;
     int hints_error = 0;
+    bool learned = false;
     std::map<std::string, Entry> entries;
     std::map<std::pair<uint64_t, uint64_t>, ino_t> inodes;
     static bool valid_name(std::string_view name) {
@@ -78,16 +81,20 @@ public:
         previous_hints = connection.source_hints(source);
         // A known source retains its own footprint. A new source can bootstrap
         // from a nearby job without overwriting either source's future hints.
-        hints_error = load_hints(previous_hints.owner ? previous_hints : connection.source_hints(scope));
+        auto hints = previous_hints.owner ? previous_hints : connection.source_hints(scope);
+        learned = bool(hints.owner);
+        hints_error = load_hints(hints);
     }
     ~Files() {
         if (hints_error) return;
         std::string snapshot;
         snapshot.reserve(previous_hints.size);
         for (const auto &[path, entry] : entries) {
-            if (!entry.listed || entry.observed.empty()) continue;
+            if (entry.listing != Entry::Ready || !entry.searched) continue;
             // Speculative queries do not teach the next job to repeat them.
             // Retain only children the compiler actually requested this time.
+            // An empty footprint still records a searched directory: its fresh
+            // names can answer absent-header lookups without individual RPCs.
             snapshot += path; snapshot += '\0';
             for (const auto &name : entry.observed) { snapshot += name; snapshot += '\0'; }
             snapshot += '\0';
@@ -104,18 +111,23 @@ public:
         // identity without aliasing equal inode numbers on distinct devices.
         return inodes.try_emplace({device, number}, inodes.size()+1).first->second;
     }
-    int prepare(const std::set<std::string> &scheduled, Query &query) {
+    int prepare(const std::set<std::string> &scheduled, Query &query, bool speculative = false) {
         const auto &path = *scheduled.begin();
         auto &entry = entries[path];
         if (hints_error) return entry.error = hints_error;
         query.path = path;
+        auto predicted = predictions.find(path);
+        if (speculative && learned && predicted == predictions.end()) {
+            query.operation = DCC_FS_ATTRIBUTES;
+            query.bytes = path;
+            return query.bytes.size() <= DCC_FS_QUERY_MAX-12 ? 0 : (entry.error = ENAMETOOLONG);
+        }
         auto &previous = query.previous = connection.directory_names(path);
         std::array<char, DCC_FS_METADATA> listing_version{};
         if (previous.owner) {
             if (previous.size < DCC_FS_METADATA) return entry.error = EPROTO;
             memcpy(listing_version.data(), previous.data, DCC_FS_METADATA);
         }
-        auto predicted = predictions.find(path);
         if (predicted != predictions.end()) {
             entry.hints = std::move(predicted->second);
             predictions.erase(predicted);
@@ -142,6 +154,8 @@ public:
         const auto &previous = query.previous;
         entry.queried = true;
         entry.error = 0;
+        entry.listing = query.operation == DCC_FS_ATTRIBUTES ? Entry::Deferred : Entry::Unavailable;
+        entry.children.clear();
         if (response.size < DCC_FS_METADATA) return entry.error = EPROTO;
         memcpy(entry.version.data(), response.data, DCC_FS_METADATA);
         if (response.size == DCC_FS_METADATA) return 0;
@@ -182,12 +196,12 @@ public:
                     memcpy(child.version.data(), response.data+offset, DCC_FS_METADATA);
                     offset += DCC_FS_METADATA;
                 }
-                child.queried = error || !S_ISDIR(child.mode());
+                child.queried = true;
             }
             if (!reused) entry.children.push_back(std::move(name));
         }
         if (offset != response.size) return entry.error = EPROTO;
-        entry.listed = true;
+        entry.listing = Entry::Ready;
         if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) {
             std::string names;
             for (const auto &name : entry.children) { names += name; names += '\0'; }
@@ -195,7 +209,7 @@ public:
         }
         return 0;
     }
-    int fetch(std::set<std::string> paths) {
+    int fetch(std::set<std::string> paths, bool speculative = false) {
         std::vector<Query> pending;
         std::string payload;
         auto flush = [&]() -> int {
@@ -222,11 +236,12 @@ public:
             // expand the next batch, never every name in a directory.
             for (const auto &query : pending) {
                 const auto &entry = entries[query.path];
-                if (entry.error || !entry.listed) continue;
+                if (entry.error || entry.listing != Entry::Ready) continue;
                 for (const auto &name : entry.hints) {
                     auto path = query.path == "/" ? query.path+name : query.path+'/'+name;
                     auto child = entries.find(path);
-                    if (child != entries.end() && !child->second.queried &&
+                    if (child != entries.end() && child->second.listing == Entry::Deferred &&
+                        predictions.count(path) &&
                         !child->second.error && S_ISDIR(child->second.mode()))
                         paths.insert(std::move(path));
                 }
@@ -240,11 +255,11 @@ public:
                 continue;
             }
             Query query;
-            if (int error = prepare(paths, query)) return error;
+            if (int error = prepare(paths, query, speculative)) return error;
             if (payload.size()+8+query.bytes.size() > DCC_FS_QUERY_MAX-4)
                 if (int error = flush()) return error;
             paths.erase(query.path);
-            uint32_t header[] = {htonl(query.bytes.size()+4), htonl(DCC_FS_LSTAT)};
+            uint32_t header[] = {htonl(query.bytes.size()+4), htonl(query.operation)};
             payload.append(reinterpret_cast<const char *>(header), sizeof(header));
             payload += query.bytes;
             pending.push_back(std::move(query));
@@ -281,16 +296,28 @@ public:
                 }
             }
         }
-        return fetch(std::move(paths));
+        return fetch(std::move(paths), true);
     }
     int status(const std::string &path, Entry *&result) {
+        auto parent = entries.end();
+        size_t separator = path.find_last_of('/');
+        if (path != "/") {
+            parent = entries.find(separator == 0 ? "/" : path.substr(0, separator));
+            auto found = entries.find(path);
+            // Initial attributes already answer stat on an unused search root.
+            // Fetch its names only when an actual child lookup needs them.
+            if ((found == entries.end() || !found->second.queried) && parent != entries.end() &&
+                !parent->second.error && S_ISDIR(parent->second.mode()) &&
+                parent->second.listing == Entry::Deferred) {
+                if (int error = fetch({parent->first})) return error;
+            }
+        }
         auto [found, inserted] = entries.try_emplace(path);
         auto &entry = found->second;
         result = &entry;
         if (path != "/") {
-            auto separator = path.find_last_of('/');
-            auto parent = entries.find(separator == 0 ? "/" : path.substr(0, separator));
-            if (parent != entries.end() && parent->second.listed) {
+            if (parent != entries.end() && parent->second.listing == Entry::Ready) {
+                parent->second.searched = true;
                 if (inserted) {
                     entry.queried = true;
                     return entry.error = ENOENT;
@@ -307,6 +334,14 @@ public:
             entry.error = error;
         }
         return entry.error;
+    }
+    int list(const char *path, Entry *&entry) {
+        if (int error = status(path, entry)) return error;
+        if (!S_ISDIR(entry->mode())) return ENOTDIR;
+        entry->searched = true;
+        if (entry->listing == Entry::Deferred)
+            if (int error = fetch({path})) return error;
+        return entry->listing == Entry::Ready ? 0 : EACCES;
     }
     int open(const char *path, Entry *&entry) {
         if (int error = status(path, entry)) return error;
@@ -377,9 +412,7 @@ int read_link(const char *path, char *buffer, size_t size) { return files().link
 int read_directory(const char *path, void *buffer, fuse_fill_dir_t fill, off_t offset,
                    struct fuse_file_info *, enum fuse_readdir_flags) {
     Entry *entry;
-    if (int error = files().status(path, entry)) return -error;
-    if (!S_ISDIR(entry->mode())) return -ENOTDIR;
-    if (!entry->listed) return -EACCES;
+    if (int error = files().list(path, entry)) return -error;
     if (offset < 0) return -EINVAL;
     for (size_t i = offset; i < entry->children.size()+2; ++i) {
         const char *name = i == 0 ? "." : i == 1 ? ".." : entry->children[i-2].c_str();

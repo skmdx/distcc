@@ -155,8 +155,9 @@ static void negative_hints()
 {
     published_hints.clear();
     negative_hint_queries();
-    require(published_hints == std::vector<std::string>{"", ""},
-            "absent metadata hint was published for the next job");
+    std::string searched("/tree\0\0", 7);
+    require(published_hints == std::vector<std::string>{searched, searched},
+            "searched directory was forgotten or absent child metadata was retained");
 }
 
 static void disconnected_mount(const char *root)

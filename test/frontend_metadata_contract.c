@@ -114,7 +114,12 @@ int main(int argc, char **argv)
     contents(header, "one");
     char *roots[] = {argv[1], NULL};
     struct dcc_job job = {.fs_roots = roots};
-    struct dcc_frontend_reply reply = query(&job, directory_path, DCC_FS_LSTAT, NULL);
+    descriptor_stats = 0;
+    struct dcc_frontend_reply reply = query(&job, directory_path, DCC_FS_ATTRIBUTES, NULL);
+    assert(reply.size == 8 + DCC_FS_METADATA && !descriptor_stats && reply.fd == -1);
+    assert(S_ISDIR(dcc_tcp_get32(reply.data + 40)));
+    dcc_frontend_fs_clear(&reply);
+    reply = query(&job, directory_path, DCC_FS_LSTAT, NULL);
     assert(dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_STABLE);
     assert(header_size(&reply) == 3);
     unsigned char previous[DCC_FS_METADATA];
@@ -169,6 +174,9 @@ int main(int argc, char **argv)
      * execute-only directory, with no cached listing disclosed. */
     assert(geteuid() != 0);
     assert(!chmod(directory_path, 0111));
+    reply = query(&job, directory_path, DCC_FS_ATTRIBUTES, NULL);
+    assert(reply.size == 60 && (dcc_tcp_get32(reply.data + 40) & 0777) == 0111);
+    dcc_frontend_fs_clear(&reply);
     reply = query(&job, directory_path, DCC_FS_LSTAT, previous);
     assert(reply.size == 60 && S_ISDIR(dcc_tcp_get32(reply.data + 40)));
     assert((dcc_tcp_get32(reply.data + 40) & 0777) == 0111);
@@ -181,6 +189,9 @@ int main(int argc, char **argv)
     /* A directory hint is not authority to follow a replacement symlink. */
     assert(!rename(directory_path, saved));
     assert(!symlink(saved, directory_path));
+    reply = query(&job, directory_path, DCC_FS_ATTRIBUTES, NULL);
+    assert(reply.size == 60 && S_ISLNK(dcc_tcp_get32(reply.data + 40)));
+    dcc_frontend_fs_clear(&reply);
     reply = query(&job, directory_path, DCC_FS_LSTAT, previous);
     assert(reply.size == 60 && S_ISLNK(dcc_tcp_get32(reply.data + 40)));
     dcc_frontend_fs_clear(&reply);
