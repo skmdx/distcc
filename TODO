@@ -50,8 +50,11 @@ reduce client filesystem service cost in remote preprocessing
     exchange/filesystem service appears in 9.90 of 24.73 client CPU seconds.
     Planner samples take 14.53 seconds (23.79%). One-second correlation
     finds 74.45 seconds with no remote work observed, essentially unchanged.
-    Configuration, generated headers, dependency files and links coincide
-    with several gaps; timestamps alone do not establish their causes.
+    An additional unchanged build records per-process commands and wait
+    states. Its longest gaps contain unpacking, configure checks, syscall
+    generation, archive creation and local links. These are not evidence of
+    pending remote compilation. Detailed process observation itself consumes
+    CPU and is now optional; do not compare its runtime as a speedup result.
     Occupancy samples do not support a large slow-worker-only
     tail, but do not identify client readiness or build dependencies.
     Continue matched complete builds and workload attribution;
