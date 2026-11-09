@@ -396,6 +396,29 @@ bool mapping(const char *path, const std::string &value) {
     return ok;
 }
 }
+extern "C" int dcc_gcc_files_stdin(int channel, const char *job_root) {
+    int connection_fd = dup(channel);
+    if (connection_fd < 0) return -1;
+    dccfs::Connection connection(connection_fd, dcc_file_cache_records, "", job_root);
+    dccfs::Buffer input;
+    auto error = connection.request(DCC_FS_STDIN, "/", input);
+    if (error) { errno = error.value(); return -1; }
+    if (input.size < DCC_FS_METADATA ||
+        dccfs::number(input.data+24, 8) != input.size-DCC_FS_METADATA) {
+        errno = EPROTO; return -1;
+    }
+    int fd = memfd_create("distcc-stdin", MFD_CLOEXEC);
+    if (fd < 0) return -1;
+    size_t offset = DCC_FS_METADATA;
+    while (offset < input.size) {
+        ssize_t written = write(fd, input.data+offset, input.size-offset);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) { int error = errno; close(fd); errno = error; return -1; }
+        offset += written;
+    }
+    return fd;
+}
+
 extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
                                       const char *identity, const char *job_root,
                                       const char *cwd, const char *input, char *const *directories) {

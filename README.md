@@ -708,6 +708,12 @@ filesystem remain local. GCC workers require libfuse3, `/dev/fuse` and
 permission to create a user and mount namespace. Offload compilation keeps its
 existing input preparation.
 
+GCC source from standard input (`-x c -` or `-x c++ -`) also uses this path.
+The client retains an immutable memfd snapshot, and the worker supplies it as
+the compiler's standard input. Source names, include lookup and dependency
+output retain their native semantics; a local retry reads the same snapshot.
+No named temporary source file is needed.
+
 Builds whose generated sources include files outside the compiler's source and
 include directories can set `DISTCC_FRONTEND_ROOTS` to a colon-separated list
 of additional source/build trees. Relative roots use the compiler's working

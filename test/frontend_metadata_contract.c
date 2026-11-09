@@ -131,6 +131,20 @@ int main(int argc, char **argv)
     }
     if (argc == 3) return 0;
     reuse_reply(&job, header);
+    unsigned char stdin_request[5] = {0, 0, 0, 0, '/'};
+    dcc_tcp_put32(stdin_request, DCC_FS_STDIN);
+    reply = (struct dcc_frontend_reply){.fd = -1};
+    assert(!dcc_frontend_fs_reply(&job, stdin_request, sizeof(stdin_request), &reply));
+    assert(dcc_tcp_get32(reply.data) == EBADF && reply.fd == -1 && !reply.file_size);
+    dcc_frontend_fs_clear(&reply);
+    job.stdin_fd = open(header, O_RDONLY | O_CLOEXEC) + 1;
+    assert(job.stdin_fd);
+    reply = (struct dcc_frontend_reply){.fd = -1};
+    assert(!dcc_frontend_fs_reply(&job, stdin_request, sizeof(stdin_request), &reply));
+    assert(!dcc_tcp_get32(reply.data) && reply.fd >= 0 && reply.fd != job.stdin_fd - 1);
+    close(job.stdin_fd - 1); job.stdin_fd = 0;
+    assert(fcntl(reply.fd, F_GETFD) >= 0);
+    dcc_frontend_fs_clear(&reply);
 
     /* Cached directory names never freeze an existing child's attributes. */
     contents(header, "changed contents");

@@ -241,7 +241,10 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
     *input_file = *output_file = NULL;
 
     for (i = 0; (a = argv[i]); i++) {
-        if (a[0] == '-') {
+        if (!strcmp(a, "-")) {
+            if (*input_file) return EXIT_DISTCC_FAILED;
+            *input_file = a;
+        } else if (a[0] == '-') {
             if (!strcmp(a, "-E")) {
                 seen_opt_e = 1;
             } else if (!strcmp(a, "-MD") || !strcmp(a, "-MMD")) {

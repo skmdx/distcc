@@ -900,6 +900,10 @@ dcc_build_somewhere(char *argv[],
     remote_frontend = !ret && !preprocess_only && !dcc_scan_includes &&
         dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) && getenv("DISTCC_BROKER") &&
         (dcc_cpp_ir(argv, input_fname) || dcc_cpp_gcc(argv, input_fname));
+    /* The native GCC path retains '-' all the way to cc1 and transports its
+     * input independently of pathname lookup. Other paths still inherit stdin. */
+    if (!ret && !strcmp(input_fname, "-") &&
+        (!remote_frontend || !dcc_cpp_gcc(argv, input_fname))) ret = EXIT_LOCAL_CPP;
     /* Assembly may read .include/.incbin after preprocessing. Only the
      * native frontend's filesystem carries those reads to the client. */
     if (!ret && !remote_frontend && dcc_cpp_assembly(argv, input_fname))
@@ -946,6 +950,9 @@ dcc_build_somewhere(char *argv[],
         dcc_unlock(local_cpu_lock_fd);
         local_cpu_lock_fd = -1;
         if (ret) goto fallback;
+        if (!strcmp(input_fname, "-") && dcc_job_capture_stdin(prepared_job)) {
+            ret = EXIT_IO_ERROR; goto unlock_and_clean_up;
+        }
     }
     if (!prepared_job && !preprocess_only && !dcc_scan_includes && dcc_cpp_ir(argv, input_fname))
         unsetenv("INCLUDE_SERVER_PORT");
@@ -1318,11 +1325,16 @@ dcc_build_somewhere(char *argv[],
     {
         struct timespec started, finished;
         uint64_t cpu_ns = 0;
+        char stdin_path[64], *prepared_stdin = NULL;
+        if (prepared_job && prepared_job->stdin_fd) {
+            snprintf(stdin_path, sizeof(stdin_path), "/proc/self/fd/%d", prepared_job->stdin_fd - 1);
+            prepared_stdin = stdin_path;
+        }
         if (direct_lease >= 0) clock_gettime(CLOCK_MONOTONIC, &started);
         if (direct_lease >= 0 && cpp_ready && dcc_cpp_ir(argv, input_fname))
             ret = dcc_compile_local_ir(argv, input_fname, cpp_fname, cpp_fd, &cpu_ns);
         else
-            ret = dcc_compile_local(argv, input_fname, NULL, &cpu_ns);
+            ret = dcc_compile_local(argv, input_fname, prepared_stdin, &cpu_ns);
         if (direct_lease >= 0) {
             clock_gettime(CLOCK_MONOTONIC, &finished);
             dcc_broker_local_done(direct_lease, finished.tv_sec - started.tv_sec +

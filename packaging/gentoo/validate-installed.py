@@ -166,6 +166,18 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                            check=True, timeout=30)
             subprocess.run([str(exe)], check=True, timeout=5)
             results[compiler]['frontend'] = {'distributed': True, 'linked': True, 'executed': True}
+            before = (root/'client.log').stat().st_size
+            result = subprocess.run(['distcc', compiler, '-x', 'c++' if suffix == 'cc' else 'c',
+                                     '-I'+str(root), '-O2', '-fPIC', '-c', '-', '-o', str(obj)],
+                                    input=source.read_bytes(), env=frontend_env,
+                                    capture_output=True, timeout=REMOTE_TIMEOUT)
+            assert result.returncode == 0, (compiler, result.stderr.decode(errors='replace'))
+            log = (root/'client.log').read_text()[before:]
+            assert 'frontend filesystem:' in log and 'pooled TCP job completed' in log, log[-6000:]
+            subprocess.run([compiler_path, str(obj), str(support_obj), '-o', str(exe)],
+                           check=True, timeout=30)
+            subprocess.run([str(exe)], check=True, timeout=5)
+            results[compiler]['frontend_stdin'] = {'distributed': True, 'linked': True, 'executed': True}
             assembly = root/'values.S'
             assembly.write_text('#define VALUE 42\n.data\n.globl assembly_values\n'
                                 'assembly_values:\n.long VALUE\n.include "tail.inc"\n'

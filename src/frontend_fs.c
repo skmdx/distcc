@@ -259,6 +259,7 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
     if (size < 5) return -1;
     unsigned operation = dcc_tcp_get32(data);
     if (((const char *)data)[4] != '/') return -1;
+    if (operation == DCC_FS_STDIN && size != 5) return -1;
     const char *names = (const char *)data + 4, *end = (const char *)data + size;
     const char *separator = memchr(names, 0, end - names), **hints = NULL, *version = NULL;
     size_t hint_count = 0;
@@ -286,7 +287,7 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
     unsigned char header[8] = {0};
     struct stat st;
     if (!path || append(reply, header, 8)) goto failed;
-    int access = allowed(job, path);
+    int access = operation == DCC_FS_STDIN ? PATH_CONTENTS : allowed(job, path);
     int required = operation == DCC_FS_STAT || operation == DCC_FS_LSTAT ||
         operation == DCC_FS_READLINK || operation == DCC_FS_REALPATH ? PATH_METADATA : PATH_CONTENTS;
     if (!(access & required)) {
@@ -297,8 +298,9 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
     } else if (operation == DCC_FS_STAT || operation == DCC_FS_LSTAT) {
         if (query_metadata(reply, path, operation == DCC_FS_STAT,
                            access & PATH_CONTENTS, hints, hint_count, version)) error = errno;
-    } else if (operation == DCC_FS_READ) {
-        reply->fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    } else if (operation == DCC_FS_READ || operation == DCC_FS_STDIN) {
+        reply->fd = operation == DCC_FS_STDIN ? fcntl(job->stdin_fd - 1, F_DUPFD_CLOEXEC, 3) :
+            open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (reply->fd < 0 || fstat(reply->fd, &st)) error = errno;
         else if (!S_ISREG(st.st_mode)) error = EINVAL;
         else if ((uint64_t)st.st_size > DCC_TCP_BYTES - 8 - DCC_FS_METADATA) error = EFBIG;

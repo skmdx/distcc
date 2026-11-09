@@ -265,15 +265,69 @@ class GccFrontendTest(BrokerTestCase):
                         DISTCC_GCC_SCAN_LIBRARY=self.module, DISTCC_SKIP_LOCAL_RETRY='1',
                         INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
 
-    def compile(self, command):
+    def compile(self, command, source=None):
         log = Path(self.env['DISTCC_LOG']) if self.env.get('DISTCC_LOG') else None
         offset = log.stat().st_size if log and log.exists() else 0
         result = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
-                                env=self.env, capture_output=True, text=True, timeout=30)
+                                env=self.env, input=source, capture_output=True, text=True, timeout=30)
         trace = log.read_bytes()[offset:].decode() if log else result.stderr
         self.assertEqual(result.returncode, 0, trace + '\n' + Path(self.logs[0].name).read_text())
         self.assertIn('pooled TCP job completed', trace)
         return result
+
+    def test_native_gcc_stdin_preserves_names_headers_and_dependencies(self):
+        self.start_frontend()
+        (self.work/'value.h').write_text('#define VALUE 42\n')
+        source = ('#include "value.h"\nconst char *name = __FILE__;\n'
+                  'const char *base = __BASE_FILE__;\nint value = VALUE;\n')
+        for language in ('c', 'c++'):
+            for text in ('', source, '/*'+'x'*200000+'*/\n'+source):
+                with self.subTest(language=language, size=len(text)):
+                    command = [self.cc, '-x', language, '-S', '-', '-o', 'out.s',
+                               '-MMD', '-MF', 'out.d']
+                    subprocess.run(command, cwd=self.work, input=text, text=True,
+                                   check=True, capture_output=True)
+                    expected = [(self.work/name).read_bytes() for name in ('out.s', 'out.d')]
+                    for name in ('out.s', 'out.d'): (self.work/name).unlink()
+                    self.compile(command, text)
+                    self.assertEqual((self.work/'out.s').read_bytes(), expected[0])
+                    self.assertEqual((self.work/'out.d').read_bytes().replace(b'\\\n', b'').split(),
+                                     expected[1].replace(b'\\\n', b'').split())
+
+    def test_native_gcc_stdin_survives_remote_failure_and_local_retry(self):
+        self.start_frontend()
+        self.restart_server(self.build/'distccd', DISTCC_GCC_SCAN_LIBRARY='/missing-gcc-module.so')
+        self.env['DISTCC_FALLBACK'] = '1'
+        self.env.pop('DISTCC_SKIP_LOCAL_RETRY')
+        source = 'const char *name = __FILE__;\nint value = 42;\n'
+        command = [self.cc, '-x', 'c', '-c', '-', '-o', 'out.o']
+        subprocess.run(command, cwd=self.work, input=source, text=True,
+                       check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        (self.work/'out.o').unlink()
+        result = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
+                                input=source, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('retrying locally', result.stderr)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
+    def test_native_gcc_stdin_diagnostics_and_regular_file_offset(self):
+        self.start_frontend()
+        command = [self.cc, '-x', 'c', '-c', '-', '-o', 'out.o']
+        self.source.write_text('not part of this input\n#error stdin source diagnostic\n')
+        with self.source.open('rb', buffering=0) as source:
+            source.seek(len('not part of this input\n'))
+            expected = subprocess.run(command, cwd=self.work, stdin=source,
+                                      capture_output=True, text=True)
+            source.seek(len('not part of this input\n'))
+            result = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
+                                    stdin=source, env=self.env, capture_output=True,
+                                    text=True, timeout=30)
+        self.assertEqual(result.returncode, expected.returncode)
+        self.assertIn('pooled TCP job completed', result.stderr)
+        self.assertIn('<stdin>:1:', result.stderr)
+        self.assertIn('stdin source diagnostic', result.stderr)
+        self.assertNotIn('retrying locally', result.stderr)
 
     def test_native_gcc_compiles_without_local_dependency_scan(self):
         self.start_frontend()

@@ -32,6 +32,8 @@ struct dcc_job {
     struct dcc_job_input *inputs;
     /* Client-only authorization roots; never accepted from a remote peer. */
     char **fs_roots;
+    /* Owned stdin snapshot, represented as fd + 1; client-only. */
+    int stdin_fd;
     /* Borrowed worker filesystem IPC, represented as fd + 1. */
     int fs_channel;
     /* Borrowed resident compiler IPC, represented as fd + 1; never serialized. */
@@ -83,6 +85,7 @@ unsigned char *dcc_job_encode_buffer(const struct dcc_job *, size_t *);
 int dcc_job_decode_buffer(const void *, size_t, struct dcc_job **);
 /* Anonymous storage for data which must outlive its producing process. */
 int dcc_job_memfd(const char *name);
+int dcc_job_capture_stdin(struct dcc_job *job);
 struct dcc_buffer;
 /* Server compiler execution consumes an already materialized private tree.
  * Results own open FDs before the worker removes temporary pathnames. */

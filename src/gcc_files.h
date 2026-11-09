@@ -11,6 +11,9 @@ extern "C" {
 void *dcc_gcc_files_start(int channel, const char *mountpoint, const char *identity, const char *job_root,
                          const char *cwd, const char *input, char *const *directories);
 int dcc_gcc_files_stop(void *, uint64_t *cpu_ns, unsigned long long *peak_bytes);
+/* Fetch stdin before starting the filesystem service on the same channel.
+ * Returns an owned memfd for the compiler, or -1 with errno on failure. */
+int dcc_gcc_files_stdin(int channel, const char *job_root);
 #ifdef __cplusplus
 }
 #endif

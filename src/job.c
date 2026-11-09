@@ -31,6 +31,22 @@ int dcc_job_memfd(const char *name)
 {
     return memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
 }
+
+int dcc_job_capture_stdin(struct dcc_job *job)
+{
+    int fd = dcc_job_memfd("distcc-stdin");
+    if (fd < 0) return -1;
+    job->stdin_fd = fd + 1;
+    char bytes[65536];
+    for (;;) {
+        ssize_t size = read(STDIN_FILENO, bytes, sizeof(bytes));
+        if (size < 0 && errno == EINTR) continue;
+        if (size < 0 || (size && dcc_writex(fd, bytes, size))) return -1;
+        if (!size) break;
+    }
+    return fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)
+        ? -1 : 0;
+}
 static void put(struct metadata *m, const void *data, size_t size)
 {
     size_t needed = m->size + size, capacity;
@@ -111,6 +127,7 @@ void dcc_job_free(struct dcc_job *job)
 {
     unsigned i;
     if (!job) return;
+    if (job->stdin_fd) close(job->stdin_fd - 1);
     if (job->argv) for (i = 0; job->argv[i]; ++i) free(job->argv[i]);
     free(job->argv);
     if (job->fs_roots) {

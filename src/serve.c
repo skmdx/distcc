@@ -1094,6 +1094,7 @@ static int dcc_run_job(int in_fd,
     int preprocess_only = 0;
     int stdout_output = 0;
     void *filesystem = NULL;
+    int gcc_stdin = -1;
     char **gcc_defaults = NULL, **job_argv = job ? job->argv : NULL;
 
     gettimeofday(&start, NULL);
@@ -1190,6 +1191,10 @@ static int dcc_run_job(int in_fd,
         char **gcc_directories = job_argv;
         while (*job_argv && **job_argv) ++job_argv;
         if (!*job_argv || !*++job_argv) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
+        if (!strcmp(job->argv[1], "-") &&
+            (gcc_stdin = dcc_gcc_files_stdin(job->fs_channel-1, root)) < 0) {
+            ret = EXIT_IO_ERROR; goto out_cleanup;
+        }
         if (asprintf(&temp_dir, "%s/files", root) < 0) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
         filesystem = dcc_gcc_files_start(job->fs_channel-1, temp_dir, job->argv[2], root,
                                        job->cwd, job->argv[1], gcc_directories);
@@ -1367,8 +1372,10 @@ static int dcc_run_job(int in_fd,
         if (ret) goto out_cleanup;
     }
 
+    char stdin_path[64];
+    snprintf(stdin_path, sizeof(stdin_path), "/proc/self/fd/%d", gcc_stdin);
     if ((compile_ret = dcc_spawn_child(argv, &cc_pid,
-                                       "/dev/null", out_fname, err_fname))
+                                       gcc_stdin >= 0 ? stdin_path : "/dev/null", out_fname, err_fname))
         || (compile_ret = dcc_collect_child("cc", cc_pid, &status, in_fd,
                                           result ? &result->peak_bytes : NULL,
                                           result ? &result->cpu_ns : NULL))) {
@@ -1463,6 +1470,7 @@ report_result:
 
 out_cleanup:
 
+    if (gcc_stdin >= 0) close(gcc_stdin);
     /* Restore the working directory, if needed. */
     if (changed_directory) {
       if (chdir(dcc_daemon_wd) != 0) {
