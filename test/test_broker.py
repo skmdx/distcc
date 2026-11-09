@@ -1488,13 +1488,42 @@ class BrokerTest(BrokerTestCase):
         _, net = self.acquire_reserved(10)
         self.assertEqual(net.getpeername()[1], self.ports[0])
 
-    def memo(self, key):
+    def memo(self, key, command=4):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(2)
         sock.connect(self.env['DISTCC_BROKER'])
-        sock.sendall(struct.pack('=II', self.protocol_version, 4) + key + b'\0')
+        sock.sendall(struct.pack('=II', self.protocol_version, command) + key + b'\0')
         self.addCleanup(sock.close)
         return sock
+
+    def test_worker_startups_do_not_exhaust_the_completed_cache(self):
+        self.start_broker()
+        # Concurrent drivers and frontends can all be starting: pending
+        # publishing leases must not compete for the completed-cache budget.
+        owners = [(f'{role}-{i}'.encode(), self.memo(f'{role}-{i}'.encode(), 16))
+                  for role in ('driver', 'frontend') for i in range(32)]
+        for key, owner in owners:
+            self.assertEqual(owner.recv(65536), b'\0', key)
+        worker, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(worker.close)
+        self.addCleanup(peer.close)
+        for key, owner in owners:
+            waiter = self.memo(key, 16)
+            owner.sendmsg([struct.pack('=II', self.protocol_version, 17)],
+                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                            array.array('i', [worker.fileno()]))])
+            owner.close()
+            data, ancillary, _, _ = waiter.recvmsg(2, socket.CMSG_SPACE(4))
+            self.assertEqual(data, b'W\0', key)
+            rights = array.array('i')
+            for level, kind, payload in ancillary:
+                self.assertEqual((level, kind), (socket.SOL_SOCKET, socket.SCM_RIGHTS))
+                rights.frombytes(payload)
+            self.assertEqual(len(rights), 1)
+            with socket.socket(fileno=rights[0]) as returned:
+                returned.sendall(key)
+                self.assertEqual(peer.recv(128), key)
+            waiter.close()
 
     def test_memo_coalesces_and_recovers_owner_exit(self):
         self.start_broker()

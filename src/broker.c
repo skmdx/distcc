@@ -39,7 +39,10 @@
  * Only an explicit RETURN with a descriptor can populate the idle pool. */
 #define MAX_HOSTS 128
 #define MAX_CLIENTS 256
-#define MAX_MEMOS 32
+/* Each unpublished entry owns one live client lease. Matching the client
+ * bound guarantees an admitted requester can reserve an entry; completed
+ * entries can be evicted without interrupting users of their descriptors. */
+#define MAX_MEMOS MAX_CLIENTS
 struct peer {
     struct dcc_hostdef *host;
     struct sockaddr_storage address;
@@ -99,7 +102,7 @@ static int memo_get(const char *key, char **value, int *worker)
     struct msghdr msg = { .msg_iov = parts, .msg_iovlen = 2 };
     struct timeval timeout = { dcc_get_io_timeout(), 0 };
     char *buffer;
-    int fd;
+    int fd, error;
     ssize_t size;
     if (value) *value = NULL;
     if (worker) *worker = -1;
@@ -120,6 +123,7 @@ static int memo_get(const char *key, char **value, int *worker)
             free(buffer); close(fd); return -1;
         }
         close(received);
+        errno = EPROTO;
         goto failed;
     }
     if (size == 1 && !buffer[0]) { free(buffer); return fd; }
@@ -129,9 +133,12 @@ static int memo_get(const char *key, char **value, int *worker)
         close(fd);
         return -1;
     }
+    if (size >= 0) errno = size ? EPROTO : ECONNRESET;
 failed:
+    error = errno;
     free(buffer);
     close(fd);
+    errno = error;
     return -1;
 }
 

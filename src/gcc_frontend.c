@@ -75,8 +75,9 @@ static int run_planner(const char *compiler, char **argv, int output,
     char key[80], *cwd = NULL;
     int worker = -1, lease = -1, input = -1, pair[2] = {-1, -1};
     int ret = EXIT_IO_ERROR;
-    const char *stage = "worker lookup";
+    const char *stage = "worker identity";
     if (dcc_local_worker_key(compiler, library, invocation_environment, key, sizeof(key))) goto out;
+    stage = "worker lookup";
     lease = dcc_broker_worker_get(key, &worker);
     if (worker < 0 && lease >= 0) {
         stage = "worker startup";
