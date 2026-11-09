@@ -342,8 +342,7 @@ def validate_rust_cluster(targets, work):
 
 def distribute_rust_compilers(targets, work):
     """Keep selected native toolchains available to peers without changing PATH."""
-    inventory = []
-    for target in targets:
+    def inspect(target):
         info = json.loads(run(['python3', '-c', '''import hashlib, json, pathlib, shutil, subprocess
 compiler = pathlib.Path(shutil.which('rustc')).resolve()
 root = compiler.parent.parent
@@ -359,11 +358,28 @@ for path in files:
             digest.update(hashlib.file_digest(stream, 'sha256').digest())
 print(json.dumps(dict(root=str(root), host=host, digest=digest.hexdigest())))
 '''], target))
-        inventory.append((target, info))
+        return target, info
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets) or 1) as pool:
+        inventory = list(pool.map(inspect, targets))
     for identity in dict.fromkeys(info['digest'] for _, info in inventory):
         source, info = next(item for item in inventory if item[1]['digest'] == identity)
         peers = [target for target, other in inventory
                  if other['host'] == info['host'] and other['digest'] != identity]
+        if not peers:
+            continue
+        destination = '/opt/rust-distcc-' + identity
+        def needs_install(target):
+            return not json.loads(run(['python3', '-c', '''import json, pathlib, subprocess, sys
+compiler = pathlib.Path(sys.argv[1]) / 'bin/rustc'
+try:
+    ready = compiler.is_file() and subprocess.run([compiler, '-vV'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+except OSError:
+    ready = False
+print(json.dumps(ready))
+''', destination], target))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as pool:
+            peers = [target for target, missing in zip(peers, pool.map(needs_install, peers)) if missing]
         if not peers:
             continue
         stage = work / ('rust-' + identity)
@@ -375,7 +391,6 @@ print(json.dumps(dict(root=str(root), host=host, digest=digest.hexdigest())))
         # come from the administrator's installed toolchain, never a job upload.
         run(['rsync', '-rlpt', '--exclude=/share', origin, str(stage) + '/'])
         def install_peer(target):
-            destination = '/opt/rust-distcc-' + identity
             run(['sudo', '-n', 'mkdir', '-p', destination], target)
             remote = (target['ssh'] + ':' if target.get('ssh') else '') + destination + '/'
             prefix = ['rsync', '--rsync-path=sudo -n rsync'] if target.get('ssh') else ['sudo', '-n', 'rsync']

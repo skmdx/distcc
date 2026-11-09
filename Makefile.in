@@ -618,7 +618,7 @@ gcc_plan.so: $(srcdir)/src/gcc_plan.cc $(srcdir)/src/native_worker.cc $(srcdir)/
 
 CLIENT_CONTRACT_SOURCES = src/hosts.c src/hostfile.c src/loadfile.c src/lock.c src/io.c src/tempfile.c \
 	src/trace.c src/util.c src/argutil.c src/rpc.c src/filename.c src/snprintf.c src/cleanup.c
-h_client_hotpaths: test/client_hotpaths.c src/local_clang.c src/frontend_fs.c src/where.c src/where.h $(CLIENT_CONTRACT_SOURCES)
+h_client_hotpaths: test/client_hotpaths.c src/local_clang.c src/frontend_fs.c src/frontend_identity.h src/where.c src/where.h $(CLIENT_CONTRACT_SOURCES)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/local_clang.c src/where.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
 h_file_cache: test/file_cache.c src/file_cache.c src/file_cache.h $(CLIENT_CONTRACT_SOURCES)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< $(CLIENT_CONTRACT_SOURCES) $(LIBS)

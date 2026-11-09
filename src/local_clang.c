@@ -45,6 +45,15 @@ static int compare_environment(const void *a, const void *b)
     return (x->position > y->position) - (x->position < y->position);
 }
 
+static int omitted_environment(const char *binding, const char *const *names)
+{
+    for (; names && *names; ++names) {
+        size_t length = strlen(*names);
+        if (!strncmp(binding, *names, length) && binding[length] == '=') return 1;
+    }
+    return 0;
+}
+
 int dcc_local_worker_key(const char *compiler, const char *library,
                          const char *const *omit_environment, char *key, size_t size)
 {
@@ -55,13 +64,14 @@ int dcc_local_worker_key(const char *compiler, const char *library,
         int context_ready, environment_ready;
         XXH128_hash_t context, environment;
         XXH64_hash_t environment_stamp;
-        char **environment_pointer;
         const char *const *omitted;
-        struct { char *path; struct stat info; } files[2];
+        unsigned next_file;
+        struct { char *path; struct stat info; } files[8];
     } cached;
     pid_t pid = getpid();
     if (cached.pid != pid) {
-        for (unsigned i = 0; i < 2; ++i) { free(cached.files[i].path); cached.files[i].path = NULL; }
+        for (unsigned i = 0; i < 8; ++i) { free(cached.files[i].path); cached.files[i].path = NULL; }
+        cached.next_file = 0;
         cached.pid = pid;
         cached.context_ready = cached.environment_ready = 0;
     }
@@ -94,16 +104,19 @@ int dcc_local_worker_key(const char *compiler, const char *library,
     const char *paths[] = {compiler, library};
     for (unsigned i = 0; i < 2; ++i) {
         if (!paths[i]) continue;
-        if (!cached.files[i].path || strcmp(cached.files[i].path, paths[i])) {
+        unsigned slot = 0;
+        while (slot < 8 && (!cached.files[slot].path || strcmp(cached.files[slot].path, paths[i]))) ++slot;
+        if (slot == 8) {
             struct stat info;
             if (stat(paths[i], &info)) return -1;
             char *path = strdup(paths[i]);
             if (!path) return -1;
-            free(cached.files[i].path);
-            cached.files[i].path = path;
-            cached.files[i].info = info;
+            slot = cached.next_file++ % 8;
+            free(cached.files[slot].path);
+            cached.files[slot].path = path;
+            cached.files[slot].info = info;
         }
-        const struct stat *info = &cached.files[i].info;
+        const struct stat *info = &cached.files[slot].info;
         XXH3_128bits_update(hash, &info->st_dev, sizeof(info->st_dev));
         XXH3_128bits_update(hash, &info->st_ino, sizeof(info->st_ino));
         XXH3_128bits_update(hash, &info->st_ctim, sizeof(info->st_ctim));
@@ -113,25 +126,21 @@ int dcc_local_worker_key(const char *compiler, const char *library,
     size_t capacity = 0, count_environment = 0;
     XXH3_64bits_reset(&environment_state);
     while (environ[capacity]) {
-        XXH3_64bits_update(&environment_state, environ[capacity], strlen(environ[capacity]) + 1);
+        if (!omitted_environment(environ[capacity], omit_environment))
+            XXH3_64bits_update(&environment_state, environ[capacity], strlen(environ[capacity]) + 1);
         ++capacity;
     }
     for (const char *const *name = omit_environment; name && *name; ++name)
         XXH3_64bits_update(&environment_state, *name, strlen(*name) + 1);
     XXH64_hash_t stamp = XXH3_64bits_digest(&environment_state);
-    /* Pointer replacement covers the driver relay; the stamp also catches
-     * setenv/putenv changes that keep the same environ allocation. */
-    if (cached.environment_ready && cached.environment_pointer == environ &&
+    /* Relay arrays and invocation-only variables change without changing
+     * startup context. Hash retained bindings, including in-place mutations. */
+    if (cached.environment_ready &&
         cached.omitted == omit_environment && cached.environment_stamp == stamp) goto environment_ready;
     struct dcc_environment_entry *environment = calloc(capacity, sizeof(*environment));
     if (capacity && !environment) return -1;
     for (char **p = environ; *p; ++p) {
-        int omit = 0;
-        for (const char *const *name = omit_environment; name && *name; ++name) {
-            size_t length = strlen(*name);
-            if (!strncmp(*p, *name, length) && (*p)[length] == '=') { omit = 1; break; }
-        }
-        if (!omit) {
+        if (!omitted_environment(*p, omit_environment)) {
             environment[count_environment] = (struct dcc_environment_entry){
                 *p, strcspn(*p, "="), count_environment};
             ++count_environment;
@@ -146,7 +155,6 @@ int dcc_local_worker_key(const char *compiler, const char *library,
         XXH3_128bits_update(&environment_state, environment[i].text, strlen(environment[i].text)+1);
     free(environment);
     cached.environment = XXH3_128bits_digest(&environment_state);
-    cached.environment_pointer = environ;
     cached.omitted = omit_environment;
     cached.environment_stamp = stamp;
     cached.environment_ready = 1;

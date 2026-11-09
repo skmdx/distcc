@@ -266,17 +266,17 @@ class FileCacheTest(unittest.TestCase):
     def test_quota_contention_and_abandoned_reservation_do_not_block_inputs(self):
         self.write(b'old', b'complete')
         quota = self.cache_path/'.quota'
-        with quota.open('r+b') as lock:
+        with (self.cache_path/'.lock').open('r+b') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.write(b'new', b'pending')
             self.library.dcc_file_cache_prune(os.fsencode(self.cache_path.parent))
             self.assertEqual(self.get(b'old'), b'complete')
             self.assertIsNone(self.get(b'new'))
             # Simulate death after reservation, before the atomic publication.
-            lock.truncate(256*1024*1024+1)
+            quota.write_bytes(struct.pack('=q', 256*1024*1024))
         self.write(b'new', b'pending')
         self.assertEqual(self.get(b'new'), b'pending')
-        self.assertLess(quota.stat().st_size, 256*1024*1024)
+        self.assertLess(struct.unpack('=q', quota.read_bytes())[0], 256*1024*1024)
 
     def test_retained_shards_prune_after_fork_and_publish_atomic_snapshots(self):
         keys = self.shard_keys(80)

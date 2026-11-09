@@ -256,24 +256,48 @@ done:
     return result;
 }
 
-/* The sparse quota file's length is a conservative byte reservation plus one
- * (zero means uninitialized). ftruncate changes it atomically without a torn
- * counter write. Reserve before publishing; recount after deleting. Killed
- * publishers and replaced/compressed entries can overcount, never undercount;
- * a pressure scan reconciles the reservation with the immutable files. */
+/* All publications hold the root lock. Atomic replacement keeps both data
+ * and its reservation intact across publisher death; missing quota is rebuilt.
+ * Store a fixed-size counter, not a sparse extent subject to RLIMIT_FSIZE. */
+static int publish_file(int directory, const char *name, int from)
+{
+    char source[64];
+    const char *temporary = ".tmp-publish";
+    snprintf(source, sizeof(source), "/proc/self/fd/%d", from);
+    (void)unlinkat(directory, temporary, 0);
+    if (linkat(AT_FDCWD, source, directory, temporary, AT_SYMLINK_FOLLOW)) return -1;
+    int ret = renameat(directory, temporary, directory, name);
+    (void)unlinkat(directory, temporary, 0);
+    return ret;
+}
+
+static int quota_write(int root, off_t bytes)
+{
+    int fd = openat(root, ".", O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    int ret = dcc_writex(fd, &bytes, sizeof(bytes));
+    if (!ret) ret = publish_file(root, ".quota", fd);
+    close(fd);
+    return ret;
+}
+
 static int quota_lock(int root, off_t *bytes)
 {
-    struct stat st;
-    int fd = openat(root, ".quota", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    int fd = openat(root, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
-    if (flock(fd, LOCK_EX | LOCK_NB) || fstat(fd, &st)) { close(fd); return -1; }
-    *bytes = st.st_size - 1;
+    if (flock(fd, LOCK_EX | LOCK_NB)) { close(fd); return -1; }
+    *bytes = -1;
+    int counter = openat(root, ".quota", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (counter >= 0) {
+        unsigned char data[sizeof(*bytes) + 1];
+        if (read(counter, data, sizeof(data)) == sizeof(*bytes)) memcpy(bytes, data, sizeof(*bytes));
+        close(counter);
+    }
     return fd;
 }
 
 static void publish_snapshot(int shard, const char *key, int from)
 {
-    char temporary[40], source[64];
     struct stat st;
     off_t bytes;
     int root = openat(shard, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC), quota = -1;
@@ -283,13 +307,8 @@ static void publish_snapshot(int shard, const char *key, int from)
     if (quota < 0) goto done;
     if (bytes < 0 || bytes + size > CACHE_BYTES) bytes = make_room(root, size);
     if (bytes < 0 || (bytes + size > CACHE_BYTES && !st.st_nlink) ||
-        ftruncate(quota, bytes + size + 1)) goto done;
-    snprintf(temporary, sizeof(temporary), ".tmp-%lu", (unsigned long)getpid());
-    snprintf(source, sizeof(source), "/proc/self/fd/%d", from);
-    if (!linkat(AT_FDCWD, source, shard, temporary, AT_SYMLINK_FOLLOW)) {
-        (void)renameat(shard, temporary, shard, key);
-        (void)unlinkat(shard, temporary, 0);
-    }
+        quota_write(root, bytes + size)) goto done;
+    (void)publish_file(shard, key, from);
 done:
     if (quota >= 0) close(quota);
     if (root >= 0) close(root);
@@ -347,7 +366,7 @@ void dcc_file_cache_prune(const char *tmp)
      * next successful publisher/pruner enforces the idle-cache bound. */
     if (quota >= 0 && (bytes < 0 || bytes > CACHE_BYTES)) {
         bytes = make_room(root, 0);
-        if (bytes >= 0) (void)ftruncate(quota, bytes + 1);
+        if (bytes >= 0) (void)quota_write(root, bytes);
     }
     if (quota >= 0) close(quota);
     close(root);

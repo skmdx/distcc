@@ -6,6 +6,8 @@
 #include <cstring>
 #include <string>
 #include <dlfcn.h>
+#include <link.h>
+#include <sys/mman.h>
 #include <spawn.h>
 #include <sched.h>
 #include <signal.h>
@@ -122,6 +124,24 @@ int execute(int fd, bool preparing)
     return compiler_main(argc, argv, environ);
 }
 
+int populate_image(dl_phdr_info *image, size_t, void *context)
+{
+    const size_t page = *static_cast<const size_t *>(context);
+    for (unsigned i = 0; i < image->dlpi_phnum; ++i) {
+        const auto &segment = image->dlpi_phdr[i];
+        if (segment.p_type != PT_LOAD || !(segment.p_flags & PF_R) || !segment.p_memsz) continue;
+        uintptr_t start = (image->dlpi_addr + segment.p_vaddr) & ~(page - 1);
+        uintptr_t end = (image->dlpi_addr + segment.p_vaddr + segment.p_memsz + page - 1) & ~(page - 1);
+#ifdef MADV_POPULATE_READ
+        if (!madvise(reinterpret_cast<void *>(start), end - start, MADV_POPULATE_READ)) continue;
+#endif
+        // Older kernels can populate the same PTEs with ordinary reads.
+        for (uintptr_t address = start; address < end; address += page)
+            (void)*reinterpret_cast<volatile const unsigned char *>(address);
+    }
+    return 0;
+}
+
 int serve(int argc, char **argv, char **)
 {
     const char *value = getenv("DISTCC_GCC_PLAN_CONTROL");
@@ -158,6 +178,11 @@ int serve(int argc, char **argv, char **)
             return 1;
         }
     }
+    // Populate ELF mappings once before requests. This moves first-touch I/O
+    // to startup; writable compiler state still faults privately in children.
+    // Never run compiler initialization in this parent.
+    size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    dl_iterate_phdr(populate_image, &page);
     // Startup diagnostics belong to the requesting client; a successful
     // resident worker must release that client's stderr pipe before readiness.
     if (!freopen("/dev/null", "w", stderr)) return 1;

@@ -10,7 +10,6 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
-#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include "distcc.h"
 #include "exitcode.h"
@@ -75,6 +74,7 @@ static int request_planner(const char *compiler, char **argv, int input,
     static const char *const invocation_environment[] = {
         "COLLECT_GCC_OPTIONS", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
         "COLLECT_AS_OPTIONS", "MAKEFLAGS", "MAKELEVEL", "MFLAGS", "subdir",
+        "COLLECT_GCC", "COLLECT_LTO_WRAPPER", "COMPILER_PATH", "LIBRARY_PATH", "GCC_EXEC_PREFIX",
         "DISTCC_LOG", "DISTCC_VERBOSE", NULL
     };
     char key[80];
@@ -155,30 +155,18 @@ out:
 static int run_planner(const char *compiler, char **argv, int output,
                        const int standard[3], const char *role, int capture)
 {
-    int input = dcc_job_memfd("distcc-gcc-command"), ret = EXIT_IO_ERROR;
+    int ret = EXIT_IO_ERROR;
     char *cwd = getcwd(NULL, 0);
     const char *stage = "command preparation";
-    struct stat info;
-    off_t offset = 0;
     char *directory[] = {cwd, NULL};
-    if (input < 0 || !cwd || dcc_x_argv(input, "ARGC", "ARGV", directory) ||
-        dcc_x_argv(input, "ARGC", "ARGV", argv) ||
-        dcc_x_argv(input, "ARGC", "ARGV", environ)) goto out;
-    ret = request_planner(compiler, argv, input, standard, role, capture);
+    if (!cwd || ftruncate(output, 0) || lseek(output, 0, SEEK_SET) < 0 ||
+        dcc_x_argv(output, "ARGC", "ARGV", directory) ||
+        dcc_x_argv(output, "ARGC", "ARGV", argv) ||
+        dcc_x_argv(output, "ARGC", "ARGV", environ)) goto out;
+    ret = request_planner(compiler, argv, output, standard, role, capture);
     stage = NULL; // request_planner already reports worker failures.
-    if (ret) goto out;
-    stage = "plan copy";
-    ret = EXIT_IO_ERROR;
-    if (fstat(input, &info) || ftruncate(output, 0) || lseek(output, 0, SEEK_SET) < 0) goto out;
-    while (offset < info.st_size) {
-        ssize_t n = sendfile(output, input, &offset, info.st_size - offset);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) goto out;
-    }
-    ret = 0;
 out:
     if (ret && stage) rs_log_warning("GCC %s failed during %s (status=%d, errno=%d)", role, stage, ret, errno);
-    if (input >= 0) close(input);
     free(cwd);
     return ret;
 }
@@ -297,10 +285,16 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
     // An explicitly selected wrapper owns subprogram execution. Do not
     // replace it with our resident planner or change its argv contract.
     if (!wrapped) {
-        char self[PATH_MAX], *wrapper = NULL;
-        ssize_t length = readlink("/proc/self/exe", self, sizeof(self) - 1);
-        if (length < 0 || length == sizeof(self) - 1) goto done;
-        self[length] = 0;
+        static char self[PATH_MAX];
+        static pid_t owner;
+        pid_t pid = getpid();
+        char *wrapper = NULL;
+        if (owner != pid) {
+            ssize_t length = readlink("/proc/self/exe", self, sizeof(self) - 1);
+            if (length < 0 || length == sizeof(self) - 1) goto done;
+            self[length] = 0;
+            owner = pid;
+        }
         if (asprintf(&wrapper, "%s,--gcc-plan", self) < 0) goto done;
         dcc_argv_append(command, strdup("-wrapper"));
         dcc_argv_append(command, wrapper);

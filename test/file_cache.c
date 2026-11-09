@@ -1,6 +1,9 @@
 /* Real shared-input publication, pinning and pooled-capacity reclamation. */
 #include "../src/file_cache.c"
 #include <assert.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 const char *rs_program_name = "file_cache";
 
@@ -37,6 +40,20 @@ int main(int argc, char **argv)
     assert(!unlink("small"));
     dcc_file_cache_prune(".");
     assert(cached(small, ".")); /* No per-shard 4 MiB eviction. */
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) {
+        struct rlimit limit = {65536, 65536}, core = {0, 0};
+        assert(!setrlimit(RLIMIT_CORE, &core) && !setrlimit(RLIMIT_FSIZE, &limit));
+        signal(SIGXFSZ, SIG_DFL);
+        unsigned char hash[DCC_FILE_HASH_SIZE];
+        input("tiny", 4096, hash);
+        dcc_file_cache_put(hash, "tiny", 1, ".");
+        assert(cached(hash, ".") && !unlink("tiny"));
+        _exit(0);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
     assert(dcc_file_cache_get(small, "small", 1, "."));
     input("large", DCC_FILE_CACHE_MAX, large);
     dcc_file_cache_put(large, "large", 1, ".");

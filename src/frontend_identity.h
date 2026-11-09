@@ -12,6 +12,12 @@ static int dcc_compare_gid(const void *a, const void *b)
 }
 static char *dcc_frontend_identity(void)
 {
+    /* Credentials are fixed for an invocation; forked clients own a new
+     * context. Return an owned string as required by job argv ownership. */
+    static pid_t owner;
+    static char *cached;
+    pid_t pid = getpid();
+    if (cached && owner == pid) return strdup(cached);
     char boot[64];
     FILE *file = fopen("/proc/sys/kernel/random/boot_id", "r");
     if (!file) return NULL;
@@ -32,5 +38,10 @@ static char *dcc_frontend_identity(void)
             used += snprintf(identity + used, capacity - used, ":%lu", (unsigned long)groups[i]);
     }
     free(groups);
+    if (identity) {
+        free(cached);
+        cached = strdup(identity);
+        owner = pid;
+    }
     return identity;
 }

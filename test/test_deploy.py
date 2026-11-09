@@ -10,6 +10,7 @@ import shutil
 import os
 import subprocess
 import sys
+import threading
 from unittest import mock
 
 spec = importlib.util.spec_from_file_location('deploy', Path(__file__).resolve().parents[1] /
@@ -17,6 +18,40 @@ spec = importlib.util.spec_from_file_location('deploy', Path(__file__).resolve()
 assert spec is not None and spec.loader is not None
 deploy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(deploy)
+
+class RustDistributionTest(unittest.TestCase):
+    def test_parallel_inventory_skips_installed_and_only_stages_missing(self):
+        targets = [{'name': 'first'}, {'name': 'second'}]
+        for installed in (True, False):
+            with self.subTest(installed=installed), tempfile.TemporaryDirectory() as directory:
+                barrier = threading.Barrier(2, timeout=5)
+                transfers = []
+                def run(args, target=None, **kwargs):
+                    if args[:2] == ['python3', '-c']:
+                        assert target is not None
+                        if len(args) == 3:
+                            barrier.wait()  # Serial inventory would time out.
+                            name = target['name']
+                            return json.dumps(dict(root='/toolchain/' + name, host='test-arch', digest=name))
+                        # Exercise the actual presence/-vV probe locally.
+                        root = Path(directory)/target['name']
+                        compiler = root/'bin/rustc'
+                        compiler.parent.mkdir(parents=True, exist_ok=True)
+                        compiler.write_text('#!/bin/sh\nexit ' + ('0' if installed else '1') + '\n')
+                        compiler.chmod(0o700)
+                        return subprocess.check_output([*args[:3], str(root)], text=True).strip()
+                    transfers.append((args, target))
+                    return ''
+                with mock.patch.object(deploy, 'run', side_effect=run):
+                    deploy.distribute_rust_compilers(targets, Path(directory))
+                if installed:
+                    self.assertEqual(transfers, [])
+                else:
+                    self.assertEqual(sum(args[0] == 'rsync' for args, _ in transfers), 2)
+                    self.assertEqual(sum(args[:3] == ['sudo', '-n', 'rsync'] for args, _ in transfers), 2)
+                    self.assertEqual(sum(args[-1] == '-vV' for args, _ in transfers), 2)
+                self.assertFalse(list(Path(directory).glob('rust-*')))
+
 
 class TimeoutEvidenceTest(unittest.TestCase):
     def test_timeout_records_live_waiter_and_preserves_failure(self):

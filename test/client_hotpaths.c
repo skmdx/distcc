@@ -3,6 +3,7 @@
 #include "native_worker.h"
 #include "where.h"
 #include "hosts.h"
+#include "frontend_identity.h"
 #include <assert.h>
 #include <sys/resource.h>
 
@@ -52,6 +53,9 @@ int main(int argc, char **argv)
     assert(!dcc_local_worker_key("/proc/self/exe", NULL, omitted, key, sizeof(key)));
     assert(strcmp(key, previous)); /* putenv-style mutation in the same array. */
     environ = saved;
+    char *authority = dcc_frontend_identity(), *same_authority = dcc_frontend_identity();
+    assert(authority && same_authority && authority != same_authority && !strcmp(authority, same_authority));
+    free(authority); free(same_authority);
 
     struct dcc_job job = {.cwd = (char *)"/source"};
     assert(!dcc_frontend_fs_add_root(&job, "inc/../include//."));
@@ -94,10 +98,14 @@ int main(int argc, char **argv)
     sample("identity", &before);
     size_t count = 0;
     while (saved[count]) ++count;
-    char **relay = malloc((count + 1) * sizeof(*relay));
+    char **relay = malloc((count + 2) * sizeof(*relay));
     assert(relay);
     memcpy(relay, saved, (count + 1) * sizeof(*relay));
+    char volatile_binding[64];
+    relay[count] = volatile_binding;
+    relay[count + 1] = NULL;
     for (int i = 0; i < (bench ? 2000 : 1); ++i) {
+        snprintf(volatile_binding, sizeof(volatile_binding), "VOLATILE=%d", i);
         environ = i % 2 ? relay : saved;
         assert(!dcc_local_worker_key(i % 2 ? "/bin/sh" : "/proc/self/exe",
                                     "/proc/self/exe", omitted, key, sizeof(key)));
