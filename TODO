@@ -22,7 +22,7 @@ reduce client filesystem service cost in remote preprocessing
     identity and faccessat checks effective search permission. Actual
     enumeration requests LIST through the ordinary read-permission path.
     The metadata regression fails before the change and verifies zero warm
-    directory read opens after it. All 63 frontend checks pass, including
+    directory read opens after it. All 64 frontend checks pass, including
     read-only/no-search directories and real GCC precompiled-header directory
     selection with changed permissions. Directory snapshots belong to the
     open handle; the lookup map no longer duplicates its child-name vector.
@@ -37,14 +37,22 @@ reduce client filesystem service cost in remote preprocessing
     regressions verify reuse and isolation of arbitrary startup settings.
     All 27 local-Clang checks also pass. Full-build observation confirms 183
     preparation services become 48 (-73.77%). The ordinary-observation
-    before/warm pair takes 312.579/310.355 seconds (-0.71%) with
-    785.916/805.366 client CPU seconds (+2.47%) and 6642 remote jobs each.
+    before/warm pair for that change takes 312.579/310.355 seconds; client
+    CPU rises 2.47%. The subsequent GCC directory-index change borrows sorted
+    name views from immutable snapshots instead of constructing full-path
+    entries for every sibling. Only lookups and fresh attributes need child
+    state. Cold/warm, previously unused cached names, added/deleted headers,
+    permissions and PCH regressions pass. A focused 256-job real-RPC pair
+    falls 6.507 to 6.208 seconds; its former tree-walk hotspot disappears
+    below the report cutoff. Its peak child RSS is unchanged.
+    Latest matched full builds take 310.355/303.676 seconds (-2.15%) with
+    805.366/811.015 client CPU seconds (+0.70%) and 6642 remote jobs each.
     Hashes match; errors, timeouts, disconnects and fallback warnings are
-    zero. Remote CPU rises 19.98% with changed dispatch counts. Retain the
-    verified process-count reduction without claiming lower total CPU or a
-    stable whole-build speedup from this single pair. The instrumented
-    post-installation build also takes longer than its observed baseline;
-    restarting caches and changed observation cost limit that comparison.
+    zero. Remote CPU falls 7.62%, with changed dispatch counts. The first
+    post-installation build takes 312.546 seconds and 838.915 client CPU
+    seconds, also with matching hashes and zero failures. Retain the
+    verified reduction in directory state and the observed improvements;
+    single pairs and changed allocation do not establish a stable speedup.
     The matched installed object trace removes 113 directory read opens;
     mmap falls 327 to 101, munmap 308 to 82 and readlinkat 161 to 48. Effective
     access checks replace the unnecessary read opens. Sends/polls vary
@@ -52,10 +60,13 @@ reduce client filesystem service cost in remote preprocessing
     Most anonymous mappings are small allocations, not cached file
     bodies. File service, path resolution and teardown still cost client CPU;
     batching requests alone does not remove them. Warm remote occupancy is
-    5.213 cores. The warm capture assigns 41.97% of sampled CPU to clients;
-    exchange/filesystem service appears in 11.31 of 26.18 client CPU seconds.
-    Planner samples take 13.65 seconds (21.88%). One-second correlation
-    finds 76.46 seconds with no remote work observed, versus 78.86 before.
+    4.924 cores. The warm capture assigns 41.32% of sampled CPU to clients;
+    exchange/filesystem service appears in 9.98 of 24.73 client CPU seconds.
+    Planner samples take 13.49 seconds (22.54%). One-second correlation
+    finds 74.78 seconds with no remote work observed, versus 76.46 before.
+    Ready-job idle-slot time falls from 1.278 to 1.126 slot seconds; this
+    counter does not establish client-side readiness or attribution of all
+    unoccupied time.
     An additional unchanged build records per-process commands and wait
     states. Its longest gaps contain unpacking, configure checks, syscall
     generation, archive creation and local links. These are not evidence of
