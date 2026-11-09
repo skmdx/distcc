@@ -12,28 +12,36 @@ reduce client filesystem service cost in remote preprocessing
     256 branches split into four requests. Parent queries now omit attributes
     supplied by a scheduled child's own query, including across batch splits;
     each child still checks its current identity and permissions. Five-host
-    installed validation passes. Reused names
-    now omit a second, unused descriptor stat; the warm focused trace reduces
-    fstat from 246 to 133, preserving output, newfstatat (351), sends/polls
-    (8/6) and opens. This does not establish a whole-build speedup.
+    installed validation passes. Unused search roots now receive fresh
+    attributes without opening or listing them. Actual child/readdir requests
+    trigger a deferred listing; directories searched only for absent headers
+    remain in the next footprint without retaining absent child metadata.
+    The real-GCC regression verifies 32 unused directories remain unopened,
+    then uses a formerly unused directory after changing the source. All 61
+    frontend checks pass, including permission and namespace changes.
+    Against the earlier reused-name trace, a matched object keeps its hash
+    and reduces newfstatat 351 to 332 and sends/polls 8/6 to 7/5. Opens (360),
+    fstat (133), mmap (327) and munmap (308) do not change. This trace spans
+    the intervening stdin and startup-reservation revisions too.
     Native GCC stdin support adds 242 remote jobs to this workload. Startup
     reservations now match the admitted-client bound: the previous 32-entry
     cache rejected the 33rd simultaneous owner. A real broker regression with
     64 pending driver/frontend keys fails before and passes after the fix.
-    All 93 broker checks (including three root-only identity checks separately)
-    and 60 frontend checks pass. Latest initial/warm full builds take
-    317.852/320.974 seconds with 883.908/847.937 client CPU seconds and 6642
-    remote jobs each. Hashes match and errors, timeouts, disconnects and
-    fallback warnings are zero. The preceding stdin-enabled pair took
-    314.910/312.688 seconds with 916.168/872.795 client CPU seconds; its warm
-    run had one pre-dispatch worker-lookup fallback. CPU fell, but elapsed
-    time rose. No stable whole-build speedup is established.
+    All 93 broker checks previously passed, including three root-only
+    identity checks separately. Latest initial/warm full builds take
+    320.833/315.329 seconds with 885.941/843.861 client CPU seconds and 6642
+    remote jobs each. The preceding pair took 317.852/320.974 seconds with
+    883.908/847.937 client CPU seconds. Hashes match and errors, timeouts,
+    disconnects and fallback warnings are zero in all four runs. Initial
+    elapsed time rises 0.94%; warm time falls 1.76%. Retain the verified
+    reduction in unnecessary filesystem operations, but do not claim a
+    stable whole-build speedup from these single pairs.
     Most anonymous mappings are small allocations, not cached file
     bodies. File service, path resolution and teardown still cost client CPU;
     batching requests alone does not remove them. Warm remote occupancy is
-    4.703 cores. The warm capture assigns 47.96% of sampled CPU to clients;
-    exchange/filesystem service appears in 20.16 of 33.51 client CPU seconds.
-    One-second correlation finds 73.62 seconds with no remote work observed.
+    4.566 cores. The warm capture assigns 48.59% of sampled CPU to clients;
+    exchange/filesystem service appears in 19.41 of 33.35 client CPU seconds.
+    One-second correlation finds 73.73 seconds with no remote work observed.
     Configuration, generated headers, dependency files and links coincide
     with several gaps; timestamps alone do not establish their causes.
     Occupancy samples do not support a large slow-worker-only
