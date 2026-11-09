@@ -955,6 +955,39 @@ class GccFrontendTest(BrokerTestCase):
         self.compile(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
+    def test_large_directory_names_survive_cold_warm_and_changed_lookups(self):
+        self.start_frontend()
+        headers = self.work/'headers'
+        headers.mkdir()
+        names = [f'header_{index:04d}_with_a_long_unused_name.h' for index in range(3000)]
+        for name in reversed(names):
+            (headers/name).touch()
+        (headers/names[0]).write_text('#define VALUE 17\n')
+        (headers/names[-1]).write_text('#define VALUE 29\n')
+        (headers/'dangling.h').symlink_to('absent.h')
+        command = [self.cc, '-nostdinc', '-O2', '-c', 'hello.c', '-o', 'out.o']
+
+        def compare(name, optional):
+            self.source.write_text(f'#include "headers/{name}"\n'
+                                   '#if __has_include("headers/dangling.h")\n'
+                                   '#error dangling header\n#endif\n'
+                                   '#if __has_include("headers/new.h")\n'
+                                   '#include "headers/new.h"\n#else\n#define NEW 0\n#endif\n'
+                                   f'_Static_assert(NEW == {optional}, "changed name");\n'
+                                   'int value(void) { return VALUE + NEW; }\n')
+            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+            expected = (self.work/'out.o').read_bytes()
+            for _ in range(2):
+                self.compile(command)
+                self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
+        compare(names[-1], 0)
+        compare(names[0], 0)  # A cached name that has never had a child entry.
+        (headers/'new.h').write_text('#define NEW 43\n')
+        compare(names[0], 43)
+        (headers/'new.h').unlink()
+        compare(names[-1], 0)
+
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
     def test_warm_prefetch_reads_directory_metadata_once(self):
         self.start_frontend()

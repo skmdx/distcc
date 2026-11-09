@@ -29,6 +29,8 @@ struct Entry {
     std::array<char, DCC_FS_METADATA> version{};
     bool queried = false, searched = false;
     std::set<std::string> hints, observed;
+    std::vector<std::string_view> names;
+    // File contents or the immutable reply/cache record owning directory names.
     dccfs::Buffer bytes;
     unsigned mode() const { return number(version.data()+32, 4); }
 };
@@ -161,6 +163,8 @@ public:
         unsigned flags = number(response.data+DCC_FS_METADATA, 4);
         if (flags & ~(DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_STABLE)) return entry.error = EPROTO;
         bool reused = flags & DCC_FS_DIRECTORY_CACHED;
+        entry.names.clear();
+        entry.bytes = reused ? previous : response;
         if (reused) {
             if (!previous.owner || memcmp(entry.version.data(), previous.data, DCC_FS_METADATA))
                 return entry.error = EPROTO;
@@ -169,8 +173,7 @@ public:
                 auto end = names.find('\0');
                 if (end == std::string_view::npos || !valid_name(names.substr(0, end)))
                     return entry.error = EPROTO;
-                std::string name(names.substr(0, end));
-                entries.try_emplace(path == "/" ? path+name : path+'/'+name);
+                entry.names.push_back(names.substr(0, end));
                 names.remove_prefix(end+1);
             }
         }
@@ -182,12 +185,12 @@ public:
             unsigned length = number(response.data+offset, 4), error = number(response.data+offset+4, 4);
             offset += 8;
             if (!length || length > response.size-offset) return entry.error = EPROTO;
-            std::string name(response.data+offset, length);
+            std::string_view name(response.data+offset, length);
             if (!valid_name(name))
                 return entry.error = EPROTO;
             offset += length;
-            auto &child = entries[path == "/" ? path+name : path+'/'+name];
             if (error != DCC_FS_NO_METADATA) {
+                auto &child = entries[(path == "/" ? path : path+'/')+std::string(name)];
                 child.error = error;
                 if (!error) {
                     if (response.size-offset < DCC_FS_METADATA) return entry.error = EPROTO;
@@ -196,9 +199,14 @@ public:
                 }
                 child.queried = true;
             }
+            if (!reused) entry.names.push_back(name);
             if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) { names += name; names += '\0'; }
         }
         if (offset != response.size) return entry.error = EPROTO;
+        // Keep names as borrowed views, not an Entry and full path for every
+        // unrelated sibling. Only compiler lookups and fresh attributes need
+        // child state; the same index still answers negative lookups locally.
+        std::sort(entry.names.begin(), entry.names.end());
         entry.listing = Entry::Ready;
         if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) {
             connection.save_directory_names(path, entry.version, names);
@@ -308,13 +316,14 @@ public:
                 if (int error = fetch({parent->first})) return error;
             }
         }
-        auto [found, inserted] = entries.try_emplace(path);
-        auto &entry = found->second;
+        auto &entry = entries.try_emplace(path).first->second;
         result = &entry;
         if (path != "/") {
             if (parent != entries.end() && parent->second.listing == Entry::Ready) {
                 parent->second.searched = true;
-                if (inserted) {
+                std::string_view name(path.data()+separator+1, path.size()-separator-1);
+                if (!entry.queried && !std::binary_search(parent->second.names.begin(),
+                                                        parent->second.names.end(), name)) {
                     entry.queried = true;
                     return entry.error = ENOENT;
                 }
