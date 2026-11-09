@@ -12,6 +12,9 @@
  * add flags/count u32 before their entries. CACHED replies omit unchanged names;
  * child metadata and search permissions are always fresh. Names form a lookup
  * index, not authorization to enumerate a directory: actual readdir uses LIST.
+ * PARTIAL returns only hinted child attributes after the directory changes;
+ * it does not establish absence of any unreturned name. A query without a
+ * previous version requests the complete name index when actually needed.
  * STABLE permits publishing the name snapshot
  * after matching the directory version both before and after the lookup.
  * ATTRIBUTES returns lstat attributes without enumerating directory contents.
@@ -22,6 +25,7 @@
 #define DCC_FS_NO_METADATA UINT32_MAX
 #define DCC_FS_DIRECTORY_CACHED 1U
 #define DCC_FS_DIRECTORY_STABLE 2U
+#define DCC_FS_DIRECTORY_PARTIAL 4U
 enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LIST,
                        DCC_FS_CODEGEN, DCC_FS_READLINK = 7, DCC_FS_LSTAT = 8,
                        DCC_FS_DIRECTORIES, DCC_FS_STDIN, DCC_FS_ATTRIBUTES };

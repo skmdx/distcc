@@ -24,7 +24,7 @@ extern "C" {
 namespace {
 using dccfs::number;
 struct Entry {
-    enum Listing { Deferred, Unavailable, Ready } listing = Deferred;
+    enum Listing { Deferred, Unavailable, Partial, Ready } listing = Deferred;
     int error = 0;
     std::array<char, DCC_FS_METADATA> version{};
     bool queried = false, searched = false;
@@ -91,7 +91,7 @@ public:
         std::string snapshot;
         snapshot.reserve(previous_hints.size);
         for (const auto &[path, entry] : entries) {
-            if (entry.listing != Entry::Ready || !entry.searched) continue;
+            if (!entry.searched) continue;
             // Speculative queries do not teach the next job to repeat them.
             // Retain only children the compiler actually requested this time.
             // An empty footprint still records a searched directory: its fresh
@@ -161,8 +161,11 @@ public:
         if (response.size == DCC_FS_METADATA) return 0;
         if (!S_ISDIR(entry.mode()) || response.size < DCC_FS_METADATA+8) return entry.error = EPROTO;
         unsigned flags = number(response.data+DCC_FS_METADATA, 4);
-        if (flags & ~(DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_STABLE)) return entry.error = EPROTO;
+        if (flags & ~(DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_STABLE | DCC_FS_DIRECTORY_PARTIAL))
+            return entry.error = EPROTO;
         bool reused = flags & DCC_FS_DIRECTORY_CACHED;
+        bool partial = flags & DCC_FS_DIRECTORY_PARTIAL;
+        if (partial && flags != DCC_FS_DIRECTORY_PARTIAL) return entry.error = EPROTO;
         entry.names.clear();
         entry.bytes = reused ? previous : response;
         if (reused) {
@@ -199,7 +202,7 @@ public:
                 }
                 child.queried = true;
             }
-            if (!reused) entry.names.push_back(name);
+            if (!reused && !partial) entry.names.push_back(name);
             if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) { names += name; names += '\0'; }
         }
         if (offset != response.size) return entry.error = EPROTO;
@@ -207,7 +210,7 @@ public:
         // unrelated sibling. Only compiler lookups and fresh attributes need
         // child state; the same index still answers negative lookups locally.
         std::sort(entry.names.begin(), entry.names.end());
-        entry.listing = Entry::Ready;
+        entry.listing = partial ? Entry::Partial : Entry::Ready;
         if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) {
             connection.save_directory_names(path, entry.version, names);
         }
@@ -240,7 +243,7 @@ public:
             // expand the next batch, never every name in a directory.
             for (const auto &query : pending) {
                 const auto &entry = entries[query.path];
-                if (entry.error || entry.listing != Entry::Ready) continue;
+                if (entry.error || (entry.listing != Entry::Ready && entry.listing != Entry::Partial)) continue;
                 for (const auto &name : entry.hints) {
                     auto path = query.path == "/" ? query.path+name : query.path+'/'+name;
                     auto child = entries.find(path);
@@ -308,8 +311,9 @@ public:
         if (path != "/") {
             parent = entries.find(separator == 0 ? "/" : path.substr(0, separator));
             auto found = entries.find(path);
-            // Initial attributes already answer stat on an unused search root.
-            // Fetch its names only when an actual child lookup needs them.
+            // Fetch an unused search root's names only on a real child lookup.
+            // A partial footprint already has known child attributes; unknown
+            // names use individual metadata queries and extend that footprint.
             if ((found == entries.end() || !found->second.queried) && parent != entries.end() &&
                 !parent->second.error && S_ISDIR(parent->second.mode()) &&
                 parent->second.listing == Entry::Deferred) {
@@ -319,17 +323,19 @@ public:
         auto &entry = entries.try_emplace(path).first->second;
         result = &entry;
         if (path != "/") {
-            if (parent != entries.end() && parent->second.listing == Entry::Ready) {
+            if (parent != entries.end() &&
+                (parent->second.listing == Entry::Ready || parent->second.listing == Entry::Partial)) {
                 parent->second.searched = true;
                 std::string_view name(path.data()+separator+1, path.size()-separator-1);
-                if (!entry.queried && !std::binary_search(parent->second.names.begin(),
+                if (!entry.queried && parent->second.listing == Entry::Ready &&
+                    !std::binary_search(parent->second.names.begin(),
                                                         parent->second.names.end(), name)) {
                     entry.queried = true;
                     return entry.error = ENOENT;
                 }
                 // A listed parent already proves absence. Repeated failed
                 // lookups must not turn that into a fresh stat on every job.
-                if (!entry.queried || entry.error != ENOENT)
+                if (parent->second.listing == Entry::Partial || !entry.queried || entry.error != ENOENT)
                     parent->second.observed.insert(path.substr(separator+1));
             }
         }

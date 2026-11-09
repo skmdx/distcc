@@ -1071,6 +1071,45 @@ class GccFrontendTest(BrokerTestCase):
         compare(names[-1], 0)
 
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_changed_directory_reuses_footprint_without_enumerating_siblings(self):
+        self.start_frontend()
+        headers = self.work/'headers'
+        headers.mkdir()
+        for index in range(32):
+            (headers/f'unused-{index}.o').touch()
+        header = headers/'value.h'
+        header.write_text('#define VALUE 11\n')
+        self.source.write_text('#include <value.h>\nint value(void) { return VALUE; }\n')
+        command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'hello.c', '-o', 'out.o']
+        self.compile(command)
+        trace = self.work/'changed-directory.trace'
+        for value in (11, 23):
+            # Output/name churn must not enumerate unrelated siblings, while
+            # changed contents of the actual dependency must still be fresh.
+            (headers/f'new-output-{value}.o').touch()
+            header.write_text(f'#define VALUE {value}\n')
+            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+            expected = (self.work/'out.o').read_bytes()
+            result = subprocess.run(['strace', '-f', '-yy', '-e', 'trace=getdents64',
+                                     '-o', str(trace), str(self.build/'distcc'), *command],
+                                    cwd=self.work, env=self.env, capture_output=True,
+                                    text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('pooled TCP job completed', result.stderr)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+            self.assertNotIn(f'<{headers}>', trace.read_text(),
+                             'changed directory enumerated unrelated names')
+        # A partial footprint must never turn a newly requested name into a
+        # false ENOENT. GCC must reach the new dependency through the real path.
+        (headers/'added.h').write_text('#define ADDED 41\n')
+        self.source.write_text('#include <value.h>\n#include <added.h>\n'
+                               'int value(void) { return VALUE + ADDED; }\n')
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
     def test_warm_prefetch_reads_directory_metadata_once(self):
         self.start_frontend()
         headers = self.work/'headers'
@@ -1365,20 +1404,22 @@ class GccFrontendTest(BrokerTestCase):
         warm = compile_and_measure()
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
         self.assertLess(warm[0], cold[0], 'default cache did not survive job cleanup')
-        self.assertGreater(cold[1] - warm[1], header.stat().st_size)
+        self.assertGreaterEqual(cold[1], header.stat().st_size)
+        self.assertLess(warm[1], header.stat().st_size, 'unchanged header body was transferred again')
 
         # Equal size and restored mtime must not hide a changed header.
         before = header.stat()
         header.write_text(header.read_text().replace('VALUE 41', 'VALUE 42'))
         os.utime(header, ns=(before.st_atime_ns, before.st_mtime_ns))
         changed = compile_and_measure()
-        self.assertGreater(changed[1] - warm[1], before.st_size)
+        self.assertGreaterEqual(changed[1], before.st_size)
         actual = (self.work/'out.o').read_bytes()
         self.assertNotEqual(actual, expected)
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         self.assertEqual(actual, (self.work/'out.o').read_bytes())
         refreshed = compile_and_measure()
         self.assertLess(refreshed[0], changed[0])
+        self.assertLess(refreshed[1], before.st_size)
 
     def test_environment_search_path_preserves_user_header_dependencies(self):
         self.start_frontend()

@@ -151,8 +151,10 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
     if (!result && statuses == 2) {
         encode_metadata(version, initial);
         if (!memcmp(version, previous, sizeof(version))) flags |= DCC_FS_DIRECTORY_CACHED;
+        else if (hint_count && S_ISDIR(dcc_tcp_get32(previous + 32)))
+            flags |= DCC_FS_DIRECTORY_PARTIAL;
     }
-    if (flags & DCC_FS_DIRECTORY_CACHED) {
+    if (flags & (DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_PARTIAL)) {
         /* This is a lookup index, not a readdir result. The caller checked
          * current search permission; child attributes are never reused. */
         for (size_t i = 0; i < hint_count && !result; ++i) {
@@ -179,7 +181,7 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
     /* Only freshly enumerated names need a publication stability check.
      * Cached names were matched to the fresh descriptor identity above and
      * are never republished; child attributes still come from this query. */
-    if (!result && statuses == 2 && !(flags & DCC_FS_DIRECTORY_CACHED)) {
+    if (!result && statuses == 2 && !flags) {
         result = fstat(fd, &snapshot);
         if (!result) {
             encode_metadata(observed, &snapshot);
@@ -204,8 +206,8 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
     int flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK | (follow ? 0 : O_NOFOLLOW);
     int fd = -1;
     struct stat st;
-    /* Cached names answer lookups without reading a directory. Pin the same
-     * inode used for child attributes and let the kernel check effective
+    /* Cached names or a known lookup footprint avoid reading a directory.
+     * Pin the same inode used for child attributes and check effective
      * search permissions (including ACLs). Actual readdir uses LIST and its
      * ordinary read-permission check, even when lookup names are cached. */
     if (contents && previous && S_ISDIR(dcc_tcp_get32(previous + 32))) {
@@ -214,7 +216,7 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
             if (fstat(fd, &st)) goto failed;
             unsigned char version[DCC_FS_METADATA];
             encode_metadata(version, &st);
-            if (!memcmp(previous, version, sizeof(version))) {
+            if (!memcmp(previous, version, sizeof(version)) || hint_count) {
                 if (faccessat(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)) {
                     if (errno != EACCES) goto failed;
                     close(fd);

@@ -94,7 +94,7 @@ static void replies(const std::string &mode)
                     if (mode == "bad-error") { error = UINT_MAX; stamp.clear(); }
                     if (mode == "short") stamp.pop_back();
                     if (mode == "length") extra = 1;
-                    if (mode == "flags") { integer(stamp, 4); integer(stamp, 0); }
+                    if (mode == "flags") { integer(stamp, 8); integer(stamp, 0); }
                 }
                 integer(payload, error); integer(payload, stamp.size()+extra);
                 payload += stamp;
