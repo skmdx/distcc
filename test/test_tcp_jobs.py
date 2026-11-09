@@ -2419,6 +2419,27 @@ class TcpJobsTest(TcpJobTestCase):
             self.assertLess(time.monotonic(), deadline, 'refused input tree was not reclaimed')
             time.sleep(.01)
 
+    def test_cached_memory_refusal_reuses_connection(self):
+        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='1048576')
+        self.addCleanup(self.restart_server, self.build / 'distccd')
+        body = b'int cached_refusal(void) { return 17; }\n'
+        paths = tuple(f'/src/input-{i}.c'.encode() for i in range(9))
+        net = None
+        for identity in (71, 72, 73):
+            net = self.wire_job(body, paths=paths, identity=identity, net=net, verification=None)
+            uploads = 0
+            while True:
+                kind, data = self.frame(net)
+                if kind == 0x54000307:
+                    self.assertEqual(data, struct.pack('!Q', identity))
+                    break
+                self.assertEqual(kind, 0x54000301)
+                for (index,) in struct.iter_unpack('!I', data):
+                    self.upload(net, body, index)
+                    uploads += 1
+            if identity != 71:
+                self.assertEqual(uploads, 0, 'retry must exercise cached inputs')
+
     @unittest.skipUnless(shutil.which('strace'), 'strace is required')
     def test_sealed_input_maps_and_sends_raw_tail(self):
         self.start_tcp()
