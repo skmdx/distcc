@@ -6,19 +6,19 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #define FUSE_USE_VERSION 31
-#include <fuse3/fuse.h>
+#include <fuse3/fuse_lowlevel.h>
 static unsigned *attribute_calls;
-static int (*original_attributes)(const char *, struct stat *, struct fuse_file_info *);
-static int counted_attributes(const char *path, struct stat *st, struct fuse_file_info *info) {
+static void (*original_lookup)(fuse_req_t, fuse_ino_t, const char *);
+static void counted_lookup(fuse_req_t request, fuse_ino_t parent, const char *name) {
     ++*attribute_calls;
-    return original_attributes(path, st, info);
+    original_lookup(request, parent, name);
 }
-static struct fuse *counted_fuse_new(struct fuse_args *args, const struct fuse_operations *operations,
+static struct fuse_session *counted_session_new(struct fuse_args *args, const struct fuse_lowlevel_ops *operations,
                                      size_t size, void *data) {
     auto counted = *operations;
-    original_attributes = counted.getattr;
-    counted.getattr = counted_attributes;
-    return fuse_new(args, &counted, size, data);
+    original_lookup = counted.lookup;
+    counted.lookup = counted_lookup;
+    return fuse_session_new(args, &counted, size, data);
 }
 static pid_t mounted_child;
 static bool reader_alive_at_unmount;
@@ -27,11 +27,11 @@ static int checked_unmount(const char *path, int flags) {
     return syscall(SYS_umount2, path, flags);
 }
 #define umount2 checked_unmount
-#undef fuse_new
-#define fuse_new counted_fuse_new
+#undef fuse_session_new
+#define fuse_session_new counted_session_new
 #include "src/gcc_files.cc"
 #undef umount2
-#undef fuse_new
+#undef fuse_session_new
 #include <thread>
 
 // These framing tests inspect published hints but do not retain snapshots.
@@ -154,6 +154,7 @@ static void negative_hint_queries()
     Entry *entry;
     for (unsigned i = 0; i < 3; ++i)
         require(files.status("/tree/missing", entry) == ENOENT, "cached negative lookup");
+    require(entry == nullptr, "complete name index duplicated a negative path entry");
     Query next;
     require(!files.prepare({"/tree"}, next), "prepare subsequent query");
     require(next.bytes.size() == strlen("/tree")+1+DCC_FS_METADATA,
@@ -290,6 +291,16 @@ static void clean_mount(const char *root, bool lookup)
             require(open((missing+"/header-"+std::to_string(i)+".h").c_str(), O_RDONLY) == -1 &&
                     errno == ENOENT, "cached absent search directory");
         require(*attribute_calls == calls, "absent search directory woke the FUSE service again");
+        // Distinct first lookups still reach the service. Exercise that hot
+        // path, then check that the kernel retains every negative result.
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            for (unsigned i = 0; i < 4096; ++i) {
+                std::string path = missing+std::to_string(i);
+                require(lstat(path.c_str(), &info) == -1 && errno == ENOENT,
+                        "first-lookup metadata result");
+            }
+            require(*attribute_calls == calls+4096, "first lookup lost or repeated");
+        }
     }
     mounted_child = static_cast<Mount *>(mount)->child;
     uint64_t cpu = 0;
@@ -297,6 +308,8 @@ static void clean_mount(const char *root, bool lookup)
     int result = dcc_gcc_files_stop(mount, &cpu, &peak);
     mounted_child = 0;
     require(!result, "clean shutdown reported failure");
+    if (lookup) printf("Filesystem service CPU for 4096 first lookups: %llu ns\n",
+                       static_cast<unsigned long long>(cpu));
     // Detaching while the kernel read is in flight can return ECONNABORTED,
     // even for a regular unmount. The reader must have exited first.
     require(!reader_alive_at_unmount, "unmount raced the live FUSE reader");

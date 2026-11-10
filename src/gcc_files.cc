@@ -2,8 +2,8 @@
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
 #define FUSE_USE_VERSION 31
-#include <fuse3/fuse.h>
 #include <fuse3/fuse_lowlevel.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
@@ -25,6 +25,8 @@ extern "C" {
 namespace {
 using dccfs::number;
 struct Entry {
+    // The map owns the spelling; entries and keys live until this job ends.
+    const std::string *path = nullptr;
     enum Listing { Deferred, Unavailable, Partial, Ready } listing = Deferred;
     int error = 0;
     std::array<char, DCC_FS_METADATA> version{};
@@ -330,19 +332,27 @@ public:
                 if (int error = fetch({parent->first})) return error;
             }
         }
-        auto &entry = entries.try_emplace(path).first->second;
+        auto found = entries.find(path);
+        if (parent != entries.end() && parent->second.listing == Entry::Ready &&
+            (found == entries.end() || !found->second.queried)) {
+            parent->second.searched = true;
+            std::string_view name(path.data()+separator+1, path.size()-separator-1);
+            if (!std::binary_search(parent->second.names.begin(), parent->second.names.end(), name)) {
+                // The immutable name index already owns this negative answer.
+                // Do not allocate a second full-path Entry for every failed
+                // include candidate. The kernel also retains the reply.
+                result = nullptr;
+                return ENOENT;
+            }
+        }
+        auto item = entries.try_emplace(path).first;
+        auto &entry = item->second;
+        entry.path = &item->first;
         result = &entry;
         if (path != "/") {
             if (parent != entries.end() &&
                 (parent->second.listing == Entry::Ready || parent->second.listing == Entry::Partial)) {
                 parent->second.searched = true;
-                std::string_view name(path.data()+separator+1, path.size()-separator-1);
-                if (!entry.queried && parent->second.listing == Entry::Ready &&
-                    !std::binary_search(parent->second.names.begin(),
-                                                        parent->second.names.end(), name)) {
-                    entry.queried = true;
-                    return entry.error = ENOENT;
-                }
                 // A listed parent already proves absence. Repeated failed
                 // lookups must not turn that into a fresh stat on every job.
                 if (!entry.queried || entry.error != ENOENT)
@@ -395,74 +405,122 @@ public:
 };
 struct Mount {
     std::unique_ptr<Files> files;
-    struct fuse *fs = nullptr;
+    struct fuse_session *fs = nullptr;
     std::string mountpoint;
     pid_t child = -1;
 };
-Files &files() { return *static_cast<Mount *>(fuse_get_context()->private_data)->files; }
-void *initialize(struct fuse_conn_info *connection, struct fuse_config *config) {
-    // Files already retains positive and negative lookups for this job. Give
-    // the kernel the same lifetime instead of waking the service for repeated
-    // include searches. The next compiler gets a fresh mount and fresh names.
-    // libfuse saturates these durations to the protocol's maximum timeout.
-    config->entry_timeout = config->negative_timeout = std::numeric_limits<double>::max();
+Files &files(fuse_req_t request) {
+    return *static_cast<Mount *>(fuse_req_userdata(request))->files;
+}
+Entry &node(Files &fs, fuse_ino_t inode) {
+    if (inode != FUSE_ROOT_ID) return *reinterpret_cast<Entry *>(inode);
+    Entry *entry;
+    fs.status("/", entry);
+    return *entry;
+}
+void initialize(void *, struct fuse_conn_info *connection) {
     connection->want |= connection->capable & FUSE_CAP_CACHE_SYMLINKS;
-    config->kernel_cache = 1;
-    config->use_ino = 1;
-    return fuse_get_context()->private_data;
 }
-int attributes(const char *path, struct stat *st, struct fuse_file_info *) {
-    Entry *entry;
-    if (int error = files().status(path, entry)) return -error;
-    memset(st, 0, sizeof(*st));
-    const char *p = entry->version.data();
-    st->st_ino = files().inode(number(p, 8), number(p+8, 8));
-    st->st_mode = number(p+32, 4); st->st_size = number(p+24, 8);
-    st->st_nlink = S_ISDIR(st->st_mode) ? 2 : 1;
-    // Client operations enforce the original caller's permissions. Kernel
-    // access inside this private namespace belongs to its compiler process.
-    st->st_uid = getuid(); st->st_gid = getgid();
+void attributes(Files &fs, const Entry &entry, struct stat &st) {
+    st = {};
+    const char *p = entry.version.data();
+    st.st_ino = fs.inode(number(p, 8), number(p+8, 8));
+    st.st_mode = number(p+32, 4); st.st_size = number(p+24, 8);
+    st.st_nlink = S_ISDIR(st.st_mode) ? 2 : 1;
+    // Client RPC enforces original permissions. The private namespace maps
+    // this job's sole compiler user/group to zero; no credential syscall is
+    // needed for each lookup. Preserve the existing ownership presentation.
+    st.st_uid = 0; st.st_gid = 0;
     int64_t mtime = number(p+16, 8), ctime = number(p+44, 8);
-    st->st_mtim = {mtime/1000000000, mtime%1000000000};
-    st->st_ctim = {ctime/1000000000, ctime%1000000000};
-    return 0;
+    st.st_mtim = {mtime/1000000000, mtime%1000000000};
+    st.st_ctim = {ctime/1000000000, ctime%1000000000};
 }
-int open_file(const char *path, struct fuse_file_info *info) {
-    if ((info->flags & O_ACCMODE) != O_RDONLY) return -EROFS;
+void lookup(fuse_req_t request, fuse_ino_t parent, const char *name) {
+    auto &fs = files(request);
+    auto &directory = node(fs, parent);
+    if (directory.error) { fuse_reply_err(request, directory.error); return; }
+    std::string path = *directory.path;
+    if (path != "/") path += '/';
+    path += name;
     Entry *entry;
-    if (int error = files().open(path, entry)) return -error;
-    info->fh = reinterpret_cast<uintptr_t>(entry);
-    info->keep_cache = 1;
-    return 0;
-}
-int read_file(const char *, char *buffer, size_t size, off_t offset, struct fuse_file_info *info) {
-    auto &bytes = reinterpret_cast<Entry *>(info->fh)->bytes;
-    if (offset < 0) return -EINVAL;
-    if (static_cast<uint64_t>(offset) >= bytes.size) return 0;
-    size = std::min(size, bytes.size-static_cast<size_t>(offset));
-    memcpy(buffer, bytes.data+offset, size);
-    return size;
-}
-int read_link(const char *path, char *buffer, size_t size) { return files().link(path, buffer, size); }
-int open_directory(const char *path, struct fuse_file_info *info) {
-    auto names = std::make_unique<std::vector<std::string>>();
-    if (int error = files().list(path, *names)) return -error;
-    info->fh = reinterpret_cast<uintptr_t>(names.release());
-    return 0;
-}
-int read_directory(const char *, void *buffer, fuse_fill_dir_t fill, off_t offset,
-                   struct fuse_file_info *info, enum fuse_readdir_flags) {
-    const auto &names = *reinterpret_cast<std::vector<std::string> *>(info->fh);
-    if (offset < 0) return -EINVAL;
-    for (size_t i = offset; i < names.size()+2; ++i) {
-        const char *name = i == 0 ? "." : i == 1 ? ".." : names[i-2].c_str();
-        if (fill(buffer, name, nullptr, i+1, static_cast<fuse_fill_dir_flags>(0))) break;
+    int error = fs.status(path, entry);
+    if (error && error != ENOENT) { fuse_reply_err(request, error); return; }
+    struct fuse_entry_param reply{};
+    // Positive and negative names have the same job lifetime as Files.
+    reply.entry_timeout = std::numeric_limits<double>::max();
+    reply.attr_timeout = 1; // Preserve libfuse's previous attribute lifetime.
+    if (!error) {
+        reply.ino = reinterpret_cast<fuse_ino_t>(entry);
+        attributes(fs, *entry, reply.attr);
     }
-    return 0;
+    fuse_reply_entry(request, &reply);
 }
-int close_directory(const char *, struct fuse_file_info *info) {
+void forget(fuse_req_t request, fuse_ino_t, uint64_t) {
+    // The compiler may forget a dentry and ask again. Files owns the snapshot
+    // until job completion, so no second inode reference table is necessary.
+    fuse_reply_none(request);
+}
+void get_attributes(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info *) {
+    auto &fs = files(request);
+    auto &entry = node(fs, inode);
+    if (entry.error) { fuse_reply_err(request, entry.error); return; }
+    struct stat st;
+    attributes(fs, entry, st);
+    fuse_reply_attr(request, &st, 1);
+}
+void open_file(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info *info) {
+    if ((info->flags & O_ACCMODE) != O_RDONLY) { fuse_reply_err(request, EROFS); return; }
+    auto &fs = files(request);
+    Entry *entry = &node(fs, inode);
+    if (int error = fs.open(entry->path->c_str(), entry)) { fuse_reply_err(request, error); return; }
+    info->keep_cache = 1;
+    fuse_reply_open(request, info);
+}
+void read_file(fuse_req_t request, fuse_ino_t inode, size_t size, off_t offset,
+               struct fuse_file_info *) {
+    auto &bytes = node(files(request), inode).bytes;
+    if (offset < 0) { fuse_reply_err(request, EINVAL); return; }
+    if (static_cast<uint64_t>(offset) >= bytes.size) { fuse_reply_buf(request, nullptr, 0); return; }
+    size = std::min(size, bytes.size-static_cast<size_t>(offset));
+    // The immutable snapshot already owns the reply body. Low-level FUSE
+    // writes it directly, without a second allocation and memcpy per read.
+    fuse_reply_buf(request, bytes.data+offset, size);
+}
+void read_link(fuse_req_t request, fuse_ino_t inode) {
+    auto &fs = files(request);
+    char target[PATH_MAX];
+    if (int error = fs.link(node(fs, inode).path->c_str(), target, sizeof(target))) {
+        fuse_reply_err(request, -error); return;
+    }
+    fuse_reply_readlink(request, target);
+}
+void open_directory(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info *info) {
+    auto &fs = files(request);
+    auto names = std::make_unique<std::vector<std::string>>();
+    if (int error = fs.list(node(fs, inode).path->c_str(), *names)) {
+        fuse_reply_err(request, error); return;
+    }
+    info->fh = reinterpret_cast<uintptr_t>(names.release());
+    fuse_reply_open(request, info);
+}
+void read_directory(fuse_req_t request, fuse_ino_t, size_t size, off_t offset,
+                    struct fuse_file_info *info) {
+    if (offset < 0) { fuse_reply_err(request, EINVAL); return; }
+    auto &names = *reinterpret_cast<std::vector<std::string> *>(info->fh);
+    std::vector<char> buffer(size);
+    size_t used = 0;
+    struct stat st{};
+    for (size_t i = offset; i < names.size(); ++i) {
+        size_t length = fuse_add_direntry(request, buffer.data()+used, size-used,
+                                          names[i].c_str(), &st, i+1);
+        if (length > size-used) break;
+        used += length;
+    }
+    fuse_reply_buf(request, buffer.data(), used);
+}
+void close_directory(fuse_req_t request, fuse_ino_t, struct fuse_file_info *info) {
     delete reinterpret_cast<std::vector<std::string> *>(info->fh);
-    return 0;
+    fuse_reply_err(request, 0);
 }
 bool mapping(const char *path, const std::string &value) {
     int fd = ::open(path, O_WRONLY | O_CLOEXEC);
@@ -507,9 +565,11 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
         mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr)) return nullptr;
     auto state = std::make_unique<Mount>();
     state->mountpoint = mountpoint;
-    struct fuse_operations operations{};
+    struct fuse_lowlevel_ops operations{};
     operations.init = initialize;
-    operations.getattr = attributes;
+    operations.lookup = lookup;
+    operations.forget = forget;
+    operations.getattr = get_attributes;
     operations.open = open_file;
     operations.read = read_file;
     operations.readlink = read_link;
@@ -519,10 +579,10 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
     char name[] = "distcc-files", options[] = "-oro";
     char *argv[] = {name, options};
     struct fuse_args args = FUSE_ARGS_INIT(2, argv);
-    state->fs = fuse_new(&args, &operations, sizeof(operations), state.get());
+    state->fs = fuse_session_new(&args, &operations, sizeof(operations), state.get());
     fuse_opt_free_args(&args);
     if (!state->fs) { errno = EINVAL; return nullptr; }
-    if (fuse_mount(state->fs, mountpoint)) { fuse_destroy(state->fs); return nullptr; }
+    if (fuse_session_mount(state->fs, mountpoint)) { fuse_session_destroy(state->fs); return nullptr; }
     // Shutdown may arrive before the child installs libfuse's handler. Keep it
     // pending across fork, without changing the worker's own signal policy.
     sigset_t stop_signal, previous_mask;
@@ -531,10 +591,10 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
     state->child = fork();
     if (state->child) sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
     if (state->child < 0) {
-        fuse_unmount(state->fs); fuse_destroy(state->fs); return nullptr;
+        fuse_session_unmount(state->fs); fuse_session_destroy(state->fs); return nullptr;
     }
     if (!state->child) {
-        auto session = fuse_get_session(state->fs);
+        auto session = state->fs;
         struct sigaction action{};
         action.sa_handler = SIG_DFL;
         sigemptyset(&action.sa_mask);
@@ -545,7 +605,7 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
         sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
         // This service must not keep the worker's cancellation/result sockets
         // alive. It owns only the FUSE device and its filesystem RPC stream.
-        int device = fuse_session_fd(fuse_get_session(state->fs));
+        int device = fuse_session_fd(state->fs);
         int first = std::min(device, channel), last = std::max(device, channel);
         if (first > 3) close_range(3, first-1, 0);
         if (last > first+1) close_range(first+1, last-1, 0);
@@ -557,19 +617,19 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
         int result = state->files->prefetch(cwd, directories);
         if (result) {
             fprintf(stderr, "distcc GCC directory prefetch: %s\n", strerror(result));
-            fuse_unmount(state->fs);
+            fuse_session_unmount(state->fs);
         } else {
-            result = fuse_loop(state->fs);
+            result = fuse_session_loop(state->fs);
             if (result == SIGTERM) result = 0;
         }
         state->files.reset();
         fuse_remove_signal_handlers(session);
-        fuse_destroy(state->fs);
+        fuse_session_destroy(state->fs);
         _exit(result ? 1 : 0);
     }
     // Destroying the parent's handle closes its device fd without unmounting.
     // The service is the sole owner: its death must abort pending kernel reads.
-    fuse_destroy(state->fs);
+    fuse_session_destroy(state->fs);
     state->fs = nullptr;
     return state.release();
 }
