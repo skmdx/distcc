@@ -4,37 +4,40 @@ TODO list for distcc
 
 reduce remaining client filesystem service cost in remote preprocessing
 
-    r233 deploys 77f645e: keep the client filesystem/cache improvements,
-    use the common 20 ms local-slot retry instead of per-command inotify,
-    and allow bounded staging only on TCP workers with more than four lanes.
-    Sixteen/eight/four execution lanes receive four/two/zero staging slots;
-    reported build parallelism and actual admission use the same rule.
-    Queued candidates still compete against ready workers by predicted finish.
-    Local validation finishes with 543 passing tests and five skips. The
-    initial ready-worker ranking failure and outdated test assumptions were
-    corrected; the affected broker suite and real TCP-result regression pass.
+    r234 deploys 564a46a: allow four staged jobs only on TCP workers with
+    at least sixteen execution lanes, preserving the shared reported/live
+    admission rule and ready-worker finish comparison. Smaller or memory-
+    reduced workers expose execution capacity only. Client directory replies
+    reuse a fixed getdents64 buffer instead of allocating/locking a DIR per
+    enumeration; freshness, permissions and negative lookup indexes remain.
+    All 548 local tests finish with 543 passes and five skips, including
+    multi-batch listings, EINTR, mid-stream EIO and descriptor cleanup.
     All five deployed nodes pass C/C++ and Rust execution checks;
     the 25 Rust client/worker pairs and all five ThinLTO clients pass.
     One clean glibc build completes all 6642 jobs remotely with zero worker
     errors, timeouts, disconnects, planner warnings or local fallbacks.
     Compiler flags, ebuild hash and libc.so hash match the preceding build;
-    automatic parallelism is -j38, versus r228/r232's -j32 and r231's -j48.
+    automatic parallelism is -j36, versus r233's -j38 and r228/r232's -j32.
 
-    Wall time is 274.855 seconds: 4.819 seconds below r232, but 6.741 seconds
-    above r228 (+2.51%). Client build CPU is 692.676 seconds versus r228's
-    688.168 and r232's 686.887. Remote average use rises to 6.126 cores from
-    5.839/5.977, but total remote CPU also rises 7.45% relative to r228.
-    The bundle does not demonstrate a further speedup over r228; this task
-    remains open. Wall time is 12.26% below r226, not the acceptance baseline.
-    All 32 slots are busy in 46/268 one-second samples versus r232's 1/273.
-    The larger workers' queues peak at four and two; four-lane workers remain
-    at zero. Positive queue samples are 79 and nine, not continuous queuing.
-    Observed remote-active time falls from r232's 205.933 to 200.212 seconds,
-    still above r228's 195.284. Intervals without remote work total 74.464
-    seconds versus 72.653 in r228. Dividing total worker CPU by observed active
-    time estimates 8.485 cores versus r228's 8.095, not sustained 32-core use.
-    Slot occupancy is not CPU utilization; staging removes some idle gaps
-    without establishing that turnaround delay was the sole remaining cause.
+    Wall time is 270.562 seconds: 4.293 seconds below r233, but 2.448 seconds
+    above r228 (+0.91%). Client build CPU is 690.638 seconds, down 2.038 from
+    r233 but above both r228's 688.168 and r232's 686.887. Neither the speedup
+    objective nor the lowest client CPU target is met; this task remains open.
+    Remote use averages 6.069 cores, and total remote CPU is 1654.003 seconds
+    versus r228's 1580.860. Wall time is 13.63% below r226, not the acceptance
+    baseline. All 32 slots are busy in 19/264 one-second samples. Only the
+    sixteen-lane worker queues, peaking at four with 66 positive samples.
+    Observed remote-active time is 197.457 seconds versus r228's 195.284;
+    intervals without remote work are 72.922 versus 72.653 seconds. Estimated
+    worker CPU per remote-active second is 8.377, not sustained 32-core use.
+
+    With the eight-lane worker's queue removed, aggregate CPU per job is
+    418 ms versus r233's 430 ms, still above r228's 363 ms. These mix different
+    translation units. None of the saved worker frequency samples in r228,
+    r233 or r234 is valid; thermal throttling is not established by these data.
+    The results do not support staging alone as the complete cause of the
+    remaining slowdown. Further decisions need matched work/cost evidence,
+    rather than inferring physical causes from queue depth or job counts.
 
     The preceding r230 bundle cached successful per-job symlink results and
     reduced authorization-root traversal, but incorrectly omitted full name
@@ -46,9 +49,10 @@ reduce remaining client filesystem service cost in remote preprocessing
     are retained. Restoring the index removes that regression, not the remaining
     client bottleneck or the failure to beat r228.
 
-    The r228/r232/r233 90-120 second profiles record 65.612/56.245/57.367 CPU
-    seconds. In r233, distcc-client is 28.286, planner 12.286 and GCC driver
-    6.592 seconds; client newfstatat is 1.816 and mmap/munmap total 2.286.
+    The r228/r232/r233/r234 90-120 second profiles record
+    65.612/56.245/57.367/58.082 CPU seconds. In r234, distcc-client is 27.959,
+    planner 13.551 and GCC driver 7.388 seconds; client newfstatat is 2.082,
+    getdents64 0.837 and mmap/munmap total 3.245 seconds.
     These data do not isolate changed job placement, worker execution speed
     or end-to-end turnaround costs, and do not support queue capacity alone
     as a sufficient explanation of the remaining gap against r228.
