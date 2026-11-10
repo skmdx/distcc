@@ -51,6 +51,7 @@ def owner_canary(args, work, source):
     built.check_returncode()
     shutil.copy2(helper, work/helper.name)
     shutil.copy2(source/'owner_interpose.c',work/'owner_interpose.c')
+    shutil.copy2(source/'owner.h',work/'owner.h')
     library = work/'owner_interpose.so'
     built = run([*shlex.split(os.environ.get('CC','cc')), *shlex.split(os.environ.get('CFLAGS','')),
                  '-shared','-fPIC','-Wall','-Wextra',work/'owner_interpose.c','-ldl','-pthread','-o',library])
@@ -66,6 +67,9 @@ def owner_canary(args, work, source):
         private = directory/'unexported.h'; private.write_text('not exported\n')
         value.write_text('#pragma once\nenum { value = 37 };\n')
         os.link(value,root/'hard.h')
+        (root/'copy.h').write_bytes(value.read_bytes())
+        for name in ('metadata-only.h','mutable.h','replaced.h','revoked.h'):
+            (root/name).write_text('before\n')
         (root/'denied.h').write_text('#error denied\n'); (root/'denied.h').chmod(0)
         contents = '#include "value.h"\n#include "hard.h"\nint answer(void) { return value; }\n'
         if case == 'diagnostic': contents += 'int invalid = missing_identifier;\n'
@@ -98,10 +102,18 @@ def owner_canary(args, work, source):
                 if expected is not None and output.read_bytes() != expected: raise RuntimeError('object mismatch')
                 trace = (directory/'access.trace').read_text()
                 if 'memfd:distcc-input' not in trace: raise RuntimeError('compiler did not read exported input FD')
+                # The actual GCC is the first input consumer. ABI contract
+                # checks then use additional untouched files in the same view.
+                probe = run([work/helper.name,'probe','0','0',root,cache],
+                            env=dict(environment,DCC_CANARY_IMAGE=str(work/helper.name)),
+                            pass_fds=(caller.fileno(),),timeout=15)
+                (directory/'probe.log').write_text(probe.stdout+probe.stderr)
+                probe.check_returncode()
+                contracts = json.loads(probe.stdout)
                 def get(path):
-                    caller.send(os.fsencode(path))
-                    data, ancillary, _, _ = caller.recvmsg(4,socket.CMSG_SPACE(4))
-                    error, = struct.unpack('i',data)
+                    caller.send(b'O'+os.fsencode(path))
+                    data, ancillary, _, _ = caller.recvmsg(4096,socket.CMSG_SPACE(4))
+                    error, = struct.unpack('i',data[:4])
                     if error: raise OSError(error,os.strerror(error),str(path))
                     return array.array('i',ancillary[0][2])[0]
                 first, second, alias = get(value), get(value), get(root/'hard.h')
@@ -115,7 +127,7 @@ def owner_canary(args, work, source):
                     if not export_denied: raise RuntimeError('client export authorization bypassed')
                     independent = os.read(first,4) == os.read(second,4)
                     identity = (os.fstat(first).st_dev,os.fstat(first).st_ino) == (os.fstat(alias).st_dev,os.fstat(alias).st_ino)
-                    metadata_identity = (os.stat(value).st_dev,os.stat(value).st_ino) == (os.fstat(first).st_dev,os.fstat(first).st_ino)
+                    metadata_identity = contracts['path_fd_identity']
                     seals = fcntl.fcntl(first,fcntl.F_GET_SEALS)
                     if not independent or not identity or seals != 15: raise RuntimeError('FD ownership contract failed')
                     caller.close(); owner.wait(timeout=5); peer.wait(timeout=5)
@@ -130,16 +142,19 @@ def owner_canary(args, work, source):
                     except subprocess.TimeoutExpired: process.kill(); process.wait(); raise
             if owner.returncode or peer.returncode: raise RuntimeError('owner/client failed')
         operations = (directory/'owner.log').read_text()
+        requests = (directory/'client.log').read_text().splitlines()
+        if any(line.startswith('rpc 2 ') and str(root/'metadata-only.h') in line for line in requests):
+            raise RuntimeError('metadata-only query performed READ')
         if 'export '+str(main) not in operations or 'export '+str(value) not in operations: raise RuntimeError('missing Files reachability')
         results.append(dict(case=case,status=actual.returncode,object_match=expected is not None,
                             diagnostics_match=True,independent_offsets=independent,hardlink_identity=identity,
                             native_stat_fstat_identity=metadata_identity,seals=seals,survives_owner=survives_owner,
-                            unexported_input_denied=export_denied))
+                            unexported_input_denied=export_denied,contracts=contracts))
     unchanged = all(digest(item['binary']) == item['sha256'] for item in image.values())
     if not unchanged: raise RuntimeError('compiler binary changed')
     result = dict(valid=True,cases=results,compiler_binaries_unchanged=unchanged,
                   scope='Actual Files/Connection and frontend_fs authorization; no production adoption or timing claim.',
-                  blocker='Native stat(path) and fstat(payload FD) expose different devices/inodes; path metadata has not been replaced.',
+                  path_identity='Native stat adapter and unmodified fstat describe the same OS object; client identity remains private to Files.',
                   limits=['Symlink/canonicalization, PCH and directory consumers remain outside this connection canary.',
                           'One selected compiler child per owner; no concurrent multi-compiler claim.'])
     (work/'summary.json').write_text(json.dumps(result,indent=2)+'\n'); print(json.dumps(result,indent=2))

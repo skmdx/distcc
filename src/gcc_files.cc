@@ -40,6 +40,15 @@ struct Entry {
     dccfs::Buffer link_target;
     unsigned mode() const { return number(version.data()+32, 4); }
 };
+void source_attributes(const Entry &entry, struct stat &st) {
+    st = {};
+    const char *p = entry.version.data();
+    st.st_mode = number(p+32, 4); st.st_size = number(p+24, 8);
+    st.st_nlink = S_ISDIR(st.st_mode) ? 2 : 1;
+    int64_t mtime = number(p+16, 8), ctime = number(p+44, 8);
+    st.st_mtim = {mtime/1000000000, mtime%1000000000};
+    st.st_ctim = {ctime/1000000000, ctime%1000000000};
+}
 struct Query {
     unsigned operation = DCC_FS_LSTAT;
     std::string path, bytes;
@@ -58,7 +67,6 @@ struct InputDescriptor {
     }
 };
 struct Inode {
-    ino_t number;
     std::shared_ptr<InputDescriptor> descriptor;
 };
 class Files {
@@ -132,7 +140,9 @@ public:
     ino_t inode(uint64_t device, uint64_t number) {
         // One FUSE mount represents several client devices. Preserve hardlink
         // identity without aliasing equal inode numbers on distinct devices.
-        return inodes.try_emplace(std::make_pair(device, number), Inode{inodes.size()+1, {}}).first->second.number;
+        // A stable map node is the FUSE view's opaque identity. The native
+        // view uses the OS object owned by this same node, not another map.
+        return reinterpret_cast<ino_t>(&inodes[std::make_pair(device, number)]);
     }
     int prepare(const std::set<std::string> &scheduled, Query &query, bool speculative = false) {
         const auto &path = *scheduled.begin();
@@ -396,50 +406,90 @@ public:
         }
         return 0;
     }
-    int open(const char *path, Entry *&entry) {
-        if (int error = status(path, entry)) return error;
-        if (!S_ISREG(entry->mode())) return EINVAL;
-        if (!entry->bytes.owner) {
+    int contents(const char *path, Entry &entry, const char *version) {
+        // The caller has resolved a regular entry. bytes.owner records this
+        // path's read authorization, separately from inode/metadata visibility.
+        if (!entry.bytes.owner) {
             dccfs::Snapshot snapshot;
-            if (auto error = connection.read(path, entry->version.data(), snapshot)) return error.value();
-            entry->version = snapshot.version;
-            entry->bytes = std::move(snapshot.bytes);
+            if (auto error = connection.read(path, version, snapshot)) return error.value();
+            entry.version = snapshot.version;
+            entry.bytes = std::move(snapshot.bytes);
         }
         return 0;
     }
-    // Canary boundary only: not routed from production compiler jobs. Native
-    // fstat exposes the payload inode, not the client's metadata inode.
-    int descriptor(const char *path) {
-        Entry *entry;
-        if (int error = open(path, entry)) { errno = error; return -1; }
-        auto key = std::make_pair(number(entry->version.data(), 8), number(entry->version.data()+8, 8));
-        inode(key.first, key.second);
-        auto &snapshot = inodes.at(key).descriptor;
-        if (!snapshot || snapshot->version != entry->version) {
+    int open(const char *path, Entry *&entry) {
+        if (int error = status(path, entry)) return error;
+        if (!S_ISREG(entry->mode())) return EINVAL;
+        return contents(path, *entry, entry->version.data());
+    }
+    static int stamp(int fd, const Entry &entry) {
+        int64_t time = number(entry.version.data()+16, 8);
+        struct timespec times[2] = {{0, UTIME_OMIT}, {time/1000000000, time%1000000000}};
+        // This is a read-only worker object, not the client's credential view.
+        // Reopening must not reapply client mode bits under a different UID;
+        // the client alone authorizes READ, before any descriptor is exported.
+        return fchmod(fd, 0400) || futimens(fd, times) ? -1 : 0;
+    }
+    std::shared_ptr<InputDescriptor> object(const Entry &entry) {
+        auto key = std::make_pair(number(entry.version.data(), 8), number(entry.version.data()+8, 8));
+        auto &snapshot = inodes[key].descriptor;
+        if (!snapshot) {
             auto next = std::make_shared<InputDescriptor>();
             next->fd = memfd_create("distcc-input", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-            if (next->fd < 0) return -1;
+            if (next->fd < 0 || ftruncate(next->fd, number(entry.version.data()+24, 8)) ||
+                stamp(next->fd, entry)) return {};
+            next->version = entry.version;
+            snapshot = std::move(next);
+        }
+        return snapshot;
+    }
+    // Metadata does not fetch contents or grant a readable FD. A sparse OS
+    // object establishes identity before the first authorized read.
+    int path_stat(const char *path, struct stat &st) {
+        Entry *entry;
+        if (int error = status(path, entry)) return error;
+        if (S_ISLNK(entry->mode())) return EOPNOTSUPP; // This canary has no follow-link route yet.
+        if (!S_ISREG(entry->mode())) {
+            source_attributes(*entry, st);
+            st.st_ino = inode(number(entry->version.data(), 8), number(entry->version.data()+8, 8));
+            return 0;
+        }
+        auto snapshot = object(*entry);
+        if (!snapshot || fstat(snapshot->fd, &st)) return errno;
+        return 0;
+    }
+    // Canary native view: first READ reauthorizes the path, even after an
+    // earlier stat or cache hit. A metadata-only object is never exported.
+    int descriptor(const char *path) {
+        Entry *entry;
+        if (int error = status(path, entry)) { errno = error; return -1; }
+        if (!S_ISREG(entry->mode())) { errno = EINVAL; return -1; }
+        if (int error = contents(path, *entry, nullptr)) { errno = error; return -1; }
+        auto snapshot = object(*entry);
+        if (!snapshot) return -1;
+        int seals = fcntl(snapshot->fd, F_GET_SEALS);
+        if (seals < 0) return -1;
+        if (!(seals & F_SEAL_WRITE)) {
+            if (ftruncate(snapshot->fd, entry->bytes.size)) return -1;
             for (size_t used = 0; used < entry->bytes.size;) {
-                ssize_t n = write(next->fd, entry->bytes.data+used, entry->bytes.size-used);
+                ssize_t n = pwrite(snapshot->fd, entry->bytes.data+used, entry->bytes.size-used, used);
                 if (n < 0 && errno == EINTR) continue;
                 if (n <= 0) return -1;
                 used += n;
             }
-            int64_t time = number(entry->version.data()+16, 8);
-            struct timespec stamp[2] = {{0, UTIME_OMIT}, {time/1000000000, time%1000000000}};
-            if (fchmod(next->fd, entry->mode() & 0777) || futimens(next->fd, stamp) ||
-                fcntl(next->fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)) return -1;
-            next->size = entry->bytes.size;
-            next->version = entry->version;
-            if (next->size) {
-                next->mapping = mmap(nullptr, next->size, PROT_READ, MAP_SHARED, next->fd, 0);
-                if (next->mapping == MAP_FAILED) return -1;
-            }
-            snapshot = std::move(next);
+            if (stamp(snapshot->fd, *entry) ||
+                fcntl(snapshot->fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)) return -1;
+            snapshot->size = entry->bytes.size;
+            snapshot->version = entry->version;
         }
+        if (snapshot->size && snapshot->mapping == MAP_FAILED) {
+            snapshot->mapping = mmap(nullptr, snapshot->size, PROT_READ, MAP_SHARED, snapshot->fd, 0);
+            if (snapshot->mapping == MAP_FAILED) return -1;
+        }
+        // Aliases retain the job's first authorized contents of this inode;
+        // their own READ must still succeed before they share those bytes.
+        entry->version = snapshot->version;
         entry->bytes = {snapshot, snapshot->size ? static_cast<const char *>(snapshot->mapping) : "", snapshot->size};
-        // dup/SCM_RIGHTS alone would share the offset. Opening this proc entry
-        // creates an independent read-only description of the same inode.
         std::string path_fd = "/proc/self/fd/"+std::to_string(snapshot->fd);
         return ::open(path_fd.c_str(), O_RDONLY | O_CLOEXEC);
     }
@@ -474,18 +524,13 @@ void initialize(void *, struct fuse_conn_info *connection) {
     connection->want |= connection->capable & FUSE_CAP_CACHE_SYMLINKS;
 }
 void attributes(Files &fs, const Entry &entry, struct stat &st) {
-    st = {};
+    source_attributes(entry, st);
     const char *p = entry.version.data();
     st.st_ino = fs.inode(number(p, 8), number(p+8, 8));
-    st.st_mode = number(p+32, 4); st.st_size = number(p+24, 8);
-    st.st_nlink = S_ISDIR(st.st_mode) ? 2 : 1;
     // Client RPC enforces original permissions. The private namespace maps
     // this job's sole compiler user/group to zero; no credential syscall is
     // needed for each lookup. Preserve the existing ownership presentation.
     st.st_uid = 0; st.st_gid = 0;
-    int64_t mtime = number(p+16, 8), ctime = number(p+44, 8);
-    st.st_mtim = {mtime/1000000000, mtime%1000000000};
-    st.st_ctim = {ctime/1000000000, ctime%1000000000};
 }
 void lookup(fuse_req_t request, fuse_ino_t parent, const char *name) {
     auto &fs = files(request);
