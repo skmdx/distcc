@@ -1135,11 +1135,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         available++;
         if (client->command == JOBS) {
             int jobs = dcc_capacity_parallelism(p->host, cap);
-            int staged = p->host->tcp_jobs && p->host->mode == DCC_MODE_TCP;
-            int pipeline = staged ? (jobs < DCC_TCP_PIPELINE ? jobs : DCC_TCP_PIPELINE) : 0;
-            /* Keep the compiler lanes fed while other make jobs prepare and
-             * transfer inputs. Admission still enforces execution limits. */
-            reply.slots += jobs + pipeline;
+            /* Staging overlaps these jobs' preparation and result transfer;
+             * it is not additional execution capacity. Adding every worker's
+             * staging allowance oversubscribes the shared client, especially
+             * when small workers double their advertised parallelism. */
+            reply.slots += jobs;
             if (jobs > 0) {
                 struct dcc_capacity full;
                 if (cap) {

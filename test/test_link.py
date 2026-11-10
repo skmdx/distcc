@@ -251,12 +251,45 @@ class LinkTestCase(BrokerTestCase):
                 _, error = proc.communicate(timeout=15)
                 self.assertEqual(proc.returncode, 0, error)
                 self.assertIn(b'distcc-link: local:', error)
-                self.assertIn('nothing available, sleeping 20ms', log.read_text())
+                self.assertIn('waiting for local slot release (up to 20ms)', log.read_text())
                 subprocess.run([str(output)], check=True, capture_output=True)
             finally:
                 if proc.poll() is None:
                     proc.kill()
                     proc.communicate()
+
+    def test_local_slot_close_wakes_any_free_lane_without_poll_delay(self):
+        self.env['DISTCC_HOSTS'] += ' --localslots=2'
+        self.env['DISTCC_PAUSE_TIME_MSEC'] = '5000'
+        locks = Path(self.env['DISTCC_DIR']) / 'lock'
+        locks.mkdir(exist_ok=True)
+        log, output = self.work/'release.log', self.work/'release.out'
+        self.env['DISTCC_LOG'] = str(log)
+        held = [(locks/f'cpu_localhost_{i}').open('w') for i in range(2)]
+        for file in held: fcntl.lockf(file, fcntl.LOCK_EX)
+        proc = subprocess.Popen([str(self.build/'distcc'), '--local-command',
+                                 '/bin/sh', '-c', 'echo released > "$1"', 'sh', str(output)],
+                                env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            while not log.exists() or 'waiting for local slot release' not in log.read_text():
+                self.assertIsNone(proc.poll())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            self.assertFalse(output.exists())
+            # Slot zero stays locked. A blocking lock on just that descriptor
+            # would miss this release; polling would sleep for five seconds.
+            held[1].close()
+            _, error = proc.communicate(timeout=2)
+            self.assertEqual(proc.returncode, 0, error)
+            self.assertEqual(output.read_text(), 'released\n')
+            with (locks/'cpu_localhost_1').open('w') as available:
+                fcntl.lockf(available, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            for file in held: file.close()
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
 
     def test_input_suffixes_bypass_helper_only_for_gcc(self):
         probe = self.work/'link-probe'

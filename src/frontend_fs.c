@@ -229,19 +229,31 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
             if (fstat(fd, &st)) goto failed;
             unsigned char version[DCC_FS_METADATA];
             encode_metadata(version, &st);
+            if (faccessat(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)) {
+                if (errno != EACCES) goto failed;
+                close(fd);
+                return metadata(reply, &st);
+            }
             if (!memcmp(previous, version, sizeof(version)) || hint_count) {
-                if (faccessat(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)) {
-                    if (errno != EACCES) goto failed;
-                    close(fd);
-                    return metadata(reply, &st);
-                }
                 if (metadata(reply, &st)) goto failed;
                 return directory(reply, fd, 2, hints, hint_count, previous, &st);
             }
             /* No positive hints means this directory may mainly reject
              * include candidates. Refresh its names once rather than
-             * requiring an individual RPC for every missing header. */
+             * requiring an individual RPC for every missing header. Reopen
+             * the pinned inode, not its pathname: its identity and search
+             * permissions are already checked. directory() still checks
+             * stability before publishing the newly enumerated names. */
+            int readable = openat(fd, ".", flags);
+            int error = errno;
             close(fd);
+            fd = readable;
+            if (fd < 0) {
+                errno = error;
+                return error == EACCES ? metadata(reply, &st) : -1;
+            }
+            if (metadata(reply, &st)) goto failed;
+            return directory(reply, fd, 2, hints, hint_count, previous, &st);
         }
     }
     if ((follow ? stat(path, &st) : lstat(path, &st))) return -1;

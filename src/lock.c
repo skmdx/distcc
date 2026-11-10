@@ -304,11 +304,9 @@ int dcc_lock_host(const char *lockname,
     return ret;
 }
 
-int dcc_lock_file(const char *fname, int block, int *lock_fd)
+int dcc_lock_fd(int fd, int block)
 {
-    int ret = dcc_open_lockfile(fname, lock_fd);
-    if (ret) return ret;
-    if (sys_lock(*lock_fd, block) == 0) return 0;
+    if (sys_lock(fd, block) == 0) return 0;
     else {
         switch (errno) {
 #if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
@@ -316,17 +314,23 @@ int dcc_lock_file(const char *fname, int block, int *lock_fd)
 #endif
         case EAGAIN:
         case EACCES: /* HP-UX and Cygwin give this for exclusion */
-            rs_trace("%s is busy", fname);
-            ret = EXIT_BUSY;
-            break;
+            return EXIT_BUSY;
         default:
-            rs_log_error("lock %s failed: %s", fname, strerror(errno));
-            ret = EXIT_IO_ERROR;
-            break;
+            rs_log_error("lock fd%d failed: %s", fd, strerror(errno));
+            return EXIT_IO_ERROR;
         }
+    }
+}
 
+int dcc_lock_file(const char *fname, int block, int *lock_fd)
+{
+    int ret = dcc_open_lockfile(fname, lock_fd);
+    if (ret) return ret;
+    ret = dcc_lock_fd(*lock_fd, block);
+    if (ret) {
+        if (ret == EXIT_BUSY) rs_trace("%s is busy", fname);
         dcc_close(*lock_fd);
         *lock_fd = -1;
-        return ret;
     }
+    return ret;
 }

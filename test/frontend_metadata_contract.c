@@ -159,11 +159,13 @@ static void empty_footprint(struct dcc_job *job, const char *path)
     encode_metadata(request + 5 + n, &st);
     request[5 + n + 16] ^= 1;
     struct dcc_frontend_reply reply = {.fd = -1};
+    descriptor_stats = 0;
     readable_directory_stats = 0;
     assert(!dcc_frontend_fs_reply(job, request, 5 + n + DCC_FS_METADATA, &reply));
     assert(!dcc_tcp_get32(reply.data));
     assert(reply.size > 68 && dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_STABLE);
-    assert(dcc_tcp_get32(reply.data + 64) && readable_directory_stats);
+    assert(dcc_tcp_get32(reply.data + 64) && readable_directory_stats == 1);
+    assert(descriptor_stats == 2); // One identity check and one publication check.
     dcc_frontend_fs_clear(&reply);
 }
 

@@ -242,8 +242,9 @@ not used as a performance estimate. Valid factors range from 0.01 to 1000.
 
 With `stats=PORT`, the slot limit defaults to the smaller of the server's allowed
 logical CPU count and `--jobs` limit. An explicit `/LIMIT`, for example
-`builder-a/8,stats=3633`, adds a client-side ceiling. `distcc -j` reports these
-limits. Servers without statistics retain their configured slot count (default
+`builder-a/8,stats=3633`, adds a client-side ceiling. `distcc -j` reports the sum
+of execution limits. Transport staging overlaps those jobs and is not added
+again to the build tool's parallelism. Servers without statistics retain their configured slot count (default
 4). Missing or invalid statistics also use this fallback. Clients and servers
 must report the same statistics schema, including CPU topology and coefficients.
 
@@ -438,6 +439,10 @@ local preprocessing before reserving that worker and reuse the preprocessed
 input on retries. By default, input preparation shares the available CPU slots
 with local compilation, keeping one producer able to feed remote workers even
 when local execution is full. `--localslots_cpp` sets an explicit preparation limit.
+Local commands retain their slot descriptors while waiting and wake when a lock
+descriptor closes, including on process death. A bounded recheck still handles
+explicit unlock without close and changing memory capacity; its interval is
+controlled by `DISTCC_PAUSE_TIME_MSEC` (default 20 ms).
 Ordinary Clang C-family compilation prepares LLVM IR once; the selected worker
 performs optimization and code generation. A job assigned back to its client
 also consumes that IR, preserving its dependency output without repeating the

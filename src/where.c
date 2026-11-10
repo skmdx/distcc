@@ -68,6 +68,8 @@
 
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/inotify.h>
+#include <poll.h>
 
 #include "distcc.h"
 #include "trace.h"
@@ -218,9 +220,67 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
  **/
 int dcc_lock_local(int *cpu_lock_fd)
 {
-    struct dcc_hostdef *chosen;
-
-    return dcc_lock_one(dcc_hostdef_local, &chosen, cpu_lock_fd, 0);
+    int maximum = dcc_hostdef_local->n_slots, ret = EXIT_OUT_OF_MEMORY;
+    int *fds = malloc(maximum * sizeof(*fds)), watch = -1;
+    if (!fds) return ret;
+    for (int i = 0; i < maximum; ++i) fds[i] = -1;
+    const char *pause = getenv("DISTCC_PAUSE_TIME_MSEC");
+    int timeout = pause ? atoi(pause) : 20;
+    if (timeout < 0) timeout = 0;
+    for (;;) {
+        /* Drain before checking locks: a release during or after the scan
+         * remains readable. Retained descriptors do not generate our own
+         * close events on each unsuccessful lock attempt. */
+        if (watch >= 0) {
+            char events[4096];
+            while (read(watch, events, sizeof(events)) > 0) {}
+        }
+        int limit = dcc_resource_local_slots(maximum);
+        for (int i = 0; i < limit; ++i) {
+            if (fds[i] < 0) {
+                char *name;
+                ret = dcc_make_lock_filename("cpu", dcc_hostdef_local, i, &name);
+                if (ret) goto done;
+                ret = dcc_open_lockfile(name, &fds[i]);
+                free(name);
+                if (ret) goto done;
+            }
+            ret = dcc_lock_fd(fds[i], 0);
+            if (!ret) {
+                *cpu_lock_fd = fds[i]; fds[i] = -1;
+                dcc_note_state_slot(i, DCC_LOCAL);
+                goto done;
+            }
+            if (ret != EXIT_BUSY) goto done;
+            rs_trace("cpu_localhost_%d is busy", i);
+        }
+        if (watch < 0) {
+            char *directory;
+            ret = dcc_get_lock_dir(&directory);
+            if (ret) goto done;
+            watch = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+            if (watch < 0 || inotify_add_watch(watch, directory, IN_CLOSE) < 0) {
+                rs_log_error("cannot watch local slot releases: %s", strerror(errno));
+                ret = EXIT_IO_ERROR;
+                goto done;
+            }
+            continue; /* Recheck after arming: never miss the first release. */
+        }
+        /* Close wakes normal completion and process death immediately.
+         * Explicit unlock without close and changing memory availability
+         * still need the existing bounded recheck. */
+        rs_trace("waiting for local slot release (up to %dms)", timeout);
+        struct pollfd event = {watch, POLLIN, 0};
+        if (poll(&event, 1, timeout) < 0 && errno != EINTR) {
+            ret = EXIT_IO_ERROR;
+            goto done;
+        }
+    }
+done:
+    if (watch >= 0) close(watch);
+    for (int i = 0; i < maximum; ++i) if (fds[i] >= 0) close(fds[i]);
+    free(fds);
+    return ret;
 }
 
 static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
