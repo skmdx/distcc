@@ -2,67 +2,24 @@ TODO list for distcc
 
 --> See also TODO and FIXME comments in source files and doc/todo/
 
-reduce remaining client filesystem service cost in remote preprocessing
+remove avoidable waits while remote compilation has runnable work
 
-    r234 deploys 564a46a: allow four staged jobs only on TCP workers with
-    at least sixteen execution lanes, preserving the shared reported/live
-    admission rule and ready-worker finish comparison. Smaller or memory-
-    reduced workers expose execution capacity only. Client directory replies
-    reuse a fixed getdents64 buffer instead of allocating/locking a DIR per
-    enumeration; freshness, permissions and negative lookup indexes remain.
-    All 548 local tests finish with 543 passes and five skips, including
-    multi-batch listings, EINTR, mid-stream EIO and descriptor cleanup.
-    All five deployed nodes pass C/C++ and Rust execution checks;
-    the 25 Rust client/worker pairs and all five ThinLTO clients pass.
-    One clean glibc build completes all 6642 jobs remotely with zero worker
-    errors, timeouts, disconnects, planner warnings or local fallbacks.
-    Compiler flags, ebuild hash and libc.so hash match the preceding build;
-    automatic parallelism is -j36, versus r233's -j38 and r228/r232's -j32.
+    Keep the complete-build objective: reduce client and worker filesystem/IPC
+    waits with available work, preserving compiler settings and output identity.
+    Idle capacity during build dependency waits is not a scheduling defect.
 
-    Wall time is 270.562 seconds: 4.293 seconds below r233, but 2.448 seconds
-    above r228 (+0.91%). Client build CPU is 690.638 seconds, down 2.038 from
-    r233 but above both r228's 688.168 and r232's 686.887. Neither the speedup
-    objective nor the lowest client CPU target is met; this task remains open.
-    Remote use averages 6.069 cores, and total remote CPU is 1654.003 seconds
-    versus r228's 1580.860. Wall time is 13.63% below r226, not the acceptance
-    baseline. All 32 slots are busy in 19/264 one-second samples. Only the
-    sixteen-lane worker queues, peaking at four with 66 positive samples.
-    Observed remote-active time is 197.457 seconds versus r228's 195.284;
-    intervals without remote work are 72.922 versus 72.653 seconds. Estimated
-    worker CPU per remote-active second is 8.377, not sustained 32-core use.
+    The native GCC filesystem already freezes queried names for one job, but
+    its FUSE mount did not cache negative lookups in the kernel. Repeated include
+    searches therefore woke the service even when no client RPC was needed.
+    Kernel name and symlink caches now share that job-scoped lifetime. A real
+    mount regression rejects repeated service callbacks; native GCC integration
+    tests cover fresh headers, permissions, symlinks and cancellation.
 
-    With the eight-lane worker's queue removed, aggregate CPU per job is
-    418 ms versus r233's 430 ms, still above r228's 363 ms. These mix different
-    translation units. None of the saved worker frequency samples in r228,
-    r233 or r234 is valid; thermal throttling is not established by these data.
-    The results do not support staging alone as the complete cause of the
-    remaining slowdown. Further decisions need matched work/cost evidence,
-    rather than inferring physical causes from queue depth or job counts.
-
-    The preceding r230 bundle cached successful per-job symlink results and
-    reduced authorization-root traversal, but incorrectly omitted full name
-    indexes when changed directories had no lookup hints. A real-GCC regression
-    with 64 absent headers reproduces the resulting 66 metadata RPCs versus
-    two warm RPCs; r231 restores the negative index and needs one RPC after
-    the directory change. All 80 related local tests pass. The r230 full build
-    regressed to 333.828 seconds and 955.155 client CPU seconds; those results
-    are retained. Restoring the index removes that regression, not the remaining
-    client bottleneck or the failure to beat r228.
-
-    The r228/r232/r233/r234 90-120 second profiles record
-    65.612/56.245/57.367/58.082 CPU seconds. In r234, distcc-client is 27.959,
-    planner 13.551 and GCC driver 7.388 seconds; client newfstatat is 2.082,
-    getdents64 0.837 and mmap/munmap total 3.245 seconds.
-    These data do not isolate changed job placement, worker execution speed
-    or end-to-end turnaround costs, and do not support queue capacity alone
-    as a sufficient explanation of the remaining gap against r228.
-    These inclusive sampled costs are not additive or isolated patch effects.
-    Each version has one deployment and one complete measurement. All use frame pointers, but
-    fixed windows can contain different work mixes and single runs do not
-    establish statistical significance.
-    Elimination of intermittent IPC failures, waiting and spare capacity
-    remains unverified.
-
+    Acceptance remains a matched full build with worker CPU and runnable/wait
+    evidence, no hidden fallback/errors, and matching generated artifacts.
+    Preserve unfavorable runs and limits in the existing measurement record:
+    the workspace's existing glibc measurement README (r234/r235). The fixed
+    30-second profiles do not establish whole-build or same-work improvements.
 
 recognize arbitrary input suffixes with explicit compiler language
 

@@ -717,6 +717,11 @@ filesystem remain local. GCC workers require libfuse3, `/dev/fuse` and
 permission to create a user and mount namespace. Offload compilation keeps its
 existing input preparation.
 
+Each GCC job owns its mount and its queried names, including absent files.
+Kernel name and symlink caches retain these answers for that mount's lifetime,
+avoiding repeated service wakeups for include searches. The next job creates a
+fresh mount; generated headers and changed search paths are queried afresh.
+
 GCC source from standard input (`-x c -` or `-x c++ -`) also uses this path.
 The client retains an immutable memfd snapshot, and the worker supplies it as
 the compiler's standard input. Source names, include lookup and dependency

@@ -4,6 +4,22 @@
 #include <sys/syscall.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#define FUSE_USE_VERSION 31
+#include <fuse3/fuse.h>
+static unsigned *attribute_calls;
+static int (*original_attributes)(const char *, struct stat *, struct fuse_file_info *);
+static int counted_attributes(const char *path, struct stat *st, struct fuse_file_info *info) {
+    ++*attribute_calls;
+    return original_attributes(path, st, info);
+}
+static struct fuse *counted_fuse_new(struct fuse_args *args, const struct fuse_operations *operations,
+                                     size_t size, void *data) {
+    auto counted = *operations;
+    original_attributes = counted.getattr;
+    counted.getattr = counted_attributes;
+    return fuse_new(args, &counted, size, data);
+}
 static pid_t mounted_child;
 static bool reader_alive_at_unmount;
 static int checked_unmount(const char *path, int flags) {
@@ -11,8 +27,11 @@ static int checked_unmount(const char *path, int flags) {
     return syscall(SYS_umount2, path, flags);
 }
 #define umount2 checked_unmount
+#undef fuse_new
+#define fuse_new counted_fuse_new
 #include "src/gcc_files.cc"
 #undef umount2
+#undef fuse_new
 #include <thread>
 
 // These framing tests inspect published hints but do not retain snapshots.
@@ -230,6 +249,7 @@ static void clean_mount(const char *root, bool lookup)
             std::string stamp(DCC_FS_METADATA, '\0');
             uint32_t permissions = htonl(S_IFDIR | 0755);
             memcpy(stamp.data()+32, &permissions, sizeof(permissions));
+            if (i == 2) { integer(stamp, DCC_FS_DIRECTORY_STABLE); integer(stamp, 0); }
             integer(payload, 0); integer(payload, stamp.size()); payload += stamp;
         }
         std::string response;
@@ -255,7 +275,22 @@ static void clean_mount(const char *root, bool lookup)
     sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
     close(pair[0]);
     struct stat info;
-    if (lookup) require(!lstat((mountpoint+"/tree").c_str(), &info), "live FUSE lookup");
+    if (lookup) {
+        require(!lstat((mountpoint+"/tree").c_str(), &info), "live FUSE lookup");
+        std::string missing = mountpoint+"/tree/include/absent.h";
+        require(open(missing.c_str(), O_RDONLY) == -1 && errno == ENOENT,
+                "initial negative lookup");
+        unsigned calls = *attribute_calls;
+        for (unsigned i = 0; i < 16; ++i)
+            require(open(missing.c_str(), O_RDONLY) == -1 && errno == ENOENT,
+                    "cached negative lookup");
+        printf("Repeated absent-file lookups: 16, service callbacks: %u\n", *attribute_calls-calls);
+        require(*attribute_calls == calls, "negative lookup woke the FUSE service again");
+        for (unsigned i = 0; i < 16; ++i)
+            require(open((missing+"/header-"+std::to_string(i)+".h").c_str(), O_RDONLY) == -1 &&
+                    errno == ENOENT, "cached absent search directory");
+        require(*attribute_calls == calls, "absent search directory woke the FUSE service again");
+    }
     mounted_child = static_cast<Mount *>(mount)->child;
     uint64_t cpu = 0;
     unsigned long long peak = 0;
@@ -272,6 +307,9 @@ static void clean_mount(const char *root, bool lookup)
 
 int main(int argc, char **argv)
 {
+    attribute_calls = static_cast<unsigned *>(mmap(nullptr, sizeof(unsigned), PROT_READ | PROT_WRITE,
+                                                   MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    require(attribute_calls != MAP_FAILED, "shared callback counter");
     cached_links();
     negative_hints();
     for (const char *mode : {"valid", "denied", "short", "length", "flags", "missing",
@@ -280,4 +318,5 @@ int main(int argc, char **argv)
     clean_mount(argv[1], true);
     clean_mount(argv[1], false);
     disconnected_mount(argv[1]);
+    munmap(attribute_calls, sizeof(unsigned));
 }

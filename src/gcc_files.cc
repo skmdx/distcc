@@ -15,6 +15,7 @@
 #include <set>
 #include <vector>
 #include <algorithm>
+#include <limits>
 extern "C" {
 #include "file_cache.h"
 }
@@ -393,7 +394,13 @@ struct Mount {
     pid_t child = -1;
 };
 Files &files() { return *static_cast<Mount *>(fuse_get_context()->private_data)->files; }
-void *initialize(struct fuse_conn_info *, struct fuse_config *config) {
+void *initialize(struct fuse_conn_info *connection, struct fuse_config *config) {
+    // Files already retains positive and negative lookups for this job. Give
+    // the kernel the same lifetime instead of waking the service for repeated
+    // include searches. The next compiler gets a fresh mount and fresh names.
+    // libfuse saturates these durations to the protocol's maximum timeout.
+    config->entry_timeout = config->negative_timeout = std::numeric_limits<double>::max();
+    connection->want |= connection->capable & FUSE_CAP_CACHE_SYMLINKS;
     config->kernel_cache = 1;
     config->use_ino = 1;
     return fuse_get_context()->private_data;
