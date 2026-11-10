@@ -1150,7 +1150,7 @@ class GccFrontendTest(BrokerTestCase):
         compare(names[-1], 0)
 
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
-    def test_changed_directory_reuses_footprint_without_enumerating_siblings(self):
+    def test_changed_directory_refreshes_names_without_inspecting_unused_siblings(self):
         self.start_frontend()
         headers = self.work/'headers'
         headers.mkdir()
@@ -1163,21 +1163,22 @@ class GccFrontendTest(BrokerTestCase):
         self.compile(command)
         trace = self.work/'changed-directory.trace'
         for value in (11, 23):
-            # Output/name churn must not enumerate unrelated siblings, while
-            # changed contents of the actual dependency must still be fresh.
+            # GCC also checks unknown .gch names. Refresh their name index
+            # after churn, without querying attributes of unrelated outputs.
+            # Changed contents of the dependency must still be fresh.
             (headers/f'new-output-{value}.o').touch()
             header.write_text(f'#define VALUE {value}\n')
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
-            result = subprocess.run(['strace', '-f', '-yy', '-e', 'trace=getdents64',
+            result = subprocess.run(['strace', '-f', '-yy', '-e', 'trace=newfstatat,statx',
                                      '-o', str(trace), str(self.build/'distcc'), *command],
                                     cwd=self.work, env=self.env, capture_output=True,
                                     text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('pooled TCP job completed', result.stderr)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
-            self.assertNotIn(f'<{headers}>', trace.read_text(),
-                             'changed directory enumerated unrelated names')
+            self.assertNotIn('unused-', trace.read_text(),
+                             'name refresh queried unrelated child attributes')
         # A partial footprint must never turn a newly requested name into a
         # false ENOENT. GCC must reach the new dependency through the real path.
         (headers/'added.h').write_text('#define ADDED 41\n')
@@ -1206,6 +1207,35 @@ class GccFrontendTest(BrokerTestCase):
         print(f'Negative lookup RPC counts (warm, changed directory): {counts}')
         self.assertLessEqual(counts[1], counts[0] + 2,
                              'an empty footprint must not create one RPC per absent header')
+
+    def test_changed_partial_footprint_refreshes_unknown_names_once(self):
+        self.start_frontend()
+        headers = self.work/'partial-headers'
+        headers.mkdir()
+        (headers/'known.h').write_text('#define KNOWN 17\n')
+        self.source.write_text('#include <known.h>\n' + ''.join(
+            f'#if __has_include(<absent-{i}.h>)\n#error unexpected header\n#endif\n'
+            for i in range(64)) +
+            '#if __has_include(<generated.h>)\n#include <generated.h>\n'
+            '#else\n#define GENERATED 0\n#endif\n'
+            'int value(void) { return KNOWN + GENERATED; }\n')
+        command = [self.cc, '-nostdinc', '-Ipartial-headers', '-O2', '-c', 'hello.c', '-o', 'out.o']
+        self.compile(command)
+        warm = self.compile(command)
+        counts = [int(re.search(r'frontend filesystem: (\d+) requests', warm.stderr)[1])]
+        for action in ('unrelated', 'created', 'removed'):
+            if action == 'unrelated': (headers/'output.o').touch()
+            elif action == 'created': (headers/'generated.h').write_text('#define GENERATED 23\n')
+            else: (headers/'generated.h').unlink()
+            subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+            expected = (self.work/'out.o').read_bytes()
+            result = self.compile(command)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected, action)
+            count = int(re.search(r'frontend filesystem: (\d+) requests', result.stderr)[1])
+            counts.append(count)
+            self.assertLessEqual(count, counts[0]+3,
+                                 f'{action}: partial names produced {count} RPCs versus {counts[0]} warm')
+        print(f'Partial index RPCs (warm, unrelated, created, removed): {counts}')
 
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
     def test_warm_prefetch_reads_directory_metadata_once(self):

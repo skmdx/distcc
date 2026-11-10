@@ -721,6 +721,11 @@ Each GCC job owns its mount and its queried names, including absent files.
 Kernel name and symlink caches retain these answers for that mount's lifetime,
 avoiding repeated service wakeups for include searches. The next job creates a
 fresh mount; generated headers and changed search paths are queried afresh.
+When a directory changes, known child attributes can still be refreshed in one
+batch without listing unrelated names. If the compiler then requests an unknown
+child, the worker retrieves the complete current name index once, avoiding an
+individual metadata round trip for every new include candidate. Only names and
+attributes actually requested by the compiler extend its learned footprint.
 
 GCC source from standard input (`-x c -` or `-x c++ -`) also uses this path.
 The client retains an immutable memfd snapshot, and the worker supplies it as

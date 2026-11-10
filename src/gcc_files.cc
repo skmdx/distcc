@@ -131,7 +131,12 @@ public:
         std::array<char, DCC_FS_METADATA> listing_version{};
         if (previous.owner) {
             if (previous.size < DCC_FS_METADATA) return entry.error = EPROTO;
-            memcpy(listing_version.data(), previous.data, DCC_FS_METADATA);
+            // A partial reply suffices while the compiler uses known names.
+            // Once it requests an unknown child, refresh the complete index:
+            // sending its old version again would only yield another partial
+            // reply and force an individual RPC for each new include candidate.
+            if (entry.listing != Entry::Partial)
+                memcpy(listing_version.data(), previous.data, DCC_FS_METADATA);
         }
         if (predicted != predictions.end()) {
             entry.hints = std::move(predicted->second);
@@ -315,12 +320,13 @@ public:
         if (path != "/") {
             parent = entries.find(separator == 0 ? "/" : path.substr(0, separator));
             auto found = entries.find(path);
-            // Fetch an unused search root's names only on a real child lookup.
-            // A partial footprint already has known child attributes; unknown
-            // names use individual metadata queries and extend that footprint.
+            // Fetch names only when a real lookup needs them. Known children
+            // in a partial reply already have fresh attributes; the first
+            // unknown child upgrades that reply to a complete name index.
             if ((found == entries.end() || !found->second.queried) && parent != entries.end() &&
                 !parent->second.error && S_ISDIR(parent->second.mode()) &&
-                parent->second.listing == Entry::Deferred) {
+                (parent->second.listing == Entry::Deferred || parent->second.listing == Entry::Partial)) {
+                parent->second.hints.insert(path.substr(separator+1));
                 if (int error = fetch({parent->first})) return error;
             }
         }
@@ -339,7 +345,7 @@ public:
                 }
                 // A listed parent already proves absence. Repeated failed
                 // lookups must not turn that into a fresh stat on every job.
-                if (parent->second.listing == Entry::Partial || !entry.queried || entry.error != ENOENT)
+                if (!entry.queried || entry.error != ENOENT)
                     parent->second.observed.insert(path.substr(separator+1));
             }
         }
