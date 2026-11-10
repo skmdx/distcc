@@ -50,8 +50,11 @@ unsigned char *dcc_tcp_frame_make(uint32_t, const void *, size_t, size_t *);
 int dcc_tcp_unpack(const struct dcc_tcp_frame *, unsigned *, void *, const void **, size_t *);
 /* Caller supplies CHUNK+16 bytes. RAW returns only its 16-byte header. */
 size_t dcc_tcp_encode(uint32_t, unsigned, const void *, size_t, int, void *);
-/* Immutable extents use mmap/sendfile; mutable files retain a private read buffer. */
-unsigned char *dcc_tcp_file_chunk(uint32_t, unsigned, int, off_t, size_t, int, int, size_t *);
+/* Caller owns two distinct CHUNK+16 buffers and the returned view. It stays
+ * valid until that buffer is reused. Immutable RAW returns a sendfile header;
+ * mutable RAW retains its snapshot. File size is established by the caller. */
+unsigned char *dcc_tcp_file_chunk(uint32_t, unsigned, int, off_t, size_t, int, int,
+                                  unsigned char *, unsigned char *, size_t *);
 
 #define DCC_TCP_RUN 128
 struct dcc_tcp_run { uint32_t operation; uint64_t id; char root[PATH_MAX]; };

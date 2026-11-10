@@ -25,8 +25,14 @@ reduce remaining client filesystem service cost in remote preprocessing
     and GCC driver cost falls 7.388 to 6.816 seconds. The distcc-client role
     remains the main target: its sampled CPU is effectively unchanged
     at 28.531 versus 28.633 seconds (51.87% of the latest sampled CPU).
-    Keep the combined improvements; use the retained profile to guide any
-    further client-service changes. A single complete run does not isolate
+    The next local changes reuse client chunk/snapshot storage, read file
+    extents without per-chunk mapping/stat, cache the publication mask,
+    generate transaction IDs without random syscalls, use stack request
+    lists for small jobs, and reuse settings within each compile. Server
+    output packets still own their bytes until asynchronous sends finish.
+    Deployment and a matched complete-build comparison remain pending;
+    local correctness tests alone do not establish the performance gain.
+    A single complete run does not isolate
     individual patch contributions, establish stable speedup, or prove
     intermittent IPC failures impossible. The previous warning did not recur;
     full elimination of waiting and spare capacity remains unverified.

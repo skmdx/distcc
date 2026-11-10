@@ -1,13 +1,14 @@
 /* Exercise actual client hot paths; --bench reports bounded local work. */
 #include "frontend_fs.c"
+#include "tcp_client.c"
 #include "native_worker.h"
-#include "hosts.h"
 #include "frontend_identity.h"
 #include "argv_file.h"
 #include "broker.h"
 #include <assert.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 
 const char *rs_program_name = "client_hotpaths";
 
@@ -27,6 +28,92 @@ static void sample(const char *name, struct rusage *before)
     *before = after;
 }
 
+static void chunk_contract(void)
+{
+    static unsigned char wire[DCC_TCP_CHUNK + 16U], snapshot[DCC_TCP_CHUNK + 16U];
+    static unsigned char other[DCC_TCP_CHUNK + 16U], scratch[DCC_TCP_CHUNK + 16U];
+    static unsigned char source[DCC_TCP_CHUNK + 37U], decoded[DCC_TCP_CHUNK];
+    int fd = memfd_create("chunk-test", MFD_CLOEXEC);
+    assert(fd >= 0);
+    for (unsigned random = 0; random < 2; ++random) {
+        uint32_t state = 19;
+        for (unsigned i = 0; i < sizeof(source); ++i) {
+            state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+            source[i] = random ? state : 'a';
+        }
+        assert(pwrite(fd, source, sizeof(source), 0) == sizeof(source));
+        for (int immutable = 0; immutable < 2; ++immutable) {
+            for (size_t offset = 0; offset < sizeof(source); offset += DCC_TCP_CHUNK) {
+                size_t length = sizeof(source) - offset, size;
+                if (length > DCC_TCP_CHUNK) length = DCC_TCP_CHUNK;
+                int final = offset + length == sizeof(source);
+                unsigned char *p = dcc_tcp_file_chunk(DCC_TCP_INPUT, 7, fd, offset,
+                    length, final, immutable, wire, snapshot, &size);
+                assert(p == wire || p == snapshot);
+                assert(!!(dcc_tcp_get32(p) & DCC_TCP_FINAL) == final);
+                assert(!!(dcc_tcp_get32(p) & DCC_TCP_COMPRESSED) == !random);
+                if (size == 16) {
+                    assert(immutable && random && p == wire);
+                    /* sendfile supplies the immutable extent following the header. */
+                    assert(pread(fd, p + 16, length, offset) == (ssize_t)length);
+                    size += length;
+                }
+                struct dcc_tcp_frame frame = {.type = dcc_tcp_get32(p), .data = p + 8, .size = size - 8};
+                const void *data;
+                size_t plain;
+                unsigned index;
+                assert(!dcc_tcp_unpack(&frame, &index, decoded, &data, &plain));
+                assert(index == 7 && plain == length && !memcmp(data, source + offset, plain));
+                /* A second caller must not overwrite the first caller's queued bytes. */
+                memcpy(other, p, size);
+                size_t next_size;
+                assert(dcc_tcp_file_chunk(DCC_TCP_INPUT, 9, fd, 0, 1, 1, 1,
+                                         scratch, snapshot == p ? wire : snapshot, &next_size));
+                assert(!memcmp(other, p, size));
+            }
+        }
+    }
+    size_t size;
+    unsigned char *held = dcc_tcp_file_chunk(DCC_TCP_INPUT, 0, fd, 0,
+        DCC_TCP_CHUNK, 0, 0, wire, snapshot, &size);
+    assert(held == snapshot && size == DCC_TCP_CHUNK + 16U);
+    assert(!ftruncate(fd, 0));
+    assert(!memcmp(held + 16, source, DCC_TCP_CHUNK));
+    assert(!dcc_tcp_file_chunk(DCC_TCP_INPUT, 0, fd, 0, 1, 1, 0, wire, snapshot, &size));
+    assert(!dcc_tcp_file_chunk(DCC_TCP_INPUT, 0, fd, 0, 1, 1, 1, wire, snapshot, &size));
+    assert(dcc_tcp_file_chunk(DCC_TCP_INPUT, 0, fd, 0, 0, 1, 0, wire, snapshot, &size));
+    assert(size == 16);
+    close(fd);
+}
+
+static void id_contract(void)
+{
+    uint64_t previous = transaction_id(), parent[32], child[32];
+    int fds[2], status;
+    assert(previous && !pipe(fds));
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (!pid) {
+        close(fds[0]);
+        for (unsigned i = 0; i < 32; ++i) child[i] = transaction_id();
+        assert(write(fds[1], child, sizeof(child)) == sizeof(child));
+        _exit(0);
+    }
+    close(fds[1]);
+    for (unsigned i = 0; i < 32; ++i) {
+        parent[i] = transaction_id();
+        assert(parent[i] == previous + 1);
+        previous = parent[i];
+    }
+    assert(read(fds[0], child, sizeof(child)) == sizeof(child));
+    close(fds[0]);
+    assert(waitpid(pid, &status, 0) == pid && status == 0);
+    for (unsigned i = 0; i < 32; ++i) {
+        assert(child[i] && (!i || child[i] == child[i - 1] + 1));
+        for (unsigned j = 0; j < 32; ++j) assert(parent[i] != child[j]);
+    }
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -44,6 +131,8 @@ int main(int argc, char **argv)
         } else { perror("memo_get"); return 1; }
         return 0;
     }
+    chunk_contract();
+    id_contract();
     char token[4] = {'A', 'R', 'G', 'C'};
     unsigned value = 42;
     assert(!dcc_parse_token_int("ARGCffffffff", token, &value) && value == UINT_MAX);

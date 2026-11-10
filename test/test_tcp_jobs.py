@@ -2388,14 +2388,13 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[3], "unlink") && unlink(argv[2])) return 5;
     if (!strcmp(argv[3], "truncate") && truncate(argv[2], 0)) return 6;
     unsigned char raw[DCC_TCP_CHUNK], decoded[DCC_TCP_CHUNK];
-    unsigned char *chunk = NULL;
-    size_t capacity = 0;
+    unsigned char chunk[DCC_TCP_CHUNK + 16U];
     uint64_t stream_offset = 0, total = reply.size + reply.file_size;
     while (stream_offset < total) {
         size_t size = 0;
-        int failed = next_fs_chunk(&reply, &stream_offset, raw, &chunk, &capacity, &size);
+        int failed = next_fs_chunk(&reply, &stream_offset, raw, chunk, &size);
         if (!strcmp(argv[3], "truncate")) {
-            free(chunk); dcc_frontend_fs_clear(&reply);
+            dcc_frontend_fs_clear(&reply);
             return failed ? 0 : 7;
         }
         if (failed || size != 8 + dcc_tcp_get32(chunk + 4)) return 8;
@@ -2405,7 +2404,6 @@ int main(int argc, char **argv) {
             !!(frame.type & DCC_TCP_FINAL) != (stream_offset == total) ||
             fwrite(data, 1, plain, stdout) != plain) return 9;
     }
-    free(chunk);
     int fd = reply.fd;
     dcc_frontend_fs_clear(&reply);
     return reply.data || reply.fd != -1 || fcntl(fd, F_GETFD) != -1 || errno != EBADF ? 10 : 0;
@@ -2553,6 +2551,21 @@ class TcpJobTestCase(BrokerTestCase):
 
 
 class TcpJobsTest(TcpJobTestCase):
+    def test_output_and_dependency_modes_follow_client_umask(self):
+        self.start_tcp()
+        for mask in (0o027, 0o077):
+            with self.subTest(mask=oct(mask)):
+                output, deps = self.work/f'modes-{mask}.o', self.work/f'modes-{mask}.d'
+                result = subprocess.run([str(self.build/'distcc'), 'gcc', '-c', str(self.source),
+                    '-MD', '-MF', str(deps), '-o', str(output)],
+                    env=dict(self.env, DISTCC_VERBOSE='1'), capture_output=True, text=True,
+                    umask=mask, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('pooled TCP job completed', result.stderr)
+                for path in (output, deps):
+                    self.assertGreater(path.stat().st_size, 0)
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o666 & ~mask)
+
     def test_explicit_launcher_unwraps_absolute_masquerade_compilers(self):
         self.start_tcp()
         wrappers = self.work / 'masquerade'
@@ -2701,7 +2714,7 @@ class TcpJobsTest(TcpJobTestCase):
         self.assertEqual(entry.read_bytes(), body)
 
     @unittest.skipUnless(shutil.which('strace'), 'strace is required')
-    def test_sealed_input_maps_and_sends_raw_tail(self):
+    def test_sealed_input_reuses_storage_and_sends_raw_tail(self):
         self.start_tcp()
         wrappers = self.work / 'client-bin'
         wrappers.mkdir()
@@ -2729,9 +2742,9 @@ sys.exit(result.returncode)
                        capture_output=True, timeout=20)
         self.assertEqual(actual.read_bytes(), expected.read_bytes())
         calls = trace.read_text()
-        self.assertTrue(re.search(r'mmap\([^\n]*distcc-preprocessed', calls), 'sealed input was not mapped')
+        self.assertFalse(re.search(r'mmap\([^\n]*distcc-preprocessed', calls), 'input remapped per chunk')
         self.assertTrue(re.search(r'sendfile\([^\n]*distcc-preprocessed', calls), 'raw input did not use sendfile')
-        self.assertFalse(re.search(r'pread64\([^\n]*distcc-preprocessed', calls), 'sealed input was copied')
+        self.assertTrue(re.search(r'pread64\([^\n]*distcc-preprocessed', calls), 'input was not read for compression')
 
     def test_local_error_result_preserves_object_and_reuses_connection(self):
         prefix = str(self.root / 'local-error')

@@ -412,7 +412,7 @@ struct dcc_tcp_server *dcc_tcp_server_new(int fd, const struct dcc_tcp_dispatch 
     s->socket = fd; s->metadata = s->input_fd = -1;
     s->local = domain == AF_UNIX;
     s->dispatch = dispatch; s->tail = &s->head; s->active = time(NULL);
-    s->buffer = malloc(DCC_TCP_CHUNK);
+    s->buffer = malloc(DCC_TCP_CHUNK + 16U);
     s->hash = XXH3_createState();
     dcc_job_result_init(&s->result);
     if (!s->buffer || !s->hash) {
@@ -887,9 +887,11 @@ static void encode_output(void *argument)
     size_t amount = left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK;
     struct packet *p = calloc(1, sizeof(*p));
     if (!p) return;
-    p->data = dcc_tcp_file_chunk(DCC_TCP_OUTPUT, i, s->result.fd[i],
-                                s->output_offset, amount, amount == left, 1, &p->size);
-    if (!p->data) {
+    p->data = malloc(amount + 16);
+    /* RETURNING no longer decodes inputs or filesystem replies. The server's
+     * existing scratch is exclusive to this encoder; queued packets own data. */
+    if (!p->data || !dcc_tcp_file_chunk(DCC_TCP_OUTPUT, i, s->result.fd[i],
+            s->output_offset, amount, amount == left, 1, p->data, s->buffer, &p->size)) {
         free(p->data); free(p); return;
     }
     p->header_size = p->size;

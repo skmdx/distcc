@@ -222,12 +222,11 @@ static int dcc_note_discrepancy(const char *discrepancy_filename)
 static void dcc_perhaps_adjust_cpp_where_and_protover(
     char *input_fname,
     struct dcc_hostdef *host,
-    char *discrepancy_filename)
+    char *discrepancy_filename, const char *include_server)
 {
     /* It's unfortunate that the variable that controls preprocessing is in the
        "host" datastructure. See elaborate complaint in dcc_build_somewhere. */
 
-    const char *include_server = getenv("INCLUDE_SERVER_PORT");
     if (!include_server || !*include_server) {
         host->cpp_where = DCC_CPP_ON_CLIENT;
         dcc_get_protover_from_features(host->compr, host->cpp_where, &host->protover);
@@ -723,11 +722,10 @@ static int dcc_get_max_retries(void)
 
 /* Only pure object/archive links are candidates. The helper validates options
  * and acquires a local slot only when it falls back to a local command. */
-static int dcc_link_candidate(char **argv)
+static int dcc_link_candidate(char **argv, const char *broker)
 {
     int i, input = 0;
     const char *profile = getenv("DISTCC_LINK_SYSROOT");
-    const char *broker = getenv("DISTCC_BROKER");
     if (!broker || !*broker || ((!profile || !*profile) && !strstr(argv[0], "clang")))
         return 0;
     for (i = 1; argv[i]; i++) {
@@ -744,10 +742,10 @@ static int dcc_link_candidate(char **argv)
     return input;
 }
 
-static int dcc_multi_candidate(char **argv)
+static int dcc_multi_candidate(char **argv, const char *broker)
 {
     int inputs = 0;
-    if (!getenv("DISTCC_BROKER") || dcc_getenv_bool("_DISTCC_MULTI_LOCAL", 0)) return 0;
+    if (!broker || dcc_getenv_bool("_DISTCC_MULTI_LOCAL", 0)) return 0;
     for (int i = 1; argv[i]; ++i) {
         if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "-S") ||
             !strcmp(argv[i], "-E") || !strcmp(argv[i], "-###")) return 0;
@@ -805,6 +803,12 @@ dcc_build_somewhere(char *argv[],
                     int sg_level,
                     int *status)
 {
+    /* Read job settings once. Pump can be disabled below; update its local
+     * view at the same point as the environment inherited by subprocesses.
+     * Do not cache arbitrary getenv calls across native worker invocations. */
+    const char *broker = getenv("DISTCC_BROKER");
+    const char *include_server = getenv("INCLUDE_SERVER_PORT");
+    int rewrite_cross = !getenv("DISTCC_NO_REWRITE_CROSS");
     char *input_fname = NULL, *output_fname, *cpp_fname = NULL, *deps_fname = NULL;
     int cpp_fd = -1;
     char **files = NULL;
@@ -848,7 +852,7 @@ dcc_build_somewhere(char *argv[],
      * when the build appends its usual optimization/target/linker flags. */
     if (dcc_metadata_query(argv)) goto run_local;
 
-    if (dcc_multi_candidate(argv)) {
+    if (dcc_multi_candidate(argv, broker)) {
         int argc = dcc_argv_len(argv);
         char **command = calloc(argc + 2, sizeof(*command));
         if (!command) { ret = EXIT_OUT_OF_MEMORY; goto clean_up; }
@@ -862,7 +866,7 @@ dcc_build_somewhere(char *argv[],
     }
 
     /* Links belong to the link driver, not the compile-only Clang scanner. */
-    if (dcc_link_candidate(argv)) {
+    if (dcc_link_candidate(argv, broker)) {
         int argc = dcc_argv_len(argv);
         char **link_argv = calloc(argc + 2, sizeof(*link_argv));
         if (!link_argv || !(link_argv[0] = strdup("distcc-link"))) {
@@ -883,27 +887,29 @@ dcc_build_somewhere(char *argv[],
     /* Classify before probing: preprocessing and local links need no native
      * expansion. A successful expansion invalidates the scanner's pointers. */
 #ifdef HAVE_FSTATAT
-    if (!getenv("DISTCC_NO_REWRITE_CROSS")) dcc_rewrite_generic_compiler(argv);
+    if (rewrite_cross) dcc_rewrite_generic_compiler(argv);
 #endif
     ret = dcc_prepare_clang(&argv, &auxiliary);
     if (ret) goto lock_local;
     ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 1);
     dcc_free_argv(argv);
     argv = new_argv;
-    if (dcc_offload_language(argv)) unsetenv("INCLUDE_SERVER_PORT");
+    if (dcc_offload_language(argv)) {
+        unsetenv("INCLUDE_SERVER_PORT"); include_server = NULL;
+    }
     preprocess_only = dcc_argv_search(argv, "-E");
-    if (preprocess_only && (ret || !getenv("INCLUDE_SERVER_PORT")))
+    if (preprocess_only && (ret || !include_server))
         ret = EXIT_LOCAL_CPP;
     /* Local execution consumes the same broker capacity as a local worker,
      * but needs neither native expansion nor a duplicate header/input tree. */
     if (!ret && !dcc_scan_includes && !dcc_offload_language(argv) &&
-        getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER")) {
+        broker && *broker) {
         dcc_work_describe(&work, argv, input_fname, NULL, -1, 0);
         direct_lease = dcc_broker_try_local(&work);
         if (direct_lease >= 0) goto run_local;
     }
     remote_frontend = !ret && !preprocess_only && !dcc_scan_includes &&
-        dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) && getenv("DISTCC_BROKER") &&
+        dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) && broker &&
         (dcc_cpp_ir(argv, input_fname) || dcc_cpp_gcc(argv, input_fname));
     /* The native GCC path retains '-' all the way to cc1 and transports its
      * input independently of pathname lookup. Other paths still inherit stdin. */
@@ -925,7 +931,7 @@ dcc_build_somewhere(char *argv[],
             work = (struct dcc_work_hint){0};
         }
     }
-    if (!getenv("DISTCC_NO_REWRITE_CROSS")) {
+    if (rewrite_cross) {
         int changed = dcc_add_clang_target(new_argv);
         changed |= dcc_gcc_rewrite_fqn(new_argv) == 0;
         if (changed) work = (struct dcc_work_hint){0};
@@ -961,14 +967,14 @@ dcc_build_somewhere(char *argv[],
             ret = EXIT_IO_ERROR; goto unlock_and_clean_up;
         }
     }
-    if (!prepared_job && !preprocess_only && !dcc_scan_includes && dcc_cpp_ir(argv, input_fname))
-        unsetenv("INCLUDE_SERVER_PORT");
+    if (!prepared_job && !preprocess_only && !dcc_scan_includes && dcc_cpp_ir(argv, input_fname)) {
+        unsetenv("INCLUDE_SERVER_PORT"); include_server = NULL;
+    }
 
     /* A homogeneous broker pool has a known input format before selection.
      * Finish include analysis before reserving a worker or opening its socket:
      * analysis must not consume worker slots or their idle timeout. */
-    if (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER") &&
-        getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes && !prepared_job) {
+    if (broker && *broker && include_server && !dcc_scan_includes && !prepared_job) {
         struct dcc_hostdef *list = NULL, *entry;
         int count, same_format = 1;
         enum dcc_compress compr = DCC_COMPRESS_NONE;
@@ -996,7 +1002,7 @@ dcc_build_somewhere(char *argv[],
                            "preprocessing locally before worker selection");
             if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) dcc_exit(ret);
             files = NULL;
-            unsetenv("INCLUDE_SERVER_PORT");
+            unsetenv("INCLUDE_SERVER_PORT"); include_server = NULL;
             if (preprocess_only) goto fallback;
         }
     }
@@ -1004,8 +1010,7 @@ dcc_build_somewhere(char *argv[],
     /* With a broker, finish local preprocessing before reserving a worker.
      * Release the local lock before requesting the remote lease; never wait
      * for a remote slot while holding a local slot. Reuse this input on retry. */
-    if (getenv("DISTCC_BROKER") && *getenv("DISTCC_BROKER") &&
-        !getenv("INCLUDE_SERVER_PORT") && !dcc_scan_includes && !prepared_job) {
+    if (broker && *broker && !include_server && !dcc_scan_includes && !prepared_job) {
         dcc_read_localslots_configuration();
         if (local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
             (ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
@@ -1026,7 +1031,7 @@ dcc_build_somewhere(char *argv[],
         cpp_ready = 1;
     }
 
-    if (getenv("DISTCC_BROKER"))
+    if (broker)
         if (cpp_ready || !work.key)
             dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready);
     if (prepared_job && !dcc_job_frontend(prepared_job) && work.key)
@@ -1084,7 +1089,7 @@ dcc_build_somewhere(char *argv[],
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
         /* Perhaps it is not a good idea to preprocess on the server. */
         dcc_perhaps_adjust_cpp_where_and_protover(input_fname, host,
-                                                  discrepancy_filename);
+                                                  discrepancy_filename, include_server);
     }
     if (dcc_scan_includes) {
         ret = dcc_approximate_includes(host, argv);

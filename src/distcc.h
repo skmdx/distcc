@@ -23,6 +23,9 @@
 
 /* distcc.h -- common internal-use header file */
 
+#ifndef DISTCC_H
+#define DISTCC_H
+
 #include <sys/types.h>
 #include <stdint.h>
 /* Internal return from remote execution: transport completed, but local
@@ -422,3 +425,5 @@ int dcc_map_input_file(int in_fd, off_t in_size, char **buf_ret);
 #ifndef WCOREDUMP
 #  define WCOREDUMP(status) 0
 #endif
+
+#endif /* DISTCC_H */

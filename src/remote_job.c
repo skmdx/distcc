@@ -178,8 +178,12 @@ static int publish(int *source, struct dcc_job_result *result, unsigned index, c
         }
         close(*source); *source = destination;
     }
-    mode_t mask = umask(0);
-    umask(mask);
+    /* The command-line client keeps its inherited mask for its lifetime. */
+    static mode_t mask = (mode_t)-1;
+    if (mask == (mode_t)-1) {
+        mask = umask(0);
+        umask(mask);
+    }
     if (fchmod(*source, 0666 & ~mask)) return EXIT_IO_ERROR;
     int failed = close(*source);
     *source = -1;
