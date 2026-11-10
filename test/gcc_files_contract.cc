@@ -160,6 +160,37 @@ static void negative_hints()
             "searched directory was forgotten or absent child metadata was retained");
 }
 
+static void cached_links()
+{
+    for (const char *target : {"relative/../header", "/absolute/header"}) {
+        int pair[2];
+        require(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair), "link socketpair");
+        std::thread peer([&] {
+            uint32_t header[3];
+            read_bytes(pair[1], header, sizeof(header));
+            require(ntohl(header[0]) == DCC_TCP_FS_QUERY &&
+                    ntohl(header[2]) == DCC_FS_READLINK, "link query");
+            std::string path(ntohl(header[1])-4, '\0');
+            read_bytes(pair[1], path.data(), path.size());
+            require(path == "/tree/link", "link spelling changed");
+            std::string response;
+            integer(response, 0); integer(response, strlen(target)); response += target;
+            require(send(pair[1], response.data(), response.size(), MSG_NOSIGNAL) ==
+                    static_cast<ssize_t>(response.size()), "link reply");
+            close(pair[1]); // Any repeated request fails deterministically.
+        });
+        Files files(pair[0], "/sandbox", "fixture", "/cache", "/tree", "part.c");
+        char output[128];
+        require(files.link("/tree/link", output, 1) == -ENAMETOOLONG, "short link buffer");
+        for (int i = 0; i < 3; ++i) {
+            require(!files.link("/tree/link", output, sizeof(output)), "link snapshot was not reused");
+            require(std::string(output) == (target[0] == '/' ? "/sandbox" : "") + std::string(target),
+                    "link target rewritten incorrectly");
+        }
+        peer.join();
+    }
+}
+
 static void disconnected_mount(const char *root)
 {
     int pair[2];
@@ -241,6 +272,7 @@ static void clean_mount(const char *root, bool lookup)
 
 int main(int argc, char **argv)
 {
+    cached_links();
     negative_hints();
     for (const char *mode : {"valid", "denied", "short", "length", "flags", "missing",
                              "trailing", "bad-error", "disconnect"}) replies(mode);

@@ -2314,7 +2314,7 @@ int main(int argc, char **argv) {
         compiled = subprocess.run([compiler, '-D_GNU_SOURCE', '-ffunction-sections', '-fdata-sections',
                         '-I'+str(self.build/'src'), str(self.build/'test/frontend_metadata_contract.c'),
                         str(self.build/'src/tcp_job.c'), str(self.build/'src/argutil.c'),
-                        '-Wl,--gc-sections,--wrap=fstat', '-llz4', '-o', str(executable)],
+                        '-Wl,--gc-sections,--wrap=fstat,--wrap=realpath', '-llz4', '-o', str(executable)],
                         capture_output=True, timeout=30)
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
         subprocess.run([str(executable), str(self.work)], check=True, timeout=5)

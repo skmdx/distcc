@@ -32,6 +32,9 @@ struct Entry {
     std::vector<std::string_view> names;
     // File contents or the immutable reply/cache record owning directory names.
     dccfs::Buffer bytes;
+    // A job owns one filesystem snapshot. Repeated FUSE readlink callbacks
+    // must not round-trip to the client and reauthorize the same hop.
+    dccfs::Buffer link_target;
     unsigned mode() const { return number(version.data()+32, 4); }
 };
 struct Query {
@@ -372,12 +375,14 @@ public:
         return 0;
     }
     int link(const char *path, char *buffer, size_t size) {
-        dccfs::Buffer target;
-        if (auto error = connection.request(DCC_FS_READLINK, path, target)) return -error.value();
-        std::string name(target.data, target.size);
-        if (!name.empty() && name[0] == '/') name.insert(0, root);
-        if (!size || name.size() >= size) return -ENAMETOOLONG;
-        memcpy(buffer, name.c_str(), name.size()+1);
+        auto &target = entries[path].link_target;
+        if (!target.owner)
+            if (auto error = connection.request(DCC_FS_READLINK, path, target)) return -error.value();
+        size_t prefix = target.size && target.data[0] == '/' ? root.size() : 0;
+        if (size <= prefix || target.size >= size - prefix) return -ENAMETOOLONG;
+        if (prefix) memcpy(buffer, root.data(), prefix);
+        memcpy(buffer + prefix, target.data, target.size);
+        buffer[prefix + target.size] = 0;
         return 0;
     }
 };

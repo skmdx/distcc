@@ -3,7 +3,13 @@
 #include "frontend_fs.c"
 #include <assert.h>
 
-static int mutate, descriptor_stats, readable_directory_stats;
+static int mutate, descriptor_stats, readable_directory_stats, canonicalizations;
+char *__real_realpath(const char *, char *);
+char *__wrap_realpath(const char *path, char *buffer)
+{
+    ++canonicalizations;
+    return __real_realpath(path, buffer);
+}
 int __real_fstat(int, struct stat *);
 int __wrap_fstat(int fd, struct stat *st)
 {
@@ -105,6 +111,62 @@ static void reuse_reply(struct dcc_job *job, const char *path)
     free(request);
 }
 
+static void authorization(const char *root)
+{
+    char link[PATH_MAX], physical[PATH_MAX], nested[PATH_MAX], leaf[PATH_MAX];
+    snprintf(link, sizeof(link), "%s/alias", root);
+    snprintf(physical, sizeof(physical), "%s/physical", root);
+    snprintf(nested, sizeof(nested), "%s/physical/child", root);
+    snprintf(leaf, sizeof(leaf), "%s/alias/child/header", root);
+    assert(!mkdir(physical, 0755));
+    assert(!symlink("physical", link));
+    assert(!symlink("../view", nested));
+    struct dcc_job job = {.cwd = (char *)root};
+    assert(!dcc_frontend_fs_add_root(&job, leaf));
+    assert(!dcc_frontend_fs_add_root(&job, "alias/child/another"));
+    assert(allowed(&job, link) == PATH_METADATA);
+    canonicalizations = 0;
+    struct dcc_frontend_reply reply = query(&job, link, DCC_FS_READLINK, NULL);
+    assert(canonicalizations == 1); // One hop, not one realpath per export.
+    dcc_frontend_fs_clear(&reply);
+    assert(allowed(&job, physical) == PATH_METADATA);
+    assert(allowed(&job, nested) == PATH_METADATA);
+    assert(!(allowed(&job, root) & PATH_CONTENTS));
+    snprintf(leaf, sizeof(leaf), "%s/physical/child/header", root);
+    assert(allowed(&job, leaf) == (PATH_METADATA | PATH_CONTENTS));
+    reply = query(&job, nested, DCC_FS_READLINK, NULL);
+    dcc_frontend_fs_clear(&reply);
+    snprintf(leaf, sizeof(leaf), "%s/view/header", root);
+    assert(allowed(&job, leaf) == (PATH_METADATA | PATH_CONTENTS));
+    snprintf(leaf, sizeof(leaf), "%s/view/private", root);
+    assert(!(allowed(&job, leaf) & PATH_CONTENTS));
+    assert(!dcc_frontend_fs_add_root(&job, root));
+    assert(dcc_argv_len(job.fs_roots) == 1 && !strcmp(job.fs_roots[0], root));
+    assert(!dcc_frontend_fs_add_root(&job, leaf));
+    assert(dcc_argv_len(job.fs_roots) == 1);
+    dcc_free_argv(job.fs_roots);
+}
+
+static void empty_footprint(struct dcc_job *job, const char *path)
+{
+    unsigned char request[PATH_MAX + 5 + DCC_FS_METADATA] = {0};
+    dcc_tcp_put32(request, DCC_FS_LSTAT);
+    size_t n = strlen(path);
+    memcpy(request + 4, path, n);
+    struct stat st;
+    assert(!stat(path, &st));
+    /* Changed timestamp, known directory, no predicted child names. */
+    encode_metadata(request + 5 + n, &st);
+    request[5 + n + 16] ^= 1;
+    struct dcc_frontend_reply reply = {.fd = -1};
+    readable_directory_stats = 0;
+    assert(!dcc_frontend_fs_reply(job, request, 5 + n + DCC_FS_METADATA, &reply));
+    assert(!dcc_tcp_get32(reply.data));
+    assert(reply.size == 68 && dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_PARTIAL);
+    assert(!dcc_tcp_get32(reply.data + 64) && !readable_directory_stats);
+    dcc_frontend_fs_clear(&reply);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2 || argc == 3);
@@ -114,8 +176,10 @@ int main(int argc, char **argv)
     assert(asprintf(&saved, "%s/saved", argv[1]) >= 0);
     assert(!mkdir(directory_path, 0755));
     contents(header, "one");
+    authorization(argv[1]);
     char *roots[] = {argv[1], NULL};
     struct dcc_job job = {.fs_roots = roots};
+    empty_footprint(&job, directory_path);
     descriptor_stats = 0;
     struct dcc_frontend_reply reply = query(&job, directory_path, DCC_FS_ATTRIBUTES, NULL);
     assert(reply.size == 8 + DCC_FS_METADATA && !descriptor_stats && reply.fd == -1);

@@ -59,8 +59,17 @@ int dcc_frontend_fs_add_root(struct dcc_job *job, const char *path)
     char **roots = realloc(job->fs_roots, (count+2)*sizeof(*roots));
     if (!roots) return -1;
     job->fs_roots = roots;
-    roots[count] = strdup(root); roots[count+1] = NULL;
-    return roots[count] ? 0 : -1;
+    char *copy = strdup(root);
+    if (!copy) return -1;
+    /* Keep the authorization frontier minimal. A broad export supersedes
+     * its descendants, including roots learned through earlier symlinks. */
+    size_t retained = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (within(roots[i], root)) free(roots[i]);
+        else roots[retained++] = roots[i];
+    }
+    roots[retained++] = copy; roots[retained] = NULL;
+    return 0;
 }
 int dcc_frontend_fs_add_roots(struct dcc_job *job, const char *paths)
 {
@@ -155,7 +164,7 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
     if (!result && statuses == 2) {
         encode_metadata(version, initial);
         if (!memcmp(version, previous, sizeof(version))) flags |= DCC_FS_DIRECTORY_CACHED;
-        else if (hint_count && S_ISDIR(dcc_tcp_get32(previous + 32)))
+        else if (S_ISDIR(dcc_tcp_get32(previous + 32)))
             flags |= DCC_FS_DIRECTORY_PARTIAL;
     }
     if (flags & (DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_PARTIAL)) {
@@ -218,18 +227,16 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
         fd = open(path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (fd >= 0) {
             if (fstat(fd, &st)) goto failed;
-            unsigned char version[DCC_FS_METADATA];
-            encode_metadata(version, &st);
-            if (!memcmp(previous, version, sizeof(version)) || hint_count) {
-                if (faccessat(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)) {
-                    if (errno != EACCES) goto failed;
-                    close(fd);
-                    return metadata(reply, &st);
-                }
-                if (metadata(reply, &st)) goto failed;
-                return directory(reply, fd, 2, hints, hint_count, previous, &st);
+            if (faccessat(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)) {
+                if (errno != EACCES) goto failed;
+                close(fd);
+                return metadata(reply, &st);
             }
-            close(fd);
+            if (metadata(reply, &st)) goto failed;
+            /* A changed directory invalidates negative names, not the
+             * usefulness of lookup hints. Even an empty footprint can be
+             * refreshed without enumerating unrelated build outputs. */
+            return directory(reply, fd, 2, hints, hint_count, previous, &st);
         }
     }
     if ((follow ? stat(path, &st) : lstat(path, &st))) return -1;
@@ -296,7 +303,8 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
     if (((const char *)data)[4] != '/') return -1;
     if (operation == DCC_FS_STDIN && size != 5) return -1;
     const char *names = (const char *)data + 4, *end = (const char *)data + size;
-    const char *separator = memchr(names, 0, end - names), **hints = NULL, *version = NULL;
+    const char *separator = memchr(names, 0, end - names), *small_hints[32];
+    const char **hints = small_hints, *version = NULL;
     size_t hint_count = 0;
     if (operation == DCC_FS_LSTAT) {
         if (!separator || end - separator - 1 < DCC_FS_METADATA) return -1;
@@ -310,18 +318,22 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
             previous = name; name = zero + 1; ++hint_count;
         }
         if (hint_count) {
-            hints = malloc(hint_count * sizeof(*hints));
+            if (hint_count > sizeof(small_hints) / sizeof(*small_hints))
+                hints = malloc(hint_count * sizeof(*hints));
             if (!hints) return -1;
             const char *name = version + DCC_FS_METADATA;
             for (size_t i = 0; i < hint_count; ++i) { hints[i] = name; name += strlen(name) + 1; }
         }
     } else if (separator) return -1;
-    char *path = strndup(names, separator ? separator - names : end - names);
+    char path[PATH_MAX];
+    size_t path_length = separator ? (size_t)(separator - names) : (size_t)(end - names);
     int error = 0;
     size_t start = reply->size;
     unsigned char header[8] = {0};
     struct stat st;
-    if (!path || append(reply, header, 8)) goto failed;
+    if (append(reply, header, 8)) goto failed;
+    if (path_length >= sizeof(path)) { error = ENAMETOOLONG; goto complete; }
+    memcpy(path, names, path_length); path[path_length] = 0;
     int access = operation == DCC_FS_STDIN ? PATH_CONTENTS : allowed(job, path);
     int required = operation == DCC_FS_STAT || operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES ||
         operation == DCC_FS_READLINK || operation == DCC_FS_REALPATH ? PATH_METADATA : PATH_CONTENTS;
@@ -365,26 +377,40 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
             } else {
                 /* A symlink above an export grants only the exports below
                  * it, rather than every file in the symlink's target. */
-                size_t count = dcc_argv_len(job->fs_roots);
-                for (size_t i = 0; i < count && !error; ++i) {
-                    if (!within(job->fs_roots[i], path)) continue;
-                    char *resolved = realpath(job->fs_roots[i], NULL);
-                    if (resolved && dcc_frontend_fs_add_root(job, resolved)) error = ENOMEM;
+                char *resolved = realpath(path, NULL);
+                if (resolved) {
+                    /* Resolve this hop once. Descendant symlinks remain in
+                     * their original spelling and authorize their own hop
+                     * when the compiler follows them. */
+                    size_t count = dcc_argv_len(job->fs_roots), used = 0;
+                    char **aliases = calloc(count + 1, sizeof(*aliases));
+                    if (!aliases) error = ENOMEM;
+                    for (char **root = job->fs_roots; *root && !error; ++root) {
+                        if (!within(*root, path)) continue;
+                        char alias[PATH_MAX];
+                        int alias_length = snprintf(alias, sizeof(alias), "%s%s", resolved, *root + path_length);
+                        if (alias_length < 0 || alias_length >= (int)sizeof(alias)) error = ENAMETOOLONG;
+                        else if (!(aliases[used++] = strdup(alias))) error = ENOMEM;
+                    }
+                    for (char **alias = aliases; alias && *alias && !error; ++alias)
+                        if (dcc_frontend_fs_add_root(job, *alias)) error = ENOMEM;
+                    if (aliases) dcc_free_argv(aliases);
                     free(resolved);
                 }
             }
         }
     } else error = EINVAL;
+complete:
     if (error) {
         if (reply->fd >= 0) close(reply->fd);
         reply->fd = -1; reply->file_size = 0; reply->size = start + 8;
     }
     dcc_tcp_put32(reply->data + start, error);
     dcc_tcp_put32(reply->data + start + 4, reply->size + reply->file_size - start - 8);
-    free(path); free(hints);
+    if (hints != small_hints) free(hints);
     return 0;
 failed:
-    free(path); free(hints);
+    if (hints != small_hints) free(hints);
     return -1;
 }
 int dcc_frontend_fs_reply(struct dcc_job *job, const void *data, size_t size,
