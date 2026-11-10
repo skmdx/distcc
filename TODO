@@ -8,12 +8,12 @@ remove avoidable waits while remote compilation has runnable work
     waits with available work, preserving compiler settings and output identity.
     Idle capacity during build dependency waits is not a scheduling defect.
 
-    The native GCC filesystem already freezes queried names for one job, but
-    its FUSE mount did not cache negative lookups in the kernel. Repeated include
-    searches therefore woke the service even when no client RPC was needed.
-    Kernel name and symlink caches now share that job-scoped lifetime. A real
-    mount regression rejects repeated service callbacks; native GCC integration
-    tests cover fresh headers, permissions, symlinks and cancellation.
+    Job-scoped kernel name caching removes repeated native GCC filesystem
+    wakeups and improves the complete build. First-read filesystem RPC waits
+    remain; client CPU increased. The saved full-run samples do not separate
+    every remaining input-service wait from build dependencies. Further changes
+    must address a measured runnable-work stall, not queue depth or a core-count
+    threshold. Native GCC regressions preserve fresh headers and permissions.
 
     Acceptance remains a matched full build with worker CPU and runnable/wait
     evidence, no hidden fallback/errors, and matching generated artifacts.
