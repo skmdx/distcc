@@ -51,6 +51,29 @@ scheduler transitions. No client-side perf recorder is started.
 Temporary directories contain execution copies and results, never editable
 sources. Existing evidence snapshots are not modified or executable prerequisites.
 
+## Input interposition canary
+
+For the isolated libc boundary check, use the same canonical directory:
+
+```sh
+python3 bench/replay/interpose.py --cc /path/to/target-gcc --cxx /path/to/target-g++ --workdir /path/to/empty-run
+```
+
+This compiles a small preload library with the current host compiler/flags and
+uses the existing target compilers unchanged. It saves actual ELF relocations,
+direct internal calls and dependent libraries. Each native control is compared
+with real snapshot-file substitution after poisoning the original inputs; a
+native negative control must fail. Cases cover C/C++, aliases, PCH files and
+directories, embed, diagnostic rereads, missing and denied inputs. Access logs
+and output equality are required. No scheduler capture or performance claim.
+
+`interpose.c` returns real native descriptors/streams, with no read/fstat/mmap
+emulation and no second `Files` owner. The private tree is a fixture, not export
+authorization. The selected fortified realpath boundary, external/retargeted
+symlinks, ACLs, cancellation and concurrent job ownership remain outside this
+canary's acceptance. Production integration must obtain authorized snapshots
+from the existing owner; this library is not installed or used by distccd.
+
 ## Validity and overhead
 
 TASKSTATS supplies CPU runtime, runnable delay and context-switch counts for
