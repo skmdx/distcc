@@ -1024,6 +1024,16 @@ static int cpp_limit(const struct broker *broker)
     return limit > 0 ? limit : 1;
 }
 
+static int pipeline_slots(const struct dcc_hostdef *host, int lanes)
+{
+    /* Small workers get execution slots only. Above four lanes, pre-stage
+     * one job per four lanes, bounded by the transport's existing depth.
+     * Use the same rule for build parallelism and actual admission. */
+    if (!host->tcp_jobs || host->mode != DCC_MODE_TCP || lanes <= 4) return 0;
+    int slots = lanes / 4;
+    return slots < DCC_TCP_PIPELINE ? slots : DCC_TCP_PIPELINE;
+}
+
 static int dispatch(struct broker *broker, struct client *client, double now, struct dispatch_batch *batch)
 {
     struct reply reply = {0};
@@ -1054,7 +1064,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     int i, slots, available = 0, ready_hosts = 0;
     double work_rate = 0, min_rate = 0;
     struct selection {
-        int peer, probe, wait, idle;
+        int peer, probe, wait, idle, enqueue;
         double score, fill;
         struct prediction forecast;
     } best = {.peer = -1}, ready = {.peer = -1};
@@ -1135,11 +1145,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         available++;
         if (client->command == JOBS) {
             int jobs = dcc_capacity_parallelism(p->host, cap);
-            /* Staging overlaps these jobs' preparation and result transfer;
-             * it is not additional execution capacity. Adding every worker's
-             * staging allowance oversubscribes the shared client, especially
-             * when small workers double their advertised parallelism. */
-            reply.slots += jobs;
+            reply.slots += jobs + pipeline_slots(p->host, jobs);
             if (jobs > 0) {
                 struct dcc_capacity full;
                 if (cap) {
@@ -1165,12 +1171,14 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         if (cap && (cap->capacity == 0 || cap->memory_pressure >= 10)) continue;
         if (cap && cap->available == 0 && !staged) continue;
         if (p->full_until > now || (link && p->link_until > now)) continue;
-        int inflight = slots + (staged ? (slots < DCC_TCP_PIPELINE ? slots : DCC_TCP_PIPELINE) : 0);
+        int capacity = cap && cap->capacity >= 0 && cap->capacity < slots ? cap->capacity : slots;
+        int pipeline = link_backend ? 0 : pipeline_slots(p->host, capacity);
+        int inflight = slots + pipeline;
         int work = p->busy;
         if (staged && cap && cap->busy >= 0 && cap->queued >= 0 && cap->preparing >= 0) {
             int limit = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
             if (cap->capacity >= 0 && cap->capacity < limit) limit = cap->capacity;
-            int pipeline = limit < DCC_TCP_PIPELINE ? limit : DCC_TCP_PIPELINE;
+            int shared_pipeline = pipeline_slots(p->host, limit);
             /* Project the global snapshot, not local leases plus the same
              * server queue. Requests dispatched during/after the probe are
              * conservatively charged until the next successful snapshot.
@@ -1195,11 +1203,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             if (returning < 0) returning = 0;
             int leased = p->busy - returning;
             if (link && (cap->links > 0 || recent_links[i])) continue;
-            blocked = work + preparing >= limit + pipeline || leased >= limit + pipeline;
+            blocked = work + preparing >= limit + shared_pipeline || leased >= limit + shared_pipeline;
             if (blocked && !predicted) continue;
             /* Input preparation overlaps execution; only excess preparation
              * beyond the bounded pipeline adds CPU queueing delay. */
-            if (preparing > pipeline) work += preparing - pipeline;
+            if (preparing > shared_pipeline) work += preparing - shared_pipeline;
             if (leased > work) work = leased;
             if (returning > 0)
                 inflight += returning < slots ? returning : slots;
@@ -1228,23 +1236,21 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             struct prediction forecast = {0};
             if ((client->hint.key || direct) && cap)
                 forecast.factor = execution_factor(p, work, probe, cap->capacity, broker->cpp_busy);
-            int wait = 0;
+            int wait = 0, enqueue = 0;
             if (predicted) {
                 forecast = predict(broker, client, i, work, cost, now, batch, probe, cap->capacity, inflight);
                 score = forecast.finish;
                 wait = forecast.start > forecast.prepare + .02;
             } else if (cost > 0) score *= cost;
             if (staged && cap && client->hint.key && !link) {
-                /* Keep a ready job movable until an execution lane is actually
-                 * available. Near-zero predicted residuals are not completion
-                 * evidence: uploading then would strand it behind an overrun
-                 * while a different worker becomes free. Input preparation
-                 * and returning results still overlap running compilers.
-                 * Cold work has no duration forecast, but still consumes a
-                 * CPU lane: the input pipeline is not an execution queue. */
+                /* Large workers may fill their bounded preparation queue;
+                 * small workers and link backends keep jobs movable until an
+                 * execution lane opens. Completion forecasts rank candidates
+                 * but never relax the live resource or in-flight bounds. */
                 int lanes = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
                 if (cap->capacity >= 0 && cap->capacity < lanes) lanes = cap->capacity;
                 wait |= blocked || work >= lanes || p->busy >= inflight;
+                enqueue = pipeline && !blocked && work < lanes + pipeline && p->busy < inflight;
             }
             /* Charge the throughput displaced by another compiler on every
              * worker, including existing compiles on a remote SMT core.
@@ -1261,7 +1267,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                     if (cap->capacity >= 0 && cap->capacity < lanes) lanes = cap->capacity;
                     /* A queued choice still displaces CPU work when its next
                      * lane opens. Apply the same placement policy then as now;
-                     * otherwise we wait for a host that we reject on release. */
+                     * otherwise we reject a useful pipeline as CPU overload. */
                     if (placement >= lanes) placement = lanes > 0 ? lanes - 1 : 0;
                 }
                 double demand = placement + (external > 0 ? external : 0);
@@ -1292,7 +1298,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             /* Without any input description there is no completion estimate
              * with which to justify waiting instead of using an idle CPU. */
             int idle = !cost && staged && cap && !blocked && work < dcc_capacity_jobs(p->host, cap);
-            struct selection candidate = {i, probe, wait, idle, score, fill, forecast};
+            struct selection candidate = {i, probe, wait, idle, enqueue, score, fill, forecast};
             if (best.peer < 0 || idle > best.idle || (idle == best.idle &&
                 (score < best.score || (score == best.score && fill < best.fill)))) best = candidate;
             if (predicted && !wait) {
@@ -1340,7 +1346,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         reply.status = available ? 0 : EXIT_CONNECT_FAILED;
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
-    } else if (best.peer >= 0 && best.wait) {
+    } else if (best.peer >= 0 && best.wait && !best.enqueue) {
         rs_trace("waiting for host=%s cost=%.3f score=%.3f finish=%.6f ready=%d ready_finish=%.6f "
                  "now=%.6f client=%td request=%.6f key=%llx",
                  broker->peers[best.peer].host->hostname, cost, best.score, best.forecast.finish,

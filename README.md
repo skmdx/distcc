@@ -243,8 +243,10 @@ not used as a performance estimate. Valid factors range from 0.01 to 1000.
 With `stats=PORT`, the slot limit defaults to the smaller of the server's allowed
 logical CPU count and `--jobs` limit. An explicit `/LIMIT`, for example
 `builder-a/8,stats=3633`, adds a client-side ceiling. `distcc -j` reports the sum
-of execution limits. Transport staging overlaps those jobs and is not added
-again to the build tool's parallelism. Servers without statistics retain their configured slot count (default
+of execution limits and bounded TCP staging allowances: workers with at most
+four lanes get no extra slots; larger workers get one extra per four lanes,
+capped at four. Thus 16, 8, 4 and 4 execution lanes report 38 build jobs.
+Servers without statistics retain their configured slot count (default
 4). Missing or invalid statistics also use this fallback. Clients and servers
 must report the same statistics schema, including CPU topology and coefficients.
 
@@ -352,8 +354,9 @@ work: a request can still be preparing on the client when the worker reports
 an idle snapshot. The pipeline bound takes the larger of local leases and global
 occupancy, rather than adding preparation twice. No per-stage IPC or extra
 network round trip is required.
-Input preparation can overlap execution within a pipeline of up to four jobs
-(also capped by effective parallelism). Jobs with an input-size hint compare
+Input preparation can overlap execution within the same proportional pipeline
+reported by `distcc -j`; live memory capacity can reduce or disable that
+allowance. Jobs with an input-size hint compare
 predicted completion time across both idle and occupied workers:
 `max(input_ready, cpu_slot_ready) + estimated_work * cpu_service_cost`.
 The existing contention curve accounts for SMT, frequency and external CPU
@@ -370,11 +373,11 @@ Without an input hint, selection uses marginal throughput and prefers available
 execution capacity. A missed completion forecast uses the running job's service
 age as a conservative residual estimate, so an overdue job cannot indefinitely
 appear about to finish. Recovery trials use calibrated speed rather than bypassing
-the completion-time comparison. Hinted jobs remain in the broker until the
-selected worker has an execution lane available. An expired forecast alone does
-not authorize uploading another job into that worker's queue. Keeping the job
-movable lets a newly available worker take it; preparation and result transfer
-still overlap execution, and completion feedback releases capacity immediately.
+the completion-time comparison. Larger workers may receive bounded queued jobs
+when their predicted finish wins placement; neither an expired forecast nor
+a higher build-tool parallelism bypasses the admission bound. Smaller workers
+and link backends keep jobs movable until an execution lane opens. Completion
+feedback releases capacity immediately.
 
 Successful TCP results carry input preparation, queue and execution durations
 in the existing reply and connection-return message. Only execution time is
@@ -439,10 +442,8 @@ local preprocessing before reserving that worker and reuse the preprocessed
 input on retries. By default, input preparation shares the available CPU slots
 with local compilation, keeping one producer able to feed remote workers even
 when local execution is full. `--localslots_cpp` sets an explicit preparation limit.
-Local commands retain their slot descriptors while waiting and wake when a lock
-descriptor closes, including on process death. A bounded recheck still handles
-explicit unlock without close and changing memory capacity; its interval is
-controlled by `DISTCC_PAUSE_TIME_MSEC` (default 20 ms).
+Local commands use the common file-lock acquisition path, rechecking all local
+slots and memory capacity at `DISTCC_PAUSE_TIME_MSEC` intervals (default 20 ms).
 Ordinary Clang C-family compilation prepares LLVM IR once; the selected worker
 performs optimization and code generation. A job assigned back to its client
 also consumes that IR, preserving its dependency output without repeating the

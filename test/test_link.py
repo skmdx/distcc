@@ -251,16 +251,16 @@ class LinkTestCase(BrokerTestCase):
                 _, error = proc.communicate(timeout=15)
                 self.assertEqual(proc.returncode, 0, error)
                 self.assertIn(b'distcc-link: local:', error)
-                self.assertIn('waiting for local slot release (up to 20ms)', log.read_text())
+                self.assertIn('nothing available, sleeping 20ms', log.read_text())
                 subprocess.run([str(output)], check=True, capture_output=True)
             finally:
                 if proc.poll() is None:
                     proc.kill()
                     proc.communicate()
 
-    def test_local_slot_close_wakes_any_free_lane_without_poll_delay(self):
+    def test_local_slot_release_uses_any_free_lane(self):
         self.env['DISTCC_HOSTS'] += ' --localslots=2'
-        self.env['DISTCC_PAUSE_TIME_MSEC'] = '5000'
+        self.env['DISTCC_PAUSE_TIME_MSEC'] = '20'
         locks = Path(self.env['DISTCC_DIR']) / 'lock'
         locks.mkdir(exist_ok=True)
         log, output = self.work/'release.log', self.work/'release.out'
@@ -272,13 +272,13 @@ class LinkTestCase(BrokerTestCase):
                                 env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             deadline = time.monotonic() + 5
-            while not log.exists() or 'waiting for local slot release' not in log.read_text():
+            while not log.exists() or 'cpu_localhost_1 is busy' not in log.read_text():
                 self.assertIsNone(proc.poll())
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.01)
             self.assertFalse(output.exists())
             # Slot zero stays locked. A blocking lock on just that descriptor
-            # would miss this release; polling would sleep for five seconds.
+            # would miss this release; every retry must check both lanes.
             held[1].close()
             _, error = proc.communicate(timeout=2)
             self.assertEqual(proc.returncode, 0, error)

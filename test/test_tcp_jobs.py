@@ -3500,7 +3500,9 @@ args = sys.argv[1:]
 subprocess.run([{self.cc!r}, *args], check=True)
 subprocess.run(['objcopy', '--add-section', {'noise=' + str(noise)!r}, args[args.index('-o') + 1]], check=True)
 ''')
-        self.start_tcp()
+        # Returning work is observable only with live statistics. A fixed
+        # host's spare pipeline previously hid that missing precondition.
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
         held = []
         try:
             for index in range(4):
@@ -3519,7 +3521,12 @@ subprocess.run(['objcopy', '--add-section', {'noise=' + str(noise)!r}, args[args
             time.sleep(1.1)
             self.assertIn('dcc_busy 0\n', self.get_stats(self.stats_ports[0]))
             started = time.monotonic()
-            self.job('while-hinted-results-stalled')
+            lease, net = self.acquire_reserved(10, (999, 4 * 1024 * 1024, 1))
+            body = b'int while_results_stalled(void) { return 0; }\n'
+            self.wire_job(body, cached=False, net=net)
+            self.upload(net, body)
+            self.assertTrue(self.result(net)[2])
+            lease.close(); net.close()
             self.assertLess(time.monotonic() - started, 5)
             for index, (lease, net, body) in enumerate(held):
                 net.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
