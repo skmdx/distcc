@@ -472,18 +472,14 @@ void open_file(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info *info
     if ((info->flags & O_ACCMODE) != O_RDONLY) { fuse_reply_err(request, EROFS); return; }
     auto &fs = files(request);
     Entry *entry = &node(fs, inode);
-    bool first_read = !entry->bytes.owner;
+    const auto previous = entry->version;
     if (int error = fs.open(entry->path->c_str(), entry)) { fuse_reply_err(request, error); return; }
-    if (first_read && entry->bytes.size) {
-        // OPEN already authorizes and obtains the immutable snapshot. Publish
-        // it before completing OPEN instead of waking this service again for
-        // the same bytes on the compiler's first read. Kernel reclaim can
-        // still request pages through read_file; Files retains their owner.
-        struct fuse_bufvec data = FUSE_BUFVEC_INIT(entry->bytes.size);
-        data.buf[0].mem = const_cast<char *>(entry->bytes.data);
+    if (previous != entry->version) {
+        // The client may replace/grow an input between LOOKUP and the first
+        // authorized READ. Refresh kernel attributes before it bounds reads
+        // or mmap by the old size; bytes remain demand-paged from the snapshot.
         auto session = static_cast<Mount *>(fuse_req_userdata(request))->fs;
-        if (int error = fuse_lowlevel_notify_store(session, inode, 0, &data,
-                                                   static_cast<fuse_buf_copy_flags>(0))) {
+        if (int error = fuse_lowlevel_notify_inval_inode(session, inode, -1, 0)) {
             fuse_reply_err(request, -error); return;
         }
     }

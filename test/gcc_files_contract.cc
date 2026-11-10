@@ -328,6 +328,8 @@ static void clean_mount(const char *root, bool lookup, int size_change = 0)
         for (unsigned pass = 0; pass < 2; ++pass) {
             int fd = open(filename.c_str(), O_RDONLY);
             require(fd >= 0, "authorized snapshot open");
+            require(!fstat(fd, &info) && info.st_size == static_cast<off_t>(contents.size()),
+                    "open must expose the authorized snapshot size");
             std::string output(contents.size()+1, '\0');
             require(read(fd, output.data(), output.size()) == static_cast<ssize_t>(contents.size()) &&
                     !memcmp(output.data(), contents.data(), contents.size()), "snapshot read contents/EOF");
@@ -336,7 +338,6 @@ static void clean_mount(const char *root, bool lookup, int size_change = 0)
             munmap(mapped, contents.size()); close(fd);
         }
         printf("First read/mmap and reopen READ callbacks: %u\n", *read_calls-reads);
-        require(size_change || *read_calls == reads, "authorized open did not populate kernel pages");
         int fd = open(filename.c_str(), O_RDONLY);
         require(fd >= 0, "snapshot reopen before page reclamation");
         require(!posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED), "discard cached snapshot pages");
