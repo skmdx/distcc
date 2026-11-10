@@ -419,7 +419,7 @@ static size_t dcc_stats_reply(char reply[DCC_STATS_SIZE]) {
     double core_scale, smt_gain;
     struct dcc_cpu_perf perf;
     struct dcc_server_load load = { .busy = -1, .queued = -1, .links = -1,
-                                    .preparing = -1, .returning = -1 };
+                                    .preparing = -1, .returning = -1, .input_waiting = -1 };
     int admission = 0, available = -1, capacity = -1;
     double memory_pressure = -1;
     unsigned long long ready_idle_ns = 0;
@@ -464,6 +464,7 @@ dcc_load2 %1.2lf\n\
 dcc_load3 %1.2lf\n\
 dcc_running %d\n\
 dcc_busy %d\n\
+dcc_input_waiting %d\n\
 dcc_queued %d\n\
 dcc_preparing %d\n\
 dcc_returning %d\n\
@@ -570,7 +571,7 @@ dcc_free_mem %d MB\n\
                                dcc_stats.kids_avg[2],
                                current_load,
                                loadavg[0], loadavg[1], loadavg[2],
-                               running, load.busy, load.queued, load.preparing, load.returning,
+                               running, load.busy, load.input_waiting, load.queued, load.preparing, load.returning,
                                capacity, dcc_resource_job_bytes(), dcc_resource_samples(),
                                dcc_resource_peak_bytes(), dcc_resource_spare_bytes(),
                                compile_capacity, pump_capacity, rust_capacity, thinlto_capacity, offload_capacity,

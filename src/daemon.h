@@ -46,6 +46,8 @@ void dcc_reap_kids(int must_reap);
 int dcc_preforking_parent(int listen_fd);
 struct dcc_server_load {
     int busy, queued, links, preparing, returning;
+    /* Subset of resident busy owners, not additional CPU demand. */
+    int input_waiting;
     unsigned long long reserved;
 };
 #ifdef __linux__

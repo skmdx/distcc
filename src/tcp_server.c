@@ -807,6 +807,10 @@ static int install_links(struct dcc_tcp_server *s)
 void dcc_tcp_server_load(struct dcc_tcp_server *s, struct dcc_server_load *load)
 {
     if (!s) return;
+    /* GCC's single compiler thread is blocked until this filesystem reply.
+     * Keep resident admission/memory ownership distinct from CPU activity. */
+    if (s->phase == RUNNING && s->job->kind == DCC_JOB_GCC_FRONTEND && s->fs_waiting)
+        load->input_waiting++;
     if (s->job && s->phase == PREPARING) {
         if (s->enqueued) load->queued++;
         else load->preparing++;

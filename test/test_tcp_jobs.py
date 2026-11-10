@@ -320,6 +320,78 @@ class FileCacheTest(unittest.TestCase):
 class GccFrontendTest(BrokerTestCase):
     worker_address = '127.0.0.1'
 
+    def test_input_wait_is_part_of_resident_busy_and_keeps_memory(self):
+        self.start_frontend(jobs=1)
+        direct = dict(self.env)
+        held, release = threading.Event(), threading.Event()
+        connections = []
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0)); listener.listen(1)
+            port = listener.getsockname()[1]
+            def forward():
+                client, _ = listener.accept()
+                server = socket.create_connection(('127.0.0.1', self.ports[0]))
+                connections.extend((client, server))
+                def uploads():
+                    try:
+                        while data := client.recv(65536): server.sendall(data)
+                    except OSError:
+                        pass  # Teardown closes the established connections.
+                sender = threading.Thread(target=uploads)
+                sender.start()
+                try:
+                    def read(size):
+                        data = bytearray()
+                        while len(data) < size:
+                            part = server.recv(size-len(data))
+                            if not part: return b''
+                            data.extend(part)
+                        return bytes(data)
+                    while header := read(8):
+                        kind, size = struct.unpack('!II', header)
+                        body = read(size)
+                        if (kind & ~0x30000) == 0x54000309 and not held.is_set():
+                            held.set()
+                            if not release.wait(10): return
+                        client.sendall(header + body)
+                except OSError:
+                    pass
+                finally:
+                    for conn in (client, server):
+                        try: conn.shutdown(socket.SHUT_RDWR)
+                        except OSError: pass
+                        conn.close()
+                    sender.join(3)
+            proxy = threading.Thread(target=forward)
+            proxy.start()
+            self.start_broker(f'127.0.0.1:{port}/1,tcp,stats={self.stats_ports[0]}', name='held-input')
+            env = dict(direct, DISTCC_BROKER=self.env['DISTCC_BROKER'])
+            source = self.work/'input-owner.c'; source.write_text('int owner(void) { return 31; }\n')
+            process = subprocess.Popen([str(self.build/'distcc'), self.cc, '-c', str(source),
+                                        '-o', str(source.with_suffix('.o'))], env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                self.assertTrue(held.wait(10), 'GCC filesystem query did not reach the proxy')
+                stats = self.get_stats(self.stats_ports[0])
+                self.assertRegex(stats, r'dcc_busy 1\n')
+                self.assertRegex(stats, r'dcc_input_waiting 1\n')
+                self.assertGreater(int(re.search(r'dcc_memory_reserved_bytes (\d+)', stats)[1]), 0)
+                release.set()
+                output, error = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, output + error)
+                self.assertIn(b'pooled TCP job completed', error)
+                self.assertRegex(self.get_stats(self.stats_ports[0]), r'dcc_input_waiting 0\n')
+            finally:
+                release.set()
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+                for conn in connections:
+                    try: conn.shutdown(socket.SHUT_RDWR)
+                    except OSError: pass
+                listener.close()
+                proxy.join(5)
+            self.assertFalse(proxy.is_alive())
+
     def test_planner_preloads_default_scan_plugin_in_parent(self):
         self.start_frontend()
         self.env['DISTCC_LOG'] = str(self.work/'client.log')
