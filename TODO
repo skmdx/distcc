@@ -4,23 +4,27 @@ TODO list for distcc
 
 reduce remaining client filesystem service cost in remote preprocessing
 
-    r231 deploys 8d4d668 on top of the r229 client and pipeline changes.
+    r232 deploys 929bf5d: report execution capacity without per-worker staging
+    multipliers, wake local commands on slot descriptor closure, and reopen
+    changed directories through their pinned descriptor. Local validation
+    passes 542 tests, with five skips; one stale slot-count expectation was
+    corrected and its affected test rerun successfully.
     All five deployed nodes pass C/C++ and Rust execution checks;
     the 25 Rust client/worker pairs and all five ThinLTO clients pass.
     One clean glibc build completes all 6642 jobs remotely with zero worker
     errors, timeouts, disconnects, planner warnings or local fallbacks.
     Compiler flags, ebuild hash and libc.so hash match the preceding build;
-    automatic parallelism rises from -j32 to -j48 through staged capacity.
+    automatic parallelism is -j32, matching r228 rather than r231's -j48.
 
-    Wall time is 272.540 seconds versus r228's 268.113 (+1.65%). Client
-    build CPU rises 688.168 to 706.271 seconds (+2.63%), while remote use
-    rises 5.839 to 6.314 cores (+8.15%). Wall time remains 13.00% below r226.
+    Wall time is 279.673 seconds versus r228's 268.113 (+4.31%). Client
+    build CPU falls 688.168 to 686.887 seconds (-0.19%), while remote use
+    rises 5.839 to 5.977 cores (+2.37%). Wall time remains 10.72% below r226.
     The bundle does not demonstrate a further speedup over r228.
-    Across one-second samples, all 32 worker slots are busy in 54/268 samples
-    versus 4/263 previously. Queue depth peaks at two on one worker and zero
-    on the other three; the previous maximum was one. Busy slots are not CPU
+    Across one-second samples, all 32 worker slots are busy in 1/273 samples
+    versus 4/263 in r228. Queue depth peaks at zero on every worker;
+    the r228 maximum was one. Busy slots are not CPU
     utilization. Dividing total worker CPU by observed active time estimates
-    8.693 cores versus 8.095, still far below sustained 32-core utilization.
+    8.173 cores versus 8.095, still far below sustained 32-core utilization.
 
     The preceding r230 bundle cached successful per-job symlink results and
     reduced authorization-root traversal, but incorrectly omitted full name
@@ -32,14 +36,18 @@ reduce remaining client filesystem service cost in remote preprocessing
     are retained. Restoring the index removes that regression, not the remaining
     client bottleneck or the failure to beat r228.
 
-    The r228/r231 90-120 second profiles record 65.612/66.551 CPU seconds.
-    The distcc-client role is 31.061/31.939; planner and GCC driver are
-    14.653/14.408 and 9.041/9.429 seconds. Client sendto/ppoll samples recover
-    from r230's 14.592/9.980 to 2.837/1.673 seconds. Metadata newfstatat remains
-    2.592 versus r228's 1.551; mmap/munmap total 3.490 versus 2.878 seconds.
+    The r228/r232 90-120 second profiles record 65.612/56.245 CPU seconds.
+    The distcc-client role is 31.061/27.245; planner and GCC driver are
+    14.653/12.061 and 9.041/6.653 seconds. Metadata newfstatat is 1.796
+    versus r228's 1.551; mmap/munmap total 2.592 versus 2.878 seconds.
+    Observed remote-active time grows 195.284 to 205.933 seconds, while
+    intervals without remote work grow 72.653 to 73.564 seconds. Thus most
+    of the extra wall time overlaps distributed compilation, despite less
+    total client CPU. The hypothesis that removing client oversubscription
+    alone beats r228 is not supported. These data do not isolate changed
+    job placement, worker execution speed or end-to-end turnaround costs.
     These inclusive sampled costs are not additive or isolated patch effects.
-    Each version has one deployment and one complete measurement; r231's
-    additional run was explicitly authorized. Both use frame pointers, but
+    Each version has one deployment and one complete measurement. Both use frame pointers, but
     fixed windows can contain different work mixes and single runs do not
     establish statistical significance.
     Elimination of intermittent IPC failures, waiting and spare capacity
