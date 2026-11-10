@@ -268,7 +268,7 @@ int dcc_compile_remote(char **argv,
     int ret;
     pid_t ssh_pid = 0;
     int ssh_status;
-    off_t doti_size;
+    off_t doti_size = -1;
     struct timeval before, after;
     unsigned int n_files;
 
@@ -385,7 +385,7 @@ int dcc_compile_remote(char **argv,
 
     if (gettimeofday(&after, NULL)) {
         rs_log_warning("gettimeofday failed");
-    } else if (host->cpp_where == DCC_CPP_ON_CLIENT) {
+    } else if (doti_size >= 0) {
         double secs, rate;
 
         dcc_calc_rate(doti_size, &before, &after, &secs, &rate);

@@ -10,7 +10,6 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/sendfile.h>
-#include <sys/mman.h>
 #include <xxhash.h>
 #include <arpa/inet.h>
 #include "distcc.h"
@@ -209,12 +208,7 @@ static int auxiliary_inputs(struct dcc_job *job, char **paths)
         in->fd = open(*p, O_RDONLY | O_CLOEXEC);
         if (!in->path || in->fd < 0 || fstat(in->fd, &st) || !S_ISREG(st.st_mode)) return -1;
         in->wire_size = in->plain_size = st.st_size;
-        void *data = st.st_size ? mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, in->fd, 0) : NULL;
-        if (data == MAP_FAILED) return -1;
-        XXH64_canonical_t hash;
-        XXH64_canonicalFromHash(&hash, XXH3_64bits(data, st.st_size));
-        if (st.st_size) munmap(data, st.st_size);
-        memcpy(in->digest, hash.digest, sizeof(in->digest));
+        if (dcc_file_digest(in->fd, st.st_size, in->digest)) return -1;
         in->cached = 1;
     }
     return 0;

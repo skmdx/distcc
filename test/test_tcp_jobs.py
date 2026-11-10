@@ -231,7 +231,8 @@ class FileCacheTest(unittest.TestCase):
     def test_shared_snapshots_verify_empty_large_and_corrupt_contents(self):
         library = self.library
         root = self.cache_path.parent
-        for index, payload in enumerate((b'', bytes(range(256))*513)):
+        for index, size in enumerate((0, 65535, 65536, 65537, 131328)):
+            payload = (bytes(range(256))*513)[:size]
             with self.subTest(size=len(payload)):
                 source, output = root/f'source-{index}', root/f'output-{index}'
                 source.write_bytes(payload)

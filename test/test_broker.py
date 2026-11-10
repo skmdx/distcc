@@ -1025,14 +1025,32 @@ class BrokerTest(BrokerTestCase):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2, busy=2, available=0))
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))
         status, slots, fds = self.receive(self.request(2))
-        self.assertEqual((status, slots, fds), (0, 8, []))
+        self.assertEqual((status, slots, fds), (0, 12, []))
+
+    def test_jobs_include_only_tcp_staging_capacity(self):
+        for index, (layout, expected) in enumerate((
+                ([(16, True), (8, True), (4, True), (4, True)], 48),
+                ([(1, True), (2, True), (8, False)], 14),
+                ([(8, False)], 8))):
+            with self.subTest(layout=layout):
+                hosts = []
+                for cores, staged in layout:
+                    peer = self.peer(stats_response(cpus=cores, cores=cores, jobs=cores,
+                        capacity=cores, running=0, busy=0, queued=0, preparing=0, returning=0))
+                    hosts.append(f'127.0.0.1:{peer.port}/{cores}' +
+                                 (',tcp' if staged else '') + f',stats={peer.port}')
+                self.start_broker(' '.join(hosts), name=f'jobs-pipeline-{index}')
+                self.assertEqual(self.receive(self.request(2)), (0, expected, []))
+                result = subprocess.run([str(self.build/'distcc'), '-j'], env=self.env,
+                    capture_output=True, text=True, check=True, timeout=5)
+                self.assertEqual(int(result.stdout), expected)
 
     def test_jobs_expose_small_class_capacity_without_overadmitting_large_jobs(self):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2,
             busy=0, running=0, queued=0, preparing=0, returning=0,
             compile_capacity=[2] * 64, pump_capacity=[2] * 64))
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))
-        self.assertEqual(self.receive(self.request(2)), (0, 8, []))
+        self.assertEqual(self.receive(self.request(2)), (0, 12, []))
         first, first_net = self.acquire_reserved(9, (201, 1024, 4), 1024)
         second, second_net = self.acquire_reserved(9, (202, 1024, 4), 1024)
         waiting = self.request(9, (203, 1024, 4), 1024)
@@ -1214,7 +1232,7 @@ class BrokerTest(BrokerTestCase):
         peers[1].response = stats_response(cpus=1, jobs=1, running=0, busy=0,
             queued=0, preparing=0, returning=0, capacity=1)
         deadline = time.monotonic() + 2
-        while self.receive(self.request(2))[1] != 2:
+        while self.receive(self.request(2))[1] != 4:  # Two execution lanes plus two staged inputs.
             self.assertLess(time.monotonic(), deadline, 'updated capacities were not observed')
             time.sleep(.01)
         waiting = self.request(10, (1301, 4 * 1024 * 1024, 1))

@@ -1,11 +1,72 @@
 /* Real shared-input publication, pinning and pooled-capacity reclamation. */
+#include <config.h>
+#include <sys/types.h>
+#include <unistd.h>
+static ssize_t test_pread(int, void *, size_t, off_t);
+#define pread test_pread
 #include "../src/file_cache.c"
+#undef pread
+#include "../src/remote_job.c"
 #include <assert.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <signal.h>
 
 const char *rs_program_name = "file_cache";
+
+static int partial_reads, interrupted, truncate_next;
+static ssize_t test_pread(int fd, void *buffer, size_t length, off_t offset)
+{
+    if (partial_reads) {
+        if (!interrupted++) { errno = EINTR; return -1; }
+        if (length > 997) length = 997;
+    }
+    if (truncate_next && offset >= 65536) {
+        assert(!ftruncate(fd, 0));
+        truncate_next = 0;
+    }
+    return pread(fd, buffer, length, offset);
+}
+
+static void digest_contract(void)
+{
+    unsigned char data[2*65536 + 17], hash[DCC_FILE_HASH_SIZE];
+    const off_t sizes[] = {0, 1, 65535, 65536, 65537, sizeof(data)};
+    for (size_t i = 0; i < sizeof(data); ++i) data[i] = i*131 + i/257;
+    int fd = open("hash-source", O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    assert(fd >= 0);
+    for (size_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); ++i) {
+        off_t size = sizes[i];
+        assert(!ftruncate(fd, size) && pwrite(fd, data, size, 0) == size);
+        XXH64_canonical_t expected;
+        XXH64_canonicalFromHash(&expected, XXH3_64bits(data, size));
+        for (partial_reads = 0; partial_reads < 2; ++partial_reads) {
+            interrupted = 0;
+            assert(lseek(fd, 3, SEEK_SET) == 3);
+            assert(!dcc_file_digest(fd, size, hash));
+            assert(!memcmp(hash, expected.digest, sizeof(hash)));
+            assert(lseek(fd, 0, SEEK_CUR) == 3);
+            assert(!verify_snapshot(fd, expected.digest));
+            hash[0] ^= 1;
+            assert(verify_snapshot(fd, hash) == -1);
+        }
+        partial_reads = 0;
+        struct dcc_job job = {0};
+        char path[] = "hash-source";
+        char *paths[] = {path, path, NULL};
+        assert(!auxiliary_inputs(&job, paths) && job.count == 1);
+        assert(job.inputs[0].plain_size == (uint64_t)size && job.inputs[0].cached);
+        assert(!memcmp(job.inputs[0].digest, expected.digest, sizeof(hash)));
+        assert(!auxiliary_inputs(&job, paths) && job.count == 1);
+        assert(lseek(job.inputs[0].fd, 0, SEEK_CUR) == 0);
+        close(job.inputs[0].fd); free(job.inputs[0].path); free(job.inputs);
+    }
+    truncate_next = 1;
+    assert(dcc_file_digest(fd, sizeof(data), hash) == -1 && errno == EIO);
+    assert(!truncate_next);
+    assert(dcc_file_digest(-1, 1, hash) == -1 && errno == EBADF);
+    assert(!close(fd) && !unlink("hash-source"));
+}
 
 static void input(const char *path, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE])
 {
@@ -32,6 +93,7 @@ static int cached(const unsigned char hash[DCC_FILE_HASH_SIZE], const char *root
 int main(int argc, char **argv)
 {
     assert(argc == 2 && !chdir(argv[1]));
+    digest_contract();
     assert(!setenv("DISTCCD_FILE_CACHE", "cache", 1));
     unsigned char small[DCC_FILE_HASH_SIZE], large[DCC_FILE_HASH_SIZE];
     input("small", 8*1024*1024, small);

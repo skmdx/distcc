@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,18 +81,46 @@ static int cache_shard(const unsigned char *hash, char key[17], const char *tmp)
     return fd;
 }
 
+int dcc_file_digest(int fd, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE])
+{
+    unsigned char buffer[65536];
+    XXH3_state_t state;
+    XXH64_hash_t value = 0;
+    off_t offset = 0;
+    if (size < 0) { errno = EINVAL; return -1; }
+    int streaming = (uint64_t)size > sizeof(buffer);
+    if (streaming) {
+        XXH3_INITSTATE(&state);
+        XXH3_64bits_reset(&state);
+    }
+    do {
+        size_t length = (uint64_t)(size - offset) > sizeof(buffer) ?
+            sizeof(buffer) : (size_t)(size - offset);
+        for (size_t used = 0; used < length;) {
+            ssize_t n = pread(fd, buffer + used, length - used, offset + used);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { if (!n) errno = EIO; return -1; }
+            used += n;
+        }
+        if (streaming) XXH3_64bits_update(&state, buffer, length);
+        else value = XXH3_64bits(buffer, length);
+        offset += length;
+    } while (offset < size);
+    if (streaming) value = XXH3_64bits_digest(&state);
+    XXH64_canonical_t canonical;
+    XXH64_canonicalFromHash(&canonical, value);
+    memcpy(hash, canonical.digest, DCC_FILE_HASH_SIZE);
+    return 0;
+}
+
 static int verify_snapshot(int from, const unsigned char *expected)
 {
     struct stat st;
-    if (fstat(from, &st) || (uint64_t)st.st_size > SIZE_MAX) return -1;
+    unsigned char hash[DCC_FILE_HASH_SIZE];
     /* Cache publication replaces names, never the opened inode. The other
      * caller owns a private reflink. Both stay immutable during verification. */
-    void *data = st.st_size ? mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, from, 0) : NULL;
-    if (data == MAP_FAILED) return -1;
-    XXH64_canonical_t hash;
-    XXH64_canonicalFromHash(&hash, XXH3_64bits(data, st.st_size));
-    if (st.st_size) munmap(data, st.st_size);
-    return memcmp(hash.digest, expected, DCC_FILE_HASH_SIZE) ? -1 : 0;
+    if (fstat(from, &st) || dcc_file_digest(from, st.st_size, hash)) return -1;
+    return memcmp(hash, expected, DCC_FILE_HASH_SIZE) ? -1 : 0;
 }
 
 static int copy_snapshot(int from, int to, const unsigned char *expected)

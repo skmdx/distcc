@@ -1135,7 +1135,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         available++;
         if (client->command == JOBS) {
             int jobs = dcc_capacity_parallelism(p->host, cap);
-            reply.slots += jobs;
+            int staged = p->host->tcp_jobs && p->host->mode == DCC_MODE_TCP;
+            int pipeline = staged ? (jobs < DCC_TCP_PIPELINE ? jobs : DCC_TCP_PIPELINE) : 0;
+            /* Keep the compiler lanes fed while other make jobs prepare and
+             * transfer inputs. Admission still enforces execution limits. */
+            reply.slots += jobs + pipeline;
             if (jobs > 0) {
                 struct dcc_capacity full;
                 if (cap) {

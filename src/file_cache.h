@@ -2,6 +2,7 @@
 #ifndef DCC_FILE_CACHE_H
 #define DCC_FILE_CACHE_H
 #include <stddef.h>
+#include <sys/types.h>
 
 #define DCC_FILE_HASH_SIZE 8
 #define DCC_FILE_MANIFEST_LIMIT 65536
@@ -15,6 +16,9 @@ struct dcc_input_digest {
 };
 
 struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count);
+/* Hash the known extent [0, size) without changing the descriptor offset.
+ * The caller owns a stable input; read errors and premature EOF return -1. */
+int dcc_file_digest(int fd, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE]);
 /* Shared snapshots require read-only mounts or compiler-owned read-only
  * inputs (such as profile data). Otherwise return a
  * private inode. NULL hash requires an already verified, immutable source. */
