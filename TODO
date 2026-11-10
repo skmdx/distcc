@@ -8,17 +8,20 @@ remove avoidable waits while remote compilation has runnable work
     waits with available work, preserving compiler settings and output identity.
     Idle capacity during build dependency waits is not a scheduling defect.
 
-    Job-scoped kernel caching and on-demand completion of partial directory
-    indexes remove repeated filesystem wakeups and serial metadata requests.
-    First-lookup FUSE IPC and required file reads remain. The full-run samples
-    do not separate every input-service wait from build dependencies. Further changes
-    must address a measured runnable-work stall, not queue depth or a core-count
-    threshold. Native GCC regressions preserve fresh headers and permissions.
+    Job-scoped kernel caching, complete-on-demand directory indexes and
+    inode-based callbacks remove demonstrated redundant lookup work. The
+    ready-command probe still spends more compiler time asleep in synchronous
+    first-lookup/open FUSE requests than executing, while the filesystem
+    service spends much less time waiting for client RPC replies. This locates
+    the remaining cost at the compiler/filesystem boundary, not broker admission.
+    Removing more of it requires eliminating a handoff while preserving native
+    compiler access and snapshot permissions. A necessary first lookup or an
+    unclassified dependency interval alone is not a new failure condition.
 
     Acceptance remains a matched full build with worker CPU and runnable/wait
     evidence, no hidden fallback/errors, and matching generated artifacts.
     Preserve unfavorable runs and limits in the existing measurement record:
-    the workspace's existing glibc measurement README (r235/r236). The fixed
+    the workspace's existing glibc measurement README (r237). The fixed
     30-second profiles do not establish whole-build or same-work improvements.
 
 recognize arbitrary input suffixes with explicit compiler language
