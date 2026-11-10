@@ -8,20 +8,22 @@ remove avoidable waits while remote compilation has runnable work
     waits with available work, preserving compiler settings and output identity.
     Idle capacity during build dependency waits is not a scheduling defect.
 
-    Job-scoped kernel caching, complete-on-demand directory indexes and
-    inode-based callbacks remove demonstrated redundant lookup work. The
-    ready-command probe still spends more compiler time asleep in synchronous
-    first-lookup/open FUSE requests than executing, while the filesystem
-    service spends much less time waiting for client RPC replies. This locates
-    the remaining cost at the compiler/filesystem boundary, not broker admission.
-    Removing more of it requires eliminating a handoff while preserving native
-    compiler access and snapshot permissions. A necessary first lookup or an
-    unclassified dependency interval alone is not a new failure condition.
+    Publishing an authorized snapshot during OPEN eliminates the redundant
+    first READ handoff; ordinary READ still refills reclaimed kernel pages.
+    The ready-command probe improves, but the complete-build comparison
+    regresses during remote-active work. This fails the overall performance
+    gate. Worker placement and occupied time changed, so neither per-job CPU
+    ratios nor a short trace establish the cause of that regression.
+    Resolve that discrepancy on matched worker jobs before another release,
+    distinguishing kernel page publication from client reply/first-lookup
+    waits. Do not skip OPEN authorization or replace directory READ permission
+    with a search-only name index. Necessary lookup/open or dependency waits
+    alone are not new failure conditions.
 
     Acceptance remains a matched full build with worker CPU and runnable/wait
     evidence, no hidden fallback/errors, and matching generated artifacts.
     Preserve unfavorable runs and limits in the existing measurement record:
-    the workspace's existing glibc measurement README (r237). The fixed
+    the workspace's existing glibc measurement README (r238). The fixed
     30-second profiles do not establish whole-build or same-work improvements.
 
 recognize arbitrary input suffixes with explicit compiler language
