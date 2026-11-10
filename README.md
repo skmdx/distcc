@@ -243,9 +243,9 @@ not used as a performance estimate. Valid factors range from 0.01 to 1000.
 With `stats=PORT`, the slot limit defaults to the smaller of the server's allowed
 logical CPU count and `--jobs` limit. An explicit `/LIMIT`, for example
 `builder-a/8,stats=3633`, adds a client-side ceiling. `distcc -j` reports the sum
-of execution limits and bounded TCP staging allowances: workers with at most
-four lanes get no extra slots; larger workers get one extra per four lanes,
-capped at four. Thus 16, 8, 4 and 4 execution lanes report 38 build jobs.
+of execution limits and bounded TCP staging allowances: workers with at least
+16 lanes get four extra slots; smaller workers get execution slots only.
+Thus 16, 8, 4 and 4 execution lanes report 36 build jobs.
 Servers without statistics retain their configured slot count (default
 4). Missing or invalid statistics also use this fallback. Clients and servers
 must report the same statistics schema, including CPU topology and coefficients.
@@ -354,7 +354,7 @@ work: a request can still be preparing on the client when the worker reports
 an idle snapshot. The pipeline bound takes the larger of local leases and global
 occupancy, rather than adding preparation twice. No per-stage IPC or extra
 network round trip is required.
-Input preparation can overlap execution within the same proportional pipeline
+Input preparation can overlap execution within the same bounded pipeline
 reported by `distcc -j`; live memory capacity can reduce or disable that
 allowance. Jobs with an input-size hint compare
 predicted completion time across both idle and occupied workers:

@@ -4,6 +4,28 @@
 #include <assert.h>
 
 static int mutate, descriptor_stats, readable_directory_stats, canonicalizations;
+static int batches, interrupt_enumeration, fail_enumeration, enumeration_fd;
+ssize_t __real_getdents64(int, void *, size_t);
+ssize_t __wrap_getdents64(int fd, void *data, size_t size)
+{
+    enumeration_fd = fd;
+    ++batches;
+    if (interrupt_enumeration) {
+        interrupt_enumeration = 0;
+        errno = EINTR; return -1;
+    }
+    if (fail_enumeration && batches == 2) { errno = EIO; return -1; }
+    ssize_t length = __real_getdents64(fd, data, size);
+    /* Filesystems may omit d_type. Force the real metadata fallback. */
+    for (size_t at = 0; length > 0 && at < (size_t)length;) {
+        struct dirent64 *entry = (void *)((char *)data + at);
+        at += entry->d_reclen;
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        entry->d_type = DT_UNKNOWN;
+        break;
+    }
+    return length;
+}
 char *__real_realpath(const char *, char *);
 char *__wrap_realpath(const char *path, char *buffer)
 {
@@ -169,6 +191,47 @@ static void empty_footprint(struct dcc_job *job, const char *path)
     dcc_frontend_fs_clear(&reply);
 }
 
+static void large_listing(struct dcc_job *job, const char *root)
+{
+    char path[PATH_MAX], name[180], directory_path[PATH_MAX];
+    snprintf(directory_path, sizeof(directory_path), "%s/large", root);
+    assert(!mkdir(directory_path, 0755));
+    for (unsigned i = 0; i < 256; ++i) {
+        snprintf(name, sizeof(name), "entry-%03u-%0150u", i, i);
+        assert(snprintf(path, sizeof(path), "%s/%s", directory_path, name) < (int)sizeof(path));
+        contents(path, "");
+    }
+    batches = 0; interrupt_enumeration = 1;
+    struct dcc_frontend_reply reply = query(job, directory_path, DCC_FS_LIST, NULL);
+    assert(batches >= 4 && !interrupt_enumeration); // EINTR, two data batches, EOF.
+    assert(fcntl(enumeration_fd, F_GETFD) == -1 && errno == EBADF);
+    unsigned count = 0;
+    unsigned char seen[256] = {0};
+    for (size_t at = 8; at < reply.size;) {
+        unsigned length = dcc_tcp_get32(reply.data + at), index;
+        assert(S_ISREG(dcc_tcp_get32(reply.data + at + 4)));
+        at += 8;
+        assert(length < sizeof(name) && length <= reply.size - at);
+        memcpy(name, reply.data + at, length); name[length] = 0; at += length;
+        assert(sscanf(name, "entry-%u-", &index) == 1 && index < 256 && !seen[index]++);
+        ++count;
+    }
+    assert(count == 256);
+    dcc_frontend_fs_clear(&reply);
+    /* An error after partial enumeration must discard that partial reply
+     * and close the directory rather than publish an incomplete name index. */
+    unsigned char request[PATH_MAX + 4];
+    dcc_tcp_put32(request, DCC_FS_LIST);
+    size_t n = strlen(directory_path);
+    memcpy(request + 4, directory_path, n);
+    batches = 0; fail_enumeration = 1;
+    assert(!dcc_frontend_fs_reply(job, request, n + 4, &reply));
+    assert(batches == 2 && reply.size == 8 && dcc_tcp_get32(reply.data) == EIO);
+    assert(fcntl(enumeration_fd, F_GETFD) == -1 && errno == EBADF);
+    fail_enumeration = 0;
+    dcc_frontend_fs_clear(&reply);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2 || argc == 3);
@@ -181,6 +244,7 @@ int main(int argc, char **argv)
     authorization(argv[1]);
     char *roots[] = {argv[1], NULL};
     struct dcc_job job = {.fs_roots = roots};
+    large_listing(&job, argv[1]);
     empty_footprint(&job, directory_path);
     descriptor_stats = 0;
     struct dcc_frontend_reply reply = query(&job, directory_path, DCC_FS_ATTRIBUTES, NULL);

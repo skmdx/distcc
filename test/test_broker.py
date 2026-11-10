@@ -589,6 +589,13 @@ class BrokerPlacementTest(BrokerTestCase):
         self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={speeds[i]}',
                                      slots=slots[i]) for i, p in enumerate(peers)))
         request = self.request(10, (1501, 4 * 1024**2, 2))
+        # The eight-lane candidate wins the finish comparison but has no
+        # staging allowance. Keep it movable until an execution lane opens.
+        request.settimeout(.1)
+        with self.assertRaises(socket.timeout): request.recv(1032)
+        queued = stats_response(cpus=8, cores=4, jobs=8, capacity=8,
+                                running=7, busy=7, queued=0, preparing=0, returning=0)
+        request.settimeout(3)
         status, _, descriptors = self.receive(request)
         self.assertEqual(status, 0)
         self.assertEqual(len(descriptors), 1)
@@ -604,8 +611,6 @@ class BrokerPlacementTest(BrokerTestCase):
         self.assertLess(float(rows[2]['finish']), float(rows[1]['finish']))
         self.assertLess(float(rows[2]['score']), float(rows[1]['score']))
         self.assertLess(float(rows[1]['score']), float(rows[0]['score']))
-        # The larger worker can receive this job before a lane opens, but
-        # only after its finish wins against the actual ready alternative.
 
 
 class BrokerTest(BrokerTestCase):
@@ -1022,14 +1027,16 @@ class BrokerTest(BrokerTestCase):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2, busy=2, available=0))
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))
         status, slots, fds = self.receive(self.request(2))
-        self.assertEqual((status, slots, fds), (0, 10, []))
+        self.assertEqual((status, slots, fds), (0, 8, []))
 
-    def test_jobs_add_proportional_pipeline_only_to_larger_tcp_workers(self):
+    def test_jobs_add_pipeline_only_to_large_tcp_workers(self):
         for index, (layout, expected) in enumerate((
-                ([(16, True), (8, True), (4, True), (4, True)], 38),
+                ([(16, True), (8, True), (4, True), (4, True)], 36),
                 ([(1, True), (2, True), (8, False)], 11),
                 ([(32, True)], 36),
-                ([(8, True), (4, True)], 14),
+                ([(8, True), (4, True)], 12),
+                ([(15, True)], 15),
+                ([(16, False)], 16),
                 ([(8, False)], 8))):
             with self.subTest(layout=layout):
                 hosts = []
@@ -1049,7 +1056,7 @@ class BrokerTest(BrokerTestCase):
             busy=0, running=0, queued=0, preparing=0, returning=0,
             compile_capacity=[2] * 64, pump_capacity=[2] * 64))
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))
-        self.assertEqual(self.receive(self.request(2)), (0, 10, []))
+        self.assertEqual(self.receive(self.request(2)), (0, 8, []))
         first, first_net = self.acquire_reserved(9, (201, 1024, 4), 1024)
         second, second_net = self.acquire_reserved(9, (202, 1024, 4), 1024)
         waiting = self.request(9, (203, 1024, 4), 1024)
@@ -1490,7 +1497,8 @@ class BrokerTest(BrokerTestCase):
             self.job(name)
 
     def test_hinted_jobs_fill_only_the_larger_workers_bounded_pipeline(self):
-        for lanes, capacity, pipeline in ((4, 4, 0), (8, 8, 2), (16, 16, 4), (16, 4, 0)):
+        for lanes, capacity, pipeline in ((4, 4, 0), (8, 8, 0), (15, 15, 0),
+                                          (16, 16, 4), (16, 8, 0), (16, 4, 0)):
             with self.subTest(lanes=lanes, capacity=capacity):
                 peer = self.peer(stats_response(cpus=lanes, cores=lanes, jobs=lanes,
                     running=capacity, busy=capacity, queued=0, preparing=0,
@@ -1547,28 +1555,28 @@ class BrokerTest(BrokerTestCase):
         self.assertEqual(selected.getpeername()[1], self.ports[0])
 
     def test_tcp_returning_leases_do_not_fill_cpu_pipeline(self):
-        peer = self.peer(stats_response(cpus=8, jobs=8, running=0, busy=0, queued=0,
-                                       preparing=0, returning=0, capacity=8))
-        hosts = self.host(0, f',tcp,stats={peer.port},speed=100', slots=8)
+        peer = self.peer(stats_response(cpus=16, jobs=16, running=0, busy=0, queued=0,
+                                       preparing=0, returning=0, capacity=16))
+        hosts = self.host(0, f',tcp,stats={peer.port},speed=100', slots=16)
         self.start_broker(hosts)
-        for _ in range(8):
+        for _ in range(16):
             _, net = self.acquire_reserved(10)
             self.assertEqual(net.getpeername()[1], self.ports[0])
-        peer.response = stats_response(cpus=8, jobs=8, running=0, busy=0, queued=0,
-                                       preparing=0, returning=8, capacity=8)
+        peer.response = stats_response(cpus=16, jobs=16, running=0, busy=0, queued=0,
+                                       preparing=0, returning=16, capacity=16)
         time.sleep(1.1)
         _, net = self.acquire_reserved(10)
         self.assertEqual(net.getpeername()[1], self.ports[0])
 
     def test_tcp_completed_snapshot_work_releases_pipeline(self):
-        peer = self.peer(stats_response(cpus=8, jobs=8, running=0, busy=0, queued=0,
-                                       preparing=0, returning=0, capacity=8))
-        hosts = (self.host(0, f',tcp,stats={peer.port}', slots=8) + ' ' +
+        peer = self.peer(stats_response(cpus=16, jobs=16, running=0, busy=0, queued=0,
+                                       preparing=0, returning=0, capacity=16))
+        hosts = (self.host(0, f',tcp,stats={peer.port}', slots=16) + ' ' +
                  self.host(1, ',tcp,speed=0.5', slots=1))
         self.start_broker(hosts)
-        held = [self.acquire_reserved(10) for _ in range(8)]
-        peer.response = stats_response(cpus=8, jobs=8, running=0, busy=8, queued=2,
-                                       preparing=0, returning=0, capacity=8)
+        held = [self.acquire_reserved(10) for _ in range(16)]
+        peer.response = stats_response(cpus=16, jobs=16, running=0, busy=16, queued=4,
+                                       preparing=0, returning=0, capacity=16)
         time.sleep(1.1)
         _, net = self.acquire_reserved(10)
         self.assertEqual(net.getpeername()[1], self.ports[1])

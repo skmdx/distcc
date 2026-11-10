@@ -1026,12 +1026,11 @@ static int cpp_limit(const struct broker *broker)
 
 static int pipeline_slots(const struct dcc_hostdef *host, int lanes)
 {
-    /* Small workers get execution slots only. Above four lanes, pre-stage
-     * one job per four lanes, bounded by the transport's existing depth.
-     * Use the same rule for build parallelism and actual admission. */
-    if (!host->tcp_jobs || host->mode != DCC_MODE_TCP || lanes <= 4) return 0;
-    int slots = lanes / 4;
-    return slots < DCC_TCP_PIPELINE ? slots : DCC_TCP_PIPELINE;
+    /* Reserve staging for workers with at least four execution lanes per
+     * pipeline slot. Smaller workers expose execution capacity only. Keep
+     * reported build parallelism and live admission on the same bound. */
+    if (!host->tcp_jobs || host->mode != DCC_MODE_TCP || lanes < 4 * DCC_TCP_PIPELINE) return 0;
+    return DCC_TCP_PIPELINE;
 }
 
 static int dispatch(struct broker *broker, struct client *client, double now, struct dispatch_batch *batch)

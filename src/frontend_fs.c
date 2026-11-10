@@ -154,7 +154,6 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
                      const char **hints, size_t hint_count, const char *previous,
                      const struct stat *initial)
 {
-    DIR *dir = NULL;
     size_t offset = reply->size;
     unsigned char header[8] = {0};
     uint32_t count = 0, flags = 0;
@@ -175,21 +174,26 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
             ++count;
         }
     } else if (!result) {
-        dir = fdopendir(fd);
-        if (!dir) result = -1;
-        struct dirent *entry;
-        if (!result) errno = 0;
-        while (!result && (entry = readdir(dir))) {
-            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-            const char *name = entry->d_name;
-            int inspect = statuses == 1 || (statuses == 2 && hint_count &&
-                bsearch(&name, hints, hint_count, sizeof(*hints), compare_names));
-            result = directory_entry(reply, fd, name, entry->d_type, statuses, inspect);
-            if (result) break;
-            ++count;
-            errno = 0;
+        /* The client serves requests sequentially. Reuse directory storage
+         * without allocating a DIR or acquiring readdir's lock per entry.
+         * The kernel supplies aligned dirent64 records; retain its offsets
+         * and file types just as readdir does. */
+        static union { struct dirent64 align; char bytes[32768]; } entries;
+        while (!result) {
+            ssize_t length = getdents64(fd, entries.bytes, sizeof(entries.bytes));
+            if (length < 0 && errno == EINTR) continue;
+            if (length <= 0) { result = length < 0 ? -1 : 0; break; }
+            for (size_t at = 0; at < (size_t)length && !result;) {
+                const struct dirent64 *entry = (const void *)(entries.bytes + at);
+                at += entry->d_reclen;
+                if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+                const char *name = entry->d_name;
+                int inspect = statuses == 1 || (statuses == 2 && hint_count &&
+                    bsearch(&name, hints, hint_count, sizeof(*hints), compare_names));
+                result = directory_entry(reply, fd, name, entry->d_type, statuses, inspect);
+                ++count;
+            }
         }
-        if (!result && errno) result = -1;
     }
     /* Only freshly enumerated names need a publication stability check.
      * Cached names were matched to the fresh descriptor identity above and
@@ -202,8 +206,7 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
         }
     }
     int error = errno;
-    if (dir) closedir(dir);
-    else close(fd);
+    close(fd);
     if (!result && statuses) {
         if (statuses == 2) dcc_tcp_put32(reply->data + offset, flags);
         dcc_tcp_put32(reply->data + offset + (statuses == 2 ? 4 : 0), count);
