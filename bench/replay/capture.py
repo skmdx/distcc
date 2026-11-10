@@ -1,11 +1,10 @@
-"""Host-side observer: exact scheduler states, sampled callers, and TCP packets."""
+"""Host-side observer: task exit aggregates, sampled callers, and TCP packets."""
 import argparse
 import json
-import os
 from pathlib import Path
 import re
+import resource
 import signal
-import struct
 import subprocess
 import sys
 import time
@@ -15,13 +14,11 @@ def clock():
     return dict(wall_ns=time.time_ns(), mono_ns=time.monotonic_ns())
 
 
-def perf_arguments(output, *, scheduler=False, call_graph='fp', cgroup=None):
-    # Do not apply -F or a global callgraph to scheduler tracepoints. Their
-    # continuous state stream must have period=1 and no per-switch stack dump.
-    events = ['-e', f'cpu-clock/freq={99 if scheduler else 49},call-graph={call_graph}/']
-    if scheduler:
-        events += ['-e', 'sched:sched_switch', '-e', 'sched:sched_wakeup']
-    args = ['perf', 'record', '--clockid', 'mono', '-c', '1', *events,
+def perf_arguments(output, *, call_graph='fp', cgroup=None, callers=False):
+    events = ['-e', 'cpu-clock']
+    if callers:
+        events += ['-e', 'context-switches']
+    args = ['perf', 'record', '--clockid', 'mono', '-F', '49', '--call-graph', call_graph, *events,
             '--no-bpf-event', '--buildid-mmap', '--no-buildid-cache',
             '-m', '1024', '--proc-map-timeout', '50', '-a']
     if cgroup:
@@ -29,43 +26,41 @@ def perf_arguments(output, *, scheduler=False, call_graph='fp', cgroup=None):
     return [*args, '-o', str(output)]
 
 
-def capture(output, command, call_graph, cgroup=None, scheduler=False, pass_fds=()):
-    subprocess.run([*perf_arguments(output, scheduler=scheduler, call_graph=call_graph,
+def capture(output, command, call_graph, cgroup=None, pass_fds=()):
+    subprocess.run([*perf_arguments(output, call_graph=call_graph,
                                    cgroup=cgroup), '--', *command],
                    pass_fds=pass_fds, check=True)
 
 
-def attributes(path, sampled=False):
+def attributes(path):
     text = subprocess.check_output(['perf', 'evlist', '-v', '-i', str(path)], text=True)
     path.with_suffix('.events.txt').write_text(text)
     events = {}
-    for name in ('sched:sched_switch',) if sampled else ('sched:sched_switch', 'sched:sched_wakeup'):
+    for name in ('cpu-clock', 'context-switches'):
         line = next(line for line in text.splitlines() if line.startswith(name+':'))
-        if ('freq: 1' in line) != sampled or f'sample_freq }}: {99 if sampled else 1},' not in line:
-            raise RuntimeError(f'invalid scheduler period: {line}')
-        if any(field not in line for field in ('TID', 'TIME', 'CPU', 'RAW')):
-            raise RuntimeError(f'incomplete scheduler fields: {line}')
-        if ('CALLCHAIN' in line) != sampled:
-            raise RuntimeError(f'invalid scheduler callchain policy: {line}')
+        if 'freq: 1' not in line or 'sample_freq }: 49,' not in line:
+            raise RuntimeError(f'invalid sampling frequency: {line}')
+        if any(field not in line for field in ('TID', 'TIME', 'CPU', 'CALLCHAIN')):
+            raise RuntimeError(f'incomplete sample fields: {line}')
         events[name] = line
-    if not sampled:
-        cpu = next(line for line in text.splitlines() if line.startswith('cpu-clock/'))
-        if 'freq: 1' not in cpu or 'CALLCHAIN' not in cpu:
-            raise RuntimeError('CPU samples must contain callers and use frequency sampling')
+    if 'sched:sched_' in text:
+        raise RuntimeError('continuous scheduler tracing is not part of this observer')
     return events
 
 
 class Observer:
-    def __init__(self, directory, config):
-        self.directory, self.config = directory, config
+    def __init__(self, directory, config, role):
+        self.directory, self.host, self.config, self.role = directory, config, config['capture'], role
         self.processes, self.files = [], []
         self.packet = None
+        self.delay_previous = None
 
-    def record(self, args, name):
+    def record(self, args, name, perf=True):
         log = (self.directory / (name+'.log')).open('w')
         self.files.append(log)
-        child = subprocess.Popen([*args, '--', sys.executable, '-u', '-c',
-                                  'import sys;print("ready",flush=True);sys.stdin.read()'],
+        command = [*args, '--', sys.executable, '-u', '-c',
+                   'import sys;print("ready",flush=True);sys.stdin.read()'] if perf else args
+        child = subprocess.Popen(command,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True)
         self.processes.append(child)
         assert child.stdout is not None
@@ -76,13 +71,19 @@ class Observer:
         d, c = self.directory, self.config
         d.mkdir(parents=True, exist_ok=True)
         self.before = clock()
-        self.record(perf_arguments(d/'states.data', scheduler=True), 'states')
-        # Caller samples are a separate stream; they never supply durations
-        # or interpolate missing transitions in the exact state stream.
-        self.record(['perf', 'record', '--clockid', 'mono', '-a', '-F', '99',
-                     '-e', 'sched:sched_switch', '--call-graph', 'fp',
-                     '--no-bpf-event', '--no-buildid-cache', '-m', '256',
-                     '-o', str(d/'callers.data')], 'callers')
+        self.cpu_before = time.process_time()
+        self.usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        if self.role == 'worker':
+            group = subprocess.check_output(['systemctl', 'show', self.host['service'],
+                                              '-p', 'ControlGroup', '--value'], text=True).strip()
+            seeds = [int(x) for x in (Path('/sys/fs/cgroup')/group.lstrip('/')/'cgroup.procs').read_text().split()]
+            (d/'target-pids.json').write_text(json.dumps(seeds))
+            setting = Path('/proc/sys/kernel/task_delayacct')
+            self.delay_previous = setting.read_text()
+            setting.write_text('1\n')
+            self.record([str(Path(__file__).with_name('taskstats')), str(d/'tasks.jsonl'),
+                         Path('/sys/devices/system/cpu/online').read_text().strip()], 'taskstats', perf=False)
+            self.record(perf_arguments(d/'samples.data', callers=True), 'samples')
         packet = (d/'packets.pcap').open('wb')
         log = (d/'packets.log').open('w')
         self.files += [packet, log]
@@ -111,12 +112,19 @@ class Observer:
                 raise RuntimeError('capture is not little-endian pcap')
 
     def stop(self):
+        try:
+            self.finish()
+        finally:
+            if self.delay_previous is not None:
+                Path('/proc/sys/kernel/task_delayacct').write_text(self.delay_previous)
+
+    def finish(self):
         failures = []
         for child in self.processes:
             if child.poll() is None:
                 child.stdin.close()
             if child.wait(timeout=15):
-                failures.append('perf failed')
+                failures.append('accounting/sample recorder failed')
             child.stdout.close()
         if self.packet:
             self.packet.send_signal(signal.SIGINT)
@@ -128,8 +136,10 @@ class Observer:
         (d/'clocks.json').write_text(json.dumps([self.before, clock()]))
         if failures:
             raise RuntimeError('; '.join(failures))
-        attributes(d/'states.data')
-        attributes(d/'callers.data', sampled=True)
+        if self.role == 'worker':
+            attributes(d/'samples.data')
+            if not (d/'tasks.jsonl').stat().st_size:
+                raise RuntimeError('no exit accounting records received')
         # A header alone is readiness, not successful packet observation.
         if (d/'packets.pcap').stat().st_size <= 24:
             raise RuntimeError('observer captured no actual packets')
@@ -139,6 +149,15 @@ class Observer:
                    re.findall(r'Packets received/dropped on interface .*?: \d+/(\d+)', text))
         if not dropped or any(int(n) for n in dropped):
             raise RuntimeError('packet capture dropped events')
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        (d/'observer-cost.json').write_text(json.dumps(dict(
+            observer_cpu_seconds=time.process_time()-self.cpu_before,
+            children_cpu_seconds=(usage.ru_utime+usage.ru_stime-
+                                  self.usage_before.ru_utime-self.usage_before.ru_stime),
+            children_read_bytes=(usage.ru_inblock-self.usage_before.ru_inblock)*512,
+            children_write_bytes=(usage.ru_oublock-self.usage_before.ru_oublock)*512,
+            output_bytes={p.name:p.stat().st_size for p in d.iterdir() if p.suffix in ('.data','.jsonl','.pcap')},
+            scope='Whole observer lifetime; excludes hook costs charged to measured tasks.'), indent=2))
         for path in d.iterdir():
             path.chmod(0o644)
 
@@ -149,7 +168,7 @@ if __name__ == '__main__':
     parser.add_argument('role', choices=('client', 'worker'))
     parser.add_argument('directory', type=Path)
     args = parser.parse_args()
-    observer = Observer(args.directory, json.loads(args.config.read_text())[args.role]['capture'])
+    observer = Observer(args.directory, json.loads(args.config.read_text())[args.role], args.role)
     try:
         observer.start()
         print('ready', flush=True)

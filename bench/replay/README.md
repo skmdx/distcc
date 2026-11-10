@@ -10,7 +10,7 @@ The entrypoint stages this directory's canonical code, validates the running
 worker/listener and compiler-wrapper PATH, smokes both observers, then runs an
 unobserved control and an observed replay. Both restore the same supplied input
 caches and use `distcc -j`. It verifies every output against its saved reference,
-worker completions, complete two-end RPC streams, scheduler coverage and errors.
+worker completions, complete two-end RPC streams, task accounting and errors.
 Original caches are restored on exit. No fleet deployment or full build is run.
 
 ## Inputs and ownership
@@ -38,21 +38,35 @@ own idle worker/input caches during the run; the entrypoint checks worker
 activity before replacing caches. It does not stop the worker daemon or change
 compiler, optimization, user parallelism, service scheduling or memory policy.
 The original build environment and reference outputs must still exist.
+The worker needs Linux TASKSTATS/delay accounting, libnl-genl development files,
+a C compiler and perf's software CPU/context-switch events. The observer enables
+`kernel.task_delayacct` only for capture and restores its previous value on exit.
 
 `probe.py`/`probe.sh` own replay and pump/PATH setup. `capture.py` owns recorder
 attributes, process lifetime and packet output permissions. `analyze.py` owns
-continuous-state reconstruction, sampled callers and TCP frame/clock matching.
+task aggregates, sampled callers and TCP frame/clock matching. `taskstats.c` is
+a thin libnl/UAPI adapter; it exports one record per exiting task rather than
+scheduler transitions. No client-side perf recorder is started.
 `run.py` owns staging, the two-run lifecycle, cache restoration and acceptance.
 Temporary directories contain execution copies and results, never editable
 sources. Existing evidence snapshots are not modified or executable prerequisites.
 
 ## Validity and overhead
 
-Scheduler states use period=1 **without callchains**. CPU callers and a separate
-frequency-sampled switch stream supply callsites. Smoke checks actual sample
-counts as well as `perf evlist`: some kernels record every tracepoint despite a
-larger period. Sampled sites identify callers; they do not supply exact blocked
-durations or prove that every FUSE-service PID has been identified.
+TASKSTATS supplies CPU runtime, runnable delay and context-switch counts for
+exiting descendants of the selected worker service. Persistent tasks are not
+included. Software `cpu-clock` and `context-switches` events sample callers at
+49 Hz; continuous scheduler tracepoints are not recorded. Smoke exercises two
+contending disposable tasks and checks positive CPU/runnable counters, real
+caller samples, sample counts below OS switch counts, and `perf evlist` attributes.
+
+The non-CPU residual is lifetime minus scheduled runtime minus runnable delay.
+It includes sleeping/stopped time and accounting error, **not** an exact FUSE or
+RPC duration. Samples identify sites but neither provide blocked durations nor
+identify every service PID. Interior totals include only entire task lifetimes
+within the work-pending interval, using conservative bounds on the kernel's
+second-resolution birth timestamp. Boundary tasks are not interpolated. An
+empty interior is unavailable, not zero waiting.
 
 Packet files are opened before the capture tool drops privileges. Smoke must
 capture real traffic, not merely print a start message. Missing events, packet
@@ -64,7 +78,9 @@ unrelated monotonic clocks are never directly subtracted.
 wall-time difference. A complete capture is **not** proof of negligible overhead.
 Inspect that difference before using timing or runnable shares to diagnose the
 uninstrumented workload. One pair is not a statistical estimate or a full-build
-speed claim. Raw perf/pcap, clocks, identities, seed hashes and logs remain in the
+speed claim. `observer-cost.json` saves recorder child CPU, block IO and output
+bytes; it excludes kernel-hook work charged to measured tasks. Raw perf/pcap,
+task aggregates, clocks, identities, seed hashes and logs remain in the
 run directory; retain it with the environment's evidence before removing scratch.
 
 Run the focused parser/validity regressions with:

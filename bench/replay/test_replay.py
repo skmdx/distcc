@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-from analyze import clock_offset, frames, rpc, scheduler, records, validate_sampling
+from analyze import clock_offset, frames, rpc, task_accounting, records, validate_sampling
 from capture import attributes
 from unittest.mock import patch
 
@@ -53,27 +53,35 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             rpc([(1., ('worker',1,'client',2), 1, struct.pack('!II',0x54000309,0))], 'worker')
 
-    def test_scheduler_period_and_callers_are_separate(self):
-        cpu = 'cpu-clock/freq=99,call-graph=fp/: freq: 1, sample_type: IP|CALLCHAIN\n'
-        events = ''.join(f'{name}: {{ sample_period, sample_freq }}: 1, sample_type: TID|TIME|CPU|RAW\n'
-                         for name in ('sched:sched_switch','sched:sched_wakeup'))
+    def test_only_sparse_software_events_are_recorded(self):
+        events = ''.join(f'{name}: {{ sample_period, sample_freq }}: 49, freq: 1, sample_type: TID|TIME|CPU|CALLCHAIN\n'
+                         for name in ('cpu-clock','context-switches'))
         with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
-            path = Path(directory)/'states.data'
-            with patch('capture.subprocess.check_output', return_value=cpu+events):
+            path = Path(directory)/'samples.data'
+            with patch('capture.subprocess.check_output', return_value=events):
                 attributes(path)
-            with patch('capture.subprocess.check_output', return_value=cpu+events.replace('1, sample_type','1, freq: 1, sample_type')):
+            with patch('capture.subprocess.check_output', return_value=events+'sched:sched_switch: raw\n'):
                 with self.assertRaises(RuntimeError):
                     attributes(path)
 
-    def test_scheduler_missing_transitions_rejected(self):
+    def test_task_lifetimes_are_not_interpolated_or_mixed_with_other_jobs(self):
         with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
             path = Path(directory)
-            continuous = ('idle 0 [000] 1.000: sched:sched_switch: idle:0 [0] R ==> cc1:2 [0]\n'
-                          'cc1 3 [000] 2.000: sched:sched_switch: cc1:3 [0] S ==> idle:0 [0]\n')
-            for name, text in (('states', continuous), ('callers', '')):
-                (path/(name+'.txt.zst')).write_bytes(subprocess.check_output(['zstd','-q','-c'], input=text.encode()))
-            with self.assertRaises(RuntimeError):
-                scheduler(path, 1., 3.)
+            row = dict(pid=20,ppid=10,comm='cc1',birth_seconds=102,elapsed_us=1000000,
+                       cpu_ns=300000000,scheduled_ns=300000000,runnable_ns=100000000,
+                       voluntary_switches=100,involuntary_switches=0,read_bytes=0,write_bytes=0)
+            (path/'tasks.jsonl').write_text(json.dumps(row)+'\n'+json.dumps(dict(row,pid=30,ppid=1)))
+            (path/'target-pids.json').write_text('[10]')
+            text = ('cc1 20 [000] 103.000: context-switches:\n\t100 fuse_chan_send (kernel)\n'
+                    'cc1 20 [000] 103.100: cpu-clock:\n\t200 compile (cc1)\n')
+            (path/'samples.txt.zst').write_bytes(subprocess.check_output(['zstd','-q','-c'],input=text.encode()))
+            result = task_accounting(path, 100., 110., 100., 110.)
+            self.assertEqual(result['target_tasks'], 1)
+            self.assertAlmostEqual(result['roles']['cc1']['non_cpu_residual'], .6)
+            self.assertEqual(result['sampled_callsites'], [dict(event='context-switches',
+                             comm='cc1', site='fuse_chan_send', count=1)])
+            self.assertEqual(result['interior_pids'], [20])
+            self.assertEqual(task_accounting(path,102.,110.,100.,110.)['interior_pids'], [])
 
     def test_full_profile_decoder_accepts_event_callgraph_terms(self):
         text = '7/7 1.0: 1000000 cpu-clock/freq=49,call-graph=fp/:\n  100 foo (compiler)\n'

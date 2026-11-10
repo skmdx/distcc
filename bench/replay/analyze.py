@@ -1,4 +1,4 @@
-"""Streaming analysis of one replay's perf state streams and paired TCP traces."""
+"""Task-accounting, sampled-caller and paired-TCP analysis for saved replay."""
 import argparse
 import collections
 import hashlib
@@ -11,12 +11,10 @@ from typing import Any
 
 
 HEADER = re.compile(r'^(.*?)\s+(-?\d+) \[(\d+)\]\s+(\d+\.\d+):\s*(.*)$')
-SWITCH = re.compile(r'sched:sched_switch: (.*):(\d+) \[\d+\] (\S+) ==> (.*):(\d+) \[\d+\]')
-WAKE = re.compile(r'sched:sched_wakeup: (.*):(\d+) \[\d+\]')
 
 
 def decode(directory):
-    for name in ('states', 'callers'):
+    for name in ('samples',):
         with (directory/(name+'.txt.zst')).open('wb') as output:
             with subprocess.Popen(['perf', 'script', '-i', str(directory/(name+'.data')),
                                    '--show-mmap-events', '--show-task-events', '--ns'],
@@ -56,104 +54,72 @@ def validate_sampling(continuous, sampled):
         raise RuntimeError(f'caller stream not sampled: {sampled}/{continuous}')
 
 
-def scheduler(directory, low, high):
-    service = set()
-    callers = collections.Counter()
-    caller_samples = 0
-    for row in records(directory/'callers.txt.zst'):
-        if 'PERF_RECORD_LOST' in row['event']:
-            raise RuntimeError('sampled caller events lost')
-        if not low <= row['time'] <= high or not SWITCH.match(row['event']):
+def task_accounting(directory, low, high, sample_low, sample_high) -> dict[str, Any]:
+    rows = [json.loads(line) for line in (directory/'tasks.jsonl').read_text().splitlines()]
+    by_pid = {row['pid']: row for row in rows}
+    if len(by_pid) != len(rows):
+        raise RuntimeError('duplicate task exit IDs; cannot resolve process ancestry')
+    seeds = set(json.loads((directory/'target-pids.json').read_text()))
+    selected = set()
+    for pid in by_pid:
+        ancestors = set()
+        current = pid
+        while current in by_pid and current not in ancestors and current not in seeds:
+            ancestors.add(current)
+            current = by_pid[current]['ppid']
+        if current in seeds:
+            selected.add(pid)
+    service, callers, events = set(), collections.Counter(), collections.Counter()
+    for row in records(directory/'samples.txt.zst'):
+        if row['pid'] not in selected or not sample_low <= row['time'] <= sample_high:
             continue
-        caller_samples += 1
+        match = re.search(r'\b(cpu-clock|context-switches):', row['event'])
+        if not match:
+            continue
+        event = match[1]
+        events[event] += 1
         stack = ' '.join(row['stack'])
-        if 'fuse_dev_do_read' in stack:
+        if 'fuse_dev_do_read' in stack or 'libfuse' in stack:
             service.add(row['pid'])
         for name in ('fuse_lookup_name', 'fuse_chan_send', 'fuse_dev_do_read',
                      'unix_stream_read_generic', 'unix_seqpacket_recvmsg', 'do_sys_poll',
                      'do_epoll_wait', 'do_wait', 'futex_wait', 'io_schedule'):
             if name in stack:
-                callers[(row['comm'], name)] += 1
+                callers[(event, row['comm'], name)] += 1
                 break
-    processes, cpus, states = {}, {}, {}
-    totals = collections.defaultdict(collections.Counter)
-    pid_totals = collections.defaultdict(collections.Counter)
-    mismatches, switches, wakes, cpu_samples = 0, 0, 0, 0
-    def role(pid, comm):
-        if not pid:
-            return 'idle'
-        if pid in service:
-            return 'fuse-service'
-        info = processes.get(pid, {})
-        name = info.get('exe', comm)
-        if info.get('planner'):
-            name += '/task' if info.get('forked') else '/resident'
-        return name
-    def add(pid, name, kind, begin, end):
-        seconds = max(0, min(end, high)-max(begin, low))
-        totals[name][kind] += seconds
-        pid_totals[pid][kind] += seconds
-    for row in records(directory/'states.txt.zst'):
-        event, now, cpu = row['event'], row['time'], row['cpu']
-        if 'PERF_RECORD_LOST' in event:
-            raise RuntimeError('continuous scheduler events lost')
-        match = re.search(r'FORK\((\d+):\d+\):\((\d+):\d+\)', event)
-        if match and match[1] != match[2]:
-            processes[int(match[1])] = dict(processes.get(int(match[2]), {}), forked=True)
-        match = re.search(r'COMM exec: (.+):(\d+)/\d+', event)
-        if match:
-            processes[int(match[2])] = {}
-        match = re.search(r'MMAP2 (\d+)/\d+:.*: r-xp (.+)$', event)
-        if match:
-            info = processes.setdefault(int(match[1]), {})
-            name = Path(match[2]).name
-            if name == 'gcc_plan.so':
-                info['planner'] = True
-            elif name in ('distcc', 'distccd', 'cc1', 'cc1plus', 'as', 'python3.14') or name.endswith('-gcc'):
-                info['exe'] = name
-        match = SWITCH.match(event)
-        if match:
-            switches += low <= now <= high
-            old, new = int(match[2]), int(match[5])
-            if cpu in cpus:
-                begin, pid, name = cpus[cpu]
-                if pid == old:
-                    add(pid, name, 'cpu', begin, now)
-                elif low < now < high:
-                    mismatches += 1
-            if new in states:
-                kind, begin, name = states.pop(new)
-                add(new, name, kind, begin, now)
-            cpus[cpu] = now, new, role(new, match[4])
-            if old and match[3] not in ('X', 'Z'):
-                states[old] = ('runnable' if match[3].startswith('R') else 'blocked',
-                               now, role(old, match[1]))
-        match = WAKE.match(event)
-        if match:
-            wakes += low <= now <= high
-            pid = int(match[2])
-            if pid in states and states[pid][0] == 'blocked':
-                _, begin, name = states[pid]
-                add(pid, name, 'blocked', begin, now)
-                states[pid] = 'runnable', now, name
-        if 'cpu-clock/' in event and low <= now <= high:
-            cpu_samples += bool(row['stack'])
-    for pid, (kind, begin, name) in states.items():
-        add(pid, name, kind, begin, high)
-    for begin, pid, name in cpus.values():
-        add(pid, name, 'cpu', begin, high)
-    observed = sum(v['cpu'] for v in totals.values())
-    expected = len(cpus)*(high-low)
-    if mismatches or abs(observed-expected) > .001 or not switches or not wakes:
-        raise RuntimeError(f'incomplete scheduler coverage: mismatches={mismatches}, CPU={observed}/{expected}')
-    validate_sampling(switches, caller_samples)
-    return dict(interval=[low, high], roles=totals, processes=pid_totals,
-                switches=switches, wakeups=wakes, cpu_caller_samples=cpu_samples,
-                sampled_switches=caller_samples, sampled_callsites=[dict(comm=k[0], site=k[1], count=v)
-                    for k, v in callers.most_common()], service_pids=sorted(service),
-                lost=0, continuity_mismatches=0, cpu_seconds=observed, expected_cpu_seconds=expected,
-                limitation='Caller sampling identifies sites, not their exact blocked durations; '
-                           'new-task time before the first observed switch is not attributed.')
+    all_roles, interior = collections.defaultdict(collections.Counter), collections.defaultdict(collections.Counter)
+    interior_pids = []
+    for pid in selected:
+        row = by_pid[pid]
+        role = 'fuse-service-sampled' if pid in service else row['comm']
+        elapsed = row['elapsed_us']/1e6
+        values = dict(tasks=1, cpu=row['cpu_ns']/1e9, scheduled=row['scheduled_ns']/1e9,
+                      runnable=row['runnable_ns']/1e9,
+                      non_cpu_residual=elapsed-(row['scheduled_ns']+row['runnable_ns'])/1e9,
+                      switches=row['voluntary_switches']+row['involuntary_switches'],
+                      read_bytes=row['read_bytes'], write_bytes=row['write_bytes'])
+        all_roles[role].update(values)
+        # Linux computes btime as floor(exit wall time) - floor(elapsed).
+        # The true start differs by <1 second. Select whole lifetimes that are
+        # certainly inside the pending-work window, never prorate aggregates.
+        if row['birth_seconds']-1 >= low and row['birth_seconds']+1+elapsed <= high:
+            interior[role].update(values)
+            interior_pids.append(pid)
+    switches = sum(by_pid[p]['voluntary_switches']+by_pid[p]['involuntary_switches'] for p in selected)
+    validate_sampling(switches, events['context-switches'])
+    if not events['cpu-clock'] or not any(by_pid[p]['comm'] in ('cc1', 'cc1plus') for p in selected):
+        raise RuntimeError('worker compiler path not reached by task accounting and samples')
+    return dict(scope='Completed descendant task lifetimes; persistent worker tasks are excluded.',
+                pending_window_wall=[low, high], roles=all_roles, interior_roles=interior,
+                interior_pids=interior_pids, target_tasks=len(selected), host_exit_records=len(rows),
+                sample_counts=events, accounted_switches=switches, service_pids=sorted(service),
+                sampled_callsites=[dict(event=k[0], comm=k[1], site=k[2], count=v)
+                                   for k,v in callers.most_common()],
+                limitations=['Non-CPU residual includes sleeping/stopped time and accounting boundary error; '
+                             'it is not an exact per-callsite blocked duration.',
+                             'Only FUSE-service PIDs positively identified by sampled stacks are labelled.',
+                             'Interior totals use whole lifetimes and conservative one-second birth bounds. '
+                             'Boundary tasks are not interpolated; an empty interior means unavailable.'])
 
 
 def packets(path, port=None):
@@ -257,11 +223,14 @@ def summarize(directory, config):
     shift = sum(offset['client_minus_worker_seconds'])/2
     result = dict(clock=offset, pending_seconds=high-low, jobs=jobs['jobs'], commands=len(commands),
                   wall_seconds=jobs['end']-jobs['start'], outputs_match=sum(c['output_match'] for c in commands))
-    for name in ('client', 'worker'):
-        anchors = json.loads((directory/name/'clocks.json').read_text())
-        delta = sum((a['mono_ns']-a['wall_ns'])/1e9 for a in anchors)/2
-        adjust = -shift if name == 'worker' else 0
-        result[name] = scheduler(directory/name, low+delta+adjust, high+delta+adjust)
+    anchors = json.loads((directory/'worker/clocks.json').read_text())
+    delta = sum((a['mono_ns']-a['wall_ns'])/1e9 for a in anchors)/2
+    bound_low, bound_high = offset['client_minus_worker_seconds']
+    result['worker'] = task_accounting(directory/'worker', low-bound_low, high-bound_high,
+                                       low+delta-shift, high+delta-shift)
+    result['client_host_cpu'] = jobs['host_cpu']
+    result['observer_cost'] = {name: json.loads((directory/name/'observer-cost.json').read_text())
+                               for name in ('client', 'worker')}
     result['rpc_client_handling'] = rpc(client, address)
     result['rpc_worker_roundtrip'] = rpc(worker, address)
     if result['rpc_client_handling']['frames'] != result['rpc_worker_roundtrip']['frames']:

@@ -137,54 +137,61 @@ def observers(hosts, phase, output):
 def fetch_observation(hosts, phase, output):
     for name, host in hosts.items():
         if host.config.get('ssh'):
-            host.run(['python3', host.directory+'/code/analyze.py', '--decode',
-                      host.directory+'/'+phase+'/'+name], root=True)
+            if name == 'worker':
+                host.run(['python3', host.directory+'/code/analyze.py', '--decode',
+                          host.directory+'/'+phase+'/'+name], root=True)
             host.fetch(host.directory+'/'+phase+'/'+name, output/name)
-        else:
+        elif name == 'worker':
             decode(output/name)
 
 
 def smoke(hosts, work):
     directory = work/'smoke'
     directory.mkdir()
-    # Exercise blocking/wakeup callsites long enough for the sparse caller
-    # sampler. The HTTP stats request gives both packet tools real traffic.
-    code = '''import os,socket,time
+    # The two smoke tasks share one CPU to exercise OS runnable accounting.
+    # Only these disposable tasks are pinned; the replay's CPU policy is intact.
+    code = '''import os,socket,time,json
+os.sched_setaffinity(0,{min(os.sched_getaffinity(0))})
 a,b=socket.socketpair();p=os.fork()
 if not p:
  a.close()
- for _ in range(4096): b.recv(1);b.sendall(b'x')
+ for _ in range(256): b.recv(1);b.sendall(b'x')
+ t=time.monotonic()+.08
+ while time.monotonic()<t: pass
  os._exit(0)
 b.close()
-for _ in range(4096): a.sendall(b'x');a.recv(1)
-os.waitpid(p,0)
-t=time.monotonic()+.05
+for _ in range(256): a.sendall(b'x');a.recv(1)
+t=time.monotonic()+.08
 while time.monotonic()<t: pass
+os.waitpid(p,0)
+print(json.dumps([os.getpid(),p]))
 '''
     with observers(hosts, 'smoke', directory):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(lambda h: h.run(['python3', '-c', code]), hosts.values()))
+        smoke_pids = json.loads(hosts['worker'].text(['python3', '-c', code]))
         c = hosts['worker'].config
         request = ("import socket;s=socket.create_connection("+repr((c['address'],c['capture']['stats_port']))+
                    ");s.sendall(b'GET / HTTP/1.0\\r\\n\\r\\n');s.recv(65536);s.close()")
         hosts['client'].run(['python3', '-c', request])
     fetch_observation(hosts, 'smoke', directory)
+    tasks = {r['pid']:r for r in (json.loads(line) for line in
+             (directory/'worker/tasks.jsonl').read_text().splitlines())}
+    if any(pid not in tasks or not tasks[pid]['scheduled_ns'] or not tasks[pid]['runnable_ns']
+           for pid in smoke_pids):
+        raise RuntimeError('smoke did not reach CPU/runnable exit accounting')
+    sampled = list(records(directory/'worker/samples.txt.zst'))
+    cpu = sum('cpu-clock:' in r['event'] and bool(r['stack']) for r in sampled if r['pid'] in smoke_pids)
+    callers = sum('context-switches:' in r['event'] and bool(r['stack']) for r in sampled if r['pid'] in smoke_pids)
+    switches = sum(tasks[pid]['voluntary_switches']+tasks[pid]['involuntary_switches'] for pid in smoke_pids)
+    validate_sampling(switches, callers)
+    if not cpu:
+        raise RuntimeError('smoke did not sample target CPU callers')
     for name in hosts:
         path = directory/name
-        continuous = list(records(path/'states.txt.zst'))
-        sampled = list(records(path/'callers.txt.zst'))
-        if any('PERF_RECORD_LOST' in r['event'] for r in continuous+sampled):
-            raise RuntimeError('smoke lost scheduler events')
-        if not any('sched:sched_switch:' in r['event'] and r['stack'] for r in sampled):
-            raise RuntimeError('smoke did not capture a scheduler caller')
-        counts = [sum('sched:sched_switch:' in r['event'] for r in rows)
-                  for rows in (continuous, sampled)]
-        validate_sampling(*counts)
-        if not any('cpu-clock/' in r['event'] and r['stack'] for r in continuous):
-            raise RuntimeError('smoke did not capture a CPU caller')
         if not list(packets(path/'packets.pcap')):
             raise RuntimeError('smoke captured no real packets')
-    (directory/'valid.json').write_text('{"valid": true}\n')
+    (directory/'valid.json').write_text(json.dumps(dict(valid=True, pids=smoke_pids,
+        taskstats=[tasks[pid] for pid in smoke_pids], cpu_samples=cpu,
+        caller_samples=callers, accounted_switches=switches), indent=2))
 
 
 def execute(hosts, config, phase, work, observed) -> dict[str, Any]:
@@ -242,15 +249,24 @@ def main():
         uid, gid = host.text(['id', '-u']).strip(), host.text(['id', '-g']).strip()
         host.run(['install', '-d', '-m', '0755', '-o', uid, '-g', gid,
                   host.directory, host.directory+'/code'], root=True)
-        for path in source.glob('*.py'):
+        for path in source.iterdir():
+            if path.suffix not in ('.py', '.c', '.sh'):
+                continue
             host.put(path, host.directory+'/code/'+path.name)
-        host.put(source/'probe.sh', host.directory+'/code/probe.sh')
         host.put(fixture, host.directory+'/config.json')
         host.put(inputs['commands'], host.directory+'/commands.json')
     try:
+        # Build the thin UAPI/libnl adapter on the worker, using its normal C
+        # compiler/flags. No scheduler algorithm or private ABI is duplicated.
+        compile_code = '''import os,shlex,subprocess,sys
+flags=shlex.split(os.environ.get('CPPFLAGS','')+' '+os.environ.get('CFLAGS',''))
+libs=shlex.split(subprocess.check_output(['pkg-config','--cflags','--libs','libnl-genl-3.0'],text=True))
+subprocess.run(shlex.split(os.environ.get('CC','cc'))+flags+[sys.argv[1]+'/taskstats.c','-o',sys.argv[1]+'/taskstats']+libs,check=True)
+'''
+        hosts['worker'].run(['python3', '-c', compile_code, hosts['worker'].directory+'/code'])
         check_worker(hosts['worker'], work/'target.json')
         smoke(hosts, work)
-        print('Smoke passed: event attributes, caller samples and actual packets on both hosts.', flush=True)
+        print('Smoke passed: target exit accounting, sparse caller samples and paired packets.', flush=True)
         with caches(hosts, dict(client=inputs['client_cache'], worker=inputs['worker_cache'])):
             control = execute(hosts, config, 'control', work, False)
             print('Unobserved replay complete.', flush=True)

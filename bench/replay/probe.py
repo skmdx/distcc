@@ -29,6 +29,7 @@ def replay(directory):
     (directory / 'identity.json').write_text(json.dumps(
         dict(resolved=resolved, binaries=identity, path=os.environ['PATH']), indent=2))
     jobs = int(subprocess.check_output(['distcc', '-j'], text=True))
+    cpu_before = list(map(int, Path('/proc/stat').read_text().splitlines()[0].split()[1:9]))
     start = time.time()
     monotonic = time.monotonic()
 
@@ -48,8 +49,12 @@ def replay(directory):
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
         results = list(executor.map(run, enumerate(commands)))
     end = time.time()
+    cpu_after = list(map(int, Path('/proc/stat').read_text().splitlines()[0].split()[1:9]))
+    cpu_seconds = [(b-a)/os.sysconf('SC_CLK_TCK') for a,b in zip(cpu_before,cpu_after)]
     result = dict(jobs=jobs, start=start, ready_monotonic=monotonic,
-                  end=end, results=results)
+                  end=end, results=results, host_cpu=dict(seconds=cpu_seconds,
+                    idle_cores=cpu_seconds[3]/(end-start),
+                    scope='Whole replay, all host tasks; tick-resolution counters.'))
     (directory / 'jobs.json').write_text(json.dumps(result, indent=2)+'\n')
     if any(r['returncode'] or not r['output_match'] for r in results):
         raise RuntimeError('replay failed or output differs; see jobs.json and job logs')

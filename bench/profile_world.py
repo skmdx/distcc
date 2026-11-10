@@ -1,13 +1,9 @@
-"""Record UNIT STACK OUTPUT, --client-schedule OUTPUT COMMAND..., --report, or --roles."""
+"""Record UNIT STACK OUTPUT, --report, or --roles."""
 import os
 from pathlib import Path
 import subprocess
 import sys
 from replay.capture import capture
-
-if len(sys.argv) > 1 and sys.argv[1] == '--client-schedule':
-    capture(sys.argv[2], sys.argv[3:], 'fp', scheduler=True)
-    raise SystemExit(0)
 
 with os.fdopen(os.memfd_create('distcc-world-profile', os.MFD_CLOEXEC), 'w+b') as data:
     fd = data.fileno()
