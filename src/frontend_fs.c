@@ -164,7 +164,7 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
     if (!result && statuses == 2) {
         encode_metadata(version, initial);
         if (!memcmp(version, previous, sizeof(version))) flags |= DCC_FS_DIRECTORY_CACHED;
-        else if (S_ISDIR(dcc_tcp_get32(previous + 32)))
+        else if (hint_count && S_ISDIR(dcc_tcp_get32(previous + 32)))
             flags |= DCC_FS_DIRECTORY_PARTIAL;
     }
     if (flags & (DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_PARTIAL)) {
@@ -227,16 +227,21 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
         fd = open(path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (fd >= 0) {
             if (fstat(fd, &st)) goto failed;
-            if (faccessat(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)) {
-                if (errno != EACCES) goto failed;
-                close(fd);
-                return metadata(reply, &st);
+            unsigned char version[DCC_FS_METADATA];
+            encode_metadata(version, &st);
+            if (!memcmp(previous, version, sizeof(version)) || hint_count) {
+                if (faccessat(fd, "", X_OK, AT_EMPTY_PATH | AT_EACCESS)) {
+                    if (errno != EACCES) goto failed;
+                    close(fd);
+                    return metadata(reply, &st);
+                }
+                if (metadata(reply, &st)) goto failed;
+                return directory(reply, fd, 2, hints, hint_count, previous, &st);
             }
-            if (metadata(reply, &st)) goto failed;
-            /* A changed directory invalidates negative names, not the
-             * usefulness of lookup hints. Even an empty footprint can be
-             * refreshed without enumerating unrelated build outputs. */
-            return directory(reply, fd, 2, hints, hint_count, previous, &st);
+            /* No positive hints means this directory may mainly reject
+             * include candidates. Refresh its names once rather than
+             * requiring an individual RPC for every missing header. */
+            close(fd);
         }
     }
     if ((follow ? stat(path, &st) : lstat(path, &st))) return -1;

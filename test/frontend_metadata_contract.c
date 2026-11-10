@@ -162,8 +162,8 @@ static void empty_footprint(struct dcc_job *job, const char *path)
     readable_directory_stats = 0;
     assert(!dcc_frontend_fs_reply(job, request, 5 + n + DCC_FS_METADATA, &reply));
     assert(!dcc_tcp_get32(reply.data));
-    assert(reply.size == 68 && dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_PARTIAL);
-    assert(!dcc_tcp_get32(reply.data + 64) && !readable_directory_stats);
+    assert(reply.size > 68 && dcc_tcp_get32(reply.data + 60) == DCC_FS_DIRECTORY_STABLE);
+    assert(dcc_tcp_get32(reply.data + 64) && readable_directory_stats);
     dcc_frontend_fs_clear(&reply);
 }
 

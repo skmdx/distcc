@@ -1188,6 +1188,25 @@ class GccFrontendTest(BrokerTestCase):
         self.compile(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
+    def test_changed_empty_footprint_keeps_batched_negative_lookups(self):
+        self.start_frontend()
+        headers = self.work/'negative-headers'
+        headers.mkdir()
+        self.source.write_text(''.join(f'#if __has_include(<absent-{i}.h>)\n#error unexpected header\n#endif\n'
+                                      for i in range(64)) + 'int value(void) { return 17; }\n')
+        command = [self.cc, '-nostdinc', '-Inegative-headers', '-O2', '-c', 'hello.c', '-o', 'out.o']
+        self.compile(command)
+        warm = self.compile(command)
+        expected = (self.work/'out.o').read_bytes()
+        (headers/'unrelated.o').touch()
+        changed = self.compile(command)
+        self.assertEqual((self.work/'out.o').read_bytes(), expected)
+        counts = [int(re.search(r'frontend filesystem: (\d+) requests', result.stderr)[1])
+                  for result in (warm, changed)]
+        print(f'Negative lookup RPC counts (warm, changed directory): {counts}')
+        self.assertLessEqual(counts[1], counts[0] + 2,
+                             'an empty footprint must not create one RPC per absent header')
+
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
     def test_warm_prefetch_reads_directory_metadata_once(self):
         self.start_frontend()
