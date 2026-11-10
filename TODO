@@ -4,7 +4,7 @@ TODO list for distcc
 
 reduce remaining client filesystem service cost in remote preprocessing
 
-    r229 deploys 35317a4 on top of the r228 client buffer changes.
+    r231 deploys 8d4d668 on top of the r229 client and pipeline changes.
     All five deployed nodes pass C/C++ and Rust execution checks;
     the 25 Rust client/worker pairs and all five ThinLTO clients pass.
     One clean glibc build completes all 6642 jobs remotely with zero worker
@@ -12,24 +12,36 @@ reduce remaining client filesystem service cost in remote preprocessing
     Compiler flags, ebuild hash and libc.so hash match the preceding build;
     automatic parallelism rises from -j32 to -j48 through staged capacity.
 
-    Wall time is 270.229 seconds versus r228's 268.113 (+0.79%). Client
-    build CPU rises 688.168 to 708.017 seconds (+2.88%), while remote use
-    rises 5.839 to 6.351 cores (+8.78%). Wall time remains 4.93% below r227
-    and 13.74% below r226. The bundle does not demonstrate a further speedup.
-    Across one-second samples, all 32 worker slots are busy in 51/264 samples
+    Wall time is 272.540 seconds versus r228's 268.113 (+1.65%). Client
+    build CPU rises 688.168 to 706.271 seconds (+2.63%), while remote use
+    rises 5.839 to 6.314 cores (+8.15%). Wall time remains 13.00% below r226.
+    The bundle does not demonstrate a further speedup over r228.
+    Across one-second samples, all 32 worker slots are busy in 54/268 samples
     versus 4/263 previously. Queue depth peaks at two on one worker and zero
     on the other three; the previous maximum was one. Busy slots are not CPU
     utilization. Dividing total worker CPU by observed active time estimates
-    8.870 cores versus 8.095, still far below sustained 32-core utilization.
+    8.693 cores versus 8.095, still far below sustained 32-core utilization.
 
-    The 90-120 second profile window records 65.612 to 62.735 CPU seconds.
-    The distcc-client role is essentially unchanged at 31.061 to 31.102;
-    planner and GCC driver fall 14.653 to 13.163 and 9.041 to 7.714 seconds.
-    Client mmap/munmap caller samples are 2.878 to 2.918 seconds, so a global
-    mapping-cost reduction is not demonstrated by this capture. Both runs
-    use frame pointers; task mixes in a fixed window can still change.
-    This is one deployment and one complete measurement, without repeated
-    runs establishing statistical significance or isolated patch effects.
+    The preceding r230 bundle cached successful per-job symlink results and
+    reduced authorization-root traversal, but incorrectly omitted full name
+    indexes when changed directories had no lookup hints. A real-GCC regression
+    with 64 absent headers reproduces the resulting 66 metadata RPCs versus
+    two warm RPCs; r231 restores the negative index and needs one RPC after
+    the directory change. All 80 related local tests pass. The r230 full build
+    regressed to 333.828 seconds and 955.155 client CPU seconds; those results
+    are retained. Restoring the index removes that regression, not the remaining
+    client bottleneck or the failure to beat r228.
+
+    The r228/r231 90-120 second profiles record 65.612/66.551 CPU seconds.
+    The distcc-client role is 31.061/31.939; planner and GCC driver are
+    14.653/14.408 and 9.041/9.429 seconds. Client sendto/ppoll samples recover
+    from r230's 14.592/9.980 to 2.837/1.673 seconds. Metadata newfstatat remains
+    2.592 versus r228's 1.551; mmap/munmap total 3.490 versus 2.878 seconds.
+    These inclusive sampled costs are not additive or isolated patch effects.
+    Each version has one deployment and one complete measurement; r231's
+    additional run was explicitly authorized. Both use frame pointers, but
+    fixed windows can contain different work mixes and single runs do not
+    establish statistical significance.
     Elimination of intermittent IPC failures, waiting and spare capacity
     remains unverified.
 
