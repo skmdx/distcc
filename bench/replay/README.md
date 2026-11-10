@@ -53,7 +53,35 @@ sources. Existing evidence snapshots are not modified or executable prerequisite
 
 ## Input interposition canary
 
-For the isolated libc boundary check, use the same canonical directory:
+For the real Files/Connection input boundary, use:
+
+```sh
+python3 bench/replay/interpose.py --owner --cc /path/to/target-gcc --cxx /path/to/target-g++ --workdir /path/to/empty-run
+```
+
+This builds `h_input_owner` through the checkout's configured Makefile. One
+owner runs the actual `Files::descriptor/open` and `Connection::read`; its client
+peer runs `dcc_frontend_fs_reply`, including export roots and native permissions.
+A private sequential socket passes a path and a real FD/error with SCM_RIGHTS.
+Only the selected compiler image uses it. Other child images, outputs, loader,
+directory operations and path metadata retain native access. This is a
+connection canary, not a production route or a new general RPC service.
+
+The existing Files inode owns a sealed payload FD and its mapped Buffer; aliases
+reuse that inode only after their own authorized read. Reopening its proc FD
+gives independent offsets, while exported FDs survive owner exit. Tests require
+actual compiler reads of the memfd, C/C++ object equality, exact error/diagnostic
+equality, export denial, hardlink identity, seals and compiler hash invariance.
+
+**Unresolved contract:** native `stat(path)` describes the original inode,
+whereas native `fstat(exported_fd)` describes a different payload inode. The
+canary records this mismatch; it does not emulate fstat or add an FD table to
+hide it. Production adoption requires the path and descriptor to describe the
+same OS-owned object. Symlink/fortified realpath, directory PCH, ACL and active
+cancellation contracts are not accepted by this test. FUSE remains the
+production job's sole filesystem owner; no production routing is changed.
+
+For the earlier, independent directory-fixture boundary check, omit `--owner`:
 
 ```sh
 python3 bench/replay/interpose.py --cc /path/to/target-gcc --cxx /path/to/target-g++ --workdir /path/to/empty-run

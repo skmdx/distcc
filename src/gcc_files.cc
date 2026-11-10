@@ -45,6 +45,22 @@ struct Query {
     std::string path, bytes;
     dccfs::Buffer previous;
 };
+// A payload FD is owned by the same Files inode and Buffer as the snapshot.
+// Exported read-only descriptions remain alive independently in the kernel.
+struct InputDescriptor {
+    int fd = -1;
+    void *mapping = MAP_FAILED;
+    size_t size = 0;
+    std::array<char, DCC_FS_METADATA> version{};
+    ~InputDescriptor() {
+        if (mapping != MAP_FAILED) munmap(mapping, size);
+        if (fd >= 0) close(fd);
+    }
+};
+struct Inode {
+    ino_t number;
+    std::shared_ptr<InputDescriptor> descriptor;
+};
 class Files {
     dccfs::Connection connection;
     std::string source, scope;
@@ -53,7 +69,7 @@ class Files {
     int hints_error = 0;
     bool learned = false;
     std::map<std::string, Entry> entries;
-    std::map<std::pair<uint64_t, uint64_t>, ino_t> inodes;
+    std::map<std::pair<uint64_t, uint64_t>, Inode> inodes;
     static bool valid_name(std::string_view name) {
         return !name.empty() && name != "." && name != ".." &&
             name.find_first_of("/\0", 0, 2) == std::string_view::npos;
@@ -116,7 +132,7 @@ public:
     ino_t inode(uint64_t device, uint64_t number) {
         // One FUSE mount represents several client devices. Preserve hardlink
         // identity without aliasing equal inode numbers on distinct devices.
-        return inodes.try_emplace({device, number}, inodes.size()+1).first->second;
+        return inodes.try_emplace(std::make_pair(device, number), Inode{inodes.size()+1, {}}).first->second.number;
     }
     int prepare(const std::set<std::string> &scheduled, Query &query, bool speculative = false) {
         const auto &path = *scheduled.begin();
@@ -390,6 +406,42 @@ public:
             entry->bytes = std::move(snapshot.bytes);
         }
         return 0;
+    }
+    // Canary boundary only: not routed from production compiler jobs. Native
+    // fstat exposes the payload inode, not the client's metadata inode.
+    int descriptor(const char *path) {
+        Entry *entry;
+        if (int error = open(path, entry)) { errno = error; return -1; }
+        auto key = std::make_pair(number(entry->version.data(), 8), number(entry->version.data()+8, 8));
+        inode(key.first, key.second);
+        auto &snapshot = inodes.at(key).descriptor;
+        if (!snapshot || snapshot->version != entry->version) {
+            auto next = std::make_shared<InputDescriptor>();
+            next->fd = memfd_create("distcc-input", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+            if (next->fd < 0) return -1;
+            for (size_t used = 0; used < entry->bytes.size;) {
+                ssize_t n = write(next->fd, entry->bytes.data+used, entry->bytes.size-used);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return -1;
+                used += n;
+            }
+            int64_t time = number(entry->version.data()+16, 8);
+            struct timespec stamp[2] = {{0, UTIME_OMIT}, {time/1000000000, time%1000000000}};
+            if (fchmod(next->fd, entry->mode() & 0777) || futimens(next->fd, stamp) ||
+                fcntl(next->fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)) return -1;
+            next->size = entry->bytes.size;
+            next->version = entry->version;
+            if (next->size) {
+                next->mapping = mmap(nullptr, next->size, PROT_READ, MAP_SHARED, next->fd, 0);
+                if (next->mapping == MAP_FAILED) return -1;
+            }
+            snapshot = std::move(next);
+        }
+        entry->bytes = {snapshot, snapshot->size ? static_cast<const char *>(snapshot->mapping) : "", snapshot->size};
+        // dup/SCM_RIGHTS alone would share the offset. Opening this proc entry
+        // creates an independent read-only description of the same inode.
+        std::string path_fd = "/proc/self/fd/"+std::to_string(snapshot->fd);
+        return ::open(path_fd.c_str(), O_RDONLY | O_CLOEXEC);
     }
     int link(const char *path, char *buffer, size_t size) {
         auto &target = entries[path].link_target;

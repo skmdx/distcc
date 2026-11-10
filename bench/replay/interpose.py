@@ -11,6 +11,10 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
+import array
+import fcntl
+import struct
 import subprocess
 from typing import Any
 
@@ -38,17 +42,124 @@ def elf(compiler, name) -> dict[str, Any]:
                 libraries=subprocess.check_output(['ldd', str(binary)], text=True))
 
 
+def owner_canary(args, work, source):
+    """Real Files owner and client authorization, without a replacement tree."""
+    project = source.parent.parent
+    helper = project/'h_input_owner'
+    built = run(['make','-f','Makefile','-f','bench/replay/owner.mk','h_input_owner'], cwd=project)
+    (work/'owner-build.log').write_text(built.stdout+built.stderr)
+    built.check_returncode()
+    shutil.copy2(helper, work/helper.name)
+    shutil.copy2(source/'owner_interpose.c',work/'owner_interpose.c')
+    library = work/'owner_interpose.so'
+    built = run([*shlex.split(os.environ.get('CC','cc')), *shlex.split(os.environ.get('CFLAGS','')),
+                 '-shared','-fPIC','-Wall','-Wextra',work/'owner_interpose.c','-ldl','-pthread','-o',library])
+    (work/'build.log').write_text(built.stdout+built.stderr); built.check_returncode()
+    image = {'cc1':elf(args.cc,'cc1'), 'cc1plus':elf(args.cxx,'cc1plus')}
+    (work/'elf.json').write_text(json.dumps(image,indent=2)+'\n')
+    cache = work/'cache'; cache.mkdir()
+    results = []
+    for case, compiler, suffix in [('c',args.cc,'c'),('cxx',args.cxx,'cc'),
+                                   ('diagnostic',args.cc,'c'),('missing',args.cc,'c'),('denied',args.cc,'c')]:
+        directory = work/case; root = directory/'input'; root.mkdir(parents=True)
+        main = root/('main.'+suffix); value = root/'value.h'
+        private = directory/'unexported.h'; private.write_text('not exported\n')
+        value.write_text('#pragma once\nenum { value = 37 };\n')
+        os.link(value,root/'hard.h')
+        (root/'denied.h').write_text('#error denied\n'); (root/'denied.h').chmod(0)
+        contents = '#include "value.h"\n#include "hard.h"\nint answer(void) { return value; }\n'
+        if case == 'diagnostic': contents += 'int invalid = missing_identifier;\n'
+        if case in ('missing','denied'): contents += '#include "'+case+'.h"\n'
+        main.write_text(contents)
+        output = directory/'output.o'
+        flags = shlex.split(os.environ.get('CXXFLAGS' if suffix == 'cc' else 'CFLAGS',''))
+        argv = [compiler,*flags,'-c',str(main),'-o',str(output)]
+        native = run(argv); (directory/'native.log').write_text(native.stderr)
+        expected = output.read_bytes() if native.returncode == 0 else None
+        if expected is not None: output.rename(directory/'native.o')
+        client_end, owner_end = socket.socketpair()
+        caller, service = socket.socketpair(type=socket.SOCK_SEQPACKET)
+        with (directory/'client.log').open('w') as cl, (directory/'owner.log').open('w') as ol:
+            peer = subprocess.Popen([work/helper.name,'client',str(client_end.fileno()),'0',root,cache],
+                                    pass_fds=(client_end.fileno(),),stderr=cl)
+            owner = subprocess.Popen([work/helper.name,'owner',str(owner_end.fileno()),str(service.fileno()),root,cache],
+                                     pass_fds=(owner_end.fileno(),service.fileno()),stderr=ol)
+            client_end.close(); owner_end.close(); service.close()
+            environment = dict(os.environ, LD_PRELOAD=str(library), DCC_CANARY_FD=str(caller.fileno()),
+                               DCC_CANARY_IMAGE=str(Path(image['cc1plus' if suffix == 'cc' else 'cc1']['binary']).resolve()),
+                               DCC_CANARY_ROOT=str(directory))
+            if os.environ.get('LD_PRELOAD'): environment['LD_PRELOAD'] += ':'+os.environ['LD_PRELOAD']
+            try:
+                actual = run(['strace','-f','-yy','-e','trace=openat,read','-o',directory/'access.trace',*argv],
+                             env=environment, pass_fds=(caller.fileno(),), timeout=15)
+                (directory/'interposed.log').write_text(actual.stderr)
+                if actual.returncode != native.returncode or actual.stderr != native.stderr:
+                    raise RuntimeError(f'{case}: status/diagnostic mismatch: {actual.stderr}')
+                if expected is not None and output.read_bytes() != expected: raise RuntimeError('object mismatch')
+                trace = (directory/'access.trace').read_text()
+                if 'memfd:distcc-input' not in trace: raise RuntimeError('compiler did not read exported input FD')
+                def get(path):
+                    caller.send(os.fsencode(path))
+                    data, ancillary, _, _ = caller.recvmsg(4,socket.CMSG_SPACE(4))
+                    error, = struct.unpack('i',data)
+                    if error: raise OSError(error,os.strerror(error),str(path))
+                    return array.array('i',ancillary[0][2])[0]
+                first, second, alias = get(value), get(value), get(root/'hard.h')
+                try:
+                    try:
+                        unexpected = get(private)
+                    except OSError as failure:
+                        export_denied = failure.errno == 13
+                    else:
+                        os.close(unexpected); export_denied = False
+                    if not export_denied: raise RuntimeError('client export authorization bypassed')
+                    independent = os.read(first,4) == os.read(second,4)
+                    identity = (os.fstat(first).st_dev,os.fstat(first).st_ino) == (os.fstat(alias).st_dev,os.fstat(alias).st_ino)
+                    metadata_identity = (os.stat(value).st_dev,os.stat(value).st_ino) == (os.fstat(first).st_dev,os.fstat(first).st_ino)
+                    seals = fcntl.fcntl(first,fcntl.F_GET_SEALS)
+                    if not independent or not identity or seals != 15: raise RuntimeError('FD ownership contract failed')
+                    caller.close(); owner.wait(timeout=5); peer.wait(timeout=5)
+                    survives_owner = os.pread(first,4,0) == b'#pra'
+                    if not survives_owner: raise RuntimeError('FD died with owner')
+                finally:
+                    for fd in (first,second,alias): os.close(fd)
+            finally:
+                caller.close()
+                for process in (owner,peer):
+                    try: process.wait(timeout=5)
+                    except subprocess.TimeoutExpired: process.kill(); process.wait(); raise
+            if owner.returncode or peer.returncode: raise RuntimeError('owner/client failed')
+        operations = (directory/'owner.log').read_text()
+        if 'export '+str(main) not in operations or 'export '+str(value) not in operations: raise RuntimeError('missing Files reachability')
+        results.append(dict(case=case,status=actual.returncode,object_match=expected is not None,
+                            diagnostics_match=True,independent_offsets=independent,hardlink_identity=identity,
+                            native_stat_fstat_identity=metadata_identity,seals=seals,survives_owner=survives_owner,
+                            unexported_input_denied=export_denied))
+    unchanged = all(digest(item['binary']) == item['sha256'] for item in image.values())
+    if not unchanged: raise RuntimeError('compiler binary changed')
+    result = dict(valid=True,cases=results,compiler_binaries_unchanged=unchanged,
+                  scope='Actual Files/Connection and frontend_fs authorization; no production adoption or timing claim.',
+                  blocker='Native stat(path) and fstat(payload FD) expose different devices/inodes; path metadata has not been replaced.',
+                  limits=['Symlink/canonicalization, PCH and directory consumers remain outside this connection canary.',
+                          'One selected compiler child per owner; no concurrent multi-compiler claim.'])
+    (work/'summary.json').write_text(json.dumps(result,indent=2)+'\n'); print(json.dumps(result,indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cc', required=True)
     parser.add_argument('--cxx', required=True)
     parser.add_argument('--workdir', type=Path, required=True)
+    parser.add_argument('--owner', action='store_true', help='Use real Files/Connection instead of the directory fixture')
     args = parser.parse_args()
     work = args.workdir.resolve()
     work.mkdir(parents=True, exist_ok=True)
     if any(work.iterdir()):
         raise RuntimeError('workdir must be new and empty')
     source = Path(__file__).resolve().parent
+    if args.owner:
+        shutil.copy2(__file__,work/'interpose.py')
+        return owner_canary(args,work,source)
     shutil.copy2(source/'interpose.c', work/'interpose.c')
     shutil.copy2(__file__, work/'interpose.py')
     library = work/'interpose.so'
