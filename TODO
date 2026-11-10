@@ -8,17 +8,17 @@ remove avoidable waits while remote compilation has runnable work
     waits with available work, preserving compiler settings and output identity.
     Idle capacity during build dependency waits is not a scheduling defect.
 
-    Job-scoped kernel name caching removes repeated native GCC filesystem
-    wakeups and improves the complete build. First-read filesystem RPC waits
-    remain; client CPU increased. The saved full-run samples do not separate
-    every remaining input-service wait from build dependencies. Further changes
+    Job-scoped kernel caching and on-demand completion of partial directory
+    indexes remove repeated filesystem wakeups and serial metadata requests.
+    First-lookup FUSE IPC and required file reads remain. The full-run samples
+    do not separate every input-service wait from build dependencies. Further changes
     must address a measured runnable-work stall, not queue depth or a core-count
     threshold. Native GCC regressions preserve fresh headers and permissions.
 
     Acceptance remains a matched full build with worker CPU and runnable/wait
     evidence, no hidden fallback/errors, and matching generated artifacts.
     Preserve unfavorable runs and limits in the existing measurement record:
-    the workspace's existing glibc measurement README (r234/r235). The fixed
+    the workspace's existing glibc measurement README (r235/r236). The fixed
     30-second profiles do not establish whole-build or same-work improvements.
 
 recognize arbitrary input suffixes with explicit compiler language
