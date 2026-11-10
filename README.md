@@ -509,6 +509,11 @@ are moved to the configured results directory; intermediate binary packages
 are removed. The command does not create commits or publish a new release.
 
 Run `./benchmark` without arguments to measure the installed fleet. It can be
+complemented by the [saved-command replay](bench/replay/README.md) for a matched
+single-worker diagnostic, paired packet/scheduler capture and an unobserved
+control. Its fixture stays outside public code, and each run starts from a new
+empty directory; archived scripts are evidence, not executable prerequisites.
+The installed-fleet benchmark can be
 symlinked into `PATH` as `distcc-bench`. The private
 `~/.config/distcc/bench.json` selects the build client and workers by their names
 in `deploy.json`; see `bench/fleet.example.json`. Configure a known complete
