@@ -4,38 +4,33 @@ TODO list for distcc
 
 reduce remaining client filesystem service cost in remote preprocessing
 
-    r227 combines the client overhead and admission changes in 9df3164 and
-    e20547a. All five deployed nodes pass C/C++ and Rust execution checks;
+    r228 deploys fabaeaa on top of the r227 client admission changes.
+    All five deployed nodes pass C/C++ and Rust execution checks;
     the 25 Rust client/worker pairs and all five ThinLTO clients pass.
     One clean glibc build completes all 6642 jobs remotely with zero worker
     errors, timeouts, disconnects, planner warnings or local fallbacks.
     Compiler flags, automatic -j32, ebuild hash and libc.so hash match the
-    retained r220/r223/r226 builds.
+    retained r220/r223/r226/r227 builds.
 
-    Wall time is 284.251 seconds versus 296.422 / 304.547 / 313.258 seconds
-    for r220 / r223 / r226: reductions of 4.11% / 6.66% / 9.26%.
-    Against r226, client build CPU falls 802.960 to 701.395 seconds (-12.65%).
-    Whole-client average CPU use changes from 2.636 to 2.560 cores; total
-    remote use rises from 4.793 to 5.828 cores (+21.60%). Remote CPU time
-    rises 9.96% with changed placement, so lower wall time is not evidence
-    of less total worker CPU work.
+    Wall time is 268.113 seconds versus r227's 284.251 (-5.68%). Client
+    build CPU falls 701.395 to 688.168 seconds (-1.89%). Whole-client average
+    CPU use rises from 2.560 to 2.642 cores; remote use is nearly unchanged
+    at 5.828 to 5.839 cores (+0.17%). Remote CPU time falls 5.08% with changed
+    placement. Against r220 / r223 / r226, wall time falls 9.55% / 11.96% /
+    14.41%. This is one deployment and one complete measurement, not repeated
+    runs establishing statistical significance or isolated patch effects.
 
-    The matched 30-second profile window records 60.143 to 55.204 CPU
-    seconds (-8.21%). Native planner cost falls 13.020 to 11.469 seconds
-    and GCC driver cost falls 7.388 to 6.816 seconds. The distcc-client role
-    remains the main target: its sampled CPU is effectively unchanged
-    at 28.531 versus 28.633 seconds (51.87% of the latest sampled CPU).
-    The next local changes reuse client chunk/snapshot storage, read file
-    extents without per-chunk mapping/stat, cache the publication mask,
-    generate transaction IDs without random syscalls, use stack request
-    lists for small jobs, and reuse settings within each compile. Server
-    output packets still own their bytes until asynchronous sends finish.
-    Deployment and a matched complete-build comparison remain pending;
-    local correctness tests alone do not establish the performance gain.
-    A single complete run does not isolate
-    individual patch contributions, establish stable speedup, or prove
-    intermittent IPC failures impossible. The previous warning did not recur;
-    full elimination of waiting and spare capacity remains unverified.
+    The 90-120 second profile window records 55.204 to 65.612 CPU seconds.
+    The distcc-client role rises 28.633 to 31.061 seconds, while its share
+    falls 51.87% to 47.34%. Planner and GCC driver CPU rise 11.469 to 14.653
+    and 6.816 to 9.041 seconds. mmap/munmap samples rise 2.776 to 2.878
+    seconds; getenv leaf samples rise 0.796 to 0.816 seconds. These hotspot
+    reductions are not demonstrated. Work in a fixed time window can change,
+    and r228 uses frame pointers instead of r227's DWARF 16384 unwinding;
+    instrumentation overhead and call-chain coverage are not identical.
+    Retain this distinction from the observed full-build time reduction.
+    Elimination of intermittent IPC failures, waiting and spare capacity
+    remains unverified.
 
 
 recognize arbitrary input suffixes with explicit compiler language
