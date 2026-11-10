@@ -8,6 +8,13 @@
 #define FUSE_USE_VERSION 31
 #include <fuse3/fuse_lowlevel.h>
 static unsigned *attribute_calls;
+static unsigned *read_calls;
+static void (*original_read)(fuse_req_t, fuse_ino_t, size_t, off_t, struct fuse_file_info *);
+static void counted_read(fuse_req_t request, fuse_ino_t inode, size_t size, off_t offset,
+                         struct fuse_file_info *info) {
+    ++*read_calls;
+    original_read(request, inode, size, offset, info);
+}
 static void (*original_lookup)(fuse_req_t, fuse_ino_t, const char *);
 static void counted_lookup(fuse_req_t request, fuse_ino_t parent, const char *name) {
     ++*attribute_calls;
@@ -18,6 +25,8 @@ static struct fuse_session *counted_session_new(struct fuse_args *args, const st
     auto counted = *operations;
     original_lookup = counted.lookup;
     counted.lookup = counted_lookup;
+    original_read = counted.read;
+    counted.read = counted_read;
     return fuse_session_new(args, &counted, size, data);
 }
 static pid_t mounted_child;
@@ -67,6 +76,10 @@ static void integer(std::string &bytes, unsigned value)
 {
     uint32_t wire = htonl(value);
     bytes.append(reinterpret_cast<const char *>(&wire), sizeof(wire));
+}
+static void store_number(char *bytes, uint64_t value, unsigned size)
+{
+    while (size) { bytes[--size] = value; value >>= 8; }
 }
 static void read_query(int fd)
 {
@@ -237,8 +250,10 @@ static void disconnected_mount(const char *root)
     require(!rmdir(mountpoint.c_str()), "mount cleanup");
 }
 
-static void clean_mount(const char *root, bool lookup)
+static void clean_mount(const char *root, bool lookup, int size_change = 0)
 {
+    std::string contents(8193, 'x');
+    contents.back() = 'z';
     int pair[2];
     require(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair), "clean mount socketpair");
     pid_t peer = fork();
@@ -250,13 +265,44 @@ static void clean_mount(const char *root, bool lookup)
             std::string stamp(DCC_FS_METADATA, '\0');
             uint32_t permissions = htonl(S_IFDIR | 0755);
             memcpy(stamp.data()+32, &permissions, sizeof(permissions));
-            if (i == 2) { integer(stamp, DCC_FS_DIRECTORY_STABLE); integer(stamp, 0); }
+            if (i == 2) {
+                integer(stamp, DCC_FS_DIRECTORY_STABLE); integer(stamp, 2);
+                for (const char *name : {"data.h", "denied.h"}) {
+                    integer(stamp, strlen(name)); integer(stamp, 0); stamp += name;
+                    std::string file(DCC_FS_METADATA, '\0');
+                    store_number(file.data()+32, S_IFREG | 0644, 4);
+                    store_number(file.data()+24, contents.size()+size_change, 8);
+                    stamp += file;
+                }
+            }
             integer(payload, 0); integer(payload, stamp.size()); payload += stamp;
         }
         std::string response;
         integer(response, 0); integer(response, payload.size()); response += payload;
         require(send(pair[1], response.data(), response.size(), MSG_NOSIGNAL) ==
                 static_cast<ssize_t>(response.size()), "clean mount reply");
+        if (lookup) {
+            for (const char *name : {"data.h", "denied.h"}) {
+                uint32_t header[3];
+                read_bytes(pair[1], header, sizeof(header));
+                std::string path(ntohl(header[1])-4, '\0');
+                read_bytes(pair[1], path.data(), path.size());
+                require(ntohl(header[2]) == DCC_FS_READ &&
+                        path == std::string("/tree/include/")+name, "snapshot read request");
+                std::string body;
+                bool denied = !strcmp(name, "denied.h");
+                if (!denied) {
+                    body.resize(DCC_FS_METADATA);
+                    store_number(body.data()+32, S_IFREG | 0644, 4);
+                    store_number(body.data()+24, contents.size(), 8);
+                    body += contents;
+                }
+                response.clear(); integer(response, denied ? EACCES : 0);
+                integer(response, body.size()); response += body;
+                require(send(pair[1], response.data(), response.size(), MSG_NOSIGNAL) ==
+                        static_cast<ssize_t>(response.size()), "snapshot reply");
+            }
+        }
         close(pair[1]); _exit(0);
     }
     close(pair[1]);
@@ -277,6 +323,33 @@ static void clean_mount(const char *root, bool lookup)
     close(pair[0]);
     struct stat info;
     if (lookup) {
+        unsigned reads = *read_calls;
+        std::string filename = mountpoint+"/tree/include/data.h";
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            int fd = open(filename.c_str(), O_RDONLY);
+            require(fd >= 0, "authorized snapshot open");
+            std::string output(contents.size()+1, '\0');
+            require(read(fd, output.data(), output.size()) == static_cast<ssize_t>(contents.size()) &&
+                    !memcmp(output.data(), contents.data(), contents.size()), "snapshot read contents/EOF");
+            void *mapped = mmap(nullptr, contents.size(), PROT_READ, MAP_PRIVATE, fd, 0);
+            require(mapped != MAP_FAILED && !memcmp(mapped, contents.data(), contents.size()), "snapshot mmap contents");
+            munmap(mapped, contents.size()); close(fd);
+        }
+        printf("First read/mmap and reopen READ callbacks: %u\n", *read_calls-reads);
+        require(size_change || *read_calls == reads, "authorized open did not populate kernel pages");
+        int fd = open(filename.c_str(), O_RDONLY);
+        require(fd >= 0, "snapshot reopen before page reclamation");
+        require(!posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED), "discard cached snapshot pages");
+        reads = *read_calls;
+        std::string reclaimed(contents.size(), '\0');
+        require(read(fd, reclaimed.data(), reclaimed.size()) == static_cast<ssize_t>(contents.size()) &&
+                reclaimed == contents, "immutable snapshot must refill reclaimed kernel pages");
+        require(*read_calls > reads, "reclamation did not exercise the refill callback");
+        close(fd);
+        filename = mountpoint+"/tree/include/denied.h";
+        require(!stat(filename.c_str(), &info), "metadata visibility must not authorize a read");
+        require(open(filename.c_str(), O_RDONLY) < 0 && errno == EACCES,
+                "read denial must occur at open, not first read");
         require(!lstat((mountpoint+"/tree").c_str(), &info), "live FUSE lookup");
         std::string missing = mountpoint+"/tree/include/absent.h";
         require(open(missing.c_str(), O_RDONLY) == -1 && errno == ENOENT,
@@ -323,13 +396,19 @@ int main(int argc, char **argv)
     attribute_calls = static_cast<unsigned *>(mmap(nullptr, sizeof(unsigned), PROT_READ | PROT_WRITE,
                                                    MAP_SHARED | MAP_ANONYMOUS, -1, 0));
     require(attribute_calls != MAP_FAILED, "shared callback counter");
+    read_calls = static_cast<unsigned *>(mmap(nullptr, sizeof(unsigned), PROT_READ | PROT_WRITE,
+                                             MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    require(read_calls != MAP_FAILED, "shared read callback counter");
     cached_links();
     negative_hints();
     for (const char *mode : {"valid", "denied", "short", "length", "flags", "missing",
                              "trailing", "bad-error", "disconnect"}) replies(mode);
     require(argc == 2, "temporary root argument");
     clean_mount(argv[1], true);
+    clean_mount(argv[1], true, 4096); // Input shrinks between lookup and read RPC.
+    clean_mount(argv[1], true, -4096); // Input grows at the same boundary.
     clean_mount(argv[1], false);
     disconnected_mount(argv[1]);
     munmap(attribute_calls, sizeof(unsigned));
+    munmap(read_calls, sizeof(unsigned));
 }

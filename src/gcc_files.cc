@@ -472,7 +472,21 @@ void open_file(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info *info
     if ((info->flags & O_ACCMODE) != O_RDONLY) { fuse_reply_err(request, EROFS); return; }
     auto &fs = files(request);
     Entry *entry = &node(fs, inode);
+    bool first_read = !entry->bytes.owner;
     if (int error = fs.open(entry->path->c_str(), entry)) { fuse_reply_err(request, error); return; }
+    if (first_read && entry->bytes.size) {
+        // OPEN already authorizes and obtains the immutable snapshot. Publish
+        // it before completing OPEN instead of waking this service again for
+        // the same bytes on the compiler's first read. Kernel reclaim can
+        // still request pages through read_file; Files retains their owner.
+        struct fuse_bufvec data = FUSE_BUFVEC_INIT(entry->bytes.size);
+        data.buf[0].mem = const_cast<char *>(entry->bytes.data);
+        auto session = static_cast<Mount *>(fuse_req_userdata(request))->fs;
+        if (int error = fuse_lowlevel_notify_store(session, inode, 0, &data,
+                                                   static_cast<fuse_buf_copy_flags>(0))) {
+            fuse_reply_err(request, -error); return;
+        }
+    }
     info->keep_cache = 1;
     fuse_reply_open(request, info);
 }
