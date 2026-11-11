@@ -324,6 +324,19 @@ AC_SEARCH_LIBS(inet_aton, [resolv])
 
 PKG_CHECK_MODULES(POPT, [popt >= 1.7])
 PKG_CHECK_MODULES(FUSE, [fuse3])
+save_LIBS="$LIBS"
+save_CPPFLAGS="$CPPFLAGS"
+LIBS="$FUSE_LIBS $LIBS"
+CPPFLAGS="$FUSE_CFLAGS $CPPFLAGS"
+AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+#define FUSE_USE_VERSION 31
+#include <fuse_lowlevel.h>
+]], [[
+    unsigned capability = FUSE_CAP_OVER_IO_URING;
+    return fuse_req_is_uring((fuse_req_t)0) + capability;
+]])], [], [AC_MSG_ERROR([libfuse with the public FUSE io_uring API is required])])
+LIBS="$save_LIBS"
+CPPFLAGS="$save_CPPFLAGS"
 AC_SUBST(POPT_CFLAGS)
 AC_SUBST(POPT_LIBS)
 

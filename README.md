@@ -778,6 +778,16 @@ batches before filesystem lookups begin. The client checks each path with the
 same permissions and freshness rules as an individual request; unexpected
 paths still use on-demand queries. The filesystem service alone owns the FUSE
 device, so its exit also releases any pending compiler lookup.
+The worker requests libfuse's advertised io_uring transport at queue depth one;
+unsupported kernels or libraries keep the classic session. A cancellable
+semaphore serializes callbacks around the single Files/RPC owner. After joining
+the Files child, the parent includes its transport, request counts and status
+in the existing job summary, without a separate diagnostic stream.
+The Gentoo package requires the public libfuse io_uring API and the libfuse NUMA
+capability fix. Enabling libfuse's `io-uring` USE flag remains an administrator
+choice. Its systemd drop-in loads the FUSE module and uses tmpfiles to enable
+the kernel's existing `enable_uring` parameter; absent parameters are untouched.
+Existing mounts and other daemons are not restarted.
 Directory names are shared across source contexts. Attribute prefetch hints
 are scoped to the source's parent directory, so unrelated translation units
 cannot grow one global metadata batch. The client checks directory

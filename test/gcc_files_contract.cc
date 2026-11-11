@@ -43,6 +43,9 @@ static int checked_unmount(const char *path, int flags) {
 #undef fuse_session_new
 #include <thread>
 
+static std::string job_summary;
+extern "C" void dcc_job_summary_append(const char *text) { job_summary += text; }
+
 // These framing tests inspect published hints but do not retain snapshots.
 // Native compiler integration tests exercise the shared cache and invalidation.
 static std::vector<std::string> published_hints;
@@ -244,7 +247,10 @@ static void disconnected_mount(const char *root)
     require(lstat((mountpoint+"/probe").c_str(), &info) < 0, "failed service answered lookup");
     uint64_t cpu = 0;
     unsigned long long peak = 0;
+    job_summary.clear();
     require(dcc_gcc_files_stop(mount, &cpu, &peak) != 0, "failed prefetch reported success");
+    require(job_summary.find(" status=0 ") == std::string::npos,
+            "failed Files service logged success");
     int status;
     require(waitpid(peer, &status, 0) == peer && WIFEXITED(status) && !WEXITSTATUS(status), "peer exit");
     require(!rmdir(mountpoint.c_str()), "mount cleanup");
@@ -379,9 +385,14 @@ static void clean_mount(const char *root, bool lookup, int size_change = 0)
     mounted_child = static_cast<Mount *>(mount)->child;
     uint64_t cpu = 0;
     unsigned long long peak = 0;
+    job_summary.clear();
     int result = dcc_gcc_files_stop(mount, &cpu, &peak);
     mounted_child = 0;
     require(!result, "clean shutdown reported failure");
+    require(job_summary.find(" status=0 ") != std::string::npos,
+            "joined Files service did not append its result to the job summary");
+    if (lookup) require(job_summary.find(" transport=unused") == std::string::npos,
+                        "actual FUSE requests were not accounted");
     if (lookup) printf("Filesystem service CPU for 4096 first lookups: %llu ns\n",
                        static_cast<unsigned long long>(cpu));
     // Detaching while the kernel read is in flight can return ECONNABORTED,

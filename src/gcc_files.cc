@@ -8,6 +8,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <semaphore.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
@@ -19,6 +20,7 @@
 #include <limits>
 extern "C" {
 #include "file_cache.h"
+#include "trace.h"
 }
 #include "remote_files.h"
 #include "gcc_files.h"
@@ -410,9 +412,19 @@ struct Mount {
     std::string mountpoint;
     pid_t child = -1;
     sem_t serial;
-    unsigned long uring = 0, classic = 0;
-    Mount() { if (sem_init(&serial, 0, 1)) throw std::system_error(errno, std::generic_category()); }
-    ~Mount() { sem_destroy(&serial); }
+    struct Traffic { unsigned long uring, classic; int status; } *traffic;
+    Mount() {
+        traffic = static_cast<Traffic *>(mmap(nullptr, sizeof(Traffic), PROT_READ | PROT_WRITE,
+                                              MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+        if (traffic == MAP_FAILED) throw std::system_error(errno, std::generic_category());
+        traffic->status = -1;
+        if (sem_init(&serial, 0, 1)) {
+            int error = errno;
+            munmap(traffic, sizeof(Traffic));
+            throw std::system_error(error, std::generic_category());
+        }
+    }
+    ~Mount() { sem_destroy(&serial); munmap(traffic, sizeof(Traffic)); }
 };
 // sem_wait is cancellable; pthread_mutex_lock is not. libfuse cancels and
 // joins queue threads in order, including waiters behind a blocked RPC owner.
@@ -422,7 +434,7 @@ struct Callback {
     Mount &mount;
     explicit Callback(fuse_req_t request) : mount(*static_cast<Mount *>(fuse_req_userdata(request))) {
         while (sem_wait(&mount.serial)) if (errno != EINTR) _exit(120);
-        if (fuse_req_is_uring(request)) ++mount.uring; else ++mount.classic;
+        if (fuse_req_is_uring(request)) ++mount.traffic->uring; else ++mount.traffic->classic;
     }
     ~Callback() { sem_post(&mount.serial); }
     bool stopped() const { return fuse_session_exited(mount.fs); }
@@ -439,9 +451,6 @@ Entry &node(Files &fs, fuse_ino_t inode) {
 void initialize(void *, struct fuse_conn_info *connection) {
     connection->want |= connection->capable & FUSE_CAP_CACHE_SYMLINKS;
     connection->want |= connection->capable & FUSE_CAP_OVER_IO_URING;
-    fprintf(stderr, "DCC_URING init job_pid=%ld transport=%s depth=1 max_write=%u cpus=%ld\n",
-            (long)getpid(), connection->capable & FUSE_CAP_OVER_IO_URING ? "uring" : "classic",
-            connection->max_write, sysconf(_SC_NPROCESSORS_CONF));
 }
 void attributes(Files &fs, const Entry &entry, struct stat &st) {
     st = {};
@@ -669,7 +678,7 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
             result = fuse_session_loop(state->fs);
             if (result == SIGTERM) result = 0;
         }
-        fprintf(stderr, "DCC_URING done job_pid=%ld uring=%lu classic=%lu status=%d\n", (long)getpid(), state->uring, state->classic, result);
+        state->traffic->status = result;
         state->files.reset();
         fuse_remove_signal_handlers(session);
         fuse_session_destroy(state->fs);
@@ -694,6 +703,14 @@ extern "C" int dcc_gcc_files_stop(void *opaque, uint64_t *cpu_ns, unsigned long 
     struct rusage usage{};
     pid_t result;
     do { result = wait4(state->child, &status, 0, &usage); } while (result < 0 && errno == EINTR);
+    // The job's normal logger owns the record. Read the shared counters only
+    // after joining the Files child; short-lived FUSE services need no extra
+    // stderr/syslog stream or inherited logging descriptors.
+    char traffic[192];
+    snprintf(traffic, sizeof(traffic), " DCC_URING done job_pid=%ld uring=%lu classic=%lu status=%d transport=%s",
+             (long)state->child, state->traffic->uring, state->traffic->classic, state->traffic->status,
+             state->traffic->uring ? "uring" : state->traffic->classic ? "classic" : "unused");
+    dcc_job_summary_append(traffic);
     if (umount2(state->mountpoint.c_str(), MNT_DETACH) && errno != EINVAL && errno != ENOENT) {
         error = errno;
         fprintf(stderr, "distcc GCC filesystem unmount: %s\n", strerror(error));
