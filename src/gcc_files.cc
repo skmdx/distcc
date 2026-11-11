@@ -436,15 +436,12 @@ Entry &node(Files &fs, fuse_ino_t inode) {
     fs.status("/", entry);
     return *entry;
 }
-void initialize(void *opaque, struct fuse_conn_info *connection) {
+void initialize(void *, struct fuse_conn_info *connection) {
     connection->want |= connection->capable & FUSE_CAP_CACHE_SYMLINKS;
-    if (!(connection->capable & FUSE_CAP_OVER_IO_URING)) {
-        fprintf(stderr, "DCC_URING unavailable\n");
-        fuse_session_exit(static_cast<Mount *>(opaque)->fs);
-        return;
-    }
-    connection->want |= FUSE_CAP_OVER_IO_URING;
-    fprintf(stderr, "DCC_URING init job_pid=%ld depth=1 max_write=%u cpus=%ld\n", (long)getpid(), connection->max_write, sysconf(_SC_NPROCESSORS_CONF));
+    connection->want |= connection->capable & FUSE_CAP_OVER_IO_URING;
+    fprintf(stderr, "DCC_URING init job_pid=%ld transport=%s depth=1 max_write=%u cpus=%ld\n",
+            (long)getpid(), connection->capable & FUSE_CAP_OVER_IO_URING ? "uring" : "classic",
+            connection->max_write, sysconf(_SC_NPROCESSORS_CONF));
 }
 void attributes(Files &fs, const Entry &entry, struct stat &st) {
     st = {};
