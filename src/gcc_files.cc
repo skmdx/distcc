@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
+#include <semaphore.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
@@ -408,6 +409,23 @@ struct Mount {
     struct fuse_session *fs = nullptr;
     std::string mountpoint;
     pid_t child = -1;
+    sem_t serial;
+    unsigned long uring = 0, classic = 0;
+    Mount() { if (sem_init(&serial, 0, 1)) throw std::system_error(errno, std::generic_category()); }
+    ~Mount() { sem_destroy(&serial); }
+};
+// sem_wait is cancellable; pthread_mutex_lock is not. libfuse cancels and
+// joins queue threads in order, including waiters behind a blocked RPC owner.
+// The guard releases ownership on C++ cancellation unwind; later callbacks
+// observe the session exit before touching the single Files/RPC owner.
+struct Callback {
+    Mount &mount;
+    explicit Callback(fuse_req_t request) : mount(*static_cast<Mount *>(fuse_req_userdata(request))) {
+        while (sem_wait(&mount.serial)) if (errno != EINTR) _exit(120);
+        if (fuse_req_is_uring(request)) ++mount.uring; else ++mount.classic;
+    }
+    ~Callback() { sem_post(&mount.serial); }
+    bool stopped() const { return fuse_session_exited(mount.fs); }
 };
 Files &files(fuse_req_t request) {
     return *static_cast<Mount *>(fuse_req_userdata(request))->files;
@@ -418,8 +436,15 @@ Entry &node(Files &fs, fuse_ino_t inode) {
     fs.status("/", entry);
     return *entry;
 }
-void initialize(void *, struct fuse_conn_info *connection) {
+void initialize(void *opaque, struct fuse_conn_info *connection) {
     connection->want |= connection->capable & FUSE_CAP_CACHE_SYMLINKS;
+    if (!(connection->capable & FUSE_CAP_OVER_IO_URING)) {
+        fprintf(stderr, "DCC_URING unavailable\n");
+        fuse_session_exit(static_cast<Mount *>(opaque)->fs);
+        return;
+    }
+    connection->want |= FUSE_CAP_OVER_IO_URING;
+    fprintf(stderr, "DCC_URING init max_write=%u cpus=%ld\n", connection->max_write, sysconf(_SC_NPROCESSORS_CONF));
 }
 void attributes(Files &fs, const Entry &entry, struct stat &st) {
     st = {};
@@ -436,6 +461,8 @@ void attributes(Files &fs, const Entry &entry, struct stat &st) {
     st.st_ctim = {ctime/1000000000, ctime%1000000000};
 }
 void lookup(fuse_req_t request, fuse_ino_t parent, const char *name) {
+    Callback guard(request);
+    if (guard.stopped()) { fuse_reply_err(request, EINTR); return; }
     auto &fs = files(request);
     auto &directory = node(fs, parent);
     if (directory.error) { fuse_reply_err(request, directory.error); return; }
@@ -461,6 +488,8 @@ void forget(fuse_req_t request, fuse_ino_t, uint64_t) {
     fuse_reply_none(request);
 }
 void get_attributes(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info *) {
+    Callback guard(request);
+    if (guard.stopped()) { fuse_reply_err(request, EINTR); return; }
     auto &fs = files(request);
     auto &entry = node(fs, inode);
     if (entry.error) { fuse_reply_err(request, entry.error); return; }
@@ -469,6 +498,8 @@ void get_attributes(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info 
     fuse_reply_attr(request, &st, 1);
 }
 void open_file(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info *info) {
+    Callback guard(request);
+    if (guard.stopped()) { fuse_reply_err(request, EINTR); return; }
     if ((info->flags & O_ACCMODE) != O_RDONLY) { fuse_reply_err(request, EROFS); return; }
     auto &fs = files(request);
     Entry *entry = &node(fs, inode);
@@ -488,6 +519,8 @@ void open_file(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info *info
 }
 void read_file(fuse_req_t request, fuse_ino_t inode, size_t size, off_t offset,
                struct fuse_file_info *) {
+    Callback guard(request);
+    if (guard.stopped()) { fuse_reply_err(request, EINTR); return; }
     auto &bytes = node(files(request), inode).bytes;
     if (offset < 0) { fuse_reply_err(request, EINVAL); return; }
     if (static_cast<uint64_t>(offset) >= bytes.size) { fuse_reply_buf(request, nullptr, 0); return; }
@@ -497,6 +530,8 @@ void read_file(fuse_req_t request, fuse_ino_t inode, size_t size, off_t offset,
     fuse_reply_buf(request, bytes.data+offset, size);
 }
 void read_link(fuse_req_t request, fuse_ino_t inode) {
+    Callback guard(request);
+    if (guard.stopped()) { fuse_reply_err(request, EINTR); return; }
     auto &fs = files(request);
     char target[PATH_MAX];
     if (int error = fs.link(node(fs, inode).path->c_str(), target, sizeof(target))) {
@@ -505,6 +540,8 @@ void read_link(fuse_req_t request, fuse_ino_t inode) {
     fuse_reply_readlink(request, target);
 }
 void open_directory(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info *info) {
+    Callback guard(request);
+    if (guard.stopped()) { fuse_reply_err(request, EINTR); return; }
     auto &fs = files(request);
     auto names = std::make_unique<std::vector<std::string>>();
     if (int error = fs.list(node(fs, inode).path->c_str(), *names)) {
@@ -515,6 +552,8 @@ void open_directory(fuse_req_t request, fuse_ino_t inode, struct fuse_file_info 
 }
 void read_directory(fuse_req_t request, fuse_ino_t, size_t size, off_t offset,
                     struct fuse_file_info *info) {
+    Callback guard(request);
+    if (guard.stopped()) { fuse_reply_err(request, EINTR); return; }
     if (offset < 0) { fuse_reply_err(request, EINVAL); return; }
     auto &names = *reinterpret_cast<std::vector<std::string> *>(info->fh);
     std::vector<char> buffer(size);
@@ -529,6 +568,7 @@ void read_directory(fuse_req_t request, fuse_ino_t, size_t size, off_t offset,
     fuse_reply_buf(request, buffer.data(), used);
 }
 void close_directory(fuse_req_t request, fuse_ino_t, struct fuse_file_info *info) {
+    Callback guard(request);
     delete reinterpret_cast<std::vector<std::string> *>(info->fh);
     fuse_reply_err(request, 0);
 }
@@ -586,7 +626,7 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
     operations.opendir = open_directory;
     operations.readdir = read_directory;
     operations.releasedir = close_directory;
-    char name[] = "distcc-files", options[] = "-oro";
+    char name[] = "distcc-files", options[] = "-oro,io_uring";
     char *argv[] = {name, options};
     struct fuse_args args = FUSE_ARGS_INIT(2, argv);
     state->fs = fuse_session_new(&args, &operations, sizeof(operations), state.get());
@@ -632,6 +672,7 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
             result = fuse_session_loop(state->fs);
             if (result == SIGTERM) result = 0;
         }
+        fprintf(stderr, "DCC_URING done uring=%lu classic=%lu status=%d\n", state->uring, state->classic, result);
         state->files.reset();
         fuse_remove_signal_handlers(session);
         fuse_session_destroy(state->fs);
