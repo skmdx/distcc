@@ -263,6 +263,8 @@ int dcc_execute_job(struct dcc_job *job, const char *root, int cancel_fd,
             ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT, &version);
     dcc_job_summary_clear();
     ret = dcc_run_job(cancel_fd, -1, version, job, root, result);
+    dcc_job_summary_append(job->kind == DCC_JOB_GCC_FRONTEND
+                           ? " input_view:gcc" : " input_view:other");
     dcc_job_summary();
     if (ret) dcc_job_result_free(result);
     return ret;
