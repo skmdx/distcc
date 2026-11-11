@@ -444,7 +444,7 @@ void initialize(void *opaque, struct fuse_conn_info *connection) {
         return;
     }
     connection->want |= FUSE_CAP_OVER_IO_URING;
-    fprintf(stderr, "DCC_URING init max_write=%u cpus=%ld\n", connection->max_write, sysconf(_SC_NPROCESSORS_CONF));
+    fprintf(stderr, "DCC_URING init job_pid=%ld depth=1 max_write=%u cpus=%ld\n", (long)getpid(), connection->max_write, sysconf(_SC_NPROCESSORS_CONF));
 }
 void attributes(Files &fs, const Entry &entry, struct stat &st) {
     st = {};
@@ -626,7 +626,7 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
     operations.opendir = open_directory;
     operations.readdir = read_directory;
     operations.releasedir = close_directory;
-    char name[] = "distcc-files", options[] = "-oro,io_uring";
+    char name[] = "distcc-files", options[] = "-oro,io_uring,io_uring_q_depth=1";
     char *argv[] = {name, options};
     struct fuse_args args = FUSE_ARGS_INIT(2, argv);
     state->fs = fuse_session_new(&args, &operations, sizeof(operations), state.get());
@@ -672,7 +672,7 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
             result = fuse_session_loop(state->fs);
             if (result == SIGTERM) result = 0;
         }
-        fprintf(stderr, "DCC_URING done uring=%lu classic=%lu status=%d\n", state->uring, state->classic, result);
+        fprintf(stderr, "DCC_URING done job_pid=%ld uring=%lu classic=%lu status=%d\n", (long)getpid(), state->uring, state->classic, result);
         state->files.reset();
         fuse_remove_signal_handlers(session);
         fuse_session_destroy(state->fs);
