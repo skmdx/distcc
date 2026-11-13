@@ -981,6 +981,16 @@ void dcc_tcp_server_fs_poll(struct dcc_tcp_server *s, struct pollfd *p)
 int dcc_tcp_server_fs_process(struct dcc_tcp_server *s, short events)
 {
     if (s->phase != RUNNING || !s->fs_peer) return 0;
+    if (s->fs_waiting == 3) {
+        int granted = s->dispatch->execution(s, 1);
+        if (granted < 0) return -1;
+        if (granted) {
+            s->fs_reply = s->buffer;
+            dcc_tcp_put32(s->buffer, 0); dcc_tcp_put32(s->buffer + 4, 4);
+            dcc_tcp_put32(s->buffer + 8, 1);
+            s->fs_size = 12; s->fs_sent = 0; s->fs_waiting = 2;
+        }
+    }
     if (s->fs_reply && (events & POLLOUT)) {
         ssize_t n = send(s->fs_peer - 1, s->fs_reply + s->fs_sent,
                          s->fs_size - s->fs_sent, MSG_NOSIGNAL | MSG_DONTWAIT);
@@ -1003,13 +1013,20 @@ int dcc_tcp_server_fs_process(struct dcc_tcp_server *s, short events)
         if (complete) {
             if (s->fs_query.fd_plus_one || s->fs_query.type != DCC_TCP_FS_QUERY) return -1;
             int ret = 0;
-            if (s->fs_query.size >= 4 && dcc_tcp_get32(s->fs_query.data) == DCC_FS_CODEGEN) {
+            unsigned operation = s->fs_query.size >= 4 ? dcc_tcp_get32(s->fs_query.data) : 0;
+            if (operation == DCC_FS_CODEGEN || operation == DCC_FS_EXECUTION) {
                 if (s->fs_query.size != 8) return -1;
-                s->fs_reply = s->buffer;
-                unsigned granted = s->dispatch->codegen(s, dcc_tcp_get32(s->fs_query.data + 4));
-                dcc_tcp_put32(s->buffer, 0); dcc_tcp_put32(s->buffer + 4, 4);
-                dcc_tcp_put32(s->buffer + 8, granted);
-                s->fs_size = 12; s->fs_sent = 0; s->fs_waiting = 2;
+                unsigned argument = dcc_tcp_get32(s->fs_query.data + 4);
+                int granted = operation == DCC_FS_CODEGEN ?
+                    (int)s->dispatch->codegen(s, argument) : s->dispatch->execution(s, argument);
+                if (granted < 0) return -1;
+                if (!granted && operation == DCC_FS_EXECUTION) s->fs_waiting = 3;
+                else {
+                    s->fs_reply = s->buffer;
+                    dcc_tcp_put32(s->buffer, 0); dcc_tcp_put32(s->buffer + 4, 4);
+                    dcc_tcp_put32(s->buffer + 8, granted);
+                    s->fs_size = 12; s->fs_sent = 0; s->fs_waiting = 2;
+                }
             } else {
                 ret = queue(s, DCC_TCP_FS_QUERY, s->fs_query.data, s->fs_query.size);
                 s->fs_waiting = 1;

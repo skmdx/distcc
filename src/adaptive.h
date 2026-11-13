@@ -10,7 +10,7 @@ struct dcc_capacity {
     double load, memory_pressure;
     /* Optional live metrics; -1 means unavailable, never idle. */
     int running, busy, queued, links, admission, available;
-    int preparing, returning, capacity;
+    int preparing, returning, capacity, suspended;
     int compile_capacity[DCC_MEMORY_BUCKETS];
     int pump_capacity[DCC_MEMORY_BUCKETS];
     int rust_capacity[DCC_MEMORY_BUCKETS];

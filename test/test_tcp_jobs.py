@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Prepared-input TCP jobs through real broker, daemon and compilers."""
 import concurrent.futures
+import contextlib
+import resource
 import array
 import ctypes
 import errno
@@ -1839,6 +1841,92 @@ class FrontendTest(BrokerTestCase):
             line for line in text.splitlines() if 'compiler libraries' in line or 'frontend' in line))
         self.assertIn('operation=C', text)
         self.assertEqual(text.count('frontend filesystem:'), 8)
+
+    def check_result_wait_lane(self, cancel):
+        descriptors = resource.getrlimit(resource.RLIMIT_NOFILE)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(descriptors[0], 1024), descriptors[1]))
+            clang = self.start_frontend(jobs=2, DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, descriptors)
+        warm = self.work/'warm.c'
+        warm.write_text('int warm;\n')
+        def command(source, name):
+            return [str(self.build/'distcc'), clang, '-O2', '-c', str(source),
+                    '-o', str(self.work/(name+'.o')), '-MMD', '-MF', str(self.work/(name+'.d')),
+                    '-MT', 'shared-target']
+        subprocess.run(command(warm, 'warm'), env=self.env, check=True, capture_output=True, timeout=30)
+        trace = Path(self.logs[0].name)
+        helper = int(re.findall(r'started reusable frontend pid=(\d+)', trace.read_text())[-1])
+        trace_offset = trace.stat().st_size
+        def current_trace():
+            return trace.read_bytes()[trace_offset:].decode()
+        children = Path(f'/proc/{helper}/task/{helper}/children')
+        source = self.work/'held.cpp'
+        source.write_text('\n'.join(f'struct S{i} {{int a[{i+1}];}};' for i in range(40000))+
+                          '\nint value() {return sizeof(S39999);}\n')
+        clients, owner = [], None
+        try:
+            clients.append(subprocess.Popen(command(source, 'owner'), env=self.env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            deadline = time.monotonic()+10
+            while owner is None:
+                for value in children.read_text().split():
+                    with contextlib.suppress(FileNotFoundError, ProcessLookupError):
+                        infos = Path('/proc')/value/'fdinfo'
+                        if any('OFDLCK' in p.read_text() for p in infos.iterdir()):
+                            owner = int(value); os.kill(owner, signal.SIGSTOP); break
+                self.assertIsNone(clients[0].poll())
+                self.assertLess(time.monotonic(), deadline, 'compiler never acquired a result claim')
+                if owner is None: time.sleep(.001)
+            clients.append(subprocess.Popen(command(source, 'waiter'), env=self.env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            while 'execution lane suspended' not in current_trace():
+                self.assertIsNone(clients[1].poll())
+                self.assertLess(time.monotonic(), deadline, 'result waiter did not yield')
+                time.sleep(.01)
+            state = self.get_stats(self.stats_ports[0])
+            self.assertIn('dcc_busy 1\n', state)
+            self.assertIn('dcc_suspended 1\n', state)
+            self.assertNotIn('dcc_memory_reserved_bytes 0\n', state)
+            # Both original prefork owners remain in use. A different real
+            # compilation must finish in the yielded lane, without their help.
+            independent = subprocess.run(command(warm, 'independent'), env=self.env,
+                                         capture_output=True, timeout=10)
+            self.assertEqual(independent.returncode, 0, independent.stderr)
+            self.assertEqual((self.work/'warm.o').read_bytes(), (self.work/'independent.o').read_bytes())
+            if cancel:
+                clients[1].kill(); clients[1].communicate(timeout=10)
+                while len(children.read_text().split()) != 1:
+                    self.assertLess(time.monotonic(), deadline, 'cancelled waiter still owns its compiler')
+                    time.sleep(.01)
+            os.kill(owner, signal.SIGCONT); owner = None
+            for process in clients[:1] if cancel else clients:
+                _, errors = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 0, errors)
+            if not cancel:
+                self.assertIn('execution lane resumed', current_trace())
+                for suffix in ('.o', '.d'):
+                    self.assertEqual((self.work/('owner'+suffix)).read_bytes(),
+                                     (self.work/('waiter'+suffix)).read_bytes())
+            deadline = time.monotonic()+5
+            while True:
+                state = self.get_stats(self.stats_ports[0])
+                if 'dcc_busy 0\n' in state and 'dcc_memory_reserved_bytes 0\n' in state: break
+                self.assertLess(time.monotonic(), deadline, state)
+                time.sleep(.01)
+        finally:
+            if owner:
+                with contextlib.suppress(ProcessLookupError): os.kill(owner, signal.SIGCONT)
+            for process in clients:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=10)
+
+    def test_result_claim_wait_releases_execution_owner_and_resumes(self):
+        self.check_result_wait_lane(False)
+
+    def test_result_claim_wait_cancel_preserves_other_owner(self):
+        self.check_result_wait_lane(True)
 
     def test_remote_codegen_shares_ipc_and_preserves_cpp_results(self):
         self.check_remote_codegen(4)

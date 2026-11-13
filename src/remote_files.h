@@ -169,7 +169,24 @@ public:
     Buffer compilation(std::string_view action) { return cached(cache_key("clang-result", action)); }
     int claim_compilation(std::string_view action) {
         auto key = cache_key("clang-result", action);
-        return cache.claim(records, key.data(), key.size());
+        int claim = cache.claim(records, key.data(), key.size(), 0);
+        if (claim >= 0 || errno != EAGAIN) return claim;
+        auto execution = [this](unsigned active) {
+            uint32_t value = htonl(active);
+            Buffer answer;
+            auto error = request(DCC_FS_EXECUTION,
+                {reinterpret_cast<const char *>(&value), sizeof(value)}, answer);
+            if (!error && (answer.size != 4 || number(answer.data, 4) != 1))
+                error = std::make_error_code(std::errc::protocol_error);
+            if (error) throw std::system_error(error, "compiler execution lane");
+        };
+        execution(0);
+        claim = cache.claim(records, key.data(), key.size(), 1);
+        int error = errno;
+        try { execution(1); }
+        catch (...) { if (claim >= 0) close(claim); throw; }
+        errno = error;
+        return claim;
     }
     void save_compilation(std::string_view action, std::string_view result) {
         auto key = cache_key("clang-result", action);

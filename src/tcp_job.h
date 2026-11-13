@@ -73,6 +73,8 @@ struct dcc_tcp_dispatch {
     int (*start)(struct dcc_tcp_server *, const struct dcc_tcp_run *, int, int, const struct dcc_job *);
     void (*cancel)(struct dcc_tcp_server *);
     unsigned (*codegen)(struct dcc_tcp_server *, unsigned);
+    /* 1 transitioned, 0 resume must wait for a lane, -1 invalid state. */
+    int (*execution)(struct dcc_tcp_server *, unsigned);
 };
 struct dcc_tcp_server *dcc_tcp_server_new(int, const struct dcc_tcp_dispatch *);
 void dcc_tcp_server_free(struct dcc_tcp_server *);

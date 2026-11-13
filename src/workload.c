@@ -147,30 +147,65 @@ static void learn_class(struct dcc_work_class *c, const struct dcc_work_hint *hi
         c->xz = .001 * initial_rate(hint->kind - 1);
     }
     double x = hint->bytes / 1048576.0, y = computation_size(hint);
+    c->weight = .98 * c->weight + .02;
+    c->x = .98 * c->x + .02 * x;
+    c->y = .98 * c->y + .02 * y;
+    c->z = .98 * c->z + .02 * seconds;
     c->xx = .98 * c->xx + .02 * x * x;
     c->xy = .98 * c->xy + .02 * x * y;
     c->yy = .98 * c->yy + .02 * y * y;
     c->xz = .98 * c->xz + .02 * x * seconds;
     c->yz = .98 * c->yz + .02 * y * seconds;
-    /* Two-feature nonnegative least squares. If the unconstrained solution
-     * crosses an axis, use the better one-feature fit instead. */
-    double determinant = c->xx * c->yy - c->xy * c->xy;
-    if (determinant > 1e-12) {
-        double input = (c->xz * c->yy - c->yz * c->xy) / determinant;
-        double work = (c->yz * c->xx - c->xz * c->xy) / determinant;
-        if (input >= 0 && work >= 0) {
-            c->input_rate = input;
-            c->work_rate = work;
-            return;
+    /* Nonnegative affine fit: fixed frontend cost must not disappear when a
+     * small source includes large headers. Enumerating the seven active sets
+     * also handles collinear byte/work features without unstable subtraction.
+     * Normalize equations by their diagonals so byte/instruction units do not
+     * set the pivot threshold. Singular sets defer to smaller subsets. */
+    double gram[3][3] = {{c->weight, c->x, c->y},
+                         {c->x, c->xx, c->xy}, {c->y, c->xy, c->yy}};
+    double rhs[3] = {c->z, c->xz, c->yz};
+    double scale[3] = {c->weight, c->xx, c->yy};
+    double best[3] = {0}, gain = 0;
+    for (unsigned mask = 1; mask < 8; ++mask) {
+        unsigned index[3], count = 0;
+        double a[3][4] = {{0}}, coefficients[3] = {0};
+        for (unsigned i = 0; i < 3; ++i) if (mask & (1U << i)) index[count++] = i;
+        int valid = 1;
+        for (unsigned i = 0; i < count; ++i)
+            if (!(scale[index[i]] > 0)) valid = 0;
+        if (!valid) continue;
+        for (unsigned i = 0; i < count; ++i) {
+            for (unsigned j = 0; j < count; ++j)
+                a[i][j] = gram[index[i]][index[j]] / scale[index[i]];
+            a[i][count] = rhs[index[i]] / scale[index[i]];
+        }
+        for (unsigned k = 0; k < count; ++k) {
+            if (a[k][k] < 1e-10) { valid = 0; break; }
+            double pivot = a[k][k];
+            for (unsigned j = k; j <= count; ++j) a[k][j] /= pivot;
+            for (unsigned i = 0; i < count; ++i) if (i != k) {
+                double factor = a[i][k];
+                for (unsigned j = k; j <= count; ++j) a[i][j] -= factor * a[k][j];
+            }
+        }
+        if (!valid) continue;
+        for (unsigned i = 0; i < count; ++i) {
+            coefficients[index[i]] = a[i][count];
+            if (!isfinite(coefficients[index[i]]) || coefficients[index[i]] < 0) valid = 0;
+        }
+        if (!valid) continue;
+        double improvement = 0;
+        for (unsigned i = 0; i < 3; ++i) {
+            improvement += 2 * coefficients[i] * rhs[i];
+            for (unsigned j = 0; j < 3; ++j)
+                improvement -= coefficients[i] * gram[i][j] * coefficients[j];
+        }
+        if (improvement > gain) {
+            gain = improvement;
+            memcpy(best, coefficients, sizeof(best));
         }
     }
-    if (c->yz <= 0 || c->xz * c->xz / c->xx >= c->yz * c->yz / c->yy) {
-        c->input_rate = c->xz / c->xx;
-        c->work_rate = 0;
-    } else {
-        c->input_rate = 0;
-        c->work_rate = c->yz / c->yy;
-    }
+    c->fixed = best[0]; c->input_rate = best[1]; c->work_rate = best[2];
 }
 
 double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_work_hint *hint)
@@ -202,7 +237,7 @@ double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_wor
     /* Start file-based backends with occupancy-based placement and learn from execution,
      * rather than treating precompiled dependencies as C++ parsing work. */
     if (hint->kind >= DCC_WORK_RUST && !c->xx) return 0;
-    double seconds = hint->bytes / 1048576.0 * (c->xx ? c->input_rate : initial_rate(kind))
+    double seconds = c->fixed + hint->bytes / 1048576.0 * (c->xx ? c->input_rate : initial_rate(kind))
                    + computation_size(hint) * c->work_rate;
     return seconds > .01 ? seconds : .01;
 }

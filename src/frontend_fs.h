@@ -28,11 +28,14 @@
 #define DCC_FS_DIRECTORY_PARTIAL 4U
 enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LIST,
                        DCC_FS_CODEGEN, DCC_FS_READLINK = 7, DCC_FS_LSTAT = 8,
-                       DCC_FS_DIRECTORIES, DCC_FS_STDIN, DCC_FS_ATTRIBUTES };
+                       DCC_FS_DIRECTORIES, DCC_FS_STDIN, DCC_FS_ATTRIBUTES,
+                       DCC_FS_EXECUTION };
 /* STDIN requests use "/" as their operand and return the same metadata/body
  * layout as READ. Only a job's explicitly captured stdin is accessible. */
 /* Compiler-to-daemon only: a requested CPU count replaces the path. Zero
  * releases borrowed CPUs. The reply contains the granted count. */
+/* EXECUTION also stays on the worker: 0 yields this job's execution lane,
+ * 1 reacquires it. Memory/input ownership remains with the suspended job. */
 struct dcc_job;
 int dcc_frontend_fs_add_roots(struct dcc_job *job, const char *paths);
 int dcc_frontend_fs_add_root(struct dcc_job *job, const char *path);

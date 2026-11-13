@@ -17,8 +17,9 @@ struct dcc_work_hint {
     uint64_t memory_class; /* Same resource class as the serialized worker job. */
 };
 struct dcc_work_class {
+    double weight, x, y, z;
     double xx, xy, yy, xz, yz;
-    double input_rate, work_rate;
+    double fixed, input_rate, work_rate;
 };
 struct dcc_work_model {
     struct { uint64_t key, family, bytes; double seconds; int peer; } history[DCC_WORK_HISTORY];

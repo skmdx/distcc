@@ -511,7 +511,7 @@ done:
     if (fd >= 0) close(fd);
     if (lock >= 0) close(lock);
 }
-static int record_claim(struct dcc_record_cache *cache, const void *key, size_t size)
+static int record_claim(struct dcc_record_cache *cache, const void *key, size_t size, int wait)
 {
     char name[17];
     int shard = record_shard(cache, key, size, name);
@@ -522,7 +522,10 @@ static int record_claim(struct dcc_record_cache *cache, const void *key, size_t 
      * unrelated producers: record_contents still verifies the complete key. */
     struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET,
         .l_start = (off_t)(XXH3_64bits(key, size) & INT64_MAX), .l_len = 1};
-    if (fcntl(fd, F_OFD_SETLKW, &lock)) { int error = errno; close(fd); errno = error; return -1; }
+    if (fcntl(fd, wait ? F_OFD_SETLKW : F_OFD_SETLK, &lock)) {
+        int error = errno == EACCES ? EAGAIN : errno;
+        close(fd); errno = error; return -1;
+    }
     return fd;
 }
 const struct dcc_file_cache_api dcc_file_cache_records = {

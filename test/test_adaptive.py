@@ -444,7 +444,8 @@ int open(const char *path, int flags, ...) {
 
     def test_tcp_jobs_keep_class_capacity_in_the_cross_process_cache(self):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2,
-            compile_capacity=[8] * 64, pump_capacity=[2] * 64))
+            compile_capacity=[8] * 64, pump_capacity=[2] * 64,
+            suspended=3, memory_pressure=0))
         env = dict(self.base_env,
             DISTCC_HOSTS=f'127.0.0.1:{self.ports[0]},tcp,stats={peer.port}',
             DISTCC_DIR=str(self.ddir))
@@ -628,6 +629,65 @@ int open(const char *path, int flags, ...) {
                                 env=dict(self.base_env, DISTCC_HOSTS="@host,stats=3633"),
                                 capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 106)
+
+
+class WorkCostTest(unittest.TestCase):
+    def test_affine_cost_retains_fixed_work_and_handles_collinear_features(self):
+        with tempfile.TemporaryDirectory(prefix='distcc-work-cost-') as directory:
+            root = Path(directory)
+            source, executable = root/'cost.c', root/'cost'
+            source.write_text(r'''
+#include <assert.h>
+#include <math.h>
+#include <stdio.h>
+#include "workload.h"
+static struct dcc_work_model model;
+int main(int argc, char **argv) {
+    struct dcc_work_hint h = {.key=1, .bytes=4096, .work_units=4096, .kind=5};
+    if (argc > 1) {
+        unsigned kind, units; unsigned long long bytes; double seconds;
+        while (scanf("%u %llu %u %lf", &kind, &bytes, &units, &seconds) == 4) {
+            h.kind=kind; h.bytes=bytes; h.work_units=units; ++h.key;
+            printf("%.9f %.9f\n", dcc_work_predict(&model,&h), seconds);
+            dcc_work_observe(&model,&h,seconds,0);
+        }
+        return 0;
+    }
+    assert(dcc_work_predict(&model,&h)>0);
+    h.kind=DCC_WORK_THINLTO;
+    assert(dcc_work_predict(&model,&h)==0);
+    for (unsigned i=0; i<1200; ++i) {
+        h=(struct dcc_work_hint){.key=i+1,.bytes=4096*(1+i%100),.kind=5};
+        h.work_units=h.bytes;
+        dcc_work_observe(&model,&h,3+20*h.bytes/1048576.,0);
+        h.kind=DCC_WORK_THINLTO; h.bytes=(1+i%17)*131072;
+        h.work_units=(1+(i*7)%19)*65536;
+        dcc_work_observe(&model,&h,.4+1.5*h.bytes/1048576.+8*h.work_units/1048576.,0);
+    }
+    h=(struct dcc_work_hint){.key=10000,.bytes=4096,.work_units=4096,.kind=5};
+    assert(fabs(dcc_work_predict(&model,&h)-(3+20/256.))<.01);
+    h.kind=DCC_WORK_THINLTO; h.bytes=524288; h.work_units=786432;
+    assert(fabs(dcc_work_predict(&model,&h)-7.15)<.01);
+    for (unsigned i=0; i<DCC_WORK_CLASSES; ++i) {
+        assert(isfinite(model.classes[i].fixed) && model.classes[i].fixed>=0);
+        assert(isfinite(model.classes[i].input_rate) && model.classes[i].input_rate>=0);
+        assert(isfinite(model.classes[i].work_rate) && model.classes[i].work_rate>=0);
+    }
+    /* Declining cost with increasing size must use a nonnegative boundary,
+     * not extrapolate negative execution time. Constant features stay finite. */
+    for (unsigned i=0; i<1200; ++i) {
+        h=(struct dcc_work_hint){.key=20000+i,.bytes=65536,.work_units=65536,.kind=4};
+        dcc_work_observe(&model,&h,1+(i%2),0);
+    }
+    h.key=40000; h.bytes=1; h.work_units=1;
+    assert(isfinite(dcc_work_predict(&model,&h)) && dcc_work_predict(&model,&h)>0);
+    return 0;
+}''')
+            subprocess.run(['gcc', '-D_GNU_SOURCE', '-I.', '-Isrc', '-ffunction-sections',
+                            '-fdata-sections', str(source), 'src/workload.c',
+                            '-Wl,--gc-sections', '-lm', '-o', str(executable)],
+                           check=True, capture_output=True)
+            subprocess.run([executable], check=True, capture_output=True, timeout=5)
 
 
 class MemoryEstimateTest(unittest.TestCase):

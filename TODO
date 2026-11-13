@@ -7,11 +7,13 @@ Clang result reuse and source scheduling (experimental)
     Keep isolated host speed/slot options identical to the installed config.
     Including admissible source pipelines fixes the blocked-peer selection
     defect, but the corrected four-worker replay still fails the wall-time gate.
-    Small source files can substantially underpredict frontend execution cost.
-    IR claim waits also retain a fixed prefork executor; changing busy counters
-    alone cannot release that executor. Do not enlarge capacity without keeping
-    execution, resume and memory ownership together. Adoption requires matched
-    whole-build benefit, output/diagnostic parity and no hidden fallback.
+    Affine cost learning now retains fixed frontend work; IR claim waits yield
+    CPU/executor ownership while preserving bounded memory and cancellation.
+    The replay still misses the wall-time gate: throughput displacement can
+    rank a slower immediate worker above an earlier fast-worker completion.
+    Resolve that latency/throughput tradeoff without degrading steady supply.
+    Adoption requires matched whole-build benefit, output/diagnostic parity
+    and no hidden fallback; reduced CPU or better forecasts alone do not pass.
 
 remove avoidable waits while remote compilation has runnable work
 

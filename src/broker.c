@@ -1277,7 +1277,13 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * same worker while the client prepares its request. */
             int returning = cap->returning - p->completed;
             if (returning < 0) returning = 0;
-            int leased = p->busy - returning;
+            /* IR claim waiters retain memory and cancellation ownership, not
+             * CPU lanes. The server admits/resumes them under the unchanged
+             * CPU limit. As for returning leases, live global CPU/queue counts
+             * account for work whose individual lease cannot be identified. */
+            int suspended = cap->suspended > 0 ? cap->suspended : 0;
+            int leased = p->busy - returning - suspended;
+            if (leased < 0) leased = 0;
             if (link && (cap->links > 0 || recent_links[i])) continue;
             blocked = work + preparing >= limit + shared_pipeline || leased >= limit + shared_pipeline;
             if (blocked && !predicted) continue;
@@ -1287,6 +1293,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             if (leased > work) work = leased;
             if (returning > 0)
                 inflight += returning < slots ? returning : slots;
+            inflight += suspended;
             projected = *cap;
             projected.busy = cpu;
             projected.queued = 0;

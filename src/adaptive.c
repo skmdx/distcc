@@ -48,7 +48,7 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
     double value;
     *cap = (struct dcc_capacity){ .running = -1, .busy = -1, .queued = -1,
                                  .links = -1, .available = -1, .memory_pressure = -1,
-                                 .preparing = -1, .returning = -1, .capacity = -1,
+                                 .preparing = -1, .returning = -1, .capacity = -1, .suspended = -1,
                                  .cpu_scale = -1, .cpu_age = -1 };
     if ((strncmp(buf, "HTTP/1.0 200 ", 13) &&
          strncmp(buf, "HTTP/1.1 200 ", 13)) ||
@@ -171,19 +171,20 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
         } else {
             static const char *names[] = {"dcc_running", "dcc_busy", "dcc_queued",
                                           "dcc_links", "dcc_admission", "dcc_available",
-                                          "dcc_preparing", "dcc_returning", "dcc_capacity"};
+                                          "dcc_preparing", "dcc_returning", "dcc_capacity", "dcc_suspended"};
             int *values[] = {&cap->running, &cap->busy, &cap->queued,
                             &cap->links, &cap->admission, &cap->available,
-                            &cap->preparing, &cap->returning, &cap->capacity};
+                            &cap->preparing, &cap->returning, &cap->capacity, &cap->suspended};
             unsigned i;
             for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
                 size_t len = strlen(names[i]);
                 if (strncmp(line, names[i], len) || line[len] != ' ') continue;
-                if ((fields & (8 << i)) || sscanf(line + len, "%lf %c", &value, &extra) != 1 ||
+                unsigned long long field = i == 9 ? 1ULL << 36 : 8ULL << i;
+                if ((fields & field) || sscanf(line + len, "%lf %c", &value, &extra) != 1 ||
                     !(value >= -1 && value <= 1000000) || value != (int)value)
                     return -1;
                 *values[i] = value;
-                fields |= 8 << i;
+                fields |= field;
             }
         }
     }

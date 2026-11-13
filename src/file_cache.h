@@ -41,8 +41,9 @@ struct dcc_file_cache_api {
                     const void **data, size_t *size);
     void (*write)(struct dcc_record_cache *, const void *, size_t, const void *, size_t);
     /* An open-file-description lock for this record key. Close the returned
-     * descriptor to release it, including when a compiling process exits. */
-    int (*claim)(struct dcc_record_cache *, const void *, size_t);
+     * descriptor to release it, including when a compiling process exits.
+     * A nonblocking attempt reports EAGAIN for an owned record. */
+    int (*claim)(struct dcc_record_cache *, const void *, size_t, int wait);
 };
 extern const struct dcc_file_cache_api dcc_file_cache_records;
 

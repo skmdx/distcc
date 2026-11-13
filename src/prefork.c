@@ -76,7 +76,7 @@ static int dcc_preforked_child(int listen_fd);
 #define MAX_PENDING 256
 #define SESSION_NEW 2
 #define WORKER_RETIRING 4
-enum worker_phase { IDLE, EXECUTING, RETIRING };
+enum worker_phase { IDLE, EXECUTING, RETIRING, SUSPENDED, RESUMING };
 struct worker {
     pid_t pid;
     int fd, busy, link;
@@ -144,7 +144,10 @@ static void cancel_tcp_job(struct dcc_tcp_server *job)
     }
 }
 static unsigned reserve_codegen(struct dcc_tcp_server *, unsigned);
-static const struct dcc_tcp_dispatch tcp_dispatch = {accept_tcp_job, cancel_tcp_job, reserve_codegen};
+static int reserve_execution(struct dcc_tcp_server *, unsigned);
+static const struct dcc_tcp_dispatch tcp_dispatch = {
+    accept_tcp_job, cancel_tcp_job, reserve_codegen, reserve_execution
+};
 
 int dcc_prefork_shutdown(int signal_number)
 {
@@ -192,6 +195,8 @@ int dcc_prefork_status(struct dcc_server_load *load)
         load->busy += workers[i].fd >= 0 && workers[i].busy == EXECUTING;
         load->busy += workers[i].codegen_cpus;
         load->links += workers[i].fd >= 0 && workers[i].busy == EXECUTING && workers[i].link;
+        load->queued += workers[i].fd >= 0 && workers[i].busy == RESUMING;
+        load->suspended += workers[i].fd >= 0 && workers[i].busy == SUSPENDED;
         struct worker *w = &workers[i];
         if (!w->busy || !w->reservation) continue;
         unsigned long long charge = w->reservation;
@@ -211,6 +216,30 @@ int dcc_prefork_status(struct dcc_server_load *load)
     if (dcc_auth_enabled) return 0;
 #endif
     return 1;
+}
+
+static int reserve_execution(struct dcc_tcp_server *job, unsigned active)
+{
+    for (int i = 0; i < worker_count; ++i) {
+        struct worker *w = &workers[i];
+        if (w->tcp != job) continue;
+        if (!active) {
+            if (w->busy != EXECUTING || w->codegen_cpus) return -1;
+            w->busy = SUSPENDED;
+            rs_trace("execution lane suspended worker=%ld", (long)w->pid);
+            return 1;
+        }
+        if (active != 1 || (w->busy != SUSPENDED && w->busy != RESUMING)) return -1;
+        struct dcc_server_load load;
+        dcc_prefork_status(&load);
+        w->busy = RESUMING;
+        if (load.busy >= dcc_cpu_perf_limit(dcc_max_kids)) return 0;
+        w->busy = EXECUTING;
+        dcc_cpu_perf_started();
+        rs_trace("execution lane resumed worker=%ld", (long)w->pid);
+        return 1;
+    }
+    return -1;
 }
 
 static unsigned reserve_codegen(struct dcc_tcp_server *job, unsigned requested)
@@ -327,7 +356,7 @@ static void receive_worker_message(struct worker *w)
 int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout)
 {
     if (shutdown_signal) finish_shutdown();
-    int needed = count + worker_count + 3 * MAX_PENDING + 3;
+    int needed = 2 * (count + worker_count + 3 * MAX_PENDING + 3);
     if (needed > parent_poll_capacity) {
         parent_polls = realloc(parent_polls, needed * sizeof(*parent_polls));
         if (!parent_polls) dcc_exit(EXIT_OUT_OF_MEMORY);
@@ -371,7 +400,17 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
         }
     }
     /* Bound idle expiry even without statistics or other activity. */
-    result = poll(polls, total, runnable ? 0 : timeout < 1000 ? timeout : 1000);
+    /* Unused bounded slots are not file descriptors. Passing all of them to
+     * poll can exceed RLIMIT_NOFILE even with only a handful of live sockets.
+     * Keep indexed ownership above, but poll only the live descriptors. */
+    int active = 0;
+    for (i = 0; i < total; ++i) {
+        polls[i].revents = 0;
+        if (polls[i].fd >= 0) polls[total + active++] = polls[i];
+    }
+    result = poll(polls + total, active, runnable ? 0 : timeout < 1000 ? timeout : 1000);
+    for (i = 0, j = 0; i < total; ++i)
+        if (polls[i].fd >= 0) polls[i].revents = polls[total + j++].revents;
     if (shutdown_signal) finish_shutdown();
     for (i = 0; i < count; ++i) extra[i].revents = polls[i].revents;
     if (result < 0) return result;
@@ -464,6 +503,10 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             dcc_tcp_server_free(tcp[i]); tcp[i] = NULL;
         }
     }
+    /* Suspended compilers retain their result/cancel owner, but must not take
+     * an executor away from ready work. Spawn only the missing owners; the
+     * existing CPU and memory admission limits still govern execution. */
+    dcc_create_kids(listen_fd);
     dcc_tcp_dispatch_ready();
     if (polls[count].revents & POLLIN) {
         struct sockaddr_storage address;
@@ -499,7 +542,7 @@ int dcc_preforking_parent(int listen_fd)
     act_child.sa_handler = dcc_sigchld_handler;
     sigaction(SIGCHLD, &act_child, NULL);
 #ifdef __linux__
-    worker_count = dcc_max_kids;
+    worker_count = dcc_max_kids + MAX_PENDING;
     workers = calloc(worker_count, sizeof(*workers));
     if (!workers) return EXIT_OUT_OF_MEMORY;
     for (ret = 0; ret < worker_count; ++ret) workers[ret].fd = -1;
@@ -561,7 +604,18 @@ static void dcc_create_kids(int listen_fd) {
     pid_t kid;
     int maximum = dcc_max_kids;
 #ifdef __linux__
-    maximum = worker_count;
+    for (int i = 0; i < worker_count; ++i)
+        maximum += workers[i].busy == SUSPENDED || workers[i].busy == RESUMING;
+    /* Once the waits end, retire surplus idle owners without interrupting a
+     * compiler. At most MAX_PENDING TCP jobs can retain suspended owners. */
+    int retiring = 0;
+    for (int i = 0; i < worker_count; ++i) retiring += workers[i].busy == RETIRING;
+    for (int i = worker_count; i-- && dcc_nkids - retiring > maximum;) {
+        struct worker *w = &workers[i];
+        if (w->pid && w->fd >= 0 && w->busy == IDLE) {
+            close(w->fd); w->fd = -1; w->busy = RETIRING; ++retiring;
+        }
+    }
 #endif
 
     while (dcc_nkids < maximum) {

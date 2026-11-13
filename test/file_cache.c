@@ -99,19 +99,20 @@ static void claims_contract(void)
     pid_t owner = fork();
     assert(owner >= 0);
     if (!owner) {
-        int lock = record_claim(cache, "action", 6);
+        int lock = record_claim(cache, "action", 6, 1);
         assert(lock >= 0 && (fcntl(lock, F_GETFD) & FD_CLOEXEC));
         assert(write(ready[1], "R", 1) == 1);
         for (;;) pause();
     }
     char value;
     assert(read(ready[0], &value, 1) == 1 && value == 'R');
-    int other = record_claim(cache, "different", 9);
+    assert(record_claim(cache, "action", 6, 0) == -1 && errno == EAGAIN);
+    int other = record_claim(cache, "different", 9, 0);
     assert(other >= 0 && !close(other));
     pid_t waiter = fork();
     assert(waiter >= 0);
     if (!waiter) {
-        int lock = record_claim(cache, "action", 6);
+        int lock = record_claim(cache, "action", 6, 1);
         assert(lock >= 0);
         _exit(0); /* Exiting, as well as close/exec, releases the claim. */
     }
@@ -119,7 +120,7 @@ static void claims_contract(void)
     int status;
     assert(waitpid(owner, &status, 0) == owner && WIFSIGNALED(status));
     assert(waitpid(waiter, &status, 0) == waiter && WIFEXITED(status) && !WEXITSTATUS(status));
-    int lock = record_claim(cache, "action", 6);
+    int lock = record_claim(cache, "action", 6, 0);
     assert(lock >= 0 && !close(lock));
     close(ready[0]); close(ready[1]); record_close(cache);
 }
