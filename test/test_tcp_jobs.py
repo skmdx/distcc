@@ -2007,7 +2007,7 @@ class FrontendTest(BrokerTestCase):
                         try:
                             if Path(f'/proc/{child}/stat').read_text().rsplit(')', 1)[1].split()[0] != 'Z':
                                 alive.append(child)
-                        except FileNotFoundError: pass
+                        except (FileNotFoundError, ProcessLookupError): pass
                     state = self.get_stats(self.stats_ports[0])
                     if not alive and 'dcc_busy 0\n' in state: break
                     self.assertLess(time.monotonic(), deadline, (alive, state))

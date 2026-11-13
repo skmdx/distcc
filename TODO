@@ -11,8 +11,11 @@ Clang result reuse and source scheduling (experimental)
     isolated replay and removes its slow-worker tail. Aggregate queue waits
     still exceed the installed baseline; steady supply is not proven improved.
     A matched whole-build pair now shows a wall/CPU benefit with no fallback.
-    Publication/deployment still needs review of the heterogeneous-compiler
-    parity boundary; raw object equality is not claimed for adaptive codegen.
+    Release qualification is currently failing: the shared token decoder
+    rejects the legacy space-padded hexadecimal fields tested by protocol and
+    pump integration; the argument-rejection retry test times out for both
+    fallback policies. Fix these contracts before the reverse full-build pair.
+    Raw object equality is not claimed for heterogeneous/adaptive codegen.
 
 remove avoidable waits while remote compilation has runnable work
 

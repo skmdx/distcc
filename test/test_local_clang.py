@@ -121,6 +121,8 @@ class LocalClangTest(BrokerTestCase):
         wrappers.mkdir()
         name = Path(self.compiler).name
         (wrappers/name).symlink_to(self.build/'distcc')
+        # Portage disables ccache in src_test; this test exercises it explicitly.
+        self.env.pop('CCACHE_DISABLE', None)
         self.env.update(CCACHE_DIR=str(self.work/'ccache'),
                         CCACHE_CONFIGPATH=str(self.work/'ccache.conf'),
                         CCACHE_COMPILERCHECK='%compiler% -dumpversion',

@@ -26,6 +26,9 @@ from test_broker import BrokerTestCase
 class LinkArchiveTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        root = str(Path.cwd())
+        sys.path.insert(0, root)
+        cls.addClassCleanup(sys.path.remove, root)
         extension = str(next(Path.cwd().glob('_include_server/lib.*')))
         sys.path.insert(0, extension)
         cls.addClassCleanup(sys.path.remove, extension)

@@ -14,10 +14,8 @@ class MultiSourceTest(BrokerTestCase):
         self.start_broker(hosts=' '.join(self.host(i, options) for i in range(len(self.ports))))
         library = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
         if not library:
-            from include_server import clang_scan
-            target = subprocess.check_output(['gcc', '-dumpmachine'], text=True).strip()
-            version = subprocess.check_output(['gcc', '-dumpfullversion'], text=True).strip()
-            library = str(Path(clang_scan.gcc_scan_dir) / target / version / 'distcc_gcc_scan.so')
+            directory = subprocess.check_output(['gcc', '-print-file-name=plugin'], text=True).strip()
+            library = str(Path(directory) / 'distcc_gcc_scan.so')
         if not Path(library).is_file():
             self.skipTest('The selected GCC dependency module must be built first')
         self.env = dict(self.env,

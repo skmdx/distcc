@@ -963,7 +963,7 @@ pump-maintainer-check: pump include-server check_programs
 maintainer-check: distcc-maintainer-check include-server-maintainer-check preprocess-check \
 	pump-maintainer-check
 
-adaptive-check: distcc distccd distccmon-text h_hosts h_compile h_plan_dependencies h_state include-server
+adaptive-check: all check_programs h_client_hotpaths h_resource h_file_cache
 	$(PYTHON) "$(srcdir)/test/test_state.py" -v
 	$(PYTHON) "$(srcdir)/test/test_portage_jobs.py" -v
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v

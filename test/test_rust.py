@@ -891,10 +891,12 @@ pub fn read_only() -> bool {
         assert held is not None
         held.close()
         deadline = time.monotonic() + 5
+        # Cache capacity is global: large unused inputs may remain cached.
+        # Cancellation/completion must release job links, not evict cache data.
         while list(self.root.glob('distcc-tcp-*')) or any(
-                p.stat().st_size > 4 * 1024 * 1024
+                p.stat().st_nlink != 1
                 for p in cache.parent.parent.glob('*/*') if len(p.name) == 16):
-            self.assertLess(time.monotonic(), deadline, 'released large inputs were retained')
+            self.assertLess(time.monotonic(), deadline, 'completed jobs retained input references')
             time.sleep(.01)
 
     def test_input_budget_waits_then_compiles_and_reclaims_cancelled_jobs(self):
