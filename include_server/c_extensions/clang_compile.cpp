@@ -15,6 +15,7 @@
 #include "compiler_command.h"
 #ifdef DCC_CLANG_COMPILE_MODULE
 #include "clang_codegen.h"
+#include "clang_result.h"
 #endif
 
 namespace {
@@ -183,7 +184,9 @@ static int compile_file(int request, int fd) {
         compiler->setFileManager(new clang::FileManager(invocation->getFileSystemOpts(), files));
         compiler->createSourceManager();
 #ifdef DCC_CLANG_COMPILE_MODULE
-        auto generated = dcc_clang_codegen(*compiler, [&](unsigned count) { return files->codegen_cpus(count); });
+        dcc_result::Result result(*files, *compiler, cwd);
+        auto generated = dcc_clang_codegen(*compiler, [&](unsigned count) { return files->codegen_cpus(count); },
+                                           &result);
         ok = generated ? *generated : clang::ExecuteCompilerInvocation(compiler.get());
 #else
         ok = clang::ExecuteCompilerInvocation(compiler.get());

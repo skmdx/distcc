@@ -1675,6 +1675,137 @@ class FrontendTest(BrokerTestCase):
                         DISTCC_SKIP_LOCAL_RETRY='1', INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
         return clang
 
+    def test_remote_result_reuse_preserves_artifacts_and_revalidates_inputs(self):
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        source, header = self.work/'source.c', self.work/'value.h'
+        source.write_text('#include "value.h"\n#if __has_include("optional.h")\n'
+                          '#include "optional.h"\n#endif\n'
+                          '#warning preserved diagnostic\nint value(void) {return VALUE;}\n')
+        header.write_text('#define VALUE 3\n')
+        def compile(index):
+            output, deps = self.work/f'{index}.o', self.work/f'{index}.d'
+            command = [clang, '-O2', '-c', str(source), '-o', str(output),
+                       '-MMD', '-MP', '-MF', str(deps), '-MQ', f'target {index}']
+            local = subprocess.run(command, env=self.env, capture_output=True, timeout=30)
+            expected = [output.read_bytes(), deps.read_bytes()]
+            output.unlink(); deps.unlink()
+            result = subprocess.run([str(self.build/'distcc'), *command],
+                                    env=self.env, capture_output=True, timeout=30)
+            self.assertEqual((result.returncode, result.stdout), (local.returncode, local.stdout), result.stderr)
+            self.assertEqual([output.read_bytes(), deps.read_bytes()], expected)
+            # distcc's own verbose trace is separate from the compiler diagnostic.
+            self.assertIn(local.stderr, result.stderr)
+            return result.stderr
+        first = compile(0)
+        self.assertIn(b'distcc compiler result: stored', first)
+        self.assertIn(b'distcc compiler result: hit', compile(1))
+        header.write_text('#define VALUE 4\n')
+        self.assertNotIn(b'distcc compiler result: hit', compile(2))
+        self.assertIn(b'distcc compiler result: hit', compile(3))
+        (self.work/'optional.h').write_text('#undef VALUE\n#define VALUE 5\n')
+        self.assertNotIn(b'distcc compiler result: hit', compile(4))
+        header.unlink()
+        failed = subprocess.run([str(self.build/'distcc'), clang, '-O2', '-c', str(source),
+                                 '-o', str(self.work/'failed.o'), '-MMD', '-MP',
+                                 '-MF', str(self.work/'failed.d'), '-MQ', 'target failed'], env=self.env,
+                                capture_output=True, timeout=30)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b"'value.h' file not found", failed.stderr)
+        self.assertNotIn(b'distcc compiler result: hit', failed.stderr)
+
+    def test_remote_result_reuse_cpp20_and_volatile_builtins(self):
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        source = self.work/'source.cpp'
+        command = [str(self.build/'distcc'), clang, '-std=c++20', '-O2', '-c', str(source)]
+        def compile(index):
+            p = subprocess.run([*command, '-o', str(self.work/f'{index}.o')],
+                               env=self.env, capture_output=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            return p.stderr
+        source.write_text('int value() { __asm__ volatile("" ::: "memory"); return 42; }\n')
+        self.assertIn(b'distcc compiler result: stored', compile(0))
+        self.assertIn(b'distcc compiler result: hit', compile(1))
+        self.assertEqual((self.work/'0.o').read_bytes(), (self.work/'1.o').read_bytes())
+        source.write_text('const char *value() { return __TIME__; }\n')
+        self.assertNotIn(b'distcc compiler result: stored', compile(2))
+        self.assertNotIn(b'distcc compiler result: hit', compile(3))
+
+    def test_remote_result_reuse_keeps_native_assembler_reads_live(self):
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        source, data = self.work/'asm.c', self.work/'payload'
+        data.write_bytes(b'first payload')
+        source.write_text('__asm__(".pushsection .rodata\\n.incbin \\\"' + str(data) +
+                          '\\\"\\n.popsection\\n");\nint value(void) {return 3;}\n')
+        def compile(index):
+            output = self.work/f'asm-{index}.o'
+            command = [clang, '-O2', '-c', str(source), '-o', str(output)]
+            subprocess.run(command, check=True, capture_output=True)
+            expected = output.read_bytes(); output.unlink()
+            result = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
+                                    capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_bytes(), expected)
+            return result.stderr, expected
+        first, old = compile(0)
+        self.assertIn(b'distcc compiler result: stored', first)
+        data.write_bytes(b'changed payload')
+        second, new = compile(1)
+        self.assertIn(b'distcc compiler result: hit', second)
+        self.assertNotEqual(new, old)
+        data.unlink()
+        command = [str(self.build/'distcc'), clang, '-O2', '-c', str(source), '-o', str(self.work/'fail.o')]
+        reused = subprocess.run(command, env=self.env, capture_output=True, timeout=30)
+        self.assertNotEqual(reused.returncode, 0)
+        self.assertIn(b'distcc compiler result: hit', reused.stderr)
+        source.write_text(source.read_text()+'\n')  # Same asm/diagnostic, forced frontend miss.
+        live = subprocess.run(command, env=self.env, capture_output=True, timeout=30)
+        self.assertEqual(reused.returncode, live.returncode)
+        def errors(text):
+            return [line for line in text.splitlines() if b'error:' in line or b'.incbin' in line]
+        self.assertEqual(errors(reused.stderr), errors(live.stderr))
+
+    def test_remote_result_reuse_revalidates_symlink_and_read_permission(self):
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        source, link = self.work/'source.c', self.work/'link.h'
+        a, b = self.work/'a.h', self.work/'b.h'
+        a.write_text('#define VALUE 1\n'); b.write_text('#define VALUE 2\n')
+        link.symlink_to(a)
+        source.write_text('#include "link.h"\nint value(void) {return VALUE;}\n')
+        command = [str(self.build/'distcc'), clang, '-O2', '-c', str(source), '-o', str(self.work/'out.o')]
+        def compile():
+            return subprocess.run(command, env=self.env, capture_output=True, timeout=30)
+        self.assertEqual(compile().returncode, 0)
+        self.assertIn(b'distcc compiler result: hit', compile().stderr)
+        first = (self.work/'out.o').read_bytes()
+        link.unlink(); link.symlink_to(b)
+        changed = compile()
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertNotIn(b'distcc compiler result: hit', changed.stderr)
+        self.assertNotEqual(first, (self.work/'out.o').read_bytes())
+        if os.geteuid() != 0:
+            b.chmod(0)
+            denied = compile()
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertNotIn(b'distcc compiler result: hit', denied.stderr)
+            b.chmod(0o644)
+
+    def test_remote_result_reuse_coalesces_concurrent_requests(self):
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        source = self.work/'shared.cpp'
+        source.write_text('\n'.join(f'struct S{i} {{ int member[{i+1}]; }};' for i in range(4000)) +
+                          '\nint value() {return sizeof(S3999);}\n')
+        def compile(index):
+            return subprocess.run([str(self.build/'distcc'), clang, '-O2', '-c', str(source),
+                                   '-o', str(self.work/f'{index}.o'), '-MMD', '-MF', str(self.work/f'{index}.d'),
+                                   '-MT', 'shared-target'], env=self.env, capture_output=True, timeout=30)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(compile, range(3)))
+        self.assertTrue(all(p.returncode == 0 for p in results), [p.stderr for p in results])
+        self.assertEqual(sum(b'distcc compiler result: stored' in p.stderr for p in results), 1)
+        self.assertEqual(sum(b'distcc compiler result: hit' in p.stderr for p in results), 2)
+        for suffix in ('.o', '.d'):
+            self.assertEqual(len({(self.work/f'{i}{suffix}').read_bytes() for i in range(3)}), 1)
+
     def test_frontend_preparation_shares_resident_compiler_and_isolates_requests(self):
         clang = self.start_frontend()
         log = self.work/'client.log'

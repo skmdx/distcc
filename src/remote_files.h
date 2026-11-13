@@ -166,6 +166,15 @@ public:
         return {};
     }
     Buffer directory_names(std::string_view path) { return cached(cache_key("directory-names", path)); }
+    Buffer compilation(std::string_view action) { return cached(cache_key("clang-result", action)); }
+    int claim_compilation(std::string_view action) {
+        auto key = cache_key("clang-result", action);
+        return cache.claim(records, key.data(), key.size());
+    }
+    void save_compilation(std::string_view action, std::string_view result) {
+        auto key = cache_key("clang-result", action);
+        cache.write(records, key.data(), key.size(), result.data(), result.size());
+    }
     Buffer source_hints(std::string_view source) {
         return cached(cache_key("gcc-source-hints", source));
     }

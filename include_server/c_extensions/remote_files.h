@@ -1,6 +1,7 @@
 /* Compiler-owned remote lookups. SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
 #include "../../src/tcp_job.h"
+#include "../../src/job.h"
 #include "../../src/file_cache.h"
 #include "../../src/frontend_fs.h"
 #include "../../src/remote_files.h"
@@ -9,6 +10,8 @@
 #include <clang/Lex/HeaderSearchOptions.h>
 #include <clang/Tooling/Tooling.h>
 #include <llvm/Support/JSON.h>
+#include <llvm/Support/SHA256.h>
+#include <llvm/ADT/StringExtras.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/TargetSelect.h>
@@ -103,6 +106,8 @@ class RemoteFiles : public llvm::vfs::FileSystem {
         std::array<char, DCC_FS_METADATA> version{};
         std::shared_ptr<const llvm::MemoryBuffer> contents;
         bool queried = false, listed = false;
+        unsigned observed = 0;
+        std::string resolved;
         explicit Entry(std::error_code error) : error(error) {}
         explicit Entry(const char *bytes) {
             memcpy(version.data(), bytes, version.size());
@@ -123,13 +128,57 @@ class RemoteFiles : public llvm::vfs::FileSystem {
     dccfs::Connection connection;
     std::string cwd;
     llvm::StringMap<Entry> entries;
+    bool recording = false, stable = true;
+    std::vector<std::string> observations;
+    void observe(llvm::StringRef name, unsigned operation, std::error_code error = {}) {
+        if (!recording) return;
+        if (!llvm::json::isUTF8(name) || observations.size() >= DCC_JOB_INPUT_MAX) {
+            stable = false; return;
+        }
+        auto [found, inserted] = entries.try_emplace(name, error);
+        if (!found->second.observed) observations.push_back(name.str());
+        found->second.observed |= operation;
+    }
+    static std::string digest(llvm::StringRef bytes) {
+        auto hash = llvm::SHA256::hash(llvm::ArrayRef(
+            reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size()));
+        return llvm::toHex(hash);
+    }
+    llvm::json::Object observation(llvm::StringRef name) const {
+        const auto &entry = entries.find(name)->second;
+        llvm::json::Object result{{"path", name.str()}, {"ops", entry.observed},
+                                  {"error", entry.error.value()}};
+        if (entry.error) return result;
+        auto version = entry.version;
+        // A directory's identity/search permission matters, but unrelated
+        // output creation does not alter a stat-only observation. Actual
+        // negative and positive names are recorded separately.
+        if (S_ISDIR(entry.mode())) {
+            memset(version.data()+16, 0, 16);
+            memset(version.data()+44, 0, 8);
+        }
+        result["metadata"] = digest({version.data(), version.size()});
+        if (entry.observed & 2) {
+            if (entry.contents) result["contents"] = digest(entry.contents->getBuffer());
+            else result["error"] = EPROTO;
+        }
+        if (entry.observed & 4) result["resolved"] = entry.resolved;
+        return result;
+    }
     Entry &remember(llvm::StringRef name, const char *bytes) {
         auto [found, inserted] = entries.try_emplace(name, bytes);
-        if (!inserted) found->second.update(bytes);
+        if (!inserted) {
+            if (found->second.observed && (found->second.error ||
+                memcmp(found->second.version.data(), bytes, DCC_FS_METADATA))) stable = false;
+            found->second.update(bytes);
+        }
         return found->second;
     }
     std::error_code remember(llvm::StringRef name, std::error_code error) {
-        entries.insert_or_assign(name, Entry(error));
+        auto old = entries.find(name);
+        if (old != entries.end() && old->second.observed && old->second.error != error) stable = false;
+        if (old == entries.end()) entries.try_emplace(name, error);
+        else old->second.error = error;
         return error;
     }
     llvm::SmallString<256> absolute(const llvm::Twine &path) const {
@@ -176,6 +225,40 @@ public:
     RemoteFiles(int fd, std::string cwd, const dcc_file_cache_api &cache,
                 std::string identity, std::string cache_root)
         : connection(fd, cache, std::move(identity), cache_root), cwd(std::move(cwd)) {}
+    int claimResult(llvm::StringRef action) { return connection.claim_compilation({action.data(), action.size()}); }
+    dccfs::Buffer result(llvm::StringRef action) { return connection.compilation({action.data(), action.size()}); }
+    void saveResult(llvm::StringRef action, llvm::StringRef value) {
+        connection.save_compilation({action.data(), action.size()}, {value.data(), value.size()});
+    }
+    void beginObservations() {
+        for (auto &entry : entries) entry.second.observed = 0;
+        observations.clear(); stable = recording = true;
+    }
+    std::optional<llvm::json::Array> certificate() const {
+        if (!stable) return std::nullopt;
+        llvm::json::Array result;
+        for (const auto &name : observations) result.push_back(observation(name));
+        return result;
+    }
+    bool validate(const llvm::json::Array &expected) {
+        if (expected.empty() || expected.size() > DCC_JOB_INPUT_MAX) return false;
+        beginObservations();
+        for (const auto &value : expected) {
+            auto *item = value.getAsObject();
+            if (!item) return false;
+            auto path = item->getString("path"); auto ops = item->getInteger("ops");
+            if (!path || !ops || *ops <= 0 || (*ops & ~7) || !path->starts_with("/")) return false;
+            if (*ops & 1) (void)status(*path);
+            if (*ops & 2) (void)openFileForRead(*path);
+            if (*ops & 4) {
+                llvm::SmallString<256> resolved;
+                (void)getRealPath(*path, resolved);
+            }
+            if (!stable || entries.find(*path) == entries.end() ||
+                llvm::json::Value(observation(*path)) != value) return false;
+        }
+        return true;
+    }
     bool share_stream() { return connection.share_stream(); }
     unsigned codegen_cpus(unsigned requested) {
         if (requested && !share_stream()) return 0;
@@ -187,6 +270,11 @@ public:
     }
     llvm::ErrorOr<llvm::vfs::Status> status(const llvm::Twine &path) override {
         auto name = absolute(path);
+        auto result = statusImpl(name);
+        observe(name, 1, result ? std::error_code{} : result.getError());
+        return result;
+    }
+    llvm::ErrorOr<llvm::vfs::Status> statusImpl(llvm::StringRef name) {
         auto found = entries.find(name);
         if (found != entries.end() && (found->second.error ||
             !S_ISDIR(found->second.mode()) || found->second.queried)) return found->second.status(name);
@@ -227,6 +315,11 @@ public:
     }
     llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(const llvm::Twine &path) override {
         auto name = absolute(path);
+        auto result = openImpl(name);
+        observe(name, 2, result ? std::error_code{} : result.getError());
+        return result;
+    }
+    llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openImpl(llvm::StringRef name) {
         std::array<char, DCC_FS_METADATA> version{};
         auto found = entries.find(name);
         if (found != entries.end()) {
@@ -244,10 +337,11 @@ public:
             return remember(name, error);
         auto &record = remember(name, snapshot.version.data());
         record.contents = std::make_shared<SnapshotBuffer>(
-            llvm::StringRef(snapshot.bytes.data, snapshot.bytes.size), name.str().str(), std::move(snapshot.bytes.owner));
+            llvm::StringRef(snapshot.bytes.data, snapshot.bytes.size), name.str(), std::move(snapshot.bytes.owner));
         return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));
     }
     llvm::vfs::directory_iterator dir_begin(const llvm::Twine &path, std::error_code &error) override {
+        if (recording) stable = false; // Enumeration is not a stat-only dependency.
         auto name = absolute(path);
         auto response = request(DCC_FS_LIST, name);
         if (!response) { error = response.getError(); return {}; }
@@ -265,9 +359,16 @@ public:
     }
     llvm::ErrorOr<std::string> getCurrentWorkingDirectory() const override { return cwd; }
     std::error_code getRealPath(const llvm::Twine &path, llvm::SmallVectorImpl<char> &output) override {
-        auto answer = request(DCC_FS_REALPATH, absolute(path));
+        auto name = absolute(path);
+        auto answer = request(DCC_FS_REALPATH, name);
+        auto found = entries.find(name);
+        if (recording && (found == entries.end() || !answer)) stable = false;
         if (!answer) return answer.getError();
         auto bytes = (*answer)->getBuffer();
+        if (recording && found != entries.end()) {
+            if (!llvm::json::isUTF8(bytes)) stable = false;
+            else { found->second.resolved = bytes.str(); observe(name, 4); }
+        }
         output.assign(bytes.begin(), bytes.end());
         return {};
     }

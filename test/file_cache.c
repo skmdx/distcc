@@ -90,11 +90,46 @@ static int cached(const unsigned char hash[DCC_FILE_HASH_SIZE], const char *root
     return found;
 }
 
+static void claims_contract(void)
+{
+    struct dcc_record_cache *cache = record_open(".");
+    assert(cache);
+    int ready[2];
+    assert(!pipe(ready));
+    pid_t owner = fork();
+    assert(owner >= 0);
+    if (!owner) {
+        int lock = record_claim(cache, "action", 6);
+        assert(lock >= 0 && (fcntl(lock, F_GETFD) & FD_CLOEXEC));
+        assert(write(ready[1], "R", 1) == 1);
+        for (;;) pause();
+    }
+    char value;
+    assert(read(ready[0], &value, 1) == 1 && value == 'R');
+    int other = record_claim(cache, "different", 9);
+    assert(other >= 0 && !close(other));
+    pid_t waiter = fork();
+    assert(waiter >= 0);
+    if (!waiter) {
+        int lock = record_claim(cache, "action", 6);
+        assert(lock >= 0);
+        _exit(0); /* Exiting, as well as close/exec, releases the claim. */
+    }
+    assert(!kill(owner, SIGTERM));
+    int status;
+    assert(waitpid(owner, &status, 0) == owner && WIFSIGNALED(status));
+    assert(waitpid(waiter, &status, 0) == waiter && WIFEXITED(status) && !WEXITSTATUS(status));
+    int lock = record_claim(cache, "action", 6);
+    assert(lock >= 0 && !close(lock));
+    close(ready[0]); close(ready[1]); record_close(cache);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2 && !chdir(argv[1]));
     digest_contract();
     assert(!setenv("DISTCCD_FILE_CACHE", "cache", 1));
+    claims_contract();
     unsigned char small[DCC_FILE_HASH_SIZE], large[DCC_FILE_HASH_SIZE];
     input("small", 8*1024*1024, small);
     dcc_file_cache_put(small, "small", 1, ".");

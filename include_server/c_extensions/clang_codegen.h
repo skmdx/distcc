@@ -4,6 +4,7 @@
 #include <optional>
 #include <functional>
 namespace clang { class CompilerInstance; }
+namespace dcc_result { class Result; }
 
 // Serial execution has no split/merge cost. Beyond two parts the model is
 // convex, so stop as soon as another part no longer reduces completion time.
@@ -25,5 +26,5 @@ inline unsigned dcc_codegen_parallelism(double serial, double overhead,
 
 void dcc_clang_codegen_init();
 std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &,
-    const std::function<unsigned(unsigned)> &reserve = {});
+    const std::function<unsigned(unsigned)> &reserve = {}, dcc_result::Result *result = nullptr);
 #endif

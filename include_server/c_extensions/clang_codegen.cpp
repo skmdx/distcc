@@ -11,6 +11,7 @@
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/MultiplexConsumer.h>
 #include <llvm/IR/Module.h>
+#include "clang_result.h"
 #include <llvm/ObjCopy/ConfigManager.h>
 #include <llvm/ObjCopy/ObjCopy.h>
 #include <llvm/Object/Binary.h>
@@ -98,7 +99,9 @@ class TimedIRAction : public clang::EmitLLVMOnlyAction {
         return std::make_unique<clang::MultiplexConsumer>(std::move(consumers));
     }
 public:
-    TimedIRAction() { if (enabled) samples[0] = Sample::now(); }
+    explicit TimedIRAction(llvm::LLVMContext *context) : EmitLLVMOnlyAction(context) {
+        if (enabled) samples[0] = Sample::now();
+    }
     void irReady(uint64_t instructions) {
         if (!enabled) return;
         optimized_instructions = instructions;
@@ -184,7 +187,7 @@ void dcc_clang_codegen_init() {
 }
 
 std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler,
-    const std::function<unsigned(unsigned)> &reserve) {
+    const std::function<unsigned(unsigned)> &reserve, dcc_result::Result *result) {
     const char *enabled = getenv("DISTCC_CLANG_CODEGEN");
     auto &frontend = compiler.getFrontendOpts();
     const auto &codegen = compiler.getCodeGenOpts();
@@ -205,18 +208,30 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler,
         llvm::cl::ParseCommandLineOptions(args.size()-1, args.data(), "", nullptr,
                                           &compiler.getVirtualFileSystem());
     }
-    TimedIRAction action;
+    auto context = std::make_unique<llvm::LLVMContext>();
+    TimedIRAction action(context.get());
     std::unique_ptr<llvm::Module> module;
     auto dispose = llvm::scope_exit([&] {
         if (frontend.DisableFree) {
             if (!module) module = action.takeModule();
             llvm::BuryPointer(std::move(module));
-            llvm::BuryPointer(action.takeLLVMContext());
+            llvm::BuryPointer(std::move(context));
         }
     });
-    if (!compiler.ExecuteAction(action)) return false;
-    module = action.takeModule();
-    if (!module) return false;
+    if (result) {
+        module = result->replay(*context);
+        if (result->publication_failed) return false;
+        if (module && !compiler.hasTarget() && !compiler.createTarget()) return false;
+    }
+    if (!module) {
+        if (result) result->start();
+        if (!compiler.ExecuteAction(action)) return false;
+        module = action.takeModule();
+        if (!module) return false;
+        if (result) result->save(*module);
+    }
+    // Only frontend IR is shared. Backend/assembler inputs and all final
+    // object writes remain part of each job's ordinary execution path.
     uint64_t total = 0, largest = 0;
     unsigned functions = 0;
     for (const auto &function : *module) {

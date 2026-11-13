@@ -511,6 +511,20 @@ done:
     if (fd >= 0) close(fd);
     if (lock >= 0) close(lock);
 }
+static int record_claim(struct dcc_record_cache *cache, const void *key, size_t size)
+{
+    char name[17];
+    int shard = record_shard(cache, key, size, name);
+    if (shard < 0) return -1;
+    int fd = openat(shard, ".claims", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    /* Locks beyond EOF allocate no storage. Hash collisions only serialize
+     * unrelated producers: record_contents still verifies the complete key. */
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET,
+        .l_start = (off_t)(XXH3_64bits(key, size) & INT64_MAX), .l_len = 1};
+    if (fcntl(fd, F_OFD_SETLKW, &lock)) { int error = errno; close(fd); errno = error; return -1; }
+    return fd;
+}
 const struct dcc_file_cache_api dcc_file_cache_records = {
-    record_open, record_close, record_lookup, record_contents, record_write
+    record_open, record_close, record_lookup, record_contents, record_write, record_claim
 };

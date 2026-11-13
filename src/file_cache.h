@@ -40,6 +40,9 @@ struct dcc_file_cache_api {
     int (*contents)(const void *record, size_t record_size, const void *key, size_t key_size,
                     const void **data, size_t *size);
     void (*write)(struct dcc_record_cache *, const void *, size_t, const void *, size_t);
+    /* An open-file-description lock for this record key. Close the returned
+     * descriptor to release it, including when a compiling process exits. */
+    int (*claim)(struct dcc_record_cache *, const void *, size_t);
 };
 extern const struct dcc_file_cache_api dcc_file_cache_records;
 
