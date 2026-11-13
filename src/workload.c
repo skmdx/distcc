@@ -207,7 +207,15 @@ double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_wor
     return seconds > .01 ? seconds : .01;
 }
 
-void dcc_work_observe(struct dcc_work_model *model, const struct dcc_work_hint *hint, double seconds)
+int dcc_work_peer(const struct dcc_work_model *model, const struct dcc_work_hint *hint)
+{
+    if (!hint->key) return -1;
+    unsigned i = history_slot(model, hint);
+    return model->history[i].key == hint->key && model->history[i].family == hint->family &&
+           model->history[i].bytes == hint->bytes ? model->history[i].peer : -1;
+}
+
+void dcc_work_observe(struct dcc_work_model *model, const struct dcc_work_hint *hint, double seconds, int peer)
 {
     if (!hint->key || !isfinite(seconds) || seconds < .001 || seconds > 86400) return;
     unsigned i = history_slot(model, hint), kind = hint->kind - 1;
@@ -221,4 +229,5 @@ void dcc_work_observe(struct dcc_work_model *model, const struct dcc_work_hint *
     model->history[i].family = hint->family;
     model->history[i].bytes = hint->bytes;
     model->history[i].seconds = seconds;
+    model->history[i].peer = peer;
 }

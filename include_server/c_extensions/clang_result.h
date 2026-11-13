@@ -193,8 +193,21 @@ public:
         auto *inputs = record->getArray("inputs"); auto *names = record->getArray("dependencies");
         auto messages = record->getString("diagnostics");
         auto warnings = record->getInteger("warnings");
-        if (!inputs || !names || !messages || !warnings || *warnings < 0 || *warnings > UINT_MAX ||
-            !files.validate(*inputs)) return {};
+        if (!inputs || !names || !messages || !warnings || *warnings < 0 || *warnings > UINT_MAX) return {};
+        const bool measured = getenv("DISTCC_VERBOSE");
+        auto now = [](clockid_t clock) {
+            timespec value{};
+            clock_gettime(clock, &value);
+            return uint64_t(value.tv_sec)*1000000000 + value.tv_nsec;
+        };
+        const auto wall = measured ? now(CLOCK_MONOTONIC) : 0;
+        const auto cpu = measured ? now(CLOCK_PROCESS_CPUTIME_ID) : 0;
+        const bool valid = files.validate(*inputs);
+        if (measured)
+            llvm::errs() << "distcc compiler result: validation inputs=" << inputs->size()
+                << " valid=" << valid << " cpu_ns=" << now(CLOCK_PROCESS_CPUTIME_ID)-cpu
+                << " wall_ns=" << now(CLOCK_MONOTONIC)-wall << '\n';
+        if (!valid) return {};
         llvm::MemoryBufferRef bitcode({cached.data+8+size, cached.size-8-size}, "distcc frontend IR");
         auto module = llvm::parseBitcodeFile(bitcode, context);
         if (!module) { llvm::consumeError(module.takeError()); return {}; }

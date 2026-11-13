@@ -21,12 +21,13 @@ struct dcc_work_class {
     double input_rate, work_rate;
 };
 struct dcc_work_model {
-    struct { uint64_t key, family, bytes; double seconds; } history[DCC_WORK_HISTORY];
+    struct { uint64_t key, family, bytes; double seconds; int peer; } history[DCC_WORK_HISTORY];
     unsigned char next[DCC_WORK_HISTORY / DCC_WORK_WAYS];
     struct dcc_work_class classes[DCC_WORK_CLASSES];
 };
 void dcc_work_describe(struct dcc_work_hint *, char **, const char *, const char *, int, int);
 int dcc_work_valid(const struct dcc_work_hint *);
 double dcc_work_predict(const struct dcc_work_model *, const struct dcc_work_hint *);
-void dcc_work_observe(struct dcc_work_model *, const struct dcc_work_hint *, double);
+int dcc_work_peer(const struct dcc_work_model *, const struct dcc_work_hint *);
+void dcc_work_observe(struct dcc_work_model *, const struct dcc_work_hint *, double, int);
 #endif

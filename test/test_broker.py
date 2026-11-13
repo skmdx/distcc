@@ -614,6 +614,54 @@ class BrokerPlacementTest(BrokerTestCase):
 
 
 class BrokerTest(BrokerTestCase):
+    def test_source_affinity_uses_only_existing_pipeline_capacity(self):
+        peers = [self.peer(stats_response(cpus=n, cores=n, jobs=n, capacity=n,
+                    running=0, busy=0, queued=0, preparing=0, returning=0)) for n in (16, 4)]
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else 1}',
+                                            slots=16 if i == 0 else 4) for i, p in enumerate(peers)))
+        for key in range(100, 116):
+            _, net = self.acquire_reserved(10, (key, 1048576, 5), family=key)
+            self.assertEqual(net.getpeername()[1], self.ports[0])
+        # Repeats may occupy the already bounded four-slot pipeline, while
+        # unrelated jobs remain free to use the idle worker.
+        for _ in range(4):
+            _, net = self.acquire_reserved(10, (100, 1048576, 5), family=100)
+            self.assertEqual(net.getpeername()[1], self.ports[0])
+        _, net = self.acquire_reserved(10, (100, 1048576, 5), family=100)
+        self.assertEqual(net.getpeername()[1], self.ports[1])
+
+    def test_source_affinity_does_not_follow_a_slower_owner(self):
+        peers = [self.peer(stats_response(cpus=4, cores=4, jobs=4, capacity=4,
+                    running=0, busy=0, queued=0, preparing=0, returning=0)) for _ in range(2)]
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else 1}', slots=4)
+                                  for i, p in enumerate(peers)))
+        occupied = [self.acquire_reserved(10, (100 + i, 1048576, 5), family=100 + i)[0] for i in range(4)]
+        _, owner = self.acquire_reserved(10, (200, 1048576, 5), family=200)
+        self.assertEqual(owner.getpeername()[1], self.ports[1])
+        for lease in occupied: lease.close()
+        _, repeat = self.acquire_reserved(10, (200, 1048576, 5), family=200)
+        self.assertEqual(repeat.getpeername()[1], self.ports[0])
+
+    def test_source_affinity_survives_completion_but_not_a_changed_source(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        peers = [self.peer(stats_response(cpus=n, cores=n, jobs=n, capacity=n,
+                    running=0, busy=0, queued=0, preparing=0, returning=0)) for n in (16, 4)]
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else 1}',
+                                            slots=16 if i == 0 else 4) for i, p in enumerate(peers)))
+        seed, net = self.acquire_reserved(10, (100, 1048576, 5), family=900)
+        seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 1_000_000_000, 0)],
+                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+        self.assertEqual(seed.recv(1), b'')
+        for key in range(101, 117):
+            _, net = self.acquire_reserved(10, (key, 1048576, 5), family=key)
+            self.assertEqual(net.getpeername()[1], self.ports[0])
+        self.acquire_reserved(10, (100, 1048576, 5), family=901)
+        # Ordinary cost prediction may independently choose either host. A
+        # changed input must not acquire the old input's locality preference.
+        self.assertNotIn('source affinity: key=64 ', (self.work/'broker.log').read_text())
+        _, repeated = self.acquire_reserved(10, (100, 1048576, 5), family=900)
+        self.assertEqual(repeated.getpeername()[1], self.ports[0])
+
     def test_wait_accounts_for_contention_after_next_lane_opens(self):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
                     running=17, busy=16, queued=0, preparing=0, returning=0)),

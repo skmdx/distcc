@@ -1021,7 +1021,7 @@ static void observe(struct broker *broker, struct client *client, const struct f
     struct peer *peer = &broker->peers[client->peer];
     double cost = timing->execute_ns / 1e9 / client->factor;
     /* Both direct compilation and remote jobs train the input-cost model. */
-    dcc_work_observe(&broker->model, &client->hint, cost);
+    dcc_work_observe(&broker->model, &client->hint, cost, client->peer);
     peer->mean_cost = peer->mean_cost > 0 ? .875 * peer->mean_cost + .125 * cost : cost;
     int bulk = bulk_input(peer, &client->hint);
     /* Tiny transfers cannot measure bandwidth reliably. Include fast samples
@@ -1132,7 +1132,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         int peer, probe, wait, idle, enqueue;
         double score, fill;
         struct prediction forecast;
-    } best = {.peer = -1}, ready = {.peer = -1};
+    } best = {.peer = -1}, ready = {.peer = -1}, affinity = {.peer = -1};
     int direct = client->command == TRY_LOCAL;
     if (direct) {
         for (i = 0; i < broker->count; ++i)
@@ -1150,10 +1150,21 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                        client->hint.kind == DCC_WORK_OFFLOAD_LINK;
     int local_cpp = !link && !direct && client->command != ACQUIRE_CPP && client->command != ACQUIRE_READY;
     int recent[MAX_HOSTS] = {0}, recent_links[MAX_HOSTS] = {0};
+    unsigned char owners[MAX_HOSTS] = {0};
+    /* Placement history is only a locality hint. The receiving worker still
+     * validates its compiler/input certificate; this never authorizes reuse.
+     * Keep the hint in the existing bounded cost history, and consult live
+     * leases for work whose frontend may have completed before its backend. */
+    int locality = !direct && !link && (client->hint.kind == 4 || client->hint.kind == 5);
+    int previous = locality ? dcc_work_peer(&broker->model, &client->hint) : -1;
+    if (previous >= 0 && previous < broker->count) owners[previous] = 1;
     unsigned long long headroom[MAX_HOSTS], pending[MAX_HOSTS] = {0}, new_memory[MAX_HOSTS] = {0};
     for (i = 0; i < MAX_CLIENTS; ++i) {
         const struct client *c = &broker->clients[i];
         if (c->fd < 0 || c->peer < 0) continue;
+        if (locality && c->hint.key == client->hint.key &&
+            c->hint.family == client->hint.family && c->hint.bytes == client->hint.bytes)
+            owners[c->peer] = 1;
         unsigned long long bytes = memory_forecast(&broker->peers[c->peer].metrics, &c->hint, NULL);
         pending[c->peer] = bytes > UINT64_MAX - pending[c->peer] ? UINT64_MAX : pending[c->peer] + bytes;
         if (!c->direct && c->serial > broker->peers[c->peer].observed_serial) {
@@ -1364,6 +1375,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * with which to justify waiting instead of using an idle CPU. */
             int idle = !cost && staged && cap && !blocked && work < dcc_capacity_jobs(p->host, cap);
             struct selection candidate = {i, probe, wait, idle, enqueue, score, fill, forecast};
+            if (owners[i] && staged && predicted && (!wait || enqueue) &&
+                (affinity.peer < 0 || forecast.factor < affinity.forecast.factor ||
+                 (forecast.factor == affinity.forecast.factor && score < affinity.score)))
+                affinity = candidate;
             if (best.peer < 0 || idle > best.idle || (idle == best.idle &&
                 (score < best.score || (score == best.score && fill < best.fill)))) best = candidate;
             if (predicted && !wait) {
@@ -1387,6 +1402,17 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     if (best.wait && ready.peer >= 0 &&
         (link_backend || best.forecast.finish >= ready.forecast.finish))
         best = ready;
+    /* Prefer an already populated, no-slower worker only inside its existing
+     * immediate admission/pipeline bounds. Never wait for locality, increase
+     * the pipeline, or pin a repeat to a slower owner. No speculative cache
+     * speedup is subtracted from the normal execution-cost model. */
+    if (affinity.peer >= 0 && best.peer >= 0 && affinity.peer != best.peer &&
+        affinity.forecast.factor <= best.forecast.factor) {
+        rs_trace("source affinity: key=%llx host=%s instead=%s",
+                 (unsigned long long)client->hint.key, broker->peers[affinity.peer].host->hostname,
+                 broker->peers[best.peer].host->hostname);
+        best = affinity;
+    }
     if (direct && !(best.peer >= 0 && best.idle && !best.wait &&
                     broker->peers[best.peer].local && broker->peers[best.peer].host->tcp_jobs)) {
         reply.slots = 0;
