@@ -11,7 +11,9 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include "native_worker.h"
+#include "plan_memo.h"
 extern "C" {
 #include "argv_file.h"
 }
@@ -117,6 +119,7 @@ int execute(int fd, bool preparing)
     }
     if (!output || ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) return 1;
     environ = command.groups[2];
+    if (fcntl(5, F_GETFD) >= 0) dcc_plan_record_begin(5, !capture_program.empty());
     // main has never run in the parent. GCC parses the complete fresh argv
     // and environment, observes current paths, and initializes its plugins.
     return compiler_main(argc, argv, environ);

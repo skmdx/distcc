@@ -270,6 +270,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_portage_jobs.py \
 	test/test_broker.py \
 	test/test_tcp_jobs.py \
+	test/test_plan_memo.py \
 	test/remote_files_contract.cc \
 	test/gcc_files_contract.cc \
 	test/file_cache.c \
@@ -409,9 +410,9 @@ h_getline_obj = src/h_getline.o $(common_obj)
 
 common_obj += src/job.o
 common_obj += src/tcp_job.o
-distcc_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o
+distcc_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o src/plan_memo.o
 distccd_obj += src/tcp_server.o src/tcp_worker.o src/tcp_async.o src/clang_worker.o src/gcc_files.o
-h_compile_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o
+h_compile_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o src/plan_memo.o
 distcc_obj += src/remote_job.o src/file_cache.o
 h_compile_obj += src/remote_job.o src/file_cache.o
 
@@ -614,8 +615,8 @@ cpp_lookup.so: $(srcdir)/src/cpp_lookup.c
 src/argv_file.pic.o: $(srcdir)/src/argv_file.c $(srcdir)/src/argv_file.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
 
-gcc_plan.so: $(srcdir)/src/gcc_plan.cc $(srcdir)/src/native_worker.cc $(srcdir)/src/native_worker.h src/argv_file.pic.o
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=gnu++17 -fPIC -fvisibility=hidden -shared $(LDFLAGS) -o $@ $(srcdir)/src/gcc_plan.cc $(srcdir)/src/native_worker.cc src/argv_file.pic.o -ldl
+gcc_plan.so: $(srcdir)/src/gcc_plan.cc $(srcdir)/src/gcc_dependencies.cc $(srcdir)/src/plan_memo.h $(srcdir)/src/native_worker.cc $(srcdir)/src/native_worker.h src/argv_file.pic.o
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=gnu++17 -fPIC -fvisibility=hidden -shared $(LDFLAGS) -o $@ $(srcdir)/src/gcc_plan.cc $(srcdir)/src/gcc_dependencies.cc $(srcdir)/src/native_worker.cc src/argv_file.pic.o -ldl
 
 CLIENT_CONTRACT_SOURCES = src/hosts.c src/hostfile.c src/loadfile.c src/lock.c src/io.c src/tempfile.c \
 	src/trace.c src/util.c src/argutil.c src/rpc.c src/filename.c src/snprintf.c src/cleanup.c
@@ -962,6 +963,7 @@ adaptive-check: distcc distccd distccmon-text h_hosts h_compile h_state include-
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v
 	$(PYTHON) "$(srcdir)/test/test_broker.py" -v
 	$(PYTHON) "$(srcdir)/test/test_tcp_jobs.py" -v
+	$(PYTHON) "$(srcdir)/test/test_plan_memo.py" -v
 	$(PYTHON) "$(srcdir)/test/test_local_clang.py" -v
 	$(PYTHON) "$(srcdir)/test/test_rust.py" -v
 	$(PYTHON) "$(srcdir)/test/test_thinlto.py" -v
@@ -1500,8 +1502,10 @@ SRC += src/job.c src/remote_job.c
 SRC += src/tcp_job.c src/tcp_client.c src/tcp_server.c src/tcp_worker.c src/tcp_async.c
 SRC += src/frontend_fs.c src/gcc_frontend.c src/gcc_files.cc
 SRC += src/argv_file.c src/gcc_plan.cc src/native_worker.cc src/native_worker.h
+SRC += src/plan_memo.c src/plan_memo.h src/gcc_dependencies.cc
 src/rpc.o src/argv_file.o: src/argv_file.h
 src/gcc_frontend.o src/local_clang.o src/clang_worker.o src/distcc.o: src/native_worker.h
+src/gcc_frontend.o src/plan_memo.o src/h_compile.o: src/plan_memo.h
 src/frontend_fs.o src/tcp_client.o src/local_clang.o: src/frontend_fs.h
 HEADERS += src/tcp_job.h src/tcp_async.h src/clang_worker.h
 HEADERS += src/job.h

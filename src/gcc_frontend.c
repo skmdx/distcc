@@ -23,8 +23,12 @@
 #include "trace.h"
 #include "util.h"
 #include "argv_file.h"
+#include "where.h"
+#include "lock.h"
+#include "plan_memo.h"
 
 extern char **environ;
+static int plan_dependencies = -1;
 
 static int start_planner(const char *compiler, char **argv, const char *library, const char *role)
 {
@@ -94,10 +98,11 @@ static int request_planner(const char *compiler, char **argv, int input,
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) ||
         (capture && socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, relay)) ||
         lseek(input, 0, SEEK_SET) < 0) goto out;
-    int fds[] = {input, pair[1], standard[0], standard[1], standard[2], relay[1]};
-    struct dcc_native_request request = {capture ? 'D' : 'P', 0};
+    int fds[] = {input, pair[1], standard[0], standard[1], standard[2],
+                 capture ? relay[1] : plan_dependencies, plan_dependencies};
+    struct dcc_native_request request = {plan_dependencies >= 0 ? (capture ? 'G' : 'S') : (capture ? 'D' : 'P'), 0};
     stage = "command send";
-    if (dcc_send_fds(worker, &request, sizeof(request), fds, capture ? 6 : 5)) goto out;
+    if (dcc_send_fds(worker, &request, sizeof(request), fds, (capture ? 6 : 5)+(plan_dependencies>=0))) goto out;
     close(pair[1]); pair[1] = -1;
     if (relay[1] >= 0) { close(relay[1]); relay[1] = -1; }
     struct dcc_native_result result;
@@ -254,6 +259,10 @@ static int plan_driver(char **argv, int output, int capture)
 out:
     if (diagnostics >= 0) {
         struct stat info;
+        if (plan_dependencies >= 0 && (!fstat(diagnostics, &info) && info.st_size)) {
+            unsigned char invalid = 1;
+            if (pwrite(plan_dependencies, &invalid, 1, 2) != 1) ret = EXIT_IO_ERROR;
+        }
         if (ret && !fstat(diagnostics, &info) && info.st_size &&
             lseek(diagnostics, 0, SEEK_SET) >= 0)
             dcc_pump_readwrite(STDERR_FILENO, diagnostics, info.st_size);
@@ -266,6 +275,9 @@ out:
 int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **result)
 {
     int descriptor = dcc_job_memfd("distcc-gcc-plan"), ret = EXIT_IO_ERROR;
+    int lease = -1, cpu = -1;
+    char *key = NULL, *memo = NULL;
+    unsigned dependencies = 0;
     char **command = NULL, **groups[2] = {NULL, NULL};
     struct dcc_job *job = NULL;
     if (descriptor < 0 || fcntl(descriptor, F_SETFD, 0) ||
@@ -299,8 +311,39 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
         dcc_argv_append(command, strdup("-wrapper"));
         dcc_argv_append(command, wrapper);
     }
-    if (plan_driver(command, descriptor, !wrapped) ||
-        lseek(descriptor, 0, SEEK_SET) < 0 || dcc_r_argv_file(descriptor, 2, groups)) goto done;
+    key = dcc_plan_key(argv, input);
+    if (key) {
+        lease = dcc_broker_memo_get(key, &memo);
+        while (memo) {
+            if (dcc_plan_memo_decode(memo, descriptor, &dependencies)) {
+                rs_trace("GCC plan memo hit dependencies=%u", dependencies);
+                goto decoded;
+            }
+            char *stale = memo; memo = NULL;
+            lease = dcc_broker_memo_refresh(key, stale, &memo);
+            free(stale);
+        }
+    }
+    // Waiters and hits never hold a local analysis lease. Only the publisher
+    // (or an explicitly uncached request) pays compiler execution admission.
+    if ((ret = dcc_lock_local_cpp(&cpu))) goto done;
+    ret = EXIT_IO_ERROR;
+    if (lease >= 0) {
+        plan_dependencies = dcc_job_memfd("distcc-gcc-dependencies");
+        unsigned char empty[4] = {0};
+        if (plan_dependencies < 0 || write(plan_dependencies, empty, 4) != 4) goto done;
+    }
+    ret = plan_driver(command, descriptor, !wrapped);
+    dcc_unlock(cpu); cpu = -1;
+    if (ret) goto done;
+    if (lease >= 0) {
+        memo = dcc_plan_memo_encode(plan_dependencies, descriptor, &dependencies);
+        rs_trace("GCC plan memo %s dependencies=%u", memo ? "publish" : "uncacheable", dependencies);
+        dcc_broker_memo_put(lease, memo); lease = -1;
+    }
+decoded:
+    ret = EXIT_IO_ERROR;
+    if (lseek(descriptor, 0, SEEK_SET) < 0 || dcc_r_argv_file(descriptor, 2, groups)) goto done;
     job = calloc(1, sizeof(*job));
     if (!job) goto done;
     job->kind = DCC_JOB_GCC_FRONTEND;
@@ -335,6 +378,11 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
     *result = job; job = NULL;
     ret = 0;
 done:
+    if (cpu >= 0) dcc_unlock(cpu);
+    if (lease >= 0) close(lease);
+    if (plan_dependencies >= 0) close(plan_dependencies);
+    plan_dependencies = -1;
+    free(key); free(memo);
     if (descriptor >= 0) close(descriptor);
     if (command) dcc_free_argv(command);
     for (unsigned i = 0; i < 2; ++i) if (groups[i]) dcc_free_argv(groups[i]);

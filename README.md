@@ -742,15 +742,33 @@ The Portage phase hook adds the package's `WORKDIR` automatically, retaining
 explicit roots. This covers sibling headers and generated sources even when
 the pump analyzer is disabled.
 
-Client driver planning shares the automatic local input-preparation budget.
-Its lease is released before worker selection, so completed planning does not
-keep the client apparently busy or reserve a worker while awaiting a local CPU.
+Live client driver planning shares the automatic local input-preparation budget.
+Only a memo owner takes that lease, after coalescing simultaneous requests;
+validated hits and memo waiters do not consume preprocessing slots. The lease
+is released before worker selection.
 For GCC on x86_64/aarch64 glibc, the native driver supplies frontend arguments
 through its `-wrapper` interface. A client-owned helper retains the loaded GCC
-image before its main function runs, then forks a fresh planner for each job.
-Only library loading is shared: every invocation parses its own arguments,
-environment and current search directories. Planning stops after GCC registers
-its include chains, before opening the source. No search-plan result is cached.
+image before its main function runs, then forks a fresh planner on a memo miss.
+Planning stops after GCC registers its include chains, before opening the source.
+The broker retains the resulting defaults/roots with the live driver's and
+planner's filesystem observations. Public libc calls still perform the real
+operations through the caller's sandbox. Each hit revalidates the recorded
+positive and negative probes in the requesting client's credentials, namespace
+and sandbox; inode, ownership, mode, size, mtime/ctime, errors and link targets
+must agree. This does not cache input read authorization or input bytes.
+
+Keys retain the compiler/helper, environment, cwd, input extension and parent,
+macros and other arguments. Only the single input name and separate `-o`, `-MF`,
+`-MT`, `-MQ` operands are normalized. Responses, custom specs, explicit wrappers,
+plugins, stdin, multiple source operands and diagnostic/preprocess-only commands
+use live planning. Incomplete, changing, diagnostic-producing or oversized
+journals are not published. A stale reader requests compare-and-replace of the
+observed memo; it cannot discard a newer publisher's value. The broker indexes
+keys in a balanced tree and bounds ready values to 64 MiB, individual messages
+to 64 KiB and journals to 24 KiB. Retained worker handles keep their existing
+256-entry bound. Cancellation transfers an unfinished lease to a live waiter.
+The isolated contracts are in `test/test_plan_memo.py`; `h_compile plan` exposes
+the same defaults/roots for comparison with a live invocation.
 The broker scopes helpers to the caller, executable, namespaces, credentials
 and loader environment; replacing the compiler or helper selects a new image.
 The existing native worker loop owns concurrent invocations, cancellation and

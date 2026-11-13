@@ -31,6 +31,8 @@
 #include "util.h"
 #include "tcp_job.h"
 #include "workload.h"
+#include <search.h>
+#include <xxhash.h>
 
 #ifdef __linux__
 
@@ -40,10 +42,10 @@
  * Only an explicit RETURN with a descriptor can populate the idle pool. */
 #define MAX_HOSTS 128
 #define MAX_CLIENTS 256
-/* Each unpublished entry owns one live client lease. Matching the client
- * bound guarantees an admitted requester can reserve an entry; completed
- * entries can be evicted without interrupting users of their descriptors. */
-#define MAX_MEMOS MAX_CLIENTS
+/* Bound retained bytes rather than tying result count to concurrent clients.
+ * Unpublished entries still own one of MAX_CLIENTS leases. Only ready entries
+ * are on the LRU; replacement cannot evict a publishing owner or its waiters. */
+#define MEMO_BYTES (64U * 1024U * 1024U)
 struct peer {
     struct dcc_hostdef *host;
     struct sockaddr_storage address;
@@ -71,7 +73,7 @@ struct client {
     enum client_state state;
     uint32_t command, local_limit;
     double deadline;
-    int memo;
+    struct memo *memo;
     int pooled;
     int reused;
     int admission;
@@ -80,7 +82,8 @@ struct client {
     struct dcc_work_hint hint;
     double cost, ready_at, run_at, factor, waiting_since;
 };
-struct memo { char *key, *value; double used; uid_t owner; int worker, socket; };
+struct memo { char *key, *value; uid_t owner; int worker, socket;
+              struct memo *previous, *next; };
 struct idle_connection { int fd, peer; double expires; };
 struct broker {
     struct peer peers[MAX_HOSTS];
@@ -88,7 +91,10 @@ struct broker {
     int count, cpp_busy, cpp_limit, analysis_busy;
     uint64_t direct_completed, direct_prepared_completed;
     double refresh_at, first_probe_until;
-    struct memo memos[MAX_MEMOS];
+    void *memos;
+    struct memo *memo_first, *memo_last;
+    size_t memo_bytes;
+    unsigned memo_workers;
     struct idle_connection pool[MAX_CLIENTS];
     struct dcc_work_model model;
 };
@@ -115,10 +121,10 @@ static int reconnect_wait(struct reconnect *retry, int error, int allow_unreacha
     return 1;
 }
 
-static int memo_get_once(const char *key, char **value, int *worker, double deadline)
+static int memo_get_once(const char *key, char **value, int *worker, unsigned command, double deadline)
 {
     struct sockaddr_un address;
-    struct request request = { BROKER_VERSION, worker ? WORKER_GET : MEMO_GET };
+    struct request request = { BROKER_VERSION, command };
     struct iovec parts[2] = {{ &request, sizeof(request) }, { (void *)key, strlen(key) + 1 }};
     struct msghdr msg = { .msg_iov = parts, .msg_iovlen = 2 };
     struct timeval timeout = { dcc_get_io_timeout(), 0 };
@@ -173,19 +179,33 @@ failed:
     return -1;
 }
 
-static int memo_get(const char *key, char **value, int *worker)
+static int memo_get(const char *key, char **value, int *worker, unsigned command)
 {
     struct reconnect retry = {0};
     int fd;
     do {
-        fd = memo_get_once(key, value, worker, retry.deadline);
+        fd = memo_get_once(key, value, worker, command, retry.deadline);
         if (fd >= 0 || (value && *value) || (worker && *worker >= 0)) return fd;
     } while (reconnect_wait(&retry, errno, 0));
     return -1;
 }
 
-int dcc_broker_memo_get(const char *key, char **value) { return memo_get(key, value, NULL); }
-int dcc_broker_worker_get(const char *key, int *worker) { return memo_get(key, NULL, worker); }
+int dcc_broker_memo_get(const char *key, char **value) { return memo_get(key, value, NULL, MEMO_GET); }
+int dcc_broker_worker_get(const char *key, int *worker) { return memo_get(key, NULL, worker, WORKER_GET); }
+
+static void memo_digest(const char *value, char digest[33])
+{
+    XXH128_hash_t h=XXH3_128bits(value,strlen(value));
+    snprintf(digest,33,"%016llx%016llx",(unsigned long long)h.high64,(unsigned long long)h.low64);
+}
+int dcc_broker_memo_refresh(const char *key, const char *stale, char **value)
+{
+    char digest[33], *payload=NULL;
+    memo_digest(stale,digest);
+    if (asprintf(&payload,"%s\n%s",key,digest)<0) return -1;
+    int lease=memo_get(payload,value,NULL,MEMO_REFRESH);
+    free(payload); return lease;
+}
 
 void dcc_broker_worker_put(int lease, int worker)
 {
@@ -618,10 +638,10 @@ static void release_assignment(struct broker *broker, struct client *client)
     client->net = client->peer = -1;
 }
 
+static void memo_forget(struct broker *, struct memo *);
 static void release_client(struct broker *broker, struct client *client)
 {
-    if (client->state == MEMO_OWNER && !broker->memos[client->memo].value &&
-        !broker->memos[client->memo].socket) {
+    if (client->state == MEMO_OWNER && !client->memo->value && !client->memo->socket) {
         int i;
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *waiter = &broker->clients[i];
@@ -633,10 +653,7 @@ static void release_client(struct broker *broker, struct client *client)
                 release_client(broker, waiter);
             }
         }
-        if (i == MAX_CLIENTS) {
-            free(broker->memos[client->memo].key);
-            broker->memos[client->memo].key = NULL;
-        }
+        if (i == MAX_CLIENTS) memo_forget(broker,client->memo);
     }
     release_assignment(broker, client);
     close(client->fd);
@@ -645,11 +662,37 @@ static void release_client(struct broker *broker, struct client *client)
 
 static int memo_ready(const struct memo *memo) { return memo->value || memo->socket; }
 
-static void memo_clear(struct memo *memo)
+static int memo_order(const void *aa, const void *bb)
 {
-    free(memo->key); free(memo->value);
-    if (memo->socket) close(memo->socket - 1);
-    memset(memo, 0, sizeof(*memo));
+    const struct memo *a=aa,*b=bb;
+    if (a->owner!=b->owner) return a->owner<b->owner ? -1 : 1;
+    if (a->worker!=b->worker) return a->worker<b->worker ? -1 : 1;
+    return strcmp(a->key,b->key);
+}
+static void memo_unlink(struct broker *broker, struct memo *memo)
+{
+    if (memo->previous) memo->previous->next=memo->next;
+    else if (broker->memo_first==memo) broker->memo_first=memo->next;
+    if (memo->next) memo->next->previous=memo->previous;
+    else if (broker->memo_last==memo) broker->memo_last=memo->previous;
+    memo->next=memo->previous=NULL;
+}
+static void memo_touch(struct broker *broker, struct memo *memo)
+{
+    memo_unlink(broker,memo);
+    memo->previous=broker->memo_last;
+    if (memo->previous) memo->previous->next=memo;
+    else broker->memo_first=memo;
+    broker->memo_last=memo;
+}
+static void memo_forget(struct broker *broker, struct memo *memo)
+{
+    memo_unlink(broker,memo);
+    tdelete(memo,&broker->memos,memo_order);
+    broker->memo_bytes-=sizeof(*memo)+strlen(memo->key)+1;
+    if (memo->value) broker->memo_bytes-=strlen(memo->value)+1;
+    if (memo->socket) { close(memo->socket-1); --broker->memo_workers; }
+    free(memo->key); free(memo->value); free(memo);
 }
 
 static void memo_reply(int fd, const struct memo *memo)
@@ -661,54 +704,64 @@ static void memo_reply(int fd, const struct memo *memo)
 static void memo_request(struct broker *broker, struct client *client,
                          unsigned command, const char *payload, int worker_fd, double now)
 {
-    int i, slot = -1;
+    int i;
     struct memo *memo;
+    char *replacement=NULL, *expected=NULL;
+    (void)now;
     int worker = command == WORKER_GET || command == WORKER_PUT;
     struct ucred credentials;
     socklen_t length = sizeof(credentials);
     if (getsockopt(client->fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length)) goto done;
-    if ((command == MEMO_GET || command == WORKER_GET) && client->state == REQUEST) {
-        for (i = 0; i < MAX_MEMOS; i++) {
-            memo = &broker->memos[i];
-            if (memo->socket) {
-                char byte;
-                ssize_t alive = recv(memo->socket - 1, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
-                if (alive != -1 || (errno != EAGAIN && errno != EWOULDBLOCK)) memo_clear(memo);
-            }
-            if (memo->key && memo->worker == worker && memo->owner == credentials.uid && !strcmp(memo->key, payload)) {
-                memo->used = now;
-                if (memo_ready(memo)) {
-                    memo_reply(client->fd, memo);
-                    release_client(broker, client);
-                } else {
-                    client->state = MEMO_WAIT;
-                    client->memo = i;
-                }
-                return;
-            }
-            if ((!memo->key || memo_ready(memo)) &&
-                (slot < 0 || memo->used < broker->memos[slot].used)) slot = i;
+    if ((command == MEMO_GET || command == WORKER_GET || command == MEMO_REFRESH) && client->state == REQUEST) {
+        if (command==MEMO_REFRESH) {
+            replacement=strdup(payload);
+            if (!replacement || !(expected=strrchr(replacement,'\n')) || strlen(expected+1)!=32) goto done;
+            *expected++=0; payload=replacement;
         }
-        if (slot >= 0) {
-            memo = &broker->memos[slot];
-            memo_clear(memo);
-            memo->key = strdup(payload);
-            memo->owner = credentials.uid;
-            memo->worker = worker;
-            memo->used = now;
-            if (memo->key && send(client->fd, "", 1, MSG_NOSIGNAL) == 1) {
-                client->memo = slot;
-                client->state = MEMO_OWNER;
-                return;
+        struct memo lookup={.key=(char *)payload,.owner=credentials.uid,.worker=worker};
+        struct memo **found=tfind(&lookup,&broker->memos,memo_order);
+        memo=found ? *found : NULL;
+        if (memo && memo->socket) {
+            char byte;
+            ssize_t alive=recv(memo->socket-1,&byte,1,MSG_PEEK|MSG_DONTWAIT);
+            if (alive!=-1 || (errno!=EAGAIN && errno!=EWOULDBLOCK)) {
+                memo_forget(broker,memo); memo=NULL;
             }
-            free(memo->key);
-            memo->key = NULL;
         }
+        if (memo && expected && memo->value) {
+            char digest[33]; memo_digest(memo->value,digest);
+            if (!strcmp(digest,expected)) {
+                memo_unlink(broker,memo);
+                broker->memo_bytes-=strlen(memo->value)+1;
+                free(memo->value); memo->value=NULL;
+                client->state=MEMO_OWNER; client->memo=memo;
+                if (send(client->fd,"",1,MSG_NOSIGNAL)!=1) goto done;
+                free(replacement); return;
+            }
+        }
+        if (memo) {
+            if (memo_ready(memo)) { memo_touch(broker,memo); memo_reply(client->fd,memo); }
+            else { client->state=MEMO_WAIT; client->memo=memo; free(replacement); return; }
+            goto done;
+        }
+        memo=calloc(1,sizeof(*memo));
+        if (!memo) goto done;
+        memo->key=strdup(payload); memo->owner=credentials.uid; memo->worker=worker;
+        if (!memo->key || !tsearch(memo,&broker->memos,memo_order)) {
+            free(memo->key); free(memo); goto done;
+        }
+        broker->memo_bytes+=sizeof(*memo)+strlen(memo->key)+1;
+        client->memo=memo; client->state=MEMO_OWNER;
+        if (send(client->fd,"",1,MSG_NOSIGNAL)==1) { free(replacement); return; }
     } else if ((command == MEMO_PUT || command == WORKER_PUT) && client->state == MEMO_OWNER) {
-        memo = &broker->memos[client->memo];
+        memo = client->memo;
         if (memo->worker != worker) goto done;
-        if (worker) { memo->socket = worker_fd + 1; worker_fd = -1; }
-        else memo->value = strdup(payload);
+        if (worker) { memo->socket = worker_fd + 1; worker_fd = -1; ++broker->memo_workers; }
+        else {
+            memo->value = strdup(payload);
+            if (!memo->value) goto done;
+            broker->memo_bytes+=strlen(memo->value)+1;
+        }
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *waiter = &broker->clients[i];
             if (waiter->fd >= 0 && waiter->state == MEMO_WAIT && waiter->memo == client->memo) {
@@ -716,8 +769,21 @@ static void memo_request(struct broker *broker, struct client *client,
                 release_client(broker, waiter);
             }
         }
+        memo_touch(broker,memo);
+        // The publisher is released before eviction so its memo pointer cannot
+        // become dangling while release_client examines the lease state.
+        client->state=REQUEST;
+        // Plan values need more than the former 256 shared slots. Retained
+        // compiler processes still obey that existing descriptor/worker bound.
+        while ((broker->memo_bytes>MEMO_BYTES || broker->memo_workers>MAX_CLIENTS) && broker->memo_first) {
+            struct memo *oldest=broker->memo_first;
+            if (broker->memo_bytes<=MEMO_BYTES)
+                while (!oldest->socket) oldest=oldest->next;
+            memo_forget(broker,oldest);
+        }
     }
 done:
+    free(replacement);
     if (worker_fd >= 0) close(worker_fd);
     release_client(broker, client);
 }
@@ -1905,7 +1971,7 @@ int dcc_broker_serve(const char *path)
                 }
                 if (length > (ssize_t)sizeof(request) && length <= (ssize_t)sizeof(packet) &&
                     request.version == BROKER_VERSION &&
-                    (request.command == MEMO_GET || request.command == MEMO_PUT || request.command == WORKER_GET) &&
+                    (request.command == MEMO_GET || request.command == MEMO_PUT || request.command == WORKER_GET || request.command == MEMO_REFRESH) &&
                     packet.payload[0] && !packet.payload[length - sizeof(request) - 1] &&
                     strlen(packet.payload) == (size_t)length - sizeof(request) - 1) {
                     memo_request(broker, c, request.command, packet.payload, -1, now);
@@ -1970,9 +2036,7 @@ done:
     if (mask_set) sigprocmask(SIG_SETMASK, &previous, NULL);
     for (count = 0; count < MAX_CLIENTS; ++count)
         if (broker->pool[count].fd >= 0) close(broker->pool[count].fd);
-    for (count = 0; count < MAX_MEMOS; count++) {
-        memo_clear(&broker->memos[count]);
-    }
+    while (broker->memo_first) memo_forget(broker,broker->memo_first);
     if (fd >= 0) {
         close(fd);
         if (!inherited)
@@ -2018,6 +2082,11 @@ int dcc_broker_memo_get(const char *key, char **value)
     (void)key;
     *value = NULL;
     return -1;
+}
+int dcc_broker_memo_refresh(const char *key, const char *stale, char **value)
+{
+    (void)stale;
+    return dcc_broker_memo_get(key,value);
 }
 void dcc_broker_memo_put(int lease, const char *value)
 {

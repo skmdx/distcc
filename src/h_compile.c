@@ -41,6 +41,10 @@
 #include "trace.h"
 #include "util.h"
 #include "compile.h"
+#include "job.h"
+#include "frontend_fs.h"
+#include "native_worker.h"
+#include "plan_memo.h"
 
 
 #define USAGE \
@@ -57,6 +61,8 @@ const char *rs_program_name = __FILE__;
 
 int main(int argc, char *argv[])
 {
+    if (argc > 1 && (!strcmp(argv[1], "--gcc-plan") || !strcmp(argv[1], "--gcc-plan-capture")))
+        return dcc_gcc_plan_execute(argv+2);
     rs_trace_set_level(RS_LOG_DEBUG);
     rs_add_logger(rs_logger_file, RS_LOG_DEBUG, NULL, STDERR_FILENO);
     if (argc < 2) {
@@ -64,7 +70,20 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (strcmp(argv[1], "dcc_fresh_dependency_exists") == 0) {
+    if (!strcmp(argv[1], "plan_key") && argc > 4) {
+        char *key=dcc_plan_key(argv+3,argv[2]);
+        puts(key ? key : "bypass"); free(key);
+    } else if (!strcmp(argv[1], "plan") && argc > 4) {
+        struct dcc_job *job=NULL;
+        int ret=dcc_gcc_frontend_prepare(argv+3,argv[2],&job);
+        if (ret) return ret;
+        /* Two NUL-delimited groups: exactly the live defaults and roots. */
+        for (unsigned i=3, groups=0; job->argv[i] && groups<2; ++i) {
+            fwrite(job->argv[i],1,strlen(job->argv[i])+1,stdout);
+            if (!*job->argv[i]) ++groups;
+        }
+        dcc_job_free(job);
+    } else if (strcmp(argv[1], "dcc_fresh_dependency_exists") == 0) {
         if (argc != 5) {
             rs_log_error("dcc_fresh_dependency_exists expects DOTD_FNAME "
                          "EXCL_PAT REF_TIME");

@@ -939,6 +939,10 @@ class GccFrontendTest(BrokerTestCase):
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.01)
             self.compile([self.cc, '-c', str(self.source), '-o', 'replacement.o'])
+            # A validated plan does not need the dead compiler process. A new
+            # option signature must still replace it and execute a live plan.
+            self.assertEqual(log.read_text().count('started reusable GCC driver pid='), 1)
+            self.compile([self.cc, '-DREPLACEMENT=1', '-c', str(self.source), '-o', 'new-plan.o'])
             self.assertEqual(log.read_text().count('started reusable GCC driver pid='), 2)
         finally:
             if process.poll() is None:
