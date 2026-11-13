@@ -10,8 +10,9 @@ Clang result reuse and source scheduling (experimental)
     Learned source completion ranking after known queues drain improves the
     isolated replay and removes its slow-worker tail. Aggregate queue waits
     still exceed the installed baseline; steady supply is not proven improved.
-    Adoption requires matched whole-build benefit, output/diagnostic parity
-    and no hidden fallback; reduced CPU or better forecasts alone do not pass.
+    A matched whole-build pair now shows a wall/CPU benefit with no fallback.
+    Publication/deployment still needs review of the heterogeneous-compiler
+    parity boundary; raw object equality is not claimed for adaptive codegen.
 
 remove avoidable waits while remote compilation has runnable work
 
