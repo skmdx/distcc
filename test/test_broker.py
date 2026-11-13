@@ -1194,6 +1194,29 @@ class BrokerTest(BrokerTestCase):
             _, net = self.acquire_reserved(10, (1000 + index, 4 * 1024 * 1024, 1))
             self.assertEqual(net.getpeername()[1], self.ports[expected], index)
 
+    def test_source_completion_distinguishes_background_tasks_and_queued_work(self):
+        peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16,
+                    running=14, busy=13, queued=0, preparing=0, returning=0, capacity=16)),
+                 self.peer(stats_response(cpus=4, cores=2, jobs=4,
+                    running=1, busy=1, queued=0, preparing=0, returning=0, capacity=4))]
+        hosts = self.host(0, f',tcp,stats={peers[0].port},speed=1', slots=16) + ' ' + \
+                self.host(1, f',tcp,stats={peers[1].port},speed=.49', slots=4)
+        for prefix, busy, queued, expected in (
+                ('admissible-tail', 13, 0, 0),
+                ('queued-work', 16, 1, 1)):
+            with self.subTest(prefix=prefix):
+                peers[0].response = stats_response(cpus=16, cores=8, jobs=16,
+                    running=busy + 1, busy=busy, queued=queued, preparing=0,
+                    returning=0, capacity=16)
+                self.start_broker(hosts, name=prefix)
+                seed, net = self.acquire_reserved(10, (2099, 1048576, 5))
+                seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 8_000_000_000, 0)],
+                             [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                               array.array('i', [net.fileno()]))])
+                self.assertEqual(seed.recv(1), b'')
+                _, net = self.acquire_reserved(10, (2100, 1048576, 5))
+                self.assertEqual(net.getpeername()[1], self.ports[expected])
+
     def test_job_cost_learns_execution_cost(self):
         peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
                     queued=0, preparing=0, returning=0, capacity=1)) for _ in range(2)]

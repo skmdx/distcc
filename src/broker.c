@@ -1132,7 +1132,9 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         int peer, probe, wait, idle, enqueue;
         double score, fill;
         struct prediction forecast;
-    } best = {.peer = -1}, ready = {.peer = -1}, affinity = {.peer = -1};
+    } best = {.peer = -1}, ready = {.peer = -1}, affinity = {.peer = -1},
+      completion = {.peer = -1};
+    int backlogged = batch->count != 0;
     int direct = client->command == TRY_LOCAL;
     if (direct) {
         for (i = 0; i < broker->count; ++i)
@@ -1156,6 +1158,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
      * Keep the hint in the existing bounded cost history, and consult live
      * leases for work whose frontend may have completed before its backend. */
     int locality = !direct && !link && (client->hint.kind == 4 || client->hint.kind == 5);
+    /* A cold byte prior is not evidence for a finite completion comparison. */
+    int completion_model = locality && broker->model.classes[client->hint.kind - 1].xx > 0;
     int previous = locality ? dcc_work_peer(&broker->model, &client->hint) : -1;
     if (previous >= 0 && previous < broker->count) owners[previous] = 1;
     unsigned long long headroom[MAX_HOSTS], pending[MAX_HOSTS] = {0}, new_memory[MAX_HOSTS] = {0};
@@ -1251,6 +1255,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         int pipeline = link_backend ? 0 : pipeline_slots(p->host, capacity);
         int inflight = slots + pipeline;
         int work = p->busy;
+        if (!cap || cap->busy < 0 || cap->queued < 0 || cap->preparing < 0)
+            backlogged = 1;
         if (staged && cap && cap->busy >= 0 && cap->queued >= 0 && cap->preparing >= 0) {
             int limit = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
             if (cap->capacity >= 0 && cap->capacity < limit) limit = cap->capacity;
@@ -1291,6 +1297,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * beyond the bounded pipeline adds CPU queueing delay. */
             if (preparing > shared_pipeline) work += preparing - shared_pipeline;
             if (leased > work) work = leased;
+            if (work > limit) backlogged = 1;
             if (returning > 0)
                 inflight += returning < slots ? returning : slots;
             inflight += suspended;
@@ -1339,6 +1346,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * worker, including existing compiles on a remote SMT core.
              * Minimizing this job's latency alone packs the fastest worker's
              * SMT lanes while independent physical cores remain unused. */
+            double prior_factor = forecast.factor;
             if (staged && cap && !link && !link_backend && (predicted ||
                 (!blocked && work < dcc_capacity_jobs(p->host, cap)))) {
                 struct dcc_capacity live = observed_capacity(p, broker->cpp_busy);
@@ -1356,7 +1364,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 double demand = placement + (external > 0 ? external : 0);
                 /* Include the CPU work displaced by this compile, notably
                  * client preprocessing on a machine that also runs a worker. */
-                double before = demand ? demand / execution_factor(p, placement - 1, probe, cap->capacity, broker->cpp_busy) : 0;
+                prior_factor = execution_factor(p, placement - 1, probe, cap->capacity, broker->cpp_busy);
+                double before = demand ? demand / prior_factor : 0;
                 double gain = (demand + 1) / execution_factor(p, placement, probe, cap->capacity, broker->cpp_busy) - before;
                 /* At saturation there is no positive marginal throughput.
                  * Charge aggregate service demand instead of dropping the
@@ -1367,14 +1376,23 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 double throughput = forecast.start + (cost > 0 ? cost : 1) * penalty;
                 if (!predicted || throughput > score) score = throughput;
             }
+            /* Without queued source work, aggregate throughput is not the
+             * completion barrier. Charge the worst delay on one competing
+             * lane, not the sum of delays on lanes that run in parallel.
+             * The existing service curve accounts for external contention on
+             * both sides; a daemon's nonzero runnable count is not a veto.
+             * Admission still requires an available CPU or existing pipeline. */
+            double critical = forecast.finish;
+            if (forecast.factor > prior_factor)
+                critical += cost * (forecast.factor - prior_factor);
             double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;
             rs_trace("candidate host=%s work=%d capacity=%d cost=%.3f factor=%.3f prepare=%.3f start=%.3f score=%.3f wait=%d "
-                     "finish=%.6f blocked=%d busy=%d preparing=%d queued=%d leases=%d direct=%d cpp=%d planned=%u "
+                     "finish=%.6f critical=%.6f blocked=%d busy=%d preparing=%d queued=%d leases=%d direct=%d cpp=%d planned=%u "
                      "now=%.6f client=%td request=%.6f key=%llx",
                      p->host->hostname, work, cap ? cap->capacity : -1, cost,
                      forecast.factor, forecast.prepare, forecast.start, score, wait,
-                     forecast.finish, blocked, cap ? cap->busy : -1, cap ? cap->preparing : -1,
+                     forecast.finish, critical, blocked, cap ? cap->busy : -1, cap ? cap->preparing : -1,
                      cap ? cap->queued : -1, p->busy, p->direct, p->local ? broker->cpp_busy : 0, batch->count,
                      now, client - broker->clients, client->waiting_since,
                      (unsigned long long)client->hint.key);
@@ -1382,6 +1400,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * with which to justify waiting instead of using an idle CPU. */
             int idle = !cost && staged && cap && !blocked && work < dcc_capacity_jobs(p->host, cap);
             struct selection candidate = {i, probe, wait, idle, enqueue, score, fill, forecast};
+            if (completion_model && predicted && (!wait || enqueue) &&
+                (completion.peer < 0 || critical < completion.score)) {
+                completion = candidate;
+                completion.score = critical;
+            }
             if (owners[i] && staged && predicted && (!wait || enqueue) &&
                 (affinity.peer < 0 || forecast.factor < affinity.forecast.factor ||
                  (forecast.factor == affinity.forecast.factor && score < affinity.score)))
@@ -1413,6 +1436,14 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     if (best.wait && ready.peer >= 0 &&
         (link_backend || best.forecast.finish >= ready.forecast.finish))
         best = ready;
+    if (!backlogged && completion.peer >= 0) {
+        if (completion.peer != best.peer)
+            rs_trace("source completion: key=%llx host=%s finish=%.6f critical=%.6f",
+                     (unsigned long long)client->hint.key,
+                     broker->peers[completion.peer].host->hostname,
+                     completion.forecast.finish, completion.score);
+        best = completion;
+    }
     /* Prefer an already populated, no-slower worker only inside its existing
      * immediate admission/pipeline bounds. Never wait for locality, increase
      * the pipeline, or pin a repeat to a slower owner. No speculative cache
