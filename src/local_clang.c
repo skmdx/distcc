@@ -25,6 +25,7 @@
 #include "rpc.h"
 #include "trace.h"
 #include "util.h"
+#include <sys/wait.h>
 
 extern char **environ;
 
@@ -189,14 +190,14 @@ static int start_worker(const char *compiler)
 }
 
 /* -1 means no request was accepted: ordinary execution is still safe. */
-static int request(char **argv, char operation, int output, int *status, uint64_t *cpu_ns)
+static int request(char **argv, char operation, int output, int errors, int *status, uint64_t *cpu_ns)
 {
     if (!dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0) ||
         !strstr(dcc_find_basename(argv[0]), "clang")) return -1;
     /* Internal tool entry points bypass Clang's driver in the native binary. */
     if (argv[1] && !strncmp(argv[1], "-cc1", 4)) return -1;
     char *compiler = NULL, *cwd = NULL;
-    int worker = -1, lease = -1, input = -1, pair[] = {-1,-1}, ret = -1;
+    int worker = -1, lease = -1, input = -1, sink = -1, pair[] = {-1,-1}, ret = -1;
     if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
     else if (dcc_which(argv[0], &compiler)) goto out;
     char key[80];
@@ -212,7 +213,10 @@ static int request(char **argv, char operation, int output, int *status, uint64_
     char *directory[] = {cwd, compiler, NULL};
     if (dcc_x_argv(input, "ARGC", "ARGV", directory) ||
         dcc_x_argv(input, "ARGC", "ARGV", argv) || lseek(input, 0, SEEK_SET) < 0) goto out;
-    int fds[] = {input, pair[1], 0, 1, 2};
+    /* Driver inspection may print bindings/phases. As with -### discovery,
+     * inspection stdout must not escape before the actual command executes. */
+    if (operation == 'L' && (sink = open("/dev/null", O_WRONLY | O_CLOEXEC)) < 0) goto out;
+    int fds[] = {input, pair[1], 0, sink >= 0 ? sink : 1, errors};
     struct dcc_native_request request = {operation, 0};
     if (dcc_send_fds(worker, &request, sizeof(request), fds, 5)) goto out;
     close(pair[1]); pair[1] = -1;
@@ -229,6 +233,7 @@ out:
     if (lease >= 0) close(lease);
     if (worker >= 0) close(worker);
     if (input >= 0) close(input);
+    if (sink >= 0) close(sink);
     if (pair[0] >= 0) close(pair[0]);
     if (pair[1] >= 0) close(pair[1]);
     free(compiler); free(cwd);
@@ -237,14 +242,14 @@ out:
 
 int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
 {
-    return request(argv, 'C', -1, status, cpu_ns);
+    return request(argv, 'C', -1, 2, status, cpu_ns);
 }
 
 static int dcc_clang_local_prepare(char **argv, char ***command, char ***roots)
 {
     int output = dcc_job_memfd("distcc-frontend-command"), status;
     if (output < 0) return EXIT_IO_ERROR;
-    int ret = request(argv, 'P', output, &status, NULL);
+    int ret = request(argv, 'P', output, 2, &status, NULL);
     if (!ret) {
         if (status || lseek(output, 0, SEEK_SET) < 0) ret = EXIT_DISTCC_FAILED;
         else {
@@ -255,6 +260,33 @@ static int dcc_clang_local_prepare(char **argv, char ***command, char ***roots)
     }
     close(output);
     return ret;
+}
+
+int dcc_clang_link_prepare(char **argv, int *plan, int *errors, int *remote)
+{
+    *plan = *errors = -1;
+    *remote = 0;
+    if (!dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0) ||
+        !strstr(dcc_find_basename(argv[0]), "clang")) return -1;
+    *plan = dcc_job_memfd("distcc-link-plan");
+    *errors = dcc_job_memfd("distcc-link-diagnostics");
+    if (*plan < 0 || *errors < 0) return EXIT_IO_ERROR;
+    int status, ret = request(argv, 'L', *plan, *errors, &status, NULL);
+    if (ret) return ret < 0 ? EXIT_DISTCC_FAILED : ret;
+    if (status) {
+        off_t size = lseek(*errors, 0, SEEK_END);
+        if (size < 0 || lseek(*errors, 0, SEEK_SET) < 0) return EXIT_IO_ERROR;
+        ret = dcc_pump_readwrite(2, *errors, size);
+        return ret ? ret : WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    }
+    char **groups[1];
+    if (lseek(*plan, 0, SEEK_SET) < 0 ||
+        (ret = dcc_r_argv_file(*plan, 1, groups))) return EXIT_IO_ERROR;
+    *remote = groups[0][0] != NULL;
+    dcc_free_argv(groups[0]);
+    if (lseek(*plan, 0, SEEK_SET) < 0 || lseek(*errors, 0, SEEK_SET) < 0)
+        return EXIT_IO_ERROR;
+    return 0;
 }
 
 /* This owns client broker requests; shared argument parsing is also linked

@@ -4,6 +4,9 @@
 #include <clang/Options/Options.h>
 #include <clang/Driver/Compilation.h>
 #include <clang/Driver/Driver.h>
+#include <clang/Driver/Job.h>
+#include <clang/Driver/Tool.h>
+#include <clang/Driver/ToolChain.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/CompilerInvocation.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
@@ -45,7 +48,7 @@ public:
     std::unique_ptr<clang::driver::Compilation> compilation;
     llvm::ArrayRef<const char *> cc1;
     std::unique_ptr<clang::CompilerInvocation> compiler;
-    explicit FrontendPlan(char **input) {
+    explicit FrontendPlan(char **input, bool frontend = true) {
         for (char **p = input; *p; ++p) command.emplace_back(*p);
         if (command.empty()) return;
         const auto invoked_as = command.front();
@@ -54,8 +57,13 @@ public:
         if (executable) command.front() = *executable;
         for (const auto &arg : command) argv.push_back(arg.c_str());
         diagnostic_options = clang::CreateAndPopulateDiagOpts(argv);
+        clang::TextDiagnosticPrinter *printer = nullptr;
+        if (!frontend) {
+            printer = new clang::TextDiagnosticPrinter(llvm::errs(), *diagnostic_options);
+            printer->setPrefix(llvm::sys::path::filename(argv[0]).str());
+        }
         diagnostics = clang::CompilerInstance::createDiagnostics(
-            *llvm::vfs::getRealFileSystem(), *diagnostic_options);
+            *llvm::vfs::getRealFileSystem(), *diagnostic_options, printer);
         if (argv.size() >= 2 && llvm::StringRef(argv[1]) == "-cc1") {
             cc1 = llvm::ArrayRef(argv).drop_front();
         } else {
@@ -63,6 +71,7 @@ public:
                 llvm::sys::getDefaultTargetTriple(), *diagnostics);
             compilation.reset(driver->BuildCompilation(argv));
             if (!compilation || compilation->containsError() || diagnostics->hasErrorOccurred()) return;
+            if (!frontend) return;
             auto args = clang::tooling::getCC1Arguments(diagnostics.get(), compilation.get());
             if (!args) return;
             cc1 = *args;
@@ -73,6 +82,9 @@ public:
         compiler = std::move(invocation);
     }
     const std::string &executable() const { return command.front(); }
+    bool valid() const {
+        return compilation && !compilation->containsError() && !diagnostics->hasErrorOccurred();
+    }
 };
 
 std::string absolute(llvm::StringRef name) {
@@ -142,6 +154,32 @@ extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots) {
     for (const auto &path : unique) if (!path.empty()) directories.push_back(path);
     *cc1 = copy(result); *roots = copy(directories);
     return *cc1 && *roots ? 0 : -1;
+}
+
+/* An empty command denotes a valid local driver job. Clang owns linker
+ * selection, including config files, response files and toolchain defaults. */
+extern "C" int dcc_clang_link_plan(char **argv, char ***command) {
+    *command = nullptr;
+    FrontendPlan plan(argv, false);
+    if (!plan.valid()) return 1;
+    std::vector<std::string> result;
+    auto &jobs = plan.compilation->getJobs();
+    if (jobs.size() == 1) {
+        const auto &job = *jobs.begin();
+        // GetLinkerPath's LLD flag is false for explicit paths, including a
+        // perfectly usable LLD from another installation. Only a positively
+        // identified BFD job bypasses the link coordinator. Other commands
+        // retain the coordinator's existing capability policy.
+        auto bfd = job.getCreator().getToolChain().GetProgramPath("ld.bfd");
+        if (!llvm::sys::fs::equivalent(job.getExecutable(), bfd)) {
+            result.emplace_back(job.getExecutable());
+            for (const char *arg : job.getArguments()) result.emplace_back(arg);
+            if (plan.compilation->getArgs().hasArg(clang::options::OPT_v))
+                job.Print(llvm::errs(), "\n", false);
+        }
+    }
+    *command = copy(result);
+    return *command ? 0 : 1;
 }
 
 extern "C" int dcc_clang_inputs(char **argv, char ***normalized, char ***files) {

@@ -27,6 +27,7 @@
 LLD_HAS_DRIVER(elf)
 
 extern "C" int dcc_clang_frontend(char **, char ***, char ***);
+extern "C" int dcc_clang_link_plan(char **, char ***);
 
 namespace {
 const dcc_argv_file_api *command_api;
@@ -119,7 +120,7 @@ int run(llvm::ArrayRef<const char *> original) {
     }
     return status;
 }
-int prepare(int fd, char **args) {
+int prepare(int fd, char **args, bool link) {
     char **command = nullptr, **roots = nullptr;
     auto cleanup = llvm::scope_exit([&] {
         for (auto values : {command, roots}) {
@@ -127,13 +128,14 @@ int prepare(int fd, char **args) {
             free(values);
         }
     });
-    if (dcc_clang_frontend(args, &command, &roots)) return 1;
+    if (link ? dcc_clang_link_plan(args, &command) :
+               dcc_clang_frontend(args, &command, &roots)) return 1;
     // The complete input is now owned in memory. Reuse its file for the reply.
     if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) return 1;
     return command_api->write(fd, "ARGC", "ARGV", command) ||
-           command_api->write(fd, "ARGC", "ARGV", roots);
+           (!link && command_api->write(fd, "ARGC", "ARGV", roots));
 }
-int execute(int fd, bool preparing) {
+int execute(int fd, unsigned operation) {
     CompilerCommand command(*command_api);
     if (!command.read(fd, 2)) {
         llvm::errs() << "distcc: invalid complete compiler command file\n";
@@ -150,8 +152,11 @@ int execute(int fd, bool preparing) {
     }
     argv[0] = directory[1];
     llvm::SmallVector<const char *> args;
-    if (!preparing) for (char **p = argv; *p; ++p) args.push_back(*p);
-    return preparing ? prepare(fd, argv) : run(args);
+    if (operation == 'C') {
+        for (char **p = argv; *p; ++p) args.push_back(*p);
+        return run(args);
+    }
+    return prepare(fd, argv, operation == 'L');
 }
 PyObject *serve(PyObject *, PyObject *input) {
     int fd;
@@ -159,8 +164,8 @@ PyObject *serve(PyObject *, PyObject *input) {
     int status;
     Py_BEGIN_ALLOW_THREADS
     llvm::outs().flush(); llvm::errs().flush();
-    status = dcc_native_worker(fd, [](int request, bool preparing) {
-        int result = execute(request, preparing);
+    status = dcc_native_worker(fd, [](int request, unsigned operation) {
+        int result = execute(request, operation);
         llvm::outs().flush(); llvm::errs().flush();
         return result;
     });

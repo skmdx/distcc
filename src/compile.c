@@ -867,6 +867,32 @@ dcc_build_somewhere(char *argv[],
 
     /* Links belong to the link driver, not the compile-only Clang scanner. */
     if (dcc_link_candidate(argv, broker)) {
+        int plan, errors, remote;
+        ret = dcc_clang_link_prepare(argv, &plan, &errors, &remote);
+        if (ret >= 0 && (ret || !remote)) {
+            dcc_close(plan); dcc_close(errors);
+            if (ret) goto clean_up;
+            goto lock_local;
+        }
+        if (!ret) {
+            int argc = dcc_argv_len(argv);
+            char plan_fd[32], errors_fd[32];
+            snprintf(plan_fd, sizeof(plan_fd), "%d", plan);
+            snprintf(errors_fd, sizeof(errors_fd), "%d", errors);
+            char **command = calloc(argc + 5, sizeof(*command));
+            if (!command || fcntl(plan, F_SETFD, 0) || fcntl(errors, F_SETFD, 0)) {
+                ret = EXIT_IO_ERROR;
+            } else {
+                command[0] = "distcc-link"; command[1] = "--clang-plan";
+                command[2] = plan_fd; command[3] = errors_fd;
+                memcpy(command + 4, argv, (argc + 1) * sizeof(*argv));
+                ret = dcc_compile_local(command, NULL, NULL, NULL);
+            }
+            free(command);
+            dcc_close(plan); dcc_close(errors);
+            goto clean_up;
+        }
+        dcc_close(plan); dcc_close(errors);
         int argc = dcc_argv_len(argv);
         char **link_argv = calloc(argc + 2, sizeof(*link_argv));
         if (!link_argv || !(link_argv[0] = strdup("distcc-link"))) {

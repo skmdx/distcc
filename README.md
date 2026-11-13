@@ -832,6 +832,11 @@ scheduling; the compiler helper forks an isolated child for each invocation.
 The selected driver handles options and tool selection, and other linkers and
 specialized compiler tools retain their native execution. Client disconnection
 cancels the invocation, and closing the broker cache releases idle helpers.
+Link discovery also uses this resident driver. A positively identified BFD
+link goes directly to the existing local slot/execution path, avoiding the
+Python coordinator and a separate `clang -###` process. Other linker commands
+pass the prepared invocation to `distcc-link`, which retains its existing
+LLD/offload capability policy. Driver diagnostics are emitted once.
 This evaluation path requires the selected Clang release's `clang_native`
 extension and keeps the caller's filesystem, credentials and sandbox context.
 

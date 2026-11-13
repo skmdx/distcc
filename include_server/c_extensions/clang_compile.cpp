@@ -212,8 +212,8 @@ PyObject *serve(PyObject *, PyObject *arguments) {
     int status;
     Py_BEGIN_ALLOW_THREADS
     llvm::outs().flush(); llvm::errs().flush();
-    status = dcc_native_worker(descriptor, [](int request, bool preparing) {
-        int result = preparing ? 1 : compile_file(request, STDIN_FILENO);
+    status = dcc_native_worker(descriptor, [](int request, unsigned operation) {
+        int result = operation != 'C' ? 1 : compile_file(request, STDIN_FILENO);
         llvm::outs().flush(); llvm::errs().flush();
         return result;
     });

@@ -48,7 +48,7 @@ bool child_descriptors(int *fds, unsigned count, unsigned operation) {
 }
 }
 
-int dcc_native_worker(int control, int (*execute)(int, bool)) {
+int dcc_native_worker(int control, int (*execute)(int, unsigned)) {
     // This service outlives its caller. Retain only stdio and its control
     // channel; inherited pipes and locks would keep the caller's jobs alive.
     if (dup2(control, 3) < 0 || close_range(4, ~0U, 0)) return 1;
@@ -122,7 +122,7 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                 if (!length) return 0;
                 if (length != sizeof(request) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) ||
                     received != (request.operation == 'G' ? 7 : request.operation == 'D' || request.operation == 'S' ? 6 : 5) ||
-                    (request.operation != 'C' && request.operation != 'P' && request.operation != 'D' &&
+                    (request.operation != 'C' && request.operation != 'P' && request.operation != 'L' && request.operation != 'D' &&
                      request.operation != 'G' && request.operation != 'S') ||
                     request.group > INT_MAX) return 1;
                 fflush(nullptr);
@@ -135,7 +135,7 @@ int dcc_native_worker(int control, int (*execute)(int, bool)) {
                         setpgid(0, request.group) || sigprocmask(SIG_SETMASK, &previous_mask, nullptr) ||
                         sigaction(SIGINT, &action, nullptr) ||
                         !child_descriptors(fds, received, request.operation)) _exit(1);
-                    int status = execute(3, request.operation != 'C');
+                    int status = execute(3, request.operation);
                     fflush(nullptr);
                     _exit(status >= 0 ? status : 128-status);
                 }

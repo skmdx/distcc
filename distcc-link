@@ -208,21 +208,28 @@ def compiler_identity(compiler, target=None):
     }
 
 
-def clang_link_command(command, *, offload=False):
+def clang_link_command(command, *, offload=False, plan=None):
     """Let the client's driver resolve configuration, runtimes and LTO flags.
 
     HIP's linker wrapper owns device extraction and registration. Its host
     linker arguments can use DTLTO without bypassing those device stages.
     """
-    from include_server import clang_scan
-    result = subprocess.run([command[0], '-###', *command[1:]], capture_output=True, text=True)
-    # Clang escapes $, backticks and quotes for display. shlex preserves \$
-    # inside double quotes, corrupting literal linker operands such as $ORIGIN.
-    commands = [clang_scan.tokenize_command(line) for line in result.stderr.splitlines()
-                if line.lstrip().startswith('"')]
-    if result.returncode or len(commands) != 1 or not commands[0]:
-        raise LocalOnly('Clang remote links require a single LLD invocation')
-    invocation = commands[0]
+    if plan is None:
+        from include_server import clang_scan
+        result = subprocess.run([command[0], '-###', *command[1:]], capture_output=True, text=True)
+        # Clang escapes $, backticks and quotes for display. shlex preserves \$
+        # inside double quotes, corrupting literal linker operands such as $ORIGIN.
+        commands = [clang_scan.tokenize_command(line) for line in result.stderr.splitlines()
+                    if line.lstrip().startswith('"')]
+        if result.returncode or len(commands) != 1 or not commands[0]:
+            raise LocalOnly('Clang remote links require a single LLD invocation')
+        invocation = commands[0]
+        # Libtool needs LLVM's unquoted -v printer, not -### quoting.
+        verbose = ''.join(clang_scan.format_command(invocation) + '\n'
+                          if line.lstrip().startswith('"') else line
+                          for line in result.stderr.splitlines(keepends=True)) if '-v' in command[1:] else ''
+    else:
+        invocation, verbose = plan
     if offload and Path(invocation[0]).name == 'clang-linker-wrapper':
         linker = next((arg.partition('=')[2] for arg in invocation[1:]
                        if arg.startswith('--linker-path=')), '')
@@ -230,11 +237,6 @@ def clang_link_command(command, *, offload=False):
         linker = invocation[0]
     if not re.fullmatch(r'ld\.lld(?:-\d+)?', Path(linker).name):
         raise LocalOnly('Clang remote links require LLD')
-    # -### quotes every operand, unlike -v. Libtool parses the latter to find
-    # implicit runtimes, so use LLVM's printer to preserve that output contract.
-    verbose = ''.join(clang_scan.format_command(invocation) + '\n'
-                      if line.lstrip().startswith('"') else line
-                      for line in result.stderr.splitlines(keepends=True)) if '-v' in command[1:] else ''
     return invocation, verbose
 
 
@@ -296,7 +298,7 @@ def validate_input(path):
         raise LocalOnly('linker scripts require their referenced files')
 
 
-def prepare_job(command, profile, identity=None):
+def prepare_job(command, profile, identity=None, *, link_plan=None):
     compiler, *args = command
     args = response_args(args)
     if any(arg in ('-m16', '-m32', '-mx32', '-mabi=ilp32') for arg in args):
@@ -318,7 +320,7 @@ def prepare_job(command, profile, identity=None):
         raise LocalOnly('invalid sysroot key')
     diagnostics = ''
     if compiler_family(compiler) == 'clang':
-        invocation, diagnostics = clang_link_command([compiler, *args])
+        invocation, diagnostics = clang_link_command([compiler, *args], plan=link_plan)
         args = invocation[1:]
     return (*map_link_job(compiler, args, profile, identity, target=target), diagnostics)
 
@@ -1271,6 +1273,18 @@ def main():
             print('distcc-link: ' + str(error), file=sys.stderr)
             return 100
     command = sys.argv[1:]
+    link_plan = None
+    if command[:1] == ['--clang-plan']:
+        from include_server import distcc_pump_c_extensions as protocol
+        plan_fd, errors_fd = map(int, command[1:3])
+        try:
+            invocation = protocol.RArgv(plan_fd)
+        finally:
+            os.close(plan_fd)
+        with os.fdopen(errors_fd, errors='replace') as stream:
+            diagnostics = stream.read()
+        link_plan = (invocation, diagnostics)
+        command = command[3:]
     if not command:
         print('usage: distcc-link COMPILER [link options]\n'
               '       distcc-link --sync|--refresh SNAPSHOT COMPILER PROFILE CACHE_DIRECTORY...', file=sys.stderr)
@@ -1280,7 +1294,7 @@ def main():
     local = [str(Path(__file__).resolve().with_name('distcc')), '--local-command']
     try:
         if os.environ.get('DISTCC_BROKER') and compiler_family(command[0]) == 'clang':
-            invocation, diagnostics = clang_link_command(command, offload=True)
+            invocation, diagnostics = clang_link_command(command, offload=True, plan=link_plan)
             args = invocation[1:]
             offload = Path(invocation[0]).name == 'clang-linker-wrapper'
             distributed = any(arg.startswith('--thinlto-distributor=') for arg in args)
@@ -1311,7 +1325,7 @@ def main():
         if path.is_dir():
             path /= compiler_family(command[0]) + '.json'
         profile = json.loads(path.read_text())
-        job, inputs, output, diagnostics = prepare_job(command, profile)
+        job, inputs, output, diagnostics = prepare_job(command, profile, link_plan=link_plan)
         check_source(profile)
         sys.stderr.write(diagnostics)
         sys.stderr.flush()

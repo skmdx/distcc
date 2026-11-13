@@ -51,6 +51,67 @@ class LocalClangTest(BrokerTestCase):
         finally:
             os.close(reader)
 
+    def test_bfd_link_plan_preserves_output_and_diagnostics(self):
+        self.start_local()
+        (self.work/'source.c').write_text('int main(void) { return 0; }\n')
+        self.assertEqual(self.command(['-c', 'source.c', '-o', 'source.o'], reused=False).returncode, 0)
+        for flags in ([], ['-v'], ['-Wno-unused-command-line-argument']):
+            with self.subTest(flags=flags):
+                args = ['-fuse-ld=bfd', *flags, 'source.o', '-o', 'linked']
+                original = self.command(args, reused=False)
+                self.assertEqual(original.returncode, 0, original.stderr)
+                output = (self.work/'linked').read_bytes()
+                result = self.command(args)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (original.returncode, original.stdout, original.stderr))
+                self.assertEqual((self.work/'linked').read_bytes(), output)
+        log = (self.work/'client.log').read_text()
+        self.assertIn('operation=L', log)
+        self.assertNotIn('forking to execute: distcc-link', log)
+
+    def test_link_plan_driver_error_is_not_success_or_local_retry(self):
+        self.start_local()
+        for args in (['absent.o', '-o', 'linked'],
+                     ['absent.o', '-fnot-a-clang-option', '-o', 'linked']):
+            with self.subTest(args=args):
+                original = self.command(args, reused=False)
+                result = self.command(args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((result.returncode, result.stderr),
+                                 (original.returncode, original.stderr))
+                self.assertFalse((self.work/'linked').exists())
+
+    def test_link_plan_response_file_and_explicit_linker_path(self):
+        self.start_local()
+        linker = shutil.which('ld.bfd')
+        if not linker:
+            self.skipTest('BFD required')
+        (self.work/'source.c').write_text('int main(void) { return 0; }\n')
+        self.assertEqual(self.command(['-c', 'source.c', '-o', 'source.o'], reused=False).returncode, 0)
+        (self.work/'link.rsp').write_text('-fuse-ld=' + linker + ' source.o -o linked\n')
+        original = self.command(['@link.rsp'], reused=False)
+        self.assertEqual(original.returncode, 0, original.stderr)
+        output = (self.work/'linked').read_bytes()
+        result = self.command(['@link.rsp'])
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (original.returncode, original.stdout, original.stderr))
+        self.assertEqual((self.work/'linked').read_bytes(), output)
+
+    def test_link_plan_config_diagnostics_are_not_duplicated(self):
+        self.start_local()
+        (self.work/'source.c').write_text('int main(void) { return 0; }\n')
+        self.assertEqual(self.command(['-c', 'source.c', '-o', 'source.o'], reused=False).returncode, 0)
+        for option in ('-ccc-print-bindings', '-ccc-print-phases'):
+            with self.subTest(option=option):
+                config = self.work/'driver.cfg'
+                config.write_text(option+'\n')
+                args = ['--config='+str(config), 'source.o', '-o', 'linked']
+                original = self.command(args, reused=False)
+                result = self.command(args)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (original.returncode, original.stdout, original.stderr))
+                self.assertFalse((self.work/'linked').exists())
+
     def test_ccache_compiler_query_completes_with_resident_worker(self):
         self.start_local()
         ccache = shutil.which('ccache')

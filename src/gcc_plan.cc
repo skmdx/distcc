@@ -95,10 +95,10 @@ int spawn_relay(pid_t *pid, char *const argv[], char *const environment[])
     return 0;
 }
 
-int execute(int fd, bool preparing)
+int execute(int fd, unsigned operation)
 {
     dcc_argv_file command{};
-    if (!preparing || dcc_argv_file_read(fd, 3, &command)) return 1;
+    if (operation == 'C' || dcc_argv_file_read(fd, 3, &command)) return 1;
     char **directory = command.groups[0], **argv = command.groups[1];
     if (!directory[0] || directory[1] || !argv[0] || chdir(directory[0])) return 1;
     // The driver parsed every option. Only our private output descriptor

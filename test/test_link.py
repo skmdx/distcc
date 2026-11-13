@@ -31,6 +31,17 @@ class LinkArchiveTest(unittest.TestCase):
         cls.addClassCleanup(sys.path.remove, extension)
         cls.helper = runpy.run_path(str(Path.cwd() / 'distcc-link'))
 
+    def test_prepared_link_keeps_capability_policy_without_driver_query(self):
+        select = self.helper['clang_link_command']
+        with mock.patch.object(subprocess, 'run', side_effect=AssertionError('replanned')):
+            direct = (['/compiler/bin/ld.lld', 'input.o', '-o', 'out'], 'warning\n')
+            self.assertEqual(select(['clang', 'input.o'], plan=direct), direct)
+            offload = (['clang-linker-wrapper', '--linker-path=/compiler/bin/ld.lld', 'input.o'], '')
+            self.assertEqual(select(['clang', 'input.o'], offload=True, plan=offload), offload)
+            for plan in ((['ld.gold', 'input.o'], ''), offload):
+                with self.assertRaises(self.helper['LocalOnly']):
+                    select(['clang', 'input.o'], plan=plan)
+
     def test_identity_is_queried_only_after_link_validation(self):
         prepare = self.helper['prepare_job']
         globals_ = prepare.__globals__
@@ -621,8 +632,23 @@ class ClangLinkTest(LinkTestCase):
     compiler = 'clang++'
     sync_compiler = 'clang'
 
+    def setUp(self):
+        super().setUp()
+        self.env['DISTCC_CLANG_LOCAL'] = '1'
+
     def link(self, args=(), prefix=()):
         return super().link(['-fuse-ld=lld', *args], prefix)
+
+    def test_resident_driver_plan_reaches_remote_link(self):
+        self.env['DISTCC_LOG'] = str(self.work/'link-plan.log')
+        output, result = self.link()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-link: linked on ', result.stderr)
+        local = self.work/'local-plan-reference'
+        subprocess.run([self.compiler, '-fuse-ld=lld', str(self.obj), '-o', str(local)],
+                       check=True, capture_output=True)
+        self.assertEqual(output.read_bytes(), local.read_bytes())
+        self.assertIn('operation=L', (self.work/'link-plan.log').read_text())
 
     def test_cpp_remote_link_matches_local(self):
         output, result = self.link()
@@ -693,7 +719,8 @@ class ClangLinkTest(LinkTestCase):
     def test_other_linker_stays_local(self):
         output, result = self.link(['-fuse-ld=bfd'])
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('distcc-link: local:', result.stderr)
+        self.assertIn('operation=L', result.stderr)
+        self.assertIn('exec on localhost:', result.stderr)
         self.assertNotIn('distcc-link: linked on ', result.stderr)
         self.assertEqual(subprocess.check_output([output], text=True), 'linked\n')
 
