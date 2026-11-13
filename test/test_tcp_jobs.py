@@ -1715,6 +1715,26 @@ class FrontendTest(BrokerTestCase):
         self.assertIn(b"'value.h' file not found", failed.stderr)
         self.assertNotIn(b'distcc compiler result: hit', failed.stderr)
 
+    def test_remote_result_reuse_quiet_diagnostics(self):
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='0')
+        self.env['DISTCC_VERBOSE'] = '0'
+        source = self.work/'source.c'
+        source.write_text('#warning preserved diagnostic\nint value(void) { return 7; }\n')
+        for index in range(3):
+            with self.subTest(invocation=index):
+                output, deps = self.work/f'{index}.o', self.work/f'{index}.d'
+                command = [clang, '-O2', '-c', str(source), '-o', str(output),
+                           '-MMD', '-MF', str(deps)]
+                local = subprocess.run(command, env=self.env, capture_output=True, timeout=30)
+                self.assertEqual(local.returncode, 0, local.stderr)
+                expected = [output.read_bytes(), deps.read_bytes()]
+                output.unlink(); deps.unlink()
+                remote = subprocess.run([str(self.build/'distcc'), *command],
+                                        env=self.env, capture_output=True, timeout=30)
+                self.assertEqual((remote.returncode, remote.stdout, remote.stderr),
+                                 (local.returncode, local.stdout, local.stderr))
+                self.assertEqual([output.read_bytes(), deps.read_bytes()], expected)
+
     def test_remote_result_reuse_cpp20_and_volatile_builtins(self):
         clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
         source = self.work/'source.cpp'

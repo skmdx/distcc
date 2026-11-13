@@ -145,6 +145,7 @@ class Result {
     clang::CompilerInstance &compiler;
     std::string key;
     int lock = -1;
+    bool verbose = false;
     std::shared_ptr<Dependencies> dependencies;
     Diagnostics *diagnostics = nullptr;
 public:
@@ -152,8 +153,10 @@ public:
         : files(files), compiler(compiler) {
         const char *enabled = getenv("DISTCC_CLANG_CODEGEN");
         if (!enabled || strcmp(enabled, "1")) return;
+        const char *verbosity = getenv("DISTCC_VERBOSE");
+        verbose = verbosity && !strcmp(verbosity, "1");
         if (!eligible(compiler.getInvocation())) {
-            if (getenv("DISTCC_VERBOSE")) {
+            if (verbose) {
                 const auto &i = compiler.getInvocation();
                 llvm::errs() << "distcc compiler result: bypass invocation modules=" << i.getLangOpts().Modules
                     << " llvm-args=" << i.getFrontendOpts().LLVMArgs.size()
@@ -194,16 +197,15 @@ public:
         auto messages = record->getString("diagnostics");
         auto warnings = record->getInteger("warnings");
         if (!inputs || !names || !messages || !warnings || *warnings < 0 || *warnings > UINT_MAX) return {};
-        const bool measured = getenv("DISTCC_VERBOSE");
         auto now = [](clockid_t clock) {
             timespec value{};
             clock_gettime(clock, &value);
             return uint64_t(value.tv_sec)*1000000000 + value.tv_nsec;
         };
-        const auto wall = measured ? now(CLOCK_MONOTONIC) : 0;
-        const auto cpu = measured ? now(CLOCK_PROCESS_CPUTIME_ID) : 0;
+        const auto wall = verbose ? now(CLOCK_MONOTONIC) : 0;
+        const auto cpu = verbose ? now(CLOCK_PROCESS_CPUTIME_ID) : 0;
         const bool valid = files.validate(*inputs);
-        if (measured)
+        if (verbose)
             llvm::errs() << "distcc compiler result: validation inputs=" << inputs->size()
                 << " valid=" << valid << " cpu_ns=" << now(CLOCK_PROCESS_CPUTIME_ID)-cpu
                 << " wall_ns=" << now(CLOCK_MONOTONIC)-wall << '\n';
@@ -227,7 +229,7 @@ public:
         compiler.getDiagnostics().setNumWarnings(*warnings);
         compiler.printDiagnosticStats();
         compiler.getDiagnostics().setClient(original.release());
-        if (getenv("DISTCC_VERBOSE")) llvm::errs() << "distcc compiler result: hit inputs=" << inputs->size() << '\n';
+        if (verbose) llvm::errs() << "distcc compiler result: hit inputs=" << inputs->size() << '\n';
         release();
         return std::move(*module);
     }
@@ -245,12 +247,12 @@ public:
         auto unlock = llvm::scope_exit([&] { release(); });
         if (!dependencies) return;
         if (!dependencies->reusable) {
-            if (getenv("DISTCC_VERBOSE")) llvm::errs() << "distcc compiler result: bypass volatile/module input\n";
+            if (verbose) llvm::errs() << "distcc compiler result: bypass volatile/module input\n";
             return;
         }
         auto inputs = files.certificate();
         if (!inputs || inputs->empty() || !llvm::json::isUTF8(diagnostics->bytes)) {
-            if (getenv("DISTCC_VERBOSE")) llvm::errs() << "distcc compiler result: bypass observations\n";
+            if (verbose) llvm::errs() << "distcc compiler result: bypass observations\n";
             return;
         }
         const auto input_count = inputs->size();
@@ -273,7 +275,7 @@ public:
         for (unsigned n = 0; n < 8; ++n) record[7-n] = uint64_t(metadata.size()) >> (8*n);
         record += metadata; record.append(bytes.data(), bytes.size());
         files.saveResult(key, record);
-        if (getenv("DISTCC_VERBOSE")) llvm::errs() << "distcc compiler result: stored inputs=" << input_count << '\n';
+        if (verbose) llvm::errs() << "distcc compiler result: stored inputs=" << input_count << '\n';
     }
 };
 }
