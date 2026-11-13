@@ -62,7 +62,7 @@ void record(unsigned operation, const char *path, int flags, int error,
     auto prior=observed.find(identity);
     if (prior!=observed.end()) {
         if (prior->second.error!=current.error || prior->second.target!=current.target ||
-            !dcc_plan_stat_equal(&prior->second.metadata,&current.metadata)) reject();
+            !dcc_plan_stat_equal(operation,&prior->second.metadata,&current.metadata)) reject();
     } else if (!invalid) {
         observed.emplace(identity,current);
         dcc_plan_dependency item{};
@@ -81,12 +81,20 @@ void record(unsigned operation, const char *path, int flags, int error,
     observing = false;
     errno = saved;
 }
+bool external_specs(const char *path) {
+    // GCC can read external specs through either open/read or stdio. Its
+    // actual successful open identifies the file without interpreting specs.
+    const char *base=strrchr(path,'/');base=base ? base+1 : path;
+    if (strcmp(base,"specs")) return false;
+    reject(6);return true;
+}
 void opened(const char *path, int flags, int fd, int error) {
     if (journal < 0 || observing) return;
     if (strcmp(path,"/dev/null") && ((flags & O_ACCMODE) != O_RDONLY || flags & (O_CREAT | O_TRUNC) ||
         (flags & O_TMPFILE) == O_TMPFILE)) {
         reject(5); return;
     }
+    if (fd>=0 && external_specs(path)) return;
     struct stat st{};
     if (fd >= 0 && fstat(fd, &st)) { reject(); return; }
     record(DCC_PLAN_OPEN, path, flags, error, &st);
@@ -98,10 +106,7 @@ void stream(const char *path, const char *mode, FILE *file, int error) {
     if (!path || ((*mode!='r' || strchr(mode,'+')) && strcmp(path,"/dev/null"))) {
         reject(5); return;
     }
-    // External specs can make otherwise normalized operands influence the
-    // invocation. GCC has already identified/opened the file: no specs parser.
-    const char *base=strrchr(path,'/'); base=base ? base+1 : path;
-    if (file && !strcmp(base,"specs")) { reject(6); return; }
+    if (file && external_specs(path)) return;
     struct stat st{};
     if (file && fstat(fileno(file), &st)) { reject(); return; }
     record(DCC_PLAN_STREAM,path,0,error,&st,mode);
@@ -236,14 +241,43 @@ EXPORT FILE *freopen(const char *path, const char *mode, FILE *file) {
 }
 namespace {
 std::string at_path(int fd, const char *path) {
-    if (fd == AT_FDCWD || *path == '/') return path;
+    if (path && *path == '/') return path;
+    if (fd == AT_FDCWD) return path && *path ? path : ".";
     char link[64], target[PATH_MAX];
     snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
     static auto call = next<decltype(&readlink)>("readlink");
     ssize_t n = forward(call,link, target, sizeof(target)-1);
     if (n < 0 || n == sizeof(target)-1) { reject(); return {}; }
     target[n] = 0;
-    return std::string(target) + (*path ? "/" : "") + path;
+    return std::string(target) + (path && *path ? "/" : "") + (path ? path : "");
+}
+void at_stat(int fd,const char *path,int flags,int result,int error,const struct stat *st) {
+    if (journal<0 || observing) return;
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT)) { reject(); return; }
+    std::string name=at_path(fd,path);
+    unsigned operation=flags & AT_SYMLINK_NOFOLLOW ? DCC_PLAN_LSTAT : DCC_PLAN_STAT;
+    if ((!path || !*path) && (flags & AT_EMPTY_PATH)) {
+        // An empty path refers to the actual FD, even for an O_PATH symlink.
+        // Retain only objects still reachable by the recorded pathname. No FD
+        // table, deleted-file guess or replacement of the real operation.
+        if (result) { reject(); return; }
+        operation=S_ISLNK(st->st_mode) ? DCC_PLAN_LSTAT : DCC_PLAN_STAT;
+        struct stat named{};
+        static auto info=next<decltype(&lstat)>("lstat");
+        static auto follow=next<decltype(&stat)>("stat");
+        if (forward(operation==DCC_PLAN_LSTAT ? info : follow,name.c_str(),&named) ||
+            !dcc_plan_stat_equal(DCC_PLAN_OPEN,&named,st)) { reject(); return; }
+    } else if (!path || !*path) { reject(); return; }
+    record(operation,name.c_str(),0,error,result ? nullptr : st);
+}
+void at_access(int fd,const char *path,int mode,int flags,int error) {
+    if (journal<0 || observing) return;
+    if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW) || !path || !*path) {
+        // FD-only access cannot be replayed as path access without changing
+        // its search-permission semantics. Keep such invocations live.
+        reject(); return;
+    }
+    record(DCC_PLAN_ACCESS_AT,at_path(fd,path).c_str(),mode|flags,error);
 }
 }
 EXPORT int openat(int fd, const char *path, int flags, ...) {
@@ -259,22 +293,96 @@ EXPORT int openat(int fd, const char *path, int flags, ...) {
 EXPORT int fstatat(int fd, const char *path, struct stat *st, int flags) {
     static auto call = next<decltype(&fstatat)>("fstatat");
     int r = forward(call,fd, path, st, flags), e = r ? errno : 0;
-    if (journal >= 0 && !observing) {
-        if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT)) reject();
-        else record(flags & AT_SYMLINK_NOFOLLOW ? DCC_PLAN_LSTAT : DCC_PLAN_STAT,
-                    at_path(fd,path).c_str(), 0, e, r ? nullptr : st);
-    }
+    at_stat(fd,path,flags,r,e,st);
     errno = e; return r;
 }
 EXPORT int faccessat(int fd, const char *path, int mode, int flags) {
     static auto call = next<decltype(&faccessat)>("faccessat");
     int r = forward(call,fd, path, mode, flags), e = r ? errno : 0;
-    if (journal >= 0 && !observing) {
-        if (flags) reject();
-        else record(DCC_PLAN_ACCESS, at_path(fd,path).c_str(), mode, e);
-    }
+    at_access(fd,path,mode,flags,e);
     errno = e; return r;
 }
+// Fortified entrypoints call hidden libc implementations. Forward the actual
+// checked ABI so its invalid-flags diagnostics are preserved before recording.
+#define CHECKED_OPEN(name) \
+EXPORT int name(const char *path,int flags) { \
+    static auto call=next<int (*)(const char *,int)>(#name); \
+    int fd=forward(call,path,flags),e=fd<0 ? errno : 0; \
+    opened(path,flags,fd,e); errno=e; return fd; \
+}
+CHECKED_OPEN(__open_2)
+CHECKED_OPEN(__open64_2)
+#define CHECKED_OPENAT(name) \
+EXPORT int name(int directory,const char *path,int flags) { \
+    static auto call=next<int (*)(int,const char *,int)>(#name); \
+    int fd=forward(call,directory,path,flags),e=fd<0 ? errno : 0; \
+    if (journal>=0 && !observing) opened(at_path(directory,path).c_str(),flags,fd,e); \
+    errno=e; return fd; \
+}
+CHECKED_OPENAT(__openat_2)
+CHECKED_OPENAT(__openat64_2)
+EXPORT int openat64(int directory,const char *path,int flags,...) {
+    static auto call=next<decltype(&openat64)>("openat64");
+    mode_t mode=0;
+    if (flags & O_CREAT || (flags & O_TMPFILE)==O_TMPFILE) {
+        va_list args; va_start(args,flags); mode=va_arg(args,int); va_end(args);
+    }
+    int fd=forward(call,directory,path,flags,mode),e=fd<0 ? errno : 0;
+    if (journal>=0 && !observing) opened(at_path(directory,path).c_str(),flags,fd,e);
+    errno=e; return fd;
+}
+EXPORT ssize_t readlinkat(int fd,const char *path,char *buffer,size_t size) {
+    static auto call=next<decltype(&readlinkat)>("readlinkat");
+    ssize_t r=forward(call,fd,path,buffer,size); int e=r<0 ? errno : 0;
+    if (journal>=0 && !observing) {
+        std::string name=at_path(fd,path),target;
+        struct stat st{};
+        static auto info=next<decltype(&lstat)>("lstat");
+        if (!path || !*path) reject(); // empty-path symlink FD needs a live operation
+        else if (r>=0 && (size_t(r)==size || forward(info,name.c_str(),&st))) reject();
+        else {
+            if (r>=0) target.assign(buffer,r);
+            record(DCC_PLAN_LINK,name.c_str(),0,e,&st,r>=0 ? target.c_str() : nullptr);
+        }
+    }
+    errno=e; return r;
+}
+namespace {
+// Copy public fields, never assume that the large-file ABI has stat's layout.
+void metadata64(struct stat *out,const struct stat64 *in) {
+    out->st_dev=in->st_dev; out->st_ino=in->st_ino; out->st_mode=in->st_mode;
+    out->st_uid=in->st_uid; out->st_gid=in->st_gid; out->st_nlink=in->st_nlink;
+    out->st_size=in->st_size; out->st_mtim=in->st_mtim; out->st_ctim=in->st_ctim;
+}
+}
+#define STAT64(name,operation) \
+EXPORT int name(const char *path,struct stat64 *st) { \
+    static auto call=next<decltype(&name)>(#name); \
+    int r=forward(call,path,st),e=r ? errno : 0; struct stat data{}; \
+    if (!r) metadata64(&data,st); \
+    record(operation,path,0,e,&data); errno=e; return r; \
+}
+STAT64(stat64,DCC_PLAN_STAT)
+STAT64(lstat64,DCC_PLAN_LSTAT)
+EXPORT int fstatat64(int fd,const char *path,struct stat64 *st,int flags) {
+    static auto call=next<decltype(&fstatat64)>("fstatat64");
+    int r=forward(call,fd,path,st,flags),e=r ? errno : 0; struct stat data{};
+    if (!r) metadata64(&data,st);
+    at_stat(fd,path,flags,r,e,&data); errno=e; return r;
+}
+EXPORT FILE *freopen64(const char *path,const char *mode,FILE *file) {
+    static auto call=next<decltype(&freopen64)>("freopen64");
+    FILE *result=forward(call,path,mode,file); int e=result ? 0 : errno;
+    stream(path,mode,result,e); errno=e; return result;
+}
+#define EFFECTIVE_ACCESS(name) \
+EXPORT int name(const char *path,int mode) { \
+    static auto call=next<decltype(&name)>(#name); \
+    int r=forward(call,path,mode),e=r ? errno : 0; \
+    at_access(AT_FDCWD,path,mode,AT_EACCESS,e); errno=e; return r; \
+}
+EFFECTIVE_ACCESS(eaccess)
+EFFECTIVE_ACCESS(euidaccess)
 EXPORT void _exit(int status) {
     dcc_plan_record_finish(status);
     static auto call = next<decltype(&_exit)>("_exit");

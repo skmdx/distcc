@@ -754,21 +754,32 @@ The broker retains the resulting defaults/roots with the live driver's and
 planner's filesystem observations. Public libc calls still perform the real
 operations through the caller's sandbox. Each hit revalidates the recorded
 positive and negative probes in the requesting client's credentials, namespace
-and sandbox; inode, ownership, mode, size, mtime/ctime, errors and link targets
-must agree. This does not cache input read authorization or input bytes.
+and sandbox. Inode, ownership, mode, errors and link targets must agree.
+Regular files and directory enumeration/open probes also retain size,
+link count and mtime/ctime. A directory existence/type probe retains its
+identity rather than its entry-change timestamps: creating object/dependency
+files beside headers does not change GCC's include chains. Separate child
+probes still detect newly created include/specs paths, and access operations
+are repeated through the sandbox. This does not cache input read authorization
+or input bytes.
 
 Keys retain the compiler/helper, environment, cwd, input extension and parent,
 macros and other arguments. Only the single input name and separate `-o`, `-MF`,
 `-MT`, `-MQ` operands are normalized. Responses, custom specs, explicit wrappers,
 plugins, stdin, multiple source operands and diagnostic/preprocess-only commands
-use live planning. Incomplete, changing, diagnostic-producing or oversized
+use live planning; an implicit external specs file opened by GCC does too.
+The recorder covers the public fortified and large-file libc entrypoints as
+well as ordinary calls. FD-only operations without equivalent pathname
+validation remain live. Incomplete, changing, diagnostic-producing or oversized
 journals are not published. A stale reader requests compare-and-replace of the
 observed memo; it cannot discard a newer publisher's value. The broker indexes
 keys in a balanced tree and bounds ready values to 64 MiB, individual messages
 to 64 KiB and journals to 24 KiB. Retained worker handles keep their existing
 256-entry bound. Cancellation transfers an unfinished lease to a live waiter.
-The isolated contracts are in `test/test_plan_memo.py`; `h_compile plan` exposes
-the same defaults/roots for comparison with a live invocation.
+The isolated contracts are in `test/test_plan_memo.py` and
+`test/plan_dependency_calls.cc`; `h_compile plan` exposes the same defaults/roots
+for comparison with a live invocation. `plan_record` and `plan_dump` retain and
+inspect the actual dependency journal without adding production trace switches.
 The broker scopes helpers to the caller, executable, namespaces, credentials
 and loader environment; replacing the compiler or helper selects a new image.
 The existing native worker loop owns concurrent invocations, cancellation and

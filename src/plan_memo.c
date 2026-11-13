@@ -81,6 +81,8 @@ static int validate(const struct dcc_plan_dependency *d, const char *path, const
     case DCC_PLAN_STAT: result=stat(path,&st); break;
     case DCC_PLAN_LSTAT: result=lstat(path,&st); break;
     case DCC_PLAN_ACCESS: result=access(path,d->flags); break;
+    case DCC_PLAN_ACCESS_AT:
+        result=faccessat(AT_FDCWD,path,d->flags & 7,d->flags & ~7U); break;
     case DCC_PLAN_OPEN: {
         if (strcmp(path,"/dev/null") && ((d->flags&O_ACCMODE)!=O_RDONLY ||
             d->flags&(O_CREAT|O_TRUNC) || (d->flags&O_TMPFILE)==O_TMPFILE)) return 0;
@@ -119,7 +121,8 @@ static int validate(const struct dcc_plan_dependency *d, const char *path, const
     default: return 0;
     }
     error=result ? errno : 0;
-    return error==d->error && (error || d->operation==DCC_PLAN_ACCESS || dcc_plan_stat_equal(&st,&d->metadata));
+    return error==d->error && (error || d->operation==DCC_PLAN_ACCESS ||
+        d->operation==DCC_PLAN_ACCESS_AT || dcc_plan_stat_equal(d->operation,&st,&d->metadata));
 }
 
 struct record { struct dcc_plan_dependency d; const char *path, *target; };
@@ -159,7 +162,7 @@ static int journal_records(const unsigned char *data, size_t length,
     qsort(all,used,sizeof(*all),order);
     for (unsigned i=0;i<used;++i) {
         if (i && !order(&all[i-1],&all[i])) {
-            if (all[i].d.error!=all[i-1].d.error || !dcc_plan_stat_equal(&all[i].d.metadata,&all[i-1].d.metadata) ||
+            if (all[i].d.error!=all[i-1].d.error || !dcc_plan_stat_equal(all[i].d.operation,&all[i].d.metadata,&all[i-1].d.metadata) ||
                 strcmp(all[i].target?all[i].target:"",all[i-1].target?all[i-1].target:"")) goto bad;
         } else if (!validate(&all[i].d,all[i].path,all[i].target)) {
             rs_trace("GCC plan dependency changed: operation=%u path=%s",all[i].d.operation,all[i].path);

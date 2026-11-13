@@ -275,6 +275,7 @@ test_SOURCE = test/comfychair.py \
 	test/gcc_files_contract.cc \
 	test/file_cache.c \
 	test/client_hotpaths.c \
+	test/plan_dependency_calls.cc \
 	test/resource.c \
 	test/frontend_metadata_contract.c \
 	test/tcp_frames.c \
@@ -527,6 +528,7 @@ check_PROGRAMS = \
 	h_strip@EXEEXT@ \
 	h_dotd@EXEEXT@ \
 	h_compile@EXEEXT@ \
+	h_plan_dependencies \
 	h_state@EXEEXT@ \
 	h_getline@EXEEXT@
 
@@ -723,6 +725,9 @@ h_fix_debug_info@EXEEXT@: $(h_fix_debug_info)
 
 h_compile@EXEEXT@: $(h_compile_obj)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(h_compile_obj) $(LIBS)
+
+h_plan_dependencies: $(srcdir)/test/plan_dependency_calls.cc $(srcdir)/src/gcc_dependencies.cc $(srcdir)/src/plan_memo.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=gnu++17 -Wl,--export-dynamic $(LDFLAGS) -o $@ $(srcdir)/test/plan_dependency_calls.cc $(srcdir)/src/gcc_dependencies.cc -ldl
 
 h_getline@EXEEXT@: $(h_getline_obj)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(h_getline_obj) $(LIBS)
@@ -957,7 +962,7 @@ pump-maintainer-check: pump include-server check_programs
 maintainer-check: distcc-maintainer-check include-server-maintainer-check preprocess-check \
 	pump-maintainer-check
 
-adaptive-check: distcc distccd distccmon-text h_hosts h_compile h_state include-server
+adaptive-check: distcc distccd distccmon-text h_hosts h_compile h_plan_dependencies h_state include-server
 	$(PYTHON) "$(srcdir)/test/test_state.py" -v
 	$(PYTHON) "$(srcdir)/test/test_portage_jobs.py" -v
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v

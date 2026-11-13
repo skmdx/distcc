@@ -8,6 +8,7 @@ import re
 import socket
 import struct
 import subprocess
+import tempfile
 import unittest
 
 from test_broker import BrokerTestCase
@@ -99,6 +100,25 @@ class PlanMemoTest(BrokerTestCase):
         self.assertNotEqual(bad.returncode,0)
         self.assertNotIn('GCC plan memo publish',log.read_text()[offset:])
 
+    def test_implicit_specs_appearance_and_cpp_live_plan(self):
+        self.prepare()
+        (self.sources/'a.cpp').write_text('template<class T> T value(T x) { return x; }\n')
+        first=self.plan('a.cpp');hit=self.plan('a.cpp')
+        self.assertIn('memo hit',hit.stderr)
+        self.assertEqual(first.stdout,self.plan('a.cpp',live=True).stdout)
+        prefix=self.work/'toolchain';prefix.mkdir()
+        flags=['-B'+str(prefix)+'/']
+        self.assertIn('memo publish',self.plan(flags=flags).stderr)
+        specs=prefix/'specs'
+        specs.write_text('*cpp:\n-I'+str(self.sources)+'\n')
+        changed=self.plan(flags=flags)
+        self.assertIn('memo uncacheable',changed.stderr)
+        self.assertEqual(changed.stdout,self.plan(flags=flags,live=True).stdout)
+        specs.write_text('*cpp:\n-I'+str(self.work)+'\n')
+        changed_again=self.plan(flags=flags)
+        self.assertIn('memo uncacheable',changed_again.stderr)
+        self.assertNotEqual(changed.stdout,changed_again.stdout)
+
     def plan(self,name='a.c',flags=(),env=None,live=False):
         source=str(self.sources/name)
         result=subprocess.run([str(self.build/'h_compile'),'plan','-' if live else source,self.cc,'-c',source,
@@ -158,8 +178,28 @@ class PlanMemoTest(BrokerTestCase):
         self.assertIn('memo publish',first.stderr)
         self.assertIn('memo hit',self.plan('b.c',env=env).stderr)
         (directory/'new.h').write_text('')
-        self.assertIn('memo publish',self.plan('b.c',env=env).stderr)
+        self.assertIn('memo hit',self.plan('b.c',env=env).stderr)
+        self.assertEqual(first.stdout,self.plan(env=env,live=True).stdout)
         self.assertNotEqual(first.stdout,self.plan().stdout)
+
+    def test_parallel_outputs_in_include_directory_do_not_invalidate(self):
+        self.prepare()
+        self.outputs=self.sources
+        flags=['-I'+str(self.sources),'-I.']
+        self.compile_one(flags=flags,expect='publish')
+        self.compile_one('b.c',flags=flags,expect='hit')
+        self.assertIn('memo publish',self.plan('c.c',flags=flags).stderr)
+        def output(i):
+            for suffix in ('.o','.dt'):
+                (self.sources/(str(i)+suffix)).write_bytes(b'object')
+                (self.work/(str(i)+suffix)).write_bytes(b'dependency')
+            return self.plan('c.c',flags=flags)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            plans=list(pool.map(output,range(32)))
+        self.assertTrue(all('memo hit' in p.stderr for p in plans),
+                        '\n'.join(p.stderr for p in plans if 'memo hit' not in p.stderr))
+        live=self.plan('c.c',flags=flags,live=True).stdout
+        self.assertTrue(all(p.stdout==live for p in plans))
 
     def test_broker_capacity_stale_compare_exchange_and_owner_exit(self):
         self.start_broker()
@@ -204,10 +244,80 @@ class PlanMemoTest(BrokerTestCase):
         self.assertEqual(memo(b'plan-1399').recv(65536),large+b'\0')
 
 
+class PlanDependenciesTest(unittest.TestCase):
+    def prepare(self):
+        self.build=Path.cwd()
+        self.storage=tempfile.TemporaryDirectory(prefix='plan-dependencies-')
+        self.addCleanup(self.storage.cleanup)
+        self.work=Path(self.storage.name)
+        self.env=os.environ.copy()
+        self.sources=self.work/'sources';self.sources.mkdir()
+        (self.sources/'a.c').write_text('int value;\n')
+
+    def journal(self, operation, path, valid=True):
+        raw=self.work/'journal';memo=self.work/'journal.memo'
+        result=subprocess.run([str(self.build/'h_plan_dependencies'),str(raw),operation,str(path)],
+                              env=self.env,cwd=self.work,capture_output=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        encoded=subprocess.run([str(self.build/'h_compile'),'plan_journal',str(raw)],
+                               env=self.env,cwd=self.work,capture_output=True)
+        self.assertEqual(encoded.returncode,0 if valid else 1,encoded.stderr)
+        memo.write_bytes(encoded.stdout)
+        return memo
+
+    def valid_journal(self, memo):
+        return subprocess.run([str(self.build/'h_compile'),'plan_validate',str(memo)],
+                              env=self.env,cwd=self.work,capture_output=True).returncode==0
+
+    def test_directory_probe_and_enumeration_have_distinct_dependencies(self):
+        self.prepare()
+        directory=self.work/'index';directory.mkdir()
+        for op in ('stat','lstat','stat64','lstat64','fstatat64','opendir'):
+            with self.subTest(operation=op):
+                memo=self.journal(op,directory)
+                child=directory/'out.o';child.write_bytes(b'object')
+                self.assertEqual(self.valid_journal(memo),op!='opendir')
+                child.unlink()
+                directory.chmod(0o700)
+                self.assertFalse(self.valid_journal(memo))
+                directory.chmod(0o755)
+        memo=self.journal('stat',directory)
+        directory.rename(self.work/'old-index');directory.mkdir()
+        self.assertFalse(self.valid_journal(memo))
+
+    def test_fortified_largefile_access_and_empty_path_boundaries(self):
+        self.prepare()
+        path=self.work/'input';path.write_bytes(b'old')
+        for op in ('__open_2','__open64_2','__openat_2','__openat64_2','openat64',
+                   'freopen64','fstatat-empty','fstatat64-empty','stat64','fstatat64'):
+            with self.subTest(operation=op):
+                memo=self.journal(op,path)
+                self.assertTrue(self.valid_journal(memo))
+                path.write_bytes(path.read_bytes()+b'new')
+                self.assertFalse(self.valid_journal(memo))
+                path.unlink()
+                memo=self.journal(op,path,valid='empty' not in op)
+                path.write_bytes(b'old')
+                if 'empty' not in op:self.assertFalse(self.valid_journal(memo))
+        for op in ('eaccess','euidaccess','faccessat'):
+            memo=self.journal(op,path);self.assertTrue(self.valid_journal(memo))
+            path.chmod(0)
+            self.assertFalse(self.valid_journal(memo))
+            denied=self.journal(op,path);self.assertTrue(self.valid_journal(denied))
+            path.chmod(0o600);self.assertFalse(self.valid_journal(denied))
+            memo=self.journal(op,path)
+            path.unlink();self.assertFalse(self.valid_journal(memo));path.write_bytes(b'old')
+        self.journal('faccessat-empty',path,valid=False)
+        link=self.work/'alias';link.symlink_to(path)
+        for op in ('readlinkat','lstat64','fstatat-empty'):
+            memo=self.journal(op,link);self.assertTrue(self.valid_journal(memo))
+            link.unlink();link.symlink_to(self.sources/'a.c')
+            self.assertFalse(self.valid_journal(memo));link.unlink();link.symlink_to(path)
+
 def load_tests(loader, tests, pattern):
     # Reuse the broker fixture, not all unrelated inherited scheduling tests.
-    return unittest.TestSuite(PlanMemoTest(name) for name in PlanMemoTest.__dict__
-                              if name.startswith('test_'))
+    return unittest.TestSuite(case(name) for case in (PlanMemoTest,PlanDependenciesTest)
+                              for name in case.__dict__ if name.startswith('test_'))
 
 
 if __name__=='__main__': unittest.main()
