@@ -2,6 +2,17 @@ TODO list for distcc
 
 --> See also TODO and FIXME comments in source files and doc/todo/
 
+Clang result reuse and source scheduling (experimental)
+
+    Keep isolated host speed/slot options identical to the installed config.
+    Including admissible source pipelines fixes the blocked-peer selection
+    defect, but the corrected four-worker replay still fails the wall-time gate.
+    Small source files can substantially underpredict frontend execution cost.
+    IR claim waits also retain a fixed prefork executor; changing busy counters
+    alone cannot release that executor. Do not enlarge capacity without keeping
+    execution, resume and memory ownership together. Adoption requires matched
+    whole-build benefit, output/diagnostic parity and no hidden fallback.
+
 remove avoidable waits while remote compilation has runnable work
 
     Keep the complete-build objective: reduce client and worker filesystem/IPC

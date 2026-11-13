@@ -1381,7 +1381,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 affinity = candidate;
             if (best.peer < 0 || idle > best.idle || (idle == best.idle &&
                 (score < best.score || (score == best.score && fill < best.fill)))) best = candidate;
-            if (predicted && !wait) {
+            /* A source pipeline can accept work while its CPU lanes are busy.
+             * Include it in the available alternatives: a blocked peer with a
+             * lower throughput score must not make the wait/ready comparison
+             * discard an admissible pipeline with an earlier completion. */
+            if (predicted && (!wait || (locality && enqueue))) {
                 ready_hosts++;
                 if (ready.peer < 0 || score < ready.score ||
                     (score == ready.score && fill < ready.fill)) ready = candidate;

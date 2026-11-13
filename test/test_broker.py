@@ -477,6 +477,37 @@ class BrokerDirectTest(BrokerTestCase):
 class BrokerPlacementTest(BrokerTestCase):
     worker_count = 3
 
+    def test_source_pipeline_is_not_discarded_by_a_blocked_third_peer(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                     running=16, busy=16, queued=0, preparing=0, returning=0)),
+                 self.peer(stats_response(cpus=4, cores=4, jobs=4, capacity=4,
+                     running=4, busy=4, queued=0, preparing=0, returning=0)),
+                 self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                     running=3, busy=3, queued=0, preparing=0, returning=0))]
+        speeds, slots = (1, .56, .49), (16, 4, 4)
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={speeds[i]}',
+                                     slots=slots[i]) for i, p in enumerate(peers)))
+        _, net = self.acquire_reserved(10, (8000, 4 * 1024**2, 5), family=8000)
+        self.assertEqual(net.getpeername()[1], self.ports[0])
+        rows = [dict(field.split('=',1) for field in line.split() if '=' in field)
+                for line in (self.work/'broker.log').read_text().splitlines()
+                if '(dispatch) candidate ' in line][:3]
+        self.assertEqual([r['blocked'] for r in rows], ['0','1','0'])
+        self.assertLess(float(rows[0]['finish']), float(rows[1]['finish']))
+        self.assertLess(float(rows[1]['score']), float(rows[0]['score']))
+
+    def test_source_drain_retains_independent_core_throughput(self):
+        peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
+                     running=0, busy=0, queued=0, preparing=0, returning=0)),
+                 self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=2,
+                     running=0, busy=0, queued=0, preparing=0, returning=0))]
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={1 if i==0 else .8}',
+                                     slots=16 if i==0 else 4) for i,p in enumerate(peers)))
+        for index, expected in enumerate([0]*8+[1]*2+[0]*3):
+            _,net=self.acquire_reserved(10,(8100+index,4*1024**2,5),family=8100+index)
+            self.assertEqual(net.getpeername()[1],self.ports[expected],index)
+
     def test_cold_file_jobs_remain_movable_until_a_cpu_lane_opens(self):
         metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
                                 busy=1, running=1, queued=0, preparing=0, returning=0)
