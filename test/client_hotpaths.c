@@ -137,12 +137,21 @@ int main(int argc, char **argv)
     unsigned value = 42;
     assert(!dcc_parse_token_int("ARGCffffffff", token, &value) && value == UINT_MAX);
     assert(!dcc_parse_token_int("ARGCABCDEF01", token, &value) && value == 0xabcdef01U);
+    assert(!dcc_parse_token_int("ARGC       1", token, &value) && value == 1);
+    assert(!dcc_parse_token_int("ARGC ABCDEF1", token, &value) && value == 0xabcdef1U);
+    assert(dcc_parse_token_int("ARGC        ", token, &value));
     assert(dcc_parse_token_int("ARGV00000001", token, &value));
     for (unsigned i = 4; i < 12; ++i) {
-        for (const char *bad = "gG-+ /"; *bad; ++bad) {
+        for (const char *bad = "gG-+/\t\n"; *bad; ++bad) {
             char bytes[12];
             memcpy(bytes, "ARGC00000001", sizeof(bytes));
             bytes[i] = *bad;
+            assert(dcc_parse_token_int(bytes, token, &value));
+        }
+        if (i > 4) {
+            char bytes[12];
+            memcpy(bytes, "ARGC00000001", sizeof(bytes));
+            bytes[i] = ' ';
             assert(dcc_parse_token_int(bytes, token, &value));
         }
     }

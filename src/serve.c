@@ -1225,10 +1225,25 @@ static int dcc_run_job(int in_fd,
     }
 
     if ((ret = job ? dcc_copy_argv(job_argv, &argv, 0) :
-                    dcc_r_argv(in_fd, "ARGC", "ARGV", &argv))
-        || (ret = dcc_scan_args(argv, &orig_input_tmp, &orig_output_tmp,
-                                &tweaked_argv, 0)))
+                    dcc_r_argv(in_fd, "ARGC", "ARGV", &argv)))
         goto out_cleanup;
+    if ((ret = dcc_scan_args(argv, &orig_input_tmp, &orig_output_tmp,
+                            &tweaked_argv, 0))) {
+        if (ret != EXIT_DISTCC_FAILED && ret != EXIT_LOCAL_CPP)
+            goto out_cleanup;
+        status = W_EXITCODE(ret, 0);
+        /* The argv arrived intact. Consume its input and return a completed
+         * rejection, rather than an EOF that quarantines a healthy worker.
+         * Staged TCP jobs already own their complete input snapshot. */
+        if (!job && (ret = cpp_where == DCC_CPP_ON_SERVER
+                ? dcc_r_many_files(in_fd, temp_dir, compr)
+                : dcc_r_token_file(in_fd, "DOTI", "/dev/null", compr)))
+            goto out_cleanup;
+        rs_log_error("compiler arguments cannot be distributed");
+        job_result = STATS_REJ_BAD_REQ;
+        ret = 0;
+        goto report_result;
+    }
 
     /* The orig_input_tmp and orig_output_tmp values returned by dcc_scan_args()
      * are aliased with some element of tweaked_argv.  We need to copy them,
@@ -1411,7 +1426,8 @@ report_result:
                 if (ret) goto out_cleanup;
             }
         }
-        job_result = status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
+        if (job_result != STATS_REJ_BAD_REQ)
+            job_result = status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
     } else if ((ret = dcc_x_result_header(out_fd, protover))
         || (ret = dcc_x_cc_status(out_fd, status))
         || (ret = dcc_x_file(out_fd, err_fname, "SERR", compr, NULL))
@@ -1466,6 +1482,7 @@ report_result:
         job_result = STATS_COMPILE_TIMEOUT;
     }
 
+    if (job_result == STATS_REJ_BAD_REQ) goto out_cleanup;
     dcc_critique_status(status, argv[0], orig_input, dcc_hostdef_local,
                         0);
     rs_log(RS_LOG_INFO|RS_LOG_NONAME, "job complete");

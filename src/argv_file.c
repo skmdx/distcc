@@ -53,7 +53,11 @@ int dcc_parse_token_int(const char *bytes, const char *expected, unsigned *value
 {
     if (memcmp(bytes, expected, 4)) return EXIT_PROTOCOL_ERROR;
     unsigned result = 0;
-    for (unsigned i = 4; i < 12; ++i) {
+    unsigned i = 4;
+    /* Legacy peers right-align hexadecimal values in this fixed-width field. */
+    while (i < 12 && bytes[i] == ' ') ++i;
+    if (i == 12) return EXIT_PROTOCOL_ERROR;
+    for (; i < 12; ++i) {
         unsigned digit = (unsigned char)bytes[i] - '0';
         if (digit > 9) {
             digit = ((unsigned char)bytes[i] | 32U) - 'a';

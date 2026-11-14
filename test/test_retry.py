@@ -20,8 +20,9 @@ class RejectingProxy(socketserver.ThreadingTCPServer):
     """Change -c to -M in transit so the real daemon rejects the argv."""
     daemon_threads = True
 
-    def __init__(self, port):
+    def __init__(self, port, disconnect=False):
         self.worker_port, self.rejections = port, 0
+        self.disconnect = disconnect
         super().__init__(('127.0.0.1', 0), RejectionConnection)
         self.thread = threading.Thread(target=self.serve_forever)
         self.thread.start()
@@ -46,8 +47,10 @@ class RejectionConnection(socketserver.BaseRequestHandler):
                     while data := source.recv(65536):
                         pending += data
                         if reject and needle in pending:
-                            pending = pending.replace(needle, b'ARGV00000002-M', 1)
                             server.rejections += 1
+                            if server.disconnect:
+                                return
+                            pending = pending.replace(needle, b'ARGV00000002-M', 1)
                             reject = False
                         # Retain only a possible fragmented token, so SLOT and
                         # POOL handshakes are forwarded without buffering.
@@ -156,23 +159,30 @@ class RetryTest(BrokerTestCase):
             assert after is not None
             self.assertEqual(before[1], after[1])
 
-    def rejecting_host(self):
-        proxy = RejectingProxy(self.ports[0])
+    def rejecting_host(self, disconnect=False):
+        proxy = RejectingProxy(self.ports[0], disconnect)
         self.addCleanup(proxy.close)
         peer = self.peer(stats_response(admission=1, available=4))
         return proxy, f'127.0.0.1:{proxy.server_address[1]}/4,stats={peer.port},speed=100'
 
     def test_argument_rejection_fallback_disabled_and_enabled(self):
+        for codec in ('', ',lz4'):
+            self.check_argument_rejection(codec)
+
+    def check_argument_rejection(self, codec):
         for fallback in ('0', '1'):
-            with self.subTest(fallback=fallback):
+            with self.subTest(fallback=fallback, codec=codec):
                 proxy, host = self.rejecting_host()
-                self.start_broker(host, name='broker-' + fallback)
+                self.start_broker(host + codec, name='broker-' + fallback + codec)
                 obj = self.work / ('fallback-' + fallback + '.o')
+                obj.unlink(missing_ok=True)
                 result = subprocess.run([str(self.build/'distcc'), 'gcc', '-c',
                                          str(self.source), '-o', str(obj)],
                                         env=dict(self.env, DISTCC_FALLBACK=fallback),
                                         capture_output=True, text=True, timeout=8)
                 self.assertEqual(proxy.rejections, 1, result.stderr)
+                self.assertNotIn('server provided no answer', result.stderr)
+                self.assertNotIn('unexpected eof', result.stderr)
                 if fallback == '0':
                     self.assertNotEqual(result.returncode, 0, result.stderr)
                     self.assertFalse(obj.exists())
@@ -200,7 +210,7 @@ class RetryTest(BrokerTestCase):
         return marker, gate
 
     def test_disabled_backoff_still_bounds_retries(self):
-        proxy, host = self.rejecting_host()
+        proxy, host = self.rejecting_host(disconnect=True)
         self.start_broker(host, backoff=0)
         result = subprocess.run([str(self.build/'distcc'), 'gcc', '-c', str(self.source),
                                  '-o', str(self.work/'rejected.o')], env=self.env,
@@ -209,7 +219,9 @@ class RetryTest(BrokerTestCase):
         self.assertEqual(proxy.rejections, 3)
 
     def test_retry_reuses_preprocessed_input(self):
-        proxy, host = self.rejecting_host()
+        # Transport loss retries another worker; an intact argument rejection
+        # is a completed result and must not quarantine the worker.
+        proxy, host = self.rejecting_host(disconnect=True)
         self.start_broker(host + ' ' + self.host(1, f',stats={self.stats_ports[1]}'))
         marker, _ = self.client_compiler()
         self.job('recovered')

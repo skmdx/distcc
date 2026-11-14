@@ -1752,7 +1752,7 @@ class ScanIncludes_Case(CompileHello_Case):
           self.assert_re_search(
               r"DIRECTORY /.*/ScanIncludes_Case/test_subdir", out);
           self.assert_re_search(
-              r"SYSTEMDIR /.*", out);
+              r"FILE      /.*/stdio\.h", out);
         else:
           self.assert_re_search(r"ERROR: '--scan_includes' specified, but "
                                 "distcc wouldn't have used include server "
