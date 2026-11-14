@@ -117,6 +117,9 @@ class TransportTest(unittest.TestCase):
                              [str(compiler)])
 
     def test_package_mirror_removes_retired_ebuild_without_touching_siblings(self):
+        if not shutil.which('sudo') or subprocess.run(
+                ['sudo', '-n', 'true'], capture_output=True).returncode:
+            self.skipTest('passwordless sudo required')
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             source, destination = root / 'source', root / 'destination'
