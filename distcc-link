@@ -1321,6 +1321,8 @@ def main():
                     return result
                 print('distcc-link: distributed link failed; retrying locally', file=sys.stderr)
                 os.execv(local[0], [*local, *command])
+        if not os.environ.get('DISTCC_LINK_SYSROOT'):
+            raise LocalOnly('remote link sysroot is not configured')
         path = Path(os.environ['DISTCC_LINK_SYSROOT'])
         if path.is_dir():
             path /= compiler_family(command[0]) + '.json'

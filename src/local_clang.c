@@ -272,7 +272,9 @@ int dcc_clang_link_prepare(char **argv, int *plan, int *errors, int *remote)
     *errors = dcc_job_memfd("distcc-link-diagnostics");
     if (*plan < 0 || *errors < 0) return EXIT_IO_ERROR;
     int status, ret = request(argv, 'L', *plan, *errors, &status, NULL);
-    if (ret) return ret < 0 ? EXIT_DISTCC_FAILED : ret;
+    /* No request accepted: let the link coordinator query the actual driver,
+     * just as when resident compiler libraries are disabled or unavailable. */
+    if (ret) return ret;
     if (status) {
         off_t size = lseek(*errors, 0, SEEK_END);
         if (size < 0 || lseek(*errors, 0, SEEK_SET) < 0) return EXIT_IO_ERROR;

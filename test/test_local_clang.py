@@ -51,6 +51,35 @@ class LocalClangTest(BrokerTestCase):
         finally:
             os.close(reader)
 
+    def test_link_without_resident_library_uses_driver(self):
+        self.start_local()
+        self.env.update(DISTCC_VERBOSE='0', DISTCC_FALLBACK='0')
+        helpers = self.work/'without-libraries'
+        helpers.mkdir()
+        helper = helpers/'distcc-clang'
+        # Model an installed Clang release without its resident module: the
+        # helper exits before the ready handshake or any request is accepted.
+        helper.write_text('#!/bin/sh\nexit 1\n')
+        helper.chmod(0o755)
+        self.env['PATH'] = str(helpers)+os.pathsep+self.env['PATH']
+        (self.work/'source.c').write_text('int main(void) { return 0; }\n')
+        original = self.command(['-c', 'source.c', '-o', 'source.o'], reused=False)
+        self.assertEqual(original.returncode, 0, original.stderr)
+        for extra in ([], ['-Wl,--distcc-invalid-link-option']):
+            with self.subTest(extra=extra):
+                args = ['-fuse-ld=lld', 'source.o', '-o', 'linked', *extra]
+                original = self.command(args, reused=False)
+                expected = (self.work/'linked').read_bytes() if not original.returncode else None
+                (self.work/'linked').unlink(missing_ok=True)
+                result = self.command(args)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (original.returncode, original.stdout, original.stderr))
+                if expected is not None:
+                    self.assertEqual((self.work/'linked').read_bytes(), expected)
+                    subprocess.run([str(self.work/'linked')], check=True)
+                else:
+                    self.assertFalse((self.work/'linked').exists())
+
     def test_bfd_link_plan_preserves_output_and_diagnostics(self):
         self.start_local()
         (self.work/'source.c').write_text('int main(void) { return 0; }\n')
