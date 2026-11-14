@@ -208,6 +208,10 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 ''')
         compiler = shutil.which('clang')
         assert compiler is not None
+        # This fixture selects ThinLTO/lld in meson.build. Package-build flags
+        # (for example -flto=auto/-fuse-ld=bfd) must not override that contract.
+        for name in ('CFLAGS', 'CPPFLAGS', 'LDFLAGS'):
+            self.env.pop(name, None)
         self.env['CC'] = shlex.join([str(self.build / 'distcc'), compiler])
         before = [self.get_stats(port) for port in self.stats_ports]
         for args in (['setup', 'build', '--prefix=' + str(prefix)],
