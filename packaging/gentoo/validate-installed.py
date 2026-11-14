@@ -107,6 +107,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
     if '--rust-only' in sys.argv or '--thinlto-only' in sys.argv:
         assert ',tcp' in env['DISTCC_HOSTS'], 'Validation requires the TCP job protocol'
         compilers = []
+    seen_gcc_plans = set()
     for compiler_path in dict.fromkeys(compilers):
         compiler = Path(compiler_path).name
         suffix, include = ('cc', 'cstdint') if '++' in compiler else ('c', 'stdint.h')
@@ -164,7 +165,13 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             assert 'frontend filesystem:' in log and 'pooled TCP job completed' in log, log[-6000:]
             with open(compiler_path, 'rb') as executable:
                 if executable.read(4) == b'\x7fELF':
-                    assert 'reused GCC driver status=0' in log, log[-6000:]
+                    stat = os.fstat(executable.fileno())
+                    identity = (stat.st_dev, stat.st_ino, suffix)
+                    if identity not in seen_gcc_plans:
+                        assert 'reused GCC driver status=0' in log, log[-6000:]
+                        seen_gcc_plans.add(identity)
+                    else:
+                        assert 'GCC plan memo hit' in log or 'reused GCC driver status=0' in log, log[-6000:]
             subprocess.run([compiler_path, str(obj), str(support_obj), '-o', str(exe)],
                            check=True, timeout=30)
             subprocess.run([str(exe)], check=True, timeout=5)
