@@ -16,12 +16,12 @@ from test_adaptive import stats_response
 
 
 class LocalClangTest(BrokerTestCase):
-    def start_local(self):
+    def start_local(self, hosts=None):
         compiler = shutil.which('clang')
         if not compiler:
             self.skipTest('Clang unavailable')
         self.compiler = compiler
-        self.broker = self.start_broker()
+        self.broker = self.start_broker(hosts=hosts)
         self.env.update(DISTCC_HOSTS='localhost/4', DISTCC_CLANG_LOCAL='1', DISTCC_VERBOSE='1',
                         DISTCC_CLANG_CODEGEN='1',
                         DISTCC_LOG=str(self.work/'client.log'),
@@ -185,6 +185,65 @@ class LocalClangTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.work/'source.o').is_file())
         self.assertIn('reused local compiler libraries', (self.work/'client.log').read_text())
+
+    def test_profile_preprocessing_preserves_output_and_ccache_identity(self):
+        # The broker needs a local TCP worker to grant direct execution of
+        # ccache's compile command, just as on an installed worker/client.
+        self.start_local(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
+        profdata, ccache = shutil.which('llvm-profdata'), shutil.which('ccache')
+        if not profdata or not ccache:
+            self.skipTest('llvm-profdata and ccache required')
+        (self.work/'training.c').write_text('int main(void) { return 0; }\n')
+        training = self.command(['-fprofile-generate', 'training.c', '-o', 'training'], False)
+        self.assertEqual(training.returncode, 0, training.stderr)
+        subprocess.run([str(self.work/'training')], cwd=self.work, check=True,
+                       env=dict(self.env, LLVM_PROFILE_FILE=str(self.work/'training.profraw')))
+        subprocess.run([profdata, 'merge', 'training.profraw', '-o', 'training.profdata'],
+                       cwd=self.work, check=True, capture_output=True)
+        profile = '-fprofile-use='+str(self.work/'training.profdata')
+        sources = {'first.c': 'int first(void) { return 1; }\n',
+                   'second.c': 'int second(void) { return 2; }\n'}
+        for name, content in sources.items():
+            (self.work/name).write_text(content)
+            for flags in ([profile, '-E'], ['-E', profile]):
+                expected = self.command([*flags, '-o', 'result.i', name], False)
+                self.assertEqual(expected.returncode, 0, expected.stderr)
+                data = (self.work/'result.i').read_bytes()
+                (self.work/'result.i').unlink()
+                result = self.command([*flags, '-o', 'result.i', name])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.work/'result.i').is_file(), result.stderr)
+                self.assertEqual((self.work/'result.i').read_bytes(), data)
+                self.assertEqual((self.work/name).read_text(), content)
+        wrappers = self.work/'wrappers'
+        wrappers.mkdir()
+        compiler = Path(self.compiler).name
+        (wrappers/compiler).symlink_to(self.build/'distcc')
+        self.env.pop('CCACHE_DISABLE', None)
+        self.env.update(CCACHE_DIR=str(self.work/'ccache'),
+                        CCACHE_CONFIGPATH=str(self.work/'ccache.conf'),
+                        CCACHE_LOGFILE=str(self.work/'ccache.log'),
+                        DISTCC_VERBOSE='0',
+                        PATH=str(wrappers)+os.pathsep+str(Path(self.compiler).parent)+
+                             os.pathsep+self.env['PATH'])
+        for repetition in range(2):
+            for name in sources:
+                args = [profile, '-c', name, '-o', 'result.o', '-MMD', '-MF', 'result.d']
+                expected = self.command(args, False)
+                self.assertEqual(expected.returncode, 0, expected.stderr)
+                artifacts = [(self.work/f).read_bytes() for f in ('result.o', 'result.d')]
+                try:
+                    result = subprocess.run([ccache, compiler, *args], cwd=self.work,
+                                            env=self.env, capture_output=True, timeout=30)
+                except subprocess.TimeoutExpired as error:
+                    error.add_note((self.work/'client.log').read_text()[-2400:])
+                    error.add_note((self.work/'ccache.log').read_text()[-1800:])
+                    raise
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([(self.work/f).read_bytes() for f in ('result.o', 'result.d')],
+                                 artifacts)
+                self.assertEqual(result.stderr, expected.stderr)
+        self.assertEqual((self.work/'ccache.log').read_text().count('Result: direct_cache_hit'), 2)
 
     def test_driver_alias_preserves_target_and_explicit_overrides(self):
         self.start_local()

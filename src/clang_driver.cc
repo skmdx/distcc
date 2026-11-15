@@ -82,6 +82,14 @@ public:
         compiler = std::move(invocation);
     }
     const std::string &executable() const { return command.front(); }
+    llvm::opt::InputArgList parseArguments(llvm::ArrayRef<const char *> raw, bool &error) const {
+        if (driver) return driver->ParseArgStrings(raw, true, error);
+        unsigned index = 0, count = 0;
+        auto args = clang::getDriverOptTable().ParseArgs(
+            raw, index, count, llvm::opt::Visibility(clang::options::CC1Option));
+        error = count != 0;
+        return args;
+    }
     bool valid() const {
         return compilation && !compilation->containsError() && !diagnostics->hasErrorOccurred();
     }
@@ -196,9 +204,12 @@ extern "C" int dcc_clang_inputs(char **argv, char ***normalized, char ***files) 
         for (const auto &job : plan.compilation->getJobs())
             for (const auto &input : job.getInputInfos())
                 if (input.isFilename()) used.insert(absolute(input.getFilename()));
-    unsigned missing_index = 0, missing_count = 0;
-    auto args = clang::getDriverOptTable().ParseArgs(raw, missing_index, missing_count);
-    if (missing_count) return -1;
+    // The shared table also contains other driver dialects: DXC's -E takes
+    // an entry-point operand, whereas Clang's -E requests preprocessing.
+    // Use the same dialect as the driver that selected the actual inputs.
+    bool error = false;
+    auto args = plan.parseArguments(raw, error);
+    if (error) return -1;
     std::set<unsigned> unused;
     for (const auto *arg : args.filtered(clang::options::OPT_INPUT))
         if (!used.count(absolute(arg->getValue()))) unused.insert(arg->getIndex() + 1);
