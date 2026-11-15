@@ -372,7 +372,12 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                             env=rust_env, text=True, timeout=REMOTE_TIMEOUT)
         assert rust.returncode == 0, (rust.stdout + rust.stderr,
             (root/'client.log').read_text()[-6000:] if (root/'client.log').exists() else '')
-        assert 'distcc-rust: compiled on ' in rust.stderr, rust.stderr
+        distributed = os.environ.get('VALIDATE_DISTCC_RUST_ROUTE', 'remote') == 'remote'
+        if distributed:
+            assert 'distcc-rust: compiled on ' in rust.stderr, rust.stderr
+        else:
+            assert 'distcc-rust: local: worker has no matching Rust toolchain' in rust.stderr, rust.stderr
+            assert 'distcc-rust: compiled on ' not in rust.stderr, rust.stderr
         subprocess.run([rustc, '--crate-name=rust_test', '--crate-type=rlib', '-Ctarget-cpu=native',
                         '--emit=llvm-ir=' + str(local_ir), str(source)],
                        env=rust_env, check=True, capture_output=True, timeout=90)
@@ -387,5 +392,5 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         subprocess.run([executable], check=True, timeout=10)
         results['rustc'] = {'compiler': rustc,
                            'version': subprocess.check_output([rustc, '-V'], text=True).strip(),
-                           'distributed': True, 'executed': True, 'native_cpu_matched': True}
+                           'distributed': distributed, 'executed': True, 'native_cpu_matched': True}
     print(json.dumps({'compilers': results, 'wrapper': str(wrapper.resolve()), 'fallback': False}))

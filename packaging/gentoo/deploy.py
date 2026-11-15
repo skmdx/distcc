@@ -317,54 +317,89 @@ def validate(target, work):
     print(f"{target['name']}: C/C++ and Rust remote compilation and execution passed", flush=True)
 
 
-def validate_rust_cluster(targets, work):
+def validate_rust_cluster(targets, work, inventory):
     def path(target):
         return target['temporary'] + '/distcc-rust-cluster-check'
 
     try:
         parallel(targets, lambda target: transfer(
             [str(ROOT / 'packaging/gentoo'/name) for name in VALIDATION_FILES], path(target), target))
-        # Exercise every client against each worker concurrently. Self tests
-        # alone miss cross-architecture, access-control and input-budget errors.
+        # Exercise every installed build/architecture against each worker.
+        # A foreign architecture may lack a matching build; verify its explicit
+        # pre-execution local route rather than running an incompatible rustc.
+        clients = {}
+        for client, compilers in inventory:
+            for compiler in compilers:
+                clients.setdefault((compiler['host'], compiler['digest']), (client, compiler))
         for worker in targets:
-            def validate_client(client):
-                name = client['name'] + '-to-' + worker['name']
+            requested = list({json.dumps(compiler['identity'], sort_keys=True): compiler['identity']
+                              for _, compiler in clients.values()}.values())
+            available = json.loads(run(['python3', '-c', '''import json, runpy, shutil, sys
+helper = runpy.run_path(shutil.which('distcc-rust'))
+print(json.dumps([identity for identity in json.loads(sys.argv[1])
+                  if next(helper['worker_compilers'](identity), None) is not None]))
+''', json.dumps(requested)], worker))
+            def validate_client(item):
+                client, compiler = item
+                expected = 'remote' if compiler['identity'] in available else 'local'
+                name = client['name'] + '-' + compiler['digest'][:12] + '-to-' + worker['name']
                 with (work / ('rust-' + name + '.log')).open('w') as log:
                     bounded(['env', 'TMPDIR=' + client['temporary'],
                              'VALIDATE_DISTCC_HOSTS=' + worker['server_hosts'],
+                             'VALIDATE_DISTCC_RUSTC=' + compiler['root'] + '/bin/rustc',
+                             'VALIDATE_DISTCC_RUST_ROUTE=' + expected,
                              'python3', '-B', path(client) + '/validate-installed.py', '--rust-only'],
                             client, 'rust-' + worker['name'], log)
-                print(f'Rust {name}: distributed compilation and execution passed', flush=True)
-            parallel(targets, validate_client)
+                print(f'Rust {name}: {expected} compilation and execution passed', flush=True)
+            # Several slots can belong to one client; bounded() uses one unit
+            # per client/worker, so keep those slots sequential on that client.
+            def validate_slots(client):
+                for item in clients.values():
+                    if item[0] == client:
+                        validate_client(item)
+            parallel(targets, validate_slots)
     finally:
         parallel(targets, lambda target: run(['sudo', '-n', 'rm', '-rf', '--', path(target)], target))
 
 
 def distribute_rust_compilers(targets, work):
-    """Keep selected native toolchains available to peers without changing PATH."""
+    """Share all installed Rust slots with native peers without changing PATH."""
     def inspect(target):
-        info = json.loads(run(['python3', '-c', '''import hashlib, json, pathlib, shutil, subprocess
-compiler = pathlib.Path(shutil.which('rustc')).resolve()
-root = compiler.parent.parent
-version = subprocess.check_output([compiler, '-vV'], text=True)
-host = dict(line.split(': ', 1) for line in version.splitlines()[1:] if ': ' in line)['host']
-digest = hashlib.sha256()
-files = [compiler, *sorted((root / 'lib').glob('librustc_driver*')),
-         *sorted((root / 'lib/rustlib' / host / 'codegen-backends').glob('*'))]
-for path in files:
-    if path.is_file():
-        digest.update(path.name.encode() + b'\\0')
-        with path.open('rb') as stream:
-            digest.update(hashlib.file_digest(stream, 'sha256').digest())
-print(json.dumps(dict(root=str(root), host=host, digest=digest.hexdigest())))
+        info = json.loads(run(['python3', '-c', '''import glob, hashlib, json, pathlib, shutil, subprocess
+paths = [shutil.which('rustc'), *glob.glob('/usr/lib/rust/*/bin/rustc'),
+         *glob.glob('/opt/rust-bin-*/bin/rustc')]
+result = []
+for compiler in dict.fromkeys(pathlib.Path(p).resolve() for p in paths if p):
+    root = compiler.parent.parent
+    if root.name.startswith('rust-distcc-'):
+        continue
+    version = subprocess.check_output([compiler, '-vV'], text=True)
+    lines = version.splitlines()
+    fields = dict(line.split(': ', 1) for line in lines[1:] if ': ' in line)
+    host = fields['host']
+    identity = dict(version=lines[0], commit=fields['commit-hash'], llvm=fields['LLVM version'])
+    digest = hashlib.sha256()
+    files = [compiler, *sorted((root / 'lib').glob('librustc_driver*')),
+             *sorted((root / 'lib/rustlib' / host / 'codegen-backends').glob('*'))]
+    for path in files:
+        if path.is_file():
+            digest.update(path.name.encode() + b'\\0')
+            with path.open('rb') as stream:
+                digest.update(hashlib.file_digest(stream, 'sha256').digest())
+    result.append(dict(root=str(root), host=host, digest=digest.hexdigest(), identity=identity))
+if not result:
+    raise RuntimeError('no installed Rust slot found')
+print(json.dumps(result))
 '''], target))
         return target, info
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets) or 1) as pool:
         inventory = list(pool.map(inspect, targets))
-    for identity in dict.fromkeys(info['digest'] for _, info in inventory):
-        source, info = next(item for item in inventory if item[1]['digest'] == identity)
-        peers = [target for target, other in inventory
-                 if other['host'] == info['host'] and other['digest'] != identity]
+    slots = [(target, info) for target, compilers in inventory for info in compilers]
+    for identity in dict.fromkeys(info['digest'] for _, info in slots):
+        source, info = next(item for item in slots if item[1]['digest'] == identity)
+        peers = [target for target, compilers in inventory
+                 if compilers[0]['host'] == info['host'] and
+                 not any(other['digest'] == identity for other in compilers)]
         if not peers:
             continue
         destination = '/opt/rust-distcc-' + identity
@@ -398,7 +433,9 @@ print(json.dumps(ready))
             run([destination + '/bin/rustc', '-vV'], target)
         parallel(peers, install_peer)
         shutil.rmtree(stage)
-    print('Rust: selected native compilers available on matching worker architectures', flush=True)
+    (work / 'rust-inventory.json').write_text(json.dumps(inventory, indent=2) + '\n')
+    print('Rust: all installed slots available on matching worker architectures', flush=True)
+    return inventory
 
 
 def validate_thinlto_cluster(targets, work):
@@ -444,7 +481,7 @@ def main():
                 run(['sudo', '-n', 'true'], target)
             paused = {target['name']: builds_to_pause(target) for target in targets}
             distribute_sources(settings, version, ebuild, targets, work)
-            distribute_rust_compilers(targets, work)
+            rust_inventory = distribute_rust_compilers(targets, work)
             for target in targets:
                 names = paused[target['name']]
                 if names:
@@ -457,7 +494,7 @@ def main():
                 validate(target, work)
             rollout(targets, lambda target: prepare(target, version, ebuild, work, settings['cross']),
                     deploy_target)
-            validate_rust_cluster(targets, work)
+            validate_rust_cluster(targets, work, rust_inventory)
             validate_thinlto_cluster(targets, work)
             for target in targets:
                 if target['name'] in resume:

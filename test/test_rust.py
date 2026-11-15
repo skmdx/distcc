@@ -13,6 +13,7 @@ import struct
 import sys
 import time
 import unittest
+from unittest import mock
 
 from test_broker import BrokerTestCase
 
@@ -1024,7 +1025,7 @@ pub fn read_only() -> bool {
         with self.assertRaises(helper['LocalOnly']):
             helper['metadata'](job, inputs, self.work)
 
-    def test_worker_accepts_different_build_metadata_when_artifact_links(self):
+    def test_worker_refuses_unknown_build_without_compiling(self):
         helper = runpy.run_path(str(self.build / 'distcc-rust'))
         source = self.work / 'version.rs'
         source.write_text('pub fn answer() -> u32 { 1 }')
@@ -1037,21 +1038,18 @@ pub fn read_only() -> bool {
         result = subprocess.run([str(self.build / 'distcc'), '--file-job', str(metadata),
                                  str(snapshots), str(artifact)], env=self.env,
                                 capture_output=True, text=True, timeout=90)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('distcc-rust: compiled on', result.stderr)
-        helper['install_outputs'](artifact, job, outdir, outputs, self.work)
-        main = self.work / 'main.rs'
-        main.write_text('fn main() { assert_eq!(version::answer(), 1); }')
-        executable = self.work / 'linked'
-        result = self.rust(main, '--extern', 'version=' + str(output), '-o', executable, remote=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        subprocess.run([executable], check=True)
+        self.assertEqual(result.returncode, 121, result.stderr)
+        self.assertIn('worker has no matching Rust toolchain', result.stderr)
+        self.assertNotIn('E0514', result.stderr)
+        self.assertFalse(artifact.exists())
+        self.assertFalse(output.exists())
 
-    def test_worker_retries_real_incompatible_metadata_and_links(self):
+    def test_worker_selects_matching_build_without_incompatible_attempt(self):
         helper = runpy.run_path(str(self.build / 'distcc-rust'))
         selected = helper['identity'](self.rustc)[0]
-        alternatives = [path for path in helper['worker_compilers'](selected)
-                        if helper['identity'](path)[0]['version'] != selected['version']]
+        alternatives = [path for root in (Path('/usr/lib/rust'), Path('/opt'))
+                        for path in root.glob('*/bin/rustc')
+                        if helper['identity'](path)[0] != selected]
         if not alternatives:
             self.skipTest('a second Rust metadata version is required')
         incompatible = alternatives[0]
@@ -1066,9 +1064,6 @@ pub fn read_only() -> bool {
                 job, inputs, outdir, outputs = helper['plan'](self.rustc,
                     ['--crate-name=metadata', '--crate-type=rlib', '--error-format=' + diagnostic,
                      '--color=always', str(source), '-o', str(output)], work)
-                # Prefer an actual, incompatible compiler. The source compiler's
-                # identity is only a ranking hint; rustc must judge the inputs.
-                job['compiler'] = helper['identity'](incompatible)[0]
                 metadata, snapshots = helper['metadata'](job, inputs, work)
                 artifact = work / 'result.tar'
                 command = [str(self.build / 'distcc'), '--file-job', str(metadata),
@@ -1076,8 +1071,16 @@ pub fn read_only() -> bool {
                 self.restart_server(self.build / 'distccd', DISTCCD_RUSTC=str(incompatible))
                 result = subprocess.run(command, env=self.env, capture_output=True,
                                         text=True, timeout=90)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn('E0514', result.stderr)
+                self.assertEqual(result.returncode, 121, result.stderr)
+                self.assertNotIn('E0514', result.stderr)
+                self.assertFalse(artifact.exists())
+                # Capability refusal is a deliberate local route even with
+                # DISTCC_FALLBACK=0; compilation errors still remain failures.
+                result = self.rust('--crate-name=metadata', '--crate-type=rlib',
+                                   source, '-o', output)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('local: worker has no matching Rust toolchain', result.stderr)
+                self.assertNotIn('compiled on', result.stderr)
                 self.restart_server(self.build / 'distccd',
                                     DISTCCD_RUSTC=os.pathsep.join((str(incompatible), self.rustc)))
                 result = subprocess.run(command, env=self.env, capture_output=True,
@@ -1093,6 +1096,30 @@ pub fn read_only() -> bool {
                                    '-o', executable, remote=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 subprocess.run([executable], check=True, timeout=5)
+
+                # A matching identity is necessary, not permission to hide a
+                # real compiler rejection (for example mixed dependency builds).
+                job['compiler'] = helper['identity'](incompatible)[0]
+                mixed = work / 'mixed'
+                mixed.mkdir()
+                metadata, snapshots = helper['metadata'](job, inputs, mixed)
+                artifact.unlink()
+                result = subprocess.run([str(self.build/'distcc'), '--file-job', str(metadata),
+                                         str(snapshots), str(artifact)], env=self.env, capture_output=True,
+                                        text=True, timeout=90)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('E0514', result.stderr)
+                self.assertFalse(artifact.exists())
+
+    def test_worker_build_identity_is_not_release_number(self):
+        helper = runpy.run_path(str(self.build / 'distcc-rust'))
+        selected = helper['identity'](self.rustc)[0]
+        vendor = dict(selected, version=selected['version'] + ' (vendor)')
+        select = helper['worker_compilers']
+        with mock.patch.dict(os.environ, DISTCCD_RUSTC=self.rustc), \
+             mock.patch.dict(select.__globals__, identity=lambda path: (vendor, 'host')):
+            self.assertEqual(list(select(selected)), [])
+            self.assertEqual(list(select(vendor)), [Path(self.rustc).resolve()])
 
     def test_worker_does_not_retry_source_errors(self):
         helper = runpy.run_path(str(self.build / 'distcc-rust'))

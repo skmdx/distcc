@@ -308,44 +308,19 @@ def metadata(job, inputs, work):
 
 
 def worker_compilers(requested):
-    # Prefer the client's build, but let rustc and the eventual client link
-    # decide compatibility. Version/LLVM differences are not rejection gates.
-    # Executables still come from administrator-installed toolchains.
+    # Rust metadata is build-specific, including vendor builds of the same
+    # release. Only administrator-installed, matching builds may consume it.
     configured = os.environ.get('DISTCCD_RUSTC')
     candidates = configured.split(os.pathsep) if configured else [shutil.which('rustc')]
     if not configured:
         candidates += glob.glob('/usr/lib/rust/*/bin/rustc') + glob.glob('/opt/rust-*/bin/rustc')
-    ranked = []
     for candidate in dict.fromkeys(Path(p).resolve() for p in candidates if p):
         try:
             actual = identity(candidate)[0]
-            score = (actual == requested, actual['commit'] == requested['commit'],
-                     actual['version'] == requested['version'],
-                     actual['llvm'] == requested['llvm'])
             if actual == requested:
-                # Keep the common case to one compiler query. Discover other
-                # candidates only if rustc rejects the input metadata.
                 yield candidate
-            else:
-                ranked.append((score, candidate))
         except (OSError, subprocess.CalledProcessError):
             continue
-    for _, candidate in sorted(ranked, key=lambda item: item[0], reverse=True):
-        yield candidate
-
-
-def incompatible_metadata(diagnostics):
-    for line in diagnostics:
-        if line.startswith(b'{'):
-            try:
-                code = json.loads(line).get('code')
-            except (ValueError, AttributeError):
-                continue
-            if isinstance(code, dict) and code.get('code') == 'E0514':
-                return True
-        elif b'error[E0514]' in line:
-            return True
-    return False
 
 
 def worker(root, archive):
@@ -406,34 +381,15 @@ def worker(root, archive):
     # Let bwrap create mount points, then protect shared input inodes. This
     # remount is nonrecursive: output, /tmp and native markers stay writable.
     directory = rooted(str(output))
-    result = None
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        for compiler in worker_compilers(job['compiler']):
-            if result is not None:
-                for path in directory.iterdir():
-                    if path.is_dir() and not path.is_symlink():
-                        shutil.rmtree(path)
-                    else:
-                        path.unlink()
-            for stream in (stdout, stderr):
-                stream.seek(0)
-                stream.truncate()
-            if native is not None:
-                for name in ('cpu-used', 'features-used'):
-                    (profile / name).unlink(missing_ok=True)
-            result = subprocess.run([*sandbox, '--ro-bind', str(compiler.parent.parent),
-                CONTROL + '/compiler', '--remount-ro', '/',
-                CONTROL + '/compiler/bin/rustc', *job['args']], stdout=stdout, stderr=stderr)
-            stderr.seek(0)
-            if result.returncode == 0 or not incompatible_metadata(stderr):
-                break
-        if result is None:
-            raise LocalOnly('no worker Rust compiler is installed')
-        # Do not publish failed attempts' artifact notifications or diagnostics.
-        for source, destination in ((stdout, sys.stdout.buffer), (stderr, sys.stderr.buffer)):
-            source.seek(0)
-            shutil.copyfileobj(source, destination)
-            destination.flush()
+    compiler = next(worker_compilers(job['compiler']), None)
+    if compiler is None:
+        # EXIT_LOCAL_COMPILE: no compiler has run and no result exists. This is
+        # a capability refusal, not a failed compile eligible for retry.
+        print('distcc-rust: worker has no matching Rust toolchain', file=sys.stderr)
+        return 121
+    result = subprocess.run([*sandbox, '--ro-bind', str(compiler.parent.parent),
+        CONTROL + '/compiler', '--remount-ro', '/',
+        CONTROL + '/compiler/bin/rustc', *job['args']])
     if result.returncode:
         return result.returncode if result.returncode > 0 else 128 - result.returncode
     if native is not None and not all((profile / (name + '-used')).exists()
@@ -502,6 +458,8 @@ def client(compiler, args):
             result = subprocess.run([transport, '--file-job', str(description), str(snapshots),
                                      str(work / 'result.tar')], env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode == 121:  # EXIT_LOCAL_COMPILE, before compilation
+                raise LocalOnly('worker has no matching Rust toolchain')
             if (result.returncode and os.environ.get('DISTCC_FALLBACK') != '0'
                     and os.environ.get('DISTCC_SKIP_LOCAL_RETRY') != '1'):
                 raise LocalOnly('worker compilation failed; retrying locally')

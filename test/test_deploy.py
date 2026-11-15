@@ -20,6 +20,32 @@ deploy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(deploy)
 
 class RustDistributionTest(unittest.TestCase):
+    def test_inventory_collects_slots_once_and_never_redistributes_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            slots = [root/name for name in ('native', 'rust-bin-release', 'rust-distcc-copy')]
+            for slot in slots:
+                (slot/'bin').mkdir(parents=True)
+                compiler = slot/'bin/rustc'
+                compiler.write_text('#!/bin/sh\nprintf "rustc test\\ncommit-hash: commit\\nhost: arch\\nLLVM version: llvm\\n"\n')
+                compiler.chmod(0o700)
+            def run(args, target=None, **kwargs):
+                self.assertEqual(args[:2], ['python3', '-c'])
+                def paths(pattern):
+                    return [str(slots[0]/'bin/rustc')] if pattern.startswith('/usr/lib') else [
+                        str(slots[1]/'bin/rustc'), str(slots[0]/'bin/rustc')]
+                output = io.StringIO()
+                with mock.patch('glob.glob', side_effect=paths), \
+                     mock.patch('shutil.which', return_value=str(slots[2]/'bin/rustc')), \
+                     contextlib.redirect_stdout(output):
+                    exec(args[2], {})
+                return output.getvalue()
+            with mock.patch.object(deploy, 'run', side_effect=run):
+                inventory = deploy.distribute_rust_compilers([{'name': 'worker'}], root)
+            self.assertEqual([info['root'] for info in inventory[0][1]],
+                             [str(slots[0]), str(slots[1])])
+            self.assertEqual(inventory[0][1][0]['identity']['commit'], 'commit')
+
     def test_parallel_inventory_skips_installed_and_only_stages_missing(self):
         targets = [{'name': 'first'}, {'name': 'second'}]
         for installed in (True, False):
@@ -32,7 +58,8 @@ class RustDistributionTest(unittest.TestCase):
                         if len(args) == 3:
                             barrier.wait()  # Serial inventory would time out.
                             name = target['name']
-                            return json.dumps(dict(root='/toolchain/' + name, host='test-arch', digest=name))
+                            return json.dumps([dict(root='/toolchain/' + name, host='test-arch', digest=name),
+                                               dict(root='/toolchain/common', host='test-arch', digest='common')])
                         # Exercise the actual presence/-vV probe locally.
                         root = Path(directory)/target['name']
                         compiler = root/'bin/rustc'
@@ -50,7 +77,7 @@ class RustDistributionTest(unittest.TestCase):
                     self.assertEqual(sum(args[0] == 'rsync' for args, _ in transfers), 2)
                     self.assertEqual(sum(args[:3] == ['sudo', '-n', 'rsync'] for args, _ in transfers), 2)
                     self.assertEqual(sum(args[-1] == '-vV' for args, _ in transfers), 2)
-                self.assertFalse(list(Path(directory).glob('rust-*')))
+                self.assertFalse([path for path in Path(directory).glob('rust-*') if path.is_dir()])
 
 
 class TimeoutEvidenceTest(unittest.TestCase):
