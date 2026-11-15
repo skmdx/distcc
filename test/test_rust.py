@@ -570,6 +570,33 @@ class RustTest(BrokerTestCase):
         self.assertIn('distcc-rust: compiled on', result.stderr)
         self.assertNotIn('failed to connect to jobserver', result.stderr)
 
+    def test_repeated_crate_types_keep_native_archive_on_client(self):
+        source = self.work / 'combined.rs'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        for types in (['--crate-type=staticlib', '--crate-type=rlib'],
+                      ['--crate-type', 'rlib', '--crate-type', 'staticlib'],
+                      ['--crate-type=staticlib,rlib']):
+            with self.subTest(types=types):
+                result = self.rust(*types, source, '--out-dir', self.work)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-rust: local:', result.stderr)
+                self.assertNotIn('distcc-rust: compiled on', result.stderr)
+                for name in ('libcombined.a', 'libcombined.rlib'):
+                    output = self.work / name
+                    self.assertGreater(output.stat().st_size, 0)
+                    output.unlink()
+
+    def test_worker_rejects_native_action_hidden_by_later_crate_type(self):
+        helper = runpy.run_path(str(self.build / 'distcc-rust'))
+        control = self.work / '__distcc_rust'
+        control.mkdir()
+        for kind in ('staticlib', 'cdylib', 'proc-macro', 'bin'):
+            with self.subTest(kind=kind):
+                (control / 'job.json').write_text(json.dumps({
+                    'args': ['--crate-type=' + kind, '--crate-type=rlib']}))
+                with self.assertRaisesRegex(helper['LocalOnly'], 'native linking'):
+                    helper['worker'](self.work, self.work / 'unused.tar')
+
     def test_proc_macro_stays_local(self):
         source = self.work / 'macros.rs'
         source.write_text('extern crate proc_macro; use proc_macro::TokenStream; '
