@@ -362,6 +362,7 @@ print(json.dumps([identity for identity in json.loads(sys.argv[1])
             parallel(targets, validate_slots)
     finally:
         parallel(targets, lambda target: run(['sudo', '-n', 'rm', '-rf', '--', path(target)], target))
+    return len(clients) * len(targets if workers is None else workers)
 
 
 def distribute_rust_compilers(targets, work):
@@ -542,7 +543,7 @@ def main():
                 validate(target, work)
             rollout(targets, lambda target: prepare(target, version, ebuild, work, settings['cross']),
                     deploy_target)
-            validate_rust_cluster(targets, work, rust_inventory)
+            rust_pairs = validate_rust_cluster(targets, work, rust_inventory)
             validate_thinlto_cluster(targets, work)
             for target in targets:
                 if target['name'] in resume:
@@ -557,7 +558,7 @@ def main():
             if (work / 'binpkgs').exists():
                 run(['sudo', '-n', 'rm', '-r', '--', work / 'binpkgs'])
             (work / 'result.json').write_text(json.dumps({'version': version, 'success': True,
-                                                        'rust_pairs': len(targets) ** 2,
+                                                        'rust_pairs': rust_pairs,
                                                         'thinlto_clients': len(targets),
                                                         'targets': [t['name'] for t in targets]}))
             results = Path(settings['results'])
