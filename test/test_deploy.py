@@ -35,8 +35,14 @@ class RustDistributionTest(unittest.TestCase):
                     return [str(slots[0]/'bin/rustc')] if pattern.startswith('/usr/lib') else [
                         str(slots[1]/'bin/rustc'), str(slots[0]/'bin/rustc')]
                 output = io.StringIO()
+                check_output = subprocess.check_output
+                def output_for(command, **options):
+                    if command[0] == 'ldd':
+                        return ''
+                    return check_output(command, **options)
                 with mock.patch('glob.glob', side_effect=paths), \
                      mock.patch('shutil.which', return_value=str(slots[2]/'bin/rustc')), \
+                     mock.patch('subprocess.check_output', side_effect=output_for), \
                      contextlib.redirect_stdout(output):
                     exec(args[2], {})
                 return output.getvalue()
@@ -58,8 +64,9 @@ class RustDistributionTest(unittest.TestCase):
                         if len(args) == 3:
                             barrier.wait()  # Serial inventory would time out.
                             name = target['name']
-                            return json.dumps([dict(root='/toolchain/' + name, host='test-arch', digest=name),
-                                               dict(root='/toolchain/common', host='test-arch', digest='common')])
+                            return json.dumps([dict(root='/toolchain/' + name, host='test-arch', digest=name,
+                                                    runtime=[dict(name='libLLVM.so', path='/backend/libLLVM.so')]),
+                                               dict(root='/toolchain/common', host='test-arch', digest='common', runtime=[])])
                         # Exercise the actual presence/-vV probe locally.
                         root = Path(directory)/target['name']
                         compiler = root/'bin/rustc'
@@ -74,7 +81,8 @@ class RustDistributionTest(unittest.TestCase):
                 if installed:
                     self.assertEqual(transfers, [])
                 else:
-                    self.assertEqual(sum(args[0] == 'rsync' for args, _ in transfers), 2)
+                    self.assertEqual(sum(args[0] == 'rsync' for args, _ in transfers), 4)
+                    self.assertEqual(sum(args[:2] == ['rsync', '-Lpt'] for args, _ in transfers), 2)
                     self.assertEqual(sum(args[:3] == ['sudo', '-n', 'rsync'] for args, _ in transfers), 2)
                     self.assertEqual(sum(args[-1] == '-vV' for args, _ in transfers), 2)
                 self.assertFalse([path for path in Path(directory).glob('rust-*') if path.is_dir()])

@@ -365,7 +365,7 @@ print(json.dumps([identity for identity in json.loads(sys.argv[1])
 def distribute_rust_compilers(targets, work):
     """Share all installed Rust slots with native peers without changing PATH."""
     def inspect(target):
-        info = json.loads(run(['python3', '-c', '''import glob, hashlib, json, pathlib, shutil, subprocess
+        info = json.loads(run(['python3', '-c', '''import glob, hashlib, json, os, pathlib, re, shutil, subprocess
 paths = [shutil.which('rustc'), *glob.glob('/usr/lib/rust/*/bin/rustc'),
          *glob.glob('/opt/rust-bin-*/bin/rustc')]
 result = []
@@ -378,15 +378,25 @@ for compiler in dict.fromkeys(pathlib.Path(p).resolve() for p in paths if p):
     fields = dict(line.split(': ', 1) for line in lines[1:] if ': ' in line)
     host = fields['host']
     identity = dict(version=lines[0], commit=fields['commit-hash'], llvm=fields['LLVM version'])
+    # System-LLVM Rust builds may use a different LLVM ABI from the peer's
+    # installed LLVM (for example libc++ versus libstdc++). Preserve the exact
+    # loaded backend in the compiler's existing $ORIGIN/../lib search path.
+    loaded = subprocess.check_output(['ldd', str(compiler)], text=True,
+                                     env=dict(os.environ, LC_ALL='C'))
+    runtime = [dict(name=name, path=path) for name, path in
+               re.findall(r'^\\s*(libLLVM\\S*) => (/\\S+)', loaded, re.M)
+               if not pathlib.Path(path).resolve().is_relative_to(root)]
     digest = hashlib.sha256()
     files = [compiler, *sorted((root / 'lib').glob('librustc_driver*')),
-             *sorted((root / 'lib/rustlib' / host / 'codegen-backends').glob('*'))]
+             *sorted((root / 'lib/rustlib' / host / 'codegen-backends').glob('*')),
+             *(pathlib.Path(item['path']) for item in runtime)]
     for path in files:
         if path.is_file():
             digest.update(path.name.encode() + b'\\0')
             with path.open('rb') as stream:
                 digest.update(hashlib.file_digest(stream, 'sha256').digest())
-    result.append(dict(root=str(root), host=host, digest=digest.hexdigest(), identity=identity))
+    result.append(dict(root=str(root), host=host, digest=digest.hexdigest(), identity=identity,
+                       runtime=runtime))
 if not result:
     raise RuntimeError('no installed Rust slot found')
 print(json.dumps(result))
@@ -425,6 +435,9 @@ print(json.dumps(ready))
         # Preserve relative runtime-library links. The compiler and its driver
         # come from the administrator's installed toolchain, never a job upload.
         run(['rsync', '-rlpt', '--exclude=/share', origin, str(stage) + '/'])
+        for library in info['runtime']:
+            origin = (source['ssh'] + ':' if source.get('ssh') else '') + library['path']
+            run(['rsync', '-Lpt', origin, str(stage / 'lib' / library['name'])])
         def install_peer(target):
             run(['sudo', '-n', 'mkdir', '-p', destination], target)
             remote = (target['ssh'] + ':' if target.get('ssh') else '') + destination + '/'
