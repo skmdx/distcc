@@ -385,11 +385,11 @@ for compiler in dict.fromkeys(pathlib.Path(p).resolve() for p in paths if p):
                                      env=dict(os.environ, LC_ALL='C'))
     runtime = [dict(name=name, path=path) for name, path in
                re.findall(r'^\\s*(\\S+) => (/\\S+)', loaded, re.M)
-               if not pathlib.Path(path).resolve().is_relative_to(root)]
-    loaders = re.findall(r'^\\s*(/\\S+) \\(', loaded, re.M)
+               if not name.startswith('/') and not pathlib.Path(path).resolve().is_relative_to(root)]
+    loaders = re.findall(r'^\\s*(/\\S+)(?: => (/\\S+))? \\(', loaded, re.M)
     if len(loaders) != 1:
         raise RuntimeError('Rust ELF loader was not resolved: ' + str(compiler))
-    runtime.append(dict(name='ld.so', path=loaders[0]))
+    runtime.append(dict(name='ld.so', path=loaders[0][1] or loaders[0][0]))
     digest = hashlib.sha256()
     files = [compiler, *sorted((root / 'lib').glob('librustc_driver*')),
              *sorted((root / 'lib/rustlib' / host / 'codegen-backends').glob('*')),

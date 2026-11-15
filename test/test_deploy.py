@@ -40,7 +40,8 @@ class RustDistributionTest(unittest.TestCase):
                 check_output = subprocess.check_output
                 def output_for(command, **options):
                     if command[0] == 'ldd':
-                        return '\tlibdependency.so => ' + str(root/'libdependency.so') + ' (0x1)\n\t' + str(root/'loader') + ' (0x2)\n'
+                        alias = '/lib/interpreter => ' if 'native' in command[1] else ''
+                        return '\tlibdependency.so => ' + str(root/'libdependency.so') + ' (0x1)\n\t' + alias + str(root/'loader') + ' (0x2)\n'
                     return check_output(command, **options)
                 with mock.patch('glob.glob', side_effect=paths), \
                      mock.patch('shutil.which', return_value=str(slots[2]/'bin/rustc')), \
@@ -55,6 +56,7 @@ class RustDistributionTest(unittest.TestCase):
             self.assertEqual(inventory[0][1][0]['identity']['commit'], 'commit')
             self.assertEqual([item['name'] for item in inventory[0][1][0]['runtime']],
                              ['libdependency.so', 'ld.so'])
+            self.assertEqual(inventory[0][1][0]['runtime'], inventory[0][1][1]['runtime'])
 
     def test_parallel_inventory_skips_installed_and_only_stages_missing(self):
         targets = [{'name': 'first'}, {'name': 'second'}]
