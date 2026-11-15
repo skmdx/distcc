@@ -21,6 +21,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @unittest.skipUnless(shutil.which('rustc') and shutil.which('bwrap'), 'rustc and bubblewrap required')
 class RustTest(BrokerTestCase):
+    def test_dependency_parent_traversal_preserves_empty_directories(self):
+        (self.work/'empty'/'bits').mkdir(parents=True)
+        (self.work/'value.rs').write_text('pub fn answer() -> u32 { 42 }')
+        source = self.work/'traversal.rs'
+        source.write_text('#[path="empty/bits/../../value.rs"] mod value; '
+                          'pub fn answer() -> u32 { value::answer() }')
+        output = self.work/'libtraversal.rlib'
+        result = self.rust('--crate-type=rlib', source, '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        main = self.work/'main.rs'
+        main.write_text('fn main() { assert_eq!(traversal::answer(), 42); }')
+        executable = self.work/'main'
+        result = self.rust(main, '--extern', 'traversal='+str(output),
+                           '-o', executable, remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([executable], check=True, timeout=5)
+
+    def test_dependency_symlink_parent_is_not_lexically_rewritten(self):
+        helper = runpy.run_path(str(self.build/'distcc-rust'))
+        (self.work/'target'/'child').mkdir(parents=True)
+        (self.work/'alias').symlink_to('target/child')
+        (self.work/'target'/'value.rs').write_text('actual input')
+        (self.work/'value.rs').write_text('different input')
+        dep = self.work/'probe.d'
+        dep.write_text('out: input\n\n'+str(self.work/'alias/../value.rs')+':\n')
+        with self.assertRaisesRegex(helper['LocalOnly'], 'crosses a symlink'):
+            helper['dependencies'](dep)
+
     def test_source_and_output_below_tmp_survive_worker_isolation(self):
         helper = runpy.run_path(str(self.build/'distcc-rust'))
         source = self.work/'temporary.rs'

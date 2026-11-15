@@ -124,6 +124,7 @@ def dependencies(path):
     # env-dep records name the variables observed by env!/option_env!.
     text = path.read_text()
     files = []
+    directories = set()
     _, separator, records = text.partition('\n\n')
     if not separator:
         raise LocalOnly('rustc did not produce dependency records')
@@ -132,7 +133,23 @@ def dependencies(path):
             continue
         if not record.endswith(':'):
             raise LocalOnly('unsupported dependency record')
-        files.append(absolute(record[:-1].replace('\\ ', ' ')))
+        spelling = Path(os.path.join(os.getcwd(), record[:-1].replace('\\ ', ' ')))
+        name = absolute(spelling)
+        if '..' in spelling.parts:
+            # rustc reuses this spelling when opening the input. Normalizing
+            # the uploaded filename must not remove directories traversed by
+            # "..", even when they contain no dependency files themselves.
+            # A symlink followed by ".." can denote a different file; this
+            # flat snapshot cannot represent that resolution faithfully.
+            if spelling.resolve() != name.resolve():
+                raise LocalOnly('dependency traversal crosses a symlink')
+            for parent in spelling.parents:
+                if parent.name == '..':
+                    directory = parent.parent
+                    if not directory.is_dir():
+                        raise LocalOnly('dependency traversal directory disappeared')
+                    directories.add(str(absolute(directory)))
+        files.append(name)
     if not files:
         raise LocalOnly('rustc did not produce dependency records')
     environment = {}
@@ -141,7 +158,7 @@ def dependencies(path):
             name = line[len('# env-dep:'):].partition('=')[0]
             if name in os.environ:
                 environment[name] = os.environ[name]
-    return files, environment
+    return files, environment, sorted(directories)
 
 
 def plan(compiler, args, work):
@@ -204,7 +221,7 @@ def plan(compiler, args, work):
         raise LocalOnly('dependency expansion failed')
     if any(Path(os.fsdecode(name)).resolve() in libraries for name in loaded.read_bytes().split(b'\0') if name):
         raise LocalOnly('procedural macro executed through a transitive dependency')
-    source_files, environment = dependencies(work / 'probe.d')
+    source_files, environment, directories = dependencies(work / 'probe.d')
     inputs.update(source_files)
     if 'RUSTC_BOOTSTRAP' in os.environ:
         environment['RUSTC_BOOTSTRAP'] = os.environ['RUSTC_BOOTSTRAP']
@@ -241,7 +258,7 @@ def plan(compiler, args, work):
         mapped.append(('-o', str(output / dest.name)))
         outdir = dest.parent
     job = dict(compiler=compiler_id, cwd=os.getcwd(), args=flatten(mapped),
-               environment=environment, output=str(output))
+               environment=environment, output=str(output), directories=directories)
     codegen = dict(v.split('=', 1) for k, v in opts if k == '-C' and '=' in v)
     if codegen.get('target-cpu') == 'native':
         job['native'] = native_profile(compiler, compiler_id, work)
@@ -342,6 +359,8 @@ def worker(root, archive):
         if not path.is_absolute() or '..' in path.parts or (path == output and str(path) == '/'):
             raise LocalOnly('invalid worker path')
         (root / str(path).lstrip('/')).mkdir(parents=True, exist_ok=True)
+    for name in job.get('directories', []):
+        rooted(name).mkdir(parents=True, exist_ok=True)
     # Bypass user PATH wrappers: namespace isolation and separate diagnostic
     # streams are part of the worker contract.
     sandbox = [shutil.which('bwrap', path=os.defpath) or '/usr/bin/bwrap',
