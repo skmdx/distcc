@@ -320,6 +320,23 @@ class FileCacheTest(unittest.TestCase):
 
 
 class GccFrontendTest(BrokerTestCase):
+    def test_main_input_below_absolute_symlink_ancestor(self):
+        self.start_frontend()
+        source = self.root/(self._testMethodName+'-source')
+        (source/'src').mkdir(parents=True)
+        (source/'src'/'unit.c').write_text('int value(void) { return 42; }\n')
+        (self.work/'_deps').mkdir()
+        alias = self.work/'_deps'/'source'
+        alias.symlink_to(source, target_is_directory=True)
+        command = [self.cc, '-nostdinc', '-I'+str(alias/'src'), '-c',
+                   str(alias/'src'/'unit.c'), '-o', str(self.work/'out.o')]
+        subprocess.run(command, cwd=self.work, check=True, capture_output=True)
+        expected = (self.work/'out.o').read_bytes()
+        for _ in range(2):
+            (self.work/'out.o').unlink()
+            self.compile(command)
+            self.assertEqual((self.work/'out.o').read_bytes(), expected)
+
     worker_address = '127.0.0.1'
 
     def test_planner_preloads_default_scan_plugin_in_parent(self):

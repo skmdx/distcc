@@ -449,7 +449,11 @@ Entry &node(Files &fs, fuse_ino_t inode) {
     return *entry;
 }
 void initialize(void *, struct fuse_conn_info *connection) {
-    connection->want |= connection->capable & FUSE_CAP_CACHE_SYMLINKS;
+    // Absolute targets gain the private mount prefix in read_link(), while
+    // lookup still returns client metadata. Kernels using page_get_link()
+    // truncate cached symlinks to that original st_size. Files already pins
+    // each link's reply for the job; leave kernel symlink caching disabled.
+    connection->want &= ~FUSE_CAP_CACHE_SYMLINKS;
     connection->want |= connection->capable & FUSE_CAP_OVER_IO_URING;
 }
 void attributes(Files &fs, const Entry &entry, struct stat &st) {
