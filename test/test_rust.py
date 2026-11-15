@@ -577,11 +577,12 @@ class RustTest(BrokerTestCase):
                       ['--crate-type', 'rlib', '--crate-type', 'staticlib'],
                       ['--crate-type=staticlib,rlib']):
             with self.subTest(types=types):
-                result = self.rust(*types, source, '--out-dir', self.work)
+                result = self.rust(*types, '--emit=link', '--emit=dep-info',
+                                   source, '--out-dir', self.work)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('distcc-rust: local:', result.stderr)
                 self.assertNotIn('distcc-rust: compiled on', result.stderr)
-                for name in ('libcombined.a', 'libcombined.rlib'):
+                for name in ('libcombined.a', 'libcombined.rlib', 'combined.d'):
                     output = self.work / name
                     self.assertGreater(output.stat().st_size, 0)
                     output.unlink()
@@ -593,9 +594,28 @@ class RustTest(BrokerTestCase):
         for kind in ('staticlib', 'cdylib', 'proc-macro', 'bin'):
             with self.subTest(kind=kind):
                 (control / 'job.json').write_text(json.dumps({
-                    'args': ['--crate-type=' + kind, '--crate-type=rlib']}))
+                    'args': ['--crate-type=' + kind, '--crate-type=rlib',
+                             '--emit=link', '--emit=dep-info']}))
                 with self.assertRaisesRegex(helper['LocalOnly'], 'native linking'):
                     helper['worker'](self.work, self.work / 'unused.tar')
+
+    def test_repeated_emits_preserve_remote_outputs(self):
+        source = self.work / 'emissions.rs'
+        source.write_text('pub fn answer() -> u32 { 42 }')
+        library, deps = self.work / 'libemissions.rlib', self.work / 'emissions.d'
+        for emits in (['--emit=link', '--emit=dep-info=' + str(deps)],
+                      ['--emit=dep-info=' + str(deps), '--emit=link']):
+            with self.subTest(emits=emits):
+                args = ['--crate-type=rlib', *emits, str(source), '-o', str(library)]
+                result = self.rust(*args, remote=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = [path.read_bytes() for path in (library, deps)]
+                library.unlink()
+                deps.unlink()
+                result = self.rust(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-rust: compiled on', result.stderr)
+                self.assertEqual([path.read_bytes() for path in (library, deps)], expected)
 
     def test_proc_macro_stays_local(self):
         source = self.work / 'macros.rs'
