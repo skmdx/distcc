@@ -496,6 +496,9 @@ directory on peers of the same compiler host architecture, preserving the user's
 selected compiler. Existing distributed copies are not source slots.
 System-linked LLVM backends are copied into the toolchain's library directory
 and included in its digest; the compiler's existing loader search path is retained.
+Distribution verifies every transferred byte, flushes the complete tree, then
+writes a durable completion marker. Workers ignore digest-named copies without
+that marker; interrupted or older unmarked copies are revalidated on deployment.
 A foreign architecture without the matching build declines the job; identical release
 numbers alone do not establish compatibility. Rust checks require worker addresses reachable from all clients
 in `server_hosts`. Source archives are fetched and verified locally,

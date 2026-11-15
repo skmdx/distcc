@@ -415,10 +415,13 @@ print(json.dumps(result))
         destination = '/opt/rust-distcc-' + identity
         def needs_install(target):
             return not json.loads(run(['python3', '-c', '''import json, pathlib, subprocess, sys
-compiler = pathlib.Path(sys.argv[1]) / 'bin/rustc'
+root = pathlib.Path(sys.argv[1])
+compiler = root / 'bin/rustc'
 try:
-    ready = compiler.is_file() and subprocess.run([compiler, '-vV'],
+    ready = ((root / '.distcc-complete').read_text().strip() == root.name.removeprefix('rust-distcc-')
+        and compiler.is_file() and subprocess.run([compiler, '-vV'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    )
 except OSError:
     ready = False
 print(json.dumps(ready))
@@ -440,10 +443,28 @@ print(json.dumps(ready))
             run(['rsync', '-Lpt', origin, str(stage / 'lib' / library['name'])])
         def install_peer(target):
             run(['sudo', '-n', 'mkdir', '-p', destination], target)
+            run(['sudo', '-n', 'rm', '-f', destination + '/.distcc-complete'], target)
             remote = (target['ssh'] + ':' if target.get('ssh') else '') + destination + '/'
             prefix = ['rsync', '--rsync-path=sudo -n rsync'] if target.get('ssh') else ['sudo', '-n', 'rsync']
-            run([*prefix, '-rlpt', str(stage) + '/', remote])
+            # Recheck all bytes after an interrupted deployment, including files
+            # whose size and timestamp already match. No worker may use this
+            # digest until the entire tree and completion record are durable.
+            run([*prefix, '-rlpt', '--checksum', '--delete', str(stage) + '/', remote])
             run([destination + '/bin/rustc', '-vV'], target)
+            run(['sudo', '-n', 'sync', '-f', destination], target)
+            run(['sudo', '-n', 'python3', '-c', '''import os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+with (root / '.distcc-complete').open('w') as marker:
+    os.fchmod(marker.fileno(), 0o644)
+    marker.write(root.name.removeprefix('rust-distcc-') + '\\n')
+    marker.flush()
+    os.fsync(marker.fileno())
+fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+''', destination], target)
         parallel(peers, install_peer)
         shutil.rmtree(stage)
     (work / 'rust-inventory.json').write_text(json.dumps(inventory, indent=2) + '\n')
@@ -494,13 +515,13 @@ def main():
                 run(['sudo', '-n', 'true'], target)
             paused = {target['name']: builds_to_pause(target) for target in targets}
             distribute_sources(settings, version, ebuild, targets, work)
-            rust_inventory = distribute_rust_compilers(targets, work)
             for target in targets:
                 names = paused[target['name']]
                 if names:
                     resume[target['name']] = sorted(set(resume.get(target['name'], []) + names))
                     resume_path.write_text(json.dumps(resume))
                     run(['sudo', '-n', 'systemctl', 'stop', *names], target)
+            rust_inventory = distribute_rust_compilers(targets, work)
             def deploy_target(target):
                 install(target, version, work)
                 configure(target, work)

@@ -1121,6 +1121,22 @@ pub fn read_only() -> bool {
             self.assertEqual(list(select(selected)), [])
             self.assertEqual(list(select(vendor)), [Path(self.rustc).resolve()])
 
+    def test_worker_ignores_interrupted_distributed_tree(self):
+        helper = runpy.run_path(str(self.build/'distcc-rust'))
+        selected = helper['identity'](self.rustc)[0]
+        root = self.work/('rust-distcc-' + 'a'*64)
+        (root/'bin').mkdir(parents=True)
+        compiler = root/'bin/rustc'
+        version = subprocess.check_output([self.rustc, '-vV'], text=True)
+        compiler.write_text('#!/bin/sh\nprintf %s ' + shlex.quote(version) + '\n')
+        compiler.chmod(0o700)
+        with mock.patch.dict(os.environ, DISTCCD_RUSTC=str(compiler)):
+            self.assertEqual(list(helper['worker_compilers'](selected)), [])
+            (root/'.distcc-complete').write_text('b'*64)
+            self.assertEqual(list(helper['worker_compilers'](selected)), [])
+            (root/'.distcc-complete').write_text('a'*64 + '\n')
+            self.assertEqual(list(helper['worker_compilers'](selected)), [compiler])
+
     def test_worker_does_not_retry_source_errors(self):
         helper = runpy.run_path(str(self.build / 'distcc-rust'))
         source = self.work / 'error.rs'

@@ -54,8 +54,9 @@ class RustDistributionTest(unittest.TestCase):
 
     def test_parallel_inventory_skips_installed_and_only_stages_missing(self):
         targets = [{'name': 'first'}, {'name': 'second'}]
-        for installed in (True, False):
-            with self.subTest(installed=installed), tempfile.TemporaryDirectory() as directory:
+        for state in ('complete', 'unmarked', 'wrong-marker', 'broken'):
+            installed = state == 'complete'
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
                 barrier = threading.Barrier(2, timeout=5)
                 transfers = []
                 def run(args, target=None, **kwargs):
@@ -71,10 +72,16 @@ class RustDistributionTest(unittest.TestCase):
                         root = Path(directory)/target['name']
                         compiler = root/'bin/rustc'
                         compiler.parent.mkdir(parents=True, exist_ok=True)
-                        compiler.write_text('#!/bin/sh\nexit ' + ('0' if installed else '1') + '\n')
+                        compiler.write_text('#!/bin/sh\nexit ' + ('1' if state == 'broken' else '0') + '\n')
                         compiler.chmod(0o700)
+                        if state != 'unmarked':
+                            (root/'.distcc-complete').write_text('wrong' if state == 'wrong-marker' else root.name)
                         return subprocess.check_output([*args[:3], str(root)], text=True).strip()
                     transfers.append((args, target))
+                    if args[:4] == ['sudo', '-n', 'python3', '-c']:
+                        root = Path(directory)/target['name']
+                        subprocess.run([sys.executable, '-c', args[4], str(root)], check=True)
+                        self.assertEqual((root/'.distcc-complete').read_text().strip(), root.name)
                     return ''
                 with mock.patch.object(deploy, 'run', side_effect=run):
                     deploy.distribute_rust_compilers(targets, Path(directory))
@@ -85,6 +92,14 @@ class RustDistributionTest(unittest.TestCase):
                     self.assertEqual(sum(args[:2] == ['rsync', '-Lpt'] for args, _ in transfers), 2)
                     self.assertEqual(sum(args[:3] == ['sudo', '-n', 'rsync'] for args, _ in transfers), 2)
                     self.assertEqual(sum(args[-1] == '-vV' for args, _ in transfers), 2)
+                    for args, _ in transfers:
+                        if args[:3] == ['sudo', '-n', 'rsync']:
+                            self.assertIn('--checksum', args)
+                            self.assertIn('--delete', args)
+                    for target in targets:
+                        commands = [args for args, peer in transfers if peer == target]
+                        self.assertEqual(commands[-2][:4], ['sudo', '-n', 'sync', '-f'])
+                        self.assertEqual(commands[-1][:4], ['sudo', '-n', 'python3', '-c'])
                 self.assertFalse([path for path in Path(directory).glob('rust-*') if path.is_dir()])
 
 

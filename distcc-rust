@@ -9,6 +9,7 @@ import fcntl
 import glob
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -316,6 +317,10 @@ def worker_compilers(requested):
         candidates += glob.glob('/usr/lib/rust/*/bin/rustc') + glob.glob('/opt/rust-*/bin/rustc')
     for candidate in dict.fromkeys(Path(p).resolve() for p in candidates if p):
         try:
+            root = candidate.parent.parent
+            if re.fullmatch(r'rust-distcc-[0-9a-f]{64}', root.name):
+                if (root / '.distcc-complete').read_text().strip() != root.name[12:]:
+                    continue
             actual = identity(candidate)[0]
             if actual == requested:
                 yield candidate
