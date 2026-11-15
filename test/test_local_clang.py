@@ -141,6 +141,28 @@ class LocalClangTest(BrokerTestCase):
                                  (original.returncode, original.stdout, original.stderr))
                 self.assertFalse((self.work/'linked').exists())
 
+    def test_absolute_masquerade_matches_path_directory_identity(self):
+        self.start_local()
+        wrappers = self.work / 'wrappers'
+        wrappers.mkdir()
+        compiler = wrappers / Path(self.compiler).name
+        compiler.symlink_to(self.build / 'distcc')
+        alias = self.work / 'alias'
+        alias.symlink_to(wrappers, target_is_directory=True)
+        source = self.work / 'main.c'
+        source.write_text('int main(void) { return 0; }\n')
+        for directory in (str(wrappers) + '/', str(wrappers) + '/.', str(alias), '.'):
+            with self.subTest(directory=directory):
+                env = dict(self.env, PATH=directory + os.pathsep +
+                           str(Path(self.compiler).parent) + os.pathsep + self.env['PATH'])
+                obj, exe = self.work / 'main.o', self.work / 'main'
+                for arguments in (['-c', str(source), '-o', str(obj)],
+                                  [str(obj), '-o', str(exe)]):
+                    result = subprocess.run([str(compiler), *arguments], cwd=wrappers,
+                                            env=env, capture_output=True, timeout=20)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                subprocess.run([str(exe)], check=True, timeout=5)
+
     def test_ccache_compiler_query_completes_with_resident_worker(self):
         self.start_local()
         ccache = shutil.which('ccache')

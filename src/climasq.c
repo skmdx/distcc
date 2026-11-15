@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 #include "distcc.h"
 #include "util.h"
@@ -57,10 +58,11 @@
  **/
 int dcc_support_masquerade(char *argv[], char *progname, int *did_masquerade)
 {
-    const char *envpath, *findpath, *p, *n;
+    const char *envpath, *p, *n;
     char *buf;
     size_t len;
-    size_t findlen;
+    int named_path = progname != argv[0];
+    struct stat directory;
 
     if (!(envpath = getenv("PATH")))
         /* strange but true*/
@@ -73,12 +75,20 @@ int dcc_support_masquerade(char *argv[], char *progname, int *did_masquerade)
 
     /* Filter PATH to contain only the part that is past our dir.
      * If we were called explicitly, find the named dir on the PATH. */
-    if (progname != argv[0]) {
-        findpath = dcc_abspath(argv[0], progname - argv[0] - 1);
-        findlen = strlen(findpath);
-    } else {
-        findpath = NULL;
-        findlen = 0;
+    if (named_path) {
+        char *path = strndup(argv[0], progname - argv[0]);
+        if (!path) {
+            free(buf);
+            return EXIT_OUT_OF_MEMORY;
+        }
+        int ret = stat(path, &directory);
+        if (ret != 0)
+            rs_log_error("cannot stat compiler directory %s: %s", path, strerror(errno));
+        free(path);
+        if (ret != 0) {
+            free(buf);
+            return EXIT_IO_ERROR;
+        }
     }
 
     for (n = p = envpath; *n; p = n) {
@@ -91,13 +101,14 @@ int dcc_support_masquerade(char *argv[], char *progname, int *did_masquerade)
             n = p + len;
         }
 
-        if (findpath) {
-            /* Looking for a component in the path equal to findpath */
-
-            /* FIXME: This won't catch paths that are in fact the same, but
-             * that are not the same string.  This might happen if you have
-             * multiple slashes, or dots, or symlinks... */
-           if (len != findlen || strncmp(p, findpath, findlen) != 0)
+        if (named_path) {
+            struct stat candidate;
+            memcpy(buf, p, len);
+            buf[len] = '\0';
+            /* PATH may spell the same directory with a trailing slash,
+             * dots or a symlink. Let the filesystem resolve its identity. */
+            if (stat(len ? buf : ".", &candidate) != 0 ||
+                candidate.st_dev != directory.st_dev || candidate.st_ino != directory.st_ino)
                 continue;
         } else {
             /* Looking for a component in the path containing a file
