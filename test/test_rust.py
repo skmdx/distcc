@@ -1047,8 +1047,9 @@ pub fn read_only() -> bool {
     def test_worker_selects_matching_build_without_incompatible_attempt(self):
         helper = runpy.run_path(str(self.build / 'distcc-rust'))
         selected = helper['identity'](self.rustc)[0]
-        alternatives = [path for root in (Path('/usr/lib/rust'), Path('/opt'))
-                        for path in root.glob('*/bin/rustc')
+        alternatives = [path for root, pattern in ((Path('/usr/lib/rust'), '*/bin/rustc'),
+                                                   (Path('/opt'), 'rust-bin-*/bin/rustc'))
+                        for path in root.glob(pattern)
                         if helper['identity'](path)[0] != selected]
         if not alternatives:
             self.skipTest('a second Rust metadata version is required')
@@ -1136,6 +1137,34 @@ pub fn read_only() -> bool {
             self.assertEqual(list(helper['worker_compilers'](selected)), [])
             (root/'.distcc-complete').write_text('a'*64 + '\n')
             self.assertEqual(list(helper['worker_compilers'](selected)), [compiler])
+
+    def test_distributed_runtime_loader_executes_real_compiler(self):
+        original = Path(self.rustc).resolve()
+        root = self.work/('rust-distcc-' + 'c'*64)
+        (root/'bin').mkdir(parents=True)
+        (root/'distcc-runtime').mkdir()
+        shutil.copy2(original, root/'bin/rustc')
+        (root/'lib').mkdir()
+        subprocess.run(['cp', '-L', '--reflink=auto',
+                        *map(str, (original.parent.parent/'lib').glob('*.so*')),
+                        str(root/'lib')], check=True)
+        loaded = subprocess.check_output(['ldd', str(original)], text=True,
+                                         env=dict(os.environ, LC_ALL='C'))
+        loader, = re.findall(r'^\s*(/\S+) \(', loaded, re.M)
+        (root/'distcc-runtime/ld.so').symlink_to(loader)
+        (root/'.distcc-complete').write_text('c'*64 + '\n')
+        self.restart_server(self.build/'distccd', DISTCCD_RUSTC=str(root/'bin/rustc'))
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        source = self.work/'runtime.rs'
+        source.write_text('pub fn answer() -> String { String::from("runtime") }')
+        output = self.work/'libruntime.rlib'
+        result = self.rust('--crate-type=rlib', source, '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('compiled on', result.stderr)
+        source.write_text('fn main() { assert_eq!(runtime::answer(), "runtime"); }')
+        result = self.rust(source, '--extern', 'runtime='+str(output), '-o', self.work/'main', remote=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([self.work/'main'], check=True, timeout=5)
 
     def test_worker_does_not_retry_source_errors(self):
         helper = runpy.run_path(str(self.build / 'distcc-rust'))

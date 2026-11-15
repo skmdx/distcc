@@ -24,6 +24,8 @@ class RustDistributionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             slots = [root/name for name in ('native', 'rust-bin-release', 'rust-distcc-copy')]
+            (root/'loader').write_bytes(b'loader')
+            (root/'libdependency.so').write_bytes(b'dependency')
             for slot in slots:
                 (slot/'bin').mkdir(parents=True)
                 compiler = slot/'bin/rustc'
@@ -38,7 +40,7 @@ class RustDistributionTest(unittest.TestCase):
                 check_output = subprocess.check_output
                 def output_for(command, **options):
                     if command[0] == 'ldd':
-                        return ''
+                        return '\tlibdependency.so => ' + str(root/'libdependency.so') + ' (0x1)\n\t' + str(root/'loader') + ' (0x2)\n'
                     return check_output(command, **options)
                 with mock.patch('glob.glob', side_effect=paths), \
                      mock.patch('shutil.which', return_value=str(slots[2]/'bin/rustc')), \
@@ -51,6 +53,8 @@ class RustDistributionTest(unittest.TestCase):
             self.assertEqual([info['root'] for info in inventory[0][1]],
                              [str(slots[0]), str(slots[1])])
             self.assertEqual(inventory[0][1][0]['identity']['commit'], 'commit')
+            self.assertEqual([item['name'] for item in inventory[0][1][0]['runtime']],
+                             ['libdependency.so', 'ld.so'])
 
     def test_parallel_inventory_skips_installed_and_only_stages_missing(self):
         targets = [{'name': 'first'}, {'name': 'second'}]
@@ -74,10 +78,15 @@ class RustDistributionTest(unittest.TestCase):
                         compiler.parent.mkdir(parents=True, exist_ok=True)
                         compiler.write_text('#!/bin/sh\nexit ' + ('1' if state == 'broken' else '0') + '\n')
                         compiler.chmod(0o700)
+                        (root/'distcc-runtime').mkdir(exist_ok=True)
+                        shutil.copy2(compiler, root/'distcc-runtime/ld.so')
                         if state != 'unmarked':
                             (root/'.distcc-complete').write_text('wrong' if state == 'wrong-marker' else root.name)
                         return subprocess.check_output([*args[:3], str(root)], text=True).strip()
                     transfers.append((args, target))
+                    if args[:2] == ['rsync', '-rlpt']:
+                        # The source transfer creates the toolchain root.
+                        (Path(args[-1])/'lib').mkdir()
                     if args[:4] == ['sudo', '-n', 'python3', '-c']:
                         root = Path(directory)/target['name']
                         subprocess.run([sys.executable, '-c', args[4], str(root)], check=True)

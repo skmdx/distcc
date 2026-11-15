@@ -87,10 +87,19 @@ def distributed_emits(opts):
     return emits
 
 
+def compiler_command(compiler, mounted=None):
+    root = Path(shutil.which(str(compiler)) or compiler).resolve().parent.parent
+    if (root/'distcc-runtime/ld.so').is_file():
+        root = Path(mounted) if mounted else root
+        return [str(root/'distcc-runtime/ld.so'), '--library-path',
+                str(root/'lib') + ':' + str(root/'distcc-runtime'), str(root/'bin/rustc')]
+    return [str(Path(mounted)/'bin/rustc') if mounted else str(compiler)]
+
+
 def identity(compiler):
     # Compiler queries and dependency discovery inherit Cargo's jobserver FDs,
     # like the original rustc command. Python-owned files remain CLOEXEC.
-    lines = subprocess.check_output([compiler, '-vV'], text=True, close_fds=False).splitlines()
+    lines = subprocess.check_output([*compiler_command(compiler), '-vV'], text=True, close_fds=False).splitlines()
     fields = dict(line.split(': ', 1) for line in lines[1:] if ': ' in line)
     return {'version': lines[0], 'commit': fields.get('commit-hash', ''),
             'llvm': fields.get('LLVM version', '')}, fields['host']
@@ -394,7 +403,7 @@ def worker(root, archive):
         return 121
     result = subprocess.run([*sandbox, '--ro-bind', str(compiler.parent.parent),
         CONTROL + '/compiler', '--remount-ro', '/',
-        CONTROL + '/compiler/bin/rustc', *job['args']])
+        *compiler_command(compiler, CONTROL + '/compiler'), *job['args']])
     if result.returncode:
         return result.returncode if result.returncode > 0 else 128 - result.returncode
     if native is not None and not all((profile / (name + '-used')).exists()

@@ -494,8 +494,9 @@ or explicit unsupported-toolchain local route.
 Deployment copies all installed Rust slots to a separate `/opt/rust-distcc-*`
 directory on peers of the same compiler host architecture, preserving the user's
 selected compiler. Existing distributed copies are not source slots.
-System-linked LLVM backends are copied into the toolchain's library directory
-and included in its digest; the compiler's existing loader search path is retained.
+The resolved ELF runtime libraries and loader accompany the compiler and enter
+its digest. The worker invokes that loader with the toolchain's library paths,
+without changing the system loader, installed libraries or process-wide settings.
 Distribution verifies every transferred byte, flushes the complete tree, then
 writes a durable completion marker. Workers ignore digest-named copies without
 that marker; interrupted or older unmarked copies are revalidated on deployment.

@@ -378,14 +378,18 @@ for compiler in dict.fromkeys(pathlib.Path(p).resolve() for p in paths if p):
     fields = dict(line.split(': ', 1) for line in lines[1:] if ': ' in line)
     host = fields['host']
     identity = dict(version=lines[0], commit=fields['commit-hash'], llvm=fields['LLVM version'])
-    # System-LLVM Rust builds may use a different LLVM ABI from the peer's
-    # installed LLVM (for example libc++ versus libstdc++). Preserve the exact
-    # loaded backend in the compiler's existing $ORIGIN/../lib search path.
+    # Preserve the resolved dependency closure and its ELF loader together.
+    # Mixing a system-LLVM build with a peer's C++ or libc runtime is not a
+    # portable toolchain, even when rustc -vV happens to start successfully.
     loaded = subprocess.check_output(['ldd', str(compiler)], text=True,
                                      env=dict(os.environ, LC_ALL='C'))
     runtime = [dict(name=name, path=path) for name, path in
-               re.findall(r'^\\s*(libLLVM\\S*) => (/\\S+)', loaded, re.M)
+               re.findall(r'^\\s*(\\S+) => (/\\S+)', loaded, re.M)
                if not pathlib.Path(path).resolve().is_relative_to(root)]
+    loaders = re.findall(r'^\\s*(/\\S+) \\(', loaded, re.M)
+    if len(loaders) != 1:
+        raise RuntimeError('Rust ELF loader was not resolved: ' + str(compiler))
+    runtime.append(dict(name='ld.so', path=loaders[0]))
     digest = hashlib.sha256()
     files = [compiler, *sorted((root / 'lib').glob('librustc_driver*')),
              *sorted((root / 'lib/rustlib' / host / 'codegen-backends').glob('*')),
@@ -419,7 +423,8 @@ root = pathlib.Path(sys.argv[1])
 compiler = root / 'bin/rustc'
 try:
     ready = ((root / '.distcc-complete').read_text().strip() == root.name.removeprefix('rust-distcc-')
-        and compiler.is_file() and subprocess.run([compiler, '-vV'],
+        and compiler.is_file() and subprocess.run([root/'distcc-runtime/ld.so', '--library-path',
+            str(root/'lib') + ':' + str(root/'distcc-runtime'), compiler, '-vV'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     )
 except OSError:
@@ -438,9 +443,14 @@ print(json.dumps(ready))
         # Preserve relative runtime-library links. The compiler and its driver
         # come from the administrator's installed toolchain, never a job upload.
         run(['rsync', '-rlpt', '--exclude=/share', origin, str(stage) + '/'])
+        runtime = stage / 'distcc-runtime'
+        runtime.mkdir()
+        origins = [(source['ssh'] + ':' if source.get('ssh') else '') + lib['path']
+                   for lib in info['runtime']]
+        run(['rsync', '-Lpt', *origins, str(runtime) + '/'])
         for library in info['runtime']:
-            origin = (source['ssh'] + ':' if source.get('ssh') else '') + library['path']
-            run(['rsync', '-Lpt', origin, str(stage / 'lib' / library['name'])])
+            if Path(library['path']).name != library['name']:
+                (runtime / Path(library['path']).name).rename(runtime / library['name'])
         def install_peer(target):
             run(['sudo', '-n', 'mkdir', '-p', destination], target)
             run(['sudo', '-n', 'rm', '-f', destination + '/.distcc-complete'], target)
@@ -450,7 +460,9 @@ print(json.dumps(ready))
             # whose size and timestamp already match. No worker may use this
             # digest until the entire tree and completion record are durable.
             run([*prefix, '-rlpt', '--checksum', '--delete', str(stage) + '/', remote])
-            run([destination + '/bin/rustc', '-vV'], target)
+            run([destination + '/distcc-runtime/ld.so', '--library-path',
+                 destination + '/lib:' + destination + '/distcc-runtime',
+                 destination + '/bin/rustc', '-vV'], target)
             run(['sudo', '-n', 'sync', '-f', destination], target)
             run(['sudo', '-n', 'python3', '-c', '''import os, pathlib, sys
 root = pathlib.Path(sys.argv[1])
