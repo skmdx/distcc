@@ -317,7 +317,7 @@ def validate(target, work):
     print(f"{target['name']}: C/C++ and Rust remote compilation and execution passed", flush=True)
 
 
-def validate_rust_cluster(targets, work, inventory):
+def validate_rust_cluster(targets, work, inventory, workers=None):
     def path(target):
         return target['temporary'] + '/distcc-rust-cluster-check'
 
@@ -331,11 +331,13 @@ def validate_rust_cluster(targets, work, inventory):
         for client, compilers in inventory:
             for compiler in compilers:
                 clients.setdefault((compiler['host'], compiler['digest']), (client, compiler))
-        for worker in targets:
+        for worker in targets if workers is None else workers:
             requested = list({json.dumps(compiler['identity'], sort_keys=True): compiler['identity']
                               for _, compiler in clients.values()}.values())
-            available = json.loads(run(['python3', '-c', '''import json, runpy, shutil, sys
-helper = runpy.run_path(shutil.which('distcc-rust'))
+            available = json.loads(run(['python3', '-c', '''import json, pathlib, runpy, shutil, sys
+wrapper = pathlib.Path(shutil.which('distcc-rust')).resolve()
+sys.path.insert(0, str(wrapper.parent))
+helper = runpy.run_path(str(wrapper))
 print(json.dumps([identity for identity in json.loads(sys.argv[1])
                   if next(helper['worker_compilers'](identity), None) is not None]))
 ''', json.dumps(requested)], worker))
