@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -50,6 +51,31 @@ class LocalClangTest(BrokerTestCase):
                 'started local compiler libraries'), 1)
         finally:
             os.close(reader)
+
+    def test_worker_startup_uses_transport_deadline_and_reaps_timeout(self):
+        self.start_local()
+        helpers = self.work/'slow-start'
+        helpers.mkdir()
+        helper = helpers/'distcc-clang'
+        pidfile = self.work/'startup.pid'
+        helper.write_text('#!/bin/sh\necho $$ > ' + shlex.quote(str(pidfile)) +
+                          '\nsleep 6\nexec ' + shlex.quote(str(self.build/'distcc-clang')) +
+                          ' "$@"\n')
+        helper.chmod(0o755)
+        self.env['PATH'] = str(helpers)+os.pathsep+self.env['PATH']
+        original = self.command(['-dumpversion'], reused=False)
+        result = self.command(['-dumpversion'])
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (original.returncode, original.stdout, original.stderr))
+        self.assertIn('started local compiler libraries', (self.work/'client.log').read_text())
+
+        # A different environment requests a different helper, not the cached
+        # ready one. Its configured timeout must also reap the startup process.
+        self.env['DISTCC_IO_TIMEOUT'] = '1'
+        result = self.command(['-dumpversion'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(Path('/proc', pidfile.read_text().strip()).exists())
+        self.assertIn('IO timeout', (self.work/'client.log').read_text())
 
     def test_link_without_resident_library_uses_driver(self):
         self.start_local()

@@ -4,7 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -175,14 +175,22 @@ static int start_worker(const char *compiler)
     char descriptor[32];
     snprintf(descriptor, sizeof(descriptor), "%d", pair[1]);
     char *command[] = {"distcc-clang", "--native-worker", descriptor, (char *)compiler, NULL};
-    pid_t pid;
+    pid_t pid = -1;
     int ret = fcntl(pair[1], F_SETFD, 0) ? EXIT_IO_ERROR :
         dcc_spawn_child(command, &pid, "/dev/null", "/dev/null", "/dev/null");
     close(pair[1]);
-    struct pollfd ready = {pair[0], POLLIN, 0};
     char byte;
-    if (ret || poll(&ready, 1, 5000) <= 0 || recv(pair[0], &byte, 1, 0) != 1 || byte != 'R') {
-        close(pair[0]); return -1;
+    /* Loading compiler libraries may fault them in from slow storage. Use the
+     * same transport deadline as other compiler requests, not a startup-only
+     * five-second limit. The caller owns a helper until its ready handshake. */
+    if (ret || dcc_select_for_read(pair[0], dcc_get_io_timeout()) ||
+        recv(pair[0], &byte, 1, 0) != 1 || byte != 'R') {
+        close(pair[0]);
+        if (!ret && pid > 0) {
+            kill(-pid, SIGKILL);
+            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        }
+        return -1;
     }
     rs_trace("started local compiler libraries pid=%ld", (long)pid);
     return pair[0];
