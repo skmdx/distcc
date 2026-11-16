@@ -2329,7 +2329,7 @@ class FrontendTest(BrokerTestCase):
         clang = self.start_frontend(DISTCC_VERBOSE='1')
         trace_offset = Path(self.logs[0].name).stat().st_size
         source, output = self.work/'release.c', self.work/'release.o'
-        source.write_text('int release(void) { return __clang_major__; }\n')
+        source.write_text('#include <immintrin.h>\nint release(void) { return __clang_major__; }\n')
         for compiler in (clang, alternate, clang):
             command = [compiler, '-O2', '-c', str(source), '-o', str(output)]
             subprocess.run(command, check=True, capture_output=True)
@@ -2341,6 +2341,26 @@ class FrontendTest(BrokerTestCase):
             self.assertEqual(output.read_bytes(), expected)
         trace = Path(self.logs[0].name).read_bytes()[trace_offset:].decode()
         self.assertEqual(len(re.findall(r'started reusable frontend pid=', trace)), 2, trace[-6000:])
+
+    def test_frontend_without_reuse_uses_requested_driver_and_headers(self):
+        compiler = shutil.which('clang-22')
+        if not compiler:
+            self.skipTest('Alternate LLVM release unavailable')
+        self.start_frontend()
+        source, output, deps = (self.work / name for name in ('version.c', 'version.o', 'version.d'))
+        source.write_text('#include <immintrin.h>\nint version(void) {return __clang_major__;}\n')
+        command = [compiler, '-O2', '-fcolor-diagnostics', '-MD', '-MF', str(deps),
+                   '-c', str(source), '-o', str(output)]
+        subprocess.run(command, check=True, capture_output=True, timeout=30)
+        expected = output.read_bytes(), deps.read_bytes()
+        for enabled in ('0', '1'):
+            with self.subTest(local_compiler_reuse=enabled):
+                output.unlink(missing_ok=True); deps.unlink(missing_ok=True)
+                result = subprocess.run([str(self.build/'distcc'), *command],
+                    env=dict(self.env, DISTCC_CLANG_LOCAL=enabled), capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((output.read_bytes(), deps.read_bytes()), expected)
+                self.assertIn(b'frontend filesystem:', result.stderr)
 
     def test_remote_frontend_default_dependency_path_follows_object_output(self):
         clang = self.start_frontend()

@@ -1,7 +1,6 @@
 /* Client-owned compiler libraries, shared through the existing broker cache.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -192,7 +191,8 @@ static int start_worker(const char *compiler)
 /* -1 means no request was accepted: ordinary execution is still safe. */
 static int request(char **argv, char operation, int output, int errors, int *status, uint64_t *cpu_ns)
 {
-    if (!dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0) ||
+    int reuse = dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0);
+    if ((!reuse && operation != 'P') ||
         !strstr(dcc_find_basename(argv[0]), "clang")) return -1;
     /* Internal tool entry points bypass Clang's driver in the native binary. */
     if (argv[1] && !strncmp(argv[1], "-cc1", 4)) return -1;
@@ -201,11 +201,14 @@ static int request(char **argv, char operation, int output, int errors, int *sta
     if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
     else if (dcc_which(argv[0], &compiler)) goto out;
     char key[80];
-    if (!compiler || dcc_local_worker_key(compiler, NULL, NULL, key, sizeof(key))) goto out;
-    lease = dcc_broker_worker_get(key, &worker);
-    if (worker < 0 && lease >= 0) {
+    if (!compiler) goto out;
+    if (reuse && !dcc_local_worker_key(compiler, NULL, NULL, key, sizeof(key)))
+        lease = dcc_broker_worker_get(key, &worker);
+    /* Frontend planning must use the requested compiler's libraries even
+     * without a broker. Closing the uncached channel reaps this one-shot helper. */
+    if (worker < 0 && (lease >= 0 || operation == 'P')) {
         worker = start_worker(compiler);
-        dcc_broker_worker_put(lease, worker); lease = -1;
+        if (lease >= 0) { dcc_broker_worker_put(lease, worker); lease = -1; }
     }
     if (worker < 0 || !(cwd = getcwd(NULL, 0)) ||
         socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair) ||
@@ -300,12 +303,6 @@ int dcc_frontend_prepare(char **argv, struct dcc_job **result)
     job->kind = DCC_JOB_FRONTEND;
     job->cwd = getcwd(NULL, 0);
     int ret = job->cwd ? dcc_clang_local_prepare(argv, &job->argv, &job->fs_roots) : EXIT_IO_ERROR;
-    if (ret < 0) {
-        void *handle = dcc_clang_driver();
-        int (*capture)(char **, char ***, char ***) = handle ? dlsym(handle, "dcc_clang_frontend") : NULL;
-        ret = capture ? capture(argv, &job->argv, &job->fs_roots) : -1;
-        if (handle) dlclose(handle);
-    }
     if (!ret) ret = dcc_frontend_fs_add_roots(job, getenv("DISTCC_FRONTEND_ROOTS"));
     if (ret) { dcc_job_free(job); return EXIT_DISTCC_FAILED; }
     *result = job;
