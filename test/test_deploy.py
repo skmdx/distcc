@@ -249,6 +249,7 @@ class RolloutTest(unittest.TestCase):
             work = Path(temporary)
             target = {'name': 'worker', 'temporary': temporary, 'repository': str(work/'repo')}
             with mock.patch.object(deploy, 'run', return_value='sys-devel/distcc-old'), \
+                 mock.patch.object(deploy, 'build_cache_environment', return_value=[]) as cache, \
                  mock.patch.object(deploy, 'transfer'), mock.patch.object(deploy, 'bounded') as bounded:
                 deploy.prepare(target, 'distcc-new', work/'distcc-new.ebuild', work, {})
                 args, selected, stage, _ = bounded.call_args.args
@@ -256,12 +257,71 @@ class RolloutTest(unittest.TestCase):
                 self.assertIn('--usepkg=n', args)
                 self.assertIn('PKGDIR='+temporary+'/distcc-deploy-binpkgs/distcc-new', args)
                 self.assertEqual((selected, stage), (target, 'build'))
+                cache.assert_called_once_with(target, ['PKGDIR='+temporary+'/distcc-deploy-binpkgs/distcc-new'])
             with mock.patch.object(deploy, 'run', side_effect=['sys-devel/distcc-old', 'sys-devel/distcc-new']), \
                  mock.patch.object(deploy, 'bounded') as bounded:
                 deploy.install(target, 'distcc-new', work)
                 args, selected, stage, _ = bounded.call_args.args
                 self.assertIn('--usepkgonly', args)
                 self.assertEqual((selected, stage), (target, 'install'))
+
+    def test_ccache_preserves_features_and_does_not_choose_a_cache_directory(self):
+        target = {'name': 'builder'}
+        context = ['ROOT=/cross', 'PORTAGE_CONFIGROOT=/cross']
+        for features in ('distcc sandbox userpriv', 'distcc ccache sandbox'):
+            with mock.patch.object(deploy, 'run', return_value=json.dumps({
+                    'FEATURES': features, 'PORTAGE_TMPDIR': '/build space'})) as run:
+                env = deploy.build_cache_environment(target, context)
+            self.assertEqual(env, ['FEATURES=' + features + ('' if 'ccache' in features else ' ccache'),
+                                   'CCACHE_BASEDIR=/build space', 'CCACHE_NOHASHDIR=1'])
+            self.assertEqual(run.call_args.args[1], target)
+            self.assertEqual(run.call_args.args[0][:3], ['env', *context])
+            self.assertFalse(any(value.startswith('CCACHE_DIR=') for value in env))
+        with mock.patch.object(deploy, 'run', return_value='null'):
+            self.assertEqual(deploy.build_cache_environment(target, context), [])
+
+    def test_cross_package_probes_cache_on_build_host_in_cross_context(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            target = {'name': 'worker', 'binary': True, 'temporary': '/target', 'repository': '/repo'}
+            cross = {'root': '/cross', 'limits': ['CPUWeight=10']}
+            with mock.patch.object(deploy, 'run', return_value='sys-devel/distcc-old'), \
+                 mock.patch.object(deploy, 'transfer'), \
+                 mock.patch.object(deploy, 'build_cache_environment', return_value=['FEATURES=distcc ccache']) as cache, \
+                 mock.patch.object(deploy, 'bounded') as bounded:
+                deploy.prepare(target, 'distcc-new', work/'distcc-new.ebuild', work, cross)
+            cache.assert_called_once_with(None, ['ROOT=/cross', 'SYSROOT=/cross',
+                'PORTAGE_CONFIGROOT=/cross', 'PKGDIR='+str(work/'binpkgs'/'worker')])
+            self.assertIn('FEATURES=distcc ccache', bounded.call_args.args[0])
+            self.assertTrue(bounded.call_args.kwargs['cross'])
+
+    @unittest.skipUnless(shutil.which('ccache') and shutil.which('gcc') and Path('src/config.h').is_file(),
+                         'ccache, GCC and a configured build tree required')
+    def test_ccache_reuses_lto_object_across_release_source_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env = dict(os.environ, CCACHE_DIR=str(root/'cache'),
+                       CCACHE_BASEDIR=str(root), CCACHE_NOHASHDIR='1')
+            objects = []
+            for revision in ('previous', 'next'):
+                source = root/('distcc-'+revision)/'work'/('distcc-'+revision)
+                (source/'src').mkdir(parents=True)
+                shutil.copyfile('src/config.h', source/'config.h')
+                for header in (deploy.ROOT/'src').glob('*.h'):
+                    shutil.copyfile(header, source/'src'/header.name)
+                shutil.copyfile(deploy.ROOT/'src'/'argv_file.c', source/'src'/'argv_file.c')
+                output = source/'argv.o'
+                subprocess.run(['ccache', 'gcc', '-O3', '-pipe', '-march=native', '-mtune=native',
+                    '-flto=auto', '-D_GNU_SOURCE', '-DHAVE_CONFIG_H', '-I'+str(source),
+                    '-I'+str(source/'src'), '-c', str(source/'src'/'argv_file.c'), '-o', str(output)],
+                    cwd=source, env=env, check=True, capture_output=True, timeout=30)
+                objects.append(output.read_bytes())
+            self.assertEqual(objects[0], objects[1])
+            self.assertIn(b'.gnu.lto_', objects[0])
+            stats = dict(line.split() for line in subprocess.check_output(
+                ['ccache', '--print-stats'], env=env, text=True).splitlines())
+            self.assertEqual(int(stats['cache_miss']), 1)
+            self.assertEqual(int(stats['direct_cache_hit']) + int(stats['preprocessed_cache_hit']), 1)
 
 
 @unittest.skipUnless(shutil.which('systemd-run') and shutil.which('sudo'), 'systemd and sudo required')

@@ -504,7 +504,11 @@ A foreign architecture without the matching build declines the job; identical re
 numbers alone do not establish compatibility. Rust checks require worker addresses reachable from all clients
 in `server_hosts`. Source archives are fetched and verified locally,
 then synchronized to targets; remote internet access is not required. Source
-builds use distcc. Cgroup resource limits are optional explicit configuration;
+builds use distcc and enable ccache when it is installed on the actual build
+host, including cross builds. Existing Portage features and the cache directory
+are preserved; `PORTAGE_TMPDIR` supplies `CCACHE_BASEDIR` and cwd hashing is
+disabled so unchanged sources can hit across release work directories.
+Cgroup resource limits are optional explicit configuration;
 the deployment command does not impose a memory cap or disable swap.
 A configured cross sysroot builds the
 binary package for targets without native build capacity. See

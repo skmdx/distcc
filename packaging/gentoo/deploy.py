@@ -200,6 +200,25 @@ def bounded(args, target, stage, log, *, cross=False):
     run([*cmd, *args], target if not cross else None, log=log)
 
 
+def build_cache_environment(target, context):
+    """Enable an installed build-host ccache without replacing Portage policy."""
+    settings = json.loads(run(['env', *context, 'python3', '-c', '''import json, shutil, subprocess
+if shutil.which('ccache'):
+    keys = ['FEATURES', 'PORTAGE_TMPDIR']
+    values = subprocess.check_output(['portageq', 'envvar', *keys], text=True).splitlines()
+    print(json.dumps(dict(zip(keys, values, strict=True))))
+else:
+    print('null')
+'''], target))
+    if settings is None:
+        return []
+    features = settings['FEATURES'].split()
+    if 'ccache' not in features:
+        features.append('ccache')
+    return ['FEATURES=' + ' '.join(features),
+            'CCACHE_BASEDIR=' + settings['PORTAGE_TMPDIR'], 'CCACHE_NOHASHDIR=1']
+
+
 def prepare(target, version, ebuild, work, cross):
     name = target['name']
     print(f'{name}: preparing {version}', flush=True)
@@ -213,6 +232,7 @@ def prepare(target, version, ebuild, work, cross):
             packages.mkdir(parents=True)
             env = ['ROOT=' + cross['root'], 'SYSROOT=' + cross['root'],
                    'PORTAGE_CONFIGROOT=' + cross['root'], 'PKGDIR=' + str(packages)]
+            env = env + build_cache_environment(None, env)
             args = ['env', *env, 'emerge', '--buildpkgonly',
                     '--oneshot', '--nodeps', '--usepkg=n', '--quiet-build=y', '=sys-devel/' + version]
             builder = dict(target, build_limits=cross.get('limits', []))
@@ -221,7 +241,9 @@ def prepare(target, version, ebuild, work, cross):
             transfer([str(packages) + '/'], remote_packages, target)
         else:
             packages = target['temporary'] + '/distcc-deploy-binpkgs/' + version
-            args = ['env', 'PKGDIR=' + packages, 'emerge', '--buildpkgonly', '--oneshot', '--nodeps',
+            env = ['PKGDIR=' + packages]
+            env = env + build_cache_environment(target, env)
+            args = ['env', *env, 'emerge', '--buildpkgonly', '--oneshot', '--nodeps',
                     '--usepkg=n', '--quiet-build=y', '=sys-devel/' + version]
             bounded(args, target, 'build', log)
     print(f'{name}: package ready', flush=True)
