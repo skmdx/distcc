@@ -206,12 +206,12 @@ class PlanMemoTest(BrokerTestCase):
         def memo(key,command=4):
             peer=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET)
             peer.settimeout(2);peer.connect(self.env['DISTCC_BROKER'])
-            peer.sendall(struct.pack('=II',3,command)+key+b'\0')
+            peer.sendall(struct.pack('=II',4,command)+key+b'\0')
             self.addCleanup(peer.close)
             return peer
         def publish(key,value):
             owner=memo(key);self.assertEqual(owner.recv(1),b'\0')
-            owner.sendall(struct.pack('=II',3,5)+value+b'\0')
+            owner.sendall(struct.pack('=II',4,5)+value+b'\0')
             self.assertEqual(owner.recv(1),b'');owner.close()
         # 1,400 realistic-size payloads and worker handles share one byte-bounded
         # broker tree. This must not regress to the former 256-entry ceiling.
@@ -226,13 +226,13 @@ class PlanMemoTest(BrokerTestCase):
         owner=memo(payload,18);self.assertEqual(owner.recv(1),b'\0')
         waiter=memo(payload,18);owner.close()
         self.assertEqual(waiter.recv(1),b'\0')
-        waiter.sendall(struct.pack('=II',3,5)+b'new\0');self.assertEqual(waiter.recv(1),b'')
+        waiter.sendall(struct.pack('=II',4,5)+b'new\0');self.assertEqual(waiter.recv(1),b'')
         # A late invalidator must not discard the already replaced value.
         self.assertEqual(memo(payload,18).recv(100),b'new\0')
         for i in range(257):
             left,right=socket.socketpair();self.addCleanup(right.close)
             owner=memo(('worker-'+str(i)).encode(),16);self.assertEqual(owner.recv(1),b'\0')
-            owner.sendmsg([struct.pack('=II',3,17)],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,
+            owner.sendmsg([struct.pack('=II',4,17)],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,
                           array.array('i',[left.fileno()]))])
             left.close();self.assertEqual(owner.recv(1),b'');owner.close()
         self.assertEqual(memo(b'worker-0',16).recv(1),b'\0')

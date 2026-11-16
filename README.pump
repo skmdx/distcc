@@ -50,8 +50,11 @@ shares these slots with local compilation. An explicit limit remains effective.
 Native analysis can use the available CPUs and publishes
 its observed resident plus frontend peak memory. One initial request calibrates
 demand before parallel scans are admitted using that peak and the existing
-memory headroom policy. Waiting broker clients recheck admission as soon as
-the measured peak is published, with a timed retry for unrelated budget changes.
+memory headroom policy. The broker queues analyzer requests in arrival order
+against the client's measured analyzer limit, separately from ordinary CPU
+leases. Pressure and spare headroom reduce parallelism without excluding the
+last fitting producer; that producer may use existing free swap within ancestor
+cgroup limits. Admission is rechecked after a lease is granted.
 Imports happen before forking so immutable library pages
 are shared. Memory budgets and pressure are checked
 in the requesting client's cgroup. Busy clients wait for capacity

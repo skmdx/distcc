@@ -5,6 +5,7 @@ import fcntl
 import concurrent.futures
 import os
 import re
+import select
 from pathlib import Path
 import socket
 import shutil
@@ -39,7 +40,7 @@ class MemoReconnectTest(unittest.TestCase):
                         second, _ = listener.accept()
                         with second:
                             self.assertEqual(second.recv(128), original)
-                            self.assertEqual(original, struct.pack('=II', 3, 16 if kind == 'worker' else 4) + b'retry\0')
+                            self.assertEqual(original, struct.pack('=II', 4, 16 if kind == 'worker' else 4) + b'retry\0')
                             if kind == 'worker':
                                 with tempfile.TemporaryFile() as worker:
                                     worker.write(b'W'); worker.seek(0)
@@ -64,7 +65,7 @@ class MemoReconnectTest(unittest.TestCase):
 
 
 class BrokerTestCase(DistccTestCase):
-    protocol_version = 3
+    protocol_version = 4
 
     def start_memory_refusal(self):
         # The first snapshot fits; before execution the real daemon's memory
@@ -138,7 +139,7 @@ class BrokerTestCase(DistccTestCase):
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
         payload = struct.pack("=II", self.protocol_version, command)
-        if command == 12:
+        if command in (12, 13):
             payload += struct.pack('=I', cpp_limit)
         if command & 65535 in (6, 9, 10, 15):
             if memory_class is None:
@@ -258,6 +259,25 @@ class BrokerDirectTest(BrokerTestCase):
         self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
         self.assertEqual(self.receive(self.request(15)), (0, 0, []))
         self.assertEqual(self.receive(self.request(12)), (0, 1, []))
+
+    def test_serial_analysis_queues_in_request_order(self):
+        self.start_broker(self.host(0) + ' --localslots_cpp=4')
+        held = self.request(13, cpp_limit=1)
+        self.assertEqual(self.receive(held), (0, 1, []))
+        waiting = []
+        for _ in range(3):
+            waiting.append(self.request(13, cpp_limit=1))
+            time.sleep(.02)
+        try:
+            self.assertFalse(select.select(waiting, [], [], .05)[0])
+            held.close()
+            for index, lease in enumerate(waiting):
+                self.assertEqual(self.receive(lease), (0, 1, []))
+                self.assertFalse(select.select(waiting[index+1:], [], [], .02)[0])
+                lease.close()
+        finally:
+            held.close()
+            for lease in waiting: lease.close()
 
     def test_automatic_frontend_capacity_shares_local_cpu_leases(self):
         metrics = stats_response(cpus=2, cores=2, jobs=2, capacity=2,

@@ -234,9 +234,10 @@ static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
         int occupied;
         for (;;) {
             int maximum = chosen->slots_specified ? chosen->n_slots : dcc_resource_cpus();
-            int limit = analysis ? 0 : dcc_resource_local_slots(maximum);
-            if (!analysis && !limit) {
-                dcc_lock_pause(0);
+            int limit = analysis ? dcc_resource_analysis_slots(dcc_resource_cpus()) :
+                                   dcc_resource_local_slots(maximum);
+            if (!limit) {
+                dcc_lock_pause(analysis ? 1 : 0);
                 continue;
             }
             ret = dcc_broker_local_cpp(cpu_lock_fd, &occupied, analysis, limit);

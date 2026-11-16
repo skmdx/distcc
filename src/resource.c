@@ -20,6 +20,7 @@
 static double pressure = -1;
 static int processors = 1;
 static unsigned long long available = ULLONG_MAX, budget = ULLONG_MAX;
+static unsigned long long swap_available;
 
 #ifdef __linux__
 /* These procfs/cgroup records are small. Read a complete snapshot without
@@ -94,6 +95,7 @@ static void sample_resources(void)
     sampled = now;
     pressure = -1;
     available = budget = ULLONG_MAX;
+    swap_available = 0;
     long online = sysconf(_SC_NPROCESSORS_ONLN);
     processors = online > 0 && online < INT_MAX ? (int)online : 1;
     cpu_set_t allowed;
@@ -119,12 +121,14 @@ static void sample_resources(void)
     }
     if (!read_text("/proc/meminfo", data, sizeof(data))) {
         char *cursor = data, *line;
-        while ((line = strsep(&cursor, "\n")))
+        while ((line = strsep(&cursor, "\n"))) {
             if (sscanf(line, "MemAvailable: %llu kB", &value) == 1) {
                 available = value * 1024;
                 budget = available + own;
-                break;
             }
+            if (sscanf(line, "SwapFree: %llu kB", &value) == 1)
+                swap_available = value * 1024;
+        }
     }
     read_pressure("/proc/pressure/memory");
     if (group[0]) {
@@ -147,6 +151,12 @@ static void sample_resources(void)
                 unsigned long long free = limit > used ? limit - used : 0;
                 if (free < available) available = free;
                 if (free + own < budget) budget = free + own;
+            }
+            limit = read_bytes(path, "memory.swap.max");
+            if (limit != ULLONG_MAX) {
+                used = read_bytes(path, "memory.swap.current");
+                unsigned long long free = used < limit ? limit - used : 0;
+                if (free < swap_available) swap_available = free;
             }
             if (snprintf(name, sizeof(name), "%s/memory.pressure", path) < (int)sizeof(name))
                 read_pressure(name);
@@ -348,11 +358,25 @@ int dcc_resource_slots(int maximum)
     return resource_slots(maximum, dcc_resource_job_bytes(), dcc_resource_spare_bytes(), 1);
 }
 
+static int producer_slots(int maximum, unsigned long long job, unsigned long long spare)
+{
+    int slots = resource_slots(maximum, job, spare, 0);
+    /* PSI and optional spare constrain parallel producers, not the last one.
+     * A fitting serial producer must be able to feed idle remote workers even
+     * while persistent caches keep PSI high. This single producer may use the
+     * host's existing swap, bounded by every ancestor cgroup's swap allowance.
+     * It must still fit the RAM budget. Parallel producers and worker execution
+     * retain their RAM-only admission; no kernel limits or swap policy change. */
+    if (!slots && maximum > 0 && budget >= job &&
+        (available >= job || swap_available >= job - available)) return 1;
+    return slots;
+}
+
 int dcc_resource_local_slots(int maximum)
 {
     const char *setting = getenv("DISTCC_JOB_MEMORY");
     unsigned long long job = setting && *setting ? configured_job_bytes() : 256ULL * 1024 * 1024;
-    return resource_slots(maximum, job, job / 4, 0);
+    return producer_slots(maximum, job, job / 4);
 }
 
 int dcc_resource_class_slots(int maximum, unsigned memory_class,
@@ -415,13 +439,10 @@ int dcc_resource_analysis_slots(int maximum)
          * prevent smaller native analysis from ever collecting a sample. */
         sample_resources();
         unsigned long long initial = available < budget ? available : budget;
-        return initial ? resource_slots(1, initial, 0, 0) : 0;
+        return initial && maximum > 0 ? producer_slots(1, initial, 0) : 0;
     }
     unsigned long long job = measured_job_bytes(peak);
-    int slots = resource_slots(maximum, job, peak, 0);
-    /* Persistent caches can leave room for one measured scan but not a second
-     * peak as reserve. Keep the per-job margin and serialize that case. */
-    return slots ? slots : resource_slots(1, job, 0, 0);
+    return producer_slots(maximum, job, peak);
 }
 
 void dcc_resource_analysis_wait(int occupied, unsigned timeout_ms)

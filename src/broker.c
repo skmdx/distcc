@@ -269,7 +269,9 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
     const void *message = &request;
     size_t request_size = sizeof(request.header);
     if (hint) { request.hint = *hint; request_size = sizeof(request); }
-    if (command == LOCAL_CPP) { message = &local; request_size = sizeof(local); }
+    if (command == LOCAL_CPP || command == LOCAL_ANALYSIS) {
+        message = &local; request_size = sizeof(local);
+    }
     union {
         struct cmsghdr align;
         char bytes[CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))];
@@ -1107,9 +1109,9 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         /* Queue against the client's budget before granting a lease. Otherwise
          * a smaller client rejects the broker's grant and sleeps for a second
          * even when the next compiler releases its slot immediately. */
-        if (client->command == LOCAL_CPP && client->local_limit < (unsigned)limit)
-            limit = client->local_limit;
-        if (broker->cpp_busy < limit) {
+        unsigned occupied = client->command == LOCAL_ANALYSIS ?
+                            broker->analysis_busy : broker->cpp_busy;
+        if (broker->cpp_busy < limit && occupied < client->local_limit) {
             /* Memory calibration belongs to the analyzer pool. IR producers
              * still consume CPU here, but are not resident analyzer workers. */
             reply.slots = (client->command == LOCAL_ANALYSIS ?
@@ -2054,7 +2056,7 @@ int dcc_broker_serve(const char *path)
                 }
                 int compile = request.command == ACQUIRE_POOL || request.command == ACQUIRE_CPP ||
                               request.command == ACQUIRE_READY || request.command == TRY_LOCAL;
-                int local_cpp = request.command == LOCAL_CPP;
+                int local_cpp = request.command == LOCAL_CPP || request.command == LOCAL_ANALYSIS;
                 if (c->state != REQUEST || length != (ssize_t)(sizeof(request) +
                         (compile ? sizeof(struct dcc_work_hint) : local_cpp ? sizeof(uint32_t) : 0)) ||
                     request.version != BROKER_VERSION ||
