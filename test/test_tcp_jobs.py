@@ -320,6 +320,53 @@ class FileCacheTest(unittest.TestCase):
 
 
 class GccFrontendTest(BrokerTestCase):
+    def test_native_gcc_uses_client_diagnostic_locale(self):
+        locales = subprocess.check_output(['locale', '-a'], text=True).splitlines()
+        japanese = next((x for x in locales if x.lower().startswith('ja_jp.')), None)
+        if not japanese:
+            self.skipTest('Japanese locale required to distinguish worker diagnostics')
+        self.start_frontend(LANG=japanese, LANGUAGE='ja', LC_ALL=japanese)
+        source = self.work/'diagnostic.c'
+        source.write_text('#line 1 "completed"\nint value = missing;\n')
+        command = [self.cc, '-fdiagnostics-color=never', '-c', str(source),
+                   '-o', str(self.work/'diagnostic.o')]
+        names = ('LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES')
+        for locale in ({'LANG': japanese, 'LANGUAGE': 'ja', 'LC_ALL': 'C'},
+                       {'LANG': japanese, 'LC_MESSAGES': japanese}, {}):
+            with self.subTest(locale=locale):
+                env = {k:v for k,v in self.env.items() if k not in names}
+                env.update(locale)
+                expected = subprocess.run(command, env=env, capture_output=True, text=True)
+                actual = subprocess.run([str(self.build/'distcc'), *command], env=env,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(expected.returncode, 1, expected.stderr)
+                self.assertEqual(actual.returncode, expected.returncode, actual.stderr)
+                self.assertIn(expected.stderr, actual.stderr)
+                self.assertIn('pooled TCP job completed', actual.stderr)
+                self.assertNotIn('retrying locally', actual.stderr)
+                self.assertNotIn('running locally instead', actual.stderr)
+
+    def test_cgo_parses_native_gcc_probe_diagnostics(self):
+        go = shutil.which('go')
+        if not go:
+            self.skipTest('Go required for cgo diagnostic probe')
+        self.start_frontend(LANG='ja_JP.UTF-8', LANGUAGE='ja', LC_ALL='ja_JP.UTF-8')
+        source = self.work/'probe.go'
+        source.write_text('package probe\n/* typedef int value_t; */\nimport "C"\n'
+                          'var Value C.value_t\n')
+        output = self.work/'cgo'
+        output.mkdir()
+        env = dict(self.env, CC=f'{self.build}/distcc {self.cc}')
+        # cgo also runs -E probes; they do not use the native frontend. There
+        # is no include server in this fixture, so use its normal local -E path.
+        env.pop('INCLUDE_SERVER_PORT')
+        result = subprocess.run([go, 'tool', 'cgo', '-objdir', str(output), str(source)],
+                                env=env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((output/'probe.cgo2.c').is_file())
+        self.assertNotIn('retrying locally', result.stderr)
+
     def test_main_input_below_absolute_symlink_ancestor(self):
         self.start_frontend()
         source = self.root/(self._testMethodName+'-source')

@@ -1193,6 +1193,20 @@ static int dcc_run_job(int in_fd,
         char **gcc_directories = job_argv;
         while (*job_argv && **job_argv) ++job_argv;
         if (!*job_argv || !*++job_argv) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
+        /* Native GCC runs in the TCP worker's per-job child. Preserve the
+         * caller's diagnostic language (cgo parses English diagnostics) and
+         * character classification without inheriting the daemon's locale.
+         * The fixed schema cannot set loader or other executable settings. */
+        if (dcc_argv_len(job_argv) < DCC_GCC_LOCALE_COUNT + 2 ||
+            strcmp(*job_argv++, "gcc-locale-v1")) {
+            ret = EXIT_PROTOCOL_ERROR; goto out_cleanup;
+        }
+        for (unsigned i = 0; i < DCC_GCC_LOCALE_COUNT; ++i, ++job_argv) {
+            if (**job_argv ? setenv(dcc_gcc_locale_names[i], *job_argv, 1)
+                          : unsetenv(dcc_gcc_locale_names[i])) {
+                ret = EXIT_OUT_OF_MEMORY; goto out_cleanup;
+            }
+        }
         if (!strcmp(job->argv[1], "-") &&
             (gcc_stdin = dcc_gcc_files_stdin(job->fs_channel-1, root)) < 0) {
             ret = EXIT_IO_ERROR; goto out_cleanup;

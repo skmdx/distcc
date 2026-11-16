@@ -12,6 +12,10 @@
 #include "job.h"
 #include "distcc.h"
 
+const char *const dcc_gcc_locale_names[DCC_GCC_LOCALE_COUNT] = {
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES"
+};
+
 struct metadata {
     unsigned char *data;
     size_t size, offset, capacity;

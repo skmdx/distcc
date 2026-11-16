@@ -8,6 +8,10 @@
 #define DCC_JOB_INPUT_MAX 65536
 #define DCC_JOB_RESULT_COUNT 4
 #define DCC_SYSTEM_HEADERS ".distcc-system"
+/* Fixed GCC execution metadata, not an arbitrary remote environment. Empty
+ * values clear the worker setting and retain libc's normal locale precedence. */
+#define DCC_GCC_LOCALE_COUNT 5
+extern const char *const dcc_gcc_locale_names[DCC_GCC_LOCALE_COUNT];
 enum dcc_job_kind { DCC_JOB_COMPILE, DCC_JOB_PUMP, DCC_JOB_LINK, DCC_JOB_RUST, DCC_JOB_THINLTO,
                     DCC_JOB_OFFLOAD_LINK, DCC_JOB_FRONTEND, DCC_JOB_GCC_FRONTEND, DCC_JOB_KIND_COUNT };
 enum dcc_job_input_kind { DCC_JOB_FILE, DCC_JOB_SYMLINK, DCC_JOB_EMPTY,

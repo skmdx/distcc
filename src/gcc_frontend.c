@@ -350,7 +350,8 @@ decoded:
     job->cwd = getcwd(NULL, 0);
     unsigned defaults = dcc_argv_len(groups[0]), directories = dcc_argv_len(groups[1]);
     unsigned argc = dcc_argv_len(argv);
-    job->argv = calloc(defaults + directories + argc + 6, sizeof(*job->argv));
+    job->argv = calloc(defaults + directories + argc + 7 + DCC_GCC_LOCALE_COUNT,
+                       sizeof(*job->argv));
     if (!job->cwd || !job->argv) goto done;
     job->argv[0] = strdup(argv[0]);
     job->argv[1] = strdup(input);
@@ -364,6 +365,13 @@ decoded:
         }
         job->argv[position] = strdup("");
         if (!job->argv[position++]) goto done;
+    }
+    job->argv[position++] = strdup("gcc-locale-v1");
+    if (!job->argv[position-1]) goto done;
+    for (unsigned i = 0; i < DCC_GCC_LOCALE_COUNT; ++i) {
+        const char *value = getenv(dcc_gcc_locale_names[i]);
+        job->argv[position++] = strdup(value ? value : "");
+        if (!job->argv[position-1]) goto done;
     }
     for (unsigned i = 0; i < argc; ++i) {
         job->argv[position] = strdup(argv[i]);
