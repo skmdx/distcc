@@ -300,6 +300,37 @@ class AnalyzerPoolTest(PumpTestCase):
     compression = 'lz4'
     transport = ',tcp'
 
+    def snapshot(self):
+        """Receive the real include manifest and its kernel-owned lifetime FD."""
+        def token(name, value):
+            return name + ('%08x' % value).encode()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(10)
+            peer.connect(self.env['INCLUDE_SERVER_PORT'])
+            cwd = os.fsencode(self.work)
+            argv = [b'gcc', b'-c', os.fsencode(self.source), b'-o', b'snapshot.o']
+            peer.sendall(token(b'CDIR', len(cwd)) + cwd + token(b'LZ4C', len(argv)) +
+                         b''.join(token(b'ARGV', len(a)) + a for a in argv))
+            def read(size):
+                data = b''
+                while len(data) < size:
+                    part = peer.recv(size-len(data))
+                    self.assertTrue(part)
+                    data += part
+                return data
+            header = read(12)
+            self.assertEqual(header[:4], b'ARGC')
+            paths = []
+            for _ in range(int(header[4:], 16)):
+                header = read(12)
+                self.assertEqual(header[:4], b'ARGV')
+                paths.append(Path(os.fsdecode(read(int(header[4:], 16)))))
+            marker, rights, flags, _ = peer.recvmsg(1, socket.CMSG_SPACE(4))
+            self.assertEqual((marker, flags), (b'\0', 0))
+            self.assertEqual(len(rights), 1)
+            self.assertEqual(rights[0][:2], (socket.SOL_SOCKET, socket.SCM_RIGHTS))
+            return paths, struct.unpack('i', rights[0][2])[0]
+
     def test_response_files_are_expanded_before_pump_and_native_options(self):
         source = self.work / 'response source.cc'
         header = self.work / 'response header.h'
@@ -701,17 +732,19 @@ read -r proceed || exit 1
     def test_recovery_preserves_published_inputs_and_shutdown_reaps_workers(self):
         result = self.run_cc('gcc', ['-c', self.source, '-o', 'first.o'])
         self.assertEqual(result.returncode, 0, result.stderr.decode())
+        paths, lease = self.snapshot()
+        self.addCleanup(lambda: os.close(lease) if lease >= 0 else None)
         supervisor = int(self.env['INCLUDE_SERVER_PID'])
         roots = list(self.work.glob(f'*.include_server-{supervisor}-*'))
-        snapshots = {p: p.read_bytes() for root in roots for p in root.rglob('*') if p.is_file()}
+        snapshots = {p: p.read_bytes() for p in paths if p.is_file()}
         self.assertTrue(snapshots, 'published inputs not reached')
         workers = self.analyzer_pids()
-        victim = next(iter(workers))
-        os.kill(victim, signal.SIGKILL)
+        for victim in workers:
+            os.kill(victim, signal.SIGKILL)
         deadline = time.monotonic() + 5
         while True:
             replacements = self.analyzer_pids()
-            if len(replacements) == 2 and victim not in replacements:
+            if len(replacements) == 2 and not workers.intersection(replacements):
                 break
             self.assertLess(time.monotonic(), deadline, 'analyzer was not replaced')
             time.sleep(.01)
@@ -719,12 +752,30 @@ read -r proceed || exit 1
         result = self.run_cc('gcc', ['-c', self.source, '-o', 'recovered.o'])
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual((self.work / 'first.o').read_bytes(), (self.work / 'recovered.o').read_bytes())
+        os.close(lease)
+        lease = -1
         for pid in replacements:
             os.kill(pid, signal.SIGSTOP)
         self.shutdown_pump()
         self.assertFalse(any(Path(f'/proc/{pid}').exists() for pid in replacements))
         self.assertFalse(list(self.work.glob(f'*.include_server-{supervisor}-*')))
         self.assertFalse(Path(self.env['INCLUDE_SERVER_PORT']).exists())
+
+    def test_disconnected_server_preprocessing_preserves_fallback_policy(self):
+        self.env.pop('DISTCC_TESTING_INCLUDE_SERVER')
+        self.env['INCLUDE_SERVER_PORT'] = str(self.work / 'absent-server')
+        expected = self.run_cc('gcc', ['-E', self.source], False)
+        self.assertEqual(expected.returncode, 0)
+        for fallback in ('0', '1'):
+            with self.subTest(fallback=fallback):
+                self.env['DISTCC_FALLBACK'] = fallback
+                result = self.run_cc('gcc', ['-E', self.source])
+                if fallback == '0':
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr.decode())
+                    self.assertEqual(result.stdout, expected.stdout)
 
 
 class PreprocessTest(PumpTestCase):

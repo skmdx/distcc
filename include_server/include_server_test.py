@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import tempfile
 import subprocess
+import errno
+import select
+import sys
 import unittest
 from unittest import mock
 
@@ -16,6 +19,29 @@ import include_server
 
 
 class IncludeServerTest(unittest.TestCase):
+  @unittest.skipUnless(hasattr(os, 'pidfd_open'), 'Linux child lifetime check')
+  def test_worker_exits_even_when_storage_and_error_log_are_full(self):
+    pool = include_server.AnalyzerPool(str(self.root / 'pool'))
+    self.addCleanup(pool.close)
+    def fail():
+      full = os.open('/dev/full', os.O_WRONLY)
+      os.dup2(full, sys.stderr.fileno())
+      os.close(full)
+      raise OSError(errno.ENOSPC, 'snapshot storage full')
+    with mock.patch.object(pool.server, 'serve_forever', side_effect=fail):
+      pool.start_worker()
+    pid = next(iter(pool.workers))
+    fd = os.pidfd_open(pid)
+    try:
+      self.assertTrue(select.select([fd], [], [], 5)[0], 'failed worker did not exit')
+    finally:
+      os.close(fd)
+    _, status = os.waitpid(pid, 0)
+    pool.workers.remove(pid)
+    self.assertTrue(os.WIFEXITED(status))
+    self.assertEqual(os.WEXITSTATUS(status), 1)
+    pool.keeper.CollectClientRoots()
+
   def setUp(self):
     self.addCleanup(os.chdir, os.getcwd())
     self.storage = tempfile.TemporaryDirectory()
@@ -37,6 +63,7 @@ class IncludeServerTest(unittest.TestCase):
     class StreamHandler:
       def __init__(self):
         self.rfile = self.wfile = mock.Mock(fileno=lambda: 27)
+        self.request = mock.Mock()
     with (mock.patch.object(include_server.socketserver, 'StreamRequestHandler', StreamHandler),
           mock.patch.object(distcc_pump_c_extensions, 'RCwd', return_value=str(self.root)),
           mock.patch.object(distcc_pump_c_extensions, 'RArgv', return_value=(['gcc', source], 'lzo')),

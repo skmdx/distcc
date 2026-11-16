@@ -35,6 +35,8 @@ import resource
 import shutil
 import signal
 import socketserver
+import socket
+import array
 import sys
 import struct
 import tempfile
@@ -360,6 +362,7 @@ def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
       cmd, compression = distcc_pump_c_extensions.RArgv(self.rfile.fileno(), True)
 
       try:
+        include_analyzer.client_root_keeper.CollectClientRoots()
         files_and_links = include_analyzer.DoCompilationCommand(
             cmd, currdir, include_analyzer.client_root_keeper, compression)
 
@@ -428,6 +431,10 @@ def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
         if memory_path is not None:
           RecordMemory(memory_path)
         distcc_pump_c_extensions.XArgv(self.wfile.fileno(), files_and_links)
+        # The client owns this snapshot through transmission and cancellation.
+        # SCM_RIGHTS duplicates the already-held shared lock without a handoff gap.
+        self.request.sendmsg([b'\0'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+            array.array('i', [include_analyzer.client_root_keeper.lease]))])
       # Print out observed paths.
       if basics.opt_path_observation_re:
          include_analyzer.build_stat_cache.WarnAboutPathObservations(
@@ -541,8 +548,8 @@ class AnalyzerPool:
   """Persistent, process-isolated analyzers sharing one listening socket.
 
   Each worker has its own cwd, compiler contexts and input generations.
-  All published roots belong to the supervisor, so replacing a failed worker
-  cannot invalidate inputs a distcc client is still transmitting.
+  Published generations stay pinned by analyzer/client directory descriptors;
+  replacing a worker reclaims only generations with no remaining consumers.
   """
 
   def __init__(self, port):
@@ -598,12 +605,16 @@ class AnalyzerPool:
       except BaseException:
         traceback.print_exc()
       finally:
-        if write_fd is not None:
-          os.close(write_fd)
-        self.server.server_close()
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(status)
+        try:
+          if write_fd is not None:
+            os.close(write_fd)
+          self.server.server_close()
+          sys.stdout.flush()
+          sys.stderr.flush()
+        finally:
+          # A full stderr filesystem must not unwind a forked child through
+          # the supervisor's cleanup and signal its inherited sibling PIDs.
+          os._exit(status)
     self.workers.add(pid)
     os.close(write_fd)
     try:
@@ -629,6 +640,9 @@ class AnalyzerPool:
       self.signal_worker(pid, signal.SIGKILL)
       _, status = os.waitpid(pid, 0)
       self.workers.remove(pid)
+      # Reclaim failed-worker caches before logging or starting its replacement,
+      # including when a cache write failed because temporary storage was full.
+      self.keeper.CollectClientRoots()
       print('Include server: replacing analyzer (status %d)' % status,
             file=sys.stderr, flush=True)
       self.start_worker()

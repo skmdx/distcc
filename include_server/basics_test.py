@@ -24,13 +24,19 @@ import os
 import os.path
 import tempfile
 import unittest
+import socket
+import array
+import errno
+from unittest import mock
 
 import basics
 
 class BasicsTest(unittest.TestCase):
 
   def setUp(self):
-
+    environment = mock.patch.dict(os.environ)
+    environment.start()
+    self.addCleanup(environment.stop)
     basics.opt_debug_pattern = 1
 
   def tearDown(self):
@@ -39,50 +45,17 @@ class BasicsTest(unittest.TestCase):
   def test_ClientRootKeeper(self):
     os.environ['DISTCC_CLIENT_TMP'] = 'to/be'
     self.assertRaises(SystemExit, basics.ClientRootKeeper)
-    os.environ['DISTCC_CLIENT_TMP'] = '/to/be/or'
-    self.assertEqual(basics.ClientRootKeeper().number_missing_levels, 0)
-    try:
-      tempfile_mkdtemp = tempfile.mkdtemp
-      os_makedirs = os.makedirs
-
-      def Mock_tempfile_mkdtemp(pat, dir):
-        self.assertTrue((pat, dir)
-                     in
-                     [('.%s-%s-%d' %
-                       (basics.ClientRootKeeper.INCLUDE_SERVER_NAME,
-                        os.getpid(), generation),
-                       prefix)
-                      for generation, prefix in
-                      [(1,'/to/be'), (2, '/to')]])
-        return (dir == '/to/be' and '/to/be/xxxxxx'
-                or dir == '/to' and '/to/xxxxxxx')
-
-      def Mock_os_makedirs(f, *unused_args):
-        if not f.startswith('/to/'):
-          raise Exception(f)
-
-      tempfile.mkdtemp = Mock_tempfile_mkdtemp
-      os.makedirs = Mock_os_makedirs
-
-
-      os.environ['DISTCC_CLIENT_TMP'] = '/to/be'
-      client_root_keeper = basics.ClientRootKeeper()
-      client_root_keeper.ClientRootMakedir(1)
-      self.assertEqual(os.path.dirname(client_root_keeper.client_root),
-                       "/to/be")
-      os.environ['DISTCC_CLIENT_TMP'] = '/to'
-      client_root_keeper = basics.ClientRootKeeper()
-      client_root_keeper.ClientRootMakedir(2)
-      self.assertEqual(os.path.dirname(
-          os.path.dirname(client_root_keeper.client_root)), "/to")
-      self.assertEqual(os.path.basename(client_root_keeper.client_root),
-                       "padding")
-      self.assertEqual(len(
-        [ None for ch in client_root_keeper.client_root if ch == '/' ]), 3)
-    finally:
-      tempfile.mkdtemp = tempfile_mkdtemp
-      os.makedirs = os_makedirs
-
+    for path, padding in (('/to', 1), ('/to/be', 0), ('/to/be/or', 0)):
+      os.environ['DISTCC_CLIENT_TMP'] = path
+      self.assertEqual(basics.ClientRootKeeper().number_missing_levels, padding)
+    with tempfile.TemporaryDirectory() as directory:
+      os.environ['DISTCC_CLIENT_TMP'] = directory
+      keeper = basics.ClientRootKeeper()
+      keeper.ClientRootMakedir(1)
+      self.assertTrue(os.path.isdir(keeper.client_root))
+      self.assertTrue(keeper.client_root.startswith(directory + '/'))
+      keeper.CleanOutClientRoots()
+      self.assertFalse(keeper.Glob(str(os.getpid())))
 
   def test_ClientRootKeeper_Deletions(self):
     """Test whether directories emerge and go away appropriately."""
@@ -114,5 +87,53 @@ class BasicsTest(unittest.TestCase):
                    client_root_keeper._client_root_before_padding)
     finally:
       os.rmdir(os.environ['DISTCC_CLIENT_TMP'])
+
+  def test_retired_generations_follow_client_descriptors(self):
+    with tempfile.TemporaryDirectory() as directory:
+      os.environ['DISTCC_CLIENT_TMP'] = directory
+      keeper = basics.ClientRootKeeper()
+      collector = basics.ClientRootKeeper()
+      keeper.ClientRootMakedir(1)
+      old = keeper.client_root
+      with open(old + '/snapshot', 'w') as output:
+        output.write('immutable input')
+      sender, receiver = socket.socketpair()
+      try:
+        sender.sendmsg([b'\0'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                array.array('i', [keeper.lease]))])
+        _, rights, _, _ = receiver.recvmsg(1, socket.CMSG_SPACE(4))
+        lease = array.array('i', rights[0][2])[0]
+      finally:
+        sender.close()
+        receiver.close()
+      try:
+        for generation in range(2, 22):
+          keeper.ClientRootMakedir(generation)
+          collector.CollectClientRoots()
+          self.assertEqual(len(keeper.Glob(str(os.getpid()))), 2)
+          with open(old + '/snapshot') as source:
+            self.assertEqual(source.read(), 'immutable input')
+      finally:
+        os.close(lease)
+      collector.CollectClientRoots()
+      self.assertFalse(os.path.exists(old))
+      self.assertTrue(os.path.isdir(keeper.client_root))
+      keeper.CleanOutClientRoots()
+      self.assertEqual(os.listdir(directory), [])
+
+  def test_storage_failure_releases_retired_generation(self):
+    with tempfile.TemporaryDirectory() as directory:
+      os.environ['DISTCC_CLIENT_TMP'] = directory
+      keeper = basics.ClientRootKeeper()
+      keeper.ClientRootMakedir(1)
+      old = keeper.client_root
+      with mock.patch.object(tempfile, 'mkdtemp', side_effect=OSError(errno.ENOSPC, 'full')):
+        with self.assertRaises(SystemExit):
+          keeper.ClientRootMakedir(2)
+      self.assertFalse(os.path.exists(old))
+      self.assertIsNone(keeper.lease)
+      keeper.ClientRootMakedir(3)
+      keeper.CleanOutClientRoots()
+      self.assertEqual(os.listdir(directory), [])
 
 unittest.main()

@@ -60,9 +60,13 @@ are shared. Memory budgets and pressure are checked
 in the requesting client's cgroup. Busy clients wait for capacity
 without switching preprocessing mode, including `-E` and `--scan-includes`.
 Homogeneous broker clients finish analysis before reserving a remote worker.
-Each analyzer owns its cwd and caches. The supervisor replaces failed analyzers
-and retains their published input snapshots until pump shuts down, so an
-in-progress transfer cannot lose its inputs during recovery.
+Each analyzer owns its cwd and caches. A published manifest transfers a shared
+directory-lock descriptor to its client; that descriptor pins the immutable
+generation through transfer, retry and cancellation. Requests and worker
+replacement reclaim generations only after all analyzer/client descriptors
+close. Failed workers cannot delete an in-progress transfer, and retired caches
+do not accumulate until the build ends. Client and include server must be
+upgraded together at an idle build boundary.
 
 The client expands GNU-style `@response` files with LLVM's argument parser before
 classifying the job. Empty CMake module maps and nested response files therefore

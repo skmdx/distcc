@@ -187,7 +187,7 @@ class IncludeAnalyzer(object):
       files_and_links += self._ForceDirectoriesToExist()
 
     # Never publish a manifest assembled from changing inputs. Previous
-    # manifests keep their immutable generation until the build finishes.
+    # manifests keep their immutable generation while a client holds its lease.
     if self.build_stat_cache.file_stamps.Changed(self.current_input_paths):
       raise CacheInvalidated()
 
@@ -243,8 +243,6 @@ class IncludeAnalyzer(object):
     self.generation += 1
     # Tabula rasa: for this analysis, we must forget everything recorded in the
     # client_root directory about source files, directories, and symbolic links.
-    # But we cannot delete any such information, because slow-poke distcc
-    # clients that have received earlier include manifests perhaps only now get
-    # around to reading a previous generation client root directory.
+    # Retired generations are reclaimed only after the last client lease closes.
     self.client_root_keeper.ClientRootMakedir(self.generation)
     self._InitializeAllCaches()

@@ -50,10 +50,12 @@ static int dcc_categorize_file(const char *include_server_filename);
 /** Talks to the include server, over the AF_UNIX socket specified
  * in env variable INCLUDE_SERVER_PORT. If all goes well,
  * it returns the array of files in @p files and returns 0;
- * if anything goes wrong, it returns a non-zero value.
+ * if anything goes wrong, it returns a non-zero value. On success, snapshot
+ * owns a CLOEXEC directory descriptor which must stay open until all uses of
+ * the returned paths finish. Initialize it to -1 and close it during cleanup.
  */
 
-int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr)
+int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr, int *snapshot)
 {
     char *include_server_port;
     int fd = -1, lock_fd = -1;
@@ -119,9 +121,16 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
         rs_log_warning("include server gave up analyzing");
         goto out;
     }
+    char marker;
+    if (dcc_recv_fd(fd, &marker, 1, snapshot) != 1 || marker || *snapshot < 0) {
+        rs_log_warning("include server did not transfer its snapshot lease");
+        if (*snapshot >= 0) { dcc_close(*snapshot); *snapshot = -1; }
+        goto out;
+    }
     ret = 0;
 out:
     if (fd != -1 && dcc_close(fd)) ret = 1;
+    if (ret && *snapshot >= 0) { dcc_close(*snapshot); *snapshot = -1; }
     dcc_unlock(lock_fd);
     return ret;
 }
@@ -135,7 +144,7 @@ dcc_approximate_includes(struct dcc_hostdef *host, char **argv)
 {
     char **files;
     int i;
-    int ret;
+    int ret, snapshot = -1;
 
     if (host->cpp_where != DCC_CPP_ON_SERVER) {
         rs_log_error("'--scan_includes' specified, "
@@ -145,17 +154,18 @@ dcc_approximate_includes(struct dcc_hostdef *host, char **argv)
         //return 0;
     }
 
-    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
+    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr, &snapshot))) {
         rs_log_error("failed to get includes from include server");
         return ret;
     }
 
     for (i = 0; files[i]; i++) {
-        if ((ret = dcc_categorize_file(files[i])))
-            return ret;
+        if ((ret = dcc_categorize_file(files[i]))) break;
     }
 
-    return 0;
+    if (snapshot >= 0) dcc_close(snapshot);
+    dcc_free_argv(files);
+    return ret;
 }
 
 /*

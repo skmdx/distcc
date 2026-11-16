@@ -811,6 +811,7 @@ dcc_build_somewhere(char *argv[],
     int rewrite_cross = !getenv("DISTCC_NO_REWRITE_CROSS");
     char *input_fname = NULL, *output_fname, *cpp_fname = NULL, *deps_fname = NULL;
     int cpp_fd = -1;
+    int input_snapshot = -1;
     char **files = NULL;
     char **auxiliary = NULL;
     struct dcc_job *prepared_job = NULL;
@@ -1017,7 +1018,7 @@ dcc_build_somewhere(char *argv[],
             entry = next;
         }
         if (count && same_format) {
-            ret = dcc_talk_to_include_server(argv, &files, compr);
+            ret = dcc_talk_to_include_server(argv, &files, compr, &input_snapshot);
             if (ret == EXIT_LOCAL_COMPILE) goto lock_local;
         }
         if (!ret && files && compr == DCC_COMPRESS_LZ4_STREAM) {
@@ -1030,7 +1031,7 @@ dcc_build_somewhere(char *argv[],
             if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) dcc_exit(ret);
             files = NULL;
             unsetenv("INCLUDE_SERVER_PORT"); include_server = NULL;
-            if (preprocess_only) goto fallback;
+            if (preprocess_only) { ret = EXIT_LOCAL_CPP; goto fallback; }
         }
     }
 
@@ -1123,7 +1124,7 @@ dcc_build_somewhere(char *argv[],
         goto unlock_and_clean_up;
     }
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr))) {
+        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr, &input_snapshot))) {
             if (ret == EXIT_LOCAL_COMPILE) {
                 release_host(host, &cpu_lock_fd, &local_cpu_lock_fd, 0);
                 goto lock_local;
@@ -1415,6 +1416,7 @@ dcc_build_somewhere(char *argv[],
 
   clean_up:
     dcc_job_free(prepared_job);
+    if (input_snapshot >= 0) close(input_snapshot);
     if (auxiliary) dcc_free_argv(auxiliary);
     if (cpp_fd >= 0) { close(cpp_fd); free(cpp_fname); }
     dcc_free_argv(argv);

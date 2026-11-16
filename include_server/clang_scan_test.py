@@ -656,6 +656,7 @@ with tempfile.TemporaryDirectory() as directory:
                                             str(self.root), keeper, 'lz4s')
     image = next(path for path in earlier if path.endswith('/prior.h.lz4s'))
     old_image = Path(image).read_bytes()
+    self.addCleanup(os.close, os.dup(keeper.lease))
     native_scan = compiler_analyzer.gcc_scan.scan
     calls = []
     def change_prior(*args):
@@ -692,6 +693,7 @@ with tempfile.TemporaryDirectory() as directory:
         original = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
         old_image = next(path for path in original if path.endswith('/header.h.lz4s'))
         old_bytes = Path(old_image).read_bytes()
+        self.addCleanup(os.close, os.dup(keeper.lease))
         for mapped, data in ((False, b'int hardlink;\n'), (True, b'int mmapdata;\n')):
           with alias.open('r+b') as stream:
             if mapped:
@@ -769,7 +771,10 @@ with tempfile.TemporaryDirectory() as directory:
       files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
     self.assertEqual(len(images), 2)
     for path, contents in images.items():
-      self.assertEqual(Path(path).read_bytes(), contents)
+      if path in files:
+        self.assertEqual(Path(path).read_bytes(), contents)
+      else:
+        self.assertFalse(Path(path).exists(), 'unpublished failed scan must be reclaimed')
     image = next(path for path in files if path.endswith('/header.h.lz4s'))
     self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(header.read_bytes()))
 

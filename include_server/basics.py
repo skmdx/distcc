@@ -23,6 +23,8 @@
 __author__ = 'Nils Klarlund'
 
 import glob
+import contextlib
+import fcntl
 import os.path
 import shutil
 import sys
@@ -72,9 +74,39 @@ class ClientRootKeeper(object):
     # Preserve the old minimum prefix depth; deeper temporary roots need no padding.
     self.number_missing_levels = max(0, 3 - len(self.client_tmp.split('/')))
     self.client_root = None
-    # Pool workers own their caches, but published inputs survive worker
-    # replacement. Only the supervisor removes them when the build ends.
+    # A shared directory lock follows published snapshots through SCM_RIGHTS.
+    # Closing the analyzer's descriptor does not release a client's reference.
+    self.lease = None
     self.owner_pid = os.getpid() if owner_pid is None else owner_pid
+
+  @contextlib.contextmanager
+  def _LockedRoots(self):
+    fd = os.open(self.client_tmp, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+      fcntl.flock(fd, fcntl.LOCK_EX)
+      yield
+    finally:
+      os.close(fd)
+
+  def _Collect(self, pid):
+    for root in self.Glob(str(pid)):
+      try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+      except FileNotFoundError:
+        continue
+      try:
+        try:
+          fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+          continue
+        shutil.rmtree(root)
+      finally:
+        os.close(fd)
+
+  def CollectClientRoots(self):
+    """Reclaim retired generations; live analyzers and clients keep their FDs."""
+    with self._LockedRoots():
+      self._Collect(self.owner_pid)
 
   def Glob(self, pid_expr):
     """Glob unpadded client roots whose pid is matched by pid expression."""
@@ -89,18 +121,26 @@ class ClientRootKeeper(object):
       generation: a natural number, usually 1 or slightly bigger; this number,
         minus 1, indicates how many times a reset of the caches has taken place.
     """
+    if self.lease is not None:
+      os.close(self.lease)
+      self.lease = None
     try:
-      # Create a unique identifier that will never repeat. Use pid as suffix for
-      # cleanout mechanism that wipes files not associated with a running pid.
-      self._client_root_before_padding = tempfile.mkdtemp(
+      with self._LockedRoots():
+        self._Collect(self.owner_pid)
+        # Publish a new root under the same lock used by collectors, so no
+        # collector can observe it before its shared lifetime lock is held.
+        self._client_root_before_padding = tempfile.mkdtemp(
           '.%s-%s-%d' %
           (self.INCLUDE_SERVER_NAME,
            self.owner_pid, generation),
           dir=self.client_tmp)
-      self.client_root = (self._client_root_before_padding
+        self.client_root = (self._client_root_before_padding
                           + '/padding' * self.number_missing_levels)
-      if not os.path.isdir(self.client_root):
-        os.makedirs(self.client_root)
+        if not os.path.isdir(self.client_root):
+          os.makedirs(self.client_root)
+        self.lease = os.open(self._client_root_before_padding,
+                             os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fcntl.flock(self.lease, fcntl.LOCK_SH)
     except (IOError, OSError) as why:
       sys.exit('Could not create client root directory %s: %s' %
                (self.client_root, why))
@@ -112,8 +152,11 @@ class ClientRootKeeper(object):
     """
     if not pid:
       pid = self.owner_pid
-    for client_root in self.Glob(str(pid)):
-      shutil.rmtree(client_root, ignore_errors=True)
+    if pid == self.owner_pid and self.lease is not None:
+      os.close(self.lease)
+      self.lease = None
+    with self._LockedRoots():
+      self._Collect(pid)
 
   def CleanOutOthers(self):
     """Search for left-overs from include servers that have passed away."""
