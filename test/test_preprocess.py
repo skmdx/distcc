@@ -300,7 +300,7 @@ class AnalyzerPoolTest(PumpTestCase):
     compression = 'lz4'
     transport = ',tcp'
 
-    def snapshot(self):
+    def snapshot(self, compression=b'LZ4C'):
         """Receive the real include manifest and its kernel-owned lifetime FD."""
         def token(name, value):
             return name + ('%08x' % value).encode()
@@ -309,7 +309,7 @@ class AnalyzerPoolTest(PumpTestCase):
             peer.connect(self.env['INCLUDE_SERVER_PORT'])
             cwd = os.fsencode(self.work)
             argv = [b'gcc', b'-c', os.fsencode(self.source), b'-o', b'snapshot.o']
-            peer.sendall(token(b'CDIR', len(cwd)) + cwd + token(b'LZ4C', len(argv)) +
+            peer.sendall(token(b'CDIR', len(cwd)) + cwd + token(compression, len(argv)) +
                          b''.join(token(b'ARGV', len(a)) + a for a in argv))
             def read(size):
                 data = b''
@@ -776,6 +776,56 @@ read -r proceed || exit 1
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr.decode())
                     self.assertEqual(result.stdout, expected.stdout)
+
+    def test_snapshot_lease_can_arrive_after_manifest(self):
+        paths, lease = self.snapshot(b'LZ4S')
+        self.addCleanup(os.close, lease)
+        self.addCleanup(self.env.__setitem__, 'INCLUDE_SERVER_PORT', self.env['INCLUDE_SERVER_PORT'])
+        reference = self.run_cc('gcc', ['-c', self.source, '-o', 'reference.o'])
+        self.assertEqual(reference.returncode, 0, reference.stderr.decode())
+        manifest = b'ARGC%08x' % len(paths)
+        for path in paths:
+            value = os.fsencode(path)
+            manifest += b'ARGV%08x' % len(value) + value
+        for transfer in (True, False):
+            with self.subTest(transfer=transfer), socket.socket(socket.AF_UNIX) as server:
+                endpoint = str(self.root / ('delayed-' + str(transfer)))
+                server.bind(endpoint)
+                server.listen(1)
+                server.settimeout(10)
+                def respond():
+                    with server.accept()[0] as peer:
+                        peer.settimeout(10)
+                        def read(size):
+                            data = b''
+                            while len(data) < size:
+                                chunk = peer.recv(size-len(data))
+                                if not chunk:
+                                    raise EOFError('client request ended early')
+                                data += chunk
+                            return data
+                        read(int(read(12)[4:], 16))  # working directory
+                        for _ in range(int(read(12)[4:], 16)):
+                            read(int(read(12)[4:], 16))
+                        peer.sendall(manifest)
+                        time.sleep(.1)  # Force the real nonblocking client to wait.
+                        if transfer:
+                            peer.sendmsg([b'\0'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                                   struct.pack('i', lease))])
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    response = pool.submit(respond)
+                    self.env['INCLUDE_SERVER_PORT'] = endpoint
+                    output = 'delayed-' + str(transfer) + '.o'
+                    result = self.run_cc('gcc', ['-c', self.source, '-o', output])
+                    response.result(timeout=10)
+                if transfer:
+                    self.assertEqual(result.returncode, 0,
+                                     result.stderr.decode() + (self.work / 'client.log').read_text())
+                    self.assertEqual((self.work / output).read_bytes(),
+                                     (self.work / 'reference.o').read_bytes())
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse((self.work / output).exists())
 
 
 class PreprocessTest(PumpTestCase):

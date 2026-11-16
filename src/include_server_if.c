@@ -24,6 +24,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <errno.h>
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -122,7 +123,14 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
         goto out;
     }
     char marker;
-    if (dcc_recv_fd(fd, &marker, 1, snapshot) != 1 || marker || *snapshot < 0) {
+    ssize_t received;
+    /* The manifest and SCM_RIGHTS are separate stream messages. The socket is
+     * nonblocking, so a complete manifest does not imply the lease has arrived. */
+    while ((received = dcc_recv_fd(fd, &marker, 1, snapshot)) < 0 &&
+           (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (dcc_select_for_read(fd, dcc_get_io_timeout())) goto out;
+    }
+    if (received != 1 || marker || *snapshot < 0) {
         rs_log_warning("include server did not transfer its snapshot lease");
         if (*snapshot >= 0) { dcc_close(*snapshot); *snapshot = -1; }
         goto out;
