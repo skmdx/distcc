@@ -5,8 +5,29 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#define FUSE_USE_VERSION 31
+#include <dlfcn.h>
+#include <semaphore.h>
+#define FUSE_USE_VERSION 312
 #include <fuse3/fuse_lowlevel.h>
+static bool inject_read_shutdown;
+static sem_t *read_shutdown;
+static fuse_session *read_session;
+static unsigned session_reads;
+extern "C" ssize_t read(int fd, void *buffer, size_t size) {
+    static auto libc_read = reinterpret_cast<ssize_t (*)(int, void *, size_t)>(dlsym(RTLD_NEXT, "read"));
+    if (read_session && fd == fuse_session_fd(read_session) && ++session_reads == 2) {
+        auto *session = read_session;
+        read_session = nullptr;
+        // Shutdown in the check-to-read gap, with no pending FUSE request.
+        fuse_session_exit(session);
+        sem_post(read_shutdown);
+    }
+    return libc_read(fd, buffer, size);
+}
+static int observed_loop(fuse_session *session, fuse_loop_config *config) {
+    if (inject_read_shutdown) read_session = session;
+    return fuse_session_loop_mt(session, config);
+}
 static unsigned *attribute_calls;
 static unsigned *read_calls;
 static void (*original_read)(fuse_req_t, fuse_ino_t, size_t, off_t, struct fuse_file_info *);
@@ -27,7 +48,14 @@ static struct fuse_session *counted_session_new(struct fuse_args *args, const st
     counted.lookup = counted_lookup;
     original_read = counted.read;
     counted.read = counted_read;
-    return fuse_session_new(args, &counted, size, data);
+    // The reproduced hang is on the classic transport. Consume FUSE_INIT,
+    // then inject shutdown before the next read, when no request is queued.
+    char name[] = "shutdown-race", options[] = "-oro";
+    char *argv[] = {name, options};
+    fuse_args classic = FUSE_ARGS_INIT(2, argv);
+    auto *session = fuse_session_new(inject_read_shutdown ? &classic : args, &counted, size, data);
+    fuse_opt_free_args(&classic);
+    return session;
 }
 static pid_t mounted_child;
 static bool reader_alive_at_unmount;
@@ -38,9 +66,11 @@ static int checked_unmount(const char *path, int flags) {
 #define umount2 checked_unmount
 #undef fuse_session_new
 #define fuse_session_new counted_session_new
+#define fuse_session_loop_mt observed_loop
 #include "src/gcc_files.cc"
 #undef umount2
 #undef fuse_session_new
+#undef fuse_session_loop_mt
 #include <thread>
 
 static std::string job_summary;
@@ -328,6 +358,13 @@ static void clean_mount(const char *root, bool lookup, int size_change = 0)
     sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
     close(pair[0]);
     struct stat info;
+    if (inject_read_shutdown) {
+        while (sem_wait(read_shutdown) && errno == EINTR) {}
+        siginfo_t exited{};
+        require(!waitid(P_PID, static_cast<Mount *>(mount)->child, &exited, WEXITED | WNOWAIT),
+                "shutdown reader did not exit without a second signal");
+        require(exited.si_code == CLD_EXITED && !exited.si_status, "shutdown reader failed");
+    }
     if (lookup) {
         unsigned reads = *read_calls;
         std::string filename = mountpoint+"/tree/include/data.h";
@@ -405,6 +442,9 @@ static void clean_mount(const char *root, bool lookup, int size_change = 0)
 
 int main(int argc, char **argv)
 {
+    read_shutdown = static_cast<sem_t *>(mmap(nullptr, sizeof(sem_t), PROT_READ | PROT_WRITE,
+                                            MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+    require(read_shutdown != MAP_FAILED && !sem_init(read_shutdown, 1, 0), "shutdown semaphore");
     attribute_calls = static_cast<unsigned *>(mmap(nullptr, sizeof(unsigned), PROT_READ | PROT_WRITE,
                                                    MAP_SHARED | MAP_ANONYMOUS, -1, 0));
     require(attribute_calls != MAP_FAILED, "shared callback counter");
@@ -420,7 +460,12 @@ int main(int argc, char **argv)
     clean_mount(argv[1], true, 4096); // Input shrinks between lookup and read RPC.
     clean_mount(argv[1], true, -4096); // Input grows at the same boundary.
     clean_mount(argv[1], false);
+    inject_read_shutdown = true;
+    clean_mount(argv[1], false);
+    inject_read_shutdown = false;
     disconnected_mount(argv[1]);
+    sem_destroy(read_shutdown);
+    munmap(read_shutdown, sizeof(sem_t));
     munmap(attribute_calls, sizeof(unsigned));
     munmap(read_calls, sizeof(unsigned));
 }

@@ -1,7 +1,7 @@
 /* Let the native GCC frontend read client files through the existing RPC.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
-#define FUSE_USE_VERSION 31
+#define FUSE_USE_VERSION 312
 #include <fuse3/fuse_lowlevel.h>
 #include <limits.h>
 #include <fcntl.h>
@@ -27,6 +27,18 @@ extern "C" {
 
 namespace {
 using dccfs::number;
+static int run_session(fuse_session *session) {
+    // A signal can arrive after the single-thread loop's exit check but before
+    // its blocking read. The MT loop wakes via a semaphore and cancels/joins
+    // its reader, including in that window. Keep classic callbacks serial.
+    auto *config = fuse_loop_cfg_create();
+    if (!config) return -ENOMEM;
+    fuse_loop_cfg_set_max_threads(config, 1);
+    fuse_loop_cfg_set_clone_fd(config, 0);
+    int result = fuse_session_loop_mt(session, config);
+    fuse_loop_cfg_destroy(config);
+    return result;
+}
 struct Entry {
     // The map owns the spelling; entries and keys live until this job ends.
     const std::string *path = nullptr;
@@ -679,7 +691,7 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
             fprintf(stderr, "distcc GCC directory prefetch: %s\n", strerror(result));
             fuse_session_unmount(state->fs);
         } else {
-            result = fuse_session_loop(state->fs);
+            result = run_session(state->fs);
             if (result == SIGTERM) result = 0;
         }
         state->traffic->status = result;
