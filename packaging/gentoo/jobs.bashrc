@@ -52,6 +52,22 @@ distcc_configure_jobs() {
             unset "${variable}" "${marker}"
         fi
         if has distcc ${FEATURES} && ! has distcc ${RESTRICT} && [[ ! -v ${variable} ]]; then
+            # Do not put distcc outside an existing compiler wrapper chain.
+            # In particular, ccache -> distcc must retain that order: a second
+            # outer distcc recursively invokes itself while planning GCC.
+            case ${variable} in
+                CMAKE_C_*) compiler=${CC:-${CHOST:+${CHOST}-}gcc} ;;
+                CMAKE_CXX_*) compiler=${CXX:-${CHOST:+${CHOST}-}g++} ;;
+                CMAKE_HIP_*) compiler=${HIPCXX:-} ;;
+                *) compiler= ;;
+            esac
+            if [[ -n ${compiler} ]]; then
+                compiler=${compiler%%[[:space:]]*}
+                [[ ${compiler} == */* ]] || compiler=$(type -P -- "${compiler}")
+                if [[ -n ${compiler} ]] && distcc_compiler_is_distributed "${compiler}"; then
+                    continue
+                fi
+            fi
             export "${variable}=distcc"
             printf -v "${marker}" '%s' distcc
         fi

@@ -224,7 +224,17 @@ CC=''' + shlex.quote(str(cache / 'cc')) + '''
 ''' + environment + '''
 source "$JOBS_HOOK"
 echo "$MAKEOPTS $NINJAOPTS $CMAKE_BUILD_PARALLEL_LEVEL"
-'''), [f'-j{jobs} -j{jobs} {jobs}'])
+echo "${CMAKE_C_COMPILER_LAUNCHER-unset} ${CMAKE_C_LINKER_LAUNCHER-unset}"
+# CMake may resolve a bare name to the same absolute ccache masquerade link.
+CC=cc
+source "$JOBS_HOOK"
+echo "${CMAKE_C_COMPILER_LAUNCHER-unset} ${CMAKE_C_LINKER_LAUNCHER-unset}"
+CMAKE_C_COMPILER_LAUNCHER=custom-wrapper
+source "$JOBS_HOOK"
+echo "$CMAKE_C_COMPILER_LAUNCHER"
+'''), [f'-j{jobs} -j{jobs} {jobs}',
+       'unset unset' if jobs == 12 else 'distcc distcc',
+       'unset unset' if jobs == 12 else 'distcc distcc', 'custom-wrapper'])
 
 
 if __name__ == '__main__':
