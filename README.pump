@@ -232,9 +232,12 @@ the required header closure, not libraries or a complete sysroot for linking.
 
 For Gentoo, source `packaging/gentoo/pump.bashrc` (installed by the overlay as
 `/usr/share/distcc/portage-pump.bashrc`) from `/etc/portage/bashrc`, and call
-`distcc_pump_start` from `pre_src_compile` and `distcc_pump_stop` from
-`post_src_compile`. The start helper registers failure cleanup within the compile
-phase. Enable selected packages with `DISTCC_PUMP=1` in their `package.env`
+`distcc_pump_start` from the `pre_src_configure`, `pre_src_compile`, and
+`pre_src_test` hooks, and `distcc_pump_stop` from their corresponding post hooks.
+Configure probes and tests compile inputs too: each phase needs the package
+work-tree authorization, even without the pump analyzer. The start helper
+registers failure cleanup within the current phase.
+Enable selected packages with `DISTCC_PUMP=1` in their `package.env`
 environment file. The helper preserves Portage's compiler wrapper search order.
 
 Standalone GCC and Clang `-E` calls with a source file are also distributed.
