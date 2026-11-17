@@ -253,6 +253,9 @@ out:
 
 int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
 {
+    /* Recursive compiler probes are already admitted by their caller. They
+     * must execute the compiler directly, without another broker/helper wait. */
+    if (dcc_recursion_safeguard()) return -1;
     return request(argv, 'C', -1, 2, status, cpu_ns);
 }
 

@@ -9,6 +9,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import unittest
 
@@ -76,6 +77,26 @@ class LocalClangTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(Path('/proc', pidfile.read_text().strip()).exists())
         self.assertIn('IO timeout', (self.work/'client.log').read_text())
+
+    def test_admitted_compiler_probe_does_not_start_resident_worker(self):
+        self.start_local()
+        wrappers = self.work/'probe-bin'
+        wrappers.mkdir()
+        compiler = wrappers/Path(self.compiler).name
+        compiler.symlink_to(self.build/'distcc')
+        module = next((self.build/'_include_server').glob('lib*/include_server'))
+        env = dict(self.env, PATH=str(wrappers)+os.pathsep+self.env['PATH'],
+                   PYTHONPATH=str(module))
+        script = ('from compiler_analyzer import run; import sys; '
+                  'r = run(sys.argv[1:]); sys.stdout.buffer.write(r.stdout); '
+                  'sys.stderr.buffer.write(r.stderr)')
+        arguments = ['-x', 'c', '-E', '-v', '/dev/null']
+        expected = self.command(arguments, reused=False)
+        result = subprocess.run([sys.executable, '-c', script, str(compiler), *arguments],
+                                env=env, cwd=self.work, capture_output=True, timeout=5)
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (expected.returncode, expected.stdout, expected.stderr))
+        self.assertNotIn('--native-worker', (self.work/'client.log').read_text())
 
     def test_link_without_resident_library_uses_driver(self):
         self.start_local()
