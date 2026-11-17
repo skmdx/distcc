@@ -567,7 +567,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
             'static int (*const verb_data_28)(int)=second;\n'
             'extern int (*__start_ENTRIES[])(int), (*__stop_ENTRIES[])(int);\n'
             'int main(void) { return __stop_ENTRIES-__start_ENTRIES!=2 || '
-            '__start_ENTRIES[0](2)+__start_ENTRIES[1](2)!=9; }\n')
+            '__start_ENTRIES[0](2)!=5 || __start_ENTRIES[1](2)!=4; }\n')
         obj, output = source.with_suffix('.o'), self.work / 'retained'
         result = self.run_command([compiler, '-O2', '-flto=thin', '-c', source, '-o', obj])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -576,7 +576,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
                                    '-fuse-ld=lld', *flags, obj, '-o', output])
         self.assertEqual(result.returncode, 0, result.stderr)
         counts = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
-        self.assertTrue(any(count > 1 for count in counts), result.stderr)
+        self.assertEqual(counts, [1], result.stderr)
         self.assertEqual(self.run_command([output]).returncode, 0)
 
     def test_ranked_submission_survives_slow_process_start(self):

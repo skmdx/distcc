@@ -28,7 +28,7 @@ dcc_split_module(Module &module, unsigned count,
   // definitions survive the relocatable merge with assembly in partition zero.
   // Local assembly definitions and per-object weak/versioned references lack
   // the IR ownership information needed to move their users between objects.
-  bool keepAssemblyTogether = false;
+  bool keepTogether = false;
   // Function assembly may also define symbols referenced elsewhere in this
   // module. LLVM IR does not describe those edges; splitting can turn a local
   // assembler definition into an unresolved reference in another object.
@@ -36,7 +36,7 @@ dcc_split_module(Module &module, unsigned count,
     for (const auto &block : function)
       for (const auto &instruction : block)
         if (const auto *call = dyn_cast<CallBase>(&instruction))
-          if (call->isInlineAsm()) keepAssemblyTogether = true;
+          if (call->isInlineAsm()) keepTogether = true;
   if (!module.getModuleInlineAsm().empty()) {
     InitializeAllTargetInfos();
     InitializeAllTargetMCs();
@@ -45,14 +45,21 @@ dcc_split_module(Module &module, unsigned count,
         [&](StringRef, object::BasicSymbolRef::Flags flags) {
           using Symbol = object::BasicSymbolRef;
           if (!(flags & Symbol::SF_Undefined) && !(flags & Symbol::SF_Global))
-            keepAssemblyTogether = true;
+            keepTogether = true;
           if ((flags & Symbol::SF_Undefined) && (flags & Symbol::SF_Weak))
-            keepAssemblyTogether = true;
+            keepTogether = true;
         });
     ModuleSymbolTable::CollectAsmSymvers(module, [&](StringRef, StringRef) {
-      keepAssemblyTogether = true;
+      keepTogether = true;
     });
   }
+
+  // Explicit sections can be linker-assembled arrays whose declaration order
+  // is observable (for example ordered option tables). Independent objects
+  // cannot preserve that order through the relocatable merge.
+  for (const auto &global : module.globals())
+    if (global.hasSection() && global.getSection() != "llvm.metadata")
+      keepTogether = true;
 
   auto emit = [&](Module &part, bool last) -> Error {
     if (verifyModule(part, &errs()))
@@ -60,7 +67,7 @@ dcc_split_module(Module &module, unsigned count,
     return consume(part, last);
   };
   std::vector<std::string> names;
-  if (count < 2 || keepAssemblyTogether) {
+  if (count < 2 || keepTogether) {
     if (auto error = emit(module, true))
       return std::move(error);
   } else {
