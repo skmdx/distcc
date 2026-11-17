@@ -192,6 +192,9 @@ def llvm_option(option, config=llvm_config):
 if llvm_option('--version').split('.')[0] not in ('22', '23'):
   sys.exit('libclang-cpp requires LLVM 22 or 23 headers and libraries.')
 llvm_lib = llvm_option('--libdir')
+# C++ standard-library and ABI options belong to each LLVM installation,
+# including at link time; the caller's default C++ runtime may differ.
+llvm_cxxflags = shlex.split(llvm_option('--cxxflags'))
 # Search the target sysroot while linking, but retain its installed path in
 # the extension so a cross-built package does not depend on the build machine.
 llvm_runtime_lib = llvm_lib
@@ -210,7 +213,8 @@ scanner = setuptools.Extension(
     depends=frontend_headers,
     language='c++', include_dirs=[llvm_option('--includedir')],
     library_dirs=[llvm_lib], runtime_library_dirs=[llvm_runtime_lib],
-    libraries=['clang-cpp', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
+    libraries=['clang-cpp', 'LLVM'],
+    extra_compile_args=llvm_cxxflags + ['-g0'], extra_link_args=llvm_cxxflags,
 )
 
 # Worker code generation must use the requested compiler's LLVM release.
@@ -230,6 +234,7 @@ for config in (os.environ.get('DISTCC_CLANG_CONFIGS') or llvm_config).split(os.p
   if major not in ('22', '23'):
     sys.exit('Clang worker frontends require LLVM 22 or 23.')
   library = llvm_option('--libdir', config)
+  cxxflags = shlex.split(llvm_option('--cxxflags', config))
   runtime = library[len(sysroot):] if sysroot and library.startswith(sysroot + '/') else library
   bindir = llvm_option('--bindir', config)
   if sysroot and bindir.startswith(sysroot + '/'):
@@ -241,7 +246,8 @@ for config in (os.environ.get('DISTCC_CLANG_CONFIGS') or llvm_config).split(os.p
       depends=frontend_headers + codegen_headers + worker_headers,
       language='c++', include_dirs=[llvm_option('--includedir', config), os.path.join(srcdir, 'src')],
       library_dirs=[library], runtime_library_dirs=[runtime],
-      libraries=['clang-cpp', 'lldELF', 'lldCommon', 'LLVM'], extra_compile_args=['-std=c++17', '-g0'],
+      libraries=['clang-cpp', 'lldELF', 'lldCommon', 'LLVM'],
+      extra_compile_args=cxxflags + ['-g0'], extra_link_args=cxxflags,
       define_macros=[('DCC_CLANG_COMPILE_MODULE', '1')] + codegen_macros,
   ))
   frontends.append(setuptools.Extension(
@@ -256,7 +262,7 @@ for config in (os.environ.get('DISTCC_CLANG_CONFIGS') or llvm_config).split(os.p
       language='c++', include_dirs=[llvm_option('--includedir', config), os.path.join(srcdir, 'src')],
       library_dirs=[library], runtime_library_dirs=[runtime],
       libraries=['clang-cpp', 'lldELF', 'lldCommon', 'LLVM'],
-      extra_compile_args=['-std=c++17', '-g0'],
+      extra_compile_args=cxxflags + ['-g0'], extra_link_args=cxxflags,
       define_macros=codegen_macros,
   ))
 
