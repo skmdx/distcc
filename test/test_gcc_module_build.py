@@ -14,6 +14,17 @@ import unittest
 @unittest.skipUnless(shutil.which('gcc') and shutil.which('g++') and shutil.which('readelf'),
                      'GCC C++ toolchain and readelf required')
 class ModuleBuildTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('clang++'), 'Clang C++ toolchain required')
+    def test_dependency_hooks_with_clang_fortify_overloads(self):
+        source = Path(__file__).resolve().parents[1]/'src/gcc_dependencies.cc'
+        for fortify in (2, 3):
+            for offsets in ([], ['-D_FILE_OFFSET_BITS=64']):
+                with self.subTest(fortify=fortify, offsets=offsets):
+                    result = subprocess.run(['clang++', '-std=c++17', '-O2',
+                            f'-D_FORTIFY_SOURCE={fortify}', *offsets, '-fsyntax-only',
+                            str(source)], capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
     def build(self, root, flags, source):
         # The small sources isolate the build contract; installed frontend
         # integration tests separately exercise the real GCC module ABI.

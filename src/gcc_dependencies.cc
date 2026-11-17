@@ -162,7 +162,7 @@ EXPORT int access(const char *path, int mode) {
     record(DCC_PLAN_ACCESS, path, mode, e); errno = e; return r;
 }
 EXPORT int open(const char *path, int flags, ...) {
-    static auto call = next<decltype(&open)>("open");
+    static auto call = next<int (*)(const char *, int, ...)>("open");
     mode_t mode = 0;
     if (flags & O_CREAT || (flags & O_TMPFILE) == O_TMPFILE) {
         va_list args; va_start(args, flags); mode = va_arg(args, int); va_end(args);
@@ -219,7 +219,7 @@ EXPORT char *__realpath_chk(const char *path, char *resolved, size_t size) {
 // The libc implementations of these wrappers use hidden open/stat entrypoints.
 // Observe their public boundary instead of hoping nested calls are interposable.
 EXPORT int open64(const char *path, int flags, ...) {
-    static auto call = next<decltype(&open64)>("open64");
+    static auto call = next<int (*)(const char *, int, ...)>("open64");
     mode_t mode = 0;
     if (flags & O_CREAT || (flags & O_TMPFILE) == O_TMPFILE) {
         va_list args; va_start(args, flags); mode = va_arg(args, int); va_end(args);
@@ -281,7 +281,7 @@ void at_access(int fd,const char *path,int mode,int flags,int error) {
 }
 }
 EXPORT int openat(int fd, const char *path, int flags, ...) {
-    static auto call = next<decltype(&openat)>("openat");
+    static auto call = next<int (*)(int, const char *, int, ...)>("openat");
     mode_t mode = 0;
     if (flags & O_CREAT || (flags & O_TMPFILE) == O_TMPFILE) {
         va_list args; va_start(args, flags); mode = va_arg(args, int); va_end(args);
@@ -322,7 +322,7 @@ EXPORT int name(int directory,const char *path,int flags) { \
 CHECKED_OPENAT(__openat_2)
 CHECKED_OPENAT(__openat64_2)
 EXPORT int openat64(int directory,const char *path,int flags,...) {
-    static auto call=next<decltype(&openat64)>("openat64");
+    static auto call=next<int (*)(int, const char *, int, ...)>("openat64");
     mode_t mode=0;
     if (flags & O_CREAT || (flags & O_TMPFILE)==O_TMPFILE) {
         va_list args; va_start(args,flags); mode=va_arg(args,int); va_end(args);
