@@ -1,6 +1,7 @@
 #include "lto_partition.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/GlobalAlias.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -27,6 +28,14 @@ dcc_split_module(Module &module, unsigned count,
   // Local assembly definitions and per-object weak/versioned references lack
   // the IR ownership information needed to move their users between objects.
   bool keepAssemblyTogether = false;
+  // Function assembly may also define symbols referenced elsewhere in this
+  // module. LLVM IR does not describe those edges; splitting can turn a local
+  // assembler definition into an unresolved reference in another object.
+  for (const auto &function : module)
+    for (const auto &block : function)
+      for (const auto &instruction : block)
+        if (const auto *call = dyn_cast<CallBase>(&instruction))
+          if (call->isInlineAsm()) keepAssemblyTogether = true;
   if (!module.getModuleInlineAsm().empty()) {
     InitializeAllTargetInfos();
     InitializeAllTargetMCs();

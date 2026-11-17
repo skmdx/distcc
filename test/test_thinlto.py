@@ -512,6 +512,38 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.run_command([output]).returncode, 0)
 
+    def test_function_assembly_preserves_cross_function_symbols(self):
+        compiler = shutil.which('clang')
+        tools = llvm_tools(compiler)
+        if not tools:
+            self.skipTest('matching LLVM partition helpers are not installed')
+        source = self.work / 'function-assembly.c'
+        source.write_text(
+            '__attribute__((noinline)) void define(void) {\n'
+            '  asm volatile(".local asm_value\\n.pushsection .data\\n"'
+            '"asm_value: .long 7\\n.popsection\\n");\n}\n'
+            'extern int asm_value;\n'
+            '__attribute__((noinline)) int read_value(void) { return asm_value; }\n'
+            'int main(void) { define(); return read_value()!=7; }\n')
+        bitcode = source.with_suffix('.bc')
+        result = self.run_command([compiler, '-emit-llvm', '-c', source, '-o', bitcode])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_command([tools['plan'], 'split', bitcode, '3', self.work / 'part'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parts = json.loads(result.stdout)['parts']
+        self.assertEqual(len(parts), 1)
+        output = self.work / 'function-assembly'
+        result = self.run_command([compiler, parts[0]['path'], '-o', output])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_command([output]).returncode, 0)
+        obj = source.with_suffix('.o')
+        result = self.run_command([compiler, '-O2', '-flto=thin', '-c', source, '-o', obj])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_command([self.build / 'distcc', compiler, '-O2', '-flto=thin',
+                                   '-fuse-ld=lld', obj, '-o', output])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_command([output]).returncode, 0)
+
     def test_ranked_submission_survives_slow_process_start(self):
         """Use real workers while delaying the largest job before broker IPC."""
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
