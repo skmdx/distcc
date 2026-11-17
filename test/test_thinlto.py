@@ -544,6 +544,41 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.run_command([output]).returncode, 0)
 
+    def test_partitioned_backend_preserves_retained_section(self):
+        self.check_used_section(retain=True)
+
+    def test_partitioned_backend_preserves_compiler_used_section(self):
+        self.check_used_section(retain=False)
+
+    def check_used_section(self, retain):
+        compiler = shutil.which('clang')
+        if not llvm_tools(compiler):
+            self.skipTest('matching LLVM partition helpers are not installed')
+        source = self.work / 'retained.c'
+        body = 'volatile int v=x;\n' + '\n'.join(f'v += {i};' for i in range(128))
+        attributes = 'used,retain' if retain else 'used'
+        source.write_text(
+            '__attribute__((noinline)) int first(int x) { ' + body + '; return x+1; }\n'
+            '__attribute__((noinline)) int second(int x) { ' + body + '; return first(x)+1; }\n'
+            '__attribute__((noinline)) int third(int x) { ' + body + '; return second(x)+1; }\n'
+            '__attribute__((' + attributes + ',section("ENTRIES"))) '
+            'static int (*const verb_data_27)(int)=third;\n'
+            '__attribute__((' + attributes + ',section("ENTRIES"))) '
+            'static int (*const verb_data_28)(int)=second;\n'
+            'extern int (*__start_ENTRIES[])(int), (*__stop_ENTRIES[])(int);\n'
+            'int main(void) { return __stop_ENTRIES-__start_ENTRIES!=2 || '
+            '__start_ENTRIES[0](2)+__start_ENTRIES[1](2)!=9; }\n')
+        obj, output = source.with_suffix('.o'), self.work / 'retained'
+        result = self.run_command([compiler, '-O2', '-flto=thin', '-c', source, '-o', obj])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        flags = ['-Wl,--gc-sections'] if retain else []
+        result = self.run_command([self.build / 'distcc', compiler, '-O2', '-flto=thin',
+                                   '-fuse-ld=lld', *flags, obj, '-o', output])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        counts = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
+        self.assertTrue(any(count > 1 for count in counts), result.stderr)
+        self.assertEqual(self.run_command([output]).returncode, 0)
+
     def test_ranked_submission_survives_slow_process_start(self):
         """Use real workers while delaying the largest job before broker IPC."""
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')

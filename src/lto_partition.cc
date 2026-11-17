@@ -10,6 +10,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <algorithm>
 #include <memory>
 #include <vector>
@@ -89,9 +90,29 @@ dcc_split_module(Module &module, unsigned count,
     for (auto &global : module.global_values())
       if (global.hasLocalLinkage())
         locals.push_back(&global);
+    SmallVector<GlobalValue *, 16> used, compilerUsed;
+    collectUsedGlobalVariables(module, used, false);
+    collectUsedGlobalVariables(module, compilerUsed, true);
     Error failure = Error::success();
     unsigned index = 0;
     dccSplitModule(module, count, [&](std::unique_ptr<Module> part) {
+      // SplitModule hashes the retention arrays independently of their
+      // definitions. Rebuild each list beside the definitions it protects,
+      // so optimization and ELF section GC retain the same input objects.
+      auto retain = [&](StringRef name, ArrayRef<GlobalValue *> original,
+                        bool compilerOnly) {
+        if (auto *list = part->getNamedGlobal(name)) list->eraseFromParent();
+        SmallVector<GlobalValue *, 16> values;
+        for (auto *global : original) {
+          auto *copy = part->getNamedValue(global->getName());
+          assert(copy && "split module lost a retained global");
+          if (!copy->isDeclarationForLinker()) values.push_back(copy);
+        }
+        if (compilerOnly) appendToCompilerUsed(*part, values);
+        else appendToUsed(*part, values);
+      };
+      retain("llvm.used", used, false);
+      retain("llvm.compiler.used", compilerUsed, true);
       if (!failure)
         failure = emit(*part, ++index == count);
     }, false, true);
