@@ -77,9 +77,11 @@ class LinkArchiveTest(unittest.TestCase):
                 query.assert_called_once_with('clang', target)
 
     def test_tcp_progress_and_local_artifact_descriptor(self):
-        from include_server.distcc_pump_c_extensions import TCP_BEGIN, TCP_PROGRESS, TCP_RESULT_FD
+        from include_server.distcc_pump_c_extensions import TCP_BEGIN, TCP_PROGRESS, TCP_RESULT_FD, TCP_COMPLETE_SIZE
         archive = self.helper['LinkArchive']({}, {})
         payload = b'linked artifact\n' * 4096
+        load = bytes(range(TCP_COMPLETE_SIZE - 8))
+        timing = (101, 202, 303, 404)
         client, server = socket.socketpair()
         client.settimeout(5)
         server.settimeout(5)
@@ -103,7 +105,7 @@ class LinkArchiveTest(unittest.TestCase):
                 if kind & 0x20000:
                     break
             server.sendall(struct.pack('!II', TCP_PROGRESS, 8) + identity)
-            result = struct.pack('!II8Q', 0, 0o755, 0, 0, len(payload), 0, 0, 0, 0, 0)
+            result = struct.pack('!II8Q', 0, 0o755, 0, 0, len(payload), 0, *timing)
             server.sendall(struct.pack('!II', TCP_BEGIN + 3, len(result)) + result)
             with tempfile.TemporaryFile() as artifact:
                 artifact.write(payload)
@@ -115,12 +117,12 @@ class LinkArchiveTest(unittest.TestCase):
                                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [fd]))])
                 finally:
                     os.close(fd)
-            server.sendall(struct.pack('!II', TCP_BEGIN + 5, 8) + identity)
+            server.sendall(struct.pack('!II', TCP_BEGIN + 5, TCP_COMPLETE_SIZE) + identity + load)
 
         with client, server, tempfile.TemporaryDirectory() as directory, ThreadPoolExecutor(1) as pool:
             future = pool.submit(peer)
             output = Path(directory) / 'linked'
-            self.assertEqual(self.helper['tcp_link'](client, archive, output), 0)
+            self.assertEqual(self.helper['tcp_link'](client, archive, output), (0, timing, load))
             future.result(timeout=5)
             self.assertEqual(output.read_bytes(), payload)
 

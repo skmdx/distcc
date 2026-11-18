@@ -627,7 +627,7 @@ class LinkArchive:
 
 def tcp_link(net, archive, output):
     """Stream a link archive and receive one bounded pooled TCP transaction."""
-    from include_server.distcc_pump_c_extensions import TCP_BEGIN, TCP_RESULT_FD, TCP_PROGRESS
+    from include_server.distcc_pump_c_extensions import TCP_BEGIN, TCP_RESULT_FD, TCP_PROGRESS, TCP_COMPLETE_SIZE
 
     begin, need, incoming, result_type, outgoing, complete = range(TCP_BEGIN, TCP_BEGIN + 6)
     compressed, final = 0x10000, 0x20000
@@ -716,6 +716,7 @@ def tcp_link(net, archive, output):
     if kind != result_type or len(body) != 72:
         raise OSError('invalid TCP link result')
     status, mode, *sizes = struct.unpack('!II4Q', body[:40])
+    timing = struct.unpack('!4Q', body[40:])
     if status > 65535 or mode > 0o777 or sum(sizes) > 512 * 1024 * 1024:
         raise OSError('invalid TCP link result sizes')
     with tempfile.NamedTemporaryFile(dir=output.absolute().parent,
@@ -752,8 +753,10 @@ def tcp_link(net, archive, output):
                         finished[index] = True
                     continue
                 if kind == complete:
-                    if body != struct.pack('!Q', identity) or not all(finished):
+                    if (len(body) != TCP_COMPLETE_SIZE or body[:8] != struct.pack('!Q', identity)
+                            or not all(finished)):
                         raise OSError('incomplete TCP link result')
+                    load = body[8:]
                     break
                 if kind & ~(compressed | final) != outgoing or len(body) < 8:
                     raise OSError('invalid TCP link artifact')
@@ -790,7 +793,7 @@ def tcp_link(net, archive, output):
                 os.replace(temporary, output)
         finally:
             temporary.unlink(missing_ok=True)
-    return status
+    return status, timing, load
 
 
 def remote_link(job, inputs, output):
@@ -823,9 +826,9 @@ def remote_link(job, inputs, output):
             if 'tcp' in options:
                 with socket.socket(fileno=descriptors.pop()) as net:
                     net.settimeout(float(os.environ.get('DISTCC_IO_TIMEOUT', '300')))
-                    status = tcp_link(net, archive, output)
+                    status, timing, load = tcp_link(net, archive, output)
                     try:
-                        lease.sendmsg([struct.pack('=II4Q', BROKER_VERSION, 7, 0, 0, 0, 0)],
+                        lease.sendmsg([struct.pack('=II4Q', BROKER_VERSION, 7, *timing), load],
                                       [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                         array.array('i', [net.fileno()]))])
                     except OSError:

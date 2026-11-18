@@ -500,6 +500,7 @@ PyInit_distcc_pump_c_extensions(void) {
       PyModule_AddStringConstant(module, "__version__", version) < 0 ||
       PyModule_AddIntConstant(module, "BROKER_VERSION", BROKER_VERSION) < 0 ||
       PyModule_AddIntConstant(module, "TCP_BEGIN", DCC_TCP_BEGIN) < 0 ||
+      PyModule_AddIntConstant(module, "TCP_COMPLETE_SIZE", sizeof(struct dcc_tcp_complete)) < 0 ||
       PyModule_AddIntConstant(module, "TCP_RESULT_FD", DCC_TCP_RESULT_FD) < 0 ||
       PyModule_AddIntConstant(module, "TCP_PROGRESS", DCC_TCP_PROGRESS) < 0 ||
       PyModule_AddStringConstant(module, "gcc_scan_dir", DCC_GCC_SCAN_DIR) < 0 ||
