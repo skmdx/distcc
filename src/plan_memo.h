@@ -33,7 +33,16 @@ extern "C" {
 #endif
 void dcc_plan_record_begin(int descriptor, int driver);
 void dcc_plan_record_finish(int status);
+#define DCC_PLAN_MARKER "__distcc_plan_arg_"
 #ifndef __cplusplus
+struct dcc_plan_template {
+    char **argv;
+    char **values;
+    size_t count, capacity;
+};
+void dcc_clang_plan_template(struct dcc_plan_template *, char **argv, const char *input);
+void dcc_free_plan_template(struct dcc_plan_template *);
+int dcc_bind_plan(const struct dcc_plan_template *, char **argv);
 char *dcc_plan_key(char **argv, const char *input);
 int dcc_plan_memo_decode(const char *memo, size_t size, int output, unsigned *dependencies);
 char *dcc_plan_memo_encode(int journal, int output, unsigned *dependencies, size_t *length);

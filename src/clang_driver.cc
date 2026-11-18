@@ -19,7 +19,6 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/Program.h>
-#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/Error.h>
 #include <llvm/ADT/SmallString.h>
@@ -41,12 +40,15 @@ namespace {
 // or otherwise change the command the actual compiler selected.
 class PlanFiles : public llvm::vfs::ProxyFileSystem {
     int fd;
+    bool templated;
     size_t bytes = 4;
     std::set<std::string> records;
     void observe(unsigned op, const llvm::Twine &path, std::error_code error, llvm::StringRef target = {}) {
-        if (fd < 0) return;
         llvm::SmallString<256> name;
         path.toVector(name);
+        // A derived path consulted by the driver is an input to planning.
+        if (templated && name.str().contains(DCC_PLAN_MARKER)) dynamic_path = true;
+        if (fd < 0) return;
         if (getUnderlyingFS().makeAbsolute(name)) { fd = -1; return; }
         dcc_plan_dependency item{};
         item.operation = op;
@@ -62,7 +64,8 @@ class PlanFiles : public llvm::vfs::ProxyFileSystem {
         if (bytes > DCC_PLAN_JOURNAL_LIMIT || write(fd, entry.data(), entry.size()) != (ssize_t)entry.size()) fd = -1;
     }
 public:
-    explicit PlanFiles(int journal) : ProxyFileSystem(llvm::vfs::getRealFileSystem()), fd(journal) {}
+    bool dynamic_path = false;
+    PlanFiles(int journal, bool templated) : ProxyFileSystem(llvm::vfs::getRealFileSystem()), fd(journal), templated(templated) {}
     llvm::ErrorOr<llvm::vfs::Status> status(const llvm::Twine &p) override {
         auto value = getUnderlyingFS().status(p);
         observe(DCC_PLAN_STAT, p, value.getError());
@@ -101,7 +104,7 @@ public:
     llvm::ArrayRef<const char *> cc1;
     std::unique_ptr<clang::CompilerInvocation> compiler;
     explicit FrontendPlan(char **input, bool frontend = true,
-                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> files = llvm::vfs::getRealFileSystem()) {
+                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> files = llvm::vfs::getRealFileSystem(), bool check_inputs = true) {
         for (char **p = input; *p; ++p) command.emplace_back(*p);
         if (command.empty()) return;
         const auto invoked_as = command.front();
@@ -122,6 +125,7 @@ public:
         } else {
             driver = std::make_unique<clang::driver::Driver>(argv[0],
                 llvm::sys::getDefaultTargetTriple(), *diagnostics, "clang LLVM compiler", files);
+            driver->setCheckInputsExist(check_inputs);
             compilation.reset(driver->BuildCompilation(argv));
             if (!compilation || compilation->containsError() || diagnostics->hasErrorOccurred()) return;
             if (!frontend) return;
@@ -169,32 +173,12 @@ char **copy(const std::vector<std::string> &values) {
 }
 }
 
-extern "C" int dcc_clang_expand_response_files(char **argv, char ***expanded) {
-    llvm::SmallVector<const char *, 32> args;
-    for (char **p = argv; *p; ++p) args.push_back(*p);
-    llvm::BumpPtrAllocator allocator;
-    llvm::cl::ExpansionContext context(allocator, llvm::cl::TokenizeGNUCommandLine);
-    if (auto error = context.expandResponseFiles(args)) {
-        llvm::consumeError(std::move(error));
-        return -1;
-    }
-    std::vector<std::string> values;
-    for (const char *arg : args) {
-        // LLVM leaves unreadable response files untouched. Let the actual
-        // compiler diagnose them locally instead of sending a partial argv.
-        if (arg[0] == '@') return -1;
-        values.emplace_back(arg);
-    }
-    *expanded = copy(values);
-    return *expanded ? 0 : -1;
-}
-
-extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots, int journal) {
+extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots, int journal, bool templated) {
     *cc1 = *roots = nullptr;
-    llvm::IntrusiveRefCntPtr<PlanFiles> files(new PlanFiles(journal));
-    FrontendPlan plan(argv, true, files);
+    llvm::IntrusiveRefCntPtr<PlanFiles> files(new PlanFiles(journal, templated));
+    FrontendPlan plan(argv, true, files, !templated);
     files->finish();
-    if (!plan.compiler) return -1;
+    if (files->dynamic_path || !plan.compiler) return -1;
     auto &invocation = *plan.compiler;
     const auto &inputs = invocation.getFrontendOpts().Inputs;
     if (inputs.size() != 1 || !inputs[0].isFile()) return -1;

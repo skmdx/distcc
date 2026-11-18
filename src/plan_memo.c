@@ -73,6 +73,118 @@ char *dcc_plan_key(char **argv, const char *input)
 #undef ADD
 }
 
+void dcc_free_plan_template(struct dcc_plan_template *plan)
+{
+    if (plan->argv) dcc_free_argv(plan->argv);
+    for (size_t i = 0; i < plan->count; ++i) free(plan->values[i]);
+    free(plan->values);
+    *plan = (struct dcc_plan_template){0};
+}
+
+/* Punctuation stays in the shell-free driver template. In particular Clang
+ * quotes whitespace, dollars, hashes and backslashes itself when lowering -MQ. */
+static int template_part(struct dcc_plan_template *plan, char **arg, size_t first, size_t last)
+{
+    static const char safe[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+    char *text = NULL;
+    size_t length;
+    FILE *stream = open_memstream(&text, &length);
+    if (!stream) return -1;
+    fwrite(*arg, 1, first, stream);
+    int ok = 1;
+    while (first < last) {
+        size_t span = strspn(*arg + first, safe);
+        if (!span) { fputc((*arg)[first++], stream); continue; }
+        if (span > last-first) span = last-first;
+        if (plan->count == plan->capacity) {
+            size_t capacity = plan->capacity ? plan->capacity * 2 : 8;
+            char **values = reallocarray(plan->values, capacity, sizeof(*values));
+            if (!values) { ok = 0; break; }
+            plan->values = values;
+            plan->capacity = capacity;
+        }
+        char *value = strndup(*arg + first, span);
+        if (!value) { ok = 0; break; }
+        fprintf(stream, DCC_PLAN_MARKER "%zu__", plan->count);
+        plan->values[plan->count++] = value;
+        first += span;
+    }
+    fputs(*arg + last, stream);
+    if (fclose(stream) || !ok) { free(text); return -1; }
+    free(*arg);
+    *arg = text;
+    return 0;
+}
+
+void dcc_clang_plan_template(struct dcc_plan_template *plan, char **argv, const char *input)
+{
+    const char *extension = dcc_find_extension_const(input);
+    if (!extension || access(input, R_OK)) return;
+    size_t inputs = 0;
+    extern char **environ;
+    for (char **env = environ; *env; ++env)
+        if (strstr(*env, DCC_PLAN_MARKER)) return;
+    for (size_t i = 0; argv[i]; ++i) {
+        if (strstr(argv[i], DCC_PLAN_MARKER) || !strncmp(argv[i], "--config", 8) ||
+            !strcmp(argv[i], "-Xclang") ||
+            !strcmp(argv[i], "-Xpreprocessor") || !strcmp(argv[i], "-Xassembler") ||
+            strstr(argv[i], "record-command-line") || !strcmp(argv[i], "-MJ")) return;
+        inputs += !strcmp(argv[i], input);
+    }
+    if (inputs != 1 || dcc_copy_argv(argv, &plan->argv, 0)) return;
+    for (size_t i = 1; argv[i]; ++i) {
+        const char *arg = argv[i];
+        size_t first = 0, last = strlen(arg);
+        if (!strcmp(arg, input)) {
+            first = dcc_find_basename(arg) - arg;
+            last = extension - input;
+        } else {
+            unsigned flag = !strncmp(arg,"-MF",3) || !strncmp(arg,"-MT",3) || !strncmp(arg,"-MQ",3) ? 3 :
+                            !strncmp(arg,"-o",2) ? 2 : 0;
+            if (!flag) continue;
+            if (arg[flag]) first = flag;
+            else { if (!argv[++i]) goto exact; arg = argv[i]; last = strlen(arg); }
+            if (!strcmp(arg+first,"-") || !strcmp(arg+first,"/dev/null")) continue;
+            if (flag == 2) {
+                const char *suffix = dcc_find_extension_const(arg+first);
+                if (suffix) last = suffix-arg;
+            }
+        }
+        if (template_part(plan, &plan->argv[i], first, last)) goto exact;
+    }
+    return;
+exact:
+    dcc_free_plan_template(plan);
+}
+
+int dcc_bind_plan(const struct dcc_plan_template *plan, char **argv)
+{
+    for (char **p = argv; *p; ++p) {
+        const char *start = *p, *marker = strstr(start, DCC_PLAN_MARKER);
+        if (!marker) continue;
+        char *text = NULL;
+        size_t length;
+        FILE *stream = open_memstream(&text, &length);
+        if (!stream) return -1;
+        do {
+            fwrite(start, 1, marker-start, stream);
+            const char *number = marker + sizeof(DCC_PLAN_MARKER)-1;
+            char *end;
+            unsigned long index = strtoul(number, &end, 10);
+            if (end == number || strncmp(end,"__",2) || index >= plan->count) {
+                fclose(stream); free(text); return -1;
+            }
+            fputs(plan->values[index], stream);
+            start = end+2;
+        } while ((marker = strstr(start,DCC_PLAN_MARKER)));
+        fputs(start, stream);
+        if (fclose(stream)) { free(text); return -1; }
+        free(*p);
+        *p = text;
+    }
+    return 0;
+}
+
 static int validate(const struct dcc_plan_dependency *d, const char *path, const char *target)
 {
     struct stat st={0};

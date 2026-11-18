@@ -1,6 +1,7 @@
 """Exercise the actual libclang-cpp extension and its filesystem contract."""
 import os
 import gc
+import io
 import json
 import mmap
 from pathlib import Path
@@ -24,6 +25,22 @@ import distcc_pump_c_extensions
 
 
 class ClangScanTest(unittest.TestCase):
+  def test_compressed_snapshots_read_the_source_once(self):
+    class Input(io.BytesIO):
+      def seek(self, *args):
+        raise AssertionError('compressor rewound the input')
+    for codec in ('lzo', 'lz4', 'lz4s'):
+      data = b'\xef\xbb\xbf' + b'header\n' * 90000
+      with self.subTest(codec=codec), tempfile.TemporaryDirectory() as tmp:
+        one, two = (Path(tmp) / n for n in ('one', 'two'))
+        metadata = compress_files.WriteCompressed(one, Input(data), codec, 'prefix')
+        expected = data[:3] + b'prefix' + data[3:]
+        self.assertEqual(metadata[:8], xxhash.xxh3_64_digest(expected))
+        self.assertEqual(int.from_bytes(metadata[8:16]), one.stat().st_size)
+        self.assertEqual(int.from_bytes(metadata[16:]), len(expected))
+        self.assertEqual(metadata, compress_files.WriteCompressed(two, Input(data), codec, 'prefix'))
+        self.assertEqual(one.stat().st_ino, two.stat().st_ino)
+
   def test_driver_diagnostics_preserve_literal_linker_arguments(self):
     # Exercise Clang's own diagnostic quoting, including shell metacharacters.
     values = ['$ORIGIN/:XXXXXXXXXXXXXXXXXXXXXXXXXXX', 'space and "quotes"',

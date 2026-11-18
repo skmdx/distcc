@@ -53,6 +53,6 @@ struct dcc_frontend_reply {
 int dcc_frontend_fs_reply(struct dcc_job *, const void *, size_t, struct dcc_frontend_reply *);
 void dcc_frontend_fs_reset(struct dcc_frontend_reply *);
 void dcc_frontend_fs_clear(struct dcc_frontend_reply *);
-int dcc_frontend_prepare(char **, struct dcc_job **);
+int dcc_frontend_prepare(char **, const char *, struct dcc_job **);
 int dcc_gcc_frontend_prepare(char **, const char *, struct dcc_job **);
 #endif

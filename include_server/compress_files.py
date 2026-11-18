@@ -32,64 +32,48 @@ import distcc_pump_c_extensions
 
 def WriteCompressed(path, source, compression, prefix='', cas=None):
   """Publish a compressed snapshot and return its 24-byte manifest record."""
-  if prefix:
-    if source.read(3) == b'\xef\xbb\xbf':
-      prefix = '\ufeff' + prefix
-    else:
-      source.seek(0)
-  prefix = prefix.encode()
-  start = source.tell()
-
-  def chunks():
-    source.seek(start)
-    chunk = prefix
-    while True:
-      chunk += source.read(256 * 1024 - len(chunk))
-      if not chunk:
-        return
-      yield chunk
-      chunk = b''
-
-  digest = xxhash.xxh3_64()
-  plain_size = 0
-  for chunk in chunks():
-    plain_size += len(chunk)
-    digest.update(chunk)
+  head = source.read(3) if prefix else b''
+  if head == b'\xef\xbb\xbf':
+    head = head + prefix.encode()
+  else:
+    head = prefix.encode() + head
   if cas is None:
     cas = os.path.join(os.path.dirname(path), '.cas')
   os.makedirs(cas, mode=0o700, exist_ok=True)
-  key = os.path.join(cas, f'{digest.hexdigest()}-{plain_size}.{compression}')
-  if not os.path.exists(key):
-    fd, tmp = tempfile.mkstemp(dir=cas)
+  digest = xxhash.xxh3_64()
+  plain_size = 0
+  fd, tmp = tempfile.mkstemp(dir=cas)
+  try:
+    with os.fdopen(fd, 'wb') as output:
+      if compression == 'lz4s':
+        chunk = head + source.read(256 * 1024 - len(head))
+        while chunk:
+          digest.update(chunk)
+          plain_size += len(chunk)
+          encoded = distcc_pump_c_extensions.CompressLz4Alloc(chunk)[4:]
+          compressed = len(encoded) < len(chunk)
+          output.write(struct.pack('!II', len(chunk), len(encoded) if compressed else 0))
+          output.write(encoded if compressed else chunk)
+          chunk = source.read(256 * 1024)
+        output.write(bytes(8))
+      else:
+        data = head + source.read()
+        digest.update(data)
+        plain_size = len(data)
+        compress = (distcc_pump_c_extensions.CompressLz4Alloc if compression == 'lz4'
+                    else distcc_pump_c_extensions.CompressLzo1xAlloc)
+        output.write(compress(data))
+      compressed_size = output.tell()
+      os.fchmod(output.fileno(), 0o400)
+    key = os.path.join(cas, f'{digest.hexdigest()}-{plain_size}.{compression}')
     try:
-      with os.fdopen(fd, 'wb') as output:
-        check = xxhash.xxh3_64()
-        if compression == 'lz4s':
-          for chunk in chunks():
-            check.update(chunk)
-            encoded = distcc_pump_c_extensions.CompressLz4Alloc(chunk)[4:]
-            compressed = len(encoded) < len(chunk)
-            output.write(struct.pack('!II', len(chunk), len(encoded) if compressed else 0))
-            output.write(encoded if compressed else chunk)
-          output.write(bytes(8))
-        else:
-          source.seek(start)
-          data = prefix + source.read()
-          check.update(data)
-          compress = (distcc_pump_c_extensions.CompressLz4Alloc if compression == 'lz4'
-                      else distcc_pump_c_extensions.CompressLzo1xAlloc)
-          output.write(compress(data))
-        if check.digest() != digest.digest():
-          raise OSError('input changed during compression')
-        os.fchmod(output.fileno(), 0o400)
-      try:
-        os.link(tmp, key)
-      except FileExistsError:
-        pass
-    finally:
-      os.unlink(tmp)
-  os.link(key, path)
-  return digest.digest() + struct.pack('!QQ', os.stat(key).st_size, plain_size)
+      os.link(tmp, key)
+    except FileExistsError:
+      compressed_size = os.stat(key).st_size
+    os.link(key, path)
+  finally:
+    os.unlink(tmp)
+  return digest.digest() + struct.pack('!QQ', compressed_size, plain_size)
 
 
 class CompressFiles(object):

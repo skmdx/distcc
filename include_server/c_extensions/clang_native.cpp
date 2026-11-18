@@ -26,8 +26,7 @@
 
 LLD_HAS_DRIVER(elf)
 
-extern "C" int dcc_clang_frontend(char **, char ***, char ***, int);
-extern "C" int dcc_clang_expand_response_files(char **, char ***);
+extern "C" int dcc_clang_frontend(char **, char ***, char ***, int, bool);
 extern "C" int dcc_clang_link_plan(char **, char ***);
 
 namespace {
@@ -121,7 +120,7 @@ int run(llvm::ArrayRef<const char *> original) {
     }
     return status;
 }
-int prepare(int fd, char **args, unsigned operation, int journal) {
+int prepare(int fd, char **args, unsigned operation, int journal, bool templated) {
     char **command = nullptr, **roots = nullptr;
     auto cleanup = llvm::scope_exit([&] {
         for (auto values : {command, roots}) {
@@ -129,9 +128,8 @@ int prepare(int fd, char **args, unsigned operation, int journal) {
             free(values);
         }
     });
-    if (operation == 'R' ? dcc_clang_expand_response_files(args, &command) :
-        operation == 'L' ? dcc_clang_link_plan(args, &command) :
-                           dcc_clang_frontend(args, &command, &roots, journal)) return 1;
+    if (operation == 'L' ? dcc_clang_link_plan(args, &command) :
+                           dcc_clang_frontend(args, &command, &roots, journal, templated)) return 1;
     // The complete input is now owned in memory. Reuse its file for the reply.
     if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) return 1;
     return command_api->write(fd, "ARGC", "ARGV", command) ||
@@ -144,7 +142,8 @@ int execute(int fd, unsigned operation, int journal) {
         return 1;
     }
     char **directory = command[0], **argv = command[1];
-    if (!directory[0] || !directory[1] || directory[2] || !argv[0]) {
+    if (!directory[0] || !directory[1] || !argv[0] ||
+        (directory[2] && (operation != 'P' || strcmp(directory[2], "template") || directory[3]))) {
         llvm::errs() << "distcc: invalid local compiler command\n";
         return 1;
     }
@@ -152,13 +151,13 @@ int execute(int fd, unsigned operation, int journal) {
         llvm::errs() << "distcc: " << directory[0] << ": " << strerror(errno) << '\n';
         return 1;
     }
-    if (operation != 'R') argv[0] = directory[1];
+    argv[0] = directory[1];
     llvm::SmallVector<const char *> args;
     if (operation == 'C') {
         for (char **p = argv; *p; ++p) args.push_back(*p);
         return run(args);
     }
-    return prepare(fd, argv, operation, journal);
+    return prepare(fd, argv, operation, journal, directory[2] != nullptr);
 }
 PyObject *serve(PyObject *, PyObject *input) {
     int fd;
@@ -170,7 +169,11 @@ PyObject *serve(PyObject *, PyObject *input) {
         int result = execute(request, operation, -1);
         llvm::outs().flush(); llvm::errs().flush();
         return result;
-    }, execute);
+    }, [](int request, unsigned operation, int journal) {
+        int result = execute(request, operation, journal);
+        llvm::outs().flush(); llvm::errs().flush();
+        return result;
+    });
     Py_END_ALLOW_THREADS
     if (PyErr_CheckSignals() < 0) return nullptr;
     return PyLong_FromLong(status);

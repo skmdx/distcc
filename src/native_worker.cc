@@ -122,15 +122,16 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
                 if (!length) return 0;
                 if (length != sizeof(request) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) ||
                     received != (request.operation == 'G' ? 7 : request.operation == 'D' || request.operation == 'S' ? 6 : 5) ||
-                    (request.operation != 'C' && request.operation != 'R' && request.operation != 'P' && request.operation != 'L' && request.operation != 'D' &&
+                    (request.operation != 'C' && request.operation != 'P' && request.operation != 'L' && request.operation != 'D' &&
                      request.operation != 'G' && request.operation != 'S') ||
                     request.group > INT_MAX) return 1;
-                if (plan && (request.operation == 'P' || request.operation == 'R')) {
+                if (plan && request.operation == 'P') {
                     // Only planning runs in the serial dispatcher. Compiler children
                     // retain their own descriptor tables and working directories.
                     int cwd = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC), saved = dup(STDERR_FILENO);
                     if (cwd < 0 || saved < 0 || dup2(fds[4], STDERR_FILENO) < 0) return 1;
                     int status = plan(fds[0], request.operation, fds[2]);
+                    fflush(stderr);
                     if (fchdir(cwd) || dup2(saved, STDERR_FILENO) < 0) return 1;
                     close(cwd); close(saved);
                     dcc_native_result reply{uint64_t(status & 255) << 8, 0, 0};

@@ -1931,6 +1931,31 @@ class FrontendTest(BrokerTestCase):
         for suffix in ('.o', '.d'):
             self.assertEqual(len({(self.work/f'{i}{suffix}').read_bytes() for i in range(3)}), 1)
 
+    def test_clean_build_reuses_plan_across_neighboring_sources(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        clang = self.start_frontend()
+        for name, code in (('first', 17), ('second', 29)):
+            directory = self.work / name
+            directory.mkdir()
+            source = self.work / (name + '.cpp')
+            source.write_text(f'int main() {{ return {code}; }}\n')
+            obj, dep = directory / (name + '.o'), directory / (name + '.d')
+            args = ['-c', source.name, '-o', str(obj), '-MMD', '-MF', str(dep),
+                    '-MT', name + '-plain', '-MQ', name + ' quoted$']
+            result = subprocess.run([self.build/'distcc', clang, *args], env=self.env,
+                                    cwd=self.work, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual('Clang plan memo hit' in result.stderr, name == 'second', result.stderr)
+            self.assertEqual('operation=P' in result.stderr, name == 'first', result.stderr)
+            broker = (self.work/'broker.log').read_text()
+            self.assertEqual(broker.count('input preparation command=12 '), 1, broker)
+            remote_deps = dep.read_bytes()
+            exe = directory / 'test'
+            subprocess.run([clang, obj, '-o', exe], check=True)
+            self.assertEqual(subprocess.run([exe]).returncode, code)
+            subprocess.run([clang, *args], cwd=self.work, check=True)
+            self.assertEqual(remote_deps, dep.read_bytes())
+
     def test_frontend_plan_memo_revalidates_driver_config(self):
         clang = self.start_frontend()
         options = self.work/'compile.cfg'

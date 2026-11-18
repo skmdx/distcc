@@ -986,12 +986,9 @@ dcc_build_somewhere(char *argv[],
     /* Emit frontend IR once. The worker optimizes and generates machine code
      * without needing a second preprocessing pass or a header snapshot. */
     if (remote_frontend) {
-        if (dcc_cpp_ir(argv, input_fname)) {
-            if ((ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
-            ret = dcc_frontend_prepare(argv, &prepared_job);
-            dcc_unlock(local_cpu_lock_fd);
-            local_cpu_lock_fd = -1;
-        } else ret = dcc_gcc_frontend_prepare(argv, input_fname, &prepared_job);
+        if (dcc_cpp_ir(argv, input_fname))
+            ret = dcc_frontend_prepare(argv, input_fname, &prepared_job);
+        else ret = dcc_gcc_frontend_prepare(argv, input_fname, &prepared_job);
         if (ret) goto fallback;
         if (!strcmp(input_fname, "-") && dcc_job_capture_stdin(prepared_job)) {
             ret = EXIT_IO_ERROR; goto unlock_and_clean_up;

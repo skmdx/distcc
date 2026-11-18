@@ -72,6 +72,8 @@
 #include <string.h>
 #include <fcntl.h>
 #include <assert.h>
+#include <errno.h>
+#include <ctype.h>
 #include <dlfcn.h>
 
 #include <sys/stat.h>
@@ -82,6 +84,78 @@
 #include "exitcode.h"
 #include "job.h"
 #include "snprintf.h"
+
+struct response_args {
+    char **args;
+    size_t count, capacity;
+};
+
+static int expand_response_arg(struct response_args *out, const char *arg, unsigned depth)
+{
+    if (arg[0] != '@' || !depth) {
+        if (out->count + 1 >= out->capacity) {
+            size_t capacity = out->capacity ? out->capacity * 2 : 32;
+            char **args = reallocarray(out->args, capacity, sizeof(*args));
+            if (!args) return EXIT_OUT_OF_MEMORY;
+            out->args = args;
+            out->capacity = capacity;
+        }
+        out->args[out->count] = strdup(arg);
+        if (!out->args[out->count]) return EXIT_OUT_OF_MEMORY;
+        out->args[++out->count] = NULL;
+        return 0;
+    }
+    // On failure the caller retains its original argv for native diagnostics.
+    if (depth > 32) return EXIT_DISTCC_FAILED;
+    FILE *file = fopen(arg + 1, "re");
+    if (!file) return EXIT_DISTCC_FAILED;
+    char *data = NULL;
+    size_t allocated = 0;
+    ssize_t length = getdelim(&data, &allocated, '\0', file);
+    int ret = ferror(file) || (length < 0 && !feof(file)) ? EXIT_IO_ERROR : 0;
+    fclose(file);
+    if (ret || length <= 0) { free(data); return ret; }
+    // Binary/encoded files belong to the invoking driver's native parser.
+    if (!data[length-1] || (unsigned char)data[0] == 0xff || (unsigned char)data[0] == 0xfe ||
+        !strncmp(data, "\xef\xbb\xbf", 3)) { free(data); return EXIT_DISTCC_FAILED; }
+    char *p = data;
+    while (*p && !ret) {
+        while (isspace((unsigned char)*p)) ++p;
+        if (!*p) break;
+        char *word = p, *end = p;
+        char quote = 0;
+        while (*p && (quote || !isspace((unsigned char)*p))) {
+            char ch = *p++;
+            if (ch == '\\') {
+                if (!*p) { ret = EXIT_DISTCC_FAILED; break; }
+                *end++ = *p++;
+            } else if (quote && ch == quote) quote = 0;
+            else if (!quote && (ch == '\'' || ch == '"')) quote = ch;
+            else *end++ = ch;
+        }
+        if (*p) ++p;
+        *end = '\0';
+        if (quote) ret = EXIT_DISTCC_FAILED;
+        if (!ret) ret = expand_response_arg(out, word, depth + 1);
+    }
+    free(data);
+    return ret;
+}
+
+int dcc_expand_response_files(char ***argv)
+{
+    char **p = *argv + 1;
+    while (*p && **p != '@') ++p;
+    if (!*p) return 0;
+    struct response_args out = {0};
+    for (p = *argv; *p; ++p) {
+        int ret = expand_response_arg(&out, *p, p != *argv);
+        if (ret) { if (out.args) dcc_free_argv(out.args); return ret; }
+    }
+    dcc_free_argv(*argv);
+    *argv = out.args;
+    return 0;
+}
 
 /* Offload preprocessing is a compiler-generated bundle of target-specific
  * translation units. It must not go through the single-frontend pump scanner. */
