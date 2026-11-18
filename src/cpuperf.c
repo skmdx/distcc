@@ -223,15 +223,3 @@ void dcc_cpu_perf_started(void)
     }
 #endif
 }
-
-void dcc_cpu_perf_child(void)
-{
-#ifdef __linux__
-    if (!cpu_perf.initialized) return;
-    for (int i = 0; i < CPU_SETSIZE; ++i)
-        if (cpu_perf.cpu[i].fd >= 0) {
-            close(cpu_perf.cpu[i].fd);
-            cpu_perf.cpu[i].fd = -1;
-        }
-#endif
-}

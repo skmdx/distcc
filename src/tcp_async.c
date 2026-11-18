@@ -3,6 +3,7 @@
 #include <config.h>
 #include <errno.h>
 #include <pthread.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -14,9 +15,7 @@ static pthread_cond_t ready = PTHREAD_COND_INITIALIZER;
 static struct dcc_tcp_work *head, **tail = &head;
 static struct dcc_tcp_work *completed, **completed_tail = &completed;
 static unsigned outstanding; /* Parent-owned; includes uncollected completions. */
-static pthread_t threads[2];
-static unsigned count;
-static int stopping, wake = -1;
+static int started, wake = -1;
 static atomic_ulong tasks;
 static atomic_uint active, peak;
 
@@ -25,9 +24,8 @@ static void *worker(void *unused)
     (void)unused;
     for (;;) {
         pthread_mutex_lock(&lock);
-        while (!head && !stopping) pthread_cond_wait(&ready, &lock);
+        while (!head) pthread_cond_wait(&ready, &lock);
         struct dcc_tcp_work *w = head;
-        if (!w) { pthread_mutex_unlock(&lock); return NULL; }
         head = w->next;
         if (!head) tail = &head;
         pthread_mutex_unlock(&lock);
@@ -45,21 +43,25 @@ static void *worker(void *unused)
         }
         pthread_mutex_unlock(&lock);
     }
+    return NULL;
 }
 int dcc_tcp_async_submit(struct dcc_tcp_work *w, void (*run)(void *),
                          void (*complete)(void *), void *argument)
 {
     if (wake < 0 && (wake = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0) return -1;
-    if (!count) {
+    if (!started) {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 512 * 1024);
-        stopping = 0;
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         unsigned limit = sysconf(_SC_NPROCESSORS_ONLN) > 1 ? 2 : 1;
-        for (; count < limit; ++count)
-            if (pthread_create(&threads[count], &attr, worker, NULL)) break;
+        for (unsigned i = 0; i < limit; ++i) {
+            pthread_t thread;
+            if (pthread_create(&thread, &attr, worker, NULL)) break;
+            started = 1;
+        }
         pthread_attr_destroy(&attr);
-        if (!count) return -1;
+        if (!started) return -1;
     }
     w->run = run; w->complete = complete; w->argument = argument; w->next = NULL;
     ++outstanding;
@@ -70,7 +72,6 @@ int dcc_tcp_async_submit(struct dcc_tcp_work *w, void (*run)(void *),
     return 0;
 }
 int dcc_tcp_async_fd(void) { return wake; }
-int dcc_tcp_async_pending(void) { return outstanding != 0; }
 unsigned long dcc_tcp_async_tasks(void) { return atomic_load(&tasks); }
 unsigned dcc_tcp_async_peak(void) { return atomic_load(&peak); }
 void dcc_tcp_async_drain(void)
@@ -91,17 +92,12 @@ void dcc_tcp_async_drain(void)
         complete(argument); /* May release or resubmit w. */
     }
 }
-void dcc_tcp_async_stop(void)
+/* Shutdown may enqueue tree reclamation from a completion callback. */
+void dcc_tcp_async_finish(void)
 {
-    pthread_mutex_lock(&lock);
-    stopping = 1;
-    pthread_cond_broadcast(&ready);
-    pthread_mutex_unlock(&lock);
-    for (unsigned i = 0; i < count; ++i) pthread_join(threads[i], NULL);
-    count = 0;
-}
-void dcc_tcp_async_child(void)
-{
-    if (wake >= 0) close(wake);
-    wake = -1;
+    struct pollfd p = {wake, POLLIN, 0};
+    while (outstanding) {
+        if (poll(&p, 1, -1) < 0 && errno == EINTR) continue;
+        dcc_tcp_async_drain();
+    }
 }

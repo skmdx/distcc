@@ -65,6 +65,7 @@ struct dcc_tcp_server {
     struct dcc_job *job;
     struct dcc_tcp_run run;
     struct input *inputs;
+    struct dcc_record_cache *cache;
     unsigned remaining, input_index, output_index, prepared;
     uint64_t input_offset, output_offset, reserved, input_bytes, result_bytes;
     uint64_t input_pending; /* File bytes not yet materialized in the private tree. */
@@ -88,7 +89,7 @@ struct dcc_tcp_server {
     const unsigned char *fs_reply; /* Borrows frame or buffer until sent. */
     size_t fs_size, fs_sent;
 };
-/* The parent event loop alone owns these. Children abandon inherited FDs. */
+/* The parent event loop alone owns these. */
 static struct upload *uploads[256];
 static uint64_t retained;
 static int read_frame(int fd, struct dcc_tcp_frame *frame, size_t limit)
@@ -126,7 +127,8 @@ static void input_complete(void *);
 static void output_complete(void *);
 static void copy_input(void *);
 static void copy_complete(void *);
-static int prepare_inputs(struct dcc_tcp_server *);
+static void prepare_inputs(void *);
+static void prepare_complete(void *);
 static void reserve_input(struct input *in)
 {
     if (in->storage_needed) return;
@@ -180,14 +182,6 @@ void dcc_tcp_server_collect(void)
         return;
     }
 }
-void dcc_tcp_server_quiesce(void)
-{
-    do {
-        dcc_tcp_async_stop();
-        dcc_tcp_async_drain();
-    } while (dcc_tcp_async_pending());
-}
-
 uint64_t dcc_tcp_ready_idle_ns(void)
 {
     struct dcc_server_load load;
@@ -247,14 +241,17 @@ static int queue(struct dcc_tcp_server *s, uint32_t type, const void *data, size
 }
 static void need(struct input *in)
 {
-    unsigned char index[4];
     in->wanted = 1;
     reserve_input(in);
     /* Preparation batches all wanted inputs. A promoted waiter must not
      * also send an early NEED that the final batch would repeat. */
-    if (in->server->prepared < in->server->job->count || !in->server->storage_reserved) return;
-    dcc_tcp_put32(index, in->index);
-    queue(in->server, DCC_TCP_NEED, index, sizeof(index));
+    if (!in->server->prepared || !in->server->storage_reserved) return;
+    size_t size = dcc_tcp_bitmap_size(in->server->job->count);
+    unsigned char *bits = calloc(size, 1);
+    if (!bits) { in->server->failed = 1; return; }
+    bits[in->index / 8] = 1U << (in->index % 8);
+    queue(in->server, DCC_TCP_NEED, bits, size);
+    free(bits);
 }
 static void unhash(struct upload *u)
 {
@@ -304,12 +301,13 @@ struct tree_cleanup {
     uint64_t bytes;
     char root[PATH_MAX];
     struct dcc_job *job;
+    struct dcc_record_cache *cache;
 };
-static void prune_inputs(const struct dcc_job *job)
+static void prune_inputs(const struct dcc_job *job, struct dcc_record_cache *cache)
 {
     if (job) for (unsigned i = 0; i < job->count; ++i) {
         if (dcc_job_shared(job, i) && job->inputs[i].cached) {
-            dcc_file_cache_prune(dcc_job_tmp_top(job));
+            dcc_file_cache_prune(cache);
             break;
         }
     }
@@ -318,7 +316,8 @@ static void cleanup_tree(void *argument)
 {
     struct tree_cleanup *tree = argument;
     remove_tree(AT_FDCWD, tree->root);
-    prune_inputs(tree->job);
+    prune_inputs(tree->job, tree->cache);
+    dcc_file_cache_close(tree->cache);
 }
 static void cleanup_complete(void *argument)
 {
@@ -349,20 +348,23 @@ static void release_inputs(struct dcc_tcp_server *s)
             strcpy(tree->root, s->run.root);
             tree->bytes = bytes;
             tree->job = s->job;
+            tree->cache = s->cache;
             if (!dcc_tcp_async_submit(&tree->work, cleanup_tree, cleanup_complete, tree)) {
                 bytes = 0;
                 s->job = NULL;
+                s->cache = NULL;
             }
             else { free(tree); tree = NULL; }
         }
         /* Allocation/thread creation failure must still reclaim the private tree. */
         if (!tree) {
             remove_tree(AT_FDCWD, s->run.root);
-            prune_inputs(s->job);
+            prune_inputs(s->job, s->cache);
         }
     }
     s->run.root[0] = 0;
     free(s->inputs); s->inputs = NULL;
+    dcc_file_cache_close(s->cache); s->cache = NULL;
     dcc_job_free(s->job); s->job = NULL;
     retained -= bytes;
     s->reserved -= s->input_bytes;
@@ -421,34 +423,6 @@ struct dcc_tcp_server *dcc_tcp_server_new(int fd, const struct dcc_tcp_dispatch 
     retained += DCC_TCP_CHUNK;
     return s;
 }
-void dcc_tcp_server_abandon(struct dcc_tcp_server *s)
-{
-    if (!s) return;
-    close_filesystem(s);
-    if (s->encoded) { free(s->encoded->data); free(s->encoded); }
-    close(s->socket);
-    if (s->metadata >= 0) close(s->metadata);
-    if (s->input_fd >= 0) close(s->input_fd);
-    dcc_job_result_free(&s->result);
-    /* A forked worker must neither unlink parent trees nor promote uploads. */
-    if (s->inputs) for (unsigned i = 0; i < s->job->count; ++i) free(s->inputs[i].path);
-    free(s->inputs);
-    dcc_job_free(s->job);
-    free_frame(&s->frame);
-    free_frame(&s->decoding);
-    while (s->head) {
-        struct packet *p = s->head;
-        s->head = p->next; free(p->data); free(p);
-    }
-    free(s->buffer); XXH3_freeState(s->hash); free(s);
-    /* These references also belong to the parent. Free once in the child's
-     * private address space so replacement workers do not pin old buffers. */
-    for (unsigned i = 0; i < 256; ++i) while (uploads[i]) {
-        struct upload *next = uploads[i]->next;
-        free(uploads[i]); uploads[i] = next;
-    }
-    ready_head = NULL; ready_tail = &ready_head;
-}
 void dcc_tcp_server_free(struct dcc_tcp_server *s)
 {
     if (!s) return;
@@ -487,7 +461,7 @@ static void copy_input(void *argument)
     struct dcc_tcp_server *s = argument;
     int shared = dcc_job_shared(s->job, s->cache_index) &&
                  dcc_job_shared(s->copy_source->server->job, s->copy_source->index);
-    s->cache_hit = dcc_file_cache_copy(NULL, s->copy_source->path, s->inputs[s->cache_index].path, shared);
+    s->cache_hit = dcc_file_cache_copy(s->copy_source->path, s->inputs[s->cache_index].path, shared);
 }
 static void copy_complete(void *argument)
 {
@@ -504,46 +478,29 @@ static void copy_complete(void *argument)
 }
 static int prepare(struct dcc_tcp_server *s)
 {
-    char **paths = calloc(s->job->count ? s->job->count : 1, sizeof(*paths));
     const char *tmp = dcc_job_tmp_top(s->job);
-    if (!paths || !tmp) { free(paths); return -1; }
+    if (!tmp) return -1;
     int length = snprintf(s->run.root, sizeof(s->run.root), "%s/distcc-tcp-XXXXXX", tmp);
     if (length < 0 || (size_t)length >= sizeof(s->run.root) || !mkdtemp(s->run.root)) {
-        s->run.root[0] = 0; free(paths); return -1;
+        s->run.root[0] = 0; return -1;
     }
     char *canonical = realpath(s->run.root, NULL);
-    if (!canonical || strlen(canonical) >= sizeof(s->run.root)) { free(canonical); free(paths); return -1; }
+    if (!canonical || strlen(canonical) >= sizeof(s->run.root)) { free(canonical); return -1; }
     strcpy(s->run.root, canonical); free(canonical);
     const char *regular;
     struct stat location, normal;
     if (dcc_get_tmp_top(&regular) || stat(regular, &normal) || stat(s->run.root, &location)) {
-        free(paths); return -1;
+        return -1;
     }
     /* The two work roots share reservations when they share a filesystem. */
     s->storage_group = location.st_dev != normal.st_dev;
     s->inputs = calloc(s->job->count ? s->job->count : 1, sizeof(*s->inputs));
-    if (!s->inputs) { free(paths); return -1; }
+    if (!s->inputs) { return -1; }
     if (!dcc_job_tree(s->job)) {
         storage_pending[s->storage_group] += s->input_pending;
         s->storage_reserved = 1;
     }
-    for (unsigned i = 0; i < s->job->count; ++i) paths[i] = s->job->inputs[i].path;
-    qsort(paths, s->job->count, sizeof(*paths), path_order);
-    /* Check all ancestors, not merely adjacent lexicographic entries. */
-    for (unsigned i = 0; i < s->job->count; ++i) {
-        char *copy = strdup(paths[i]);
-        if (!copy || (i && !strcmp(paths[i-1], paths[i]))) { free(copy); free(paths); return -1; }
-        for (char *p = copy + 1; *p; ++p) if (*p == '/') {
-            *p = 0;
-            if (bsearch(&copy, paths, s->job->count, sizeof(*paths), path_order)) {
-                free(copy); free(paths); return -1;
-            }
-            *p = '/';
-        }
-        free(copy);
-    }
-    free(paths);
-    return 0;
+    return dcc_tcp_async_submit(&s->work, prepare_inputs, prepare_complete, s);
 }
 
 /* Keep metadata while waiting for file space; a busy worker must not
@@ -597,68 +554,111 @@ static int input_missing(struct dcc_tcp_server *s, unsigned i)
         !dcc_job_shared(u->owner->server->job, u->owner->index)) reserve_input(in);
     return 0;
 }
-static void lookup_input(void *argument)
+/* Sorting full paths groups every directory prefix into a contiguous range.
+ * Create it on the first occurrence and reject any file used as an ancestor. */
+static int prepare_paths(struct dcc_tcp_server *s)
 {
-    struct dcc_tcp_server *s = argument;
-    const struct dcc_job_input *in = &s->job->inputs[s->prepared];
-    const char *path = s->inputs[s->prepared].path;
-    s->cache_hit = dcc_file_cache_get(in->digest, path, dcc_job_shared(s->job, s->prepared),
-                                     dcc_job_tmp_top(s->job));
-    if (s->cache_hit) {
-        struct stat st;
-        if (stat(path, &st) || (uint64_t)st.st_size != in->plain_size) s->cache_hit = -1;
-    }
-}
-static void lookup_complete(void *argument)
-{
-    struct dcc_tcp_server *s = argument;
-    if (s->cache_hit < 0 || (!s->cache_hit && input_missing(s, s->prepared))) {
-        rs_trace("TCP input %u cache lookup failed", s->prepared);
-        s->failed = 1;
-    }
-    if (s->cache_hit > 0) input_stored(&s->inputs[s->prepared]);
-    ++s->prepared;
-    if (s->prepared == s->job->count && prepare_inputs(s)) s->failed = 1;
-    if (s->socket < 0) dcc_tcp_server_free(s);
-}
-static int prepare_inputs(struct dcc_tcp_server *s)
-{
-    unsigned limit = s->prepared + 8;
-    for (; s->prepared < s->job->count && s->prepared < limit; ++s->prepared) {
-        unsigned i = s->prepared;
+    unsigned count = s->job->count;
+    if (!count) return 0;
+    char **paths = calloc(count, sizeof(*paths));
+    int root = open(s->run.root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int ret = -1;
+    if (root < 0 || !paths) goto done;
+    for (unsigned i = 0; i < count; ++i) {
         struct input *in = &s->inputs[i];
-        const struct dcc_job_input *description = &s->job->inputs[i];
-        *in = (struct input){ .server = s, .index = i };
-        if (asprintf(&in->path, "%s%s", s->run.root, description->path) < 0) return -1;
-        for (char *p = in->path + strlen(s->run.root) + 1; *p; ++p) if (*p == '/') {
-            *p = 0;
-            int ret = mkdir(in->path, 0700);
-            *p = '/';
-            if (ret && errno != EEXIST) return -1;
+        in->index = i;
+        in->server = s;
+        if (asprintf(&in->path, "%s%s", s->run.root, s->job->inputs[i].path) < 0) goto done;
+        paths[i] = s->job->inputs[i].path;
+    }
+    qsort(paths, count, sizeof(*paths), path_order);
+    for (unsigned i = 0; i < count; ++i) {
+        const char *name = paths[i];
+        char path[PATH_MAX];
+        if (strlen(name) >= sizeof(path)) goto done;
+        strcpy(path, name);
+        size_t common = 0;
+        if (i) {
+            while (path[common] && path[common] == paths[i-1][common]) ++common;
+            if (!path[common] && !paths[i-1][common]) goto done;
         }
-        if (!dcc_job_file(description)) continue;
-        if (description->fd >= 0) continue;
-        in->storage_needed = !dcc_job_shared(s->job, i);
-        if (description->cached)
-            return dcc_tcp_async_submit(&s->work, lookup_input, lookup_complete, s) ? -1 : 0;
-        if (input_missing(s, i)) return -1;
+        for (char *p = path + common; *p; ++p) {
+            if (*p != '/' || p == path) continue;
+            *p = 0;
+            char *prefix = path;
+            int conflict = bsearch(&prefix, paths, count, sizeof(*paths), path_order) != NULL ||
+                           mkdirat(root, path + 1, 0700);
+            *p = '/';
+            if (conflict) goto done;
+        }
     }
-    if (s->prepared != s->job->count) return 0;
-    if (!s->storage_reserved) {
-        int available = input_space(s);
-        if (available <= 0) return available < 0 ? -1 : 0;
-        storage_pending[s->storage_group] += s->input_pending;
-        s->storage_reserved = 1;
+    ret = 0;
+done:
+    if (root >= 0) close(root);
+    free(paths);
+    return ret;
+}
+
+static void prepare_inputs(void *argument)
+{
+    struct dcc_tcp_server *s = argument;
+    s->input_error = prepare_paths(s);
+    if (s->input_error) return;
+    const char *tmp = dcc_job_tmp_top(s->job);
+    int opened = 0;
+    for (unsigned i = 0; i < s->job->count; ++i) {
+        const struct dcc_job_input *file = &s->job->inputs[i];
+        if (!dcc_job_file(file) || file->fd >= 0) continue;
+        if (file->cached && !opened) {
+            s->cache = dcc_file_cache_open(tmp);
+            opened = 1;
+        }
+        s->inputs[i].wanted = !file->cached ||
+            !dcc_file_cache_get(s->cache, file->digest, file->plain_size,
+                                s->inputs[i].path, dcc_job_shared(s->job, i));
     }
-    unsigned char *wanted = malloc(s->job->count * 4U + 1);
+}
+
+static int request_inputs(struct dcc_tcp_server *s)
+{
+    int available = input_space(s);
+    if (available <= 0) return available;
+    storage_pending[s->storage_group] += s->input_pending;
+    s->storage_reserved = 1;
+    size_t size = dcc_tcp_bitmap_size(s->job->count);
+    unsigned char *wanted = calloc(size ? size : 1, 1);
     if (!wanted) return -1;
-    unsigned count = 0;
-    for (unsigned i = 0; i < s->job->count; ++i) if (s->inputs[i].wanted && s->job->inputs[i].cached)
-        dcc_tcp_put32(wanted + 4U * count++, i);
-    int ret = count ? queue(s, DCC_TCP_NEED, wanted, count * 4U) : 0;
+    int any = 0;
+    for (unsigned i = 0; i < s->job->count; ++i) {
+        if (s->inputs[i].wanted && s->job->inputs[i].cached) {
+            wanted[i / 8] |= 1U << (i % 8);
+            any = 1;
+        }
+    }
+    int ret = any ? queue(s, DCC_TCP_NEED, wanted, size) : 0;
     free(wanted);
-    if (ret) return ret;
-    return 0;
+    return ret;
+}
+
+static void prepare_complete(void *argument)
+{
+    struct dcc_tcp_server *s = argument;
+    if (s->socket < 0) { dcc_tcp_server_free(s); return; }
+    if (s->input_error) { s->failed = 1; return; }
+    for (unsigned i = 0; i < s->job->count; ++i) {
+        struct input *in = &s->inputs[i];
+        if (!dcc_job_file(&s->job->inputs[i]) || s->job->inputs[i].fd >= 0) continue;
+        in->storage_needed = !dcc_job_shared(s->job, i);
+        if (!in->wanted) input_stored(in);
+        else {
+            in->wanted = 0;
+            if (input_missing(s, i)) { s->failed = 1; return; }
+        }
+    }
+    if (s->storage_reserved) storage_pending[s->storage_group] -= s->input_pending;
+    s->storage_reserved = 0;
+    s->prepared = 1;
+    if (request_inputs(s)) s->failed = 1;
 }
 static uint64_t local_input_jobs, local_input_bytes;
 uint64_t dcc_tcp_local_input_jobs(void) { return local_input_jobs; }
@@ -723,8 +723,8 @@ static void decode_input(void *argument)
         XXH64_canonicalFromHash(&digest, XXH3_64bits_digest(s->hash));
         if (s->input_offset + length != s->job->inputs[index].plain_size ||
             memcmp(digest.digest, s->job->inputs[index].digest, 8)) s->input_error = -1;
-        else dcc_file_cache_put(s->job->inputs[index].digest, s->inputs[index].path,
-                               dcc_job_shared(s->job, index), dcc_job_tmp_top(s->job));
+        else dcc_file_cache_put(s->cache, s->job->inputs[index].digest, s->inputs[index].path,
+                               dcc_job_shared(s->job, index));
     }
 }
 static int finish_input(struct dcc_tcp_server *s)
@@ -1051,7 +1051,7 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
         p->revents = 0;
         return !waiting_results && (dcc_job_tree(s->job) || input_space(s) != 0);
     }
-    if (s->job && s->prepared == s->job->count && !s->storage_reserved && s->phase == PREPARING) {
+    if (s->job && s->prepared && !s->storage_reserved && s->phase == PREPARING) {
         p->events = POLLRDHUP;
         p->revents = 0;
         return !pending && input_space(s) != 0;
@@ -1068,7 +1068,7 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
         int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
         p->events = POLLRDHUP | (buffered ? 0 : POLLIN);
     }
-    int preparing = s->job && s->phase == PREPARING && s->prepared < s->job->count;
+    int preparing = s->job && s->phase == PREPARING && !s->prepared;
     if (preparing) p->events = POLLRDHUP;
     p->revents = 0;
     int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
@@ -1078,7 +1078,7 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
 }
 static int awaiting_shared_input(const struct dcc_tcp_server *s)
 {
-    if (s->phase != PREPARING || s->prepared != s->job->count || !s->remaining) return 0;
+    if (s->phase != PREPARING || !s->prepared || !s->remaining) return 0;
     for (unsigned i = 0; i < s->job->count; ++i)
         if (s->inputs[i].wanted) return 0;
     return 1;
@@ -1122,12 +1122,13 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         int admitted = prepare_available(s);
         if (admitted <= 0) return admitted;
     }
-    /* Bounded turns interleave other connections and worker completions. */
-    if (s->job && s->phase == PREPARING && (s->prepared < s->job->count || !s->storage_reserved)) {
-        if (prepare_inputs(s)) return -1;
-        if (s->work.run) return 0;
-        if (!s->storage_reserved && s->prepared == s->job->count) return 0;
-        if (s->prepared < s->job->count) events &= ~POLLIN;
+    if (s->job && s->phase == PREPARING) {
+        if (!s->prepared) return 0;
+        if (!s->storage_reserved) {
+            if (events & (POLLHUP | POLLERR | POLLRDHUP)) return -1;
+            if (request_inputs(s)) return -1;
+            if (!s->storage_reserved) return 0;
+        }
     }
     int buffered = s->frame.data && s->frame.used == s->frame.size + 8;
     if (!s->fs_reply && (buffered || (events & (POLLIN | POLLHUP | POLLERR)))) for (unsigned turn = 0; turn < 4; ++turn) {
@@ -1165,10 +1166,10 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
             return -1;
         }
         if (s->fs_reply) break;
-        if (s->job && s->phase == PREPARING && s->prepared < s->job->count) break;
+        if (s->job && s->phase == PREPARING && !s->prepared) break;
     }
     if (s->job && s->inputs && s->storage_reserved && s->phase == PREPARING &&
-        s->prepared == s->job->count && !s->remaining) {
+        s->prepared && !s->remaining) {
         if (!s->enqueued) {
             if (install_links(s)) return -1;
             s->ready_at = monotonic_ns();

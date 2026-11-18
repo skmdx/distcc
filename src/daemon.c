@@ -43,6 +43,7 @@
  **/
 
 #include <config.h>
+#include <spawn.h>
 
 #include <dirent.h>
 #include <stdio.h>
@@ -78,6 +79,7 @@
 #include "daemon.h"
 #include "types.h"
 #include "broker.h"
+#include "stats.h"
 #ifdef HAVE_GSSAPI
 #include "auth.h"
 #endif
@@ -179,6 +181,26 @@ static void dcc_warn_masquerade_whitelist(void) {
     }
 }
 
+static char **worker_argv;
+static int worker_log = STDERR_FILENO;
+
+int dcc_spawn_worker(pid_t *pid, int channel)
+{
+    posix_spawn_file_actions_t actions;
+    int ret = posix_spawn_file_actions_init(&actions);
+    if (ret) return ret;
+    if (worker_log != STDERR_FILENO)
+        ret = posix_spawn_file_actions_adddup2(&actions, worker_log, STDERR_FILENO);
+    if (!ret && arg_stats)
+        ret = posix_spawn_file_actions_adddup2(&actions, dcc_statspipe[1], DCC_WORKER_STATS_FD);
+    if (!ret) ret = posix_spawn_file_actions_adddup2(&actions, channel, DCC_WORKER_CHANNEL_FD);
+    if (!ret) ret = posix_spawn_file_actions_addclosefrom_np(&actions,
+                              arg_stats ? DCC_WORKER_STATS_FD + 1 : DCC_WORKER_CHANNEL_FD + 1);
+    if (!ret) ret = posix_spawn(pid, "/proc/self/exe", &actions, NULL, worker_argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    return ret;
+}
+
 /**
  * distcc daemon.  May run from inetd, or standalone.  Accepts
  * requests from clients to compile files.
@@ -192,14 +214,24 @@ int main(int argc, char *argv[])
     if (argc == 3 && !strcmp(argv[1], "--broker"))
         return dcc_broker_serve(argv[2]);
 
+    int worker = argc > 1 && !strcmp(argv[1], "--worker");
+    char *command[argc + 2];
+    if (worker) {
+        ++argv; --argc;
+    } else {
+        command[0] = argv[0];
+        command[1] = (char *)"--worker";
+        memcpy(command + 2, argv + 1, argc * sizeof(*argv));
+        worker_argv = command;
+    }
     if (distccd_parse_options(argc, (const char **) argv))
         dcc_exit(EXIT_DISTCC_FAILED);
 
-    if ((ret = dcc_set_lifetime()) != 0)
+    if (!worker && (ret = dcc_set_lifetime()) != 0)
         dcc_exit(ret);
 
     /* do this before giving away root */
-    if (nice(opt_niceness) == -1) {
+    if (!worker && nice(opt_niceness) == -1) {
         rs_log_warning("nice %d failed: %s", opt_niceness,
                        strerror(errno));
         /* continue anyhow */
@@ -210,6 +242,7 @@ int main(int argc, char *argv[])
 
     /* Discard privileges before opening log so that if it's created, it has
      * the right ownership. */
+    if (worker && arg_log_file) opt_log_stderr = 1;
     dcc_setup_real_log();
 
     /* Do everything from $TMPDIR directory.  Allows start directory to be
@@ -251,6 +284,7 @@ int main(int argc, char *argv[])
     if (!opt_enable_tcp_insecure)
         dcc_warn_masquerade_whitelist();
 
+    if (worker) dcc_exit(dcc_run_worker());
     if (dcc_should_be_inetd())
         ret = dcc_inetd_server();
     else
@@ -301,6 +335,7 @@ static void dcc_setup_real_log(void)
         } else {
             rs_remove_all_loggers();
             rs_add_logger(rs_logger_file, opt_log_level_num, NULL, fd);
+            worker_log = fd;
             return;
         }
     }

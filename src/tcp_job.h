@@ -12,6 +12,8 @@
 
 /* 'T' distinguishes this protocol on the existing ACL-protected listener.
  * One framing layer; flags never introduce an inner RPC stream. */
+static inline size_t dcc_tcp_bitmap_size(unsigned count) { return (count + 7U) / 8U; }
+
 enum dcc_tcp_type {
     DCC_TCP_BEGIN = 0x54000300, DCC_TCP_NEED, DCC_TCP_INPUT,
     DCC_TCP_RESULT, DCC_TCP_OUTPUT, DCC_TCP_COMPLETE, DCC_TCP_RESULT_FD, DCC_TCP_RETRY,
@@ -78,9 +80,7 @@ struct dcc_tcp_dispatch {
 };
 struct dcc_tcp_server *dcc_tcp_server_new(int, const struct dcc_tcp_dispatch *);
 void dcc_tcp_server_free(struct dcc_tcp_server *);
-void dcc_tcp_server_abandon(struct dcc_tcp_server *);
 void dcc_tcp_server_collect(void);
-void dcc_tcp_server_quiesce(void);
 int dcc_tcp_server_pending(void);
 int dcc_tcp_server_poll(struct dcc_tcp_server *, struct pollfd *);
 int dcc_tcp_server_process(struct dcc_tcp_server *, short);

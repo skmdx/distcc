@@ -29,6 +29,7 @@
 extern "C" {
 #endif
 
+struct timeval;
 enum stats_e { STATS_TCP_ACCEPT, STATS_REJ_BAD_REQ, STATS_REJ_OVERLOAD,
                 STATS_COMPILE_OK, STATS_COMPILE_ERROR, STATS_COMPILE_TIMEOUT,
                 STATS_CLI_DISCONN, STATS_OTHER, STATS_ENUM_MAX };
@@ -36,7 +37,7 @@ enum stats_e { STATS_TCP_ACCEPT, STATS_REJ_BAD_REQ, STATS_REJ_OVERLOAD,
 extern const char *stats_text[20];
 
 int  dcc_stats_init(void);
-void dcc_stats_init_kid(void);
+extern int dcc_statspipe[2];
 int  dcc_stats_server(int listen_fd);
 void dcc_stats_event(enum stats_e e);
 void dcc_stats_compile_ok(char *compiler, char *filename, struct timeval start,

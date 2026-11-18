@@ -44,11 +44,6 @@ int dcc_clang_pool_reaped(pid_t pid)
     return 0;
 }
 
-void dcc_clang_pool_abandon(void)
-{
-    while (frontends) dcc_clang_pool_reaped(frontends->pid);
-}
-
 void dcc_clang_pool_shutdown(void)
 {
     for (struct frontend *f = frontends; f; f = f->next) kill(f->pid, SIGTERM);

@@ -888,9 +888,8 @@ before returning results. LZ4 chunks, verified shared-input caching, remote
 preprocessing and GCC/Clang distributed linking are supported. Link execution
 retains the one-link-per-server limit. Preparing and returning jobs can exceed
 the compiler-slot count. RPC buffers share a 512 MiB budget; file-backed inputs
-are admitted against available filesystem space. Rust inputs, including large
-standard and dependency libraries, share verified whole-file inodes between
-jobs. The compiler sees a read-only input tree and private writable outputs;
+are admitted against available filesystem space. Pump snapshots and Rust inputs, including large standard and
+dependency libraries, share verified whole-file inodes between jobs. The compiler sees a read-only input tree and private writable outputs;
 job links keep inputs alive through cache eviction and cancellation. Large
 entries are reclaimed when their last job releases them, while small idle
 entries remain in the bounded cache. Compiler working memory is separate.
@@ -908,8 +907,8 @@ the shared storage budget; result completion waits for the last byte.
 Tree cleanup remains charged to that budget until completion. Shared-input
 owners remain pinned until dependent snapshots finish, including on disconnect.
 Worker completion queues wake the parent event loop; only the parent updates
-connection state and dispatches compiler jobs, once per loop turn. Fork and
-shutdown drain background work before reclaiming inherited resources.
+connection state and dispatches compiler jobs, once per loop turn. The daemon spawns replacement workers while background
+work continues and drains outstanding tasks during shutdown.
 `dcc_tcp_input_prefetch_bytes` counts wire bytes read during decoding, and
 `dcc_tcp_output_overlaps` counts encodes started while an output chunk remains
 queued. These demonstrate overlap, not time saved.

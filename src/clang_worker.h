@@ -6,7 +6,6 @@
 #include "native_worker.h"
 int dcc_clang_pool_get(const char *compiler);
 int dcc_clang_pool_reaped(pid_t pid);
-void dcc_clang_pool_abandon(void);
 void dcc_clang_pool_shutdown(void);
 int dcc_clang_worker(int session, char **argv, int filesystem, int cancel,
                      const char *output, const char *errors,

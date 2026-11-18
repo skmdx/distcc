@@ -67,7 +67,7 @@ static inline const char *dcc_job_helper(const struct dcc_job *job)
 }
 static inline int dcc_job_shared(const struct dcc_job *job, unsigned index)
 {
-    return dcc_job_tree(job) || job->inputs[index].kind == DCC_JOB_READONLY;
+    return job->kind == DCC_JOB_PUMP || dcc_job_tree(job) || job->inputs[index].kind == DCC_JOB_READONLY;
 }
 struct dcc_job_result {
     int status, mode;

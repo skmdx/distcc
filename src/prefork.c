@@ -62,12 +62,9 @@
 #include "resource.h"
 #include "cpuperf.h"
 
-void dcc_manage_kids(int listen_fd);
 static void dcc_sigchld_handler(int sig);
-static void dcc_create_kids(int listen_fd);
-static int dcc_preforked_child(int listen_fd);
+static void dcc_create_kids(void);
 
-#ifdef __linux__
 #include "tcp_job.h"
 #include "tcp_async.h"
 #include "clang_worker.h"
@@ -163,7 +160,7 @@ static void finish_shutdown(void)
         close(local_listener);
         if (!dcc_tcp_local_address(arg_port, &address)) unlink(address.sun_path);
     }
-    dcc_tcp_server_quiesce();
+    dcc_tcp_async_finish();
     dcc_clang_pool_shutdown();
     /* Run outside the signal handler: tree cleanup uses allocator/directory
      * routines, and must follow worker death rather than race compiler IO. */
@@ -179,7 +176,7 @@ static void finish_shutdown(void)
     for (int i = 0; i < MAX_PENDING; ++i) {
         dcc_tcp_server_free(tcp[i]); tcp[i] = NULL;
     }
-    dcc_tcp_server_quiesce(); /* Includes trees detached during final reclamation. */
+    dcc_tcp_async_finish(); /* Includes trees detached during final reclamation. */
     dcc_remove_pid();
     raise(shutdown_signal);
     _exit(128 + shutdown_signal);
@@ -506,7 +503,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
     /* Suspended compilers retain their result/cancel owner, but must not take
      * an executor away from ready work. Spawn only the missing owners; the
      * existing CPU and memory admission limits still govern execution. */
-    dcc_create_kids(listen_fd);
+    dcc_create_kids();
     dcc_tcp_dispatch_ready();
     if (polls[count].revents & POLLIN) {
         struct sockaddr_storage address;
@@ -526,11 +523,10 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
     }
     return result;
 }
-#endif
 
 /**
  * Main loop for the parent process with the new preforked implementation.
- * The parent maintains compiler workers. On Linux it also dispatches ready
+ * The parent maintains compiler workers and dispatches ready
  * connections, retaining idle sessions independently of those workers.
  **/
 int dcc_preforking_parent(int listen_fd)
@@ -541,7 +537,6 @@ int dcc_preforking_parent(int listen_fd)
     memset(&act_child, 0, sizeof act_child);
     act_child.sa_handler = dcc_sigchld_handler;
     sigaction(SIGCHLD, &act_child, NULL);
-#ifdef __linux__
     worker_count = dcc_max_kids + MAX_PENDING;
     workers = calloc(worker_count, sizeof(*workers));
     if (!workers) return EXIT_OUT_OF_MEMORY;
@@ -554,29 +549,24 @@ int dcc_preforking_parent(int listen_fd)
             return EXIT_BIND_FAILED;
         }
     }
-#endif
 
     if (arg_stats) {
 
         ret = dcc_stats_init();
         if (ret) return ret;
 
-        dcc_create_kids(listen_fd);
+        dcc_create_kids();
 
         /* Start the stats collection and web server */
         return dcc_stats_server(listen_fd);
     } else {
         while (1) {
-            dcc_create_kids(listen_fd);
+            dcc_create_kids();
 
             /* wait for any children to exit, and then start some more */
-#ifdef __linux__
             if (dcc_prefork_poll(listen_fd, NULL, 0, 1000) < 0 && errno != EINTR)
                 return EXIT_IO_ERROR;
             dcc_reap_kids(FALSE);
-#else
-            dcc_reap_kids(TRUE);
-#endif
         }
     }
 }
@@ -592,18 +582,17 @@ static void dcc_sigchld_handler(int UNUSED(sig)) {
  * Functions in the parent can call this to clean up and maintain the pool of
  * children
  **/
-void dcc_manage_kids(int listen_fd) {
+void dcc_manage_kids(void) {
     dcc_reap_kids(FALSE);
-    dcc_create_kids(listen_fd);
+    dcc_create_kids();
 }
 
 /**
  * Maintain the compiler execution worker pool.
  **/
-static void dcc_create_kids(int listen_fd) {
+static void dcc_create_kids(void) {
     pid_t kid;
     int maximum = dcc_max_kids;
-#ifdef __linux__
     for (int i = 0; i < worker_count; ++i)
         maximum += workers[i].busy == SUSPENDED || workers[i].busy == RESUMING;
     /* Once the waits end, retire surplus idle owners without interrupting a
@@ -616,77 +605,46 @@ static void dcc_create_kids(int listen_fd) {
             close(w->fd); w->fd = -1; w->busy = RETIRING; ++retiring;
         }
     }
-#endif
 
     while (dcc_nkids < maximum) {
-#ifdef __linux__
-        int pair[2], slot, i;
+        int pair[2], slot;
         for (slot = 0; slot < worker_count && workers[slot].pid; ++slot) {}
         if (slot == worker_count || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair))
             dcc_exit(EXIT_OUT_OF_MEMORY);
-        /* A compiler child runs library code before exec: never fork it with
-         * live threads or library locks inherited from background tasks. */
-        dcc_tcp_server_quiesce();
-#endif
-        if ((kid = fork()) == -1) {
-            rs_log_error("fork failed: %s", strerror(errno));
-            dcc_exit(EXIT_OUT_OF_MEMORY); /* probably */
-        } else if (kid == 0) {
-#ifdef __linux__
-            close(pair[0]);
-            dcc_tcp_async_child();
-            dcc_clang_pool_abandon();
-            worker_channel = pair[1];
-            close(listen_fd);
-            if (local_listener >= 0) { close(local_listener); local_listener = -1; }
-            for (i = 0; i < worker_count; ++i)
-                if (workers[i].fd >= 0) close(workers[i].fd);
-            for (i = 0; i < worker_count; ++i) if (workers[i].tcp) {
-                int j;
-                for (j = 0; j < MAX_PENDING && tcp[j] != workers[i].tcp; ++j) {}
-                if (j == MAX_PENDING) dcc_tcp_server_abandon(workers[i].tcp);
-                workers[i].tcp = NULL;
-            }
-            for (i = 0; i < MAX_PENDING; ++i)
-                if (pending[i].fd >= 0) close(pending[i].fd);
-            for (i = 0; i < MAX_PENDING; ++i) {
-                dcc_tcp_server_abandon(tcp[i]);
-                tcp[i] = NULL;
-            }
-#endif
-            dcc_stats_init_kid();
-            dcc_exit(dcc_preforked_child(listen_fd));
-        } else {
-#ifdef __linux__
-            close(pair[1]);
-            workers[slot] = (struct worker){ .pid = kid, .fd = pair[0] };
-#endif
-            /* in parent */
-            ++dcc_nkids;
-            rs_trace("up to %d children", dcc_nkids);
+        /* The spawn actions install the stats pipe at 4 before the channel. */
+        int child = pair[1] == DCC_WORKER_STATS_FD ? 0 : 1;
+        int error = dcc_spawn_worker(&kid, pair[child]);
+        close(pair[child]);
+        if (error) {
+            rs_log_error("spawn worker: %s", strerror(error));
+            dcc_exit(EXIT_DISTCC_FAILED);
         }
+        workers[slot] = (struct worker){ .pid = kid, .fd = pair[1-child] };
+        ++dcc_nkids;
+        rs_trace("up to %d children", dcc_nkids);
     }
 }
 
 
 
 /**
- * Fork a child to repeatedly handle assigned (or directly accepted) jobs.
+ * Repeatedly handle assigned jobs.
  *
  * To protect against leaks, we quit after 50 requests and let the parent
  * recreate us.
  **/
-static int dcc_preforked_child(int listen_fd)
+int dcc_run_worker(void)
 {
-    dcc_cpu_perf_child();
+    worker_channel = DCC_WORKER_CHANNEL_FD;
+    if (set_cloexec_flag(worker_channel, 1) ||
+        (arg_stats && set_cloexec_flag(DCC_WORKER_STATS_FD, 1))) return EXIT_IO_ERROR;
+    dcc_statspipe[1] = DCC_WORKER_STATS_FD;
+    dcc_daemon_catch_signals();
     int ireq;
     time_t start, now;
     const int child_requests = 50;
     const time_t child_lifetime = 60 /* seconds */;
     start = now = time(NULL);
-#ifdef __linux__
-    (void)listen_fd;
-#endif
 
 #ifdef HAVE_LINUX
     if (opt_oom_score_adj != INT_MIN) {
@@ -702,9 +660,7 @@ static int dcc_preforked_child(int listen_fd)
         int acc_fd;
         struct dcc_sockaddr_storage cli_addr;
         socklen_t cli_len;
-#ifdef __linux__
         int message, session, ret;
-#endif
 
         cli_len = sizeof cli_addr;
 
@@ -712,7 +668,6 @@ static int dcc_preforked_child(int listen_fd)
         if (dcc_job_lifetime)
             alarm(0);
 
-#ifdef __linux__
         struct dcc_tcp_run run;
         int descriptors[3];
         unsigned descriptor_count = 3;
@@ -749,12 +704,6 @@ static int dcc_preforked_child(int listen_fd)
             close(acc_fd);
             return EXIT_CONNECT_FAILED;
         }
-#else
-        do {
-            acc_fd = accept(listen_fd, (struct sockaddr *) &cli_addr,
-                            &cli_len);
-        } while (acc_fd == -1 && errno == EINTR);
-#endif
 
         /* Kill this process if the compile job takes too long.
          * The synchronous timeout should happen first, so this alarm
@@ -769,7 +718,6 @@ static int dcc_preforked_child(int listen_fd)
             dcc_exit(EXIT_CONNECT_FAILED);
         }
 
-#ifdef __linux__
         if (message & SESSION_NEW) dcc_stats_event(STATS_TCP_ACCEPT);
         ret = dcc_service_job(acc_fd, acc_fd,
                 (struct sockaddr *)&cli_addr,
@@ -780,17 +728,8 @@ static int dcc_preforked_child(int listen_fd)
             close(acc_fd);
             return EXIT_IO_ERROR;
         }
-#else
-        dcc_stats_event(STATS_TCP_ACCEPT);
-
-        dcc_service_job(acc_fd, acc_fd,
-                           (struct sockaddr *) &cli_addr, cli_len, NULL);
-#endif
 
         dcc_close(acc_fd);
-#ifndef __linux__
-        now = time(NULL);
-#endif
     }
 
     rs_log_info("worn out");

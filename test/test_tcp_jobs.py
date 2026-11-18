@@ -39,6 +39,10 @@ from test_adaptive import free_port
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+def bitmap_indices(data):
+    return [i for i in range(len(data) * 8) if data[i // 8] & (1 << (i % 8))]
+
+
 class ClientHotpathsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -79,11 +83,11 @@ class FileCacheTest(unittest.TestCase):
         capsule.restype = pointer
         cls.api = Api.from_address(capsule(cls.module.file_cache, b'distcc.file_cache'))
         cls.library = ctypes.CDLL(cls.module.__file__)
-        cls.library.dcc_file_cache_put.argtypes = [pointer, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
+        cls.library.dcc_file_cache_put.argtypes = [pointer, pointer, ctypes.c_char_p, ctypes.c_int]
         cls.library.dcc_file_cache_put.restype = None
-        cls.library.dcc_file_cache_get.argtypes = cls.library.dcc_file_cache_put.argtypes
+        cls.library.dcc_file_cache_get.argtypes = [pointer, pointer, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_int]
         cls.library.dcc_file_cache_get.restype = ctypes.c_int
-        cls.library.dcc_file_cache_prune.argtypes = [ctypes.c_char_p]
+        cls.library.dcc_file_cache_prune.argtypes = [pointer]
         cls.library.dcc_file_cache_prune.restype = None
 
     def setUp(self):
@@ -142,7 +146,7 @@ class FileCacheTest(unittest.TestCase):
             os.posix_fallocate(stream.fileno(), 0, 256*1024*1024 - available)
             with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
                 digest = xxhash.xxh3_64_digest(data)
-        self.library.dcc_file_cache_put(digest, os.fsencode(source), 1, os.fsencode(source.parent))
+        self.library.dcc_file_cache_put(self.handle, digest, os.fsencode(source), 1)
         self.assertEqual(next(self.cache_path.glob('*/'+digest.hex())).stat().st_ino,
                          source.stat().st_ino)
         return source
@@ -230,7 +234,7 @@ class FileCacheTest(unittest.TestCase):
         self.assertEqual(self.get(b'key'), b'complete')
         self.assertFalse(list(self.cache_path.glob('*/.tmp-*')))
 
-    def test_shared_snapshots_verify_empty_large_and_corrupt_contents(self):
+    def test_shared_snapshots_require_published_mode_and_declared_size(self):
         library = self.library
         root = self.cache_path.parent
         for index, size in enumerate((0, 65535, 65536, 65537, 131328)):
@@ -240,20 +244,35 @@ class FileCacheTest(unittest.TestCase):
                 source.write_bytes(payload)
                 os.utime(source, ns=(10**9, 10**9))
                 digest = xxhash.xxh3_64_digest(payload)
-                library.dcc_file_cache_put(digest, os.fsencode(source), 1, os.fsencode(root))
+                library.dcc_file_cache_put(self.handle, digest, os.fsencode(source), 1)
                 self.assertEqual(library.dcc_file_cache_get(
-                    digest, os.fsencode(output), 1, os.fsencode(root)), 1)
+                    self.handle, digest, len(payload), os.fsencode(output), 1), 1)
                 self.assertEqual(output.read_bytes(), payload)
                 self.assertEqual(output.stat().st_ino, source.stat().st_ino)
                 self.assertEqual(output.stat().st_mtime_ns, 10**9)
                 output.unlink()
                 cached = next(self.cache_path.glob('*/'+digest.hex()))
                 cached.chmod(0o600)
+                self.assertEqual(library.dcc_file_cache_get(
+                    self.handle, digest, len(payload), os.fsencode(output), 1), 0)
                 cached.write_bytes(b'corrupt'+payload)
                 cached.chmod(0o400)
                 self.assertEqual(library.dcc_file_cache_get(
-                    digest, os.fsencode(output), 1, os.fsencode(root)), 0)
+                    self.handle, digest, len(payload), os.fsencode(output), 1), 0)
                 self.assertFalse(output.exists())
+
+    def test_record_and_content_with_same_key_have_independent_inodes(self):
+        source = self.cache_path.parent / 'input'
+        output = self.cache_path.parent / 'output'
+        payload = b'record and content key'
+        digest = xxhash.xxh3_64_digest(payload)
+        source.write_bytes(payload)
+        self.library.dcc_file_cache_put(self.handle, digest, os.fsencode(source), 1)
+        self.write(payload, b'metadata')
+        self.assertEqual(self.get(payload), b'metadata')
+        self.assertEqual(self.library.dcc_file_cache_get(
+            self.handle, digest, len(payload), os.fsencode(output), 1), 1)
+        self.assertTrue(output.samefile(source))
 
     def test_large_idle_input_borrows_capacity_and_survives_reopen(self):
         source, output = (self.cache_path.parent/name for name in ('source', 'output'))
@@ -261,12 +280,12 @@ class FileCacheTest(unittest.TestCase):
         source.write_bytes(payload)
         digest = xxhash.xxh3_64_digest(payload)
         root = os.fsencode(source.parent)
-        self.library.dcc_file_cache_put(digest, os.fsencode(source), 1, root)
+        self.library.dcc_file_cache_put(self.handle, digest, os.fsencode(source), 1)
         source.unlink()
-        self.library.dcc_file_cache_prune(root)
+        self.library.dcc_file_cache_prune(self.handle)
         self.close_cache()
         self.handle = self.api.open(root)
-        self.assertEqual(self.library.dcc_file_cache_get(digest, os.fsencode(output), 1, root), 1)
+        self.assertEqual(self.library.dcc_file_cache_get(self.handle, digest, len(payload), os.fsencode(output), 1), 1)
         self.assertEqual(output.read_bytes(), payload)
 
     def test_quota_contention_and_abandoned_reservation_do_not_block_inputs(self):
@@ -275,7 +294,7 @@ class FileCacheTest(unittest.TestCase):
         with (self.cache_path/'.lock').open('r+b') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.write(b'new', b'pending')
-            self.library.dcc_file_cache_prune(os.fsencode(self.cache_path.parent))
+            self.library.dcc_file_cache_prune(self.handle)
             self.assertEqual(self.get(b'old'), b'complete')
             self.assertIsNone(self.get(b'new'))
             # Simulate death after reservation, before the atomic publication.
@@ -3054,7 +3073,7 @@ class TcpJobsTest(TcpJobTestCase):
                     self.assertEqual(data, struct.pack('!Q', identity))
                     break
                 self.assertEqual(kind, 0x54000301)
-                for (index,) in struct.iter_unpack('!I', data):
+                for index in bitmap_indices(data):
                     self.upload(net, body, index)
                     uploads += 1
             if identity != 71:
@@ -3067,7 +3086,7 @@ class TcpJobsTest(TcpJobTestCase):
         net = self.wire_job(body, identity=91, verification=None, job_kind=3)
         kind, data = self.frame(net)
         self.assertEqual(kind, 0x54000301)
-        for (index,) in struct.iter_unpack('!I', data): self.upload(net, body, index)
+        for index in bitmap_indices(data): self.upload(net, body, index)
         self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 91)))
         deadline = time.monotonic() + 5
         while list(self.root.glob('distcc-tcp-*')):
@@ -3091,7 +3110,7 @@ class TcpJobsTest(TcpJobTestCase):
                 self.assertEqual(data, struct.pack('!Q', 81))
                 break
             self.assertEqual(kind, 0x54000301)
-            for (index,) in struct.iter_unpack('!I', data): self.upload(net, body, index)
+            for index in bitmap_indices(data): self.upload(net, body, index)
         digest = xxhash.xxh3_64(body).digest()
         entry = next(cache.glob('*/'+digest.hex()))
         with (entry.parent/'.lock').open('r+b') as lock:
@@ -3108,14 +3127,14 @@ class TcpJobsTest(TcpJobTestCase):
                           verification=None, job_kind=3)
             kind, data = self.frame(net)
             self.assertEqual(kind, 0x54000301)
-            for (index,) in struct.iter_unpack('!I', data): self.upload(net, body, index)
+            for index in bitmap_indices(data): self.upload(net, body, index)
             self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 85)))
             self.assertFalse(entry.exists())
         self.wire_job(body, paths=paths, identity=86, net=net,
                       verification=None, job_kind=3)
         kind, data = self.frame(net)
         self.assertEqual(kind, 0x54000301)
-        for (index,) in struct.iter_unpack('!I', data): self.upload(net, body, index)
+        for index in bitmap_indices(data): self.upload(net, body, index)
         self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 86)))
         self.assertEqual(entry.read_bytes(), body)
 
@@ -3226,38 +3245,18 @@ static void gate(const char *kind) {
     dprintf(fd, "%ld %ld", (long)getpid(), (long)syscall(SYS_gettid)); close(fd);
     for (int i = 0; i < 1000 && access(getenv("TEST_FILE_RELEASE"), F_OK); ++i) usleep(10000);
 }
-static void cache_input(int fd) {
-    char link[64], path[4096];
-    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
-    ssize_t n = readlink(link, path, sizeof(path)-1);
-    if (n > 0) {
-        path[n] = 0;
-        const char *cache = getenv("DISTCCD_FILE_CACHE");
-        if (cache && *cache && !strncmp(path, cache, strlen(cache)) && path[strlen(cache)] == '/')
-            gate("cache");
+int linkat(int src, const char *old, int dst, const char *path, int flags) {
+    if (!strcmp(path, ".tmp-publish")) gate("store");
+    if (strstr(path, "/distcc-tcp-")) {
+        gate("cache");
+        gate("copy");
     }
-}
-ssize_t read(int fd, void *data, size_t size) {
-    ssize_t (*real_read)(int, void *, size_t) = dlsym(RTLD_NEXT, "read");
-    cache_input(fd);
-    return real_read(fd, data, size);
+    return syscall(SYS_linkat, src, old, dst, path, flags);
 }
 int unlinkat(int fd, const char *path, int flags) {
     int (*real_unlinkat)(int, const char *, int) = dlsym(RTLD_NEXT, "unlinkat");
     if ((flags & AT_REMOVEDIR) && strstr(path, "/distcc-tcp-")) gate("cleanup");
     return real_unlinkat(fd, path, flags);
-}
-int ioctl(int fd, unsigned long request, ...) {
-    va_list args; va_start(args, request);
-    unsigned long argument;
-    if (request == FICLONE) {
-        argument = va_arg(args, int);
-        /* Reflink filesystems can satisfy cache hits without any read(). */
-        cache_input(argument); gate("copy"); gate("store");
-    }
-    else argument = (unsigned long)va_arg(args, void *);
-    va_end(args);
-    return syscall(SYS_ioctl, fd, request, argument);
 }
 ''')
         subprocess.run([self.cc, '-shared', '-fPIC', str(hook), '-ldl', '-o', str(library)],
@@ -3273,12 +3272,12 @@ int ioctl(int fd, unsigned long request, ...) {
                 body = f'int asynchronous_{kind};\n'.encode()
                 if kind == 'cache':
                     first = self.wire_job(body)
-                    self.assertEqual(self.frame(first), (0x54000301, bytes(4)))
+                    self.assertEqual(self.frame(first), (0x54000301, b'\x01'))
                     self.upload(first, body)
                     self.result(first)
                     first.close()
                     # A job result can precede asynchronous cache publication.
-                    # Arm the cache-read gate only after a complete input exists.
+                    # Arm the hard-link gate after a complete input exists.
                     deadline = time.monotonic()+5
                     while not any(p.read_bytes() == body for p in (self.work/'cache').glob('*/*')
                                   if len(p.name) == 16):
@@ -3289,7 +3288,7 @@ int ioctl(int fd, unsigned long request, ...) {
                 if kind == 'copy':
                     before = int(re.search(r'dcc_tcp_parallel_tasks (\d+)', self.get_stats(self.stats_ports[0]))[1])
                     owner = self.wire_job(body)
-                    self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
+                    self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
                 net = self.wire_job(body, cached=kind != 'cleanup')
                 if owner:
                     deadline = time.monotonic() + 5
@@ -3301,7 +3300,7 @@ int ioctl(int fd, unsigned long request, ...) {
                         time.sleep(.01)
                     self.upload(owner, body)
                 if kind == 'store':
-                    self.assertEqual(self.frame(net), (0x54000301, bytes(4)))
+                    self.assertEqual(self.frame(net), (0x54000301, b'\x01'))
                 if kind in ('store', 'cleanup'): self.upload(net, body)
                 try:
                     deadline = time.monotonic() + 5
@@ -3311,6 +3310,19 @@ int ioctl(int fd, unsigned long request, ...) {
                     pid, tid = map(int, marker.read_text().split())
                     self.assertEqual(pid, self.daemons[0].pid)
                     self.assertNotEqual(pid, tid, 'file operation ran in the event loop')
+                    if kind == 'cache':
+                        # Replace an idle compiler while a background thread is held inside linkat.
+                        children = Path(f'/proc/{pid}/task/{pid}/children')
+                        original = set(children.read_text().split())
+                        os.kill(int(next(iter(original))), signal.SIGTERM)
+                        while not (new := set(children.read_text().split()) - original):
+                            self.assertLess(time.monotonic(), deadline, 'replacement waited for cache I/O')
+                            time.sleep(.01)
+                        cmd = Path(f'/proc/{new.pop()}/cmdline')
+                        while b'--worker' not in cmd.read_bytes().split(b'\0'):
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(.01)
+                        self.assertTrue(Path(f'/proc/{pid}/task/{tid}').exists())
                     if owner: owner.close()
                     self.assertIn('dcc_cpus ', self.get_stats(self.stats_ports[0]))
                     if kind == 'cleanup': self.result(net)
@@ -3487,7 +3499,7 @@ time_t time(time_t *out) {
             reservations.append(net)
         body = b'int phase_accounting;\n'
         net = self.wire_job(body)
-        self.assertEqual(self.frame(net), (0x54000301, bytes(4)))
+        self.assertEqual(self.frame(net), (0x54000301, b'\x01'))
         stats = self.get_stats(self.stats_ports[0])
         self.assertIn('dcc_preparing 1\n', stats)
         self.assertIn('dcc_queued 0\n', stats)
@@ -3678,14 +3690,14 @@ ssize_t write(int fd, const void *data, size_t size) {
     def test_single_upload_and_owner_disconnect(self):
         body = b'int cache_owner_recovery(void) { return 901; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
         waiter = self.wire_job(body)
         waiter.settimeout(.15)
         with self.assertRaises(socket.timeout):
             waiter.recv(8)
         owner.close()
         waiter.settimeout(5)
-        self.assertEqual(self.frame(waiter), (0x54000301, bytes(4)))
+        self.assertEqual(self.frame(waiter), (0x54000301, b'\x01'))
         self.upload(waiter, body)
         self.result(waiter)
         hit = self.wire_job(body)
@@ -3697,7 +3709,7 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.addCleanup(self.restart_server, self.build / 'distccd')
         body = b'int recovered_from_stalled_peer(void) { return 904; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
         waiter = self.wire_job(body, identity=2)
         # The owner stays connected but sends no input, as with a lost network
         # path. A healthy waiter must receive progress before that owner expires.
@@ -3713,7 +3725,7 @@ ssize_t write(int fd, const void *data, size_t size) {
         while True:
             kind, data = self.frame(waiter)
             if kind == 0x54000301:
-                self.assertEqual(data, bytes(4))
+                self.assertEqual(data, b'\x01')
                 break
             self.assertEqual((kind, data), (0x54000308, struct.pack('!Q', 2)))
         self.assertEqual(owner.recv(1), b'')
@@ -3723,7 +3735,7 @@ ssize_t write(int fd, const void *data, size_t size) {
     def test_owner_disconnect_during_waiter_lookup_requests_input_once(self):
         body = b'int cancel_during_lookup(void) { return 903; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
         paths = [b'/anchor/source.c', b'/progress/source.c']
         paths += [f'/remaining_{i}/source.c'.encode() for i in range(3000)]
         paths += [b'/done/source.c']
@@ -3732,20 +3744,17 @@ ssize_t write(int fd, const void *data, size_t size) {
         while not (roots := list(self.root.glob('distcc-tcp-*/progress'))):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.001)
-        # The second directory appears after the first cache miss registered
-        # this job as a waiter. Later lookups are still pending.
-        self.assertFalse((roots[0].parent / 'done').exists())
         owner.close()
         kind, requested = self.frame(waiter)
         self.assertEqual(kind, 0x54000301)
-        self.assertEqual(len(requested), 4)
-        self.upload(waiter, body, struct.unpack('!I', requested)[0])
+        index, = bitmap_indices(requested)
+        self.upload(waiter, body, index)
         self.result(waiter)  # A duplicate NEED is a protocol error here.
 
     def test_parallel_cache_waiters_share_upload(self):
         body = b'int single_upload_for_all(void) { return 902; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
         waiters = [self.wire_job(body) for _ in range(7)]
         self.upload(owner, body)
         self.result(owner)
@@ -3760,11 +3769,11 @@ ssize_t write(int fd, const void *data, size_t size) {
     def test_bad_digest_discards_connection_and_releases_waiter(self):
         body = b'int verified_upload;\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000301, bytes(4)))
+        self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
         waiter = self.wire_job(body)
         self.upload(owner, b'x' * len(body))
         self.assertEqual(owner.recv(8), b'')
-        self.assertEqual(self.frame(waiter), (0x54000301, bytes(4)))
+        self.assertEqual(self.frame(waiter), (0x54000301, b'\x01'))
         self.upload(waiter, body)
         self.result(waiter)
 

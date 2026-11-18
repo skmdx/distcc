@@ -72,15 +72,13 @@ A job has three phases: preparing, running, returning. Readiness follows from
 the remaining input count; completion destroys the job and leaves an idle
 connection. Only the parent changes queue membership and cache ownership.
 Missing cached inputs have one uploader and a list of dependants. Publication
-wakes dependants; disconnect promotes another uploader. Inputs are private
-snapshots, never compiler-writable cache inodes. No inter-job upload locks are
-held while waiting for a compiler or another input. Preparation advances at
-most eight input entries per turn and stops after each cache hit. Completed
-shared uploads copy one dependant per turn without rehashing the verified
-source; that source cannot enter a compiler until all copies finish. Cache
-hits from persistent storage still undergo verification.
+wakes dependants and disconnect promotes another uploader. One background task
+per manifest creates the distinct parent directories and materializes cache
+hits. Its completion registers missing inputs in the event loop and requests
+their owners' uploads. A completed uploader retains its source until each
+dependant has a read-only link or private copy.
 
-The network exchange is BEGIN(manifest), NEED(missing cached input indices), input
+The network exchange is BEGIN(manifest), NEED(missing cached inputs), input
 chunks, RESULT(status and artifact sizes), output chunks, COMPLETE(job id).
 Uncached inputs start immediately after BEGIN, without waiting for NEED.
 Further NEED messages can promote a cache waiter after an uploader disconnects.
@@ -101,7 +99,8 @@ frame header contains a uint32 type/flags and uint32 payload length. Flag
 All integers use network byte order. Payloads are:
 
   BEGIN:    uint64 nonzero job ID, then the binary manifest described below.
-  NEED:     a nonempty vector of uint32 cached input indices.
+  NEED:     a bitmap of ceil(input count / 8) bytes. Input i uses bit i % 8 of
+            byte i / 8. Tail padding is zero. Each set bit requests one file.
   INPUT:    uint32 index, uint32 expanded chunk length, raw/LZ4 bytes.
   RESULT:   uint32 wait status, uint32 mode, four uint64 expanded sizes.
   OUTPUT:   the same chunk structure as INPUT, indexed by artifact.
@@ -125,8 +124,9 @@ output; only the event loop changes job/cache/queue ownership. Small chunks
 and raw inputs stay synchronous. Raw receive frames are written directly;
 raw result sendfile extents need no intermediate payload copy. Temporary
 output encoding buffers count against the storage budget.
-All transfer threads are joined before compiler-worker fork or daemon cleanup;
-they restart lazily. Cancelled jobs retain task resources until completion.
+Compiler workers start via posix_spawn while transfer threads continue serving
+jobs. Shutdown drains pending completions, including detached tree cleanup.
+Cancelled jobs retain task resources until completion.
 At most four frames or writes per connection per turn prevent large transfers
 from monopolizing the event loop. Retained output pauses dispatch above three
 quarters of the storage budget. Ready jobs dispatch FIFO; ordinary compiles
@@ -178,19 +178,16 @@ missing, the client does not use that manifest for cache lookup; it can recover
 expanded lengths from LZ4 chunk headers without decompression.
 
 The client uses cache keys when expected all-hit savings reach 16 KiB.
-Files larger than 4 MiB are never cached. Every job still uses its transport's
-manifest/input exchange; small inputs do not use a legacy fast-path RPC.
-Hits are copied or reflinked into private job files and verified. On systems
-without reflink, verification happens during copying. Duplicate contents
-share one upload but have independent snapshots. Pooled TCP keeps upload
-owners and waiters in the server event loop; it does not require client-side
-inter-job leases.
+The event loop assigns a single uploader for duplicate missing content.
+Pump and other read-only inputs link the verified cache inode into the job
+tree. A cross-filesystem destination uses a reflink or copy. Writable inputs
+always receive a private inode.
 
 XXH3-64 detects accidental changes; it is not collision resistant against
 adversarial input. Upload verification precedes atomic cache publication.
 DISTCCD_FILE_CACHE selects a private daemon-owned directory, defaulting to
 distcc-cache-<uid> under TMPDIR. An empty value disables retention; jobs then
-upload every required file. The cache has 64 shards, each limited to 64 files
-and 4 MiB, for at most 4096 files and 256 MiB. Insertion locks are nonblocking;
-eviction or storage failure can cause later reuploads without invalidating
-private inputs. Prefer tmpfs when memory permits or reflink-capable storage.
+upload every required file. Content and metadata records use distinct sets of 64 shards
+under a shared 256 MiB quota. Published content is immutable. Readers check
+the regular file's daemon UID, mode 0400 and declared size. Live links pin
+entries during pruning. Nonblocking publication may leave a file uncached. Prefer tmpfs when memory permits or reflink-capable storage.

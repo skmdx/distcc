@@ -39,17 +39,22 @@ static void accessed(int fd, const struct stat *st)
     }
 }
 
-static int private_directory(int parent, const char *name)
+static int open_private_directory(int parent, const char *name)
 {
     struct stat st;
     int fd;
-    if (mkdirat(parent, name, 0700) && errno != EEXIST) return -1;
     fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd >= 0 && (fstat(fd, &st) || st.st_uid != geteuid() || (st.st_mode & 077))) {
+    if (fd >= 0 && (fstat(fd, &st) || st.st_uid != geteuid() || (st.st_mode & 07777) != 0700)) {
         close(fd);
         fd = -1;
     }
     return fd;
+}
+
+static int private_directory(int parent, const char *name)
+{
+    if (mkdirat(parent, name, 0700) && errno != EEXIST) return -1;
+    return open_private_directory(parent, name);
 }
 
 static int cache_root(const char *tmp)
@@ -69,16 +74,37 @@ static int cache_root(const char *tmp)
     return root;
 }
 
-static int cache_shard(const unsigned char *hash, char key[17], const char *tmp)
+struct dcc_record_cache { int root, shards[CACHE_SHARDS]; };
+
+struct dcc_record_cache *dcc_file_cache_open(const char *tmp)
 {
-    char shard[3];
-    int root = cache_root(tmp), fd, i;
-    if (root < 0) return -1;
-    snprintf(shard, sizeof(shard), "%02x", hash[0] % CACHE_SHARDS);
-    fd = private_directory(root, shard);
-    close(root);
-    for (i = 0; i < DCC_FILE_HASH_SIZE; ++i) sprintf(key + 2*i, "%02x", hash[i]);
-    return fd;
+    int root = cache_root(tmp);
+    if (root < 0) return NULL;
+    struct dcc_record_cache *cache = malloc(sizeof(*cache));
+    if (!cache) { close(root); return NULL; }
+    cache->root = root;
+    for (unsigned i = 0; i < CACHE_SHARDS; ++i) cache->shards[i] = -1;
+    return cache;
+}
+
+void dcc_file_cache_close(struct dcc_record_cache *cache)
+{
+    if (!cache) return;
+    for (unsigned i = 0; i < CACHE_SHARDS; ++i)
+        if (cache->shards[i] >= 0) close(cache->shards[i]);
+    close(cache->root);
+    free(cache);
+}
+
+static int cache_shard(struct dcc_record_cache *cache, const unsigned char *hash, char key[17], int create)
+{
+    for (unsigned i = 0; i < DCC_FILE_HASH_SIZE; ++i) sprintf(key + 2*i, "%02x", hash[i]);
+    /* Record keys and content digests can be equal. Only the upper shards
+     * contain inputs whose digest was verified before publication. */
+    if (!cache) return -1;
+    char name[3];
+    snprintf(name, sizeof(name), "%02x", CACHE_SHARDS + hash[0] % CACHE_SHARDS);
+    return create ? private_directory(cache->root, name) : open_private_directory(cache->root, name);
 }
 
 int dcc_file_digest(int fd, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE])
@@ -113,89 +139,63 @@ int dcc_file_digest(int fd, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE])
     return 0;
 }
 
-static int verify_snapshot(int from, const unsigned char *expected)
-{
-    struct stat st;
-    unsigned char hash[DCC_FILE_HASH_SIZE];
-    /* Cache publication replaces names, never the opened inode. The other
-     * caller owns a private reflink. Both stay immutable during verification. */
-    if (fstat(from, &st) || dcc_file_digest(from, st.st_size, hash)) return -1;
-    return memcmp(hash, expected, DCC_FILE_HASH_SIZE) ? -1 : 0;
-}
-
-static int copy_snapshot(int from, int to, const unsigned char *expected)
+static int copy_snapshot(int from, int to)
 {
     char buffer[65536];
-    XXH3_state_t *xxh = NULL;
-    int ret = -1;
-    ssize_t n;
 #ifdef __linux__
-    if (!ioctl(to, FICLONE, from))
-        return expected ? verify_snapshot(to, expected) : 0;
+    if (!ioctl(to, FICLONE, from)) return 0;
 #endif
-    if (lseek(from, 0, SEEK_SET) < 0) goto done;
-    if (expected) {
-        xxh = XXH3_createState();
-        if (!xxh || XXH3_64bits_reset(xxh) != XXH_OK) goto done;
+    for (;;) {
+        ssize_t n = read(from, buffer, sizeof(buffer));
+        if (n == 0) return 0;
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 || dcc_writex(to, buffer, n)) return -1;
     }
-    while ((n = read(from, buffer, sizeof(buffer))) != 0) {
-        if (n < 0) { if (errno == EINTR) continue; goto done; }
-        if ((xxh && XXH3_64bits_update(xxh, buffer, n) != XXH_OK) ||
-            dcc_writex(to, buffer, n)) goto done;
-    }
-    if (xxh) {
-        XXH64_canonical_t canonical;
-        XXH64_canonicalFromHash(&canonical, XXH3_64bits_digest(xxh));
-        if (memcmp(canonical.digest, expected, DCC_FILE_HASH_SIZE)) goto done;
-    }
-    ret = 0;
-done:
-    XXH3_freeState(xxh);
-    return ret;
 }
 
-static int snapshot(int from, const char *destination, const unsigned char *hash, int shared)
+static int snapshot(int from, const char *destination, int shared)
 {
-    int to, ok;
-    if (dcc_mk_tmp_ancestor_dirs(destination)) return 0;
     if (shared) {
         char source[64];
-        if (hash && verify_snapshot(from, hash)) return 0;
         snprintf(source, sizeof(source), "/proc/self/fd/%d", from);
         if (!linkat(AT_FDCWD, source, AT_FDCWD, destination, AT_SYMLINK_FOLLOW)) return 1;
-        /* A separately configured cache can be on another filesystem; an
-         * open entry also remains readable if eviction removed its last name. */
-        if (errno != EXDEV && errno != ENOENT) return 0;
+        /* Eviction between open and link is a miss. */
+        if (errno != EXDEV) return 0;
     }
-    to = open(destination, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    int to = open(destination, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, shared ? 0400 : 0600);
     if (to < 0) return 0;
-    ok = !copy_snapshot(from, to, hash);
+    int ok = !copy_snapshot(from, to);
     close(to);
     if (!ok) unlink(destination);
     return ok;
 }
 
-int dcc_file_cache_copy(const unsigned char *hash, const char *source, const char *destination, int shared)
+static int published(const struct stat *st, uint64_t size)
+{
+    return S_ISREG(st->st_mode) && (st->st_mode & 07777) == 0400 &&
+           st->st_uid == geteuid() && (uint64_t)st->st_size == size;
+}
+
+int dcc_file_cache_copy(const char *source, const char *destination, int shared)
 {
     int from = open(source, O_RDONLY | O_NOFOLLOW | O_CLOEXEC), ok;
     if (from < 0) return 0;
-    ok = snapshot(from, destination, hash, shared);
+    ok = snapshot(from, destination, shared);
     close(from);
     return ok;
 }
 
-int dcc_file_cache_get(const unsigned char *hash, const char *destination, int shared, const char *tmp)
+int dcc_file_cache_get(struct dcc_record_cache *cache, const unsigned char *hash, uint64_t size,
+                       const char *destination, int shared)
 {
     char key[17];
     struct stat st;
-    int shard = cache_shard(hash, key, tmp), from = -1, ok = 0;
+    int shard = cache_shard(cache, hash, key, 0), from = -1, ok = 0;
     if (shard < 0) return 0;
     from = openat(shard, key, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-    if (from < 0 || fstat(from, &st) || !S_ISREG(st.st_mode))
+    if (from < 0 || fstat(from, &st) || !published(&st, size))
         goto done;
-    /* An open entry survives concurrent eviction. Verify the private snapshot
-     * too, so a corrupt cache entry is a miss, never a wrong compilation. */
-    ok = snapshot(from, destination, hash, shared);
+    ok = snapshot(from, destination, shared);
     if (ok) accessed(from, &st);
 done:
     if (from >= 0) close(from);
@@ -224,7 +224,7 @@ static off_t make_room(int root, off_t size)
     size_t count = 0, capacity = 0;
     off_t result = -1;
     DIR *dir = NULL;
-    for (unsigned index = 0; index < CACHE_SHARDS; ++index) {
+    for (unsigned index = 0; index < 2 * CACHE_SHARDS; ++index) {
         char name[3];
         snprintf(name, sizeof(name), "%02x", index);
         /* Fresh open descriptions avoid sharing directory offsets after fork. */
@@ -325,25 +325,23 @@ static int quota_lock(int root, off_t *bytes)
     return fd;
 }
 
-static void publish_snapshot(int shard, const char *key, int from)
+static void publish_snapshot(int root, int shard, const char *key, int from)
 {
     struct stat st;
     off_t bytes;
-    int root = openat(shard, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC), quota = -1;
-    if (root < 0 || fstat(from, &st)) goto done;
+    if (fstat(from, &st)) return;
     off_t size = st.st_blocks * 512;
-    quota = quota_lock(root, &bytes);
-    if (quota < 0) goto done;
+    int quota = quota_lock(root, &bytes);
+    if (quota < 0) return;
     if (bytes < 0 || bytes + size > CACHE_BYTES) bytes = make_room(root, size);
     if (bytes < 0 || (bytes + size > CACHE_BYTES && !st.st_nlink) ||
         quota_write(root, bytes + size)) goto done;
     (void)publish_file(shard, key, from);
 done:
-    if (quota >= 0) close(quota);
-    if (root >= 0) close(root);
+    close(quota);
 }
 
-void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared, const char *tmp)
+void dcc_file_cache_put(struct dcc_record_cache *cache, const unsigned char *hash, const char *path, int shared)
 {
     char key[17];
     struct stat st, directory;
@@ -351,7 +349,7 @@ void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared,
     from = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (from < 0 || fstat(from, &st) || !S_ISREG(st.st_mode) || (!shared && st.st_size > CACHE_BYTES))
         goto done;
-    shard = cache_shard(hash, key, tmp);
+    shard = cache_shard(cache, hash, key, 1);
     if (shard < 0) goto done;
     lock = openat(shard, ".lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     /* The verified private input already belongs to the job. Cache publication
@@ -361,22 +359,21 @@ void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared,
     to = openat(shard, key, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (to >= 0) {
         struct stat existing;
-        int present = !fstat(to, &existing) && S_ISREG(existing.st_mode) &&
-                      existing.st_size == st.st_size && !verify_snapshot(to, hash);
+        int present = !fstat(to, &existing) && published(&existing, st.st_size);
         close(to);
         to = -1;
         if (present) goto done;
     }
     if (fstat(shard, &directory)) goto done;
     if (shared && st.st_dev == directory.st_dev) {
-        if (!fchmod(from, 0400)) publish_snapshot(shard, key, from);
+        if (!fchmod(from, 0400)) publish_snapshot(cache->root, shard, key, from);
         goto done;
     }
     if (st.st_size > CACHE_BYTES) goto done;
     to = openat(shard, ".", O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
     if (to < 0) goto done;
-    if (!copy_snapshot(from, to, NULL) && !fchmod(to, 0400))
-        publish_snapshot(shard, key, to);
+    if (!copy_snapshot(from, to) && !fchmod(to, 0400))
+        publish_snapshot(cache->root, shard, key, to);
 done:
     if (to >= 0) close(to);
     if (from >= 0) close(from);
@@ -384,11 +381,11 @@ done:
     if (shard >= 0) close(shard);
 }
 
-void dcc_file_cache_prune(const char *tmp)
+void dcc_file_cache_prune(struct dcc_record_cache *cache)
 {
     off_t bytes;
-    int root = cache_root(tmp), quota;
-    if (root < 0) return;
+    if (!cache) return;
+    int root = cache->root, quota;
     quota = quota_lock(root, &bytes);
     /* RETRY cleanup shares the input-I/O workers. Never make retransmission
      * depend on another cache publisher releasing its maintenance lock. The
@@ -398,38 +395,15 @@ void dcc_file_cache_prune(const char *tmp)
         if (bytes >= 0) (void)quota_write(root, bytes);
     }
     if (quota >= 0) close(quota);
-    close(root);
 }
 
 struct record_header { uint64_t key_size, size, digest; };
-struct dcc_record_cache { int root, shards[CACHE_SHARDS]; };
-
-static struct dcc_record_cache *record_open(const char *tmp)
-{
-    int root = cache_root(tmp);
-    if (root < 0) return NULL;
-    struct dcc_record_cache *cache = malloc(sizeof(*cache));
-    if (!cache) { close(root); return NULL; }
-    cache->root = root;
-    for (unsigned i = 0; i < CACHE_SHARDS; ++i) cache->shards[i] = -1;
-    return cache;
-}
-
-static void record_close(struct dcc_record_cache *cache)
-{
-    if (!cache) return;
-    for (unsigned i = 0; i < CACHE_SHARDS; ++i)
-        if (cache->shards[i] >= 0) close(cache->shards[i]);
-    close(cache->root);
-    free(cache);
-}
-
 static int record_shard(struct dcc_record_cache *cache, const void *key, size_t length, char name[17])
 {
-    if (!cache) return -1;
     uint64_t hash = XXH3_64bits(key, length);
-    unsigned index = (hash >> 56) % CACHE_SHARDS;
     snprintf(name, 17, "%016llx", (unsigned long long)hash);
+    unsigned index = (hash >> 56) % CACHE_SHARDS;
+    if (!cache) return -1;
     if (cache->shards[index] < 0) {
         char shard[3];
         snprintf(shard, sizeof(shard), "%02x", index);
@@ -506,7 +480,7 @@ static void record_write(struct dcc_record_cache *cache, const void *key, size_t
     fd = openat(shard, ".", O_WRONLY | O_TMPFILE | O_CLOEXEC, 0600);
     if (fd < 0) goto done;
     if (!write_record(fd, &header, key, data) && !fchmod(fd, 0400))
-        publish_snapshot(shard, name, fd);
+        publish_snapshot(cache->root, shard, name, fd);
 done:
     if (fd >= 0) close(fd);
     if (lock >= 0) close(lock);
@@ -529,5 +503,5 @@ static int record_claim(struct dcc_record_cache *cache, const void *key, size_t 
     return fd;
 }
 const struct dcc_file_cache_api dcc_file_cache_records = {
-    record_open, record_close, record_lookup, record_contents, record_write, record_claim
+    dcc_file_cache_open, dcc_file_cache_close, record_lookup, record_contents, record_write, record_claim
 };

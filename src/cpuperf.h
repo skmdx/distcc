@@ -14,6 +14,5 @@ void dcc_cpu_perf_refresh(void);
 void dcc_cpu_perf_get(struct dcc_cpu_perf *perf);
 int dcc_cpu_perf_limit(int limit);
 void dcc_cpu_perf_started(void);
-void dcc_cpu_perf_child(void);
 
 #endif

@@ -2,6 +2,7 @@
 #ifndef DCC_FILE_CACHE_H
 #define DCC_FILE_CACHE_H
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #define DCC_FILE_HASH_SIZE 8
@@ -19,17 +20,19 @@ struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count);
 /* Hash the known extent [0, size) without changing the descriptor offset.
  * The caller owns a stable input; read errors and premature EOF return -1. */
 int dcc_file_digest(int fd, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE]);
-/* Shared snapshots require read-only mounts or compiler-owned read-only
- * inputs (such as profile data). Otherwise return a
- * private inode. NULL hash requires an already verified, immutable source. */
-int dcc_file_cache_copy(const unsigned char *hash, const char *source, const char *destination, int shared);
-int dcc_file_cache_get(const unsigned char *hash, const char *destination, int shared, const char *tmp);
-void dcc_file_cache_put(const unsigned char *hash, const char *path, int shared, const char *tmp);
-void dcc_file_cache_prune(const char *tmp);
+/* One owner uses a cache handle at a time. Destination ancestors exist.
+ * Shared inputs are immutable. Only verified content is published. */
+struct dcc_record_cache;
+struct dcc_record_cache *dcc_file_cache_open(const char *tmp);
+void dcc_file_cache_close(struct dcc_record_cache *cache);
+int dcc_file_cache_copy(const char *source, const char *destination, int shared);
+int dcc_file_cache_get(struct dcc_record_cache *cache, const unsigned char *hash, uint64_t size,
+                       const char *destination, int shared);
+void dcc_file_cache_put(struct dcc_record_cache *cache, const unsigned char *hash, const char *path, int shared);
+void dcc_file_cache_prune(struct dcc_record_cache *cache);
 
 /* Versioned filesystem records share the same cache budget and publication
  * rules as content snapshots. A hit verifies both the full key and payload. */
-struct dcc_record_cache;
 struct dcc_file_cache_api {
     struct dcc_record_cache *(*open)(const char *);
     void (*close)(struct dcc_record_cache *);

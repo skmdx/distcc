@@ -43,17 +43,19 @@ void dcc_reap_kids(int must_reap);
 
 
 /* prefork.c */
+void dcc_manage_kids(void);
 int dcc_preforking_parent(int listen_fd);
 struct dcc_server_load {
     int busy, queued, links, preparing, returning, suspended;
     unsigned long long reserved;
 };
-#ifdef __linux__
+enum { DCC_WORKER_CHANNEL_FD = 3, DCC_WORKER_STATS_FD = 4 };
+int dcc_spawn_worker(pid_t *pid, int channel);
+int dcc_run_worker(void);
 struct pollfd;
 int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout);
 int dcc_prefork_status(struct dcc_server_load *load);
 void dcc_prefork_reaped(pid_t pid);
-#endif
 
 
 /* serve.c */

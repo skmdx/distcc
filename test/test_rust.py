@@ -895,7 +895,8 @@ pub fn read_only() -> bool {
             if identity == 1:
                 kind, requested = frame(net)
                 self.assertEqual(kind, 0x54000301)
-                for (index,) in struct.iter_unpack('!I', requested):
+                for index in range(len(requested) * 8):
+                    if not requested[index // 8] & (1 << (index % 8)): continue
                     if index != manifest_index:
                         upload(net, index)
                 deadline = time.monotonic() + 10
@@ -910,7 +911,7 @@ pub fn read_only() -> bool {
                 # Leave only 8 MiB of unreserved capacity. The other jobs fit
                 # only if admission counts shared files as already stored.
                 held = self.reserve_input_space(999)
-                self.assertEqual(frame(held), (0x54000301, struct.pack('!I', 1)))
+                self.assertEqual(frame(held), (0x54000301, b'\x02'))
 
         deadline = time.monotonic() + 10
         relative = str(payload).lstrip('/')
@@ -932,12 +933,14 @@ pub fn read_only() -> bool {
         # Deleting the cache name and cancelling its uploading job must leave
         # the other jobs' inode references intact, without a retransmission.
         digest = xxhash.xxh3_64_digest(payload.read_bytes())
-        cache = self.root / f'distcc-cache-{os.getuid()}' / f'{digest[0] % 64:02x}' / digest.hex()
+        cache = self.root / f'distcc-cache-{os.getuid()}' / f'{64 + digest[0] % 64:02x}' / digest.hex()
         cache.unlink()
         sockets[0].close()
         promoted = select.select(sockets[1:], [], [], 5)[0]
         self.assertEqual(len(promoted), 1)
-        self.assertEqual(frame(promoted[0]), (0x54000301, struct.pack('!I', manifest_index)))
+        kind, requested = frame(promoted[0])
+        self.assertEqual(kind, 0x54000301)
+        self.assertEqual(int.from_bytes(requested, 'little'), 1 << manifest_index)
         upload(promoted[0], manifest_index)
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
         for identity, net in enumerate(sockets[1:], 2):
@@ -993,14 +996,19 @@ pub fn read_only() -> bool {
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.01)
 
+        # Warm toolchain inputs require no storage reservation. Give this job
+        # its own cold input larger than the 8 MiB left by the held request.
+        with (self.work / 'budget.bin').open('wb') as payload:
+            payload.write(os.urandom(32))
+            payload.truncate(32 * 1024 * 1024)
         held = self.reserve_input_space(101)
-        self.assertEqual(held.recv(12, socket.MSG_WAITALL), struct.pack('!3I', 0x54000301, 4, 1))
+        self.assertEqual(held.recv(9, socket.MSG_WAITALL), struct.pack('!IIB', 0x54000301, 1, 2))
         cancelled = self.reserve_input_space(102)
         preparing(2)
         cancelled.close()
         preparing(1)
         source = self.work / 'budget.rs'
-        source.write_text('pub fn answer() -> u32 { 42 }')
+        source.write_text('pub fn size() -> usize { include_bytes!("budget.bin").len() }')
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(self.rust, '--crate-type=rlib', source,
                                  '-o', self.work / 'libbudget.rlib')

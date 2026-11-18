@@ -1967,7 +1967,7 @@ class TcpPreprocessTest(PreprocessTest):
         self.assertEqual(self.cache_counts()[0], 0)
 
         key = xxhash.xxh3_64(header).hexdigest()
-        entry = self.root / f'distcc-cache-{os.geteuid()}' / f'{int(key[:2], 16) % 64:02x}' / key
+        entry = self.root / f'distcc-cache-{os.geteuid()}' / f'{64 + int(key[:2], 16) % 64:02x}' / key
         self.assertEqual(entry.read_bytes(), header)
         entry.chmod(0o600)
         entry.write_bytes(b'corrupt cached input')

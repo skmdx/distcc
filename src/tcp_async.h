@@ -11,12 +11,9 @@ struct dcc_tcp_work {
  * reclamation charged to the storage budget. Only the event loop submits or
  * frees tasks; complete runs there after the worker relinquishes ownership. */
 int dcc_tcp_async_submit(struct dcc_tcp_work *, void (*)(void *), void (*)(void *), void *);
-int dcc_tcp_async_pending(void);
 int dcc_tcp_async_fd(void);
 void dcc_tcp_async_drain(void);
-/* Join all threads before fork/shutdown; submission restarts them lazily. */
-void dcc_tcp_async_stop(void);
-void dcc_tcp_async_child(void);
+void dcc_tcp_async_finish(void);
 unsigned long dcc_tcp_async_tasks(void);
 unsigned dcc_tcp_async_peak(void);
 #endif

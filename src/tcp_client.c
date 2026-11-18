@@ -319,11 +319,12 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                 if (type == DCC_TCP_PROGRESS && !have_result && incoming.size == 8 &&
                     incoming.type == DCC_TCP_PROGRESS && dcc_tcp_get64(incoming.data) == id) {
                     /* Worker execution can exceed the transport idle timeout. */
-                } else if (type == DCC_TCP_NEED && !have_result && incoming.size && !(incoming.size % 4)) {
-                    for (size_t i = 0; i < incoming.size; i += 4) {
-                        unsigned index = dcc_tcp_get32(incoming.data + i);
-                        if (index >= job->count || requested[index] ||
-                            !dcc_job_file(&job->inputs[index]) || count == job->count) goto done;
+                } else if (type == DCC_TCP_NEED && !have_result && incoming.size &&
+                           incoming.size == dcc_tcp_bitmap_size(job->count)) {
+                    for (unsigned index = 0; index < incoming.size * 8; ++index) {
+                        if (!(incoming.data[index / 8] & (1U << (index % 8)))) continue;
+                        if (index >= job->count || requested[index] || !job->inputs[index].cached ||
+                            !dcc_job_file(&job->inputs[index])) goto done;
                         requested[index] = 1; requests[count++] = index;
                     }
                 } else if (type == DCC_TCP_FS_QUERY && incoming.type == DCC_TCP_FS_QUERY &&

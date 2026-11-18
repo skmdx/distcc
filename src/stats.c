@@ -70,9 +70,6 @@ static struct pollfd *stats_polls;
 
 #define MAX_FILENAME_LEN 1024
 
-/* in prefork.c */
-void dcc_manage_kids(int listen_fd);
-
 struct stats_s {
     int counters[STATS_ENUM_MAX];
     int kids_avg[3]; /* 1, 5, 15m */
@@ -114,25 +111,6 @@ int dcc_stats_init(void) {
     }
     memset(&dcc_stats, 0, sizeof(dcc_stats));
     return 0;
-}
-
-
-/* In the preforking model call this to initialize stats for forked children */
-void dcc_stats_init_kid(void) {
-    if (arg_stats) {
-        close(dcc_statspipe[0]);
-        if (stats_listener >= 0) close(stats_listener);
-        for (int i = 0; i < stats_count; ++i) {
-            close(stats_clients[i].fd);
-            free(stats_clients[i].reply);
-        }
-        free(stats_clients);
-        free(stats_polls);
-        stats_clients = NULL;
-        stats_polls = NULL;
-        stats_count = stats_capacity = 0;
-        stats_listener = -1;
-    }
 }
 
 
@@ -744,6 +722,6 @@ int dcc_stats_server(int listen_fd)
             }
         }
 
-        dcc_manage_kids(listen_fd);
+        dcc_manage_kids();
     }
 }

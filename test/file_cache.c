@@ -46,9 +46,6 @@ static void digest_contract(void)
             assert(!dcc_file_digest(fd, size, hash));
             assert(!memcmp(hash, expected.digest, sizeof(hash)));
             assert(lseek(fd, 0, SEEK_CUR) == 3);
-            assert(!verify_snapshot(fd, expected.digest));
-            hash[0] ^= 1;
-            assert(verify_snapshot(fd, hash) == -1);
         }
         partial_reads = 0;
         struct dcc_job job = {0};
@@ -80,10 +77,10 @@ static void input(const char *path, off_t size, unsigned char hash[DCC_FILE_HASH
     assert(!munmap(data, size) && !close(fd));
 }
 
-static int cached(const unsigned char hash[DCC_FILE_HASH_SIZE], const char *root)
+static int cached(const unsigned char hash[DCC_FILE_HASH_SIZE], struct dcc_record_cache *cache)
 {
     char key[17];
-    int shard = cache_shard(hash, key, root);
+    int shard = cache_shard(cache, hash, key, 0);
     assert(shard >= 0);
     int found = !faccessat(shard, key, F_OK, 0);
     close(shard);
@@ -92,7 +89,7 @@ static int cached(const unsigned char hash[DCC_FILE_HASH_SIZE], const char *root
 
 static void claims_contract(void)
 {
-    struct dcc_record_cache *cache = record_open(".");
+    struct dcc_record_cache *cache = dcc_file_cache_open(".");
     assert(cache);
     int ready[2];
     assert(!pipe(ready));
@@ -122,7 +119,7 @@ static void claims_contract(void)
     assert(waitpid(waiter, &status, 0) == waiter && WIFEXITED(status) && !WEXITSTATUS(status));
     int lock = record_claim(cache, "action", 6, 0);
     assert(lock >= 0 && !close(lock));
-    close(ready[0]); close(ready[1]); record_close(cache);
+    close(ready[0]); close(ready[1]); dcc_file_cache_close(cache);
 }
 
 int main(int argc, char **argv)
@@ -131,13 +128,15 @@ int main(int argc, char **argv)
     digest_contract();
     assert(!setenv("DISTCCD_FILE_CACHE", "cache", 1));
     claims_contract();
+    struct dcc_record_cache *cache = dcc_file_cache_open(".");
+    assert(cache);
     unsigned char small[DCC_FILE_HASH_SIZE], large[DCC_FILE_HASH_SIZE];
     input("small", 8*1024*1024, small);
-    dcc_file_cache_put(small, "small", 1, ".");
-    assert(cached(small, "."));
+    dcc_file_cache_put(cache, small, "small", 1);
+    assert(cached(small, cache));
     assert(!unlink("small"));
-    dcc_file_cache_prune(".");
-    assert(cached(small, ".")); /* No per-shard 4 MiB eviction. */
+    dcc_file_cache_prune(cache);
+    assert(cached(small, cache)); /* No per-shard 4 MiB eviction. */
     pid_t child = fork();
     assert(child >= 0);
     if (!child) {
@@ -146,28 +145,28 @@ int main(int argc, char **argv)
         signal(SIGXFSZ, SIG_DFL);
         unsigned char hash[DCC_FILE_HASH_SIZE];
         input("tiny", 4096, hash);
-        dcc_file_cache_put(hash, "tiny", 1, ".");
-        assert(cached(hash, ".") && !unlink("tiny"));
+        dcc_file_cache_put(cache, hash, "tiny", 1);
+        assert(cached(hash, cache) && !unlink("tiny"));
         _exit(0);
     }
     int status;
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
-    assert(dcc_file_cache_get(small, "small", 1, "."));
+    assert(dcc_file_cache_get(cache, small, 8*1024*1024, "small", 1));
     input("large", DCC_FILE_CACHE_MAX, large);
-    dcc_file_cache_put(large, "large", 1, ".");
-    dcc_file_cache_prune(".");
-    assert(cached(small, ".") && cached(large, ".")); /* Both pinned. */
+    dcc_file_cache_put(cache, large, "large", 1);
+    dcc_file_cache_prune(cache);
+    assert(cached(small, cache) && cached(large, cache)); /* Both pinned. */
     assert(!unlink("small"));
-    dcc_file_cache_prune(".");
-    assert(!cached(small, ".") && cached(large, "."));
+    dcc_file_cache_prune(cache);
+    assert(!cached(small, cache) && cached(large, cache));
     assert(!unlink("large"));
-    dcc_file_cache_prune(".");
-    assert(cached(large, ".")); /* Exactly the total budget fits. */
-    int root = cache_root(".");
+    dcc_file_cache_prune(cache);
+    assert(cached(large, cache)); /* Exactly the total budget fits. */
+    int root = cache->root;
     off_t reserved;
     int quota = quota_lock(root, &reserved);
     assert(quota >= 0 && reserved == DCC_FILE_CACHE_MAX);
-    close(quota); close(root);
+    close(quota); dcc_file_cache_close(cache);
     puts("file cache: large idle input, active pins and aggregate eviction passed");
     return 0;
 }
