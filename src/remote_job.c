@@ -25,49 +25,11 @@
 #include "workload.h"
 #include "resource.h"
 
-/* Cache hashes are optional. Recover the expansion size from chunk headers
- * when their sidecar has disappeared, without decompressing the snapshot. */
-static int snapshot_size(const char *name, uint64_t wire, uint64_t *plain)
-{
-    unsigned char data[17];
-    char *sidecar;
-    uint64_t offset = 0;
-    int fd, ret = -1;
-    ssize_t n;
-    if (asprintf(&sidecar, "%s.xxh3", name) < 0) return -1;
-    fd = open(sidecar, O_RDONLY | O_CLOEXEC);
-    free(sidecar);
-    if (fd >= 0) {
-        n = read(fd, data, sizeof(data));
-        close(fd);
-        if (n == 16) {
-            *plain = 0;
-            for (unsigned k = 8; k < 16; ++k) *plain = (*plain << 8) | data[k];
-            return 0;
-        }
-    }
-    fd = open(name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return -1;
-    *plain = 0;
-    while (offset <= wire && wire - offset >= 8) {
-        uint32_t header[2], size, compressed;
-        if (pread(fd, header, sizeof(header), offset) != sizeof(header)) break;
-        offset += 8;
-        size = ntohl(header[0]);
-        compressed = ntohl(header[1]);
-        if (!size && !compressed) { ret = offset == wire ? 0 : -1; break; }
-        if (!size || size > DCC_STREAM_CHUNK || compressed >= size || *plain > (uint64_t)INT64_MAX - size) break;
-        offset += compressed ? compressed : size;
-        *plain += size;
-    }
-    close(fd);
-    return ret;
-}
-
-struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char **files)
+struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char **files,
+                                 const struct dcc_snapshot_metadata *metadata)
 {
     struct dcc_job *job = calloc(1, sizeof(*job));
-    struct dcc_input_digest *digests = NULL;
+    int64_t savings = -12;
     char *source, *output;
     unsigned i;
     if (!job) return NULL;
@@ -81,7 +43,8 @@ struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char 
         goto failed;
     }
     for (i = 0; i < job->count; ++i) job->inputs[i].fd = -1;
-    if (files) digests = dcc_file_hashes(files, job->count);
+    if (files && !metadata) goto failed;
+    savings -= job->count;
     for (i = 0; i < job->count; ++i) {
         struct dcc_job_input *in = &job->inputs[i];
         struct stat st;
@@ -102,8 +65,18 @@ struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char 
             in->kind = DCC_JOB_EMPTY;
             continue;
         }
-        if ((!files && cpp_fd >= 0) ? fstat(cpp_fd, &st) : lstat(name, &st)) goto failed;
-        if (S_ISLNK(st.st_mode)) {
+        if (files && dcc_tcp_get64(metadata[i].wire) != UINT64_MAX) {
+            in->encoding = DCC_JOB_LZ4;
+            in->wire_size = dcc_tcp_get64(metadata[i].wire);
+            in->plain_size = dcc_tcp_get64(metadata[i].plain);
+            if (in->plain_size <= DCC_FILE_CACHE_MAX) {
+                memcpy(in->digest, metadata[i].digest, sizeof(in->digest));
+                in->cached = 1;
+                savings += (int64_t)(in->wire_size > INT_MAX ? INT_MAX : in->wire_size) - DCC_FILE_HASH_SIZE;
+            }
+            continue;
+        }
+        if (files) {
             char target[4097];
             ssize_t n = readlink(name, target, sizeof(target) - 1);
             if (n < 0 || n == sizeof(target) - 1) goto failed;
@@ -113,27 +86,18 @@ struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char 
             in->kind = DCC_JOB_SYMLINK;
             continue;
         }
-        if (!S_ISREG(st.st_mode)) goto failed;
-        in->wire_size = st.st_size;
-        in->plain_size = st.st_size;
-        if (files) {
-            if (snapshot_size(name, in->wire_size, &in->plain_size)) goto failed;
-            in->encoding = DCC_JOB_LZ4;
-            if (digests && digests[i].kind == DCC_INPUT_CACHED) {
-                in->cached = 1;
-                memcpy(in->digest, digests[i].hash, sizeof(in->digest));
-            }
-        } else {
+        if ((cpp_fd >= 0 ? fstat(cpp_fd, &st) : stat(name, &st)) || !S_ISREG(st.st_mode)) goto failed;
+        in->wire_size = in->plain_size = st.st_size;
+        {
             in->fd = cpp_fd >= 0 ? fcntl(cpp_fd, F_DUPFD_CLOEXEC, 0) :
                 open(name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
             if (in->fd < 0) goto failed;
             in->encoding = DCC_JOB_RAW;
         }
     }
-    free(digests);
+    if (savings < 16384) for (i = 0; i < job->count; ++i) job->inputs[i].cached = 0;
     return job;
 failed:
-    free(digests);
     dcc_job_free(job);
     return NULL;
 }
@@ -217,7 +181,7 @@ int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char 
                        const char *output, const char *deps, struct dcc_buffer *err,
                        struct dcc_buffer *out, int *status)
 {
-    struct dcc_job *job = prepared ? prepared : dcc_job_describe(argv, cpp, cpp_fd, files);
+    struct dcc_job *job = prepared ? prepared : dcc_job_describe(argv, cpp, cpp_fd, files, NULL);
     struct dcc_job_result result;
     int ret = EXIT_IO_ERROR, transport_complete = 0, need_cpp = 0;
     dcc_job_result_init(&result);

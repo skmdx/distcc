@@ -109,6 +109,20 @@ with tempfile.TemporaryDirectory() as directory:
           {str(self.source), str(self.root / 'shared.h'), str(self.root / 'chosen.h')})
       self.assertEqual(bytes(result['files'][str(self.source)]), self.source.read_bytes())
 
+  def test_preamble_lru_preserves_interleaved_directories_and_flags(self):
+    for directory in ('first', 'second'):
+      root = self.root / directory
+      root.mkdir()
+      (root / 'h.h').write_text('#define VALUE 42\n')
+      (root / 'a.c').write_text('#include "h.h"\nint x = VALUE;\n')
+    for repeat in (False, True, True):
+      for directory in ('first', 'second'):
+        root = self.root / directory
+        for mode in ('1', '2'):
+          result = clang_scan.scan([self.compiler, '-DMODE='+mode, '-c', str(root/'a.c')], str(root))
+          self.assertEqual(result['preamble_hit'], repeat)
+          self.assertEqual(bytes(result['files'][str(root/'h.h')]), b'#define VALUE 42\n')
+
   def test_preamble_does_not_drop_macro_stacks(self):
     (self.root / 'shared.h').write_text(
         '#pragma once\n#define FLAG 1\n#pragma push_macro("FLAG")\n'
@@ -637,7 +651,7 @@ with tempfile.TemporaryDirectory() as directory:
     header.write_text('int updated;\n')
     files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
     image = next(path for path in files if path.endswith('/header.h.lz4s'))
-    self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(header.read_bytes()))
+    self.assertEqual(analyzer.compress_files.metadata[image][:8], xxhash.xxh3_64_digest(header.read_bytes()))
 
   def test_prior_input_change_restarts_current_scan_with_fresh_caches(self):
     gcc = shutil.which('gcc')
@@ -704,7 +718,7 @@ with tempfile.TemporaryDirectory() as directory:
               stream.write(data)
           files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
           image = next(path for path in files if path.endswith('/header.h.lz4s'))
-          self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(data))
+          self.assertEqual(analyzer.compress_files.metadata[image][:8], xxhash.xxh3_64_digest(data))
           self.assertEqual(Path(old_image).read_bytes(), old_bytes)
 
   def test_cached_failed_lookup_is_revalidated_when_a_header_appears(self):
@@ -744,7 +758,7 @@ with tempfile.TemporaryDirectory() as directory:
           files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
         self.assertEqual(len(calls), 2)
         image = next(path for path in files if path.endswith('/generated/header.h.lz4s'))
-        self.assertEqual(Path(image + '.xxh3').read_bytes()[:8],
+        self.assertEqual(analyzer.compress_files.metadata[image][:8],
                          xxhash.xxh3_64_digest(header.read_bytes()))
 
   def test_compiler_scan_retries_a_change_during_compression(self):
@@ -761,12 +775,13 @@ with tempfile.TemporaryDirectory() as directory:
     command = [gcc, '-c', str(self.source)]
     write = compress_files.WriteCompressed
     images = {}
-    def changing_write(path, *args):
-      write(path, *args)
+    def changing_write(path, *args, **kwargs):
+      record = write(path, *args, **kwargs)
       if path.endswith('/header.h.lz4s'):
         images[path] = Path(path).read_bytes()
         if len(images) == 1:
           header.write_text('int updated_during_collection;\n')
+      return record
     with mock.patch.object(compress_files, 'WriteCompressed', side_effect=changing_write):
       files = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
     self.assertEqual(len(images), 2)
@@ -776,7 +791,7 @@ with tempfile.TemporaryDirectory() as directory:
       else:
         self.assertFalse(Path(path).exists(), 'unpublished failed scan must be reclaimed')
     image = next(path for path in files if path.endswith('/header.h.lz4s'))
-    self.assertEqual(Path(image + '.xxh3').read_bytes()[:8], xxhash.xxh3_64_digest(header.read_bytes()))
+    self.assertEqual(analyzer.compress_files.metadata[image][:8], xxhash.xxh3_64_digest(header.read_bytes()))
 
   def test_native_input_mutation_is_retried_with_fresh_snapshots(self):
     # Mutate a header only after Clang has read it and reached the next include.
@@ -850,7 +865,7 @@ else:
             assert any(path.endswith('/new.h.lz4s') for path in files), files
             assert not any(path.endswith('/old.h.lz4s') for path in files), files
             image = next(path for path in files if path.endswith('/header.h.lz4s'))
-            assert Path(image + '.xxh3').read_bytes()[:8] == xxhash.xxh3_64_digest(
+            assert analyzer.compress_files.metadata[image][:8] == xxhash.xxh3_64_digest(
                 (root / 'header.h').read_bytes())
         assert scan_statistics.scan_counter == 2, scan_statistics.scan_counter
     finally:
@@ -903,11 +918,12 @@ else:
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
     write = compress_files.WriteCompressed
     changes = []
-    def changing_write(path, *args):
-      write(path, *args)
+    def changing_write(path, *args, **kwargs):
+      record = write(path, *args, **kwargs)
       if path.endswith('/source.c.lz4s'):
         changes.append(path)
         self.source.write_text('int changed_%d;\n' % len(changes))
+      return record
     with mock.patch.object(compress_files, 'WriteCompressed', side_effect=changing_write):
       with self.assertRaisesRegex(basics.NotCoveredError, 'Inputs keep changing'):
         analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper, 'lz4s')

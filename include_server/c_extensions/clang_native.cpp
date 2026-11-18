@@ -26,7 +26,8 @@
 
 LLD_HAS_DRIVER(elf)
 
-extern "C" int dcc_clang_frontend(char **, char ***, char ***);
+extern "C" int dcc_clang_frontend(char **, char ***, char ***, int);
+extern "C" int dcc_clang_expand_response_files(char **, char ***);
 extern "C" int dcc_clang_link_plan(char **, char ***);
 
 namespace {
@@ -120,7 +121,7 @@ int run(llvm::ArrayRef<const char *> original) {
     }
     return status;
 }
-int prepare(int fd, char **args, bool link) {
+int prepare(int fd, char **args, unsigned operation, int journal) {
     char **command = nullptr, **roots = nullptr;
     auto cleanup = llvm::scope_exit([&] {
         for (auto values : {command, roots}) {
@@ -128,14 +129,15 @@ int prepare(int fd, char **args, bool link) {
             free(values);
         }
     });
-    if (link ? dcc_clang_link_plan(args, &command) :
-               dcc_clang_frontend(args, &command, &roots)) return 1;
+    if (operation == 'R' ? dcc_clang_expand_response_files(args, &command) :
+        operation == 'L' ? dcc_clang_link_plan(args, &command) :
+                           dcc_clang_frontend(args, &command, &roots, journal)) return 1;
     // The complete input is now owned in memory. Reuse its file for the reply.
     if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) return 1;
     return command_api->write(fd, "ARGC", "ARGV", command) ||
-           (!link && command_api->write(fd, "ARGC", "ARGV", roots));
+           (operation == 'P' && command_api->write(fd, "ARGC", "ARGV", roots));
 }
-int execute(int fd, unsigned operation) {
+int execute(int fd, unsigned operation, int journal) {
     CompilerCommand command(*command_api);
     if (!command.read(fd, 2)) {
         llvm::errs() << "distcc: invalid complete compiler command file\n";
@@ -150,13 +152,13 @@ int execute(int fd, unsigned operation) {
         llvm::errs() << "distcc: " << directory[0] << ": " << strerror(errno) << '\n';
         return 1;
     }
-    argv[0] = directory[1];
+    if (operation != 'R') argv[0] = directory[1];
     llvm::SmallVector<const char *> args;
     if (operation == 'C') {
         for (char **p = argv; *p; ++p) args.push_back(*p);
         return run(args);
     }
-    return prepare(fd, argv, operation == 'L');
+    return prepare(fd, argv, operation, journal);
 }
 PyObject *serve(PyObject *, PyObject *input) {
     int fd;
@@ -165,10 +167,10 @@ PyObject *serve(PyObject *, PyObject *input) {
     Py_BEGIN_ALLOW_THREADS
     llvm::outs().flush(); llvm::errs().flush();
     status = dcc_native_worker(fd, [](int request, unsigned operation) {
-        int result = execute(request, operation);
+        int result = execute(request, operation, -1);
         llvm::outs().flush(); llvm::errs().flush();
         return result;
-    });
+    }, execute);
     Py_END_ALLOW_THREADS
     if (PyErr_CheckSignals() < 0) return nullptr;
     return PyLong_FromLong(status);

@@ -88,36 +88,35 @@ int main(int argc, char *argv[])
         if (!strcmp(argv[1],"plan_record")) {
             char *key=dcc_plan_key(argv+3,argv[2]),*memo=NULL;
             int owner=-1;
-            if (key) owner=dcc_broker_memo_get(key,&memo);
+            size_t size=0;
+            if (key) owner=dcc_broker_memo_get(key,&memo,&size);
             if (!memo) {
                 if (owner>=0) dcc_broker_release(owner);
                 free(key); return 1;
             }
-            puts(memo); free(memo); free(key);
+            fwrite(memo,1,size,stdout); free(memo); free(key);
         }
     } else if (!strcmp(argv[1],"plan_journal") && argc==3) {
         int journal=open(argv[2],O_RDONLY),output=dcc_job_memfd("test-plan");
         unsigned count=0;
         if (journal<0 || output<0 || write(output,"plan",4)!=4) return 1;
-        char *memo=dcc_plan_memo_encode(journal,output,&count);
-        if (memo) puts(memo);
+        size_t size=0;
+        char *memo=dcc_plan_memo_encode(journal,output,&count,&size);
+        if (memo) fwrite(memo,1,size,stdout);
         int valid=memo!=NULL;
         close(journal); close(output); free(memo); return valid ? 0 : 1;
     } else if ((!strcmp(argv[1],"plan_validate") || !strcmp(argv[1],"plan_dump")) && argc==3) {
-        char text[65536]; FILE *file=fopen(argv[2],"r");
-        if (!file || !fgets(text,sizeof(text),file)) return 1;
-        fclose(file); text[strcspn(text,"\n")]=0;
+        unsigned char data[DCC_MEMO_LIMIT]; FILE *file=fopen(argv[2],"rb");
+        if (!file) return 1;
+        size_t bytes=fread(data,1,sizeof(data),file);
+        fclose(file);
         if (!strcmp(argv[1],"plan_validate")) {
             unsigned count=0; int output=dcc_job_memfd("test-plan");
-            int valid=dcc_plan_memo_decode(text,output,&count);
+            int valid=dcc_plan_memo_decode((const char *)data,bytes,output,&count);
             close(output); return valid ? 0 : 1;
         }
         /* Test-only journal inspection uses this host's public struct stat
          * ABI. Paths are length-delimited, so no pathname escaping is lost. */
-        unsigned char data[32768]; size_t bytes=strlen(text)/2;
-        for (size_t i=0;i<bytes;++i) {
-            unsigned v; if (sscanf(text+2*i,"%2x",&v)!=1) return 1; data[i]=v;
-        }
         if (bytes<12) return 1;
         uint32_t size; memcpy(&size,data,4);
         if (size+8>bytes) return 1;

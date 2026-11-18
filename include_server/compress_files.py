@@ -24,42 +24,72 @@ import io
 import xxhash
 import sys
 import struct
+import tempfile
 import os.path
 
 import distcc_pump_c_extensions
 
 
-def WriteCompressed(path, source, compression, prefix=''):
-  """Write one immutable input, including the prepared-TCP digest sidecar."""
-  compress = (distcc_pump_c_extensions.CompressLz4Alloc if compression in ('lz4', 'lz4s')
-              else distcc_pump_c_extensions.CompressLzo1xAlloc)
-  with open(path, 'wb') as output:
-    if prefix:
-      if source.read(3) == b'\xef\xbb\xbf':
-        prefix = '\ufeff' + prefix
-      else:
-        source.seek(0)
-    if compression != 'lz4s':
-      output.write(compress(prefix.encode() + source.read()))
-      return
-    digest = xxhash.xxh3_64()
-    plain_size = 0
-    chunk = prefix.encode()
+def WriteCompressed(path, source, compression, prefix='', cas=None):
+  """Publish a compressed snapshot and return its 24-byte manifest record."""
+  if prefix:
+    if source.read(3) == b'\xef\xbb\xbf':
+      prefix = '\ufeff' + prefix
+    else:
+      source.seek(0)
+  prefix = prefix.encode()
+  start = source.tell()
+
+  def chunks():
+    source.seek(start)
+    chunk = prefix
     while True:
       chunk += source.read(256 * 1024 - len(chunk))
       if not chunk:
-        break
-      digest.update(chunk)
-      plain_size += len(chunk)
-      encoded = compress(chunk)[4:]
-      compressed = len(encoded) < len(chunk)
-      output.write(struct.pack('!II', len(chunk), len(encoded) if compressed else 0))
-      output.write(encoded if compressed else chunk)
+        return
+      yield chunk
       chunk = b''
-    output.write(bytes(8))
-  with open(path + '.xxh3', 'wb') as sidecar:
-    sidecar.write(digest.digest())
-    sidecar.write(struct.pack('!Q', plain_size))
+
+  digest = xxhash.xxh3_64()
+  plain_size = 0
+  for chunk in chunks():
+    plain_size += len(chunk)
+    digest.update(chunk)
+  if cas is None:
+    cas = os.path.join(os.path.dirname(path), '.cas')
+  os.makedirs(cas, mode=0o700, exist_ok=True)
+  key = os.path.join(cas, f'{digest.hexdigest()}-{plain_size}.{compression}')
+  if not os.path.exists(key):
+    fd, tmp = tempfile.mkstemp(dir=cas)
+    try:
+      with os.fdopen(fd, 'wb') as output:
+        check = xxhash.xxh3_64()
+        if compression == 'lz4s':
+          for chunk in chunks():
+            check.update(chunk)
+            encoded = distcc_pump_c_extensions.CompressLz4Alloc(chunk)[4:]
+            compressed = len(encoded) < len(chunk)
+            output.write(struct.pack('!II', len(chunk), len(encoded) if compressed else 0))
+            output.write(encoded if compressed else chunk)
+          output.write(bytes(8))
+        else:
+          source.seek(start)
+          data = prefix + source.read()
+          check.update(data)
+          compress = (distcc_pump_c_extensions.CompressLz4Alloc if compression == 'lz4'
+                      else distcc_pump_c_extensions.CompressLzo1xAlloc)
+          output.write(compress(data))
+        if check.digest() != digest.digest():
+          raise OSError('input changed during compression')
+        os.fchmod(output.fileno(), 0o400)
+      try:
+        os.link(tmp, key)
+      except FileExistsError:
+        pass
+    finally:
+      os.unlink(tmp)
+  os.link(key, path)
+  return digest.digest() + struct.pack('!QQ', os.stat(key).st_size, plain_size)
 
 
 class CompressFiles(object):
@@ -77,7 +107,7 @@ class CompressFiles(object):
     self.realpath_map = realpath_map
     self.mirror_path = mirror_path
     # The realpath_map indices of files that have been compressed already.
-    self.files_compressed = set([])
+    self.metadata = {}
 
   def Compress(self, include_closure, client_root_keeper, currdir_idx,
                preprocess_only=False, compression='lzo', snapshots=None):
@@ -111,8 +141,7 @@ class CompressFiles(object):
         new_filepath = "%s%s.%s" % (client_root_keeper.client_root,
                                      realpath, compression)
       files.append(new_filepath)
-      if not new_filepath in self.files_compressed:
-        self.files_compressed.add(new_filepath)
+      if new_filepath not in self.metadata:
         dirname = os.path.dirname(new_filepath)
         try:
           if not os.path.isdir(dirname):
@@ -141,7 +170,8 @@ class CompressFiles(object):
         except (IOError, OSError) as why:
           sys.exit("Could not open '%s' for reading: %s" % (realpath, why))
         try:
-          WriteCompressed(new_filepath, real_file_fd, compression, prefix)
+          self.metadata[new_filepath] = WriteCompressed(new_filepath, real_file_fd, compression, prefix,
+                                                       client_root_keeper.cas)
         except (IOError, OSError) as why:
           sys.exit("Could not write to '%s': %s" % (new_filepath, why))
         finally:

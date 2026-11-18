@@ -106,8 +106,9 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
                   b''.join(struct.pack('!II', kind, len(path)) + path for kind, path in encoded))
       name = xxhash.xxh3_64_hexdigest(manifest) + '.' + compression
       path = os.path.join(directory, name)
-      if not os.path.exists(path):
-        compress_files.WriteCompressed(path, io.BytesIO(manifest), compression)
+      if path not in self.compress_files.metadata:
+        self.compress_files.metadata[path] = compress_files.WriteCompressed(
+            path, io.BytesIO(manifest), compression, cas=self.client_root_keeper.cas)
       return files + [path]
     finally:
       self.snapshots = None

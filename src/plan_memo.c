@@ -174,20 +174,20 @@ bad:
     free(all); return 0;
 }
 
-static unsigned char *file_bytes(int fd, size_t *size)
+static unsigned char *file_bytes(int fd, size_t *size, size_t limit)
 {
     struct stat st;
-    if (fstat(fd,&st) || st.st_size<0 || st.st_size>DCC_PLAN_JOURNAL_LIMIT) return NULL;
+    if (fstat(fd,&st) || st.st_size<0 || (uint64_t)st.st_size>limit) return NULL;
     unsigned char *data=malloc(st.st_size+1);
     if (!data) return NULL;
     if (pread(fd,data,st.st_size,0)!=st.st_size) { free(data); return NULL; }
     *size=st.st_size; return data;
 }
 
-char *dcc_plan_memo_encode(int journal, int output, unsigned *dependencies)
+char *dcc_plan_memo_encode(int journal, int output, unsigned *dependencies, size_t *length)
 {
     size_t size=0,plan_size=0;
-    unsigned char *data=file_bytes(journal,&size), *plan=file_bytes(output,&plan_size);
+    unsigned char *data=file_bytes(journal,&size,DCC_PLAN_JOURNAL_LIMIT), *plan=file_bytes(output,&plan_size,DCC_MEMO_LIMIT);
     struct record *records=NULL;
     unsigned count=0;
     char *memo=NULL;
@@ -198,7 +198,7 @@ char *dcc_plan_memo_encode(int journal, int output, unsigned *dependencies)
     size_t compact=4;
     for (unsigned i=0;i<count;++i) if (!i || order(&records[i-1],&records[i]))
         compact+=sizeof(records[i].d)+records[i].d.length+records[i].d.target_length;
-    if (2*(8+compact+plan_size)+1>DCC_MEMO_LIMIT) goto out;
+    if (8+compact+plan_size+1>DCC_MEMO_LIMIT) goto out;
     unsigned char *packed=malloc(8+compact+plan_size);
     if (!packed) goto out;
     uint32_t lengths[]={(uint32_t)compact,(uint32_t)plan_size};
@@ -211,36 +211,24 @@ char *dcc_plan_memo_encode(int journal, int output, unsigned *dependencies)
         if (r->target) { memcpy(packed+at,r->target,r->d.target_length); at+=r->d.target_length; }
     }
     memcpy(packed+at,plan,plan_size); at+=plan_size;
-    memo=malloc(at*2+1);
-    if (memo) {
-        const char hex[]="0123456789abcdef";
-        for (size_t i=0;i<at;++i) { memo[2*i]=hex[packed[i]>>4]; memo[2*i+1]=hex[packed[i]&15]; }
-        memo[2*at]=0;
-    }
-    free(packed);
+    memo=(char *)packed;
+    *length=at;
 out:
     free(records); free(data); free(plan); return memo;
 }
 
-int dcc_plan_memo_decode(const char *memo, int output, unsigned *dependencies)
+int dcc_plan_memo_decode(const char *memo, size_t size, int output, unsigned *dependencies)
 {
-    size_t size=strlen(memo);
-    if (size<24 || size>=DCC_MEMO_LIMIT || size%2) return 0;
-    unsigned char *data=malloc(size/2);
-    if (!data) return 0;
+    if (size < 12 || size >= DCC_MEMO_LIMIT) return 0;
+    const unsigned char *data = (const unsigned char *)memo;
     int valid=0;
     struct record *records=NULL;
-    for (size_t i=0;i<size;i+=2) {
-        const char *a=strchr("0123456789abcdef",memo[i]),*b=strchr("0123456789abcdef",memo[i+1]);
-        if (!a || !b) goto out;
-        data[i/2]=(a-"0123456789abcdef")*16+(b-"0123456789abcdef");
-    }
     uint32_t lengths[2]; memcpy(lengths,data,8);
-    if ((uint64_t)lengths[0]+lengths[1]+8!=size/2 || lengths[0]>DCC_PLAN_JOURNAL_LIMIT ||
+    if ((uint64_t)lengths[0]+lengths[1]+8!=size || lengths[0]>DCC_PLAN_JOURNAL_LIMIT ||
         !journal_records(data+8,lengths[0],&records,dependencies)) goto out;
     if (ftruncate(output,0) || lseek(output,0,SEEK_SET)<0 ||
         write(output,data+8+lengths[0],lengths[1])!=(ssize_t)lengths[1]) goto out;
     valid=1;
 out:
-    free(records); free(data); return valid;
+    free(records); return valid;
 }

@@ -35,8 +35,8 @@ void dcc_plan_record_begin(int descriptor, int driver);
 void dcc_plan_record_finish(int status);
 #ifndef __cplusplus
 char *dcc_plan_key(char **argv, const char *input);
-int dcc_plan_memo_decode(const char *memo, int output, unsigned *dependencies);
-char *dcc_plan_memo_encode(int journal, int output, unsigned *dependencies);
+int dcc_plan_memo_decode(const char *memo, size_t size, int output, unsigned *dependencies);
+char *dcc_plan_memo_encode(int journal, int output, unsigned *dependencies, size_t *length);
 #endif
 #ifdef __cplusplus
 }

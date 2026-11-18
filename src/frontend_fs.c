@@ -295,7 +295,7 @@ void dcc_frontend_fs_clear(struct dcc_frontend_reply *reply)
     *reply = (struct dcc_frontend_reply){.fd = -1};
 }
 static int append_query(struct dcc_job *, const void *, size_t, struct dcc_frontend_reply *);
-static int directory_batch(struct dcc_job *job, const unsigned char *data, size_t size,
+static int metadata_batch(struct dcc_job *job, unsigned batch, const unsigned char *data, size_t size,
                            struct dcc_frontend_reply *reply)
 {
     unsigned char header[8] = {0};
@@ -307,7 +307,10 @@ static int directory_batch(struct dcc_job *job, const unsigned char *data, size_
         /* Only metadata queries belong here: no nesting or open file bodies. */
         if (length < 4 || length > size) return -1;
         unsigned operation = dcc_tcp_get32(data);
-        if ((operation != DCC_FS_LSTAT && operation != DCC_FS_ATTRIBUTES) ||
+        int valid = batch == DCC_FS_DIRECTORIES ?
+            (operation == DCC_FS_STAT || operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES) :
+            (operation == DCC_FS_STATUS || operation == DCC_FS_REALPATH);
+        if (!valid ||
             append_query(job, data, length, reply)) return -1;
         data += length; size -= length;
     }
@@ -355,16 +358,16 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
     if (path_length >= sizeof(path)) { error = ENAMETOOLONG; goto complete; }
     memcpy(path, names, path_length); path[path_length] = 0;
     int access = operation == DCC_FS_STDIN ? PATH_CONTENTS : allowed(job, path);
-    int required = operation == DCC_FS_STAT || operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES ||
+    int required = operation == DCC_FS_STATUS || operation == DCC_FS_STAT || operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES ||
         operation == DCC_FS_READLINK || operation == DCC_FS_REALPATH ? PATH_METADATA : PATH_CONTENTS;
     if (!(access & required)) {
         /* Missing include candidates must retain their lookup error so Clang
          * can continue searching. Existing unexported files stay inaccessible. */
         error = (operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES || operation == DCC_FS_READLINK
                  ? lstat(path, &st) : stat(path, &st)) ? errno : EACCES;
-    } else if (operation == DCC_FS_STAT || operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES) {
-        if (query_metadata(reply, path, operation == DCC_FS_STAT,
-                           operation == DCC_FS_ATTRIBUTES ? 0 : access & PATH_CONTENTS,
+    } else if (operation == DCC_FS_STATUS || operation == DCC_FS_STAT || operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES) {
+        if (query_metadata(reply, path, operation == DCC_FS_STAT || operation == DCC_FS_STATUS,
+                           operation == DCC_FS_ATTRIBUTES || operation == DCC_FS_STATUS ? 0 : access & PATH_CONTENTS,
                            hints, hint_count, version)) error = errno;
     } else if (operation == DCC_FS_READ || operation == DCC_FS_STDIN) {
         reply->fd = operation == DCC_FS_STDIN ? fcntl(job->stdin_fd - 1, F_DUPFD_CLOEXEC, 3) :
@@ -438,8 +441,9 @@ int dcc_frontend_fs_reply(struct dcc_job *job, const void *data, size_t size,
 {
     dcc_frontend_fs_reset(reply);
     if (!job->fs_roots || size < 5 || size > DCC_FS_QUERY_MAX) return -1;
-    int ret = dcc_tcp_get32(data) == DCC_FS_DIRECTORIES
-        ? directory_batch(job, (const unsigned char *)data + 4, size - 4, reply)
+    unsigned op = dcc_tcp_get32(data);
+    int ret = op == DCC_FS_DIRECTORIES || op == DCC_FS_BATCH
+        ? metadata_batch(job, op, (const unsigned char *)data + 4, size - 4, reply)
         : append_query(job, data, size, reply);
     if (ret) dcc_frontend_fs_reset(reply);
     return ret;

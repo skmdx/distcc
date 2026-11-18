@@ -812,6 +812,7 @@ dcc_build_somewhere(char *argv[],
     char *input_fname = NULL, *output_fname, *cpp_fname = NULL, *deps_fname = NULL;
     int cpp_fd = -1;
     int input_snapshot = -1;
+    struct dcc_snapshot_metadata *metadata = NULL;
     char **files = NULL;
     char **auxiliary = NULL;
     struct dcc_job *prepared_job = NULL;
@@ -1019,11 +1020,11 @@ dcc_build_somewhere(char *argv[],
             entry = next;
         }
         if (count && same_format) {
-            ret = dcc_talk_to_include_server(argv, &files, compr, &input_snapshot);
+            ret = dcc_talk_to_include_server(argv, &files, compr, &input_snapshot, &metadata);
             if (ret == EXIT_LOCAL_COMPILE) goto lock_local;
         }
         if (!ret && files && compr == DCC_COMPRESS_LZ4_STREAM) {
-            prepared_job = dcc_job_describe(argv, NULL, -1, files);
+            prepared_job = dcc_job_describe(argv, NULL, -1, files, metadata);
             if (!prepared_job) { ret = EXIT_IO_ERROR; goto fallback; }
         }
         if (count && same_format && ret) {
@@ -1125,7 +1126,7 @@ dcc_build_somewhere(char *argv[],
         goto unlock_and_clean_up;
     }
     if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr, &input_snapshot))) {
+        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr, &input_snapshot, &metadata))) {
             if (ret == EXIT_LOCAL_COMPILE) {
                 release_host(host, &cpu_lock_fd, &local_cpu_lock_fd, 0);
                 goto lock_local;
@@ -1203,6 +1204,10 @@ dcc_build_somewhere(char *argv[],
     }
     char **wire_argv = dcc_remote_argv(server_side_argv);
     if (!wire_argv) { ret = EXIT_OUT_OF_MEMORY; goto unlock_and_clean_up; }
+    if (host->tcp_jobs && files && !prepared_job) {
+        prepared_job = dcc_job_describe(wire_argv, NULL, -1, files, metadata);
+        if (!prepared_job) { ret = EXIT_IO_ERROR; goto fallback; }
+    }
     ret = dcc_compile_remote(wire_argv,
                                   input_fname,
                                   cpp_fname,
@@ -1417,6 +1422,7 @@ dcc_build_somewhere(char *argv[],
 
   clean_up:
     dcc_job_free(prepared_job);
+    free(metadata);
     if (input_snapshot >= 0) close(input_snapshot);
     if (auxiliary) dcc_free_argv(auxiliary);
     if (cpp_fd >= 0) { close(cpp_fd); free(cpp_fname); }

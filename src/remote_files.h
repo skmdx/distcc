@@ -11,6 +11,11 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <array>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -38,6 +43,47 @@ class Connection {
     const dcc_file_cache_api &cache;
     dcc_record_cache *records;
     std::string identity;
+    struct Writer {
+        const dcc_file_cache_api &api;
+        dcc_record_cache *records;
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::deque<std::pair<std::string, Buffer>> queue;
+        size_t queued = 0;
+        bool stopping = false;
+        std::thread thread;
+        Writer(const dcc_file_cache_api &api, const std::string &root)
+            : api(api), records(api.open(root.c_str())), thread([this] { run(); }) {}
+        ~Writer() {
+            { std::lock_guard lock(mutex); stopping = true; }
+            ready.notify_one();
+            thread.join();
+            api.close(records);
+        }
+        void put(std::string key, Buffer bytes) {
+            std::unique_lock lock(mutex);
+            ready.wait(lock, [&] { return queued < 16 * 1024 * 1024; });
+            queued += bytes.size;
+            queue.emplace_back(std::move(key), std::move(bytes));
+            ready.notify_all();
+        }
+        void run() {
+            std::unique_lock lock(mutex);
+            for (;;) {
+                ready.wait(lock, [&] { return stopping || !queue.empty(); });
+                if (queue.empty()) return;
+                auto [key, bytes] = std::move(queue.front());
+                queue.pop_front();
+                lock.unlock();
+                api.write(records, key.data(), key.size(), bytes.data, bytes.size);
+                lock.lock();
+                queued -= bytes.size;
+                ready.notify_all();
+            }
+        }
+    };
+    std::unique_ptr<Writer> writer;
+    std::string write_root;
     static bool receive(int fd, void *data, size_t size) {
         auto p = static_cast<char *>(data);
         while (size) {
@@ -113,11 +159,15 @@ public:
         : fd(fd), cache(cache), records(cache.open(cache_root.c_str())), identity(std::move(identity)) {}
     Connection(const Connection &) = delete;
     ~Connection() {
+        finish_writes();
         cache.close(records);
         if (shared) { pthread_mutex_destroy(shared); munmap(shared, sizeof(*shared)); }
         close(fd);
     }
+    void async_writes(std::string root) { write_root = std::move(root); }
+    void finish_writes() { writer.reset(); }
     bool share_stream() {
+        finish_writes();
         if (shared) return true;
         void *memory = mmap(nullptr, sizeof(pthread_mutex_t), PROT_READ | PROT_WRITE,
                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -163,6 +213,39 @@ public:
         data[size] = 0;
         if (error) return {static_cast<int>(error), std::generic_category()};
         out = {data, data.get(), size};
+        return {};
+    }
+    struct Query { unsigned op; std::string path; };
+    template<typename Apply>
+    std::error_code batch(unsigned op, const std::vector<Query> &queries, Apply apply) {
+        size_t first = 0;
+        while (first < queries.size()) {
+            std::string packet;
+            size_t end = first;
+            while (end < queries.size()) {
+                const auto &q = queries[end];
+                size_t size = 8 + q.path.size();
+                if (size + 4 > DCC_FS_QUERY_MAX) return std::make_error_code(std::errc::filename_too_long);
+                if (packet.size() + size + 4 > DCC_FS_QUERY_MAX) break;
+                uint32_t header[] = {htonl(size - 4), htonl(q.op)};
+                packet.append(reinterpret_cast<const char *>(header), sizeof(header));
+                packet += q.path;
+                ++end;
+            }
+            Buffer reply;
+            if (auto ec = request(op, packet, reply)) return ec;
+            std::string_view data(reply.data, reply.size);
+            while (first < end) {
+                if (data.size() < 8) return std::make_error_code(std::errc::protocol_error);
+                std::error_code ec(number(data.data(), 4), std::generic_category());
+                size_t length = number(data.data()+4, 4);
+                data.remove_prefix(8);
+                if (length > data.size()) return std::make_error_code(std::errc::protocol_error);
+                if (auto error = apply(queries[first++], ec, data.substr(0, length))) return error;
+                data.remove_prefix(length);
+            }
+            if (!data.empty()) return std::make_error_code(std::errc::protocol_error);
+        }
         return {};
     }
     Buffer directory_names(std::string_view path) { return cached(cache_key("directory-names", path)); }
@@ -228,8 +311,16 @@ public:
             return std::make_error_code(std::errc::protocol_error);
         memcpy(out.version.data(), response.data, DCC_FS_METADATA);
         out.bytes = {response.owner, response.data+DCC_FS_METADATA, response.size-DCC_FS_METADATA};
-        if (version && !memcmp(version, out.version.data(), DCC_FS_METADATA))
-            cache.write(records, key.data(), key.size(), out.bytes.data, out.bytes.size);
+        if (!version) {
+            if (write_root.empty()) return {};
+            key.append(identity); key += '\0'; key.append(out.version.data(), DCC_FS_METADATA); key.append(path);
+        }
+        if (!version || !memcmp(version, out.version.data(), DCC_FS_METADATA)) {
+            if (!write_root.empty() && !shared) {
+                if (!writer) writer = std::make_unique<Writer>(cache, write_root);
+                writer->put(std::move(key), out.bytes);
+            } else cache.write(records, key.data(), key.size(), out.bytes.data, out.bytes.size);
+        }
         return {};
     }
 };

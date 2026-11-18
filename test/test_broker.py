@@ -9,6 +9,7 @@ import select
 from pathlib import Path
 import socket
 import shutil
+import select
 import signal
 import struct
 import subprocess
@@ -701,12 +702,38 @@ class BrokerTest(BrokerTestCase):
                                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))])
                 self.assertEqual(client.recv(1), b'')
         complete(2, 101, 1)
+        complete(5, 303, 1)  # An unrelated completion must retain the first scope.
         first.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 1_000_000, 0, 10_000_000, 0)],
                       [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [first_net.fileno()]))])
         self.assertEqual(first.recv(1), b'')
         complete(3, 101, 1)
         self.assertIn('source affinity: key=3 ', (self.work/'broker.log').read_text())
         complete(4, 202, 0)
+
+    def test_inflight_directory_scope_during_first_parallel_burst(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        peers = [self.peer(stats_response(cpus=4, cores=4, jobs=4, capacity=4,
+                    running=0, busy=0, queued=0, preparing=0, returning=0)) for _ in range(2)]
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port}', slots=4)
+                                   for i, p in enumerate(peers)))
+        for key in (1, 2):
+            lease = self.request(10, (key, 4096, 4), family=key, scope_key=1234)
+            status, _, fds = self.receive(lease)
+            self.assertEqual(status, 0)
+            with socket.socket(fileno=fds[0]) as net:
+                self.assertEqual(net.getpeername()[1], self.ports[0])
+        self.assertIn('source affinity: key=2 ', (self.work/'broker.log').read_text())
+
+    def test_memory_exhausted_by_external_job_blocks_staging(self):
+        size = 256 * 1024**2
+        peers = [self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=busy, running=busy,
+                    queued=0, preparing=0, returning=0, memory_headroom_bytes=headroom,
+                    frontend_capacity=4, frontend_memory=size))
+                 for busy, headroom in ((1, size-1), (0, 4*size))]
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={8 if i==0 else 1}')
+                                   for i, p in enumerate(peers)))
+        _, net = self.acquire_reserved(10, (77, 4096, 5), memory_class=1+6*64)
+        self.assertEqual(net.getpeername()[1], self.ports[1])
 
     def test_source_affinity_does_not_follow_a_slower_owner(self):
         peers = [self.peer(stats_response(cpus=4, cores=4, jobs=4, capacity=4,
@@ -1897,22 +1924,31 @@ class BrokerTest(BrokerTestCase):
 
     def test_preprocessing_reservation_released_before_compile_finishes(self):
         self.start_broker(self.host(0) + " --localslots_cpp=1")
-        first = self.request()
-        status, _, fds = self.receive(first)
-        self.assertEqual(status, 0)
-        for fd in fds:
-            self.assertTrue(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_NONBLOCK)
-            os.close(fd)
-        second = self.request()
-        second.settimeout(.15)
-        with self.assertRaises(socket.timeout):
-            second.recv(1032)
-        first.sendall(struct.pack("=II", self.protocol_version, 3))
-        second.settimeout(2)
-        status, _, fds = self.receive(second)
-        self.assertEqual(status, 0)
-        for fd in fds:
-            os.close(fd)
+        with subprocess.Popen([str(self.build/'h_client_hotpaths'), '--cpp-done'], env=self.env,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as first:
+            try:
+                self.assertTrue(select.select([first.stdout], [], [], 5)[0])
+                self.assertEqual(first.stdout.read(1), b'A')
+                second = self.request()
+                second.settimeout(.15)
+                with self.assertRaises(socket.timeout):
+                    second.recv(1032)
+                first.stdin.write(b'1')
+                first.stdin.flush()
+                self.assertTrue(select.select([first.stdout], [], [], 5)[0])
+                self.assertEqual(first.stdout.read(1), b'D')
+                second.settimeout(2)
+                status, _, fds = self.receive(second)
+                for fd in fds: os.close(fd)
+                self.assertEqual(status, 0)
+                self.assertIsNone(first.poll())
+            finally:
+                first.stdin.close()
+                try: first.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    first.kill()
+                    first.wait()
+                    raise
 
     def test_stats_refresh_does_not_block_warm_requests(self):
         slow = self.peer(stats_response(), delay=.8)

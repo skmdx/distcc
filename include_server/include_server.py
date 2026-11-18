@@ -431,6 +431,9 @@ def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
         if memory_path is not None:
           RecordMemory(memory_path)
         distcc_pump_c_extensions.XArgv(self.wfile.fileno(), files_and_links)
+        metadata = include_analyzer.compress_files.metadata
+        other = bytes(8) + struct.pack('!QQ', 2**64-1, 0)
+        self.request.sendall(b''.join(metadata.get(path, other) for path in files_and_links))
         # The client owns this snapshot through transmission and cancellation.
         # SCM_RIGHTS duplicates the already-held shared lock without a handoff gap.
         self.request.sendmsg([b'\0'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
@@ -560,6 +563,8 @@ class AnalyzerPool:
     self.workers = set()
     self.keeper = basics.ClientRootKeeper()
     self.keeper.CleanOutOthers()
+    self.cas = tempfile.TemporaryDirectory(prefix='distcc-pump-cas-', dir=self.keeper.client_tmp)
+    self.keeper.cas = self.cas.name
     self.server = Queuingsocketserver(port, socketserver.BaseRequestHandler)
     self.memory_path = port + '.memory'
     try:
@@ -674,6 +679,7 @@ class AnalyzerPool:
       os.waitpid(pid, 0)
     self.workers.clear()
     self.keeper.CleanOutClientRoots()
+    self.cas.cleanup()
     os.unlink(self.memory_path)
     os.unlink(str(self.server.server_address))
 

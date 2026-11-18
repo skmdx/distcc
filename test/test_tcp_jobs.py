@@ -1931,6 +1931,22 @@ class FrontendTest(BrokerTestCase):
         for suffix in ('.o', '.d'):
             self.assertEqual(len({(self.work/f'{i}{suffix}').read_bytes() for i in range(3)}), 1)
 
+    def test_frontend_plan_memo_revalidates_driver_config(self):
+        clang = self.start_frontend()
+        options = self.work/'compile.cfg'
+        source = self.work/'main.c'
+        source.write_text('int main(void) { return VALUE; }\n')
+        command = [str(self.build/'distcc'), clang, '--config='+str(options),
+                   '-c', str(source), '-o', str(self.work/'main.o')]
+        for value, hit in ((11, False), (11, True), (22, False), (22, True)):
+            setting = '-DVALUE='+str(value)+'\n'
+            if not options.exists() or options.read_text() != setting: options.write_text(setting)
+            result = subprocess.run(command, cwd=self.work, env=self.env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual('Clang plan memo hit' in result.stderr, hit, result.stderr)
+            subprocess.run([clang, 'main.o', '-o', 'main'], cwd=self.work, check=True)
+            self.assertEqual(subprocess.run([str(self.work/'main')]).returncode, value)
+
     def test_frontend_preparation_shares_resident_compiler_and_isolates_requests(self):
         clang = self.start_frontend()
         log = self.work/'client.log'

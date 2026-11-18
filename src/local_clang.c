@@ -16,6 +16,7 @@
 #include <xxhash.h>
 #include "distcc.h"
 #include "native_worker.h"
+#include "plan_memo.h"
 #include "broker.h"
 #include "exec.h"
 #include "exitcode.h"
@@ -197,24 +198,25 @@ static int start_worker(const char *compiler)
 }
 
 /* -1 means no request was accepted: ordinary execution is still safe. */
-static int request(char **argv, char operation, int output, int errors, int *status, uint64_t *cpu_ns)
+static int request(char **argv, char operation, int output, int errors, int journal, int *status, uint64_t *cpu_ns)
 {
     int reuse = dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0);
-    if ((!reuse && operation != 'P') ||
-        !strstr(dcc_find_basename(argv[0]), "clang")) return -1;
+    int planning = operation == 'P' || operation == 'R';
+    const char *driver = operation == 'R' && !strstr(dcc_find_basename(argv[0]), "clang") ? "clang" : argv[0];
+    if ((!reuse && !planning) || !strstr(dcc_find_basename(driver), "clang")) return -1;
     /* Internal tool entry points bypass Clang's driver in the native binary. */
-    if (argv[1] && !strncmp(argv[1], "-cc1", 4)) return -1;
+    if (operation != 'R' && argv[1] && !strncmp(argv[1], "-cc1", 4)) return -1;
     char *compiler = NULL, *cwd = NULL;
     int worker = -1, lease = -1, input = -1, sink = -1, pair[] = {-1,-1}, ret = -1;
-    if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
-    else if (dcc_which(argv[0], &compiler)) goto out;
+    if (strchr(driver, '/')) compiler = strdup(driver);
+    else if (dcc_which(driver, &compiler)) goto out;
     char key[80];
     if (!compiler) goto out;
-    if (reuse && !dcc_local_worker_key(compiler, NULL, NULL, key, sizeof(key)))
+    if ((reuse || planning) && getenv("DISTCC_BROKER") && !dcc_local_worker_key(compiler, NULL, NULL, key, sizeof(key)))
         lease = dcc_broker_worker_get(key, &worker);
     /* Frontend planning must use the requested compiler's libraries even
      * without a broker. Closing the uncached channel reaps this one-shot helper. */
-    if (worker < 0 && (lease >= 0 || operation == 'P')) {
+    if (worker < 0 && (lease >= 0 || planning)) {
         worker = start_worker(compiler);
         if (lease >= 0) { dcc_broker_worker_put(lease, worker); lease = -1; }
     }
@@ -227,7 +229,7 @@ static int request(char **argv, char operation, int output, int errors, int *sta
     /* Driver inspection may print bindings/phases. As with -### discovery,
      * inspection stdout must not escape before the actual command executes. */
     if (operation == 'L' && (sink = open("/dev/null", O_WRONLY | O_CLOEXEC)) < 0) goto out;
-    int fds[] = {input, pair[1], 0, sink >= 0 ? sink : 1, errors};
+    int fds[] = {input, pair[1], journal >= 0 ? journal : 0, sink >= 0 ? sink : 1, errors};
     struct dcc_native_request request = {operation, 0};
     if (dcc_send_fds(worker, &request, sizeof(request), fds, 5)) goto out;
     close(pair[1]); pair[1] = -1;
@@ -256,22 +258,91 @@ int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
     /* Recursive compiler probes are already admitted by their caller. They
      * must execute the compiler directly, without another broker/helper wait. */
     if (dcc_recursion_safeguard()) return -1;
-    return request(argv, 'C', -1, 2, status, cpu_ns);
+    return request(argv, 'C', -1, 2, -1, status, cpu_ns);
+}
+
+int dcc_expand_response_files(char ***argv)
+{
+    char **p = *argv + 1;
+    while (*p && **p != '@') ++p;
+    if (!*p) return 0;
+    int fd = dcc_job_memfd("distcc-expanded-argv"), status;
+    if (fd < 0) return EXIT_IO_ERROR;
+    char **expanded = NULL;
+    int ret = request(*argv, 'R', fd, 2, -1, &status, NULL);
+    if (!ret && !status && lseek(fd, 0, SEEK_SET) >= 0) ret = dcc_r_argv_file(fd, 1, &expanded);
+    close(fd);
+    if (ret || !expanded) return ret ? ret : EXIT_DISTCC_FAILED;
+    dcc_free_argv(*argv);
+    *argv = expanded;
+    return 0;
 }
 
 static int dcc_clang_local_prepare(char **argv, char ***command, char ***roots)
 {
-    int output = dcc_job_memfd("distcc-frontend-command"), status;
-    if (output < 0) return EXIT_IO_ERROR;
-    int ret = request(argv, 'P', output, 2, &status, NULL);
-    if (!ret) {
-        if (status || lseek(output, 0, SEEK_SET) < 0) ret = EXIT_DISTCC_FAILED;
-        else {
-            char **groups[2];
-            ret = dcc_r_argv_file(output, 2, groups);
-            if (!ret) { *command = groups[0]; *roots = groups[1]; }
+    int output = dcc_job_memfd("distcc-frontend-command"), status, ret = EXIT_IO_ERROR;
+    if (output < 0) return ret;
+    int journal = -1, errors = -1;
+    int lease = -1;
+    unsigned dependencies = 0;
+    size_t length = 0;
+    char *memo = NULL, *compiler = NULL, *cwd = getcwd(NULL, 0);
+    char key[96], context[80];
+    if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
+    else dcc_which(argv[0], &compiler);
+    if (compiler && cwd && getenv("DISTCC_BROKER") &&
+        !dcc_local_worker_key(compiler, NULL, NULL, context, sizeof(context))) {
+        XXH3_state_t hash;
+        XXH3_128bits_reset(&hash);
+        XXH3_128bits_update(&hash, context, strlen(context)+1);
+        XXH3_128bits_update(&hash, cwd, strlen(cwd)+1);
+        for (char **p = argv; *p; ++p) XXH3_128bits_update(&hash, *p, strlen(*p)+1);
+        XXH128_hash_t digest = XXH3_128bits_digest(&hash);
+        snprintf(key,sizeof(key),"clang-plan:%016llx%016llx",
+                 (unsigned long long)digest.high64,(unsigned long long)digest.low64);
+        lease = dcc_broker_memo_get(key, &memo, &length);
+        while (memo) {
+            if (dcc_plan_memo_decode(memo, length, output, &dependencies)) {
+                rs_trace("Clang plan memo hit dependencies=%u", dependencies);
+                goto decode;
+            }
+            char *stale = memo;
+            memo = NULL;
+            lease = dcc_broker_memo_refresh(key, stale, length, &memo, &length);
+            free(stale);
         }
     }
+    journal = dcc_job_memfd("distcc-clang-plan-dependencies");
+    if (journal < 0 || write(journal, "\0\0\0\0", 4) != 4) goto done;
+    if (lease >= 0 && (errors = dcc_job_memfd("distcc-clang-plan-diagnostics")) < 0) goto done;
+    ret = request(argv, 'P', output, errors >= 0 ? errors : 2, journal, &status, NULL);
+    if (errors >= 0) {
+        off_t size = lseek(errors, 0, SEEK_END);
+        if (size < 0 || lseek(errors, 0, SEEK_SET) < 0) { ret = EXIT_IO_ERROR; goto done; }
+        if (size) {
+            dcc_broker_release(lease); lease = -1;
+            if (dcc_pump_readwrite(2, errors, size)) { ret = EXIT_IO_ERROR; goto done; }
+        }
+    }
+    if (ret || status) { if (!ret) ret = EXIT_DISTCC_FAILED; goto done; }
+    if (lease >= 0) {
+        memo = dcc_plan_memo_encode(journal, output, &dependencies, &length);
+        rs_trace("Clang plan memo %s dependencies=%u", memo ? "publish" : "uncacheable", dependencies);
+        dcc_broker_memo_put(lease, memo, length);
+        lease = -1;
+    }
+decode:
+    if (lseek(output, 0, SEEK_SET) < 0) ret = EXIT_IO_ERROR;
+    else {
+        char **groups[2];
+        ret = dcc_r_argv_file(output, 2, groups);
+        if (!ret) { *command = groups[0]; *roots = groups[1]; }
+    }
+done:
+    if (lease >= 0) dcc_broker_release(lease);
+    free(memo); free(compiler); free(cwd);
+    if (errors >= 0) close(errors);
+    if (journal >= 0) close(journal);
     close(output);
     return ret;
 }
@@ -285,7 +356,7 @@ int dcc_clang_link_prepare(char **argv, int *plan, int *errors, int *remote)
     *plan = dcc_job_memfd("distcc-link-plan");
     *errors = dcc_job_memfd("distcc-link-diagnostics");
     if (*plan < 0 || *errors < 0) return EXIT_IO_ERROR;
-    int status, ret = request(argv, 'L', *plan, *errors, &status, NULL);
+    int status, ret = request(argv, 'L', *plan, *errors, -1, &status, NULL);
     /* No request accepted: let the link coordinator query the actual driver,
      * just as when resident compiler libraries are disabled or unavailable. */
     if (ret) return ret;

@@ -204,7 +204,7 @@ if sysroot and llvm_lib.startswith(sysroot + '/'):
   llvm_runtime_lib = llvm_lib[len(sysroot):]
 frontend_headers = [os.path.join(srcdir, 'src', name)
                     for name in ('clang_inputs.h', 'job.h', 'tcp_job.h', 'file_cache.h', 'frontend_fs.h',
-                                 'remote_files.h', 'frontend_identity.h', 'argv_file.h')]
+                                 'remote_files.h', 'frontend_identity.h', 'argv_file.h', 'plan_memo.h')]
 frontend_headers.extend(os.path.join(srcdir_include_server, 'c_extensions', name)
                         for name in ('remote_files.h', 'clang_compiler.h', 'compiler_command.h', 'clang_result.h'))
 scanner = setuptools.Extension(

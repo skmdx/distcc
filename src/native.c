@@ -185,7 +185,7 @@ int dcc_expand_native(char ***argvp, const char *input, const char *output)
     for (i = 1; argv[i]; i++) native |= native_option(argv[i]);
     if (!native) return 0;
     key = dcc_native_cache_key(argv, input, output);
-    if (key) lease = dcc_broker_memo_get(key, &text);
+    if (key) lease = dcc_broker_memo_get(key, &text, NULL);
     if (text) {
         rs_trace("native expansion cache hit");
         options = unpack_options(text, &clang);
@@ -243,7 +243,7 @@ int dcc_expand_native(char ***argvp, const char *input, const char *output)
         char *value = NULL;
         after = dcc_native_cache_key(argv, input, output);
         if (after && !strcmp(key, after)) value = pack_options(options, clang);
-        dcc_broker_memo_put(lease, value);
+        dcc_broker_memo_put(lease, value, value ? strlen(value) : 0);
         free(value);
         lease = -1;
     }
@@ -268,7 +268,7 @@ expand:
     expanded = NULL;
     ret = 0;
 out:
-    dcc_broker_memo_put(lease, NULL);
+    dcc_broker_memo_put(lease, NULL, 0);
     free(key);
     free(after);
     if (ret) rs_log_info("native option expansion unavailable; compiling locally");

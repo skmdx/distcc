@@ -56,7 +56,7 @@ static int dcc_categorize_file(const char *include_server_filename);
  * the returned paths finish. Initialize it to -1 and close it during cleanup.
  */
 
-int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr, int *snapshot)
+int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr, int *snapshot, struct dcc_snapshot_metadata **metadata)
 {
     char *include_server_port;
     int fd = -1, lock_fd = -1;
@@ -122,6 +122,9 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
         rs_log_warning("include server gave up analyzing");
         goto out;
     }
+    unsigned count = dcc_argv_len(*files);
+    if (count > DCC_JOB_INPUT_MAX || !(*metadata = calloc(count, sizeof(**metadata))) ||
+        dcc_readx(fd, *metadata, count * sizeof(**metadata))) goto out;
     char marker;
     ssize_t received;
     /* The manifest and SCM_RIGHTS are separate stream messages. The socket is
@@ -138,6 +141,7 @@ int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress com
     ret = 0;
 out:
     if (fd != -1 && dcc_close(fd)) ret = 1;
+    if (ret) { free(*metadata); *metadata = NULL; }
     if (ret && *snapshot >= 0) { dcc_close(*snapshot); *snapshot = -1; }
     dcc_unlock(lock_fd);
     return ret;
@@ -153,6 +157,7 @@ dcc_approximate_includes(struct dcc_hostdef *host, char **argv)
     char **files;
     int i;
     int ret, snapshot = -1;
+    struct dcc_snapshot_metadata *metadata = NULL;
 
     if (host->cpp_where != DCC_CPP_ON_SERVER) {
         rs_log_error("'--scan_includes' specified, "
@@ -162,7 +167,7 @@ dcc_approximate_includes(struct dcc_hostdef *host, char **argv)
         //return 0;
     }
 
-    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr, &snapshot))) {
+    if ((ret = dcc_talk_to_include_server(argv, &files, host->compr, &snapshot, &metadata))) {
         rs_log_error("failed to get includes from include server");
         return ret;
     }
@@ -171,6 +176,7 @@ dcc_approximate_includes(struct dcc_hostdef *host, char **argv)
         if ((ret = dcc_categorize_file(files[i]))) break;
     }
 
+    free(metadata);
     if (snapshot >= 0) dcc_close(snapshot);
     dcc_free_argv(files);
     return ret;

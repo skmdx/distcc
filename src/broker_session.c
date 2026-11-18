@@ -11,7 +11,14 @@
 #include "broker_session.h"
 
 #ifdef __linux__
-static struct {
+#include <pthread.h>
+static pthread_once_t cleanup_once = PTHREAD_ONCE_INIT;
+static pthread_key_t cleanup_key;
+static int cleanup_error;
+static void close_thread_session(void *socket) { close((intptr_t)socket - 1); }
+static void init_cleanup(void) { cleanup_error = pthread_key_create(&cleanup_key, close_thread_session); }
+
+static _Thread_local struct {
     pid_t pid;
     int fd, credentials;
     struct sockaddr_un address;
@@ -21,7 +28,10 @@ static struct {
 
 void dcc_session_lost(void)
 {
-    if (session.fd >= 0) close(session.fd);
+    if (session.fd >= 0) {
+        pthread_setspecific(cleanup_key, NULL);
+        close(session.fd);
+    }
     session.fd = -1;
     for (unsigned i = 0; i < DCC_BROKER_CLIENT_MAX; ++i)
         if (session.tags[i] == LIVE) session.tags[i] = LOST;
@@ -38,10 +48,14 @@ int dcc_session_begin(int credentials, unsigned *tag)
         strcpy(session.address.sun_path, path);
     }
     if (session.fd < 0) {
+        pthread_once(&cleanup_once, init_cleanup);
+        if (cleanup_error) { errno = cleanup_error; return -1; }
         session.fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
         if (session.fd < 0) return -1;
+        int error = pthread_setspecific(cleanup_key, (void *)(intptr_t)(session.fd + 1));
+        if (error) { close(session.fd); session.fd = -1; errno = error; return -1; }
         if (connect(session.fd, (struct sockaddr *)&session.address, sizeof(session.address))) {
-            int error = errno;
+            error = errno;
             dcc_session_lost(); errno = error; return -1;
         }
         session.credentials = 0;

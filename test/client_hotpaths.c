@@ -5,6 +5,7 @@
 #include "frontend_identity.h"
 #include "argv_file.h"
 #include "broker.h"
+#include "workload.h"
 #include <assert.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -120,7 +121,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "--memo") || !strcmp(argv[1], "--worker")) {
         char *value = NULL;
         int worker = -1;
-        int lease = !strcmp(argv[1], "--memo") ? dcc_broker_memo_get("retry", &value) :
+        int lease = !strcmp(argv[1], "--memo") ? dcc_broker_memo_get("retry", &value, NULL) :
                     dcc_broker_worker_get("retry", &worker);
         if (lease >= 0) { puts("owner"); dcc_broker_release(lease); }
         else if (value) { puts(value); free(value); }
@@ -129,6 +130,20 @@ int main(int argc, char **argv)
             assert(read(worker, &byte, 1) == 1 && byte == 'W');
             puts("worker"); close(worker);
         } else { perror("memo_get"); return 1; }
+        return 0;
+    }
+    if (!strcmp(argv[1], "--cpp-done")) {
+        struct dcc_hostdef *host;
+        int lease, queued = -1;
+        struct dcc_work_hint hint = {0};
+        assert(!dcc_broker_acquire(&host, &lease, 0, 0, &hint, &queued));
+        assert(host->broker_cpp_reserved);
+        assert(write(1, "A", 1) == 1 && getchar() != EOF);
+        dcc_broker_cpp_done(host);
+        assert(write(1, "D", 1) == 1);
+        (void)getchar();
+        dcc_broker_release(lease);
+        dcc_free_hostdef(host);
         return 0;
     }
     chunk_contract();

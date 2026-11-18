@@ -277,6 +277,7 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
     int descriptor = dcc_job_memfd("distcc-gcc-plan"), ret = EXIT_IO_ERROR;
     int lease = -1, cpu = -1;
     char *key = NULL, *memo = NULL;
+    size_t memo_size = 0;
     unsigned dependencies = 0;
     char **command = NULL, **groups[2] = {NULL, NULL};
     struct dcc_job *job = NULL;
@@ -313,14 +314,14 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
     }
     key = dcc_plan_key(argv, input);
     if (key) {
-        lease = dcc_broker_memo_get(key, &memo);
+        lease = dcc_broker_memo_get(key, &memo, &memo_size);
         while (memo) {
-            if (dcc_plan_memo_decode(memo, descriptor, &dependencies)) {
+            if (dcc_plan_memo_decode(memo, memo_size, descriptor, &dependencies)) {
                 rs_trace("GCC plan memo hit dependencies=%u", dependencies);
                 goto decoded;
             }
             char *stale = memo; memo = NULL;
-            lease = dcc_broker_memo_refresh(key, stale, &memo);
+            lease = dcc_broker_memo_refresh(key, stale, memo_size, &memo, &memo_size);
             free(stale);
         }
     }
@@ -337,9 +338,9 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
     dcc_unlock(cpu); cpu = -1;
     if (ret) goto done;
     if (lease >= 0) {
-        memo = dcc_plan_memo_encode(plan_dependencies, descriptor, &dependencies);
+        memo = dcc_plan_memo_encode(plan_dependencies, descriptor, &dependencies, &memo_size);
         rs_trace("GCC plan memo %s dependencies=%u", memo ? "publish" : "uncacheable", dependencies);
-        dcc_broker_memo_put(lease, memo); lease = -1;
+        dcc_broker_memo_put(lease, memo, memo_size); lease = -1;
     }
 decoded:
     ret = EXIT_IO_ERROR;

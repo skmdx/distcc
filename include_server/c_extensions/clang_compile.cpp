@@ -181,6 +181,8 @@ static int compile_file(int request, int fd) {
         });
         llvm::IntrusiveRefCntPtr<RemoteFiles> files(new RemoteFiles(dup(fd), cwd, *file_cache, client_identity,
             llvm::sys::path::parent_path(root).str()));
+        files->prepare(*invocation);
+        auto finish = llvm::scope_exit([&] { files->finish(); });
         compiler->setFileManager(new clang::FileManager(invocation->getFileSystemOpts(), files));
         compiler->createSourceManager();
 #ifdef DCC_CLANG_COMPILE_MODULE

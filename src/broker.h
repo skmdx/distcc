@@ -1,5 +1,6 @@
 /* Local distccd scheduling and connected-socket leases. */
 #include <stdint.h>
+#include <stddef.h>
 struct dcc_hostdef;
 #define DCC_BROKER_LEASE_BASE (1 << 28)
 void dcc_broker_release(int lease);
@@ -28,11 +29,11 @@ void dcc_broker_cpp_done(const struct dcc_hostdef *host);
  * retains live owners and waiters until publication or EOF; compiler startup
  * must not be cut short by the initial IPC request's handshake deadline. */
 #define DCC_MEMO_LIMIT 65536
-int dcc_broker_memo_get(const char *key, char **value);
+int dcc_broker_memo_get(const char *key, char **value, size_t *length);
 /* Replace only the exact stale value observed by this client. A competing
  * publisher's newer value is returned for validation, never invalidated. */
-int dcc_broker_memo_refresh(const char *key, const char *stale, char **value);
-void dcc_broker_memo_put(int lease, const char *value);
+int dcc_broker_memo_refresh(const char *key, const char *stale, size_t stale_length, char **value, size_t *length);
+void dcc_broker_memo_put(int lease, const char *value, size_t length);
 /* The same publishing lease can retain a compiler helper's control socket.
  * Helpers are scoped to the authenticated caller, not shared across UIDs. */
 int dcc_broker_worker_get(const char *key, int *worker);

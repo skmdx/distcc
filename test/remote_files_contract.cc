@@ -1,6 +1,7 @@
 /* Exercise VFS snapshot ownership and the actual local request stream. */
 #include "../include_server/c_extensions/remote_files.h"
 #include <thread>
+#include <future>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +30,7 @@ static void read_bytes(int fd, char *bytes, size_t size) {
     }
 }
 static unsigned cache_reads, cache_writes;
+static std::promise<void> lexer_has_buffer;
 static dcc_record_cache *cache_open(const char *) { return reinterpret_cast<dcc_record_cache *>(&cache_reads); }
 static void cache_close(dcc_record_cache *) {}
 static int cached(dcc_record_cache *, const void *key, size_t size, size_t *length) {
@@ -52,8 +54,13 @@ static int contents(const void *record, size_t record_size, const void *, size_t
 }
 static void store(dcc_record_cache *, const void *key, size_t size, const void *bytes, size_t length) {
     ++cache_writes;
-    require(llvm::StringRef(static_cast<const char *>(key), size).ends_with("/tree/c"), "cached changed version");
-    require(llvm::StringRef(static_cast<const char *>(bytes), length) == "third", "wrong cache bytes");
+    auto name = llvm::StringRef(static_cast<const char *>(key), size);
+    if (name.ends_with("/tree/c")) {
+        lexer_has_buffer.get_future().wait();
+        require(llvm::StringRef(static_cast<const char *>(bytes), length) == "third", "wrong cache bytes");
+    } else {
+        require(name.ends_with("/direct") && !length, "unexpected cache publication");
+    }
 }
 static volatile sig_atomic_t interrupted;
 static void interrupt(int) { interrupted = 1; }
@@ -144,6 +151,7 @@ int main() {
             require(bytes && (*bytes)->getBuffer() == (name[6] == 'b' ? "cache" : "third"), "cache/read bytes");
             if (name[6] == 'b') retained_cache = std::move(*bytes);
         }
+        lexer_has_buffer.set_value();
         for (auto name : {"/tree/large", "/tree/aligned"}) {
             auto file = files.openFileForRead(name); require(bool(file), "large cached file");
             auto bytes = (*file)->getBuffer(name, -1, true, false);
@@ -201,8 +209,8 @@ int main() {
         require(files.status("/denied").getError() == std::errc::permission_denied, "denied status");
         require(files.openFileForRead("/denied").getError() == std::errc::permission_denied, "lost cached error");
         require(files.getRealPath("/broken", resolved) == std::errc::io_error, "published truncated reply");
-        require(cache_reads == 6 && cache_writes == 1, "cache admission count");
     }
+    require(cache_reads == 6 && cache_writes == 2, "cache admission count after writer drain");
     peer.join();
     require(retained->getBuffer() == "fresh", "buffer did not outlive filesystem");
     require(retained_cache->getBuffer() == "cache", "cache view did not outlive filesystem");

@@ -19,6 +19,10 @@
 
 /* Author: Manos Renieris */
 
-int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr, int *snapshot);
+/* Fixed-width network order, in the same order as the leased paths.
+ * An all-ones wire size identifies links and directory placeholders. */
+struct dcc_snapshot_metadata { unsigned char digest[8], wire[8], plain[8]; };
+int dcc_talk_to_include_server(char **argv, char ***files, enum dcc_compress compr,
+                               int *snapshot, struct dcc_snapshot_metadata **metadata);
 int dcc_get_original_fname(const char *fname, char **original_fname);
 int dcc_approximate_includes(struct dcc_hostdef *host, char **argv);

@@ -13,5 +13,6 @@ int dcc_local_worker_key(const char *compiler, const char *library,
 int dcc_gcc_plan_execute(char **argv);
 #endif
 #ifdef __cplusplus
-int dcc_native_worker(int control, int (*execute)(int command, unsigned operation));
+int dcc_native_worker(int control, int (*execute)(int command, unsigned operation),
+                      int (*plan)(int command, unsigned operation, int journal) = nullptr);
 #endif

@@ -10,13 +10,6 @@
 #define DCC_FILE_CACHE_MAX (256 * 1024 * 1024)
 #define DCC_FILE_CACHE_SHARDS 64
 
-enum dcc_input_kind { DCC_INPUT_OTHER, DCC_INPUT_CACHED, DCC_INPUT_INLINE };
-struct dcc_input_digest {
-    unsigned char hash[DCC_FILE_HASH_SIZE];
-    enum dcc_input_kind kind;
-};
-
-struct dcc_input_digest *dcc_file_hashes(char **files, unsigned count);
 /* Hash the known extent [0, size) without changing the descriptor offset.
  * The caller owns a stable input; read errors and premature EOF return -1. */
 int dcc_file_digest(int fd, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE]);

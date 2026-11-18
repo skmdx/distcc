@@ -33,11 +33,63 @@
 #include <unistd.h>
 #include "clang_inputs.h"
 #include "frontend_identity.h"
+#include "plan_memo.h"
 
 namespace {
 // Own the driver's plan while callers borrow its cc1 arguments. Parsing the
 // invocation supplies input roots and auxiliary files; it must not regenerate
 // or otherwise change the command the actual compiler selected.
+class PlanFiles : public llvm::vfs::ProxyFileSystem {
+    int fd;
+    size_t bytes = 4;
+    std::set<std::string> records;
+    void observe(unsigned op, const llvm::Twine &path, std::error_code error, llvm::StringRef target = {}) {
+        if (fd < 0) return;
+        llvm::SmallString<256> name;
+        path.toVector(name);
+        if (getUnderlyingFS().makeAbsolute(name)) { fd = -1; return; }
+        dcc_plan_dependency item{};
+        item.operation = op;
+        item.error = error.value();
+        if (!error && stat(name.c_str(), &item.metadata)) { fd = -1; return; }
+        item.length = name.size() + 1;
+        item.target_length = target.empty() ? 0 : target.size() + 1;
+        std::string entry(reinterpret_cast<const char *>(&item), sizeof(item));
+        entry.append(name.c_str(), item.length);
+        if (item.target_length) { entry.append(target.data(), target.size()); entry += '\0'; }
+        if (!records.insert(entry).second) return;
+        bytes += entry.size();
+        if (bytes > DCC_PLAN_JOURNAL_LIMIT || write(fd, entry.data(), entry.size()) != (ssize_t)entry.size()) fd = -1;
+    }
+public:
+    explicit PlanFiles(int journal) : ProxyFileSystem(llvm::vfs::getRealFileSystem()), fd(journal) {}
+    llvm::ErrorOr<llvm::vfs::Status> status(const llvm::Twine &p) override {
+        auto value = getUnderlyingFS().status(p);
+        observe(DCC_PLAN_STAT, p, value.getError());
+        return value;
+    }
+    bool exists(const llvm::Twine &p) override { return bool(status(p)); }
+    llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(const llvm::Twine &p) override {
+        auto value = getUnderlyingFS().openFileForRead(p);
+        observe(DCC_PLAN_OPEN, p, value.getError());
+        return value;
+    }
+    llvm::vfs::directory_iterator dir_begin(const llvm::Twine &p, std::error_code &ec) override {
+        auto value = getUnderlyingFS().dir_begin(p, ec);
+        observe(DCC_PLAN_DIRECTORY, p, ec);
+        return value;
+    }
+    std::error_code getRealPath(const llvm::Twine &p, llvm::SmallVectorImpl<char> &out) override {
+        auto ec = getUnderlyingFS().getRealPath(p, out);
+        observe(DCC_PLAN_REALPATH, p, ec, {out.data(), out.size()});
+        return ec;
+    }
+    void finish() {
+        const unsigned char done[] = {1, 1, 0, 0};
+        if (fd >= 0 && pwrite(fd, done, sizeof(done), 0) != sizeof(done)) fd = -1;
+    }
+};
+
 class FrontendPlan {
     std::vector<std::string> command;
     llvm::SmallVector<const char *> argv;
@@ -48,7 +100,8 @@ public:
     std::unique_ptr<clang::driver::Compilation> compilation;
     llvm::ArrayRef<const char *> cc1;
     std::unique_ptr<clang::CompilerInvocation> compiler;
-    explicit FrontendPlan(char **input, bool frontend = true) {
+    explicit FrontendPlan(char **input, bool frontend = true,
+                          llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> files = llvm::vfs::getRealFileSystem()) {
         for (char **p = input; *p; ++p) command.emplace_back(*p);
         if (command.empty()) return;
         const auto invoked_as = command.front();
@@ -63,12 +116,12 @@ public:
             printer->setPrefix(llvm::sys::path::filename(argv[0]).str());
         }
         diagnostics = clang::CompilerInstance::createDiagnostics(
-            *llvm::vfs::getRealFileSystem(), *diagnostic_options, printer);
+            *files, *diagnostic_options, printer);
         if (argv.size() >= 2 && llvm::StringRef(argv[1]) == "-cc1") {
             cc1 = llvm::ArrayRef(argv).drop_front();
         } else {
             driver = std::make_unique<clang::driver::Driver>(argv[0],
-                llvm::sys::getDefaultTargetTriple(), *diagnostics);
+                llvm::sys::getDefaultTargetTriple(), *diagnostics, "clang LLVM compiler", files);
             compilation.reset(driver->BuildCompilation(argv));
             if (!compilation || compilation->containsError() || diagnostics->hasErrorOccurred()) return;
             if (!frontend) return;
@@ -136,9 +189,11 @@ extern "C" int dcc_clang_expand_response_files(char **argv, char ***expanded) {
     return *expanded ? 0 : -1;
 }
 
-extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots) {
+extern "C" int dcc_clang_frontend(char **argv, char ***cc1, char ***roots, int journal) {
     *cc1 = *roots = nullptr;
-    FrontendPlan plan(argv);
+    llvm::IntrusiveRefCntPtr<PlanFiles> files(new PlanFiles(journal));
+    FrontendPlan plan(argv, true, files);
+    files->finish();
     if (!plan.compiler) return -1;
     auto &invocation = *plan.compiler;
     const auto &inputs = invocation.getFrontendOpts().Inputs;

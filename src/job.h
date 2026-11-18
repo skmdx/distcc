@@ -87,7 +87,9 @@ struct dcc_job_result {
     char *temporary[DCC_JOB_RESULT_COUNT];
 };
 void dcc_job_free(struct dcc_job *);
-struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char **files);
+struct dcc_snapshot_metadata;
+struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char **files,
+                                 const struct dcc_snapshot_metadata *metadata);
 void dcc_job_result_init(struct dcc_job_result *);
 void dcc_job_result_free(struct dcc_job_result *);
 /* No file payload is copied into metadata. */

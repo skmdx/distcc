@@ -73,7 +73,8 @@ struct peer {
     /* Seconds/byte for prepared network input; seconds/job otherwise. */
     double prepare_cost[DCC_WORK_CLASSES];
     double mean_cost;
-    uint64_t last_scope, report_stamp;
+    uint64_t scopes[16], report_stamp;
+    unsigned next_scope;
     double report_until;
 };
 enum client_state { REQUEST, WAITING, CONNECTING, HELLO_SEND, HELLO_READ,
@@ -95,7 +96,7 @@ struct client {
     struct dcc_work_hint hint;
     double cost, ready_at, run_at, factor, waiting_since;
 };
-struct memo { char *key, *value; uid_t owner; int worker, socket;
+struct memo { char *key, *value; size_t length; uid_t owner; int worker, socket;
               struct memo *previous, *next; };
 struct idle_connection { int fd, peer, next, previous; double expires; uint32_t generation; };
 struct session { int fd, denied; double deadline, preflight; unsigned kind; };
@@ -141,7 +142,7 @@ static int reconnect_wait(struct reconnect *retry, int error, int allow_unreacha
     return 1;
 }
 
-static int memo_get_once(const char *key, char **value, int *worker, unsigned command, double deadline)
+static int memo_get_once(const char *key, char **value, size_t *length, int *worker, unsigned command, double deadline)
 {
     unsigned tag;
     struct request request = { BROKER_VERSION, command };
@@ -190,9 +191,9 @@ static int memo_get_once(const char *key, char **value, int *worker, unsigned co
         if (!worker) free(buffer);
         return lease;
     }
-    if (value && size > 1 && size <= DCC_MEMO_LIMIT && !buffer[size - 1] &&
-        strlen(buffer) == (size_t)size - 1) {
+    if (value && size > 1 && size <= DCC_MEMO_LIMIT && !buffer[size - 1]) {
         *value = buffer;
+        if (length) *length = (size_t)size - 1;
         dcc_session_finish(lease);
         return -1;
     }
@@ -206,31 +207,31 @@ failed:
     return -1;
 }
 
-static int memo_get(const char *key, char **value, int *worker, unsigned command)
+static int memo_get(const char *key, char **value, size_t *length, int *worker, unsigned command)
 {
     struct reconnect retry = {0};
     int fd;
     do {
-        fd = memo_get_once(key, value, worker, command, retry.deadline);
+        fd = memo_get_once(key, value, length, worker, command, retry.deadline);
         if (fd >= 0 || (value && *value) || (worker && *worker >= 0)) return fd;
     } while (reconnect_wait(&retry, errno, 0));
     return -1;
 }
 
-int dcc_broker_memo_get(const char *key, char **value) { return memo_get(key, value, NULL, MEMO_GET); }
-int dcc_broker_worker_get(const char *key, int *worker) { return memo_get(key, NULL, worker, WORKER_GET); }
+int dcc_broker_memo_get(const char *key, char **value, size_t *length) { return memo_get(key, value, length, NULL, MEMO_GET); }
+int dcc_broker_worker_get(const char *key, int *worker) { return memo_get(key, NULL, NULL, worker, WORKER_GET); }
 
-static void memo_digest(const char *value, char digest[33])
+static void memo_digest(const char *value, size_t size, char digest[33])
 {
-    XXH128_hash_t h=XXH3_128bits(value,strlen(value));
+    XXH128_hash_t h=XXH3_128bits(value,size);
     snprintf(digest,33,"%016llx%016llx",(unsigned long long)h.high64,(unsigned long long)h.low64);
 }
-int dcc_broker_memo_refresh(const char *key, const char *stale, char **value)
+int dcc_broker_memo_refresh(const char *key, const char *stale, size_t stale_length, char **value, size_t *length)
 {
     char digest[33], *payload=NULL;
-    memo_digest(stale,digest);
+    memo_digest(stale,stale_length,digest);
     if (asprintf(&payload,"%s\n%s",key,digest)<0) return -1;
-    int lease=memo_get(payload,value,NULL,MEMO_REFRESH);
+    int lease=memo_get(payload,value,length,NULL,MEMO_REFRESH);
     free(payload); return lease;
 }
 
@@ -249,13 +250,13 @@ void dcc_broker_worker_put(int lease, int worker)
     dcc_session_finish(lease);
 }
 
-void dcc_broker_memo_put(int lease, const char *value)
+void dcc_broker_memo_put(int lease, const char *value, size_t length)
 {
     struct request request = { BROKER_VERSION, MEMO_PUT };
-    struct iovec parts[2] = {{ &request, sizeof(request) }, { (void *)value, value ? strlen(value) + 1 : 0 }};
-    struct msghdr msg = { .msg_iov = parts, .msg_iovlen = 2 };
+    struct iovec parts[] = {{ &request, sizeof(request) }, { (void *)value, length }, { (void *)"", 1 }};
+    struct msghdr msg = { .msg_iov = parts, .msg_iovlen = 3 };
     if (lease < 0) return;
-    if (!value || !*value || strlen(value) >= DCC_MEMO_LIMIT) { dcc_broker_release(lease); return; }
+    if (!value || !length || length >= DCC_MEMO_LIMIT) { dcc_broker_release(lease); return; }
     request.command = lease_command(lease, MEMO_PUT);
     if (sendmsg(dcc_session_fd(lease), &msg, MSG_NOSIGNAL) < 0) dcc_session_lost();
     dcc_session_finish(lease);
@@ -556,8 +557,10 @@ void dcc_broker_cpp_done(const struct dcc_hostdef *host)
 {
     struct request request = { BROKER_VERSION, lease_command(host->broker_lease, CPP_DONE) };
     if (host->broker_managed && host->broker_cpp_reserved &&
-        send(host->broker_lease, &request, sizeof(request), MSG_NOSIGNAL) != sizeof(request))
+        send(dcc_session_fd(host->broker_lease), &request, sizeof(request), MSG_NOSIGNAL) != sizeof(request)) {
         rs_log_warning("could not release broker preprocessing reservation");
+        dcc_session_lost();
+    }
 }
 
 static int connect_peer(const struct peer *peer, int port)
@@ -746,7 +749,7 @@ static void memo_forget(struct broker *broker, struct memo *memo)
     memo_unlink(broker,memo);
     tdelete(memo,&broker->memos,memo_order);
     broker->memo_bytes-=sizeof(*memo)+strlen(memo->key)+1;
-    if (memo->value) broker->memo_bytes-=strlen(memo->value)+1;
+    if (memo->value) broker->memo_bytes-=memo->length+1;
     if (memo->socket) { close(memo->socket-1); --broker->memo_workers; }
     free(memo->key); free(memo->value); free(memo);
 }
@@ -754,11 +757,11 @@ static void memo_forget(struct broker *broker, struct memo *memo)
 static void memo_reply(int fd, const struct memo *memo)
 {
     if (memo->socket) dcc_send_fd(fd, "W", 2, memo->socket - 1);
-    else if (memo->value) send(fd, memo->value, strlen(memo->value) + 1, MSG_NOSIGNAL);
+    else if (memo->value) send(fd, memo->value, memo->length + 1, MSG_NOSIGNAL);
 }
 
 static void memo_request(struct broker *broker, struct client *client,
-                         unsigned command, const char *payload, int worker_fd, double now)
+                         unsigned command, const char *payload, size_t size, int worker_fd, double now)
 {
     int i;
     struct memo *memo;
@@ -785,10 +788,10 @@ static void memo_request(struct broker *broker, struct client *client,
             }
         }
         if (memo && expected && memo->value) {
-            char digest[33]; memo_digest(memo->value,digest);
+            char digest[33]; memo_digest(memo->value,memo->length,digest);
             if (!strcmp(digest,expected)) {
                 memo_unlink(broker,memo);
-                broker->memo_bytes-=strlen(memo->value)+1;
+                broker->memo_bytes-=memo->length+1;
                 free(memo->value); memo->value=NULL;
                 client->state=MEMO_OWNER; client->memo=memo;
                 if (send(client->fd,"",1,MSG_NOSIGNAL)!=1) goto done;
@@ -814,9 +817,11 @@ static void memo_request(struct broker *broker, struct client *client,
         if (memo->worker != worker) goto done;
         if (worker) { memo->socket = worker_fd + 1; worker_fd = -1; ++broker->memo_workers; }
         else {
-            memo->value = strdup(payload);
+            memo->value = malloc(size);
+            if (memo->value) memcpy(memo->value, payload, size);
+            memo->length = size - 1;
             if (!memo->value) goto done;
-            broker->memo_bytes+=strlen(memo->value)+1;
+            broker->memo_bytes+=memo->length+1;
         }
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *waiter = &broker->clients[i];
@@ -979,7 +984,7 @@ struct occupancy {
 struct dispatch_batch {
     unsigned count;
     struct occupancy peers[MAX_HOSTS];
-    const struct client *owners[2 * MAX_CLIENTS];
+    const struct client *owners[2 * MAX_CLIENTS], *scopes[2 * MAX_CLIENTS];
 };
 static int bulk_input(const struct peer *peer, const struct dcc_work_hint *hint)
 {
@@ -1064,7 +1069,11 @@ static void observe(struct broker *broker, struct client *client, const struct f
         timing->prepare_ns > 86400ULL * 1000000000 ||
         timing->queue_ns > 86400ULL * 1000000000) return;
     struct peer *peer = &broker->peers[client->peer];
-    if (client->hint.scope_key) peer->last_scope = client->hint.scope_key;
+    if (client->hint.scope_key) {
+        unsigned i = 0;
+        while (i < 16 && peer->scopes[i] != client->hint.scope_key) ++i;
+        if (i == 16) peer->scopes[peer->next_scope++ % 16] = client->hint.scope_key;
+    }
     double cost = timing->execute_ns / 1e9 / client->factor;
     /* Both direct compilation and remote jobs train the input-cost model. */
     dcc_work_observe(&broker->model, &client->hint, cost, client->peer);
@@ -1129,6 +1138,20 @@ static unsigned owner_slot(struct dispatch_batch *batch, int peer, const struct 
         i = (i + 1) % (2 * MAX_CLIENTS);
     }
 }
+static unsigned scope_slot(struct dispatch_batch *batch, int peer, uint64_t scope)
+{
+    unsigned i = (scope ^ (unsigned)peer) % (2 * MAX_CLIENTS);
+    while (batch->scopes[i] && (batch->scopes[i]->peer != peer || batch->scopes[i]->hint.scope_key != scope))
+        i = (i + 1) % (2 * MAX_CLIENTS);
+    return i;
+}
+static int warm_scope(struct dispatch_batch *batch, const struct peer *peer, int index, uint64_t scope)
+{
+    if (!scope) return 0;
+    if (batch->scopes[scope_slot(batch, index, scope)]) return 1;
+    for (unsigned i = 0; i < 16; ++i) if (peer->scopes[i] == scope) return 1;
+    return 0;
+}
 static void account_lease(struct broker *broker, struct dispatch_batch *batch, struct client *c)
 {
     const struct peer *peer = &broker->peers[c->peer];
@@ -1140,6 +1163,7 @@ static void account_lease(struct broker *broker, struct dispatch_batch *batch, s
         o->links += c->command == ACQUIRE_LINK;
         o->new_memory += bytes > UINT64_MAX - o->new_memory ? UINT64_MAX - o->new_memory : bytes;
     }
+    if (c->hint.scope_key) batch->scopes[scope_slot(batch, c->peer, c->hint.scope_key)] = c;
     if (c->hint.key) batch->owners[owner_slot(batch, c->peer, &c->hint)] = c;
 }
 
@@ -1259,7 +1283,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             projected = *cap;
             int limit;
             unsigned long long estimate = memory_forecast(cap, &client->hint, &limit);
-            memory_full = batch->peers[i].pending && headroom[i] < estimate && headroom[i] < cap->memory_headroom;
+            memory_full = (cap->busy > 0 || p->busy > (cap->returning > 0 ? cap->returning : 0)) && headroom[i] < estimate;
             /* The snapshot's class capacity assumes no subsequent jobs have
              * reserved memory. Charge their own measured classes: one large
              * lease can consume several small-job memory slots. CPU counts
@@ -1465,7 +1489,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 completion.score = critical;
             }
             int warm = (locality && (i == previous || batch->owners[owner_slot(batch, i, &client->hint)])) ||
-                       (!direct && !link && client->hint.scope_key && p->last_scope == client->hint.scope_key);
+                       (!direct && !link && warm_scope(batch, p, i, client->hint.scope_key));
             if (warm && staged && predicted && (!wait || enqueue) &&
                 (affinity.peer < 0 || forecast.factor < affinity.forecast.factor ||
                  (forecast.factor == affinity.forecast.factor && score < affinity.score)))
@@ -2135,7 +2159,7 @@ int dcc_broker_serve(const char *path)
                 }
                 if (returned >= 0 && length == sizeof(request) && request.version == BROKER_VERSION &&
                     request.command == WORKER_PUT) {
-                    memo_request(broker, c, request.command, NULL, returned, now);
+                    memo_request(broker, c, request.command, NULL, 0, returned, now);
                     continue;
                 }
                 if (returned >= 0) {
@@ -2177,9 +2201,9 @@ int dcc_broker_serve(const char *path)
                 if (length > (ssize_t)sizeof(request) && length <= (ssize_t)sizeof(packet) &&
                     request.version == BROKER_VERSION &&
                     (request.command == MEMO_GET || request.command == MEMO_PUT || request.command == WORKER_GET || request.command == MEMO_REFRESH) &&
-                    packet.payload[0] && !packet.payload[length - sizeof(request) - 1] &&
-                    strlen(packet.payload) == (size_t)length - sizeof(request) - 1) {
-                    memo_request(broker, c, request.command, packet.payload, -1, now);
+                    !packet.payload[length - sizeof(request) - 1] && length > (ssize_t)sizeof(request) + 1 &&
+                    (request.command == MEMO_PUT || strlen(packet.payload) == (size_t)length - sizeof(request) - 1)) {
+                    memo_request(broker, c, request.command, packet.payload, length - sizeof(request), -1, now);
                     continue;
                 }
                 if (c->state == ACTIVE && length == sizeof(request) &&
@@ -2302,18 +2326,18 @@ void dcc_broker_return(const struct dcc_hostdef *host, int fd, const struct dcc_
     (void)fd;
     (void)result;
 }
-int dcc_broker_memo_get(const char *key, char **value)
+int dcc_broker_memo_get(const char *key, char **value, size_t *length)
 {
     (void)key;
     *value = NULL;
     return -1;
 }
-int dcc_broker_memo_refresh(const char *key, const char *stale, char **value)
+int dcc_broker_memo_refresh(const char *key, const char *stale, size_t stale_length, char **value, size_t *length)
 {
     (void)stale;
-    return dcc_broker_memo_get(key,value);
+    return dcc_broker_memo_get(key,value,length);
 }
-void dcc_broker_memo_put(int lease, const char *value)
+void dcc_broker_memo_put(int lease, const char *value, size_t length)
 {
     (void)lease;
     (void)value;

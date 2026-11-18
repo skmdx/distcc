@@ -575,7 +575,7 @@ llvm-linker-wrapper/LinkerWrapperOpts.inc: llvm-linker-wrapper/.patched
 distcc-linker-wrapper: llvm-linker-wrapper/LinkerWrapperOpts.inc
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ llvm-linker-wrapper/ClangLinkerWrapper.cpp `$(LLVM_CONFIG) --ldflags` -lclang-cpp -lLLVM
 
-clang_driver.so: $(srcdir)/src/clang_driver.cc $(srcdir)/src/clang_inputs.h $(srcdir)/src/frontend_identity.h
+clang_driver.so: $(srcdir)/src/clang_driver.cc $(srcdir)/src/clang_inputs.h $(srcdir)/src/frontend_identity.h $(srcdir)/src/plan_memo.h
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -shared $(LDFLAGS) -o $@ $< `$(LLVM_CONFIG) --ldflags` -lclang-cpp -lLLVM
 
 $(LTO_BUILD)/SplitModule.cpp: $(srcdir)/src/llvm-split-module.patch

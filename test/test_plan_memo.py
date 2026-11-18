@@ -201,14 +201,27 @@ class PlanMemoTest(BrokerTestCase):
         live=self.plan('c.c',flags=flags,live=True).stdout
         self.assertTrue(all(p.stdout==live for p in plans))
 
+    def test_binary_plan_can_begin_with_nul_and_include_arbitrary_bytes(self):
+        self.start_broker()
+        value = b'\0\xff\nplan\0'
+        with self.request_memo(b'binary') as owner:
+            self.assertEqual(owner.recv(1), b'\0')
+            owner.sendall(struct.pack('=II', self.protocol_version, 5) + value + b'\0')
+            self.assertEqual(owner.recv(1), b'')
+        with self.request_memo(b'binary') as reader:
+            self.assertEqual(reader.recv(64), value+b'\0')
+
+    def request_memo(self, key, command=4):
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        peer.settimeout(5)
+        peer.connect(self.env['DISTCC_BROKER'])
+        peer.sendall(struct.pack('=II', self.protocol_version, command) + key + b'\0')
+        self.addCleanup(peer.close)
+        return peer
+
     def test_broker_capacity_stale_compare_exchange_and_owner_exit(self):
         self.start_broker()
-        def memo(key,command=4):
-            peer=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET)
-            peer.settimeout(2);peer.connect(self.env['DISTCC_BROKER'])
-            peer.sendall(struct.pack('=II',4,command)+key+b'\0')
-            self.addCleanup(peer.close)
-            return peer
+        memo = self.request_memo
         def publish(key,value):
             owner=memo(key);self.assertEqual(owner.recv(1),b'\0')
             owner.sendall(struct.pack('=II',4,5)+value+b'\0')

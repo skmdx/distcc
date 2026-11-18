@@ -23,6 +23,8 @@
 #include <llvm/Support/Program.h>
 #include <sys/stat.h>
 #include <map>
+#include <list>
+#include <llvm/ADT/Hashing.h>
 #include <memory>
 #include <set>
 #include <algorithm>
@@ -66,9 +68,7 @@ struct Image {
     }
 };
 using Images = std::map<std::string, std::shared_ptr<const Image>>;
-// Retain only the previous request's bytes, not its lookup results. Each scan
-// rechecks identities and negative lookups; threads do not share mutable state.
-thread_local Images previous_inputs;
+
 
 // Python views retain their immutable image independently of the next scan's
 // cache. The native cache owns no Python objects and can die without the GIL.
@@ -117,6 +117,14 @@ class Inputs : public llvm::vfs::ProxyFileSystem {
 public:
     std::map<std::string, Stamp> stamps;
     Images contents;
+    Images *previous = nullptr;
+    std::shared_ptr<const Image> reuse(const std::string &key, const Stamp &stamp) const {
+        if (previous) {
+            auto found = previous->find(key);
+            if (found != previous->end() && found->second->stamp == stamp) return found->second;
+        }
+        return {};
+    }
     bool changed = false;
     std::string changed_path;
     std::error_code cwd_error;
@@ -138,9 +146,8 @@ public:
         auto key = path(name);
         const auto &stamp = observe(key);
         if (!stamp.exists) return std::error_code(stamp.error, std::generic_category());
-        auto previous = previous_inputs.find(key);
-        if (previous != previous_inputs.end() && stamp == previous->second->stamp)
-            return llvm::vfs::Status::copyWithNewName(previous->second->info, name);
+        if (auto image = reuse(key, stamp))
+            return llvm::vfs::Status::copyWithNewName(image->info, name);
         return getUnderlyingFS().status(name);
     }
     llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(const llvm::Twine &name) override {
@@ -148,10 +155,7 @@ public:
         observe(key);
         auto it = contents.find(key);
         if (it == contents.end()) {
-            auto previous = previous_inputs.find(key);
-            std::shared_ptr<const Image> image;
-            if (previous != previous_inputs.end() && stamps.at(key) == previous->second->stamp)
-                image = previous->second;
+            auto image = reuse(key, stamps.at(key));
             if (!image) {
                 auto file = getUnderlyingFS().openFileForRead(name);
                 if (!file) return file.getError();
@@ -301,12 +305,8 @@ public:
     }
 };
 
-// Keep the current include cohort, just as previous_inputs retains the current
-// file images. A worker never accumulates one PCH for every source it has seen.
 struct PreambleCache {
-    std::vector<std::string> options;
     std::string prefix;
-    std::string directory;
     PreambleBounds bounds{0, false};
     llvm::SmallVector<char, 0> compiled;
     std::map<std::string, Stamp> stamps;
@@ -315,7 +315,25 @@ struct PreambleCache {
     bool attempted = false;
     unsigned counter = 0;
 };
-thread_local PreambleCache preamble_cache;
+struct Cohort {
+    std::string directory, flags;
+    size_t hash;
+    Images previous;
+    PreambleCache preamble;
+};
+thread_local std::list<Cohort> cohorts;
+static Cohort &selectCohort(std::string directory, std::string flags) {
+    size_t hash = llvm::hash_value(llvm::StringRef(flags));
+    auto it = std::find_if(cohorts.begin(), cohorts.end(), [&](const auto &entry) {
+        return entry.hash == hash && entry.directory == directory && entry.flags == flags;
+    });
+    if (it != cohorts.end()) cohorts.splice(cohorts.begin(), cohorts, it);
+    else {
+        if (cohorts.size() == 8) cohorts.pop_back();
+        cohorts.push_front({std::move(directory), std::move(flags), hash, {}, {}});
+    }
+    return cohorts.front();
+}
 
 class Scan : public tooling::ToolAction {
     Inputs &inputs;
@@ -323,7 +341,7 @@ class Scan : public tooling::ToolAction {
     bool use_cache;
 public:
     bool hit = false;
-    bool built = false;
+    bool built = false, retry = false;
     bool module_syntax = false;
     Scan(Inputs &inputs, Result &result, bool use_cache)
         : inputs(inputs), result(result), use_cache(use_cache) {}
@@ -341,35 +359,39 @@ public:
             compiler.createSourceManager();
             return compiler.ExecuteAction(action);
         };
+        auto source = frontend.Inputs[0].getFile().str();
+        auto input = frontend.Inputs[0];
+        auto output = std::move(frontend.OutputFile);
+        auto main_file = std::move(invocation->getCodeGenOpts().MainFileName);
+        frontend.Inputs[0] = FrontendInputFile("<main>", input.getKind());
+        frontend.OutputFile.clear();
+        invocation->getCodeGenOpts().MainFileName.clear();
+        llvm::BumpPtrAllocator allocator;
+        llvm::StringSaver saver(allocator);
+        llvm::SmallVector<const char *, 64> arguments;
+        invocation->generateCC1CommandLine(arguments, [&](const llvm::Twine &arg) {
+            return saver.save(arg).data();
+        });
+        frontend.Inputs[0] = std::move(input);
+        frontend.OutputFile = std::move(output);
+        invocation->getCodeGenOpts().MainFileName = std::move(main_file);
+        std::string flags = inputs.path(".");
+        for (const char *arg : arguments) { flags += '\0'; flags += arg; }
+        auto &cohort = selectCohort(llvm::sys::path::parent_path(inputs.path(source)).str(), std::move(flags));
+        inputs.previous = &cohort.previous;
         if (!use_cache) {
             Action<> action(result);
             return execute(invocation, manager, action);
         }
-        auto source = frontend.Inputs[0].getFile().str();
         auto buffer = inputs.getBufferForFile(source);
         if (!buffer) return false;
         auto bounds = ComputePreambleBounds(invocation->getLangOpts(), **buffer, 0);
         auto prefix = (*buffer)->getBuffer().take_front(bounds.Size).str();
-        auto directory = llvm::sys::path::parent_path(inputs.path(source)).str();
-        CompilerInvocation normalized(*invocation);
-        normalized.getFrontendOpts().Inputs = {
-            FrontendInputFile("<main>", frontend.Inputs[0].getKind())};
-        normalized.getFrontendOpts().OutputFile.clear();
-        normalized.getCodeGenOpts().MainFileName.clear();
-        llvm::BumpPtrAllocator allocator;
-        llvm::StringSaver saver(allocator);
-        llvm::SmallVector<const char *, 64> arguments;
-        normalized.generateCC1CommandLine(arguments, [&](const llvm::Twine &arg) {
-            return saver.save(arg).data();
-        });
-        std::vector<std::string> options(arguments.begin(), arguments.end());
-        options.push_back(inputs.path("."));
-        auto &cache = preamble_cache;
-        bool same_context = cache.options == options && cache.directory == directory;
-        bool same = same_context && !cache.prefix.empty() &&
+        auto &cache = cohort.preamble;
+        bool same = !cache.prefix.empty() &&
                     llvm::StringRef(prefix).starts_with(cache.prefix);
         if (same) { bounds = cache.bounds; prefix.resize(bounds.Size); }
-        else if (same_context) {
+        else if (!cache.prefix.empty()) {
             // Translation units often share initial includes followed by their
             // own header. Let Clang delimit their common complete directives.
             auto common = std::mismatch(prefix.begin(), prefix.end(),
@@ -381,8 +403,6 @@ public:
                     bounds = shared;
                     prefix.resize(bounds.Size);
                     cache = {};
-                    cache.options = options;
-                    cache.directory = directory;
                     cache.prefix = prefix;
                     cache.bounds = bounds;
                     same = true;
@@ -395,9 +415,7 @@ public:
         }
         if (!same) {
             cache = {};
-            cache.options = std::move(options);
             cache.prefix = std::move(prefix);
-            cache.directory = std::move(directory);
             cache.bounds = bounds;
         } else if (!cache.attempted && bounds.Size) {
             // Do not pay for a PCH on every one-off command. Build only after
@@ -434,7 +452,6 @@ public:
         }
         llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> filesystem(&inputs);
         if (!cache.compiled.empty()) {
-            auto cached_invocation = std::make_shared<CompilerInvocation>(*invocation);
             inputs.contents.insert(cache.contents.begin(), cache.contents.end());
             result.dependencies.insert(cache.dependencies.begin(), cache.dependencies.end());
             auto memory = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
@@ -444,7 +461,7 @@ public:
             auto overlay = llvm::makeIntrusiveRefCnt<llvm::vfs::OverlayFileSystem>(filesystem);
             overlay->pushOverlay(memory);
             filesystem = overlay;
-            auto &preprocessing = cached_invocation->getPreprocessorOpts();
+            auto &preprocessing = invocation->getPreprocessorOpts();
             preprocessing.addRemappedFile(source, buffer->release());
             preprocessing.PrecompiledPreambleBytes = {bounds.Size, bounds.PreambleEndsAtStartOfLine};
             preprocessing.DisablePCHOrModuleValidation = DisableValidationForModuleKind::PCH;
@@ -454,7 +471,7 @@ public:
             // Preamble reuse disables the PCHValidator listener which
             // normally restores __COUNTER__. Restore this native scalar too.
             Action<ReadPCHAndPreprocessAction> action(result, cache.counter);
-            bool ok = execute(cached_invocation,
+            bool ok = execute(invocation,
                 new FileManager(manager->getFileSystemOpts(), filesystem), action);
             if (!result.contextual) return ok;
             // Even builtin predefines can leave a push_macro stack. If the
@@ -462,6 +479,9 @@ public:
             hit = false;
             result = {};
             diagnostics->clear();
+            retry = true;
+            use_cache = false;
+            return false;
         }
         Action<> action(result);
         return execute(invocation, manager, action);
@@ -511,12 +531,16 @@ PyObject *scan(PyObject *, PyObject *arguments) {
         // FileManager is request-scoped: stale negative lookups cannot survive.
         FileSystemOptions options;
         options.WorkingDir = cwd;
-        llvm::IntrusiveRefCntPtr<FileManager> manager(new FileManager(options, inputs));
         Scan action(*inputs, result, use_cache);
-        tooling::ToolInvocation invocation(command, &action, manager.get(),
-                                           std::make_shared<PCHContainerOperations>());
-        invocation.setDiagnosticConsumer(&diagnostics);
-        invocation.run();
+        auto run = [&] {
+            llvm::IntrusiveRefCntPtr<FileManager> manager(new FileManager(options, inputs));
+            tooling::ToolInvocation invocation(command, &action, manager.get(),
+                                               std::make_shared<PCHContainerOperations>());
+            invocation.setDiagnosticConsumer(&diagnostics);
+            invocation.run();
+        };
+        run();
+        if (action.retry) run();
         preamble_hit = action.hit;
         preamble_built = action.built;
         ok = !diagnostics.unsafe && !result.dependencies.empty();
@@ -535,7 +559,7 @@ PyObject *scan(PyObject *, PyObject *arguments) {
         ok = inputs->validate() && ok && !result.unsupported;
     }
     Py_END_ALLOW_THREADS
-    previous_inputs = ok ? inputs->contents : Images{};
+    if (inputs->previous) *inputs->previous = ok ? inputs->contents : Images{};
     if (PyErr_CheckSignals() < 0) return nullptr;
     if (inputs->changed)
         return PyErr_Format(input_changed_error, "Input changed during Clang dependency scan: %s",
@@ -585,7 +609,7 @@ PyObject *scan(PyObject *, PyObject *arguments) {
     return Py_BuildValue("{s:N,s:N,s:N,s:O,s:O,s:n}", "files", files, "lookups", paths,
         "dependencies", deps, "preamble_hit", preamble_hit ? Py_True : Py_False,
         "preamble_built", preamble_built ? Py_True : Py_False,
-        "preamble_bytes", static_cast<Py_ssize_t>(preamble_cache.compiled.size()));
+        "preamble_bytes", static_cast<Py_ssize_t>(cohorts.empty() ? 0 : cohorts.front().preamble.compiled.size()));
 }
 
 PyObject *tokenize_command(PyObject *, PyObject *args) {

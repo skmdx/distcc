@@ -19,7 +19,9 @@
  * after matching the directory version both before and after the lookup.
  * ATTRIBUTES returns lstat attributes without enumerating directory contents.
  * DIRECTORIES contains length-u32/LSTAT-or-ATTRIBUTES-query pairs; its reply contains the
- * corresponding ordinary errno/length/body replies, in request order. */
+ * corresponding ordinary errno/length/body replies, in request order. Clang uses
+ * STAT for followed directory snapshots. BATCH groups metadata-only STATUS
+ * and REALPATH observations using the same framing. */
 #define DCC_FS_METADATA 52
 #define DCC_FS_QUERY_MAX 65536
 #define DCC_FS_NO_METADATA UINT32_MAX
@@ -29,7 +31,7 @@
 enum dcc_fs_operation { DCC_FS_STAT = 1, DCC_FS_READ, DCC_FS_REALPATH, DCC_FS_LIST,
                        DCC_FS_CODEGEN, DCC_FS_READLINK = 7, DCC_FS_LSTAT = 8,
                        DCC_FS_DIRECTORIES, DCC_FS_STDIN, DCC_FS_ATTRIBUTES,
-                       DCC_FS_EXECUTION };
+                       DCC_FS_EXECUTION, DCC_FS_BATCH, DCC_FS_STATUS };
 /* STDIN requests use "/" as their operand and return the same metadata/body
  * layout as READ. Only a job's explicitly captured stdin is accessible. */
 /* Compiler-to-daemon only: a requested CPU count replaces the path. Zero

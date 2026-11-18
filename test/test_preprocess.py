@@ -2,6 +2,7 @@
 """Remote preprocessing with mutable inputs, real compilers and pooled TCP."""
 import os
 import concurrent.futures
+import contextlib
 import fcntl
 import xxhash
 import random
@@ -82,6 +83,70 @@ class PumpTestCase(BrokerTestCase):
         return subprocess.run(prefix + [compiler] + list(map(str, args)),
                               cwd=self.work, env=self.env, capture_output=True,
                               timeout=15)
+
+    def snapshot(self, compression=b'LZ4C'):
+        """Receive the real include manifest and its kernel-owned lifetime FD."""
+        def token(name, value):
+            return name + ('%08x' % value).encode()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(10)
+            peer.connect(self.env['INCLUDE_SERVER_PORT'])
+            cwd = os.fsencode(self.work)
+            argv = [b'gcc', b'-c', os.fsencode(self.source), b'-o', b'snapshot.o']
+            peer.sendall(token(b'CDIR', len(cwd)) + cwd + token(compression, len(argv)) +
+                         b''.join(token(b'ARGV', len(a)) + a for a in argv))
+            def read(size):
+                data = b''
+                while len(data) < size:
+                    part = peer.recv(size-len(data))
+                    self.assertTrue(part)
+                    data += part
+                return data
+            header = read(12)
+            self.assertEqual(header[:4], b'ARGC')
+            paths = []
+            for _ in range(int(header[4:], 16)):
+                header = read(12)
+                self.assertEqual(header[:4], b'ARGV')
+                paths.append(Path(os.fsdecode(read(int(header[4:], 16)))))
+            metadata = read(len(paths)*24)
+            marker, rights, flags, _ = peer.recvmsg(1, socket.CMSG_SPACE(4))
+            self.assertEqual((marker, flags), (b'\0', 0))
+            self.assertEqual(len(rights), 1)
+            self.assertEqual(rights[0][:2], (socket.SOL_SOCKET, socket.SCM_RIGHTS))
+            return paths, metadata, struct.unpack('i', rights[0][2])[0]
+
+    @contextlib.contextmanager
+    def serve_snapshot(self, paths, metadata, lease, delay=0):
+        manifest = b'ARGC%08x' % len(paths)
+        for path in paths:
+            value = os.fsencode(path)
+            manifest += b'ARGV%08x' % len(value) + value
+        with socket.socket(socket.AF_UNIX) as server:
+            endpoint = str(self.work/'snapshot.sock')
+            server.bind(endpoint)
+            server.listen(1)
+            server.settimeout(10)
+            def respond():
+                with server.accept()[0] as peer, peer.makefile('rb') as request:
+                    peer.settimeout(10)
+                    request.read(int(request.read(12)[4:], 16))
+                    for _ in range(int(request.read(12)[4:], 16)):
+                        request.read(int(request.read(12)[4:], 16))
+                    peer.sendall(manifest + metadata)
+                    if delay: time.sleep(delay)
+                    if lease >= 0:
+                        peer.sendmsg([b'\0'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack('i', lease))])
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                reply = pool.submit(respond)
+                original = self.env['INCLUDE_SERVER_PORT']
+                self.env['INCLUDE_SERVER_PORT'] = endpoint
+                try:
+                    yield
+                    reply.result(timeout=10)
+                finally:
+                    self.env['INCLUDE_SERVER_PORT'] = original
+                    os.unlink(endpoint)
 
     def analyzer_pids(self):
         pid = int(self.env['INCLUDE_SERVER_PID'])
@@ -299,37 +364,6 @@ class AnalyzerPoolTest(PumpTestCase):
     cpp_slots = 2
     compression = 'lz4'
     transport = ',tcp'
-
-    def snapshot(self, compression=b'LZ4C'):
-        """Receive the real include manifest and its kernel-owned lifetime FD."""
-        def token(name, value):
-            return name + ('%08x' % value).encode()
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
-            peer.settimeout(10)
-            peer.connect(self.env['INCLUDE_SERVER_PORT'])
-            cwd = os.fsencode(self.work)
-            argv = [b'gcc', b'-c', os.fsencode(self.source), b'-o', b'snapshot.o']
-            peer.sendall(token(b'CDIR', len(cwd)) + cwd + token(compression, len(argv)) +
-                         b''.join(token(b'ARGV', len(a)) + a for a in argv))
-            def read(size):
-                data = b''
-                while len(data) < size:
-                    part = peer.recv(size-len(data))
-                    self.assertTrue(part)
-                    data += part
-                return data
-            header = read(12)
-            self.assertEqual(header[:4], b'ARGC')
-            paths = []
-            for _ in range(int(header[4:], 16)):
-                header = read(12)
-                self.assertEqual(header[:4], b'ARGV')
-                paths.append(Path(os.fsdecode(read(int(header[4:], 16)))))
-            marker, rights, flags, _ = peer.recvmsg(1, socket.CMSG_SPACE(4))
-            self.assertEqual((marker, flags), (b'\0', 0))
-            self.assertEqual(len(rights), 1)
-            self.assertEqual(rights[0][:2], (socket.SOL_SOCKET, socket.SCM_RIGHTS))
-            return paths, struct.unpack('i', rights[0][2])[0]
 
     def test_response_files_are_expanded_before_pump_and_native_options(self):
         source = self.work / 'response source.cc'
@@ -732,7 +766,7 @@ read -r proceed || exit 1
     def test_recovery_preserves_published_inputs_and_shutdown_reaps_workers(self):
         result = self.run_cc('gcc', ['-c', self.source, '-o', 'first.o'])
         self.assertEqual(result.returncode, 0, result.stderr.decode())
-        paths, lease = self.snapshot()
+        paths, _, lease = self.snapshot()
         self.addCleanup(lambda: os.close(lease) if lease >= 0 else None)
         supervisor = int(self.env['INCLUDE_SERVER_PID'])
         roots = list(self.work.glob(f'*.include_server-{supervisor}-*'))
@@ -752,6 +786,14 @@ read -r proceed || exit 1
         result = self.run_cc('gcc', ['-c', self.source, '-o', 'recovered.o'])
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual((self.work / 'first.o').read_bytes(), (self.work / 'recovered.o').read_bytes())
+        new_paths, _, new_lease = self.snapshot()
+        try:
+            before = next(p for p in paths if p.name == self.source.name+'.lz4')
+            after = next(p for p in new_paths if p.name == before.name)
+            self.assertNotEqual(before, after)
+            self.assertTrue(before.samefile(after), 'replacement worker must reuse the shared CAS inode')
+        finally:
+            os.close(new_lease)
         os.close(lease)
         lease = -1
         for pid in replacements:
@@ -778,46 +820,16 @@ read -r proceed || exit 1
                     self.assertEqual(result.stdout, expected.stdout)
 
     def test_snapshot_lease_can_arrive_after_manifest(self):
-        paths, lease = self.snapshot(b'LZ4S')
+        paths, metadata, lease = self.snapshot(b'LZ4S')
         self.addCleanup(os.close, lease)
         self.addCleanup(self.env.__setitem__, 'INCLUDE_SERVER_PORT', self.env['INCLUDE_SERVER_PORT'])
         reference = self.run_cc('gcc', ['-c', self.source, '-o', 'reference.o'])
         self.assertEqual(reference.returncode, 0, reference.stderr.decode())
-        manifest = b'ARGC%08x' % len(paths)
-        for path in paths:
-            value = os.fsencode(path)
-            manifest += b'ARGV%08x' % len(value) + value
         for transfer in (True, False):
-            with self.subTest(transfer=transfer), socket.socket(socket.AF_UNIX) as server:
-                endpoint = str(self.root / ('delayed-' + str(transfer)))
-                server.bind(endpoint)
-                server.listen(1)
-                server.settimeout(10)
-                def respond():
-                    with server.accept()[0] as peer:
-                        peer.settimeout(10)
-                        def read(size):
-                            data = b''
-                            while len(data) < size:
-                                chunk = peer.recv(size-len(data))
-                                if not chunk:
-                                    raise EOFError('client request ended early')
-                                data += chunk
-                            return data
-                        read(int(read(12)[4:], 16))  # working directory
-                        for _ in range(int(read(12)[4:], 16)):
-                            read(int(read(12)[4:], 16))
-                        peer.sendall(manifest)
-                        time.sleep(.1)  # Force the real nonblocking client to wait.
-                        if transfer:
-                            peer.sendmsg([b'\0'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                                                   struct.pack('i', lease))])
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    response = pool.submit(respond)
-                    self.env['INCLUDE_SERVER_PORT'] = endpoint
+            with self.subTest(transfer=transfer):
+                with self.serve_snapshot(paths, metadata, lease if transfer else -1, .1):
                     output = 'delayed-' + str(transfer) + '.o'
                     result = self.run_cc('gcc', ['-c', self.source, '-o', output])
-                    response.result(timeout=10)
                 if transfer:
                     self.assertEqual(result.returncode, 0,
                                      result.stderr.decode() + (self.work / 'client.log').read_text())
@@ -1252,9 +1264,10 @@ class PreprocessTest(PumpTestCase):
                                     '-idirafter', str(last), '-P'])
 
     def test_invalid_system_include_manifest_is_rejected(self):
-        self.compare(args=['-P'])
-        manifest, = [p for p in self.work.rglob('.distcc-system/*')
-                     if not p.name.endswith('.xxh3')]
+        codec = {'lzo': b'ARGC', 'lz4': b'LZ4C', 'lz4s': b'LZ4S'}[self.compression]
+        paths, metadata, lease = self.snapshot(codec)
+        self.addCleanup(os.close, lease)
+        index, manifest = next((i, p) for i, p in enumerate(paths) if p.parent.name == '.distcc-system')
         module = next((self.build / '_include_server').glob('lib*/include_server'))
         sys.path.insert(0, str(module))
         try:
@@ -1263,9 +1276,13 @@ class PreprocessTest(PumpTestCase):
             sys.path.pop(0)
         import io
         payload = b'DCSI' + struct.pack('!II', 1, 4096)
-        compress_files.WriteCompressed(str(manifest), io.BytesIO(payload), manifest.suffix[1:])
+        manifest.unlink()
+        record = compress_files.WriteCompressed(str(manifest), io.BytesIO(payload), manifest.suffix[1:],
+                                                cas=str(self.work/'invalid-cas'))
+        metadata = metadata[:24*index] + record + metadata[24*(index+1):]
         started = time.monotonic()
-        result = self.run_cc('gcc', ['-c', self.source, '-o', 'invalid.o'])
+        with self.serve_snapshot(paths, metadata, lease):
+            result = self.run_cc('gcc', ['-c', self.source, '-o', 'invalid.o'])
         self.assertNotEqual(result.returncode, 0)
         self.assertLess(time.monotonic() - started, 3)
         self.assertIn(b'invalid system include manifest', result.stderr)
@@ -2024,15 +2041,14 @@ class TcpPreprocessTest(PreprocessTest):
         self.compare(args=['-P'])
         self.assertEqual(self.cache_counts()[0], 0)
 
-    def test_missing_sidecar_does_not_reuse_cache(self):
+    def test_digest_metadata_reuses_cache_without_sidecars(self):
         self.source.write_text('/*' + random.Random(32).randbytes(16384).hex() + '*/\nint n;\n')
         self.compare(args=['-P'])
         self.cache_counts()
-        for digest in self.work.rglob('*.xxh3'):
-            digest.unlink()
+        self.assertFalse(list(self.work.rglob('*.xxh3')))
         (self.work / 'client.log').write_text('')
         self.compare(args=['-P'])
-        self.assertNotIn('input cache:', (self.work / 'client.log').read_text())
+        self.assertEqual(self.cache_counts()[0], 0)
 
     def test_disabled_server_cache(self):
         self.source.write_text('/*' + random.Random(33).randbytes(16384).hex() + '*/\nint n;\n')
