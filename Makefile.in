@@ -611,7 +611,7 @@ src/rust_native.o: $(srcdir)/src/rust_native.cc
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -c $< -o $@
 
 distcc-rust-native.so: src/rust_native.o
-	$(CXX) -shared $(LDFLAGS) -o $@ $< -ldl
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -shared $(LDFLAGS) -o $@ $< -ldl
 
 cpp_lookup.so: $(srcdir)/src/cpp_lookup.c
 	$(CC) $(CFLAGS) -fPIC -shared $(LDFLAGS) -o $@ $< -ldl -pthread

@@ -3,12 +3,44 @@
 import os
 from pathlib import Path
 import runpy
+import shlex
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
 
 class LLVMModuleBuildTest(unittest.TestCase):
+    def test_rust_native_links_with_its_compile_abi(self):
+        compiler, config = shutil.which('clang++'), shutil.which('llvm-config')
+        if not compiler or not config:
+            self.skipTest('Clang and LLVM development files required')
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(prefix='distcc-rust-abi-') as directory:
+            work = Path(directory)
+            probe = subprocess.run([compiler, '-stdlib=libc++', '-xc++', '-', '-o', str(work/'probe')],
+                                   input='#include <fstream>\nint main() { std::ifstream f; }\n',
+                                   text=True, capture_output=True)
+            if probe.returncode:
+                self.skipTest('libc++ development files required')
+            wrapper = work/'llvm-config'
+            wrapper.write_text('#!/bin/sh\nif [ "$1" = --cxxflags ]; then\n' +
+                               shlex.quote(config) + ' "$@"\nprintf " %s\\n" -stdlib=libc++\n' +
+                               'else exec ' + shlex.quote(config) + ' "$@"; fi\n')
+            wrapper.chmod(0o755)
+            (work/'src').mkdir()
+            built = subprocess.run(['make', '-f', str(root/'Makefile.in'), 'distcc-rust-native.so',
+                                    'SHELL=/bin/sh', 'srcdir='+str(root),
+                                    'CXX='+shlex.quote(compiler)+' -stdlib=libstdc++',
+                                    'CXXFLAGS=-O2', 'CPPFLAGS=', 'LDFLAGS=',
+                                    'LLVM_CONFIG='+str(wrapper)], cwd=work, capture_output=True, timeout=60)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            loaded = subprocess.run(['/bin/true'], capture_output=True,
+                                    env=dict(os.environ, LD_PRELOAD=str(work/'distcc-rust-native.so'),
+                                             LD_BIND_NOW='1'))
+            self.assertEqual((loaded.returncode, loaded.stderr), (0, b''))
+
     def test_each_llvm_supplies_compile_and_link_abi(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix='distcc-llvm-flags-') as directory:
