@@ -316,6 +316,15 @@ public:
     llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(const llvm::Twine &path) override {
         auto name = absolute(path);
         auto result = openImpl(name);
+        // A failed file open does not invalidate path metadata: an include
+        // candidate may be a directory containing a later requested header.
+        // Do not certify a failed read using a successful stat observation.
+        if (!result) {
+            auto error = result.getError();
+            if (error == std::errc::no_such_file_or_directory || error == std::errc::not_a_directory)
+                (void)remember(name, error);
+            else { stable = false; return result; }
+        }
         observe(name, 2, result ? std::error_code{} : result.getError());
         return result;
     }
@@ -334,7 +343,7 @@ public:
         dccfs::Snapshot snapshot;
         if (auto error = connection.read({name.data(), name.size()},
                 found != entries.end() && S_ISREG(found->second.mode()) ? version.data() : nullptr, snapshot))
-            return remember(name, error);
+            return error;
         auto &record = remember(name, snapshot.version.data());
         record.contents = std::make_shared<SnapshotBuffer>(
             llvm::StringRef(snapshot.bytes.data, snapshot.bytes.size), name.str(), std::move(snapshot.bytes.owner));

@@ -77,6 +77,7 @@ int main() {
         {DCC_FS_STAT, "/tree", listing},
         {DCC_FS_READ, "/tree/a", stamp(S_IFREG | 0644, 5, 2) + "fresh"},
         {DCC_FS_READ, "/tree/c", regular + "third"},
+        {DCC_FS_READ, "/tree/child", {}, EINVAL},
         {DCC_FS_STAT, "/tree/child", empty_directory},
         {DCC_FS_LIST, "/tree", types},
         {DCC_FS_LIST, "/tree/child", {}},
@@ -84,6 +85,10 @@ int main() {
         {DCC_FS_LIST, "/broken-list", types+"bad"},
         {DCC_FS_REALPATH, long_path, "/tree/a"},
         {DCC_FS_READ, "/direct", stamp(S_IFREG | 0644, 0, 1)},
+        {DCC_FS_READ, "/unseen-directory", {}, EINVAL},
+        {DCC_FS_STAT, "/unseen-directory", empty_directory},
+        {DCC_FS_STAT, "/unreadable", regular},
+        {DCC_FS_READ, "/unreadable", {}, EACCES},
         {DCC_FS_STAT, "/denied", {}, EACCES},
         {DCC_FS_REALPATH, "/broken", "bad", 0, 10},
     };
@@ -149,7 +154,11 @@ int main() {
         require(files.status("/tree/new/file").getError() == std::errc::no_such_file_or_directory,
                 "missing child snapshot");
         require(files.status("/tree/a/file").getError() == std::errc::not_a_directory, "file parent");
+        files.beginObservations();
+        require(files.openFileForRead("/tree/child").getError() == std::errc::invalid_argument,
+                "directory read error");
         require(bool(files.status("/tree/child")), "batched directory was treated as already queried");
+        require(!files.certificate(), "failed read certified using successful directory metadata");
         require(files.status("/tree/child/missing").getError() == std::errc::no_such_file_or_directory,
                 "empty directory snapshot");
         require(!files.setCurrentWorkingDirectory("/tree"), "change directory");
@@ -180,10 +189,19 @@ int main() {
         auto empty = files.openFileForRead("/direct"); require(bool(empty), "direct read");
         auto zero = (*empty)->getBuffer("empty", -1, true, false);
         require(zero && (*zero)->getBufferSize() == 0 && !(*zero)->getBufferStart()[0], "empty buffer");
+        require(files.openFileForRead("/unseen-directory").getError() == std::errc::invalid_argument,
+                "uncached directory read error");
+        require(files.status("/unseen-directory")->isDirectory(), "open error poisoned uncached stat");
+        files.beginObservations();
+        require(files.status("/unreadable")->isRegularFile(), "read-denied metadata");
+        require(files.openFileForRead("/unreadable").getError() == std::errc::permission_denied,
+                "read authorization changed");
+        require(files.status("/unreadable")->isRegularFile(), "read denial poisoned stat");
+        require(!files.certificate(), "denied read certified as successful");
         require(files.status("/denied").getError() == std::errc::permission_denied, "denied status");
         require(files.openFileForRead("/denied").getError() == std::errc::permission_denied, "lost cached error");
         require(files.getRealPath("/broken", resolved) == std::errc::io_error, "published truncated reply");
-        require(cache_reads == 5 && cache_writes == 1, "cache admission count");
+        require(cache_reads == 6 && cache_writes == 1, "cache admission count");
     }
     peer.join();
     require(retained->getBuffer() == "fresh", "buffer did not outlive filesystem");

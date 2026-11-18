@@ -1741,6 +1741,26 @@ class FrontendTest(BrokerTestCase):
                         DISTCC_SKIP_LOCAL_RETRY='1', INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
         return clang
 
+    def test_header_directory_survives_failed_file_open(self):
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1')
+        directory = self.work/'format'
+        directory.mkdir()
+        (directory/'value.h').write_text('#define VALUE 42\n')
+        source = self.work/'source.cpp'
+        source.write_text('#include <format>\n#include "format/value.h"\n'
+                          'int value() { return VALUE; }\n')
+        output, deps = self.work/'out.o', self.work/'out.d'
+        command = [clang, '-std=c++20', '-I'+str(self.work), '-c', str(source),
+                   '-o', str(output), '-MMD', '-MF', str(deps)]
+        native = subprocess.run(command, env=self.env, capture_output=True, timeout=30)
+        self.assertEqual(native.returncode, 0, native.stderr)
+        expected = output.read_bytes(), deps.read_bytes()
+        output.unlink(); deps.unlink()
+        remote = subprocess.run([str(self.build/'distcc'), *command],
+                                env=self.env, capture_output=True, timeout=30)
+        self.assertEqual(remote.returncode, 0, remote.stderr)
+        self.assertEqual((output.read_bytes(), deps.read_bytes()), expected)
+
     def test_remote_result_reuse_preserves_artifacts_and_revalidates_inputs(self):
         clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
         source, header = self.work/'source.c', self.work/'value.h'
@@ -2015,6 +2035,9 @@ class FrontendTest(BrokerTestCase):
     def test_remote_codegen_shares_ipc_and_preserves_cpp_results(self):
         self.check_remote_codegen(4)
 
+    def test_remote_codegen_keeps_inline_assembly_together(self):
+        self.check_remote_codegen(4, assembler_input=True)
+
     @unittest.skipUnless(os.uname().machine in ('x86_64', 'i686'), 'x86 target required')
     def test_remote_codegen_preserves_32bit_shared_library_calls(self):
         self.check_remote_codegen(4, shared=True)
@@ -2034,10 +2057,12 @@ class FrontendTest(BrokerTestCase):
                                    DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
         trace_offset = Path(self.logs[0].name).stat().st_size
         source, output = self.work/'cancel-codegen.c', self.work/'cancel-codegen.o'
-        source.write_text('\n'.join(
-            f'unsigned f{i}(unsigned n) {{ '
-            '__asm__ volatile(".rept 100000\\nnop\\n.endr\\n"); '
-            f'for (unsigned j=0;j<100;j++) n=n*33+j+{i}; return n; }}' for i in range(8)))
+        # Inline assembly must remain in one module. Use actual arithmetic
+        # backend work to reach cancellable parallel partitions instead.
+        source.write_text('volatile unsigned input;\n' + '\n'.join(
+            f'unsigned f{i}(unsigned n) {{ ' +
+            ''.join(f'n=n*33+input+{j+i};' for j in range(200)) +
+            'return n; }' for i in range(8)))
         command = [str(self.build/'distcc'), clang, '-O3', '-c', str(source), '-o', str(output)]
         warm = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(warm.returncode, 0, warm.stderr)
@@ -2084,13 +2109,14 @@ class FrontendTest(BrokerTestCase):
         recovered = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
 
-    def check_remote_codegen(self, jobs, compiler=None, shared=False):
+    def check_remote_codegen(self, jobs, compiler=None, shared=False, assembler_input=False):
         clang = self.start_frontend(jobs=jobs, DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
         if compiler: clang = compiler
         source = self.work/'partition.cpp'
         payload = self.work/'backend.bin'
         payload.write_bytes(random.Random(911).randbytes(256))
-        asm = r'__asm__ volatile(".pushsection .rodata\n.incbin \"" PAYLOAD "\"\n.popsection\n");'
+        asm = (r'__asm__ volatile(".pushsection .rodata\n.incbin \"" PAYLOAD "\"\n.popsection\n");'
+               if assembler_input else '')
         source.write_text('#include <cstdio>\n#include <vector>\n'
                           f'#define PAYLOAD "{payload}"\n'
                           'static std::vector<unsigned> values{3,7};\nthread_local unsigned bias=2;\n' +
@@ -2131,10 +2157,13 @@ class FrontendTest(BrokerTestCase):
                                   capture_output=True, text=True, timeout=30)
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
         self.assertEqual(result(), expected)
-        if jobs > 1: self.assertIn('distcc codegen: 2 parts', compiled.stderr)
+        if jobs > 1:
+            parts = 1 if assembler_input else 2
+            self.assertIn(f'distcc codegen: {parts} parts', compiled.stderr)
         else: self.assertNotIn('distcc codegen: ', compiled.stderr)
-        # Missing assembler input fails after the frontend, including when
-        # multiple partitions share the same request/reply stream.
+        if not assembler_input: return
+        # Missing assembler input fails after the frontend without splitting
+        # assembly-owned symbols into independently compiled modules.
         output.unlink(); payload.unlink()
         failed = subprocess.run([str(self.build/'distcc'), *command], env=self.env,
                                 capture_output=True, text=True, timeout=30)
