@@ -14,6 +14,7 @@ struct dcc_work_hint {
     uint64_t key, bytes;
     uint32_t kind, work_units; /* ThinLTO: LLVM instructions; other classes: source/input bytes. */
     uint64_t family; /* Source-content prior across command/configuration changes. */
+    uint64_t scope_key;
     uint64_t memory_class; /* Same resource class as the serialized worker job. */
 };
 struct dcc_work_class {
@@ -26,7 +27,7 @@ struct dcc_work_model {
     unsigned char next[DCC_WORK_HISTORY / DCC_WORK_WAYS];
     struct dcc_work_class classes[DCC_WORK_CLASSES];
 };
-void dcc_work_describe(struct dcc_work_hint *, char **, const char *, const char *, int, int);
+void dcc_work_describe(struct dcc_work_hint *, char **, const char *, const char *, int, int, uint64_t *);
 int dcc_work_valid(const struct dcc_work_hint *);
 double dcc_work_predict(const struct dcc_work_model *, const struct dcc_work_hint *);
 int dcc_work_peer(const struct dcc_work_model *, const struct dcc_work_hint *);

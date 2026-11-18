@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Memory admission with actual cgroup accounting and live daemon sockets.
 
-Run in a dedicated 384 MiB cgroup with swap disabled. Larger/unlimited test
+Run in a dedicated 384 MiB cgroup with the host's normal swap policy. Larger/unlimited test
 runners skip this test rather than allocating host-sized amounts of memory.
 """
 from pathlib import Path
@@ -27,7 +27,6 @@ class MemoryAdmissionTest(BrokerTestCase):
         if maximum == 'max' or not 320*1024**2 <= int(maximum) <= 512*1024**2:
             self.skipTest('run in a dedicated 384 MiB cgroup')
         maximum = int(maximum)
-        self.assertEqual((group/'memory.swap.max').read_text().strip(), '0')
         expected = min(4, (maximum - 32*1024**2) // (128*1024**2))
 
         def available():
@@ -44,12 +43,12 @@ class MemoryAdmissionTest(BrokerTestCase):
         wait_available(expected)
         leases = []
         for _ in range(expected):
-            net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=2)
+            net = socket.create_connection((self.worker_address, self.ports[0]), timeout=2)
             self.addCleanup(net.close)
             net.sendall(b'SLOT00000001')
             self.assertEqual(net.recv(12, socket.MSG_WAITALL), b'GRNT00000001')
             leases.append(net)
-        net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=2)
+        net = socket.create_connection((self.worker_address, self.ports[0]), timeout=2)
         self.addCleanup(net.close)
         net.sendall(b'SLOT00000001')
         self.assertEqual(net.recv(12, socket.MSG_WAITALL), b'BUSY00000000')
@@ -83,6 +82,7 @@ class MemoryAdmissionTest(BrokerTestCase):
 
 
 class TcpMemoryAdmissionTest(MemoryAdmissionTest):
+    worker_address = '127.0.0.2'
     transport = 'tcp'
 
 

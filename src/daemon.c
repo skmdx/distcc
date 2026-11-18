@@ -182,14 +182,20 @@ static void dcc_warn_masquerade_whitelist(void) {
 }
 
 static char **worker_argv;
-static int worker_log = STDERR_FILENO;
+static int worker_log = -1;
 
 int dcc_spawn_worker(pid_t *pid, int channel)
 {
     posix_spawn_file_actions_t actions;
     int ret = posix_spawn_file_actions_init(&actions);
     if (ret) return ret;
-    if (worker_log != STDERR_FILENO)
+    int spare = -1;
+    if (channel <= DCC_WORKER_STATS_FD) {
+        spare = fcntl(channel, F_DUPFD_CLOEXEC, DCC_WORKER_STATS_FD + 1);
+        if (spare < 0) ret = errno;
+        channel = spare;
+    }
+    if (!ret && worker_log >= 0)
         ret = posix_spawn_file_actions_adddup2(&actions, worker_log, STDERR_FILENO);
     if (!ret && arg_stats)
         ret = posix_spawn_file_actions_adddup2(&actions, dcc_statspipe[1], DCC_WORKER_STATS_FD);
@@ -197,6 +203,7 @@ int dcc_spawn_worker(pid_t *pid, int channel)
     if (!ret) ret = posix_spawn_file_actions_addclosefrom_np(&actions,
                               arg_stats ? DCC_WORKER_STATS_FD + 1 : DCC_WORKER_CHANNEL_FD + 1);
     if (!ret) ret = posix_spawn(pid, "/proc/self/exe", &actions, NULL, worker_argv, environ);
+    if (spare >= 0) close(spare);
     posix_spawn_file_actions_destroy(&actions);
     return ret;
 }
@@ -244,6 +251,11 @@ int main(int argc, char *argv[])
      * the right ownership. */
     if (worker && arg_log_file) opt_log_stderr = 1;
     dcc_setup_real_log();
+    if (!worker && (worker_log >= 0 || opt_log_stderr)) {
+        worker_log = fcntl(worker_log >= 0 ? worker_log : STDERR_FILENO,
+                           F_DUPFD_CLOEXEC, DCC_WORKER_STATS_FD + 1);
+        if (worker_log < 0) dcc_exit(EXIT_IO_ERROR);
+    }
 
     /* Do everything from $TMPDIR directory.  Allows start directory to be
      * unmounted. */

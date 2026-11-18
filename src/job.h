@@ -69,7 +69,14 @@ static inline int dcc_job_shared(const struct dcc_job *job, unsigned index)
 {
     return job->kind == DCC_JOB_PUMP || dcc_job_tree(job) || job->inputs[index].kind == DCC_JOB_READONLY;
 }
+/* Network byte order, including when relayed through the local broker. */
+struct dcc_load_report {
+    unsigned char stamp[8], headroom[8], reserved[8], estimate[8], job_memory[8];
+    unsigned char busy[4], queued[4], preparing[4], returning[4], suspended[4], links[4];
+    unsigned char capacity[4], running[4], pressure[4], cpu_scale[4], cpu_state[4], memory_class[4];
+};
 struct dcc_job_result {
+    struct dcc_load_report load;
     int status, mode;
     uint64_t prepare_ns, queue_ns, execute_ns; /* Server monotonic phase durations. */
     uint64_t cpu_ns; /* Compiler process and reaped descendants; excludes queue/transfer time. */

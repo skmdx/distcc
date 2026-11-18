@@ -253,7 +253,49 @@ unsigned long long dcc_resource_input_bytes(const struct dcc_job *job)
 
 unsigned dcc_resource_class(const struct dcc_job *job)
 {
-    return 1 + (dcc_job_frontend(job) ? DCC_JOB_FRONTEND : job->kind) * DCC_MEMORY_BUCKETS +
+    if (dcc_job_frontend(job)) {
+        enum { C, CXX, ASM, OBJC, OBJCXX, GPU };
+        unsigned language = C, phase = 0;
+        char **args = job->argv;
+        if (args && args[0] && args[1]) {
+            const char *ext = strrchr(args[1], '.');
+            if (strstr(args[0], "++") || (ext && (!strcmp(ext, ".cc") || !strcmp(ext, ".cpp") ||
+                !strcmp(ext, ".cxx") || !strcmp(ext, ".C") || !strcmp(ext, ".ii")))) language = CXX;
+            if (ext && (!strcmp(ext, ".S") || !strcmp(ext, ".s"))) language = ASM;
+            if (ext && !strcmp(ext, ".m")) language = OBJC;
+            if (ext && !strcmp(ext, ".mm")) language = OBJCXX;
+            /* Both plans begin with compiler, input and filesystem identity.
+             * GCC additionally serializes two directories/arguments lists and the locale. */
+            args += 2;
+            if (*args) ++args;
+            if (job->kind == DCC_JOB_GCC_FRONTEND) {
+                for (unsigned i = 0; i < 2; ++i) {
+                    while (*args && **args) ++args;
+                    if (*args) ++args;
+                }
+                for (unsigned i = 0; i < 1 + DCC_GCC_LOCALE_COUNT && *args; ++i) ++args;
+            }
+        }
+        for (; args && *args; ++args) {
+            const char *flag = *args;
+            if (!strcmp(flag, "-E")) phase = 1;
+            else if (!strcmp(flag, "-fsyntax-only")) phase = 2;
+            else if (!strcmp(flag, "-emit-llvm") || !strcmp(flag, "-emit-llvm-bc")) phase = 3;
+            else if (!strcmp(flag, "-S")) phase = 4;
+            else if (!strncmp(flag, "-x", 2)) {
+                const char *lang = flag + 2;
+                if (!*lang && args[1]) lang = *++args;
+                if (!strcmp(lang, "none")) continue;
+                if (strstr(lang, "objective-c")) language = strstr(lang, "++") ? OBJCXX : OBJC;
+                else if (strstr(lang, "++")) language = CXX;
+                else if (strstr(lang, "assembler")) language = ASM;
+                else if (strstr(lang, "hip") || strstr(lang, "cuda")) language = GPU;
+                else language = C;
+            }
+        }
+        return 1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS + phase * 8 + language;
+    }
+    return 1 + job->kind * DCC_MEMORY_BUCKETS +
            dcc_resource_bucket(dcc_resource_input_bytes(job));
 }
 

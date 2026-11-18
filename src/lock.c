@@ -51,6 +51,7 @@
 
 
 #include <config.h>
+#include "broker.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -206,6 +207,10 @@ static int sys_lock(int fd, int block)
 
 int dcc_unlock(int lock_fd)
 {
+    if (lock_fd >= DCC_BROKER_LEASE_BASE) {
+        dcc_broker_release(lock_fd);
+        return 0;
+    }
     struct stat st;
     /* Closing a broker control socket releases its remote job lease. */
     if (!fstat(lock_fd, &st) && S_ISSOCK(st.st_mode))

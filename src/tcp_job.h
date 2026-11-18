@@ -25,6 +25,7 @@ enum dcc_tcp_type {
 #define DCC_TCP_CHUNK (256 * 1024)
 #define DCC_TCP_BYTES (512ULL * 1024 * 1024)
 #define DCC_TCP_RESULT_SIZE 72
+struct dcc_tcp_complete { unsigned char id[8]; struct dcc_load_report load; };
 /* The parser buffers one frame, never a whole file. */
 struct dcc_tcp_frame {
     unsigned char header[8], *data;

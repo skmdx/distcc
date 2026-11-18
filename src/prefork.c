@@ -88,14 +88,41 @@ struct pending {
     char request[12];
 };
 static struct worker *workers;
-static struct pollfd *parent_polls;
-static int parent_poll_capacity;
+#include "epoll_set.h"
+struct interest {
+    struct dcc_watch watch;
+    int fd_plus_one;
+    unsigned events;
+};
+static struct interest *interests;
+static int interest_count, parent_ep = -1;
+static void watch_parent(int index, int fd, unsigned events)
+{
+    interests[index].fd_plus_one = fd + 1;
+    interests[index].events = events;
+}
 static struct pending pending[MAX_PENDING];
 static int worker_channel = -1;
 static int worker_count;
 static int local_listener = -1;
 static struct dcc_tcp_server *tcp[MAX_PENDING];
 static volatile sig_atomic_t shutdown_signal;
+enum { LISTEN, ASYNC, LOCAL, WORKERS };
+static void forget_parent(int index)
+{
+    if (index < interest_count) dcc_watch_drop(parent_ep, &interests[index].watch);
+}
+void dcc_prefork_forget_extra(int index)
+{
+    forget_parent(WORKERS + worker_count + 3 * MAX_PENDING + index);
+}
+static void close_worker(struct worker *w)
+{
+    forget_parent(WORKERS + (w - workers));
+    close(w->fd);
+    w->fd = -1;
+}
+
 static void receive_worker(struct worker *);
 static void receive_worker_message(struct worker *);
 
@@ -120,7 +147,7 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
             count = 3;
         }
         if (dcc_send_fds(w->fd, run, length, descriptors, count)) {
-            close(w->fd); w->fd = -1; w->busy = RETIRING;
+            close_worker(w); w->busy = RETIRING;
             return -1;
         }
         w->tcp = job; w->busy = EXECUTING; w->link = link;
@@ -136,7 +163,7 @@ static void cancel_tcp_job(struct dcc_tcp_server *job)
     for (int i = 0; i < worker_count; ++i) if (workers[i].tcp == job) {
         struct worker *w = &workers[i];
         /* Keep the job/tree until the worker is actually reaped. */
-        if (w->fd >= 0) { shutdown(w->fd, SHUT_RDWR); close(w->fd); w->fd = -1; }
+        if (w->fd >= 0) { shutdown(w->fd, SHUT_RDWR); close_worker(w); }
         w->busy = RETIRING;
     }
 }
@@ -288,7 +315,7 @@ void dcc_prefork_reaped(pid_t pid)
                 receive_worker(&workers[i]);
             }
             dcc_tcp_server_lost(workers[i].tcp);
-            if (workers[i].fd >= 0) close(workers[i].fd);
+            if (workers[i].fd >= 0) close_worker(&workers[i]);
             workers[i] = (struct worker){ .fd = -1 };
             return;
         }
@@ -323,7 +350,7 @@ static void receive_worker_message(struct worker *w)
         if (n != sizeof(finished)) {
             for (unsigned i = 0; i < count; ++i) close(fds[i]);
             /* EOF alone does not prove the compiler has stopped using inputs. */
-            close(w->fd); w->fd = -1; w->busy = RETIRING;
+            close_worker(w); w->busy = RETIRING;
             return;
         }
         struct dcc_tcp_server *job = w->tcp;
@@ -339,8 +366,7 @@ static void receive_worker_message(struct worker *w)
     ssize_t n = dcc_recv_fd(w->fd, &session, sizeof(session), &fd);
     if (n != sizeof(session)) {
         if (fd >= 0) close(fd);
-        close(w->fd);
-        w->fd = -1;
+        close_worker(w);
         w->busy = RETIRING;
     } else {
         w->busy = session & WORKER_RETIRING ? RETIRING : IDLE;
@@ -353,28 +379,23 @@ static void receive_worker_message(struct worker *w)
 int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout)
 {
     if (shutdown_signal) finish_shutdown();
-    int needed = 2 * (count + worker_count + 3 * MAX_PENDING + 3);
-    if (needed > parent_poll_capacity) {
-        parent_polls = realloc(parent_polls, needed * sizeof(*parent_polls));
-        if (!parent_polls) dcc_exit(EXIT_OUT_OF_MEMORY);
-        parent_poll_capacity = needed;
+    int i, j, result, base = WORKERS, sockets = base + worker_count;
+    int tcp_base = sockets + MAX_PENDING, fs_base = tcp_base + MAX_PENDING;
+    int extras = fs_base + MAX_PENDING, total = extras + count;
+    if (parent_ep < 0 && (parent_ep = epoll_create1(EPOLL_CLOEXEC)) < 0) return -1;
+    if (total > interest_count) {
+        interests = realloc(interests, total * sizeof(*interests));
+        if (!interests) dcc_exit(EXIT_OUT_OF_MEMORY);
+        memset(interests + interest_count, 0, (total - interest_count) * sizeof(*interests));
+        interest_count = total;
     }
-    struct pollfd *polls = parent_polls;
-    int i, j, result, base = count + 1, sockets = base + worker_count;
-    int total = sockets + MAX_PENDING;
-    int wake_index = total++;
-    polls[wake_index] = (struct pollfd){dcc_tcp_async_fd(), POLLIN, 0};
-    int local_index = total++;
-    polls[local_index] = (struct pollfd){local_listener, POLLIN, 0};
-    int tcp_base = total;
-    total += MAX_PENDING;
-    int fs_base = total;
-    total += MAX_PENDING;
     time_t now = time(NULL);
-    for (i = 0; i < count; ++i) polls[i] = extra[i];
-    polls[count] = (struct pollfd){ listen_fd, POLLIN, 0 };
-    for (i = 0; i < worker_count; ++i)
-        polls[base + i] = (struct pollfd){ workers[i].fd, POLLIN, 0 };
+    watch_parent(LISTEN, listen_fd, EPOLLIN);
+    watch_parent(ASYNC, dcc_tcp_async_fd(), EPOLLIN);
+    watch_parent(LOCAL, local_listener, EPOLLIN);
+    for (i = extras; i < interest_count; ++i)
+        watch_parent(i, i < total ? extra[i-extras].fd : -1, i < total ? extra[i-extras].events : 0);
+    for (i = 0; i < worker_count; ++i) watch_parent(base+i, workers[i].fd, EPOLLIN);
     int busy = 0;
     for (i = 0; i < worker_count; ++i)
         busy += workers[i].fd >= 0 && workers[i].busy == EXECUTING;
@@ -382,42 +403,44 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
     for (i = 0; i < MAX_PENDING; ++i) {
         struct pending *p = &pending[i];
         if (p->fd >= 0 && now - p->since >= (p->ready ? dcc_get_io_timeout() : 30)) {
+            forget_parent(sockets+i);
             close(p->fd);
             p->fd = -1;
         }
-        polls[sockets + i] = (struct pollfd){ p->fd, p->ready ? 0 : POLLIN, 0 };
+        watch_parent(sockets+i, p->fd, p->ready ? 0 : EPOLLIN);
     }
     int runnable = dcc_tcp_server_pending();
     for (i = 0; i < MAX_PENDING; ++i) {
-        polls[tcp_base + i] = (struct pollfd){ .fd = -1 };
-        polls[fs_base + i] = (struct pollfd){ .fd = -1 };
+        struct pollfd net = {.fd = -1}, fs = {.fd = -1};
         if (tcp[i]) {
-            runnable |= dcc_tcp_server_poll(tcp[i], &polls[tcp_base + i]);
-            dcc_tcp_server_fs_poll(tcp[i], &polls[fs_base + i]);
+            runnable |= dcc_tcp_server_poll(tcp[i], &net);
+            dcc_tcp_server_fs_poll(tcp[i], &fs);
         }
+        watch_parent(tcp_base+i, net.fd, net.events);
+        watch_parent(fs_base+i, fs.fd, fs.events);
     }
-    /* Bound idle expiry even without statistics or other activity. */
-    /* Unused bounded slots are not file descriptors. Passing all of them to
-     * poll can exceed RLIMIT_NOFILE even with only a handful of live sockets.
-     * Keep indexed ownership above, but poll only the live descriptors. */
-    int active = 0;
-    for (i = 0; i < total; ++i) {
-        polls[i].revents = 0;
-        if (polls[i].fd >= 0) polls[total + active++] = polls[i];
-    }
-    result = poll(polls + total, active, runnable ? 0 : timeout < 1000 ? timeout : 1000);
-    for (i = 0, j = 0; i < total; ++i)
-        if (polls[i].fd >= 0) polls[i].revents = polls[total + j++].revents;
+    /* A pending connection can move to a TCP job under the same fd. Remove
+     * old owners before registering new ones, including reordered stats clients. */
+    for (i = 0; i < interest_count; ++i)
+        if (interests[i].fd_plus_one != interests[i].watch.fd_plus_one)
+            dcc_watch_drop(parent_ep, &interests[i].watch);
+    for (i = 0; i < total; ++i)
+        if (dcc_watch_set(parent_ep, &interests[i].watch, interests[i].fd_plus_one - 1,
+                          interests[i].events, i)) return -1;
+    struct epoll_event events[128];
+    result = epoll_wait(parent_ep, events, 128, runnable ? 0 : timeout < 1000 ? timeout : 1000);
+    for (i = 0; i < result; ++i)
+        dcc_watch_ready(&interests[events[i].data.u64 >> 32].watch, events[i]);
     if (shutdown_signal) finish_shutdown();
-    for (i = 0; i < count; ++i) extra[i].revents = polls[i].revents;
+    for (i = 0; i < count; ++i) extra[i].revents = interests[extras+i].watch.ready;
     if (result < 0) return result;
-    if (polls[wake_index].revents) dcc_tcp_async_drain();
+    if (interests[ASYNC].watch.ready) dcc_tcp_async_drain();
     dcc_tcp_server_collect();
     for (i = 0; i < worker_count; ++i)
-        if (polls[base + i].revents) receive_worker(&workers[i]);
+        if (interests[base+i].watch.ready) receive_worker(&workers[i]);
     for (i = 0; i < MAX_PENDING; ++i) {
         struct pending *p = &pending[i];
-        if (p->fd >= 0 && polls[sockets + i].fd == p->fd && polls[sockets + i].revents) {
+        if (p->fd >= 0 && interests[sockets+i].watch.fd_plus_one == p->fd + 1 && interests[sockets+i].watch.ready) {
             char byte;
             ssize_t n = recv(p->fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
             if (n > 0) {
@@ -427,6 +450,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
 #endif
                 if (admission && !p->used && byte == 'T') {
                     for (j = 0; j < MAX_PENDING && tcp[j]; ++j) {}
+                    forget_parent(sockets+i);
                     if (j == MAX_PENDING || !(tcp[j] = dcc_tcp_server_new(p->fd, &tcp_dispatch))) close(p->fd);
                     else dcc_stats_event(STATS_TCP_ACCEPT);
                     p->fd = -1;
@@ -438,6 +462,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
                     if (p->used == 12) {
                         if (memcmp(p->request, "SLOT00000001", 12) &&
                             memcmp(p->request, "SLOT00000002", 12)) {
+                            forget_parent(sockets+i);
                             close(p->fd);
                             p->fd = -1;
                         } else p->ready = 1;
@@ -445,6 +470,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
                 } else p->ready = 1;
             }
             else if (!n || (errno != EAGAIN && errno != EINTR)) {
+                forget_parent(sockets+i);
                 close(p->fd);
                 p->fd = -1;
             }
@@ -461,6 +487,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
                 /* Refuse immediately, retaining the TCP session for retry on
                  * another host. Idle sessions never reserve compiler slots. */
                 if (send(p->fd, "BUSY00000000", 12, MSG_NOSIGNAL | MSG_DONTWAIT) != 12) {
+                    forget_parent(sockets+i);
                     close(p->fd);
                     p->fd = -1;
                 }
@@ -475,8 +502,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             struct worker *w = &workers[j];
             if (w->fd < 0 || w->busy) continue;
             if (dcc_send_fd(w->fd, &p->session, sizeof(p->session), p->fd)) {
-                close(w->fd);
-                w->fd = -1;
+                close_worker(w);
                 w->busy = 1;
                 continue;
             }
@@ -489,14 +515,17 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
              * second reply. Grant only after a worker owns the connection. */
             if (p->used && send(p->fd, "GRNT00000001", 12, MSG_NOSIGNAL | MSG_DONTWAIT) != 12)
                 shutdown(p->fd, SHUT_RDWR);
+            forget_parent(sockets+i);
             close(p->fd);
             p->fd = -1;
             break;
         }
     }
     for (i = 0; i < MAX_PENDING; ++i) {
-        if (tcp[i] && (dcc_tcp_server_fs_process(tcp[i], polls[fs_base + i].revents) ||
-                       dcc_tcp_server_process(tcp[i], polls[tcp_base + i].revents))) {
+        if (tcp[i] && (dcc_tcp_server_fs_process(tcp[i], interests[fs_base+i].watch.ready) ||
+                       dcc_tcp_server_process(tcp[i], interests[tcp_base+i].watch.ready))) {
+            forget_parent(tcp_base+i);
+            forget_parent(fs_base+i);
             dcc_tcp_server_free(tcp[i]); tcp[i] = NULL;
         }
     }
@@ -505,7 +534,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
      * existing CPU and memory admission limits still govern execution. */
     dcc_create_kids();
     dcc_tcp_dispatch_ready();
-    if (polls[count].revents & POLLIN) {
+    if (interests[LISTEN].watch.ready & POLLIN) {
         struct sockaddr_storage address;
         socklen_t length = sizeof(address);
         int fd = accept4(listen_fd, (struct sockaddr *)&address, &length, SOCK_CLOEXEC);
@@ -514,7 +543,7 @@ int dcc_prefork_poll(int listen_fd, struct pollfd *extra, int count, int timeout
             else park_connection(fd, SESSION_NEW);
         }
     }
-    if (polls[local_index].revents & POLLIN) {
+    if (interests[LOCAL].watch.ready & POLLIN) {
         int fd = accept4(local_listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (fd >= 0) {
             for (j = 0; j < MAX_PENDING && tcp[j]; ++j) {}
@@ -602,7 +631,7 @@ static void dcc_create_kids(void) {
     for (int i = worker_count; i-- && dcc_nkids - retiring > maximum;) {
         struct worker *w = &workers[i];
         if (w->pid && w->fd >= 0 && w->busy == IDLE) {
-            close(w->fd); w->fd = -1; w->busy = RETIRING; ++retiring;
+            close_worker(w); w->busy = RETIRING; ++retiring;
         }
     }
 
@@ -611,15 +640,13 @@ static void dcc_create_kids(void) {
         for (slot = 0; slot < worker_count && workers[slot].pid; ++slot) {}
         if (slot == worker_count || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair))
             dcc_exit(EXIT_OUT_OF_MEMORY);
-        /* The spawn actions install the stats pipe at 4 before the channel. */
-        int child = pair[1] == DCC_WORKER_STATS_FD ? 0 : 1;
-        int error = dcc_spawn_worker(&kid, pair[child]);
-        close(pair[child]);
+        int error = dcc_spawn_worker(&kid, pair[1]);
+        close(pair[1]);
         if (error) {
             rs_log_error("spawn worker: %s", strerror(error));
             dcc_exit(EXIT_DISTCC_FAILED);
         }
-        workers[slot] = (struct worker){ .pid = kid, .fd = pair[1-child] };
+        workers[slot] = (struct worker){ .pid = kid, .fd = pair[0] };
         ++dcc_nkids;
         rs_trace("up to %d children", dcc_nkids);
     }

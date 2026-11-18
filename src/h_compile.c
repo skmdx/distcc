@@ -90,7 +90,7 @@ int main(int argc, char *argv[])
             int owner=-1;
             if (key) owner=dcc_broker_memo_get(key,&memo);
             if (!memo) {
-                if (owner>=0) close(owner);
+                if (owner>=0) dcc_broker_release(owner);
                 free(key); return 1;
             }
             puts(memo); free(memo); free(key);

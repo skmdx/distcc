@@ -148,7 +148,7 @@ static int request_planner(const char *compiler, char **argv, int input,
 out:
     if (ret) rs_log_warning("GCC %s failed during %s (status=%d, errno=%d)",
                             role, stage, ret, errno);
-    if (lease >= 0) close(lease);
+    if (lease >= 0) dcc_broker_release(lease);
     if (worker >= 0) close(worker);
     if (pair[0] >= 0) close(pair[0]);
     if (pair[1] >= 0) close(pair[1]);
@@ -387,7 +387,7 @@ decoded:
     ret = 0;
 done:
     if (cpu >= 0) dcc_unlock(cpu);
-    if (lease >= 0) close(lease);
+    if (lease >= 0) dcc_broker_release(lease);
     if (plan_dependencies >= 0) close(plan_dependencies);
     plan_dependencies = -1;
     free(key); free(memo);

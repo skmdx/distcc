@@ -241,7 +241,7 @@ static int request(char **argv, char operation, int output, int errors, int *sta
         rs_trace("reused local compiler libraries status=%d operation=%c", *status, operation);
     }
 out:
-    if (lease >= 0) close(lease);
+    if (lease >= 0) dcc_broker_release(lease);
     if (worker >= 0) close(worker);
     if (input >= 0) close(input);
     if (sink >= 0) close(sink);

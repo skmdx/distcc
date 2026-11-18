@@ -28,14 +28,15 @@
 #define CACHE_SHARDS DCC_FILE_CACHE_SHARDS
 #define CACHE_BYTES DCC_FILE_CACHE_MAX
 
-static void accessed(int fd, const struct stat *st)
+static void accessed(int fd, const char *key, const struct stat *st)
 {
     struct timespec now;
     /* Record use at most once per timestamp second. Keep mtime unchanged:
      * shared inputs can be hardlinked into a running compiler's filesystem. */
     if (!clock_gettime(CLOCK_REALTIME_COARSE, &now) && st->st_atim.tv_sec < now.tv_sec) {
         const struct timespec times[2] = {{.tv_nsec = UTIME_NOW}, {.tv_nsec = UTIME_OMIT}};
-        (void)futimens(fd, times); /* Recency is best effort, like admission. */
+        if (key) (void)utimensat(fd, key, times, AT_SYMLINK_NOFOLLOW);
+        else (void)futimens(fd, times); /* Recency is best effort, like admission. */
     }
 }
 
@@ -74,7 +75,7 @@ static int cache_root(const char *tmp)
     return root;
 }
 
-struct dcc_record_cache { int root, shards[CACHE_SHARDS]; };
+struct dcc_record_cache { int root, shards[2 * CACHE_SHARDS]; };
 
 struct dcc_record_cache *dcc_file_cache_open(const char *tmp)
 {
@@ -83,14 +84,14 @@ struct dcc_record_cache *dcc_file_cache_open(const char *tmp)
     struct dcc_record_cache *cache = malloc(sizeof(*cache));
     if (!cache) { close(root); return NULL; }
     cache->root = root;
-    for (unsigned i = 0; i < CACHE_SHARDS; ++i) cache->shards[i] = -1;
+    for (unsigned i = 0; i < 2 * CACHE_SHARDS; ++i) cache->shards[i] = -1;
     return cache;
 }
 
 void dcc_file_cache_close(struct dcc_record_cache *cache)
 {
     if (!cache) return;
-    for (unsigned i = 0; i < CACHE_SHARDS; ++i)
+    for (unsigned i = 0; i < 2 * CACHE_SHARDS; ++i)
         if (cache->shards[i] >= 0) close(cache->shards[i]);
     close(cache->root);
     free(cache);
@@ -103,8 +104,12 @@ static int cache_shard(struct dcc_record_cache *cache, const unsigned char *hash
      * contain inputs whose digest was verified before publication. */
     if (!cache) return -1;
     char name[3];
-    snprintf(name, sizeof(name), "%02x", CACHE_SHARDS + hash[0] % CACHE_SHARDS);
-    return create ? private_directory(cache->root, name) : open_private_directory(cache->root, name);
+    unsigned index = CACHE_SHARDS + hash[0] % CACHE_SHARDS;
+    if (cache->shards[index] < 0) {
+        snprintf(name, sizeof(name), "%02x", index);
+        cache->shards[index] = create ? private_directory(cache->root, name) : open_private_directory(cache->root, name);
+    }
+    return cache->shards[index];
 }
 
 int dcc_file_digest(int fd, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE])
@@ -155,13 +160,6 @@ static int copy_snapshot(int from, int to)
 
 static int snapshot(int from, const char *destination, int shared)
 {
-    if (shared) {
-        char source[64];
-        snprintf(source, sizeof(source), "/proc/self/fd/%d", from);
-        if (!linkat(AT_FDCWD, source, AT_FDCWD, destination, AT_SYMLINK_FOLLOW)) return 1;
-        /* Eviction between open and link is a miss. */
-        if (errno != EXDEV) return 0;
-    }
     int to = open(destination, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, shared ? 0400 : 0600);
     if (to < 0) return 0;
     int ok = !copy_snapshot(from, to);
@@ -178,6 +176,10 @@ static int published(const struct stat *st, uint64_t size)
 
 int dcc_file_cache_copy(const char *source, const char *destination, int shared)
 {
+    if (shared) {
+        if (!linkat(AT_FDCWD, source, AT_FDCWD, destination, 0)) return 1;
+        if (errno != EXDEV) return 0;
+    }
     int from = open(source, O_RDONLY | O_NOFOLLOW | O_CLOEXEC), ok;
     if (from < 0) return 0;
     ok = snapshot(from, destination, shared);
@@ -192,14 +194,21 @@ int dcc_file_cache_get(struct dcc_record_cache *cache, const unsigned char *hash
     struct stat st;
     int shard = cache_shard(cache, hash, key, 0), from = -1, ok = 0;
     if (shard < 0) return 0;
+    if (shared) {
+        if (fstatat(shard, key, &st, AT_SYMLINK_NOFOLLOW) || !published(&st, size)) return 0;
+        if (!linkat(shard, key, AT_FDCWD, destination, 0)) {
+            accessed(shard, key, &st);
+            return 1;
+        }
+        if (errno != EXDEV) return 0;
+    }
     from = openat(shard, key, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (from < 0 || fstat(from, &st) || !published(&st, size))
         goto done;
     ok = snapshot(from, destination, shared);
-    if (ok) accessed(from, &st);
+    if (ok) accessed(from, NULL, &st);
 done:
     if (from >= 0) close(from);
-    close(shard);
     return ok;
 }
 
@@ -378,7 +387,6 @@ done:
     if (to >= 0) close(to);
     if (from >= 0) close(from);
     if (lock >= 0) close(lock);
-    if (shard >= 0) close(shard);
 }
 
 void dcc_file_cache_prune(struct dcc_record_cache *cache)
@@ -425,7 +433,7 @@ static int record_lookup(struct dcc_record_cache *cache, const void *key, size_t
         return -1;
     }
     *record_size = st.st_size;
-    accessed(fd, &st);
+    accessed(fd, NULL, &st);
     return fd;
 }
 static int record_contents(const void *record, size_t record_size, const void *key, size_t key_size,

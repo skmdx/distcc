@@ -393,12 +393,13 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                            dcc_tcp_get64(incoming.data) == id &&
                            !length && stream.fd < 0 && !filesystem.size && read_request == count) {
                     ret = EXIT_BUSY; goto done;
-                } else if (type == DCC_TCP_COMPLETE && have_result && incoming.size == 8 &&
+                } else if (type == DCC_TCP_COMPLETE && have_result && incoming.size == sizeof(struct dcc_tcp_complete) &&
                            dcc_tcp_get64(incoming.data) == id && finals == (1U << DCC_JOB_RESULT_COUNT) - 1 &&
                            !length && stream.fd < 0 && !filesystem.size && read_request == count) {
                     /* No next job exists until this connection is returned
                      * to the pool. Unsolicited trailing bytes are not a result. */
                     if (!local && input.end - input.begin != incoming.size + 8) goto done;
+                    memcpy(&result->load, incoming.data + 8, sizeof(result->load));
                     ret = 0; goto done;
                 } else goto done;
                 if (local) dcc_tcp_frame_next(&incoming);

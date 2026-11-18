@@ -831,6 +831,7 @@ dcc_build_somewhere(char *argv[],
     int retry_count = 0, max_retries, remote_unsupported = 0;
     struct dcc_hostdef *host = NULL;
     struct dcc_work_hint work = {0};
+    uint64_t input_hash = 0;
     char *discrepancy_filename = NULL;
     char **new_argv;
 
@@ -931,7 +932,7 @@ dcc_build_somewhere(char *argv[],
      * but needs neither native expansion nor a duplicate header/input tree. */
     if (!ret && !dcc_scan_includes && !dcc_offload_language(argv) &&
         broker && *broker) {
-        dcc_work_describe(&work, argv, input_fname, NULL, -1, 0);
+        dcc_work_describe(&work, argv, input_fname, NULL, -1, 0, &input_hash);
         direct_lease = dcc_broker_try_local(&work);
         if (direct_lease >= 0) goto run_local;
     }
@@ -1061,7 +1062,7 @@ dcc_build_somewhere(char *argv[],
 
     if (broker)
         if (cpp_ready || !work.key)
-            dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready);
+            dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready, &input_hash);
     if (prepared_job && !dcc_job_frontend(prepared_job) && work.key)
         work.bytes = dcc_resource_input_bytes(prepared_job);
     else if (!cpp_ready && (!prepared_job || !dcc_job_frontend(prepared_job)))

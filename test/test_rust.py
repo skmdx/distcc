@@ -951,7 +951,8 @@ pub fn read_only() -> bool {
             while True:
                 kind, data = frame(net)
                 if kind == 0x54000305:
-                    self.assertEqual(data, struct.pack('!Q', identity))
+                    self.assertEqual(len(data), 96)
+                    self.assertEqual(data[:8], struct.pack('!Q', identity))
                     break
                 self.assertEqual(kind & ~0x30000, 0x54000304)
                 index, plain = struct.unpack('!II', data[:8])

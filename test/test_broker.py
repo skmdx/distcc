@@ -40,7 +40,7 @@ class MemoReconnectTest(unittest.TestCase):
                         second, _ = listener.accept()
                         with second:
                             self.assertEqual(second.recv(128), original)
-                            self.assertEqual(original, struct.pack('=II', 4, 16 if kind == 'worker' else 4) + b'retry\0')
+                            self.assertEqual(original, struct.pack('=II', 4, (1 << 17) | (16 if kind == 'worker' else 4)) + b'retry\0')
                             if kind == 'worker':
                                 with tempfile.TemporaryFile() as worker:
                                     worker.write(b'W'); worker.seek(0)
@@ -134,7 +134,7 @@ class BrokerTestCase(DistccTestCase):
         return proc
 
     def request(self, command=1, work=(0, 0, 0), work_units=0, family=0, memory_class=None,
-                cpp_limit=2147483647):
+                cpp_limit=2147483647, scope_key=0):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
@@ -145,7 +145,7 @@ class BrokerTestCase(DistccTestCase):
             if memory_class is None:
                 kind = {7: 3, 8: 4, 10: 5}.get(work[2], 1 if 4 <= work[2] <= 6 else 0)
                 memory_class = 1 + kind * 64 + max(0, work[1].bit_length() - 1) if work[0] else 0
-            payload += struct.pack('=QQIIQQ', *work, work_units, family, memory_class)
+            payload += struct.pack('=QQIIQQQ', *work, work_units, family, scope_key, memory_class)
         sock.sendall(payload)
         self.addCleanup(sock.close)
         return sock
@@ -341,11 +341,10 @@ class BrokerDirectTest(BrokerTestCase):
         listener = socket.create_server(('127.0.0.2', self.ports[1]))
         self.addCleanup(listener.close)
         self.start_broker(self.host(0, f',tcp,stats={local.port}') +
-                          f' 127.0.0.2:{self.ports[1]}/2,tcp,stats={remote.port},speed=0.5')
+                          f' 127.0.0.2:{self.ports[1]}/2,tcp,stats={remote.port},speed=0.8')
         first = self.request(15, (1, 4 * 1024 * 1024, 4))
         self.assertEqual(self.receive(first), (0, 1, []))
-        # Local SMT adds .25 throughput; the independent remote core adds .5.
-        # Both stages must make the same choice despite lower local latency.
+        # With a sibling compiling, the independent remote core finishes this TU sooner.
         declined = self.request(15, (2, 4 * 1024 * 1024, 4))
         self.assertEqual(self.receive(declined), (0, 0, []))
         _, net = self.acquire_reserved(10, (2, 4 * 1024 * 1024, 4))
@@ -398,7 +397,10 @@ class BrokerDirectTest(BrokerTestCase):
         remote = self.peer(metrics, address='127.0.0.2')
         self.start_broker(self.host(0, f',tcp,stats={local.port}') +
                           f' 127.0.0.2:{self.ports[1]}/1,tcp,stats={remote.port},speed=2')
-        request = self.request(15, (1, 1024, 1))
+        tiny = self.request(15, (1, 1024, 1))
+        self.assertEqual(self.receive(tiny), (0, 1, []))
+        tiny.close()
+        request = self.request(15, (2, 4 * 1024**2, 1))
         self.assertEqual(self.receive(request), (0, 0, []))
 
     def local_broker(self):
@@ -502,7 +504,7 @@ class BrokerPlacementTest(BrokerTestCase):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
                      running=16, busy=16, queued=0, preparing=0, returning=0)),
                  self.peer(stats_response(cpus=4, cores=4, jobs=4, capacity=4,
-                     running=4, busy=4, queued=0, preparing=0, returning=0)),
+                     running=4, busy=4, queued=0, preparing=1, returning=0)),
                  self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=4,
                      running=3, busy=3, queued=0, preparing=0, returning=0))]
         speeds, slots = (1, .56, .49), (16, 4, 4)
@@ -521,7 +523,7 @@ class BrokerPlacementTest(BrokerTestCase):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
                      running=0, busy=0, queued=0, preparing=0, returning=0)),
                  self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=2,
-                     running=0, busy=0, queued=0, preparing=0, returning=0))]
+                     running=0, busy=0, queued=0, preparing=1, returning=0))]
         self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={1 if i==0 else .8}',
                                      slots=16 if i==0 else 4) for i,p in enumerate(peers)))
         for index, expected in enumerate([0]*8+[1]*2+[0]*3):
@@ -630,7 +632,7 @@ class BrokerPlacementTest(BrokerTestCase):
     def test_pipeline_compares_against_the_actual_ready_choice(self):
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
         queued = stats_response(cpus=8, cores=4, jobs=8, capacity=8,
-                                running=8, busy=8, queued=0, preparing=0, returning=0)
+                                running=8, busy=8, queued=0, preparing=2, returning=0)
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16, capacity=16,
                      running=26, busy=14, queued=0, preparing=0, returning=0)),
                  self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=4,
@@ -641,7 +643,7 @@ class BrokerPlacementTest(BrokerTestCase):
                                      slots=slots[i]) for i, p in enumerate(peers)))
         request = self.request(10, (1501, 4 * 1024**2, 2))
         # The eight-lane candidate wins the finish comparison but has no
-        # staging allowance. Keep it movable until an execution lane opens.
+        # free staging slot. Keep it movable until an execution lane opens.
         request.settimeout(.1)
         with self.assertRaises(socket.timeout): request.recv(1032)
         queued = stats_response(cpus=8, cores=4, jobs=8, capacity=8,
@@ -681,12 +683,37 @@ class BrokerTest(BrokerTestCase):
         _, net = self.acquire_reserved(10, (100, 1048576, 5), family=100)
         self.assertEqual(net.getpeername()[1], self.ports[1])
 
+    def test_adjacent_cold_sources_reuse_the_completed_directory_scope(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        peers = [self.peer(stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                    running=0, busy=0, queued=0, preparing=0, returning=0)) for _ in range(2)]
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port}', slots=1)
+                                   for i, p in enumerate(peers)))
+        first, first_net = self.acquire_reserved(10, (1, 4096, 4))
+        self.assertEqual(first_net.getpeername()[1], self.ports[0])
+        def complete(key, scope, expected):
+            client = self.request(10, (key, 4096, 4), family=key, scope_key=scope)
+            status, _, fds = self.receive(client)
+            self.assertEqual(status, 0)
+            with socket.socket(fileno=fds[0]) as net:
+                self.assertEqual(net.getpeername()[1], self.ports[expected])
+                client.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 1_000_000, 0, 10_000_000, 0)],
+                               [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))])
+                self.assertEqual(client.recv(1), b'')
+        complete(2, 101, 1)
+        first.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 1_000_000, 0, 10_000_000, 0)],
+                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [first_net.fileno()]))])
+        self.assertEqual(first.recv(1), b'')
+        complete(3, 101, 1)
+        self.assertIn('source affinity: key=3 ', (self.work/'broker.log').read_text())
+        complete(4, 202, 0)
+
     def test_source_affinity_does_not_follow_a_slower_owner(self):
         peers = [self.peer(stats_response(cpus=4, cores=4, jobs=4, capacity=4,
                     running=0, busy=0, queued=0, preparing=0, returning=0)) for _ in range(2)]
         self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else 1}', slots=4)
                                   for i, p in enumerate(peers)))
-        occupied = [self.acquire_reserved(10, (100 + i, 1048576, 5), family=100 + i)[0] for i in range(4)]
+        occupied = [self.acquire_reserved(10, (100 + i, 1048576, 5), family=100 + i)[0] for i in range(5)]
         _, owner = self.acquire_reserved(10, (200, 1048576, 5), family=200)
         self.assertEqual(owner.getpeername()[1], self.ports[1])
         for lease in occupied: lease.close()
@@ -1126,15 +1153,15 @@ class BrokerTest(BrokerTestCase):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2, busy=2, available=0))
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))
         status, slots, fds = self.receive(self.request(2))
-        self.assertEqual((status, slots, fds), (0, 8, []))
+        self.assertEqual((status, slots, fds), (0, 10, []))
 
-    def test_jobs_add_pipeline_only_to_large_tcp_workers(self):
+    def test_jobs_include_bounded_staging_from_two_tcp_lanes(self):
         for index, (layout, expected) in enumerate((
-                ([(16, True), (8, True), (4, True), (4, True)], 36),
-                ([(1, True), (2, True), (8, False)], 11),
+                ([(16, True), (8, True), (4, True), (4, True)], 40),
+                ([(1, True), (2, True), (8, False)], 12),
                 ([(32, True)], 36),
-                ([(8, True), (4, True)], 12),
-                ([(15, True)], 15),
+                ([(8, True), (4, True)], 15),
+                ([(15, True)], 19),
                 ([(16, False)], 16),
                 ([(8, False)], 8))):
             with self.subTest(layout=layout):
@@ -1152,10 +1179,10 @@ class BrokerTest(BrokerTestCase):
 
     def test_jobs_expose_small_class_capacity_without_overadmitting_large_jobs(self):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2,
-            busy=0, running=0, queued=0, preparing=0, returning=0,
+            busy=0, running=0, queued=0, preparing=0, returning=0, memory_headroom_bytes=512 * 1024**2,
             compile_capacity=[2] * 64, pump_capacity=[2] * 64))
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))
-        self.assertEqual(self.receive(self.request(2)), (0, 8, []))
+        self.assertEqual(self.receive(self.request(2)), (0, 10, []))
         first, first_net = self.acquire_reserved(9, (201, 1024, 4), 1024)
         second, second_net = self.acquire_reserved(9, (202, 1024, 4), 1024)
         waiting = self.request(9, (203, 1024, 4), 1024)
@@ -1618,9 +1645,9 @@ class BrokerTest(BrokerTestCase):
             self.assertEqual(net.getpeername()[1], self.ports[1], name)
             self.job(name)
 
-    def test_hinted_jobs_fill_only_the_larger_workers_bounded_pipeline(self):
-        for lanes, capacity, pipeline in ((4, 4, 0), (8, 8, 0), (15, 15, 0),
-                                          (16, 16, 4), (16, 8, 0), (16, 4, 0)):
+    def test_hinted_jobs_fill_only_the_bounded_pipeline(self):
+        for lanes, capacity, pipeline in ((1, 1, 0), (2, 2, 1), (4, 4, 1), (8, 8, 2), (15, 15, 4),
+                                          (16, 16, 4), (16, 8, 2), (16, 4, 1)):
             with self.subTest(lanes=lanes, capacity=capacity):
                 peer = self.peer(stats_response(cpus=lanes, cores=lanes, jobs=lanes,
                     running=capacity, busy=capacity, queued=0, preparing=0,
@@ -1724,7 +1751,7 @@ class BrokerTest(BrokerTestCase):
         # request deadline. The next turn must consume readiness before expiry.
         trace = self.work/'delayed-poll.trace'
         self.start_broker(name='delayed-poll', prefix=['strace', '--kill-on-exit', '-qq', '-o', str(trace),
-            '-e', 'trace=ppoll', '-e', 'inject=ppoll:error=EINTR:delay_exit=4s:when=2'])
+            '-e', 'trace=epoll_pwait', '-e', 'inject=epoll_pwait:error=EINTR:delay_exit=4s:when=2'])
         owner = self.memo(b'delayed-driver', 16)
         owner.settimeout(6)
         self.assertEqual(owner.recv(65536), b'\0')

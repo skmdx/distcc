@@ -336,7 +336,7 @@ common_obj = src/arg.o src/argutil.o					\
 	src/cleanup.o src/compress.o src/compress_stream.o					\
 	src/trace.o src/util.o src/io.o src/exec.o			\
 	$(rpc_obj) src/tempfile.o src/bulk.o src/help.o src/filename.o	\
-	src/lock.o src/resource.o					\
+	src/lock.o src/broker_session.o src/resource.o					\
 	src/netutil.o							\
 	src/pump.o							\
 	src/sendfile.o							\
@@ -421,7 +421,7 @@ distcc_obj += src/remote_job.o src/file_cache.o
 h_compile_obj += src/remote_job.o src/file_cache.o
 
 # All source files, for the purposes of building the distribution
-SRC =	src/stats.c src/adaptive.c src/broker.c src/workload.c src/clang_worker.c src/local_clang.c	\
+SRC =	src/stats.c src/adaptive.c src/broker.c src/broker_session.c src/workload.c src/clang_worker.c src/local_clang.c	\
 	src/access.c src/arg.c src/argutil.c				\
 	src/auth_common.c src/auth_distcc.c src/auth_distccd.c		\
 	src/backoff.c src/bulk.c src/compress_stream.c src/file_cache.c	\
@@ -457,7 +457,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c src/workload.c src/clang_worker.c 
 	src/gcc_scan.cc src/gcc_scan_inputs.cc include_server/build_gcc_scan.py
 
 
-HEADERS = src/stats.h src/adaptive.h src/broker.h src/broker_protocol.h src/cpuperf.h src/workload.h src/file_cache.h	\
+HEADERS = src/stats.h src/adaptive.h src/broker.h src/broker_protocol.h src/broker_session.h src/epoll_set.h src/lane_schedule.h src/cpuperf.h src/workload.h src/file_cache.h	\
 	src/access.h							\
 	src/auth.h							\
 	src/bulk.h							\
@@ -625,8 +625,8 @@ gcc_plan.so: $(srcdir)/src/gcc_plan.cc $(srcdir)/src/gcc_dependencies.cc $(srcdi
 CLIENT_CONTRACT_SOURCES = src/hosts.c src/hostfile.c src/loadfile.c src/lock.c src/io.c src/tempfile.c \
 	src/trace.c src/util.c src/argutil.c src/rpc.c src/filename.c src/snprintf.c src/cleanup.c
 # Host configuration must link without the client-only scheduler, as in distccd.
-h_client_hotpaths: test/client_hotpaths.c src/tcp_client.c src/tcp_job.c src/tcp_job.h src/local_clang.c src/broker.c src/broker_protocol.h src/argv_file.c src/frontend_fs.c src/frontend_identity.h $(CLIENT_CONTRACT_SOURCES)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/tcp_job.c src/local_clang.c src/broker.c src/argv_file.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
+h_client_hotpaths: test/client_hotpaths.c src/tcp_client.c src/tcp_job.c src/tcp_job.h src/local_clang.c src/broker.c src/broker_session.c src/broker_protocol.h src/broker_session.h src/epoll_set.h src/lane_schedule.h src/workload.h src/argv_file.c src/frontend_fs.c src/frontend_identity.h $(CLIENT_CONTRACT_SOURCES)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/tcp_job.c src/local_clang.c src/broker.c src/broker_session.c src/argv_file.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
 h_resource: test/resource.c src/resource.c src/resource.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 h_file_cache: test/file_cache.c src/file_cache.c src/file_cache.h src/remote_job.c src/job.h $(CLIENT_CONTRACT_SOURCES)

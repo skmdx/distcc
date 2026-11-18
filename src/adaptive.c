@@ -41,6 +41,54 @@ static int read_capacity(int fd, struct dcc_capacity *cap)
     return used == sizeof(buf) - 1 ? -1 : dcc_parse_capacity(buf, cap);
 }
 
+#ifdef __linux__
+#include "tcp_job.h"
+int dcc_capacity_update(struct dcc_capacity *cap, const struct dcc_load_report *r, int owned)
+{
+    unsigned id = dcc_tcp_get32(r->memory_class);
+    uint64_t estimate = dcc_tcp_get64(r->estimate), typical = dcc_tcp_get64(r->job_memory);
+    if (!id || id > DCC_JOB_KIND_COUNT * DCC_MEMORY_BUCKETS || !estimate || !typical ||
+        dcc_tcp_get32(r->capacity) > 10000 || dcc_tcp_get32(r->busy) > 10000 ||
+        dcc_tcp_get32(r->queued) > 10000 || dcc_tcp_get32(r->preparing) > 10000 ||
+        dcc_tcp_get32(r->returning) > 10000 || dcc_tcp_get32(r->suspended) > 10000 ||
+        dcc_tcp_get32(r->links) > 10000) return -1;
+    int32_t running = dcc_tcp_get32(r->running), scale = dcc_tcp_get32(r->cpu_scale);
+    int32_t pressure = dcc_tcp_get32(r->pressure);
+    if (running < -1 || running > 1000000 || (scale != -1000 && (scale < 0 || scale > 1000)) ||
+        (pressure != -1000 && (pressure < 0 || pressure > 100000))) return -1;
+    int kind = (id - 1) / DCC_MEMORY_BUCKETS, bucket = (id - 1) % DCC_MEMORY_BUCKETS;
+    unsigned kinds[] = {DCC_JOB_COMPILE, DCC_JOB_PUMP, DCC_JOB_RUST, DCC_JOB_THINLTO,
+                        DCC_JOB_OFFLOAD_LINK, DCC_JOB_FRONTEND};
+    cap->live_report = 1;
+    cap->memory_headroom = dcc_tcp_get64(r->headroom);
+    cap->memory_reserved = dcc_tcp_get64(r->reserved);
+    cap->job_memory = typical;
+    cap->capacity = dcc_tcp_get32(r->capacity);
+    cap->busy = dcc_tcp_get32(r->busy);
+    cap->queued = dcc_tcp_get32(r->queued);
+    cap->preparing = dcc_tcp_get32(r->preparing);
+    cap->returning = dcc_tcp_get32(r->returning);
+    cap->suspended = dcc_tcp_get32(r->suspended);
+    cap->links = dcc_tcp_get32(r->links);
+    cap->running = running;
+    if (cap->running >= 0) cap->running = cap->running > owned ? cap->running - owned : 0;
+    cap->cpu_scale = scale / 1000.0;
+    uint32_t cpu_state = dcc_tcp_get32(r->cpu_state), age = cpu_state & INT32_MAX;
+    cap->cpu_age = age ? (age - 1) / 1000.0 : -1;
+    cap->cpu_probe = cpu_state >> 31;
+    cap->memory_pressure = pressure / 1000.0;
+    cap->available = cap->capacity > cap->busy ? cap->capacity - cap->busy : 0;
+    for (unsigned i = 0; i < sizeof(kinds)/sizeof(*kinds); ++i) {
+        if (kinds[i] == (unsigned)kind) {
+            unsigned long long *bytes = i == 5 ? cap->frontend_memory : cap->memory_estimates[i];
+            bytes[bucket] = estimate;
+            break;
+        }
+    }
+    return 0;
+}
+#endif
+
 int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
 {
     char *line, extra;
@@ -57,7 +105,10 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
         return -1;
 
     for (line = strtok(line, "\n"); line; line = strtok(NULL, "\n")) {
-        if (!strncmp(line, "dcc_cpus ", 9)) {
+        if (!strncmp(line, "dcc_completion_clock_ns ", 24)) {
+            if (cap->report_stamp || sscanf(line + 24, "%llu %c", &cap->report_stamp, &extra) != 1)
+                return -1;
+        } else if (!strncmp(line, "dcc_cpus ", 9)) {
             if ((fields & 1) || sscanf(line + 9, "%lf %c", &value, &extra) != 1 ||
                 !(value >= 1 && value <= 10000) || value != (int)value)
                 return -1;
@@ -106,23 +157,19 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
                 return -1;
             cap->load = value;
             fields |= 4;
-        } else if (!strncmp(line, "dcc_frontend_capacity ", 22)) {
-            if ((fields & (1ULL << 34)) || sscanf(line + 22, "%lf %c", &value, &extra) != 1 ||
-                !(value >= -1 && value <= 10000) || value != (int)value) return -1;
-            cap->frontend_capacity = value;
-            fields |= 1ULL << 34;
         } else if (!strncmp(line, "dcc_compile_capacity ", 21) ||
                    !strncmp(line, "dcc_pump_capacity ", 18) ||
                    !strncmp(line, "dcc_rust_capacity ", 18) ||
                    !strncmp(line, "dcc_thinlto_capacity ", 21) ||
-                   !strncmp(line, "dcc_offload_capacity ", 21)) {
+                   !strncmp(line, "dcc_offload_capacity ", 21) || !strncmp(line, "dcc_frontend_capacity ", 22)) {
+            int frontend = !strncmp(line, "dcc_frontend_capacity ", 22);
             int pump = !strncmp(line, "dcc_pump_capacity ", 18);
             int rust = !strncmp(line, "dcc_rust_capacity ", 18);
             int thinlto = !strncmp(line, "dcc_thinlto_capacity ", 21);
             int offload = !strncmp(line, "dcc_offload_capacity ", 21);
-            unsigned long long field = offload ? 1ULL << 32 : thinlto ? 536870912 : rust ? 2097152 : pump ? 1048576 : 524288;
-            int *capacity = offload ? cap->offload_capacity : thinlto ? cap->thinlto_capacity : rust ? cap->rust_capacity : pump ? cap->pump_capacity : cap->compile_capacity;
-            char *item = line + (pump || rust ? 18 : 21), *end;
+            unsigned long long field = frontend ? 1ULL << 34 : offload ? 1ULL << 32 : thinlto ? 536870912 : rust ? 2097152 : pump ? 1048576 : 524288;
+            int *capacity = frontend ? cap->frontend_capacity : offload ? cap->offload_capacity : thinlto ? cap->thinlto_capacity : rust ? cap->rust_capacity : pump ? cap->pump_capacity : cap->compile_capacity;
+            char *item = line + (frontend ? 22 : pump || rust ? 18 : 21), *end;
             if (fields & field) return -1;
             for (unsigned i = 0; i < DCC_MEMORY_BUCKETS; ++i) {
                 if ((*item < '0' || *item > '9') && strncmp(item, "-1", 2)) return -1;
@@ -146,10 +193,10 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
             const char *names[] = {"dcc_memory_headroom_bytes", "dcc_memory_reserved_bytes", "dcc_job_memory_bytes",
                                   "dcc_compile_memory", "dcc_pump_memory", "dcc_rust_memory", "dcc_thinlto_memory", "dcc_offload_memory", "dcc_frontend_memory"};
             unsigned long long *values[] = {&cap->memory_headroom, &cap->memory_reserved, &cap->job_memory,
-                cap->memory_estimates[0], cap->memory_estimates[1], cap->memory_estimates[2], cap->memory_estimates[3], cap->memory_estimates[4], &cap->frontend_memory};
+                cap->memory_estimates[0], cap->memory_estimates[1], cap->memory_estimates[2], cap->memory_estimates[3], cap->memory_estimates[4], cap->frontend_memory};
             unsigned row = 0;
             while (strncmp(line, names[row], strlen(names[row]))) row++;
-            unsigned count = row < 3 || row == 8 ? 1 : DCC_MEMORY_BUCKETS;
+            unsigned count = row < 3 ? 1 : DCC_MEMORY_BUCKETS;
             unsigned long long field = row == 8 ? 1ULL << 35 : row == 7 ? 1ULL << 33 : 4194304ULL << row;
             char *item = line + strlen(names[row]) + 1, *end;
             if (fields & field) return -1;

@@ -83,7 +83,6 @@ static int cached(const unsigned char hash[DCC_FILE_HASH_SIZE], struct dcc_recor
     int shard = cache_shard(cache, hash, key, 0);
     assert(shard >= 0);
     int found = !faccessat(shard, key, F_OK, 0);
-    close(shard);
     return found;
 }
 

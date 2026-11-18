@@ -6,7 +6,8 @@ struct dcc_capacity {
     int cpus, cores, jobs;
     double core_scale, smt_gain;
     double cpu_scale, cpu_age;
-    int cpu_probe;
+    int cpu_probe, live_report;
+    unsigned long long report_stamp;
     double load, memory_pressure;
     /* Optional live metrics; -1 means unavailable, never idle. */
     int running, busy, queued, links, admission, available;
@@ -17,11 +18,13 @@ struct dcc_capacity {
     int thinlto_capacity[DCC_MEMORY_BUCKETS];
     int offload_capacity[DCC_MEMORY_BUCKETS];
     /* Frontend jobs fetch inputs lazily and have no uploaded input tree. */
-    int frontend_capacity;
-    unsigned long long frontend_memory;
+    int frontend_capacity[DCC_MEMORY_BUCKETS];
+    unsigned long long frontend_memory[DCC_MEMORY_BUCKETS];
     unsigned long long memory_headroom, memory_reserved, job_memory;
     unsigned long long memory_estimates[5][DCC_MEMORY_BUCKETS];
 };
+struct dcc_load_report;
+int dcc_capacity_update(struct dcc_capacity *, const struct dcc_load_report *, int owned);
 int dcc_parse_capacity(char *buf, struct dcc_capacity *cap);
 int dcc_capacity_slots(const struct dcc_hostdef *host, const struct dcc_capacity *cap);
 int dcc_capacity_jobs(const struct dcc_hostdef *host, const struct dcc_capacity *cap);

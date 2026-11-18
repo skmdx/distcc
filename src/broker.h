@@ -1,6 +1,8 @@
 /* Local distccd scheduling and connected-socket leases. */
 #include <stdint.h>
 struct dcc_hostdef;
+#define DCC_BROKER_LEASE_BASE (1 << 28)
+void dcc_broker_release(int lease);
 struct dcc_work_hint;
 struct dcc_job_result;
 int dcc_broker_serve(const char *path);

@@ -14,7 +14,7 @@
 #include "job.h"
 #include "resource.h"
 
-static uint64_t source_family(const char *path, const char *compiler, unsigned kind, off_t size)
+static uint64_t hash_source(const char *path, off_t size)
 {
     if (size <= 0 || size > 512LL * 1024 * 1024) return 0;
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -24,11 +24,9 @@ static uint64_t source_family(const char *path, const char *compiler, unsigned k
      * described by the caller, and a pipe/device must not block hashing. */
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
         st.st_size > 512LL * 1024 * 1024) { close(fd); return 0; }
-    const char *name = strrchr(compiler, '/');
-    name = name ? name + 1 : compiler;
-    uint64_t seed = XXH3_64bits_withSeed(name, strlen(name), kind), result = 0;
+    uint64_t result = 0;
     XXH3_state_t hash = {0};
-    XXH3_64bits_reset_withSeed(&hash, seed);
+    XXH3_64bits_reset(&hash);
     char buffer[65536];
     ssize_t length;
     while ((length = read(fd, buffer, sizeof(buffer))) != 0) {
@@ -41,7 +39,7 @@ static uint64_t source_family(const char *path, const char *compiler, unsigned k
 }
 
 void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *input,
-                       const char *prepared, int fd, int ready)
+                       const char *prepared, int fd, int ready, uint64_t *input_hash)
 {
     *hint = (struct dcc_work_hint){0};
     struct stat st;
@@ -62,6 +60,7 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
     char *cwd = getcwd(NULL, 0);
     if (!cwd) return;
     key = XXH3_64bits(cwd, strlen(cwd));
+    uint64_t directory = key;
     free(cwd);
     for (int i = 0; argv[i]; ++i) {
         if (!strcmp(argv[i], "--offload-host-only") || !strcmp(argv[i], "--cuda-host-only")) host_only = 1;
@@ -91,7 +90,17 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
                          dcc_resource_bucket(hint->bytes);
     key = XXH3_64bits_withSeed(&hint->kind, sizeof(hint->kind), key);
     hint->key = key ? key : 1;
-    if (!gpu) hint->family = source_family(input, argv[0], hint->kind, hint->work_units);
+    const char *name = strrchr(argv[0], '/');
+    name = name ? name + 1 : argv[0];
+    uint64_t family = XXH3_64bits_withSeed(name, strlen(name), kind);
+    hint->scope_key = XXH3_64bits_withSeed(&directory, sizeof(directory), family);
+    if (!gpu) {
+        if (!*input_hash) *input_hash = hash_source(input, hint->work_units);
+        if (*input_hash) {
+            uint64_t phase = XXH3_64bits_withSeed(name, strlen(name), hint->kind);
+            hint->family = XXH3_64bits_withSeed(input_hash, sizeof(*input_hash), phase);
+        }
+    }
 }
 
 int dcc_work_valid(const struct dcc_work_hint *hint)
@@ -103,7 +112,7 @@ int dcc_work_valid(const struct dcc_work_hint *hint)
     if (hint->kind == DCC_WORK_RUST || hint->kind == DCC_WORK_THINLTO ||
         hint->kind == DCC_WORK_OFFLOAD_LINK) return hint->key && hint->bytes;
     return hint->work_units <= 512U * 1024 * 1024 &&
-           ((!hint->key && !hint->bytes && !hint->kind && !hint->work_units && !hint->family) ||
+           ((!hint->key && !hint->bytes && !hint->kind && !hint->work_units && !hint->family && !hint->scope_key) ||
            (hint->key && hint->bytes && hint->bytes <= 512ULL * 1024 * 1024 &&
             hint->kind >= 1 && hint->kind <= DCC_WORK_CLASSES));
 }

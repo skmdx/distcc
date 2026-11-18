@@ -43,6 +43,8 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
                    offload_memory=None, frontend_memory=None, **metrics):
     if frontend_capacity is None: frontend_capacity = metrics.get('capacity', jobs)
     if frontend_memory is None: frontend_memory = job_memory_bytes
+    frontend_capacity = ','.join([str(frontend_capacity)] * 64)
+    frontend_memory = ','.join([str(frontend_memory)] * 64)
     if compile_capacity is None:
         compile_capacity = [metrics.get('capacity', jobs)] * 64
     capacities = compile_capacity if isinstance(compile_capacity, str) else ','.join(map(str, compile_capacity))
@@ -791,6 +793,14 @@ int main(void) {
     profiled.kind = DCC_JOB_FRONTEND;
     assert(dcc_resource_class(&profiled) == 1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS);
     assert(dcc_resource_input_bytes(&profiled) == 0);
+    char *cc1[] = {"clang", "unit.cpp", "identity", "-x", "c", "-emit-obj", NULL};
+    profiled.argv = cc1;
+    unsigned c_class = dcc_resource_class(&profiled);
+    cc1[4] = "c++";
+    unsigned cxx_class = dcc_resource_class(&profiled);
+    cc1[5] = "-fsyntax-only";
+    assert(c_class != cxx_class && cxx_class != dcc_resource_class(&profiled));
+    profiled.argv = NULL;
     profiled.kind = DCC_JOB_RUST;
     assert(dcc_resource_input_bytes(&profiled) == 80*M + 2048);
     profiled.kind = DCC_JOB_LINK;

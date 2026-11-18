@@ -105,9 +105,15 @@ const char *stats_text[20] = { "TCP_ACCEPT", "REJ_BAD_REQ", "REJ_OVERLOAD",
 /* Call this to initialize stats */
 int dcc_stats_init(void) {
     if (arg_stats) {
-        if (pipe(dcc_statspipe) == -1) {
+        if (pipe2(dcc_statspipe, O_CLOEXEC)) return -1;
+        int writer = fcntl(dcc_statspipe[1], F_DUPFD_CLOEXEC, DCC_WORKER_STATS_FD + 1);
+        close(dcc_statspipe[1]);
+        if (writer < 0 || fcntl(dcc_statspipe[0], F_SETFL, O_NONBLOCK)) {
+            close(dcc_statspipe[0]);
+            if (writer >= 0) close(writer);
             return -1;
         }
+        dcc_statspipe[1] = writer;
     }
     memset(&dcc_stats, 0, sizeof(dcc_stats));
     return 0;
@@ -363,6 +369,37 @@ static int class_capacity(unsigned memory_class, int cpu_limit, const struct dcc
     return slots < cpu_limit ? slots : cpu_limit;
 }
 
+#ifdef __linux__
+void dcc_stats_completion(struct dcc_load_report *r, unsigned memory_class, uint64_t stamp)
+{
+    struct dcc_server_load load = {0};
+    dcc_prefork_status(&load);
+    struct dcc_cpu_perf cpu;
+    dcc_cpu_perf_get(&cpu);
+    int running = dcc_getcurrentload();
+    double pressure = dcc_memory_pressure();
+    dcc_tcp_put64(r->stamp, stamp);
+    dcc_tcp_put64(r->headroom, dcc_resource_headroom(load.reserved));
+    dcc_tcp_put64(r->reserved, load.reserved);
+    dcc_tcp_put64(r->estimate, dcc_resource_estimate(memory_class));
+    dcc_tcp_put64(r->job_memory, dcc_resource_job_bytes());
+    dcc_tcp_put32(r->memory_class, memory_class);
+    dcc_tcp_put32(r->busy, load.busy);
+    dcc_tcp_put32(r->queued, load.queued);
+    dcc_tcp_put32(r->preparing, load.preparing);
+    dcc_tcp_put32(r->returning, load.returning);
+    dcc_tcp_put32(r->suspended, load.suspended);
+    dcc_tcp_put32(r->links, load.links);
+    dcc_tcp_put32(r->capacity, dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids)));
+    dcc_tcp_put32(r->running, running > 0 ? running - 1 : running);
+    dcc_tcp_put32(r->pressure, (int)(pressure * 1000));
+    dcc_tcp_put32(r->cpu_scale, (int)(cpu.scale * 1000));
+    /* Low 31 bits encode age in milliseconds plus one; zero means unknown. */
+    uint32_t age = cpu.age < 0 ? 0 : cpu.age >= 2147483 ? INT32_MAX : (uint32_t)(cpu.age * 1000) + 1;
+    dcc_tcp_put32(r->cpu_state, age | ((uint32_t)!!cpu.probe << 31));
+}
+#endif
+
 static void format_capacity(char *buffer, size_t size, char *memory, size_t memory_size, unsigned kind,
                             int cpu_limit, const struct dcc_server_load *load)
 {
@@ -384,6 +421,7 @@ static size_t dcc_stats_reply(char reply[DCC_STATS_SIZE]) {
     char pump_capacity[DCC_MEMORY_BUCKETS * 12];
     char rust_capacity[DCC_MEMORY_BUCKETS * 12];
     char thinlto_capacity[DCC_MEMORY_BUCKETS * 12];
+    char frontend_capacity[DCC_MEMORY_BUCKETS * 12], frontend_memory[DCC_MEMORY_BUCKETS * 21];
     char offload_capacity[DCC_MEMORY_BUCKETS * 12];
     char compile_memory[DCC_MEMORY_BUCKETS * 21];
     char pump_memory[DCC_MEMORY_BUCKETS * 21];
@@ -410,6 +448,7 @@ Content-Type: text/plain\n\
 Connection: close\n\n\
 argv /distccd\n\
 <distccstats>\n\
+dcc_completion_clock_ns %llu\n\
 dcc_tcp_accept %d\n\
 dcc_rej_bad_req %d\n\
 dcc_rej_overload %d\n\
@@ -456,7 +495,7 @@ dcc_pump_capacity %s\n\
 dcc_rust_capacity %s\n\
 dcc_thinlto_capacity %s\n\
 dcc_offload_capacity %s\n\
-dcc_frontend_capacity %d\n\
+dcc_frontend_capacity %s\n\
 dcc_memory_headroom_bytes %llu\n\
 dcc_memory_reserved_bytes %llu\n\
 dcc_compile_memory %s\n\
@@ -464,7 +503,7 @@ dcc_pump_memory %s\n\
 dcc_rust_memory %s\n\
 dcc_thinlto_memory %s\n\
 dcc_offload_memory %s\n\
-dcc_frontend_memory %llu\n\
+dcc_frontend_memory %s\n\
 dcc_local_input_jobs %llu\n\
 dcc_local_input_bytes %llu\n\
 dcc_tcp_ready_idle_ns %llu\n\
@@ -501,6 +540,7 @@ dcc_free_mem %d MB\n\
     format_capacity(pump_capacity, sizeof(pump_capacity), pump_memory, sizeof(pump_memory), DCC_JOB_PUMP, cpu_limit, &load);
     format_capacity(rust_capacity, sizeof(rust_capacity), rust_memory, sizeof(rust_memory), DCC_JOB_RUST, cpu_limit, &load);
     format_capacity(thinlto_capacity, sizeof(thinlto_capacity), thinlto_memory, sizeof(thinlto_memory), DCC_JOB_THINLTO, cpu_limit, &load);
+    format_capacity(frontend_capacity, sizeof(frontend_capacity), frontend_memory, sizeof(frontend_memory), DCC_JOB_FRONTEND, cpu_limit, &load);
     format_capacity(offload_capacity, sizeof(offload_capacity), offload_memory, sizeof(offload_memory), DCC_JOB_OFFLOAD_LINK, cpu_limit, &load);
 #ifdef __linux__
     capacity = dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids));
@@ -527,7 +567,10 @@ dcc_free_mem %d MB\n\
 #ifdef __linux__
         if (running > 0) running--; /* Exclude this statistics request itself. */
 #endif
+        struct timespec stamp = {0};
+        clock_gettime(CLOCK_MONOTONIC, &stamp);
         reply_len = snprintf(reply, DCC_STATS_SIZE, replytemplate,
+                               (unsigned long long)stamp.tv_sec * 1000000000 + stamp.tv_nsec,
                                dcc_stats.counters[STATS_TCP_ACCEPT],
                                dcc_stats.counters[STATS_REJ_BAD_REQ],
                                dcc_stats.counters[STATS_REJ_OVERLOAD],
@@ -553,10 +596,10 @@ dcc_free_mem %d MB\n\
                                capacity, dcc_resource_job_bytes(), dcc_resource_samples(),
                                dcc_resource_peak_bytes(), dcc_resource_spare_bytes(),
                                compile_capacity, pump_capacity, rust_capacity, thinlto_capacity, offload_capacity,
-                               class_capacity(1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS, cpu_limit, &load),
+                               frontend_capacity,
                                dcc_resource_headroom(load.reserved), load.reserved,
                                compile_memory, pump_memory, rust_memory, thinlto_memory, offload_memory,
-                               dcc_resource_estimate(1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS),
+                               frontend_memory,
                                (unsigned long long)dcc_tcp_local_input_jobs(),
                                (unsigned long long)dcc_tcp_local_input_bytes(),
                                ready_idle_ns, parallel_tasks, parallel_peak,
@@ -662,7 +705,6 @@ static void dcc_stats_process(struct statsdata *sd) {
 int dcc_stats_server(int listen_fd)
 {
     int i, ret;
-    struct statsdata sd;
 
     /* clear stats data */
     for (i = 0; i < STATS_ENUM_MAX; i++)
@@ -700,9 +742,11 @@ int dcc_stats_server(int listen_fd)
         if (ret != -1) {
             if (stats_polls[0].revents & POLLIN) {
                 /* Received stats report from a child */
-                if (read(dcc_statspipe[0], &sd, sizeof(sd)) != -1) {
-                    dcc_stats_process(&sd);
-                }
+                struct statsdata reports[16];
+                ssize_t n;
+                while ((n = read(dcc_statspipe[0], reports, sizeof(reports))) > 0)
+                    for (size_t j = 0; j < (size_t)n / sizeof(*reports); ++j)
+                        dcc_stats_process(&reports[j]);
             }
 
             time_t now = time(NULL);
@@ -710,6 +754,10 @@ int dcc_stats_server(int listen_fd)
                 struct stats_client *client = &stats_clients[i];
                 if (now - client->since >= dcc_get_io_timeout() ||
                     (stats_polls[i + 2].revents && dcc_stats_client_event(client))) {
+#ifdef __linux__
+                    dcc_prefork_forget_extra(i + 2);
+                    if (i != stats_count - 1) dcc_prefork_forget_extra(stats_count + 1);
+#endif
                     close(client->fd);
                     free(client->reply);
                     *client = stats_clients[--stats_count];

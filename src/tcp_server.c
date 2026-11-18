@@ -23,6 +23,7 @@
 #include "file_cache.h"
 #include "resource.h"
 #include "cpuperf.h"
+#include "stats.h"
 #include "daemon.h"
 #include "tcp_job.h"
 #include "frontend_fs.h"
@@ -65,7 +66,7 @@ struct dcc_tcp_server {
     struct dcc_job *job;
     struct dcc_tcp_run run;
     struct input *inputs;
-    struct dcc_record_cache *cache;
+    char *paths;
     unsigned remaining, input_index, output_index, prepared;
     uint64_t input_offset, output_offset, reserved, input_bytes, result_bytes;
     uint64_t input_pending; /* File bytes not yet materialized in the private tree. */
@@ -73,6 +74,7 @@ struct dcc_tcp_server {
     unsigned storage_group;
     int result_pending;
     XXH3_state_t *hash;
+    unsigned memory_class;
     struct dcc_job_result result;
     unsigned char *buffer;
     struct dcc_tcp_server *ready_next;
@@ -247,11 +249,10 @@ static void need(struct input *in)
      * also send an early NEED that the final batch would repeat. */
     if (!in->server->prepared || !in->server->storage_reserved) return;
     size_t size = dcc_tcp_bitmap_size(in->server->job->count);
-    unsigned char *bits = calloc(size, 1);
-    if (!bits) { in->server->failed = 1; return; }
+    unsigned char bits[DCC_JOB_INPUT_MAX / 8];
+    memset(bits, 0, size);
     bits[in->index / 8] = 1U << (in->index % 8);
     queue(in->server, DCC_TCP_NEED, bits, size);
-    free(bits);
 }
 static void unhash(struct upload *u)
 {
@@ -301,13 +302,20 @@ struct tree_cleanup {
     uint64_t bytes;
     char root[PATH_MAX];
     struct dcc_job *job;
-    struct dcc_record_cache *cache;
 };
-static void prune_inputs(const struct dcc_job *job, struct dcc_record_cache *cache)
+static struct dcc_record_cache *job_cache(const struct dcc_job *job)
+{
+    static _Thread_local struct dcc_record_cache *cache[2];
+    unsigned index = !!dcc_job_tree(job);
+    if (!cache[index]) cache[index] = dcc_file_cache_open(dcc_job_tmp_top(job));
+    return cache[index];
+}
+
+static void prune_inputs(const struct dcc_job *job)
 {
     if (job) for (unsigned i = 0; i < job->count; ++i) {
         if (dcc_job_shared(job, i) && job->inputs[i].cached) {
-            dcc_file_cache_prune(cache);
+            dcc_file_cache_prune(job_cache(job));
             break;
         }
     }
@@ -316,8 +324,7 @@ static void cleanup_tree(void *argument)
 {
     struct tree_cleanup *tree = argument;
     remove_tree(AT_FDCWD, tree->root);
-    prune_inputs(tree->job, tree->cache);
-    dcc_file_cache_close(tree->cache);
+    prune_inputs(tree->job);
 }
 static void cleanup_complete(void *argument)
 {
@@ -334,7 +341,6 @@ static void release_inputs(struct dcc_tcp_server *s)
     if (s->job) for (unsigned i = 0; i < s->job->count; ++i) {
         if (s->inputs) {
             detach(&s->inputs[i]);
-            free(s->inputs[i].path);
         }
     }
     if (s->input_fd >= 0) close(s->input_fd);
@@ -348,23 +354,21 @@ static void release_inputs(struct dcc_tcp_server *s)
             strcpy(tree->root, s->run.root);
             tree->bytes = bytes;
             tree->job = s->job;
-            tree->cache = s->cache;
             if (!dcc_tcp_async_submit(&tree->work, cleanup_tree, cleanup_complete, tree)) {
                 bytes = 0;
                 s->job = NULL;
-                s->cache = NULL;
             }
             else { free(tree); tree = NULL; }
         }
         /* Allocation/thread creation failure must still reclaim the private tree. */
         if (!tree) {
             remove_tree(AT_FDCWD, s->run.root);
-            prune_inputs(s->job, s->cache);
+            prune_inputs(s->job);
         }
     }
     s->run.root[0] = 0;
     free(s->inputs); s->inputs = NULL;
-    dcc_file_cache_close(s->cache); s->cache = NULL;
+    free(s->paths); s->paths = NULL;
     dcc_job_free(s->job); s->job = NULL;
     retained -= bytes;
     s->reserved -= s->input_bytes;
@@ -564,11 +568,17 @@ static int prepare_paths(struct dcc_tcp_server *s)
     int root = open(s->run.root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     int ret = -1;
     if (root < 0 || !paths) goto done;
+    size_t rootlen = strlen(s->run.root), length = rootlen * count;
+    for (unsigned i = 0; i < count; ++i) length += strlen(s->job->inputs[i].path) + 1;
+    char *next = s->paths = malloc(length);
+    if (!next) goto done;
     for (unsigned i = 0; i < count; ++i) {
         struct input *in = &s->inputs[i];
         in->index = i;
         in->server = s;
-        if (asprintf(&in->path, "%s%s", s->run.root, s->job->inputs[i].path) < 0) goto done;
+        in->path = next;
+        memcpy(next, s->run.root, rootlen);
+        next = stpcpy(next + rootlen, s->job->inputs[i].path) + 1;
         paths[i] = s->job->inputs[i].path;
     }
     qsort(paths, count, sizeof(*paths), path_order);
@@ -587,7 +597,7 @@ static int prepare_paths(struct dcc_tcp_server *s)
             *p = 0;
             char *prefix = path;
             int conflict = bsearch(&prefix, paths, count, sizeof(*paths), path_order) != NULL ||
-                           mkdirat(root, path + 1, 0700);
+                           (mkdirat(root, path + 1, 0700) && errno != EEXIST);
             *p = '/';
             if (conflict) goto done;
         }
@@ -604,17 +614,17 @@ static void prepare_inputs(void *argument)
     struct dcc_tcp_server *s = argument;
     s->input_error = prepare_paths(s);
     if (s->input_error) return;
-    const char *tmp = dcc_job_tmp_top(s->job);
-    int opened = 0;
+    struct dcc_record_cache *cache = NULL;
+    int checked = 0;
     for (unsigned i = 0; i < s->job->count; ++i) {
         const struct dcc_job_input *file = &s->job->inputs[i];
         if (!dcc_job_file(file) || file->fd >= 0) continue;
-        if (file->cached && !opened) {
-            s->cache = dcc_file_cache_open(tmp);
-            opened = 1;
+        if (file->cached && !checked) {
+            cache = job_cache(s->job);
+            checked = 1;
         }
         s->inputs[i].wanted = !file->cached ||
-            !dcc_file_cache_get(s->cache, file->digest, file->plain_size,
+            !dcc_file_cache_get(cache, file->digest, file->plain_size,
                                 s->inputs[i].path, dcc_job_shared(s->job, i));
     }
 }
@@ -626,8 +636,8 @@ static int request_inputs(struct dcc_tcp_server *s)
     storage_pending[s->storage_group] += s->input_pending;
     s->storage_reserved = 1;
     size_t size = dcc_tcp_bitmap_size(s->job->count);
-    unsigned char *wanted = calloc(size ? size : 1, 1);
-    if (!wanted) return -1;
+    unsigned char wanted[DCC_JOB_INPUT_MAX / 8];
+    memset(wanted, 0, size);
     int any = 0;
     for (unsigned i = 0; i < s->job->count; ++i) {
         if (s->inputs[i].wanted && s->job->inputs[i].cached) {
@@ -635,9 +645,7 @@ static int request_inputs(struct dcc_tcp_server *s)
             any = 1;
         }
     }
-    int ret = any ? queue(s, DCC_TCP_NEED, wanted, size) : 0;
-    free(wanted);
-    return ret;
+    return any ? queue(s, DCC_TCP_NEED, wanted, size) : 0;
 }
 
 static void prepare_complete(void *argument)
@@ -723,7 +731,7 @@ static void decode_input(void *argument)
         XXH64_canonicalFromHash(&digest, XXH3_64bits_digest(s->hash));
         if (s->input_offset + length != s->job->inputs[index].plain_size ||
             memcmp(digest.digest, s->job->inputs[index].digest, 8)) s->input_error = -1;
-        else dcc_file_cache_put(s->cache, s->job->inputs[index].digest, s->inputs[index].path,
+        else dcc_file_cache_put(job_cache(s->job), s->job->inputs[index].digest, s->inputs[index].path,
                                dcc_job_shared(s->job, index));
     }
 }
@@ -842,6 +850,7 @@ void dcc_tcp_server_finished(struct dcc_tcp_server *s, const struct dcc_tcp_fini
     if (used != count) goto fail;
     /* Result FDs now own the output inodes. Input lifetime ends here, not
      * when a slow receiver eventually consumes the last result byte. */
+    s->memory_class = dcc_resource_class(s->job);
     release_inputs(s);
     /* A result exists already. Keep its FDs while asynchronous input cleanup
      * frees the budget; never discard completed work for transient pressure.
@@ -963,11 +972,13 @@ static int output(struct dcc_tcp_server *s)
         return accept_output(s);
     }
     if (!s->head) {
-        unsigned char id[8];
-        dcc_tcp_put64(id, s->run.id);
+        struct dcc_tcp_complete complete;
+        dcc_tcp_put64(complete.id, s->run.id);
+        unsigned memory_class = s->memory_class;
         /* Reclaim job resources before exposing the reusable boundary. */
         reset_job(s);
-        return queue(s, DCC_TCP_COMPLETE, id, sizeof(id));
+        dcc_stats_completion(&complete.load, memory_class, monotonic_ns());
+        return queue(s, DCC_TCP_COMPLETE, &complete, sizeof(complete));
     }
     return 0;
 }

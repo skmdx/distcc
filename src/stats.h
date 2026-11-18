@@ -36,6 +36,11 @@ enum stats_e { STATS_TCP_ACCEPT, STATS_REJ_BAD_REQ, STATS_REJ_OVERLOAD,
 
 extern const char *stats_text[20];
 
+#ifdef __linux__
+#include <stdint.h>
+struct dcc_load_report;
+void dcc_stats_completion(struct dcc_load_report *, unsigned memory_class, uint64_t stamp);
+#endif
 int  dcc_stats_init(void);
 extern int dcc_statspipe[2];
 int  dcc_stats_server(int listen_fd);

@@ -147,6 +147,7 @@ ext = setuptools.Extension(
               'src/argv_file.c',
               'src/io.c',
               'src/lock.c',
+              'src/broker_session.c',
               'src/trace.c',
               'src/snprintf.c',
               'src/util.c',

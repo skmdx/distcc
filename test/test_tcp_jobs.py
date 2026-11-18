@@ -2209,7 +2209,7 @@ class FrontendTest(BrokerTestCase):
                         *map(str, self.work.glob('*.profraw')), '-o', str(profile)],
                        check=True, capture_output=True)
         before = self.get_stats(self.stats_ports[0])
-        self.assertIn('dcc_frontend_memory 1610612736\n', before)
+        self.assertEqual(set(re.search(r'dcc_frontend_memory ([\d,]+)', before)[1].split(',')), {'1610612736'})
         for index in range(2):
             result = subprocess.run([str(self.build/'distcc'), clang, '-O3', '-c', str(source),
                                      '-fprofile-use='+str(profile),
@@ -2218,9 +2218,9 @@ class FrontendTest(BrokerTestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('frontend filesystem:', result.stderr)
         after = self.get_stats(self.stats_ports[0])
-        match = re.search(r'dcc_frontend_memory (\d+)', after)
+        match = re.search(r'dcc_frontend_memory ([\d,]+)', after)
         assert match is not None, after
-        estimate = int(match[1])
+        estimate = min(map(int, match[1].split(',')))
         self.assertGreaterEqual(estimate, 256 * 1024**2)
         self.assertLess(estimate, 1536 * 1024**2)
         self.assertIn('dcc_job_memory_samples 2\n', after)
@@ -3212,7 +3212,7 @@ sys.exit(result.returncode)
         self.assertIn('dcc_local_input_jobs 4\n', after)
         self.assertGreater(int(re.search(r'dcc_local_input_bytes (\d+)', after)[1]), 0)
 
-    def test_cache_and_cleanup_leave_event_loop_responsive(self):
+    def file_gate(self):
         hook, library = self.work / 'file-gate.c', self.work / 'file-gate.so'
         arm, marker, release = (self.work / name for name in ('arm', 'entered', 'release'))
         hook.write_text(r'''
@@ -3221,6 +3221,7 @@ sys.exit(result.returncode)
 #include <fcntl.h>
 #include <stdarg.h>
 #include <linux/fs.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3245,6 +3246,14 @@ static void gate(const char *kind) {
     dprintf(fd, "%ld %ld", (long)getpid(), (long)syscall(SYS_gettid)); close(fd);
     for (int i = 0; i < 1000 && access(getenv("TEST_FILE_RELEASE"), F_OK); ++i) usleep(10000);
 }
+int fstatat(int fd, const char *path, struct stat *st, int flags) {
+    if (strlen(path) == 16) gate("lookup");
+    return ((int (*)(int,const char *,struct stat *,int))dlsym(RTLD_NEXT, "fstatat"))(fd,path,st,flags);
+}
+int fstatat64(int fd, const char *path, struct stat64 *st, int flags) {
+    if (strlen(path) == 16) gate("lookup");
+    return ((int (*)(int,const char *,struct stat64 *,int))dlsym(RTLD_NEXT, "fstatat64"))(fd,path,st,flags);
+}
 int linkat(int src, const char *old, int dst, const char *path, int flags) {
     if (!strcmp(path, ".tmp-publish")) gate("store");
     if (strstr(path, "/distcc-tcp-")) {
@@ -3262,6 +3271,10 @@ int unlinkat(int fd, const char *path, int flags) {
         subprocess.run([self.cc, '-shared', '-fPIC', str(hook), '-ldl', '-o', str(library)],
                        check=True, capture_output=True)
         self.addCleanup(self.restart_server, self.build / 'distccd')
+        return library, arm, marker, release
+
+    def test_cache_and_cleanup_leave_event_loop_responsive(self):
+        library, arm, marker, release = self.file_gate()
         for kind in ('cache', 'store', 'cleanup', 'copy'):
             with self.subTest(kind=kind):
                 for path in (arm, marker, release): path.unlink(missing_ok=True)
@@ -3363,7 +3376,7 @@ int unlinkat(int fd, const char *path, int flags) {
             self.assertIn('SCM_RIGHTS', calls)
             self.assertIn('sendfile(', calls)  # Result publication, not an input snapshot.
             self.assertNotRegex(calls, r'sendfile\([^\n]*distcc-preprocessed')
-            returned = re.search(r'sendmsg\([^\n]*iov_len=40[^\n]*SCM_RIGHTS', calls)
+            returned = re.search(r'sendmsg\([^\n]*iov_len=128[^\n]*SCM_RIGHTS', calls)
             self.assertIsNotNone(returned, 'pooled connection was not returned')
             self.assertLess(returned.start(), calls.index('sendfile('), 'copy held the pooled connection')
             self.assertEqual(actual.read_bytes(), expected.read_bytes())
@@ -3661,7 +3674,8 @@ ssize_t write(int fd, const void *data, size_t size) {
         while True:
             kind, body = self.frame(net)
             if kind == 0x54000305:
-                self.assertEqual(body, struct.pack('!Q', identity))
+                self.assertEqual(len(body), 96)
+                self.assertEqual(body[:8], struct.pack('!Q', identity))
                 break
             self.assertEqual(kind & ~0x30000, 0x54000304)
             index, plain = struct.unpack('!II', body[:8])
@@ -3734,17 +3748,31 @@ ssize_t write(int fd, const void *data, size_t size) {
 
     def test_owner_disconnect_during_waiter_lookup_requests_input_once(self):
         body = b'int cancel_during_lookup(void) { return 903; }\n'
+        library, arm, marker, release = self.file_gate()
+        cache = self.work / 'cache'
+        cache.mkdir(mode=0o700)
+        digest = xxhash.xxh3_64(body).digest()
+        (cache / f'{64 + digest[0] % 64:02x}').mkdir(mode=0o700)
+        self.restart_server(self.build / 'distccd', LD_PRELOAD=str(library),
+                            DISTCCD_FILE_CACHE=str(cache), TEST_FILE_KIND='lookup',
+                            TEST_FILE_ARM=str(arm), TEST_FILE_ENTERED=str(marker),
+                            TEST_FILE_RELEASE=str(release))
         owner = self.wire_job(body)
         self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
-        paths = [b'/anchor/source.c', b'/progress/source.c']
-        paths += [f'/remaining_{i}/source.c'.encode() for i in range(3000)]
-        paths += [b'/done/source.c']
-        waiter = self.wire_job(body, paths=paths)
-        deadline = time.monotonic() + 5
-        while not (roots := list(self.root.glob('distcc-tcp-*/progress'))):
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(.001)
-        owner.close()
+        owner_root, = self.root.glob('distcc-tcp-*/src')
+        arm.touch()
+        waiter = self.wire_job(body, paths=[b'/waiter/source.c', b'/alias/source.c'])
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists():
+                self.assertLess(time.monotonic(), deadline, 'waiter never entered cache lookup')
+                time.sleep(.005)
+            owner.close()
+            while owner_root.exists():
+                self.assertLess(time.monotonic(), deadline, 'owner disconnect was not processed')
+                time.sleep(.005)
+        finally:
+            release.touch()
         kind, requested = self.frame(waiter)
         self.assertEqual(kind, 0x54000301)
         index, = bitmap_indices(requested)
@@ -4015,7 +4043,7 @@ with open(args[args.index('-o') + 1], 'ab') as output:
                     for i in range(12):
                         kind = 0x54020304 if i == 11 else 0x54000304
                         response += struct.pack('!IIII', kind, 39, 2, 31) + payload[i*31:(i+1)*31]
-                    response += struct.pack('!II', 0x54000305, 8) + manifest[:8]
+                    response += struct.pack('!II', 0x54000305, 96) + manifest[:8] + bytes(88)
                     if trailing:
                         response += b'unsolicited bytes'
                     net.sendall(response)

@@ -321,7 +321,7 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
         dcc_job_result_free(&result);
         dcc_job_result_init(&result);
         dcc_free_hostdef(host); host = NULL;
-        if (lease >= 0) close(lease);
+        if (lease >= 0) dcc_broker_release(lease);
         lease = -1;
     }
     dcc_broker_return(host, host->broker_fd, &result);
@@ -343,7 +343,7 @@ done:
     if (queued_fd >= 0) close(queued_fd);
     dcc_job_result_free(&result);
     if (host) dcc_free_hostdef(host);
-    if (lease >= 0) close(lease);
+    if (lease >= 0) dcc_broker_release(lease);
     if (files) { for (unsigned i = 0; job && i < job->count; ++i) free(files[i]); free(files); }
     dcc_job_free(job);
     return ret < 0 ? EXIT_PROTOCOL_ERROR : ret;

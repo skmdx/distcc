@@ -122,7 +122,7 @@ int main(int argc, char **argv)
         int worker = -1;
         int lease = !strcmp(argv[1], "--memo") ? dcc_broker_memo_get("retry", &value) :
                     dcc_broker_worker_get("retry", &worker);
-        if (lease >= 0) { puts("owner"); close(lease); }
+        if (lease >= 0) { puts("owner"); dcc_broker_release(lease); }
         else if (value) { puts(value); free(value); }
         else if (worker >= 0) {
             char byte;
