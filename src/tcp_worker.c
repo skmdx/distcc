@@ -12,7 +12,6 @@
 #include "distcc.h"
 #include "exitcode.h"
 #include "tcp_job.h"
-#include "rust_job.h"
 
 int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int input, int frontend, int retiring)
 {
@@ -49,9 +48,7 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
     if (!finished.error) {
         changed_tmp = 1;
         if (input >= 0) {
-            if (job->kind == DCC_JOB_RUST) {
-                if (dcc_rust_catalog_attach(input)) finished.error = EXIT_IO_ERROR;
-            } else if (dcc_job_frontend(job)) {
+            if (dcc_job_frontend(job)) {
                 job->fs_channel = input + 1;
                 job->compiler_channel = frontend + 1;
             } else {

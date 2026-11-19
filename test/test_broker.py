@@ -41,7 +41,8 @@ class MemoReconnectTest(unittest.TestCase):
                         second, _ = listener.accept()
                         with second:
                             self.assertEqual(second.recv(128), original)
-                            self.assertEqual(original, struct.pack('=II', 4, (1 << 17) | (16 if kind == 'worker' else 4)) + b'retry\0')
+                            self.assertEqual(original, struct.pack('=II', BrokerTestCase.protocol_version,
+                                (1 << 17) | (16 if kind == 'worker' else 4)) + b'retry\0')
                             if kind == 'worker':
                                 with tempfile.TemporaryFile() as worker:
                                     worker.write(b'W'); worker.seek(0)
@@ -66,7 +67,7 @@ class MemoReconnectTest(unittest.TestCase):
 
 
 class BrokerTestCase(DistccTestCase):
-    protocol_version = 4
+    protocol_version = 5
 
     def start_memory_refusal(self):
         # The first snapshot fits; before execution the real daemon's memory
@@ -135,7 +136,7 @@ class BrokerTestCase(DistccTestCase):
         return proc
 
     def request(self, command=1, work=(0, 0, 0), work_units=0, family=0, memory_class=None,
-                cpp_limit=2147483647, scope_key=0):
+                cpp_limit=2147483647, scope_key=0, rust_host=b''):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
@@ -146,7 +147,7 @@ class BrokerTestCase(DistccTestCase):
             if memory_class is None:
                 kind = {7: 3, 8: 4, 10: 5}.get(work[2], 1 if 4 <= work[2] <= 6 else 0)
                 memory_class = 1 + kind * 64 + max(0, work[1].bit_length() - 1) if work[0] else 0
-            payload += struct.pack('=QQIIQQQ', *work, work_units, family, scope_key, memory_class)
+            payload += struct.pack('=QQIIQQQ96s', *work, work_units, family, scope_key, memory_class, rust_host)
         sock.sendall(payload)
         self.addCleanup(sock.close)
         return sock
@@ -1926,6 +1927,7 @@ class BrokerTest(BrokerTestCase):
         self.start_broker(self.host(0) + " --localslots_cpp=1")
         with subprocess.Popen([str(self.build/'h_client_hotpaths'), '--cpp-done'], env=self.env,
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE) as first:
+            assert first.stdin is not None and first.stdout is not None
             try:
                 self.assertTrue(select.select([first.stdout], [], [], 5)[0])
                 self.assertEqual(first.stdout.read(1), b'A')

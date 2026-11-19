@@ -139,7 +139,7 @@ and unprivileged user namespaces. The worker selects a rustc with the client's
 release string, commit hash and LLVM version. If it cannot find a match, the
 client runs rustc locally. The client supplies the target standard library.
 
-Distribution operates on library crates and explicit metadata/object emissions.
+Distribution supports libraries, executables, build scripts and test harnesses.
 The real client rustc discovers modules, included data, binary dependencies and
 observed environment variables. Its dependency-only probe uses
 `-Zbinary-dep-depinfo` with `RUSTC_BOOTSTRAP=1`. Compilation keeps the caller's
@@ -153,9 +153,10 @@ The broker grants a local slot for dependency discovery and can run small
 crates directly on a free client lane. Placement considers the dependency
 directory, source size, optimization phase and previous crate timings.
 Workers stream named artifacts, including Cargo metadata and dependency files,
-directly into temporary files beside their destinations. When compilation
-finishes, the client verifies the input generations, publishes the files and
-forwards rustc's JSON notifications to Cargo.
+directly into temporary files beside their destinations. For Cargo pipelining,
+the worker sends the metadata as soon as rustc announces it. The client verifies
+the input generations and atomically publishes the file before forwarding that
+notification. Code generation continues while Cargo starts dependent crates.
 
 `-C target-cpu=native` uses the client's CPU even on a different worker CPU or
 architecture. The installed `distcc-rust-native.so` records the client's actual
@@ -167,13 +168,18 @@ LLVM development headers (`LLVM_CONFIG`) build the helper without linking an
 LLVM version. Install it on clients and workers before using distributed native
 jobs. A worker verifies that rustc consumed the profile before returning results.
 
-Final executable/native links, build scripts, procedural macro crates,
-and explicit dynamic Rust dependencies run locally. The client expands nested
-line-oriented `@file` arguments and tracks their input generations. It
-also records libraries loaded by the real dependency pass, keeping transitive
-procedural macro execution on the client CPU. Unrelated procedural macros in a dependency search directory do
-not prevent distribution. Local linking
-preserves access to native system libraries. Transport or toolchain failures
+For native links the worker captures rustc's generated objects and linker
+arguments. The client runs its linker with the original Rust dependencies and
+native library search paths. Static archives can finish on the worker.
+The client tracks nested `@file` inputs and preserves the original invocation
+for local rustc. Procedural macro producers compile locally. To distribute a
+consumer, the client runs the dependency pass in a read-only bubblewrap mount
+namespace with a seccomp filter. Its loader hook and `strace` identify loaded
+libraries, read-only dependencies and attempted side effects. A compatible
+worker with the same rustc host triple receives the macro and its inputs.
+Unsupported operations cause the client to run the original compiler locally.
+Building the transport and probe requires json-c and libseccomp development
+headers and libraries. Transport or toolchain failures
 retry locally unless `DISTCC_FALLBACK=0`. Failed remote compilations also retry
 locally unless `DISTCC_SKIP_LOCAL_RETRY=1`, so an incompatible worker does not
 block a toolchain update. `DISTCC_VERBOSE=1` reports the selected worker or

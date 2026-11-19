@@ -36,7 +36,7 @@ struct packet {
     unsigned char *data;
     size_t size, sent, header_size, file_left;
     off_t file_offset;
-    int file, rights;
+    int file, rights, end_metadata;
 };
 struct upload;
 struct input {
@@ -74,6 +74,13 @@ struct dcc_tcp_server {
     int storage_reserved;
     unsigned storage_group;
     int result_pending;
+    size_t names_frame_size;
+    struct dcc_rust_artifacts *artifacts;
+    int watchfd, early_file;
+    char early_name[NAME_MAX+1];
+    const char *early_line;
+    uint64_t early_budget, early_size;
+    unsigned early_mode;
     XXH3_state_t *hash;
     unsigned memory_class;
     struct dcc_job_result result;
@@ -397,6 +404,13 @@ static void reset_job(struct dcc_tcp_server *s)
     if (s->result_pending) --waiting_results;
     s->result_pending = 0;
     s->result_bytes = 0;
+    s->names_frame_size = 0;
+    dcc_rust_watch_free(s->artifacts); s->artifacts = NULL;
+    if (s->early_file) close(s->early_file-1);
+    s->early_file = 0;
+    s->early_name[0] = 0;
+    s->early_budget = 0;
+    s->early_line = NULL;
     s->reserved = 0;
     s->remaining = s->output_index = s->prepared = 0;
     s->input_offset = s->output_offset = 0;
@@ -842,6 +856,11 @@ void dcc_tcp_server_lost(struct dcc_tcp_server *s)
 }
 /* The worker creates this directory itself in the private job tree. Open
  * each output before returning that tree to the asynchronous cleanup queue. */
+static int compare_outputs(const void *a, const void *b)
+{
+    return strcmp(((const struct dcc_named_output *)a)->name, ((const struct dcc_named_output *)b)->name);
+}
+
 static int retain_named(struct dcc_tcp_server *s, uint64_t *bytes)
 {
     struct dcc_job_result *r = &s->result;
@@ -854,8 +873,16 @@ static int retain_named(struct dcc_tcp_server *s, uint64_t *bytes)
     for (;;) {
         errno = 0;
         struct dirent *entry = readdir(dir);
-        if (!entry) { ret = errno || !r->named_count ? -1 : 0; break; }
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!entry) {
+            if (!errno) {
+                if (r->named_count > 1) qsort(r->named, r->named_count, sizeof(*r->named), compare_outputs);
+                s->names_frame_size = 8 + header;
+                ret = 0;
+            }
+            break;
+        }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+            !strcmp(entry->d_name, s->early_name)) continue;
         header += 13 + strlen(entry->d_name);
         if (header > DCC_TCP_CHUNK) break;
         void *next = realloc(r->named, (r->named_count + 1) * sizeof(*r->named));
@@ -872,6 +899,7 @@ static int retain_named(struct dcc_tcp_server *s, uint64_t *bytes)
     closedir(dir);
     return ret;
 }
+static int read_metadata(struct dcc_tcp_server *s);
 void dcc_tcp_server_finished(struct dcc_tcp_server *s, const struct dcc_tcp_finished *r,
                              int *fds, unsigned count)
 {
@@ -892,6 +920,7 @@ void dcc_tcp_server_finished(struct dcc_tcp_server *s, const struct dcc_tcp_fini
         s->result.size[i] = r->size[i];
     }
     if (used != count) goto fail;
+    if (s->artifacts && !s->early_name[0] && read_metadata(s)<0) goto fail;
     if (s->job->kind == DCC_JOB_RUST && !r->status && retain_named(s, &bytes)) goto fail;
     /* Result FDs now own the output inodes. Input lifetime ends here, not
      * when a slow receiver eventually consumes the last result byte. */
@@ -900,7 +929,7 @@ void dcc_tcp_server_finished(struct dcc_tcp_server *s, const struct dcc_tcp_fini
     /* A result exists already. Keep its FDs while asynchronous input cleanup
      * frees the budget; never discard completed work for transient pressure.
      * One connection buffer, the result header and one output chunk must fit. */
-    if (bytes > DCC_TCP_BYTES - 2 * DCC_TCP_CHUNK - DCC_TCP_RESULT_SIZE - 24U) goto fail;
+    if (bytes > DCC_TCP_BYTES - 2 * DCC_TCP_CHUNK - DCC_TCP_RESULT_SIZE - 24U - s->names_frame_size) goto fail;
     returning_bytes += bytes; s->result_bytes = bytes;
     s->result.status = r->status; s->result.mode = r->mode;
     s->result.prepare_ns = s->ready_at - s->begun_at;
@@ -917,7 +946,7 @@ fail:
 }
 static int result_available(struct dcc_tcp_server *s)
 {
-    return s->result_bytes + DCC_TCP_CHUNK + DCC_TCP_RESULT_SIZE + 24U <= DCC_TCP_BYTES - retained;
+    return s->result_bytes + s->names_frame_size + DCC_TCP_CHUNK + DCC_TCP_RESULT_SIZE + 24U <= DCC_TCP_BYTES - retained;
 }
 static int publish_result(struct dcc_tcp_server *s)
 {
@@ -932,7 +961,7 @@ static int publish_result(struct dcc_tcp_server *s)
     dcc_tcp_put64(description + 56, s->result.execute_ns);
     dcc_tcp_put64(description + 64, s->result.cpu_ns);
     if (queue(s, DCC_TCP_RESULT, description, sizeof(description))) return -1;
-    if (s->result.named_count) {
+    if (s->names_frame_size) {
         size_t offset = 0;
         for (unsigned i = 0; i < s->result.named_count; ++i) {
             const struct dcc_named_output *f = s->result.named + i;
@@ -1048,12 +1077,63 @@ static int output(struct dcc_tcp_server *s)
 void dcc_tcp_server_fs_poll(struct dcc_tcp_server *s, struct pollfd *p)
 {
     *p = (struct pollfd){.fd = -1};
+    if (s->artifacts && s->phase == RUNNING && !s->early_name[0]) {
+        p->fd = s->watchfd; p->events = POLLIN; return;
+    }
     if (s->phase != RUNNING || !s->fs_peer) return;
     p->fd = s->fs_peer - 1;
     p->events = s->fs_reply ? POLLOUT : s->fs_waiting ? 0 : POLLIN;
 }
+static int read_metadata(struct dcc_tcp_server *s)
+{
+    const char *name, *line;
+    int fd;
+    int got = dcc_rust_next_metadata(s->artifacts, &name, &line, &fd);
+    if (got <= 0) return got;
+    struct stat st;
+    size_t n = strlen(name), m = strlen(line), header = 13+n+m;
+    if (!n || n > NAME_MAX || header > DCC_TCP_CHUNK || fstat(fd,&st) || !S_ISREG(st.st_mode) ||
+        st.st_size < 0 || (uint64_t)st.st_size > DCC_TCP_BYTES) { close(fd); return -1; }
+    /* Borrow the open inode for sendfile. A slow client can retain at most
+     * one metadata file; only eight bytes per extent enter the packet queue. */
+    uint64_t packets = st.st_size ? ((uint64_t)st.st_size+DCC_TCP_CHUNK-1)/DCC_TCP_CHUNK : 1;
+    uint64_t budget=(uint64_t)st.st_size+header+8+8*packets;
+    if (budget>DCC_TCP_BYTES-DCC_TCP_CHUNK) { close(fd); return -1; }
+    s->early_budget=budget;
+    s->early_line=line;
+    s->early_size=st.st_size;
+    s->early_mode=st.st_mode&0777;
+    s->early_file=fd+1;
+    strcpy(s->early_name,name);
+    return 0;
+}
+static int queue_metadata(struct dcc_tcp_server *s)
+{
+    size_t n=strlen(s->early_name), m=strlen(s->early_line);
+    unsigned char *p = s->buffer;
+    dcc_tcp_put64(p,s->early_size); dcc_tcp_put32(p+8,s->early_mode);
+    memcpy(p+12,s->early_name,n+1); memcpy(p+13+n,s->early_line,m);
+    if (queue(s,DCC_TCP_METADATA_BEGIN,p,13+n+m)) return -1;
+    s->early_budget=0;
+    s->reserved+=s->early_size; retained+=s->early_size;
+    uint64_t offset=0;
+    do {
+        size_t amount = s->early_size-offset > DCC_TCP_CHUNK ? DCC_TCP_CHUNK : s->early_size-offset;
+        struct packet **place=s->tail;
+        if (queue(s,DCC_TCP_METADATA_DATA,NULL,0)) return -1;
+        struct packet *part=*place;
+        dcc_tcp_put32(part->data+4,amount);
+        part->file=s->early_file-1; part->file_offset=offset; part->file_left=amount;
+        offset+=amount;
+        part->end_metadata = offset == s->early_size;
+    } while (offset<s->early_size);
+    return 0;
+}
+
 int dcc_tcp_server_fs_process(struct dcc_tcp_server *s, short events)
 {
+    if (s->artifacts && s->phase==RUNNING && !s->early_name[0] && (events & POLLIN))
+        return read_metadata(s);
     if (s->phase != RUNNING || !s->fs_peer) return 0;
     if (s->fs_waiting == 3) {
         int granted = s->dispatch->execution(s, 1);
@@ -1120,6 +1200,11 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
 {
     p->fd = s->socket;
     int pending = s->work.run != NULL;
+    if (s->early_budget) {
+        p->events=POLLRDHUP | (s->head ? POLLOUT : 0);
+        p->revents=0;
+        return s->early_budget<=DCC_TCP_BYTES-retained;
+    }
     if (s->job && s->phase == PREPARING && !s->inputs) {
         p->events = POLLRDHUP;
         p->revents = 0;
@@ -1131,7 +1216,7 @@ int dcc_tcp_server_poll(struct dcc_tcp_server *s, struct pollfd *p)
         return !pending && input_space(s) != 0;
     }
     if (s->result_pending) {
-        p->events = POLLRDHUP;
+        p->events = POLLRDHUP | (s->head ? POLLOUT : 0);
         p->revents = 0;
         return result_available(s);
     }
@@ -1160,6 +1245,7 @@ static int awaiting_shared_input(const struct dcc_tcp_server *s)
 
 int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
 {
+    if (s->early_budget && s->early_budget<=DCC_TCP_BYTES-retained && queue_metadata(s)) return -1;
     time_t now = time(NULL);
     if (s->failed) return -1;
     /* A client with nothing left to upload may be waiting on another client's
@@ -1188,8 +1274,9 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         return events & (POLLHUP | POLLERR | POLLRDHUP) ? -1 : 0;
     if (s->result_pending) {
         if (events & (POLLHUP | POLLERR | POLLRDHUP)) return -1;
-        if (!result_available(s)) return 0;
-        if (publish_result(s)) return -1;
+        if (!s->early_budget && result_available(s)) {
+            if (publish_result(s)) return -1;
+        } else if (!s->head) return 0;
     }
     if (s->job && s->phase == PREPARING && !s->inputs) {
         if (events & (POLLHUP | POLLERR | POLLRDHUP)) return -1;
@@ -1252,7 +1339,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
             dcc_tcp_ready_idle_ns();
         }
     }
-    if (s->phase == RETURNING && output(s)) return -1;
+    if (s->phase == RETURNING && !s->result_pending && output(s)) return -1;
     int idle_timeout = s->job || s->phase == RETURNING ? dcc_get_io_timeout() : 30;
     /* A notification queued after poll was built has no POLLOUT event yet.
      * At its deadline, attempt that write before expiring the connection.
@@ -1286,6 +1373,10 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
         if (p->sent != p->header_size || p->file_left) continue;
         s->queued -= p->size;
         retained -= p->size;
+        if (p->end_metadata) {
+            retained -= p->file_offset; s->reserved -= p->file_offset;
+            close(s->early_file-1); s->early_file=0;
+        }
         s->head = p->next;
         if (!s->head) s->tail = &s->head;
         free(p->data); free(p);
@@ -1330,6 +1421,10 @@ void dcc_tcp_dispatch_ready(void)
                     s->fs_peer = pair[0] + 1; s->fs_child = pair[1] + 1;
                 }
                 input = s->fs_child - 1;
+            }
+            if (s->job->kind == DCC_JOB_RUST && !s->artifacts && dcc_rust_pipelined(s->job) &&
+                !(s->artifacts=dcc_rust_watch(s->run.root,&s->watchfd))) {
+                s->failed=1; dequeue(s); s=next; continue;
             }
             int ret = s->dispatch->start(s, &s->run, s->metadata, input, s->job);
             if (ret < 0) { s->failed = 1; dequeue(s); }

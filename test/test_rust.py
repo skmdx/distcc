@@ -64,7 +64,7 @@ class RustTest(BrokerTestCase):
         fields = dict(line.split(': ', 1) for line in report[1:] if ': ' in line)
         return '\n'.join((report[0], fields['commit-hash'], fields['LLVM version']))
 
-    def wire_plan(self, source, *, flags=(), requested=None, logical=None, extra=()):
+    def wire_plan(self, source, *, flags=(), requested=None, logical=None, extra=(), host=''):
         """A real rustc closure for tests which hold or alter an individual TCP transaction."""
         from distcc_job import fingerprint, manifest
         root = subprocess.check_output([self.rustc, '--print=sysroot'], text=True).strip()
@@ -77,7 +77,7 @@ class RustTest(BrokerTestCase):
         args = ['--sysroot', root, '--crate-type=rlib', logical or source,
                 '-o', '/__distcc_rust/out/libwire.rlib', *flags]
         entries = [(logical if logical and path==source else path, *fingerprint(path), 1) for path in paths]
-        return manifest(3, self.work, args, entries, rust=(1, requested or self.version(self.rustc), '', '', [], [])), paths
+        return manifest(3, self.work, args, entries, rust=(1, requested or self.version(self.rustc), host, '', '', [], [])), paths
 
     def wire_result(self, net, identity, first=None):
         codec = runpy.run_path(str(self.build/'distcc-link'))['Lz4Chunks']()
@@ -104,6 +104,7 @@ class RustTest(BrokerTestCase):
             self.assertEqual(kind & ~0x30000, 0x54000304)
             index, plain = struct.unpack_from('!II', data)
             streams[index].extend(codec.decode(data[8:], plain) if kind & 0x10000 else data[8:])
+        self.assertEqual(names, sorted(names))
         self.assertEqual(list(map(len, streams)), sizes)
         return status >> 8, streams[0].decode(errors='replace'), dict(zip(names, streams[4:]))
 
@@ -201,6 +202,12 @@ class RustTest(BrokerTestCase):
         stats = subprocess.check_output([self.build/'distcc','--lto-capacity'], env=self.env)
         self.assertEqual(json.loads(stats)['direct_completed'], 1)
         self.assertNotIn('input preparation command=', (self.work/'local.log').read_text())
+        rsp=self.work/'long.rsp'
+        rsp.write_text(f'--crate-type=rlib\n--cfg={"x"*140000}\n{source}\n-o\n{output}\n')
+        result=self.rust('@'+str(rsp))
+        self.assertEqual(result.returncode,0,result.stderr)
+        stats=subprocess.check_output([self.build/'distcc','--lto-capacity'],env=self.env)
+        self.assertEqual(json.loads(stats)['direct_completed'],2)
 
     def test_warm_compiler_and_rlib_reuse(self):
         dep, artifact = self.work/'leaf.rs', self.work/'libleaf.rlib'
@@ -221,6 +228,88 @@ class RustTest(BrokerTestCase):
             self.assertEqual(sorted(p.name for p in outdir.iterdir()), ['caller.d','libcaller.rlib','libcaller.rmeta'])
         self.assertIn('input cache: 0 of', result.stderr)
         self.assertEqual((self.work/'broker.log').read_text().count('input preparation command=12 '), 2)
+
+    def test_warm_digest_table_has_constant_ipc_and_descriptor_counts(self):
+        source=self.work/'tree.rs'
+        def compile_with(n):
+            source.write_text(''.join(f'pub mod m{i};\n' for i in range(n)))
+            for i in range(n):
+                (self.work/f'm{i}.rs').write_text(f'pub const V:u32={i};')
+            args=[self.rustc,'--crate-type=rlib','--emit=metadata',source,'--out-dir',self.work]
+            compiled=self.rust(*args[1:])
+            self.assertEqual(compiled.returncode,0,compiled.stderr)
+            trace=self.work/'client.trace'
+            result=subprocess.run(['strace','-o',trace,'-e','trace=sendmsg,memfd_create,inotify_add_watch',
+                                   self.build/'distcc',*args],env=self.env,cwd=self.work,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn('compiled on',result.stderr)
+            events=trace.read_text()
+            self.assertNotIn('inotify_add_watch(',events)
+            self.assertNotIn('memfd_create("distcc-rust-input-digests"',events)
+            return [events.count(call+'(') for call in ('sendmsg','memfd_create')]
+        self.assertEqual(compile_with(1),compile_with(150))
+
+    def test_empty_named_results_and_explicit_dependency_filename(self):
+        source=self.work/'none.rs'
+        source.write_text('pub fn value() {}')
+        out=self.work/'products'
+        out.mkdir()
+        result=self.rust(source,'--crate-type=rlib','-Zno-codegen','--emit=obj','--out-dir',out,
+                         env=dict(self.env,RUSTC_BOOTSTRAP='1'))
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('compiled on',result.stderr)
+        self.assertEqual(list(out.iterdir()),[])
+        dep=out/'dependencies.make'
+        result=self.rust(source,'--crate-type=rlib','--emit=metadata,dep-info='+str(dep),'--out-dir',out)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('compiled on',result.stderr)
+        self.assertIn(str(dep)+':',dep.read_text())
+        self.assertNotIn('/__distcc_rust',dep.read_text())
+
+    def test_local_rustc_diagnostics_and_large_original_response(self):
+        for args in ([self.work/'absent.rs'], ['--explain','E0514']):
+            plain=self.rust(*args,remote=False)
+            result=self.rust(*args)
+            self.assertEqual((result.returncode,result.stdout),(plain.returncode,plain.stdout))
+            self.assertIn(plain.stderr.strip(),result.stderr)
+        src=self.work/'args.rs'
+        src.write_text('pub fn value() {}')
+        rsp=self.work/'args.rsp'
+        rsp.write_text('--crate-type=proc-macro\n'+str(src)+'\n--cfg='+'x'*140000+'\n')
+        # The producer runs locally. rustc itself diagnoses its invalid exported item.
+        plain=self.rust('@'+str(rsp),remote=False)
+        result=self.rust('@'+str(rsp))
+        self.assertEqual(result.returncode,plain.returncode)
+        self.assertIn(plain.stderr.strip(),result.stderr)
+
+    def test_remote_codegen_and_local_native_links(self):
+        src = self.work/'products.rs'
+        src.write_text('pub fn value() -> u32 { 42 } fn main(){assert_eq!(value(),42)} '
+                       '#[test] fn check(){assert_eq!(value(),42)}')
+        for flags, name in ((['--crate-type=bin'],'program'), (['--test'],'tests'),
+                            (['--crate-type=cdylib'],'libcproduct.so'), (['--crate-type=dylib'],'libproduct.so'),
+                            (['--crate-type=staticlib'],'libproduct.a')):
+            with self.subTest(flags=flags):
+                output = self.work/name
+                result = self.rust(*flags, src, '-o', output)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('compiled on', result.stderr)
+                self.assertGreater(output.stat().st_size, 4096)
+                if name in ('program','tests'):
+                    subprocess.run([output], check=True, capture_output=True)
+        driver=self.work/'client-cc'
+        driver.write_text('#!/bin/sh\nexec cc "$@" -Wl,--defsym,verified_client_link=42\n')
+        driver.chmod(0o755)
+        output=self.work/'client-linked'
+        inner,outer=self.work/'inner args',self.work/'outer args'
+        inner.write_text('"-Wl,--defsym,verified_response_arg=17"\n')
+        outer.write_text(shlex.quote('@'+str(inner))+'\n')
+        result=self.rust(src,'-Clinker='+str(driver),'-Clink-arg=@'+str(outer),'-o',output)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('compiled on',result.stderr)
+        symbols=subprocess.check_output(['nm',output],text=True)
+        self.assertIn('verified_client_link',symbols)
+        self.assertIn('verified_response_arg',symbols)
 
     def test_large_rust_artifacts_do_not_use_small_runtime_tmpfs(self):
         runtime = self.work / 'runtime'
@@ -390,6 +479,54 @@ class RustTest(BrokerTestCase):
         self.assertIn('distcc-rust: compiled on', ''.join(diagnostics))
         self.assertEqual({name for name, _ in artifacts}, {'libpublished.rmeta', 'libpublished.rlib'})
         self.assertTrue(all(exists for _, exists in artifacts), artifacts)
+
+    def test_cargo_worker_codegen_overlaps_dependent_metadata_input(self):
+        upstream, downstream = self.work/'upstream', self.work/'downstream'
+        (self.work/'Cargo.toml').write_text('[workspace]\nmembers=["upstream","downstream"]\nresolver="2"\n')
+        for directory in (upstream,downstream):
+            directory.mkdir()
+            manifest = f'[package]\nname="{directory.name}"\nversion="0.0.1"\nedition="2021"\n[lib]\npath="lib.rs"\n'
+            if directory == downstream:
+                manifest += '[dependencies]\nupstream={path="../upstream"}\n'
+            (directory/'Cargo.toml').write_text(manifest)
+        (upstream/'lib.rs').write_text(''.join(
+            f'#[inline(never)] pub fn f{i}(mut x:u64)->u64 {{ for n in 0..99 {{ x=x.rotate_left(n)^({i}+x.wrapping_mul(3)); }} x }}\n'
+            for i in range(800)))
+        (downstream/'lib.rs').write_text(''.join(
+            f'pub fn result{i}(x:u64)->u64 {{ let mut y=upstream::f{i}(x); for j in 1..99 '
+            f'{{ y=(y^x).rotate_left(j).wrapping_add({i}); }} y }}\n' for i in range(650)))
+        env = dict(self.env, RUSTC=self.rustc, RUSTC_WRAPPER=str(self.build/'distcc'),
+                   CARGO_INCREMENTAL='0', RUSTC_BOOTSTRAP='1',
+                   RUSTFLAGS='-Zllvm-time-trace -Copt-level=2 -Ccodegen-units=1')
+        cargo = subprocess.run(['cargo','build','-vv','--offline','-j2','-p','downstream'],
+                               cwd=self.work,env=env,capture_output=True,text=True,timeout=120)
+        self.assertEqual(cargo.returncode,0,cargo.stderr)
+        self.assertGreaterEqual(cargo.stderr.count('distcc-rust: compiled on'),2,cargo.stderr)
+        self.assertRegex(cargo.stderr,r'--extern upstream=[^\s]+\.rmeta')
+        def intervals(crate):
+            trace,=(self.work/'target/debug/deps').glob(crate+'*.llvm_timings.json')
+            profile=json.loads(trace.read_bytes())
+            epoch=profile['beginningOfTime']
+            spans=sorted((epoch+e['ts'],epoch+e['ts']+e['dur']) for e in profile['traceEvents']
+                         if e['ph']=='X' and not e['name'].startswith('Total ') and
+                         (e['name']=='OptModule' or e['name'].endswith('Pass')))
+            merged=[]
+            for start,end in spans:
+                if merged and start<=merged[-1][1]:
+                    merged[-1][1]=max(merged[-1][1],end)
+                else:
+                    merged.append([start,end])
+            return merged
+        up,down=intervals('upstream'),intervals('downstream')
+        i=j=overlap=0
+        while i<len(up) and j<len(down):
+            a,b=up[i]
+            c,d=down[j]
+            overlap+=max(0,min(b,d)-max(a,c))
+            if b<=d: i+=1
+            else: j+=1
+        self.assertGreater(overlap,0)
+        print(f'Cargo dependent used upstream .rmeta with {overlap} us of overlapping LLVM passes')
 
     def test_disconnected_transport_retries_without_local_fallback(self):
         import concurrent.futures
@@ -607,7 +744,7 @@ class RustTest(BrokerTestCase):
         result = self.rust('--crate-type=rlib', source, '--extern', 'facade=' + str(rlib),
                            '-L', 'dependency=' + str(deps), '-o', library)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('procedural macro executed through a transitive dependency', result.stderr)
+        self.assertIn('isolated dependency expansion failed', result.stderr)
         self.assertEqual(marker.read_text(), 'client')
         main, executable = self.work / 'main.rs', self.work / 'transitive'
         main.write_text('fn main() { assert_eq!(consumer::answer(), 42); }')
@@ -659,7 +796,7 @@ class RustTest(BrokerTestCase):
         self.assertIn('distcc-rust: compiled on', result.stderr)
         self.assertNotIn('failed to connect to jobserver', result.stderr)
 
-    def test_repeated_crate_types_keep_native_archive_on_client(self):
+    def test_repeated_crate_types_return_native_archive(self):
         source = self.work / 'combined.rs'
         source.write_text('pub fn answer() -> u32 { 42 }')
         for types in (['--crate-type=staticlib', '--crate-type=rlib'],
@@ -669,21 +806,20 @@ class RustTest(BrokerTestCase):
                 result = self.rust(*types, '--emit=link', '--emit=dep-info',
                                    source, '--out-dir', self.work)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('distcc-rust: local:', result.stderr)
-                self.assertNotIn('distcc-rust: compiled on', result.stderr)
+                self.assertIn('distcc-rust: compiled on', result.stderr)
                 for name in ('libcombined.a', 'libcombined.rlib', 'combined.d'):
                     output = self.work / name
                     self.assertGreater(output.stat().st_size, 0)
                     output.unlink()
 
-    def test_worker_rejects_native_action_hidden_by_later_crate_type(self):
-        for kind in ('staticlib', 'cdylib', 'proc-macro', 'bin'):
+    def test_worker_rejects_plugin_producer_hidden_by_later_crate_type(self):
+        for kind in ('proc-macro',):
             src = self.work/(kind.replace('-', '_')+'.rs')
             src.write_text('// '+kind+'\npub fn answer() {}')
             status, err, outputs = self.raw_compile(src, flags=['--crate-type='+kind,'--crate-type=rlib',
                                                                '--emit=link','--emit=dep-info'])
             self.assertNotEqual(status, 0)
-            self.assertIn('native linking', err)
+            self.assertIn('procedural macro compiler plugin', err)
             self.assertFalse(outputs)
 
     def test_repeated_emits_preserve_remote_outputs(self):
@@ -704,7 +840,7 @@ class RustTest(BrokerTestCase):
                 self.assertIn('distcc-rust: compiled on', result.stderr)
                 self.assertEqual([path.read_bytes() for path in (library, deps)], expected)
 
-    def test_proc_macro_stays_local(self):
+    def test_pure_macro_consumer_runs_on_matching_worker(self):
         source = self.work / 'macros.rs'
         source.write_text('extern crate proc_macro; use proc_macro::TokenStream; '
                           '#[proc_macro] pub fn answer(_: TokenStream) -> TokenStream { "42".parse().unwrap() }')
@@ -717,9 +853,68 @@ class RustTest(BrokerTestCase):
         result = self.rust('--crate-type=rlib', source, '--extern', 'macros=' + str(library),
                            '-o', self.work / 'libconsumer.rlib')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('distcc-rust: local:', result.stderr)
+        self.assertIn('proc-macro host ABI', result.stderr)
+        self.assertIn('compiled on', result.stderr)
 
-    def test_transitive_procedural_macro_executes_on_client(self):
+    def test_broker_and_worker_refuse_mismatching_macro_host(self):
+        source=self.work/'host.rs'
+        source.write_text('pub fn value() {}')
+        self.assertEqual(self.rust('--crate-type=rlib',source).returncode,0)
+        foreign='incompatible-test-host'
+        request=self.request(10,work=(1,1024,7),work_units=1,rust_host=foreign.encode())
+        status,=struct.unpack_from('=i',request.recv(1032))
+        self.assertEqual(status,121)
+        status,err,outputs=self.raw_compile(source,host=foreign)
+        self.assertEqual(status,121,err)
+        self.assertFalse(outputs)
+
+    def test_macro_private_shared_library_and_observed_data(self):
+        library=self.work/'libhelper.so'
+        c=self.work/'helper.c'
+        c.write_text('int add(void) {return 2;}')
+        subprocess.run(['cc','-shared','-fPIC',c,'-o',library],check=True)
+        data=self.work/'number.txt'
+        data.write_text('40')
+        source=self.work/'derive.rs'
+        source.write_text('extern crate proc_macro; #[link(name="helper")] extern "C" { fn add()->i32; } '
+            '#[proc_macro] pub fn value(_:proc_macro::TokenStream)->proc_macro::TokenStream { '
+            'let n:i32=std::fs::read_to_string('+json.dumps(str(data))+').unwrap().parse().unwrap(); '
+            '(n+unsafe{add()}).to_string().parse().unwrap() }')
+        plugin=self.work/'libderive.so'
+        result=self.rust(source,'--crate-type=proc-macro','-Lnative='+str(self.work),
+                         '-Clink-arg=-Wl,-rpath,$ORIGIN','-o',plugin,remote=False)
+        self.assertEqual(result.returncode,0,result.stderr)
+        src=self.work/'app.rs'
+        src.write_text('extern crate derive; fn main(){assert_eq!(derive::value!(),42)}')
+        output=self.work/'app'
+        result=self.rust(src,'--extern','derive='+str(plugin),'-o',output)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('proc-macro host ABI',result.stderr)
+        self.assertIn('compiled on',result.stderr)
+        subprocess.run([output],check=True)
+
+    def test_macro_network_attempt_executes_once_on_client(self):
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1',0))
+            listener.listen()
+            source=self.work/'network.rs'
+            source.write_text('extern crate proc_macro; #[proc_macro] pub fn number(_:proc_macro::TokenStream)'
+                '->proc_macro::TokenStream {let _=std::net::TcpStream::connect(("127.0.0.1",'
+                +str(listener.getsockname()[1])+')); "42".parse().unwrap()}')
+            plugin=self.work/'libnetwork.so'
+            self.assertEqual(self.rust(source,'--crate-type=proc-macro','-o',plugin,remote=False).returncode,0)
+            src=self.work/'user.rs'
+            src.write_text('extern crate network; pub const N:u32=network::number!();')
+            result=self.rust(src,'--crate-type=rlib','--extern','network='+str(plugin))
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn('distcc-rust: local:',result.stderr)
+            listener.settimeout(2)
+            listener.accept()[0].close()
+            listener.settimeout(.05)
+            with self.assertRaises(TimeoutError):
+                listener.accept()
+
+    def test_pure_transitive_macro_and_symlink_execute_on_worker(self):
         macro = self.work / 'macros.rs'
         macro.write_text('extern crate proc_macro; use proc_macro::TokenStream; '
                          '#[proc_macro] pub fn answer(_: TokenStream) -> TokenStream { "42".parse().unwrap() }')
@@ -742,7 +937,8 @@ class RustTest(BrokerTestCase):
         result = self.rust('--crate-type=rlib', '-Ctarget-cpu=native', source,
                            '--extern', 'bridge=' + str(self.work / 'libbridge.rlib'), *search, '-o', output)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('procedural macro executed through a transitive dependency', result.stderr)
+        self.assertIn('proc-macro host ABI', result.stderr)
+        self.assertIn('compiled on', result.stderr)
         main = self.work / 'main.rs'
         main.write_text('fn main() { assert_eq!(consumer::value(), 42); }')
         result = self.rust(main, '--extern', 'consumer=' + str(output), *search,
@@ -1085,7 +1281,9 @@ pub fn read_only() -> bool {
         compiler.chmod(0o755)
         self.rustc = str(compiler)
         result = self.rust('@'+str(outer))
-        self.assertEqual(result.returncode, 0, result.stderr)
+        native = self.rust('@'+str(outer), remote=False)
+        self.assertEqual(result.returncode, native.returncode, result.stderr)
+        self.assertIn(native.stderr.strip(), result.stderr)
         self.assertIn('input changed:', result.stderr)
         self.assertNotIn('compiled on', result.stderr)
 

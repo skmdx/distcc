@@ -81,7 +81,7 @@ int dcc_tcp_frame_header(struct dcc_tcp_frame *f, size_t available)
     f->type = dcc_tcp_get32(f->header);
     f->size = dcc_tcp_get32(f->header + 4);
     uint32_t kind = f->type & ~DCC_TCP_FLAGS;
-    return kind < DCC_TCP_BEGIN || kind > DCC_TCP_OUTPUT_NAMES ||
+    return kind < DCC_TCP_BEGIN || kind > DCC_TCP_METADATA_DATA ||
         f->size > available ||
         f->size > (kind == DCC_TCP_BEGIN ? DCC_JOB_METADATA_MAX + 8U :
                    kind == DCC_TCP_NEED ? dcc_tcp_bitmap_size(DCC_JOB_INPUT_MAX) : DCC_TCP_CHUNK + 8U) ||

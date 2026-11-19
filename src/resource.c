@@ -258,6 +258,7 @@ uint32_t dcc_rust_source_bytes(const struct dcc_job *job)
     uint32_t bytes = 0;
     for (unsigned i = 0; i < job->count; ++i) {
         const struct dcc_job_input *in = job->inputs + i;
+        if (!in->path) continue;
         const char *ext = strrchr(in->path,'.');
         if (!ext || strcmp(ext,".rs")) continue;
         if (in->plain_size > UINT32_MAX - bytes) return UINT32_MAX;

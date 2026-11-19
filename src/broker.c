@@ -31,6 +31,7 @@
 #include "trace.h"
 #include "util.h"
 #include "tcp_job.h"
+#include "rust_job.h"
 #include "workload.h"
 #include "plan_memo.h"
 #include <search.h>
@@ -420,7 +421,8 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
         /* Admission can be temporarily unavailable while failed workers
          * restart or remain in backoff. No job has been sent on this lease. */
         errno = reply->status == EXIT_ACCESS_DENIED ? EACCES :
-                reply->status == EXIT_CONNECT_FAILED ? EHOSTUNREACH : EPROTO;
+                reply->status == EXIT_CONNECT_FAILED ? EHOSTUNREACH :
+                reply->status == EXIT_LOCAL_COMPILE ? EXDEV : EPROTO;
         goto failed;
     }
     int can_compile_locally = command & CLIENT_COMPILE;
@@ -506,7 +508,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int
                         (remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL),
                         &reply, &net, hint, queued_fd, 0);
     if (fd < 0)
-        return EXIT_CONNECT_FAILED;
+        return errno == EXDEV ? EXIT_LOCAL_COMPILE : EXIT_CONNECT_FAILED;
     *host = NULL;
     count = 0;
     if (dcc_parse_hosts(reply.host, "broker", host, &count, NULL) ||
@@ -818,7 +820,7 @@ static void memo_request(struct broker *broker, struct client *client,
         struct memo lookup={.key=(char *)payload,.owner=session->peer.uid,.worker=worker};
         struct memo **found=tfind(&lookup,&broker->memos,memo_order);
         memo=found ? *found : NULL;
-        if (memo && memo->socket) {
+        if (memo && memo->socket && strcmp(memo->key, DCC_RUST_DIGEST_TABLE)) {
             char byte;
             ssize_t alive=recv(memo->socket-1,&byte,1,MSG_PEEK|MSG_DONTWAIT);
             if (alive!=-1 || (errno!=EAGAIN && errno!=EWOULDBLOCK)) {
@@ -1280,7 +1282,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         }
         return 0;
     }
-    int i, slots, available = 0, ready_hosts = 0;
+    int i, slots, available = 0, ready_hosts = 0, abi_mismatches = 0;
     double work_rate = 0, min_rate = 0;
     struct selection {
         int peer, probe, wait, idle, enqueue;
@@ -1335,6 +1337,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         if (direct && !client->hint.key && !p->local) continue;
         struct dcc_capacity observed = observed_capacity(p, broker->cpp_busy);
         const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
+        if (*client->hint.rust_host && (!cap || strcmp(cap->rust_host,client->hint.rust_host))) {
+            if (cap && *cap->rust_host) ++abi_mismatches;
+            continue;
+        }
         struct dcc_capacity projected;
         int memory_full = 0;
         if (cap && p->host->tcp_jobs && client->hint.kind >= 1 && client->hint.kind <= DCC_WORK_CLASSES) {
@@ -1619,7 +1625,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                                p->retry_at > now ? p->retry_at - now : 0);
             }
         }
-        reply.status = available ? 0 : EXIT_CONNECT_FAILED;
+        reply.status = available ? 0 : abi_mismatches == broker->count && broker->count ?
+                       EXIT_LOCAL_COMPILE : EXIT_CONNECT_FAILED;
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
     } else if (best.peer >= 0 && best.wait && !best.enqueue) {

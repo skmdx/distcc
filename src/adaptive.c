@@ -138,6 +138,8 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
         if (!strncmp(line, "dcc_completion_clock_ns ", 24)) {
             if (cap->report_stamp || sscanf(line + 24, "%llu %c", &cap->report_stamp, &extra) != 1)
                 return -1;
+        } else if (!strncmp(line, "dcc_rust_host ", 14)) {
+            if (sscanf(line+14,"%95s %c",cap->rust_host,&extra)!=1) return -1;
         } else if (!strncmp(line, "dcc_cpus ", 9)) {
             if ((fields & 1) || sscanf(line + 9, "%lf %c", &value, &extra) != 1 ||
                 !(value >= 1 && value <= 10000) || value != (int)value)

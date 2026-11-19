@@ -2,11 +2,16 @@
  * file descriptors to the pooled transport until the result is verified. */
 #include "rust_common.h"
 #include "rust_job.h"
+#include "rust_probe.h"
+#include "rust_link_args.h"
+#include <regex>
 #include <chrono>
+#include <array>
 #include <functional>
 #include <iconv.h>
 #include <memory>
 #include <sys/resource.h>
+#include <sys/mman.h>
 #include <sched.h>
 extern "C" {
 #include "broker.h"
@@ -23,9 +28,11 @@ namespace {
 using States = std::map<fs::path, struct stat>;
 struct Work {
     fs::path dir;
-    Work() {
+    explicit Work(fs::path parent = {}) {
         auto base = env("TMPDIR");
-        string tmp = (fs::path(base.empty() ? "/tmp" : base) / "distcc-rust-XXXXXX").string();
+        if (parent.empty())
+            parent = base.empty() ? "/tmp" : base;
+        string tmp = (parent / "distcc-rust-XXXXXX").string();
         check(mkdtemp(tmp.data()) != nullptr, "Rust working directory");
         dir = fs::absolute(tmp);
     }
@@ -160,12 +167,6 @@ struct ResponseFiles {
 };
 uint64_t hash(const string &s, uint64_t seed = 0) { return XXH3_64bits_withSeed(s.data(), s.size(), seed); }
 string memo(string context, const States &dependencies, const std::function<string()> &compute) {
-    for (auto &[path, st] : dependencies) {
-        context += '\0';
-        context += path.string();
-        context += '\0';
-        context += stamp(st);
-    }
     auto h = XXH3_128bits(context.data(), context.size());
     string key = "rust-plan:" + std::to_string(h.high64) + ":" + std::to_string(h.low64);
     Fd output(dcc_job_memfd("rust-memo"));
@@ -179,6 +180,8 @@ string memo(string context, const States &dependencies, const std::function<stri
         if (dcc_plan_memo_decode(value, length, output.fd, &count, verified))
             return contents(output.fd);
         value = nullptr;
+        if (owner.id >= 0)
+            dcc_broker_release(owner.id);
         owner.id = dcc_broker_memo_refresh(key.c_str(), saved.get(), length, &value, &length, &verified);
     }
     string computed = compute();
@@ -193,6 +196,7 @@ string memo(string context, const States &dependencies, const std::function<stri
             put(journal.fd, string(reinterpret_cast<char *>(&record), sizeof(record)));
             put(journal.fd, path.string() + '\0');
         }
+        check(!ftruncate(output.fd, 0) && lseek(output.fd, 0, SEEK_SET) == 0, "reset compiler memo");
         put(output.fd, computed);
         value = dcc_plan_memo_encode(journal.fd, output.fd, &count, &length);
         if (value) {
@@ -207,13 +211,20 @@ fs::path absolute_name(const string &s) { return fs::absolute(s).lexically_norma
 struct Invocation {
     Words base, actions, types;
     fs::path source, outdir = fs::current_path(), scope;
-    string single_output, target, sysroot, name, opt = "0", cpu;
-    std::set<fs::path> inputs, search, dirs;
+    string single_output, target, sysroot, name, opt = "0", cpu, linker;
+    std::set<fs::path> inputs, search, native_search, dirs;
+    std::set<string> libraries;
+    bool trace_macro = false, needs_host = false, static_archive = false, pipeline = false;
+    string metadata_name;
+    std::set<string> link_arguments;
+    std::set<string> dep_names;
     std::map<string, string> outputs;
     Env environment;
     explicit Invocation(const Words &args) {
         auto opts = options(args);
         actions = emits(opts);
+        pipeline = metadata_notifications(opts);
+        linker = link_driver(opts);
         if (std::all_of(actions.begin(), actions.end(),
                         [](auto &s) { return s.substr(0, s.find('=')) == "dep-info"; }))
             throw Local("dependency query");
@@ -222,7 +233,7 @@ struct Invocation {
             string v = o.value.value_or("");
             if (k == "-" || (k.empty() && v == "-"))
                 throw Local("standard input requires local compilation");
-            if (k == "--test" || k == "--print" || k.compare(0, 8, "--print=") == 0)
+            if (k == "--explain" || k == "--print" || k.compare(0, 8, "--print=") == 0)
                 throw Local("local rustc query or test");
             if (k == "--emit")
                 continue;
@@ -241,8 +252,11 @@ struct Invocation {
             }
             if (k == "--crate-name")
                 name = v;
-            if (k == "--crate-type")
+            if (k == "--crate-type") {
                 types.push_back(v);
+                for (auto &type : split(v, ','))
+                    static_archive |= type == "staticlib";
+            }
             if (k == "--sysroot")
                 sysroot = v;
             if (k == "--target") {
@@ -253,6 +267,16 @@ struct Invocation {
             auto eq = v.find('=');
             string key = v.substr(0, eq), val = eq == string::npos ? "" : v.substr(eq + 1);
             if (k == "-C") {
+                if (key == "link-arg" || key == "link-args") {
+                    Words expanded;
+                    std::set<fs::path> active;
+                    expand_link_args(key == "link-arg" ? Words{val} : split(val, ' '), expanded, active,
+                                     &inputs);
+                    link_arguments.insert(expanded.begin(), expanded.end());
+                    for (const auto &arg : expanded)
+                        if (!arg.empty() && arg.front() != '-' && fs::is_regular_file(arg))
+                            inputs.insert(absolute_name(arg));
+                }
                 if (key == "incremental")
                     continue;
                 if (key == "profile-use")
@@ -265,9 +289,12 @@ struct Invocation {
             if (k == "-O")
                 opt = "2";
             if (k == "--extern" && eq != string::npos) {
-                if (fs::path(val).extension() == ".so")
-                    throw Local("procedural macro or dynamic Rust dependency");
+                trace_macro |= fs::path(val).extension() == ".so";
                 inputs.insert(absolute_name(val));
+            }
+            if (k == "-l") {
+                auto lib = eq == string::npos ? v : val;
+                libraries.insert(lib.substr(0, lib.find(':')));
             }
             if (k == "-L") {
                 auto dir = absolute_name(eq == string::npos ? v : val);
@@ -275,10 +302,9 @@ struct Invocation {
                     scope = dir;
                 if (fs::is_directory(dir)) {
                     search.insert(fs::canonical(dir));
+                    trace_macro |= key != "native" && key != "framework";
                     if (key != "crate" && key != "dependency")
-                        for (auto &p : fs::directory_iterator(dir))
-                            if (p.path().extension() == ".a")
-                                inputs.insert(p.path());
+                        native_search.insert(dir);
                 }
             }
             o.append(base);
@@ -315,6 +341,10 @@ struct Invocation {
             if (!mapped.empty())
                 mapped += ',';
             mapped += action.substr(0, eq);
+            if (eq != string::npos && action.substr(0, eq) == "dep-info")
+                dep_names.insert(fs::path(action.substr(eq + 1)).filename());
+            if (eq != string::npos && action.substr(0, eq) == "metadata")
+                metadata_name = fs::path(action.substr(eq + 1)).filename();
             if (eq != string::npos)
                 mapped += "=" + destination(action.substr(eq + 1));
         }
@@ -331,34 +361,40 @@ struct Invocation {
         Env envs = {{"RUSTC_BOOTSTRAP", "1"},
                     {"DISTCC_RUST_LOADS_FD", std::to_string(loads.fd)},
                     {"LD_PRELOAD", native_library().string() + " " + env("LD_PRELOAD")}};
-        Words cmd = {compiler};
+        Words cmd = compiler_command(compiler);
         cmd.insert(cmd.end(), base.begin(), base.end());
         if (sysroot.empty())
             cmd.insert(cmd.end(), {"--sysroot", root});
-        auto depfile = work.dir / "probe.d";
+        auto staging = work.dir / "probe";
+        fs::create_directory(staging);
+        auto depfile = staging / "probe.d";
         cmd.insert(cmd.end(), {"-Zbinary-dep-depinfo", "--emit=dep-info=" + depfile.string()});
+        Fd expanded(dcc_job_memfd("rust-expanded"));
+        if (!native_search.empty())
+            cmd.push_back("-Zunpretty=expanded");
         {
             ProbeSlot slot;
-            if (run(cmd, envs, quiet.fd, quiet.fd))
-                throw Local("dependency expansion failed");
+            probe(cmd, envs, work.dir, staging, trace_macro, expanded.fd, quiet.fd);
         }
-        std::set<fs::path> loaded;
-        for (auto &name : split(contents(loads.fd), '\0')) {
-            if (name.empty())
-                continue;
-            fs::path path(name);
-            if (search.count(fs::weakly_canonical(path.parent_path())))
-                throw Local("procedural macro executed through a transitive dependency");
-            loaded.insert(fs::weakly_canonical(path));
+        if (!native_search.empty()) {
+            string src = contents(expanded.fd);
+            const std::regex attribute(R"re(#\s*\[\s*(?:unsafe\s*\(\s*)?link\s*\(([^\]]*)\)\s*\])re");
+            const std::regex libname(R"re(\bname\s*=\s*"([A-Za-z0-9_.+-]+)")re");
+            for (std::sregex_iterator it(src.begin(), src.end(), attribute), end; it != end; ++it) {
+                std::smatch m;
+                string body = (*it)[1];
+                if (!std::regex_search(body, m, libname))
+                    throw Local("unresolved native library attribute");
+                libraries.insert(m[1]);
+            }
+            for (auto &dir : native_search)
+                for (auto &lib : libraries)
+                    for (auto &name : {lib, "lib" + lib + ".a"}) {
+                        auto path = dir / name;
+                        if (fs::is_regular_file(path))
+                            inputs.insert(path);
+                    }
         }
-        // rustc may pass the resolved object to dlopen when a search path
-        // contains a symlink. Only those library aliases need resolution.
-        if (!loaded.empty())
-            for (auto &dir : search)
-                for (auto &entry : fs::directory_iterator(dir))
-                    if (entry.path().extension() == ".so" && entry.is_symlink() &&
-                        loaded.count(fs::weakly_canonical(entry.path())))
-                        throw Local("procedural macro executed through a transitive dependency");
         string data = read(depfile);
         auto first = data.find("\n\n");
         if (first == string::npos)
@@ -386,12 +422,102 @@ struct Invocation {
                         dirs.insert(parent.parent_path().lexically_normal());
             }
             inputs.insert(path);
+            if (path.extension() == ".rmeta" && (!linker.empty() || static_archive)) {
+                for (auto ext : {".rlib", ".so"}) {
+                    auto binary = path;
+                    binary.replace_extension(ext);
+                    if (fs::is_regular_file(binary))
+                        inputs.insert(binary);
+                }
+            }
             any = true;
         }
         if (!any)
             throw Local("empty dependency records");
+        needs_host = audit(work.dir, depfile, loads.fd, root, search, inputs, dirs);
+        if (needs_host) {
+            for (auto key : {"CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "OUT_DIR"})
+                if (getenv(key))
+                    environment[key] = env(key);
+        }
         if (getenv("RUSTC_BOOTSTRAP"))
             environment["RUSTC_BOOTSTRAP"] = env("RUSTC_BOOTSTRAP");
+    }
+};
+
+// Warm hits read exactly one shared cache line group. Writers only lock a
+// colliding slot while publishing it. POSIX record locks die with the client,
+// so a later writer can repair an interrupted (odd-generation) publication.
+class Digests {
+    using Key = std::array<uint64_t, 7>;
+    struct Entry {
+        uint64_t sequence, key[7], digest;
+    };
+    static constexpr size_t slots = 16384, bytes = slots * sizeof(Entry);
+    Fd backing;
+    Entry *table;
+    static int acquire() {
+        int fd = -1;
+        Lease owner{dcc_broker_worker_get(DCC_RUST_DIGEST_TABLE, &fd)};
+        if (owner.id >= 0) {
+            Fd file(dcc_job_memfd("distcc-rust-input-digests"));
+            check(!ftruncate(file.fd, bytes) &&
+                      !fcntl(file.fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL),
+                  "bound digest table");
+            dcc_broker_worker_put(owner.id, file.fd);
+            owner.id = -1;
+            fd = file.fd;
+            file.fd = -1;
+        }
+        return fd;
+    }
+
+  public:
+    Digests() : backing(acquire()) {
+        check(descriptor_state(backing.fd).st_size == bytes, "digest table size");
+        table = static_cast<Entry *>(mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, backing.fd, 0));
+        check(table != MAP_FAILED, "map digest table");
+    }
+    ~Digests() { munmap(table, bytes); }
+    void get(const fs::path &path, int fd, const struct stat &st, unsigned char *out) {
+        Key key = {uint64_t(st.st_dev),         uint64_t(st.st_ino),          uint64_t(st.st_size),
+                   uint64_t(st.st_mtim.tv_sec), uint64_t(st.st_mtim.tv_nsec), uint64_t(st.st_ctim.tv_sec),
+                   uint64_t(st.st_ctim.tv_nsec)};
+        size_t i = XXH3_64bits(key.data(), sizeof(key)) % slots;
+        Entry &e = table[i];
+        auto seq = __atomic_load_n(&e.sequence, __ATOMIC_SEQ_CST);
+        if (seq && !(seq & 1)) {
+            Key observed;
+            for (size_t j = 0; j < key.size(); ++j)
+                observed[j] = __atomic_load_n(e.key + j, __ATOMIC_SEQ_CST);
+            uint64_t value = __atomic_load_n(&e.digest, __ATOMIC_SEQ_CST);
+            if (observed == key && seq == __atomic_load_n(&e.sequence, __ATOMIC_SEQ_CST)) {
+                memcpy(out, &value, sizeof(value));
+                return;
+            }
+        }
+        check(!dcc_file_digest(fd, st.st_size, out), "hash Rust input");
+        verify(path, st, fd);
+        struct flock lock{};
+        lock.l_type = F_WRLCK;
+        lock.l_whence = SEEK_SET;
+        lock.l_start = i;
+        lock.l_len = 1;
+        if (fcntl(backing.fd, F_SETLK, &lock)) {
+            if (errno == EACCES || errno == EAGAIN)
+                return;
+            check(false, "lock digest entry");
+        }
+        seq = __atomic_load_n(&e.sequence, __ATOMIC_SEQ_CST) | 1;
+        __atomic_store_n(&e.sequence, seq, __ATOMIC_SEQ_CST);
+        for (size_t j = 0; j < key.size(); ++j)
+            __atomic_store_n(e.key + j, key[j], __ATOMIC_SEQ_CST);
+        uint64_t digest;
+        memcpy(&digest, out, sizeof(digest));
+        __atomic_store_n(&e.digest, digest, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&e.sequence, seq + 1, __ATOMIC_SEQ_CST);
+        lock.l_type = F_UNLCK;
+        check(!fcntl(backing.fd, F_SETLK, &lock), "unlock digest entry");
     }
 };
 
@@ -404,11 +530,15 @@ class Inputs {
     Inputs(const std::set<fs::path> &paths, timespec start) {
         if (paths.size() > DCC_JOB_INPUT_MAX)
             throw Local("too many Rust inputs");
+        Digests digests;
         for (const auto &p : paths) {
             if (below(p, DCC_RUST_ROOT) || below(p, "/dev") || below(p, "/proc") || below(p, "/sys") ||
                 std::any_of(runtime.begin(), runtime.end(), [&](auto &r) { return below(p, r); }))
                 throw Local("input overlaps worker runtime");
-            held.emplace_back(open(p.c_str(), O_RDONLY | O_CLOEXEC));
+            int opened = open(p.c_str(), O_RDONLY | O_CLOEXEC);
+            if (opened < 0 && (errno == ENOENT || errno == ENOTDIR || errno == ELOOP || errno == EACCES))
+                throw Local("unavailable Rust input " + p.string());
+            held.emplace_back(opened);
             int fd = held.back().fd;
             auto st = descriptor_state(fd);
             auto after = [&](timespec t) {
@@ -422,15 +552,7 @@ class Inputs {
             in.fd = fd;
             in.plain_size = in.wire_size = st.st_size;
             verify(p, st, fd);
-            string digest = memo("xxh3", {{p, st}}, [&] {
-                unsigned char data[DCC_FILE_HASH_SIZE];
-                check(!dcc_file_digest(fd, st.st_size, data), "hash Rust input");
-                verify(p, st, fd);
-                return string(reinterpret_cast<char *>(data), sizeof(data));
-            });
-            if (digest.size() != sizeof(in.digest))
-                throw std::runtime_error("invalid digest memo");
-            memcpy(in.digest, digest.data(), digest.size());
+            digests.get(p, fd, st, in.digest);
             in.cached = st.st_size <= DCC_FILE_CACHE_MAX ? DCC_CACHE_LOOKUP : DCC_UNCACHED;
             files.push_back(in);
         }
@@ -451,7 +573,8 @@ string profile(const fs::path &compiler, const Work &work, const States &tool) {
     cpu_set_t mask;
     CPU_ZERO(&mask);
     check(!sched_getaffinity(0, sizeof(mask), &mask), "native CPU affinity");
-    auto context = profile_context(compiler) + read("/proc/sys/kernel/random/boot_id") +
+    auto context = "native:" + profile_context(compiler) + '\0' + library.string() + '\0' +
+                   read("/proc/sys/kernel/random/boot_id") +
                    string(reinterpret_cast<char *>(&mask), sizeof(mask));
     return memo(context, watched, [&] {
         Env envs = {{"LD_PRELOAD", library.string() + " " + env("LD_PRELOAD")},
@@ -470,18 +593,172 @@ string relocated(string data, const Invocation &inv) {
         data = replace(std::move(data), string(DCC_RUST_OUT) + "/" + item.first, item.second);
     return replace(std::move(data), DCC_RUST_OUT, inv.outdir.string());
 }
+int finish_links(Result &result, const Invocation &inv, const fs::path &work, const fs::path &compiler) {
+    std::map<string, dcc_named_output *> outputs;
+    std::set<fs::path> generated;
+    Words plans;
+    for (unsigned i = 0; i < result.named_count; ++i) {
+        auto &f = result.named[i];
+        string name = f.name;
+        if (name.compare(0, sizeof(DCC_RUST_LINK_PREFIX) - 1, DCC_RUST_LINK_PREFIX)) {
+            outputs.emplace(name, &f);
+            continue;
+        }
+        if (fs::path(f.destination).parent_path() != work)
+            throw Local("invalid linker artifact");
+        check(!rename(f.temporary, f.destination), f.destination);
+        free(f.temporary);
+        f.temporary = nullptr;
+        if (fs::path(name).extension() == ".plan")
+            plans.push_back(f.destination);
+        else if (fs::path(name).extension() == ".input")
+            generated.insert(fs::path(DCC_RUST_OUT) / name);
+        else
+            throw Local("invalid linker artifact type");
+    }
+    for (auto &plan : plans) {
+        auto args = split(read(plan), '\0');
+        if (args.size() < 2 || !outputs.count(args.front()))
+            throw Local("invalid linker output");
+        auto &f = *outputs.at(args.front());
+        Work final(fs::path(f.destination).parent_path());
+        auto linked = final.dir / args.front();
+        auto driver = executable(inv.linker);
+        Words cmd = {"/usr/bin/bwrap", "--unshare-all", "--die-with-parent",
+                     "--ro-bind",      "/usr",          "/usr",
+                     "--dev",          "/dev",          "--proc",
+                     "/proc",          "--tmpfs",       "/tmp",
+                     "--clearenv",     "--setenv",      "PATH",
+                     "/usr/bin:/bin"};
+        for (auto p : {"/bin", "/lib", "/lib64", "/etc/ld.so.cache"})
+            if (fs::exists(p))
+                cmd.insert(cmd.end(), {"--ro-bind", p, p});
+        std::set<fs::path> needed = inv.search;
+        needed.insert(driver);
+        needed.insert(inv.inputs.begin(), inv.inputs.end());
+        for (auto &path : needed) {
+            if (!below(path, "/usr") && !below(path, "/lib") && !below(path, "/lib64"))
+                cmd.insert(cmd.end(), {"--ro-bind", path, path});
+        }
+        auto cwd = fs::current_path();
+        cmd.insert(cmd.end(), {"--dir", cwd, "--chdir", cwd, "--ro-bind", work, DCC_RUST_OUT, "--bind",
+                               final.dir, DCC_RUST_FINAL, "--", driver});
+        unsigned destinations = 0;
+        Words command;
+        fs::path sysroot = inv.sysroot.empty() ? compiler.parent_path().parent_path() : fs::path(inv.sysroot);
+        auto path_arg = [&](const fs::path &p, bool directory) {
+            if (!p.is_absolute() || p.lexically_normal() != p)
+                return false;
+            if (directory)
+                return inv.search.count(p) != 0 || below(p, sysroot / "lib/rustlib");
+            return generated.count(p) != 0 || inv.inputs.count(p) != 0;
+        };
+        const std::set<string> switches = {"-m64",
+                                           "-m32",
+                                           "-shared",
+                                           "-pie",
+                                           "-no-pie",
+                                           "-static",
+                                           "-static-pie",
+                                           "-nodefaultlibs",
+                                           "-nostdlib",
+                                           "-nostartfiles",
+                                           "-rdynamic",
+                                           "-s",
+                                           "-pthread",
+                                           "-Wl,--as-needed",
+                                           "-Wl,--no-as-needed",
+                                           "-Wl,-Bstatic",
+                                           "-Wl,-Bdynamic",
+                                           "-Wl,--eh-frame-hdr",
+                                           "-Wl,--gc-sections",
+                                           "-Wl,--no-gc-sections",
+                                           "-Wl,--no-undefined-version",
+                                           "-Wl,--export-dynamic",
+                                           "-Wl,-z,relro,-z,now",
+                                           "-Wl,-z,relro",
+                                           "-Wl,-z,now",
+                                           "-Wl,-z,noexecstack",
+                                           "-Wl,--whole-archive",
+                                           "-Wl,--no-whole-archive",
+                                           "-Wl,--start-group",
+                                           "-Wl,--end-group",
+                                           "-Wl,--push-state",
+                                           "-Wl,--pop-state",
+                                           "-fuse-ld=lld"};
+        for (auto it = args.begin() + 1; it != args.end(); ++it) {
+            string arg = replace(*it, DCC_RUST_COMPILER, compiler.parent_path().parent_path());
+            if (arg == "-o") {
+                if (++it == args.end() || *it != (fs::path(DCC_RUST_FINAL) / f.name).string())
+                    throw Local("invalid link destination");
+                ++destinations;
+                command.insert(command.end(), {"-o", *it});
+                continue;
+            }
+            if (arg == "-L") {
+                if (++it == args.end())
+                    throw Local("incomplete linker search directory");
+                string path = replace(*it, DCC_RUST_COMPILER, compiler.parent_path().parent_path());
+                if (!path_arg(path, true))
+                    throw Local("unexpected linker search directory: " + path);
+                command.insert(command.end(), {"-L", path});
+                continue;
+            }
+            bool ok = path_arg(arg, false) || switches.count(arg) || inv.link_arguments.count(arg);
+            if (arg.compare(0, 2, "-l") == 0 && arg.size() > 2)
+                ok |= arg.find_first_not_of(
+                          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+.-:", 2) ==
+                      string::npos;
+            for (string prefix : {"-Wl,--version-script=", "-Wl,--dynamic-list="})
+                if (arg.compare(0, prefix.size(), prefix) == 0)
+                    ok |= generated.count(arg.substr(prefix.size())) != 0;
+            if (!ok)
+                throw Local("unsupported client linker argument: " + arg);
+            command.push_back(std::move(arg));
+        }
+        if (destinations != 1)
+            throw Local("missing linker destination");
+        string response;
+        for (const auto &arg : command) {
+            response += '"';
+            for (char c : arg) {
+                if (c == '"' || c == '\\')
+                    response += '\\';
+                response += c;
+            }
+            response += "\"\n";
+        }
+        auto response_path = work / "link.rsp";
+        Fd response_fd(open(response_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600));
+        put(response_fd.fd, response);
+        cmd.push_back(string("@") + DCC_RUST_OUT + "/link.rsp");
+        const std::vector<int> inherited;
+        int rc = run(cmd, {}, 1, 2, &inherited);
+        if (rc)
+            return rc;
+        struct stat st = metadata(linked);
+        check(S_ISREG(st.st_mode) && !rename(linked.c_str(), f.temporary), f.temporary);
+        close(f.fd);
+        f.fd = open(f.temporary, O_RDWR | O_CLOEXEC);
+        check(f.fd >= 0, f.temporary);
+        f.mode = st.st_mode & 0777;
+    }
+    return 0;
+}
 void publish(Result &result, const Invocation &inv) {
     mode_t mask = umask(0);
     umask(mask);
     for (unsigned i = 0; i < result.named_count; ++i) {
         auto &f = result.named[i];
+        if (!f.temporary)
+            continue;
         struct stat existing;
         if (!fstatat(AT_FDCWD, f.destination, &existing, AT_SYMLINK_NOFOLLOW)) {
             if (S_ISDIR(existing.st_mode))
                 throw std::runtime_error(string("output is a directory: ") + f.destination);
         } else
             check(errno == ENOENT, f.destination);
-        if (fs::path(f.name).extension() == ".d") {
+        if (fs::path(f.name).extension() == ".d" || inv.dep_names.count(f.name)) {
             auto text = relocated(contents(f.fd), inv);
             check(!ftruncate(f.fd, 0) && lseek(f.fd, 0, SEEK_SET) == 0, "rewrite dependency file");
             put(f.fd, text);
@@ -493,17 +770,22 @@ void publish(Result &result, const Invocation &inv) {
     }
     for (unsigned i = 0; i < result.named_count; ++i) {
         auto &f = result.named[i];
+        if (!f.temporary)
+            continue;
         check(!renameat(AT_FDCWD, f.temporary, AT_FDCWD, f.destination), f.destination);
         free(f.temporary);
         f.temporary = nullptr;
     }
 }
-int distributed(const string &compiler, const Words &args, const States &responses) {
+int distributed(char **original, const Words &args, const States &responses) {
+    const string compiler = *original;
     if (env("DISTCC_BROKER").empty())
         throw Local("Rust distribution requires DISTCC_BROKER");
     Invocation inv(args);
     auto exe = executable(compiler);
-    auto source = metadata(inv.source);
+    struct stat source;
+    if (stat(inv.source.c_str(), &source))
+        throw Local("source unavailable");
     dcc_work_hint hint{};
     hint.kind = DCC_WORK_RUST;
     hint.key = hash(inv.source.string());
@@ -539,8 +821,9 @@ int distributed(const string &compiler, const Words &args, const States &respons
         if (lease.id >= 0) {
             for (auto &[p, st] : responses)
                 verify(p, st);
-            Words cmd = {compiler};
-            cmd.insert(cmd.end(), args.begin(), args.end());
+            Words cmd;
+            for (auto p = original; *p; ++p)
+                cmd.emplace_back(*p);
             auto start = std::chrono::steady_clock::now();
             int status = run(cmd, {}, 1, 2);
             struct rusage usage{};
@@ -575,7 +858,14 @@ int distributed(const string &compiler, const Words &args, const States &respons
     }
     timespec start;
     clock_gettime(CLOCK_REALTIME, &start);
-    inv.discover(compiler, info.substr(separator + 1), work);
+    inv.discover(exe, info.substr(separator + 1), work);
+    string host = inv.needs_host ? field(version, "host: ") : "";
+    if (host.size() >= sizeof(hint.rust_host))
+        throw Local("Rust host triple too long");
+    if (!host.empty() && env("DISTCC_VERBOSE") == "1")
+        fprintf(stderr, "distcc-rust: proc-macro host ABI %s\n", host.c_str());
+    strcpy(hint.rust_host, host.c_str());
+    job.rust.host = host.data();
     job.rust.cpu = cpu.data();
     job.rust.features = features.data();
     Words directories(inv.dirs.begin(), inv.dirs.end()), environment;
@@ -586,6 +876,11 @@ int distributed(const string &compiler, const Words &args, const States &respons
     job.rust.environment = envs.data();
     job.argv = compiler_args.data();
     job.outdir = inv.outdir.c_str();
+    auto linkdir = work.dir / "link";
+    if (!inv.linker.empty()) {
+        fs::create_directory(linkdir);
+        job.linkdir = linkdir.c_str();
+    }
     Words pairs;
     for (auto &[k, v] : inv.outputs)
         pairs.insert(pairs.end(), {k, v});
@@ -610,18 +905,84 @@ int distributed(const string &compiler, const Words &args, const States &respons
     };
     verify_job();
     Result result;
+    string forwarded;
+    struct Early {
+        const Invocation &inv;
+        decltype(verify_job) &verify;
+        string &line;
+        dcc_job &job;
+    } early{inv, verify_job, forwarded, job};
+    job.metadata_context = &early;
+    if (inv.pipeline)
+        job.publish_metadata = [](void *context, dcc_named_output *f, const char *line) {
+            auto &e = *static_cast<Early *>(context);
+            try {
+                e.verify();
+                Json obj(json_tokener_parse(line), json_object_put);
+                if (json_field(obj.get(), "$message_type") != "artifact" ||
+                    json_field(obj.get(), "emit") != "metadata" ||
+                    json_field(obj.get(), "artifact") != (fs::path(DCC_RUST_OUT) / f->name).string() ||
+                    (e.inv.metadata_name.empty() ? fs::path(f->name).extension() != ".rmeta"
+                                                 : e.inv.metadata_name != f->name))
+                    throw Local("invalid metadata notification");
+                json_object_object_add(obj.get(), "artifact", json_object_new_string(f->destination));
+                string notice =
+                    string(json_object_to_json_string_ext(obj.get(), JSON_C_TO_STRING_PLAIN)) + '\n';
+                mode_t mask = umask(0);
+                umask(mask);
+                check(!fchmod(f->fd, f->mode & ~mask), "set metadata mode");
+                check(!renameat(AT_FDCWD, f->temporary, AT_FDCWD, f->destination), f->destination);
+                e.job.metadata_published = 1;
+                free(f->temporary);
+                f->temporary = nullptr;
+                e.line = line;
+                put(2, notice);
+                return 0;
+            } catch (const std::exception &error) {
+                fprintf(stderr, "distcc-rust: metadata: %s\n", error.what());
+                return -1;
+            }
+        };
     int transport = dcc_transfer_prepared(&job, nullptr, nullptr, &hint, -1, &result);
-    verify_job();
+    if (job.metadata_published) {
+        try {
+            verify_job();
+        } catch (const std::exception &e) {
+            fprintf(stderr, "distcc-rust: %s\n", e.what());
+            return EXIT_DISTCC_FAILED;
+        }
+        if (transport)
+            return EXIT_DISTCC_FAILED;
+    } else
+        verify_job();
+    if (transport == EXIT_LOCAL_COMPILE)
+        throw Local("no worker with the required Rust host ABI");
     if (transport)
         throw std::runtime_error("Rust transport failed (" + std::to_string(transport) + ")");
     int status = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
     if (status == EXIT_LOCAL_COMPILE)
         throw Local("worker has no matching Rust toolchain");
-    if (status && env("DISTCC_FALLBACK") != "0" && env("DISTCC_SKIP_LOCAL_RETRY") != "1")
+    if (status && !job.metadata_published && env("DISTCC_FALLBACK") != "0" &&
+        env("DISTCC_SKIP_LOCAL_RETRY") != "1")
         throw Local("worker compilation failed; retrying locally");
-    if (!status)
-        publish(result, inv);
-    put(2, relocated(contents(result.fd[DCC_JOB_STDERR]), inv));
+    try {
+        if (!status && !inv.linker.empty())
+            status = finish_links(result, inv, linkdir, exe);
+        if (!status)
+            publish(result, inv);
+    } catch (const std::exception &e) {
+        if (!job.metadata_published)
+            throw;
+        fprintf(stderr, "distcc-rust: %s\n", e.what());
+        return EXIT_DISTCC_FAILED;
+    }
+    auto diagnostics = contents(result.fd[DCC_JOB_STDERR]);
+    if (!forwarded.empty()) {
+        auto pos = diagnostics.find(forwarded);
+        if (pos != string::npos)
+            diagnostics.erase(pos, forwarded.size());
+    }
+    put(2, relocated(std::move(diagnostics), inv));
     put(1, relocated(contents(result.fd[DCC_JOB_STDOUT]), inv));
     return status;
 }
@@ -641,8 +1002,11 @@ extern "C" int dcc_rust_client(char **argv) {
     };
     try {
         auto response = expand_args();
-        return distributed(*argv, response.flat, response.files);
+        return distributed(argv, response.flat, response.files);
     } catch (const Local &e) {
+        if (env("DISTCC_VERBOSE") == "1")
+            fprintf(stderr, "distcc-rust: local: %s\n", e.what());
+    } catch (const fs::filesystem_error &e) {
         if (env("DISTCC_VERBOSE") == "1")
             fprintf(stderr, "distcc-rust: local: %s\n", e.what());
     } catch (const std::exception &e) {
@@ -650,13 +1014,6 @@ extern "C" int dcc_rust_client(char **argv) {
         if (env("DISTCC_FALLBACK") == "0")
             return EXIT_DISTCC_FAILED;
     }
-    try {
-        auto flat = expand_args().flat;
-        flat.insert(flat.begin(), *argv);
-        auto cmd = pointers(flat);
-        execvp(*argv, cmd.data());
-    } catch (const std::exception &) {
-        execvp(*argv, argv);
-    }
+    execvp(*argv, argv);
     return EXIT_COMPILER_MISSING;
 }

@@ -179,7 +179,9 @@ static int stage_outputs(struct dcc_job *job, struct dcc_job_result *r,
         if (!f->name) return -1;
         char **p = job->destinations;
         while (p && *p && strcmp(*p, name)) p += 2;
-        if (p && *p) f->destination = strdup(p[1]);
+        if (job->linkdir && !strncmp(name, ".distcc-link-", 13)) {
+            if (asprintf(&f->destination,"%s/%s",job->linkdir,name)<0) return -1;
+        } else if (p && *p) f->destination = strdup(p[1]);
         else if (asprintf(&f->destination, "%s/%s", job->outdir, name) < 0) return -1;
         if (!f->destination) return -1;
         const char *base = strrchr(f->destination, '/');
@@ -191,7 +193,7 @@ static int stage_outputs(struct dcc_job *job, struct dcc_job_result *r,
         f->temporary = temporary;
         total += size; length -= 13 + n; data += 13 + n;
     }
-    return length || !r->named_count ? -1 : 0;
+    return length ? -1 : 0;
 }
 static uint64_t transaction_id(void)
 {
@@ -231,6 +233,11 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     off_t file_offset = 0;
     int ret = EXIT_IO_ERROR, have_result = 0;
     unsigned named_index = 0;
+    int names_received = 0;
+    struct dcc_job_result early;
+    dcc_job_result_init(&early);
+    char *notice = NULL;
+    uint64_t early_bytes = 0;
     uint64_t named_bytes = 0;
     struct sockaddr_storage address;
     socklen_t address_size = sizeof(address);
@@ -361,6 +368,21 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                 if (type == DCC_TCP_PROGRESS && !have_result && incoming.size == 8 &&
                     incoming.type == DCC_TCP_PROGRESS && dcc_tcp_get64(incoming.data) == id) {
                     /* Worker execution can exceed the transport idle timeout. */
+                } else if (type == DCC_TCP_METADATA_BEGIN && !have_result && !notice &&
+                           job->publish_metadata && incoming.size > 14) {
+                    size_t name = strnlen((char *)incoming.data + 12, incoming.size-12);
+                    size_t prefix = 13 + name;
+                    if (prefix >= incoming.size || memchr(incoming.data+prefix, 0, incoming.size-prefix) ||
+                        stage_outputs(job, &early, incoming.data, prefix) || early.named_count != 1 ||
+                        !(notice = strndup((char *)incoming.data+prefix, incoming.size-prefix))) goto done;
+                } else if (type == DCC_TCP_METADATA_DATA && !have_result && notice && !job->metadata_published) {
+                    struct dcc_named_output *f = early.named;
+                    if (incoming.size > f->size-early_bytes || dcc_writex(f->fd, incoming.data, incoming.size)) goto done;
+                    early_bytes += incoming.size;
+                    if (early_bytes == f->size) {
+                        if (job->publish_metadata(job->metadata_context, f, notice)) goto done;
+                        job->metadata_published = 1;
+                    }
                 } else if (type == DCC_TCP_NEED && !have_result && incoming.size &&
                            incoming.size == dcc_tcp_bitmap_size(job->count)) {
                     ++needs;
@@ -424,8 +446,9 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     received[index] = result->size[index];
                     finals |= 1U << index;
                 } else if (type == DCC_TCP_OUTPUT_NAMES && job->outdir && have_result &&
-                           !result->status && !result->named_count) {
+                           !result->status && !names_received) {
                     if (stage_outputs(job, result, incoming.data, incoming.size)) goto done;
+                    names_received = 1;
                     while (named_index < result->named_count && !result->named[named_index].size) ++named_index;
                 } else if (type == DCC_TCP_OUTPUT && have_result) {
                     unsigned index;
@@ -458,7 +481,8 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                            !length && stream.fd < 0 && !filesystem.size && read_request == count) {
                     ret = EXIT_BUSY; goto done;
                 } else if (type == DCC_TCP_COMPLETE && have_result && incoming.size == sizeof(struct dcc_tcp_complete) &&
-                           (!job->outdir || result->status || result->named_count) && named_index == result->named_count &&
+                           (!notice || job->metadata_published) && (!job->outdir || result->status || names_received) &&
+                           named_index == result->named_count &&
                            dcc_tcp_get64(incoming.data) == id && finals == (1U << DCC_JOB_RESULT_COUNT) - 1 &&
                            !length && stream.fd < 0 && !filesystem.size && read_request == count) {
                     /* No next job exists until this connection is returned
@@ -474,6 +498,8 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         }
     }
 done:
+    free(notice);
+    dcc_job_result_free(&early);
     if (fs_requests) rs_trace("frontend filesystem: %llu requests, %llu bytes, %u reads, %u read batches",
         (unsigned long long)fs_requests, (unsigned long long)fs_bytes, reads, read_batches);
     if (ret)

@@ -68,9 +68,9 @@ def manifest(kind, cwd, argv, inputs, *, rust=None):
     if kind == 3:
         if rust is None:
             raise ValueError('Rust command metadata is required')
-        phase, compiler, cpu, features, directories, environment = rust
+        phase, compiler, host, cpu, features, directories, environment = rust
         number(phase)
-        for field in (compiler, cpu, features, *directories, '', *environment, ''):
+        for field in (compiler, host, cpu, features, *directories, '', *environment, ''):
             string(field)
     for name, size, digest, cached in inputs:
         for value in (0, 0, cached, size, size):

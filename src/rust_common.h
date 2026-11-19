@@ -7,6 +7,8 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <memory>
+#include <json-c/json.h>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -15,6 +17,7 @@
 #include <system_error>
 #include <vector>
 #include <fcntl.h>
+#include <linux/close_range.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -111,7 +114,8 @@ inline Words compiler_command(const fs::path &compiler, const fs::path &mount = 
                 (prefix / "bin/rustc").string()};
     return {mount.empty() ? compiler.string() : (mount / "bin/rustc").string()};
 }
-inline int run(const Words &cmd, const Env &environment, int out, int err) {
+inline int run(const Words &cmd, const Env &environment, int out, int err,
+               const std::vector<int> *inherited = nullptr) {
     auto args = pointers(cmd);
     pid_t pid = fork();
     check(pid >= 0, "fork rustc");
@@ -121,6 +125,16 @@ inline int run(const Words &cmd, const Env &environment, int out, int err) {
                 _exit(100);
         if (dup2(out, 1) < 0 || dup2(err, 2) < 0)
             _exit(100);
+        if (inherited) {
+            if (close_range(3, ~0U, CLOSE_RANGE_CLOEXEC))
+                _exit(100);
+            int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (input < 0 || dup2(input, 0) < 0 || fcntl(0, F_SETFD, 0) < 0)
+                _exit(100);
+            for (int fd : *inherited)
+                if (fcntl(fd, F_SETFD, 0) < 0)
+                    _exit(100);
+        }
         execvp(args[0], args.data());
         _exit(110);
     }
@@ -235,6 +249,30 @@ inline std::vector<Option> options(const Words &args) {
     }
     return parsed;
 }
+inline bool metadata_notifications(const std::vector<Option> &opts) {
+    bool meta = false, link = false, notify = false;
+    for (const auto &o : opts) {
+        if (!o.value || (o.key != "--emit" && o.key != "--json"))
+            continue;
+        for (auto &word : split(*o.value, ',')) {
+            auto key = word.substr(0, word.find('='));
+            if (o.key == "--json")
+                notify |= key == "artifacts";
+            else {
+                meta |= key == "metadata";
+                link |= key == "link";
+            }
+        }
+    }
+    return meta && link && notify;
+}
+using Json = std::unique_ptr<json_object, decltype(&json_object_put)>;
+inline string json_field(json_object *obj, const char *name) {
+    json_object *v;
+    return obj && json_object_object_get_ex(obj, name, &v) && json_object_is_type(v, json_type_string)
+               ? string(json_object_get_string(v), json_object_get_string_len(v))
+               : "";
+}
 inline Words emits(const std::vector<Option> &opts) {
     Words types, actions;
     for (const auto &o : opts) {
@@ -248,12 +286,32 @@ inline Words emits(const std::vector<Option> &opts) {
         actions.push_back("link");
     if (types.empty())
         types.push_back("bin");
-    bool links = std::any_of(actions.begin(), actions.end(),
-                             [](auto &a) { return a.substr(0, a.find('=')) == "link"; });
     for (const auto &type : types)
-        if (type == "proc-macro" || (links && type != "lib" && type != "rlib"))
-            throw Local("executable/native linking or procedural macro");
+        if (type == "proc-macro")
+            throw Local("procedural macro compiler plugin");
     return actions;
+}
+// Match the linker driver name rustc uses for its target flavor. The actual
+// executable is selected on the client from this local invocation.
+inline string link_driver(const std::vector<Option> &opts) {
+    bool native = false, explicit_type = false;
+    string driver = "cc";
+    auto actions = emits(opts);
+    if (std::none_of(actions.begin(), actions.end(),
+                     [](const string &a) { return a.substr(0, a.find('=')) == "link"; }))
+        return {};
+    for (auto &o : opts) {
+        if (o.key == "--test")
+            native = true;
+        if (o.key == "--crate-type") {
+            explicit_type = true;
+            for (auto &kind : split(*o.value, ','))
+                native |= kind == "bin" || kind == "cdylib" || kind == "dylib";
+        }
+        if (o.key == "-C" && o.value->compare(0, 7, "linker=") == 0)
+            driver = o.value->substr(7);
+    }
+    return native || !explicit_type ? driver : "";
 }
 inline bool below(const string &path, const string &base) {
     return path == base || path.compare(0, base.size() + 1, base + "/") == 0;

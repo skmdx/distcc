@@ -312,6 +312,7 @@ int dcc_transfer_prepared(struct dcc_job *job, char **files, const char *output,
         dcc_broker_cpp_done(host);
         ret = dcc_tcp_exchange(host, job, files, NULL, output, NULL, result);
         if (!ret) break;
+        if (job->metadata_published) { dcc_broker_failed(host); goto done; }
         /* A pooled connection can close between acquisition and BEGIN. Job
          * inputs are immutable and no result has been published: retry once
          * through a fresh reservation, including when local fallback is off. */

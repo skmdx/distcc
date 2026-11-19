@@ -46,7 +46,6 @@
 #include <spawn.h>
 
 #include <dirent.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
@@ -77,6 +76,7 @@
 #include "dopt.h"
 #include "srvnet.h"
 #include "daemon.h"
+#include "rust_job.h"
 #include "types.h"
 #include "broker.h"
 #include "stats.h"
@@ -190,8 +190,8 @@ int dcc_spawn_worker(pid_t *pid, int channel)
     int ret = posix_spawn_file_actions_init(&actions);
     if (ret) return ret;
     int spare = -1;
-    if (channel <= DCC_WORKER_STATS_FD) {
-        spare = fcntl(channel, F_DUPFD_CLOEXEC, DCC_WORKER_STATS_FD + 1);
+    if (channel <= DCC_WORKER_CATALOG_FD) {
+        spare = fcntl(channel, F_DUPFD_CLOEXEC, DCC_WORKER_CATALOG_FD + 1);
         if (spare < 0) ret = errno;
         channel = spare;
     }
@@ -200,8 +200,9 @@ int dcc_spawn_worker(pid_t *pid, int channel)
     if (!ret && arg_stats)
         ret = posix_spawn_file_actions_adddup2(&actions, dcc_statspipe[1], DCC_WORKER_STATS_FD);
     if (!ret) ret = posix_spawn_file_actions_adddup2(&actions, channel, DCC_WORKER_CHANNEL_FD);
-    if (!ret) ret = posix_spawn_file_actions_addclosefrom_np(&actions,
-                              arg_stats ? DCC_WORKER_STATS_FD + 1 : DCC_WORKER_CHANNEL_FD + 1);
+    if (!ret && !arg_stats) ret = posix_spawn_file_actions_addclose(&actions, DCC_WORKER_STATS_FD);
+    if (!ret) ret = posix_spawn_file_actions_adddup2(&actions, dcc_rust_catalog_fd(), DCC_WORKER_CATALOG_FD);
+    if (!ret) ret = posix_spawn_file_actions_addclosefrom_np(&actions, DCC_WORKER_CATALOG_FD + 1);
     if (!ret) ret = posix_spawn(pid, "/proc/self/exe", &actions, NULL, worker_argv, environ);
     if (spare >= 0) close(spare);
     posix_spawn_file_actions_destroy(&actions);
@@ -215,6 +216,9 @@ int dcc_spawn_worker(pid_t *pid, int channel)
 int main(int argc, char *argv[])
 {
     int ret;
+    if (!strncmp(argv[0], DCC_RUST_LINKERS, sizeof(DCC_RUST_LINKERS)-1) &&
+        argv[0][sizeof(DCC_RUST_LINKERS)-1]=='/')
+        return dcc_rust_capture(argv + 1);
 
     dcc_setup_startup_log();
 

@@ -49,7 +49,7 @@ struct dcc_server_load {
     int busy, queued, links, preparing, returning, suspended;
     unsigned long long reserved;
 };
-enum { DCC_WORKER_CHANNEL_FD = 3, DCC_WORKER_STATS_FD = 4 };
+enum { DCC_WORKER_CHANNEL_FD = 3, DCC_WORKER_STATS_FD = 4, DCC_WORKER_CATALOG_FD = 5 };
 int dcc_spawn_worker(pid_t *pid, int channel);
 int dcc_run_worker(void);
 struct pollfd;

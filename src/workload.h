@@ -16,6 +16,7 @@ struct dcc_work_hint {
     uint64_t family; /* Source-content prior across command/configuration changes. */
     uint64_t scope_key;
     uint64_t memory_class; /* Same resource class as the serialized worker job. */
+    char rust_host[96]; /* Exact rustc host triple required by a procedural macro. */
 };
 struct dcc_work_class {
     double weight, x, y, z;

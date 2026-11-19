@@ -20,7 +20,7 @@ enum dcc_job_encoding { DCC_JOB_RAW, DCC_JOB_LZ4 };
 enum dcc_input_cache { DCC_UNCACHED, DCC_CACHE_LOOKUP, DCC_CACHE_PUSH };
 enum dcc_rust_phase { DCC_RUST_METADATA, DCC_RUST_CODEGEN, DCC_RUST_OPTIMIZED };
 struct dcc_rust_command {
-    char *compiler, *cpu, *features;
+    char *compiler, *host, *cpu, *features;
     char **directories, **environment; /* environment entries are NAME=value */
     enum dcc_rust_phase phase;
 };
@@ -36,6 +36,7 @@ struct dcc_job_input {
     /* Owned local reference, never serialized. Open on demand to bound FD use. */
     int fd;
 };
+struct dcc_named_output;
 struct dcc_job {
     enum dcc_job_kind kind;
     char *cwd;
@@ -54,7 +55,11 @@ struct dcc_job {
     int compiler_channel;
     /* Local publication policy, borrowed from the Rust planner. */
     const char *outdir;
+    const char *linkdir;
     char **destinations; /* basename, destination pairs, NULL terminated */
+    int (*publish_metadata)(void *, struct dcc_named_output *, const char *);
+    void *metadata_context;
+    int metadata_published;
 };
 static inline int dcc_job_file(const struct dcc_job_input *in)
 {

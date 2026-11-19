@@ -13,10 +13,12 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <set>
 
 namespace {
 [[noreturn]] void fail(const char *message)
@@ -124,15 +126,47 @@ extern "C" char *LLVMGetHostCPUFeatures()
  * libraries it executes rather than interpreting Rust crate metadata. */
 extern "C" void *dlopen(const char *name, int flags)
 {
+    const char *descriptor = std::getenv("DISTCC_RUST_LOADS_FD");
+    if (!descriptor)
+        return original<void *(*)(const char *, int)>("dlopen")(name, flags);
+    auto mapped = []() {
+        std::set<std::string> paths;
+        dl_iterate_phdr(
+            [](dl_phdr_info *info, size_t, void *context) {
+                if (info->dlpi_name && *info->dlpi_name)
+                    static_cast<std::set<std::string> *>(context)->insert(info->dlpi_name);
+                return 0;
+            },
+            &paths);
+        return paths;
+    };
+    auto previous = mapped();
+    timeval start{};
+    gettimeofday(&start, nullptr);
     void *handle = original<void *(*)(const char *, int)>("dlopen")(name, flags);
     int saved_errno = errno;
-    const char *descriptor = std::getenv("DISTCC_RUST_LOADS_FD");
-    if (handle && descriptor) {
+    if (handle) {
         struct link_map *map;
         if (dlinfo(handle, RTLD_DI_LINKMAP, &map)) fail("cannot inspect loaded library");
         int fd = std::atoi(descriptor);
-        const char *data = map->l_name;
-        size_t remaining = std::strlen(data) + 1;
+        char time[40];
+        snprintf(time, sizeof(time), "%ld.%06ld", long(start.tv_sec), long(start.tv_usec));
+        std::string record(time);
+        record += '\0';
+        record += name ? name : "";
+        record += '\0';
+        record += map->l_name;
+        record += '\0';
+        for (const auto &dependency : mapped()) {
+            if (dependency == map->l_name || previous.count(dependency))
+                continue;
+            record += time;
+            record.append(2, '\0');
+            record += dependency;
+            record += '\0';
+        }
+        const char *data = record.data();
+        size_t remaining = record.size();
         while (remaining) {
             /* The parent opened this permitted log before starting rustc.
              * Loader callbacks must not reenter sandbox's filesystem hooks. */

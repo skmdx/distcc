@@ -1103,7 +1103,9 @@ static int dcc_run_job(int in_fd,
 
     if ((ret = dcc_make_tmpnam("distcc", ".deps", &deps_fname)))
         goto out_cleanup;
-    if ((ret = dcc_make_tmpnam("distcc", ".stderr", &err_fname)))
+    if (dcc_rust_pipelined(job)) {
+        if (asprintf(&err_fname, "%s%s", root, DCC_RUST_STDERR) < 0) return EXIT_OUT_OF_MEMORY;
+    } else if ((ret = dcc_make_tmpnam("distcc", ".stderr", &err_fname)))
         goto out_cleanup;
     if ((ret = dcc_make_tmpnam("distcc", ".stdout", &out_fname)))
         goto out_cleanup;

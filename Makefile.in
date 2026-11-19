@@ -238,7 +238,7 @@ dist_extra =							\
 	distcc_job.py \
 	distcc_python.py \
 	src/rust_native.cc \
-	src/rust_client.cc src/rust_worker.cc src/rust_common.h src/rust_job.h \
+	src/rust_client.cc src/rust_worker.cc src/rust_link.cc src/rust_link_args.h src/rust_probe.cc src/rust_probe.h src/rust_common.h src/rust_job.h \
 	src/clang_driver.cc \
 	src/argv_file.h \
 	src/clang_inputs.h \
@@ -419,8 +419,8 @@ distcc_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_front
 distccd_obj += src/tcp_server.o src/tcp_worker.o src/tcp_async.o src/clang_worker.o src/gcc_files.o src/plan_memo.o
 h_compile_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o src/plan_memo.o
 distcc_obj += src/remote_job.o src/file_cache.o
-distcc_obj += src/rust_client.o
-distccd_obj += src/rust_worker.o
+distcc_obj += src/rust_client.o src/rust_probe.o
+distccd_obj += src/rust_worker.o src/rust_link.o
 h_compile_obj += src/remote_job.o src/file_cache.o
 
 # All source files, for the purposes of building the distribution
@@ -616,7 +616,7 @@ install-lto: $(LTO_TARGETS)
 src/rust_native.o: $(srcdir)/src/rust_native.cc
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -c $< -o $@
 
-src/rust_client.o src/rust_worker.o: src/%.o: $(srcdir)/src/%.cc $(srcdir)/src/rust_common.h $(srcdir)/src/rust_job.h $(srcdir)/src/job.h
+src/rust_client.o src/rust_probe.o src/rust_worker.o src/rust_link.o: src/%.o: $(srcdir)/src/%.cc $(srcdir)/src/rust_common.h $(srcdir)/src/rust_job.h $(srcdir)/src/job.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -std=gnu++17 -c $< -o $@
 
 distcc-rust-native.so: src/rust_native.o

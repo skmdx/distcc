@@ -144,7 +144,7 @@ void dcc_job_free(struct dcc_job *job)
     if (job->stdin_fd) close(job->stdin_fd - 1);
     if (job->argv) for (i = 0; job->argv[i]; ++i) free(job->argv[i]);
     free(job->argv);
-    free(job->rust.compiler); free(job->rust.cpu); free(job->rust.features);
+    free(job->rust.compiler); free(job->rust.host); free(job->rust.cpu); free(job->rust.features);
     if (job->rust.directories) {
         for (char **p = job->rust.directories; *p; ++p) free(*p);
         free(job->rust.directories);
@@ -243,6 +243,7 @@ unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
     if (job->kind == DCC_JOB_RUST) {
         number(&m, job->rust.phase);
         string(&m, job->rust.compiler);
+        string(&m, job->rust.host);
         string(&m, job->rust.cpu);
         string(&m, job->rust.features);
         strings(&m, job->rust.directories);
@@ -311,6 +312,7 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
         uint64_t phase = get_number(&m);
         if (phase > DCC_RUST_OPTIMIZED ||
             !(job->rust.compiler = get_string(&m)) || !*job->rust.compiler ||
+            !(job->rust.host = get_string(&m)) ||
             !(job->rust.cpu = get_string(&m)) || !(job->rust.features = get_string(&m)) ||
             get_strings(&m, &job->rust.directories) || get_strings(&m, &job->rust.environment)) goto failed;
         job->rust.phase = phase;

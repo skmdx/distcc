@@ -4,6 +4,7 @@
 struct dcc_hostdef;
 struct dcc_capacity {
     int cpus, cores, jobs;
+    char rust_host[96];
     double core_scale, smt_gain;
     double cpu_scale, cpu_age;
     int cpu_probe, live_report;

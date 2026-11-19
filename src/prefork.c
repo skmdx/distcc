@@ -140,7 +140,6 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
         struct worker *w = &workers[i];
         if (w->fd < 0 || w->busy) continue;
         size_t length = offsetof(struct dcc_tcp_run, root) + strlen(run->root) + 1;
-        if (description->kind == DCC_JOB_RUST && (input = dcc_rust_catalog_fd()) < 0) return -1;
         int descriptors[3] = {fd, input, -1};
         unsigned count = input >= 0 ? 2 : 1;
         if (description->kind == DCC_JOB_FRONTEND) {
@@ -665,6 +664,8 @@ static void dcc_create_kids(void) {
 int dcc_run_worker(void)
 {
     worker_channel = DCC_WORKER_CHANNEL_FD;
+    if (dcc_rust_catalog_attach(DCC_WORKER_CATALOG_FD)) return EXIT_IO_ERROR;
+    close(DCC_WORKER_CATALOG_FD);
     if (set_cloexec_flag(worker_channel, 1) ||
         (arg_stats && set_cloexec_flag(DCC_WORKER_STATS_FD, 1))) return EXIT_IO_ERROR;
     dcc_statspipe[1] = DCC_WORKER_STATS_FD;
