@@ -1,18 +1,20 @@
-#include "rust/sandbox.hh"
-#include <set>
-#include <optional>
 /* Worker toolchain catalog and construction of the read-only rustc namespace. */
-#include "rust/common.hh"
 #include "rust/api.h"
+#include "rust/common.hh"
+#include "rust/sandbox.hh"
+
+#include <chrono>
 #include <fstream>
 #include <glob.h>
-#include <chrono>
-#include <mutex>
-#include <limits.h>
 #include <json-c/json.h>
-#include <sys/inotify.h>
+#include <limits.h>
+#include <mutex>
+#include <optional>
 #include <pthread.h>
+#include <set>
+#include <sys/inotify.h>
 #include <sys/mman.h>
+
 extern "C" {
 #include "exec.h"
 #include "exitcode.h"

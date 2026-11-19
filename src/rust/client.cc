@@ -1,31 +1,33 @@
-#include "rust/sandbox.hh"
-#include "rust/runtime.hh"
-#include <set>
-#include <optional>
 /* Plan the Rust dependency closure using rustc itself, and lend original
  * file descriptors to the pooled transport until the result is verified. */
-#include "rust/common.hh"
 #include "rust/api.h"
+#include "rust/common.hh"
 #include "rust/probe.h"
 #include "rust/response.hh"
-#include <chrono>
+#include "rust/runtime.hh"
+#include "rust/sandbox.hh"
+
 #include <array>
+#include <chrono>
 #include <functional>
 #include <iconv.h>
 #include <memory>
-#include <sys/resource.h>
-#include <sys/mman.h>
-#include <sys/sendfile.h>
+#include <optional>
 #include <sched.h>
+#include <set>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/sendfile.h>
+
 extern "C" {
 #include "broker.h"
-#include "workload.h"
-#include "resource.h"
-#include "where.h"
-#include "lock.h"
 #include "exitcode.h"
 #include "file_cache.h"
+#include "lock.h"
 #include "plan_memo.h"
+#include "resource.h"
+#include "where.h"
+#include "workload.h"
 }
 using namespace rust;
 namespace {
@@ -841,23 +843,42 @@ struct CguRoute {
     int peers = 0;
     bool native = false;
 };
+// A rustc-private LLVM and a system LLVM can report the same version but
+// cannot exchange C++ objects inside rustc. Trace the loader without running
+// constructors before selecting the slot's in-process hook.
+fs::path linked_llvm(const Words &command) {
+    Fd output(dcc_job_memfd("rust-llvm-library"));
+    if (run(command, {{"LD_TRACE_LOADED_OBJECTS", "1"}}, output.fd, 2))
+        throw std::runtime_error("LLVM loader query failed: " + command.front());
+    for (const auto &line : split(contents(output.fd), '\n')) {
+        auto start = line.find(" => /"), end = line.rfind(" (");
+        if (line.compare(0, 8, "\tlibLLVM") == 0 && start != string::npos && end != string::npos)
+            return line.substr(start + 4, end - start - 4);
+    }
+    return {};
+}
 CguRoute cgu_route(const Invocation &inv, const string &version, const fs::path &sysroot,
                    dcc_work_hint hint) {
     auto llvm = llvm_abi(field(version, "LLVM version: "));
     auto host = field(version, "host: ");
     auto triple = inv.target.empty() ? host : inv.target;
+    auto compiler = sysroot / "bin/rustc";
     for (auto &helper : backend_helpers(sysroot, llvm)) {
         auto shim = helper.parent_path() / "distcc-rust-cgu.so";
         if (!fs::is_regular_file(shim))
             continue;
-        auto key = "cgu-target:" + helper.string() + '\0' + llvm + '\0' + triple;
-        auto target = memo(key, {{helper, metadata(helper)}}, [&] {
+        auto key = "cgu-target:" + helper.string() + '\0' + profile_context(compiler) + '\0' + llvm + '\0' + triple;
+        auto target = memo(key, {{helper, metadata(helper)}, {compiler, metadata(compiler)}}, [&] {
             Fd output(dcc_job_memfd("rust-target"));
             int rc = run({helper, "--target-name", llvm, triple}, {}, output.fd, 2);
             if (rc == EXIT_LOCAL_COMPILE)
                 return string{};
             if (rc)
                 throw std::runtime_error("LLVM target query failed: " + helper.string());
+            auto frontend = linked_llvm(compiler_command(compiler));
+            auto backend = linked_llvm({helper});
+            if (frontend.empty() || backend.empty() || !fs::equivalent(frontend, backend))
+                return string{};
             return contents(output.fd);
         });
         if (target.empty())

@@ -2,6 +2,7 @@
 """Deploy the latest published overlay revision to the configured Gentoo fleet."""
 import concurrent.futures
 import fcntl
+import http.client
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -339,6 +341,45 @@ def validate(target, work):
     print(f"{target['name']}: C/C++ and Rust remote compilation and execution passed", flush=True)
 
 
+def rust_cgu_requirement(client, compiler):
+    abi = '.'.join(compiler['identity']['llvm'].split('.')[:2])
+    library = next((lib['path'] for lib in compiler['runtime']
+                    if lib['name'] == 'libLLVM.so.' + abi), None)
+    if not library:
+        return None
+    target = run(['sh', '-ec', '''
+directory=$(dirname "$(realpath -e -- "$1")")/distcc
+test -f "$directory/distcc-rust-cgu.so" && test -x "$directory/distcc-rust-cgu" || exit 0
+"$directory/distcc-rust-cgu" --target-name "$2" "$3" || { rc=$?; test "$rc" = 121 || exit "$rc"; }
+''', 'sh', library, abi, compiler['host']], client)
+    return (abi, target) if target else None
+
+
+def rust_worker_capabilities(hostspec):
+    endpoint, *options = hostspec.split(',')
+    address = urlsplit('//' + endpoint).hostname
+    assert address and 'tcp' in options, hostspec
+    port = next((int(s[6:]) for s in options if s.startswith('stats=')), None)
+    if port is None:
+        port = 3633
+        hostspec += ',stats=' + str(port)
+    connection = http.client.HTTPConnection(address, port, timeout=10)
+    try:
+        connection.request('GET', '/')
+        response = connection.getresponse()
+        if response.status != 200:
+            raise RuntimeError(f'{address}: worker statistics returned {response.status}')
+        fields = dict(line.split(' ', 1) for line in response.read().decode().splitlines()
+                      if line.startswith('dcc_'))
+    finally:
+        connection.close()
+    backends = set()
+    for record in fields['dcc_llvm_cgu'].split(';'):
+        abi, *names = record.split()
+        backends.update((abi, name) for name in names)
+    return hostspec, fields['dcc_rust_host'], backends
+
+
 def validate_rust_cluster(targets, work, inventory, workers=None):
     def path(target):
         return target['temporary'] + '/distcc-rust-cluster-check'
@@ -347,24 +388,27 @@ def validate_rust_cluster(targets, work, inventory, workers=None):
         parallel(targets, lambda target: transfer(
             [str(ROOT / 'packaging/gentoo'/name) for name in VALIDATION_FILES], path(target), target))
         # Exercise every installed build/architecture against each worker.
-        # A foreign architecture may lack a matching build; verify its explicit
-        # pre-execution local route rather than running an incompatible rustc.
         clients = {}
         for client, compilers in inventory:
             for compiler in compilers:
                 clients.setdefault((compiler['host'], compiler['digest']), (client, compiler))
+        requirements = {key: rust_cgu_requirement(*item) for key, item in clients.items()}
         for worker in targets if workers is None else workers:
             # Distribution installs every slot for this worker architecture.
             # Assert that the actual service can execute each expected build.
-            worker_host = next(compilers[0]['host'] for target, compilers in inventory if target == worker)
+            hosts, worker_host, backends = rust_worker_capabilities(worker['server_hosts'])
             available = [compiler['identity'] for _, compiler in clients.values() if compiler['host'] == worker_host]
             def validate_client(item):
                 client, compiler = item
-                expected = 'remote' if compiler['identity'] in available else 'local'
+                requirement = requirements[compiler['host'], compiler['digest']]
+                if compiler['host'] != worker_host and requirement in backends:
+                    expected = 'cgu'
+                else:
+                    expected = 'remote' if compiler['identity'] in available else 'local'
                 name = client['name'] + '-' + compiler['digest'][:12] + '-to-' + worker['name']
                 with (work / ('rust-' + name + '.log')).open('w') as log:
                     bounded(['env', 'TMPDIR=' + client['temporary'],
-                             'VALIDATE_DISTCC_HOSTS=' + worker['server_hosts'],
+                             'VALIDATE_DISTCC_HOSTS=' + hosts,
                              'VALIDATE_DISTCC_RUSTC=' + compiler['root'] + '/bin/rustc',
                              'VALIDATE_DISTCC_RUST_ROUTE=' + expected,
                              'python3', '-B', path(client) + '/validate-installed.py', '--rust-only'],

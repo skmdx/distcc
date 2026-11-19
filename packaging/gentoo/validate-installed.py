@@ -361,8 +361,13 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         source = root / 'rust_library.rs'
         included = root / 'rust_value.rs'
         included.write_text('pub const VALUE: u32 = 42;')
+        # Keep a single module above the CGU offload threshold. Each opaque
+        # step contributes to the value checked by the linked executable.
+        steps = ''.join(f'    x = std::hint::black_box(x).wrapping_add({i});\n'
+                        for i in range(1, 65))
         source.write_text('include!(concat!(env!("DISTCC_RUST_INPUT"), "/rust_value.rs"));\n'
-                          'pub fn value() -> u32 { VALUE }\n')
+                          'pub fn value() -> u32 {\n    let mut x = VALUE;\n' +
+                          steps + f'    x.wrapping_sub({sum(range(1, 65))})\n}}\n')
         rust_env = dict(env, DISTCC_RUST_INPUT=str(root))
         library = root / 'librust_test.rlib'
         remote_ir, local_ir = root / 'rust-remote.ll', root / 'rust-local.ll'
@@ -372,12 +377,13 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                             env=rust_env, text=True, timeout=REMOTE_TIMEOUT)
         assert rust.returncode == 0, (rust.stdout + rust.stderr,
             (root/'client.log').read_text()[-6000:] if (root/'client.log').exists() else '')
-        distributed = os.environ.get('VALIDATE_DISTCC_RUST_ROUTE', 'remote') == 'remote'
-        if distributed:
-            assert 'distcc-rust: compiled on ' in rust.stderr, rust.stderr
-        else:
-            assert 'distcc-rust: local: worker has no matching Rust toolchain' in rust.stderr, rust.stderr
-            assert 'distcc-rust: compiled on ' not in rust.stderr, rust.stderr
+        expected = os.environ.get('VALIDATE_DISTCC_RUST_ROUTE', 'remote')
+        markers = {'remote': r'distcc-rust: compiled on \S+',
+                   'cgu': r'distcc-rust-cgu: compiled on \S+',
+                   'local': r'distcc-rust: local: worker has no matching Rust toolchain'}
+        observed = {route for route, marker in markers.items()
+                    if re.search('^' + marker + '$', rust.stderr, re.M)}
+        assert observed == {expected}, (expected, observed, rust.stderr)
         subprocess.run([rustc, '--crate-name=rust_test', '--crate-type=rlib', '-Ctarget-cpu=native',
                         '--emit=llvm-ir=' + str(local_ir), str(source)],
                        env=rust_env, check=True, capture_output=True, timeout=90)
@@ -392,5 +398,6 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         subprocess.run([executable], check=True, timeout=10)
         results['rustc'] = {'compiler': rustc,
                            'version': subprocess.check_output([rustc, '-V'], text=True).strip(),
-                           'distributed': distributed, 'executed': True, 'native_cpu_matched': True}
+                           'route': expected, 'distributed': expected != 'local',
+                           'executed': True, 'native_cpu_matched': True}
     print(json.dumps({'compilers': results, 'wrapper': str(wrapper.resolve()), 'fallback': False}))
