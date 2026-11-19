@@ -21,7 +21,8 @@ enum dcc_job_encoding { DCC_JOB_RAW, DCC_JOB_LZ4 };
 enum dcc_input_cache { DCC_UNCACHED, DCC_CACHE_LOOKUP, DCC_CACHE_PUSH };
 enum dcc_rust_phase { DCC_RUST_METADATA, DCC_RUST_CODEGEN, DCC_RUST_OPTIMIZED };
 struct dcc_rust_command {
-    char *compiler, *host, *cpu, *features;
+    char *compiler, *host, *cpu, *features, *linker, *crate_types;
+    unsigned pipeline;
     char **directories, **environment; /* environment entries are NAME=value */
     enum dcc_rust_phase phase;
 };
@@ -133,6 +134,9 @@ struct dcc_buffer;
 int dcc_execute_job(struct dcc_job *, const char *root, int cancel_fd, struct dcc_job_result *);
 const char *dcc_job_tmp_top(const struct dcc_job *);
 int dcc_file_transfer(const char *metadata, const char *snapshots, const char *output, int queued_fd);
+struct dcc_work_hint;
+int dcc_transfer_prepared(struct dcc_job *, char **files, const char *output, const struct dcc_work_hint *,
+                          int queued_fd, struct dcc_job_result *);
 struct dcc_hostdef;
 int dcc_compile_direct(struct dcc_hostdef *, struct dcc_job *, char **argv, const char *cpp, int cpp_fd, char **files, char **auxiliary,
                        const char *output, const char *deps, struct dcc_buffer *err,

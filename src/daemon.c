@@ -76,7 +76,7 @@
 #include "dopt.h"
 #include "srvnet.h"
 #include "daemon.h"
-#include "rust_job.h"
+#include "rust/api.h"
 #include "types.h"
 #include "broker.h"
 #include "stats.h"

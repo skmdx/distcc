@@ -1,6 +1,9 @@
+#include "rust/sandbox.hh"
+#include <set>
+#include <optional>
 /* Worker toolchain catalog and construction of the read-only rustc namespace. */
-#include "rust_common.h"
-#include "rust_job.h"
+#include "rust/common.hh"
+#include "rust/api.h"
 #include <fstream>
 #include <glob.h>
 #include <chrono>
@@ -42,7 +45,9 @@ struct CatalogGuard {
     }
     ~CatalogGuard() { pthread_mutex_unlock(&catalog->lock); }
 };
-XXH128_hash_t fingerprint(const string &text) { return XXH3_128bits(text.data(), text.size()); }
+XXH128_hash_t fingerprint(const string &text) {
+    return XXH3_128bits(text.data(), text.size());
+}
 string cached_identity(const fs::path &path) {
     string generation = path.string() + ":" + stamp(metadata(path));
     auto key = fingerprint(generation);
@@ -65,26 +70,26 @@ fs::path select_compiler(const string &requested, const string &host, string *ad
     CatalogGuard guard;
     auto key = fingerprint(requested + '\0' + host + '\0' + env("DISTCCD_RUSTC") + '\0' + env("PATH"));
     auto &route = catalog->routes[key.low64 % 32];
-    auto generation = [](const fs::path &path, bool validate) {
+    auto generation = [](const fs::path &path, bool validate) -> std::optional<XXH128_hash_t> {
         auto root = path.parent_path().parent_path();
         string state = path.string() + stamp(metadata(path)), name = root.filename();
         if (name.compare(0, 12, "rust-distcc-") == 0 && name.size() == 76) {
             auto marker = root / ".distcc-complete";
+            if (!fs::is_regular_file(marker))
+                return std::nullopt;
             state += stamp(metadata(marker));
             if (validate && read(marker) != name.substr(12) + "\n")
-                throw Local("incomplete Rust slot");
+                return std::nullopt;
         }
         return fingerprint(state);
     };
     if (route.candidate[0] && XXH128_isEqual(key, route.request)) {
-        try {
-            auto path = executable(route.candidate);
-            if (XXH128_isEqual(generation(path, false), route.generation)) {
-                if (advertised)
-                    *advertised = field(cached_identity(path), "host: ");
-                return path;
-            }
-        } catch (const std::exception &) {
+        auto path = find_program(route.candidate);
+        auto state = path.empty() ? std::nullopt : generation(path, false);
+        if (state && XXH128_isEqual(*state, route.generation)) {
+            if (advertised)
+                *advertised = field(cached_identity(path), "host: ");
+            return path;
         }
         route.candidate[0] = 0;
     }
@@ -99,32 +104,29 @@ fs::path select_compiler(const string &requested, const string &host, string *ad
         }
     }
     std::set<fs::path> visited;
-    for (auto &candidate : candidates)
-        try {
-            fs::path path = executable(candidate);
-            if (!visited.insert(path).second)
-                continue;
-            auto current = generation(path, true);
-            auto report = cached_identity(path);
-            if ((advertised || identity(report) == requested) &&
-                (host.empty() || field(report, "host: ") == host)) {
-                if (advertised)
-                    *advertised = field(report, "host: ");
-                if (candidate.size() < sizeof(route.candidate)) {
-                    route.request = key;
-                    route.generation = current;
-                    strcpy(route.candidate, candidate.c_str());
-                }
-                return path;
-            }
-        } catch (const std::exception &) {
+    for (const auto &candidate : candidates) {
+        auto path = find_program(candidate);
+        if (path.empty() || !visited.insert(path).second)
             continue;
+        auto current = generation(path, true);
+        if (!current)
+            continue;
+        auto report = cached_identity(path);
+        auto triple = field(report, "host: ");
+        if ((!advertised && identity(report) != requested) || (!host.empty() && triple != host))
+            continue;
+        if (advertised)
+            *advertised = triple;
+        if (candidate.size() < sizeof(route.candidate)) {
+            route.request = key;
+            route.generation = *current;
+            strcpy(route.candidate, candidate.c_str());
         }
+        return path;
+    }
     return {};
 }
 fs::path rooted(const fs::path &root, const fs::path &p) {
-    if (!p.is_absolute() || p.lexically_normal() != p)
-        throw Local("invalid worker path");
     return root / p.relative_path();
 }
 void write_profile(const fs::path &path, const string &data) {
@@ -136,7 +138,9 @@ int execute(const dcc_job *job, const fs::path &root, int cancel, const char *ou
     Words flags;
     for (char **p = job->argv; *p; ++p)
         flags.emplace_back(*p);
-    auto linker = link_driver(options(flags));
+    if (*job->rust.crate_types)
+        flags.emplace_back(string("--crate-type=") + job->rust.crate_types);
+    string linker = job->rust.linker;
     auto compiler = select_compiler(job->rust.compiler, job->rust.host);
     if (compiler.empty()) {
         std::ofstream(err, std::ios::app) << "distcc-rust: worker has no matching Rust toolchain\n";
@@ -145,15 +149,12 @@ int execute(const dcc_job *job, const fs::path &root, int cancel, const char *ou
     fs::create_directories(rooted(root, job->cwd));
     fs::path output = rooted(root, DCC_RUST_OUT);
     fs::create_directories(output);
-    Words cmd = {"/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--bind", root, "/"};
-    for (auto &p : runtime)
-        if (fs::exists(p))
-            cmd.insert(cmd.end(), {"--ro-bind", p, p});
-    cmd.insert(cmd.end(), {"--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"});
+    Sandbox box(Root::Inputs, root);
+    auto &cmd = box.args;
     if (fs::is_directory(root / "tmp"))
         for (auto &child : fs::directory_iterator(root / "tmp"))
             cmd.insert(cmd.end(), {"--ro-bind", child.path(), "/tmp/" + child.path().filename().string()});
-    cmd.insert(cmd.end(), {"--bind", output, DCC_RUST_OUT, "--chdir", job->cwd, "--clearenv"});
+    cmd.insert(cmd.end(), {"--bind", output, DCC_RUST_OUT, "--chdir", job->cwd});
     if (job->rust.host && *job->rust.host) {
         std::set<fs::path> libraries;
         for (unsigned i = 0; i < job->count; ++i) {
@@ -179,9 +180,6 @@ int execute(const dcc_job *job, const fs::path &root, int cancel, const char *ou
         string entry = *p;
         auto eq = entry.find('=');
         string key = entry.substr(0, eq);
-        if (eq == string::npos || key.empty() || key.compare(0, 3, "LD_") == 0 ||
-            key.compare(0, 5, "DYLD_") == 0 || key == "RUSTC_WRAPPER" || key == "RUSTC_WORKSPACE_WRAPPER")
-            throw Local("unsafe worker environment");
         cmd.insert(cmd.end(), {"--setenv", key, entry.substr(eq + 1)});
     }
     fs::path profile = rooted(root, DCC_RUST_PROFILE);
@@ -194,11 +192,10 @@ int execute(const dcc_job *job, const fs::path &root, int cancel, const char *ou
                     "--setenv", "LD_PRELOAD", DCC_RUST_PRELOAD, "--setenv", "DISTCC_RUST_NATIVE",
                     DCC_RUST_PROFILE, "--setenv", "DISTCC_RUST_NATIVE_CAPTURE", "0"});
     }
-    cmd.insert(cmd.end(), {"--ro-bind", compiler.parent_path().parent_path(), DCC_RUST_COMPILER,
-                           "--remount-ro", "/", "--"});
+    cmd.insert(cmd.end(), {"--ro-bind", compiler.parent_path().parent_path(), DCC_RUST_COMPILER});
     auto rustc = compiler_command(compiler, DCC_RUST_COMPILER);
-    cmd.insert(cmd.end(), rustc.begin(), rustc.end());
-    cmd.insert(cmd.end(), flags.begin(), flags.end());
+    rustc.insert(rustc.end(), flags.begin(), flags.end());
+    box.command(rustc);
     auto argv = pointers(cmd);
     pid_t pid;
     int status = 0, rc = dcc_spawn_child(argv.data(), &pid, "/dev/null", out, err);
@@ -208,13 +205,44 @@ int execute(const dcc_job *job, const fs::path &root, int cancel, const char *ou
         return rc << 8;
     if (!status && *job->rust.cpu &&
         (!fs::exists(profile / "cpu-used") || !fs::exists(profile / "features-used")))
-        throw Local("worker rustc did not consume native profile");
+        throw std::runtime_error("worker rustc did not consume native profile");
     return status;
 }
+struct Backends {
+    std::map<string, fs::path> paths;
+    string offer;
+    Backends() {
+        for (const auto &helper : backend_helpers()) {
+            Fd out(dcc_job_memfd("llvm-capabilities"));
+            if (run({helper, "--capabilities"}, {}, out.fd, 2))
+                throw std::runtime_error("cannot query " + helper.string());
+            auto caps = contents(out.fd);
+            auto space = caps.find(' ');
+            if (caps.empty() || caps.back() != '\n' || space == string::npos)
+                throw std::runtime_error("invalid backend capability record");
+            caps.pop_back();
+            if (paths.emplace(caps.substr(0, space), helper).second) {
+                if (!offer.empty())
+                    offer += ';';
+                offer += caps;
+            }
+        }
+        if (offer.empty())
+            offer = "-";
+    }
+};
+const Backends &backends() {
+    static const Backends value;
+    return value;
+}
 } // namespace
-extern "C" int dcc_spawn_rust_cgu(pid_t *pid, const char *tree, const char *output, const char *stdout_path,
-                                  const char *stderr_path) {
+extern "C" int dcc_spawn_rust_cgu(pid_t *pid, const char *abi, const char *tree, const char *output,
+                                  const char *stdout_path, const char *stderr_path) {
     try {
+        auto &slots = backends().paths;
+        auto slot = slots.find(abi);
+        if (slot == slots.end())
+            return EXIT_LOCAL_COMPILE;
         // Pin the prepared input before crossing the mount boundary. Only
         // the result descriptor is writable, and LLVM starts inside bwrap.
         Fd in(open((fs::path(tree) / "cgu").c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK));
@@ -223,47 +251,25 @@ extern "C" int dcc_spawn_rust_cgu(pid_t *pid, const char *tree, const char *outp
         if (fstat(in.fd, &st) || !S_ISREG(st.st_mode))
             return EXIT_PROTOCOL_ERROR;
         auto descriptor = [](int fd) { return "/proc/self/fd/" + std::to_string(fd); };
-        Words cmd{"/usr/bin/bwrap",
-                  "--unshare-all",
-                  "--die-with-parent",
-                  "--clearenv",
-                  "--ro-bind",
-                  "/usr",
-                  "/usr",
-                  "--dev",
-                  "/dev",
-                  "--proc",
-                  "/proc",
-                  "--tmpfs",
-                  "/tmp"};
-        for (auto p : {"/lib", "/lib64", "/etc/ld.so.cache"})
-            if (fs::exists(p))
-                cmd.insert(cmd.end(), {"--ro-bind", p, p});
-        cmd.insert(cmd.end(), {"--ro-bind", executable("distcc-rust-cgu"), "/backend", "--ro-bind",
-                               descriptor(in.fd), "/input", "--bind", descriptor(out.fd), "/output",
-                               "--remount-ro", "/", "--", "/backend", "--execute"});
-        auto argv = pointers(cmd);
+        Sandbox box(Root::Backend);
+        box.mount(slot->second, "/backend");
+        box.mount(descriptor(in.fd), "/input");
+        box.mount(descriptor(out.fd), "/output", true);
+        box.command({"/backend", "--execute"});
+        auto argv = pointers(box.args);
         return dcc_spawn_child(argv.data(), pid, "/dev/null", stdout_path, stderr_path);
-    } catch (const std::exception &) {
+    } catch (const std::exception &e) {
+        fprintf(stderr, "distccd: %s: %s\n", __func__, e.what());
         return EXIT_IO_ERROR;
     }
 }
 extern "C" const char *dcc_rust_cgu_capabilities(void) {
-    static const string capabilities = []() -> string {
-        try {
-            Fd out(dcc_job_memfd("llvm-capabilities"));
-            if (run({executable("distcc-rust-cgu"), "--capabilities"}, {}, out.fd, 2))
-                return "-";
-            auto data = contents(out.fd);
-            if (data.empty() || data.back() != '\n' || data.size() >= 1024)
-                return "-";
-            data.pop_back();
-            return data;
-        } catch (const std::exception &) {
-            return "-";
-        }
-    }();
-    return capabilities.c_str();
+    try {
+        return backends().offer.c_str();
+    } catch (const std::exception &e) {
+        fprintf(stderr, "distccd: LLVM capabilities: %s\n", e.what());
+        return nullptr;
+    }
 }
 extern "C" const char *dcc_rust_host(void) {
     static std::mutex lock;
@@ -276,25 +282,17 @@ extern "C" const char *dcc_rust_host(void) {
         string found = "-";
         try {
             select_compiler("", "", &found);
-        } catch (const std::exception &) {
+            if (found.size() >= sizeof(host))
+                throw std::runtime_error("Rust host exceeds stats field");
+        } catch (const std::exception &e) {
+            fprintf(stderr, "distccd: Rust host query: %s\n", e.what());
+            return nullptr;
         }
-        snprintf(host, sizeof(host), "%s", found.size() < sizeof(host) ? found.c_str() : "-");
+        strcpy(host, found.c_str());
         expires = now + std::chrono::seconds(5);
     }
     memcpy(snapshot, host, sizeof(host));
     return snapshot;
-}
-extern "C" int dcc_rust_pipelined(const dcc_job *job) {
-    if (!job || job->kind != DCC_JOB_RUST)
-        return 0;
-    Words argv;
-    for (auto p = job->argv; *p; ++p)
-        argv.emplace_back(*p);
-    try {
-        return metadata_notifications(options(argv));
-    } catch (const std::exception &) {
-        return 0;
-    }
 }
 struct dcc_rust_artifacts {
     fs::path output;
@@ -316,11 +314,14 @@ extern "C" dcc_rust_artifacts *dcc_rust_watch(const char *root, int *fd) {
         auto watch = new dcc_rust_artifacts(root);
         *fd = watch->events.fd;
         return watch;
-    } catch (const std::exception &) {
+    } catch (const std::exception &e) {
+        fprintf(stderr, "distccd: %s: %s\n", __func__, e.what());
         return nullptr;
     }
 }
-extern "C" void dcc_rust_watch_free(dcc_rust_artifacts *s) { delete s; }
+extern "C" void dcc_rust_watch_free(dcc_rust_artifacts *s) {
+    delete s;
+}
 extern "C" int dcc_rust_next_metadata(dcc_rust_artifacts *s, const char **name, const char **line,
                                       int *file) {
     try {
@@ -357,7 +358,8 @@ extern "C" int dcc_rust_next_metadata(dcc_rust_artifacts *s, const char **name, 
             *line = s->line.c_str();
             return *file < 0 ? -1 : 1;
         }
-    } catch (const std::exception &) {
+    } catch (const std::exception &e) {
+        fprintf(stderr, "distccd: %s: %s\n", __func__, e.what());
         return -1;
     }
 }
@@ -371,7 +373,10 @@ extern "C" int dcc_rust_catalog_attach(int fd) {
             catalog = static_cast<Catalog *>(p);
         });
         return 0;
-    } catch (const std::exception &) { return -1; }
+    } catch (const std::exception &e) {
+        fprintf(stderr, "distccd: %s: %s\n", __func__, e.what());
+        return -1;
+    }
 }
 extern "C" int dcc_rust_catalog_fd(void) {
     try {
@@ -384,17 +389,23 @@ extern "C" int dcc_rust_catalog_fd(void) {
             int rc = pthread_mutexattr_init(&attr);
             if (!rc) {
                 rc = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-                if (!rc) rc = pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-                if (!rc) rc = pthread_mutex_init(&static_cast<Catalog *>(p)->lock, &attr);
+                if (!rc)
+                    rc = pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+                if (!rc)
+                    rc = pthread_mutex_init(&static_cast<Catalog *>(p)->lock, &attr);
                 pthread_mutexattr_destroy(&attr);
             }
             munmap(p, sizeof(Catalog));
-            if (rc) throw std::system_error(rc, std::generic_category(), "initialize Rust catalog");
+            if (rc)
+                throw std::system_error(rc, std::generic_category(), "initialize Rust catalog");
             // Worker spawn actions install descriptors 3 through 5.
             return fcntl(file.fd, F_DUPFD_CLOEXEC, 6);
         }());
         return shared.fd;
-    } catch (const std::exception &) { return -1; }
+    } catch (const std::exception &e) {
+        fprintf(stderr, "distccd: %s: %s\n", __func__, e.what());
+        return -1;
+    }
 }
 extern "C" int dcc_rust_worker(const dcc_job *job, const char *root, int cancel, const char *out,
                                const char *err, dcc_job_result *result) {

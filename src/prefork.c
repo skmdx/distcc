@@ -66,7 +66,7 @@ static void dcc_sigchld_handler(int sig);
 static void dcc_create_kids(void);
 
 #include "tcp_job.h"
-#include "rust_job.h"
+#include "rust/api.h"
 #include "tcp_async.h"
 #include "clang_worker.h"
 /* Only the parent owns idle sockets. Legacy workers borrow an active socket;

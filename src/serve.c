@@ -90,7 +90,7 @@
 #include "dotd.h"
 #include "fix_debug_info.h"
 #include "job.h"
-#include "rust_job.h"
+#include "rust/api.h"
 #include "clang_worker.h"
 #include "tcp_job.h"
 #ifdef HAVE_GSSAPI
@@ -978,7 +978,7 @@ static int retain_artifact(struct dcc_job_result *result, unsigned index, const 
 static int dcc_run_helper_job(int in_fd, int out_fd,
                             const char *out_fname, const char *err_fname, int *status,
                             enum dcc_protover protover, const char *input_archive,
-                            struct dcc_job_result *result, const char *helper)
+                            struct dcc_job_result *result, const char *helper, const struct dcc_job *job)
 {
     char *archive = NULL, *output = NULL;
     char *argv[5];
@@ -1003,7 +1003,7 @@ static int dcc_run_helper_job(int in_fd, int out_fd,
     argv[3] = output;
     argv[4] = NULL;
     ret = !strcmp(helper, "distcc-rust-cgu")
-        ? dcc_spawn_rust_cgu(&pid, archive, output, out_fname, err_fname)
+        ? dcc_spawn_rust_cgu(&pid, job->argv[1], archive, output, out_fname, err_fname)
         : dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname);
     if (ret || (ret = dcc_collect_child(helper, pid, status, in_fd,
                                  result ? &result->peak_bytes : NULL,
@@ -1105,7 +1105,7 @@ static int dcc_run_job(int in_fd,
 
     if ((ret = dcc_make_tmpnam("distcc", ".deps", &deps_fname)))
         goto out_cleanup;
-    if (dcc_rust_pipelined(job)) {
+    if (job && job->rust.pipeline) {
         if (asprintf(&err_fname, "%s%s", root, DCC_RUST_STDERR) < 0) return EXIT_OUT_OF_MEMORY;
     } else if ((ret = dcc_make_tmpnam("distcc", ".stderr", &err_fname)))
         goto out_cleanup;
@@ -1157,7 +1157,7 @@ static int dcc_run_job(int in_fd,
             goto out_cleanup;
         }
         ret = dcc_run_helper_job(in_fd, out_fd, out_fname, err_fname, &status,
-                              protover, input_archive, result, helper);
+                              protover, input_archive, result, helper, job);
         free(input_archive);
         job_result = ret || status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
         goto out_cleanup;

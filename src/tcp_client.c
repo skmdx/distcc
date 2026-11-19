@@ -498,6 +498,11 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         }
     }
 done:
+    /* A Rust input stream or result belongs to an accepted transaction.
+     * Only a connection lost during acquisition or BEGIN is retryable. */
+    if (ret == EXIT_IO_ERROR && (job->kind == DCC_JOB_RUST || job->kind == DCC_JOB_RUST_CGU) &&
+        (read_request || needs || have_result || notice))
+        ret = EXIT_DISTCC_FAILED;
     free(notice);
     dcc_job_result_free(&early);
     if (fs_requests) rs_trace("frontend filesystem: %llu requests, %llu bytes, %u reads, %u read batches",

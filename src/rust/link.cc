@@ -1,8 +1,8 @@
 /* rustc runs this linker in the worker namespace. Only generated files are
  * returned; the client owns the linker executable and its output locations. */
-#include "rust_common.h"
-#include "rust_job.h"
-#include "rust_link_args.h"
+#include "rust/common.hh"
+#include "rust/api.h"
+#include "rust/response.hh"
 using namespace rust;
 extern "C" int dcc_rust_capture(char **argv) {
     try {

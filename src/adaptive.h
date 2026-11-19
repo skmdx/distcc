@@ -5,7 +5,7 @@ struct dcc_hostdef;
 struct dcc_capacity {
     int cpus, cores, jobs;
     char rust_host[96];
-    char llvm_cgu[1024]; /* LLVM version followed by space-separated registered target names. */
+    char llvm_cgu[4096]; /* Semicolon-separated ABI and registered-target records. */
     double core_scale, smt_gain;
     double cpu_scale, cpu_age;
     int cpu_probe, live_report;

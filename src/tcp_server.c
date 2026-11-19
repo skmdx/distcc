@@ -28,7 +28,7 @@
 #include "tcp_job.h"
 #include "frontend_fs.h"
 #include "tcp_async.h"
-#include "rust_job.h"
+#include "rust/api.h"
 
 enum phase { PREPARING, RUNNING, RETURNING };
 struct packet {
@@ -1422,7 +1422,7 @@ void dcc_tcp_dispatch_ready(void)
                 }
                 input = s->fs_child - 1;
             }
-            if (s->job->kind == DCC_JOB_RUST && !s->artifacts && dcc_rust_pipelined(s->job) &&
+            if (s->job->kind == DCC_JOB_RUST && !s->artifacts && s->job->rust.pipeline &&
                 !(s->artifacts=dcc_rust_watch(s->run.root,&s->watchfd))) {
                 s->failed=1; dequeue(s); s=next; continue;
             }

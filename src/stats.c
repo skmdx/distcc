@@ -48,7 +48,7 @@
 #include "adaptive.h"
 #include "job.h"
 #include "cpuperf.h"
-#include "rust_job.h"
+#include "rust/api.h"
 #include <poll.h>
 #ifdef __linux__
 #include "tcp_job.h"
@@ -507,6 +507,8 @@ dcc_free_mem %d MB\n\
 #endif
         struct timespec stamp = {0};
         clock_gettime(CLOCK_MONOTONIC, &stamp);
+        const char *rust_host = dcc_rust_host(), *llvm = dcc_rust_cgu_capabilities();
+        if (!rust_host || !llvm) return 0;
         reply_len = snprintf(reply, DCC_STATS_SIZE, replytemplate,
                                (unsigned long long)stamp.tv_sec * 1000000000 + stamp.tv_nsec,
                                dcc_stats.counters[STATS_TCP_ACCEPT],
@@ -521,7 +523,7 @@ dcc_free_mem %d MB\n\
                                dcc_stats.longest_job_compiler,
                                dcc_stats.longest_job_time,
                                dcc_max_kids,
-                               dcc_rust_host(), dcc_rust_cgu_capabilities(),
+                               rust_host, llvm,
                                ncpus,
                                ncores, core_scale, smt_gain,
                                perf.scale, perf.age, perf.probe,

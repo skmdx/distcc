@@ -1,62 +1,25 @@
 /* Macro probes and native links share the kernel-enforced namespace policy. */
-#include "rust_probe.h"
-#include <seccomp.h>
+#include "rust/probe.h"
+#include "rust/runtime.hh"
+#include "rust/sandbox.hh"
 namespace rust {
-Fd namespace_filter() {
-    Fd filter(dcc_job_memfd("rust-probe-filter"));
-    auto rules = seccomp_init(SCMP_ACT_ALLOW);
-    if (!rules)
-        throw Local("cannot isolate dependency probe");
-    int rc = 0;
-    for (auto name : {"socket", "connect", "sendto", "sendmsg", "sendmmsg", "io_uring_setup", "io_setup",
-                      "open_by_handle_at", "ptrace", "pidfd_getfd", "mount", "unshare", "setns"}) {
-        int nr = seccomp_syscall_resolve_name(name);
-        if (nr != __NR_SCMP_ERROR)
-            rc |= seccomp_rule_add(rules, SCMP_ACT_ERRNO(EPERM), nr, 0);
-    }
-    rc |= seccomp_export_bpf(rules, filter.fd);
-    seccomp_release(rules);
-    if (rc || lseek(filter.fd, 0, SEEK_SET) < 0 || fcntl(filter.fd, F_SETFD, 0) < 0)
-        throw Local("cannot prepare dependency probe filter");
-    return filter;
-}
 void probe(const Words &cmd, const Env &envs, const fs::path &outputs, bool isolate, int diagnostics) {
     if (!isolate) {
         if (run(cmd, envs, diagnostics, diagnostics))
             throw Local("dependency expansion failed");
         return;
     }
-    auto filter = namespace_filter();
-    Words sandbox = {"/usr/bin/bwrap",
-                     "--unshare-all",
-                     "--die-with-parent",
-                     "--unsetenv",
-                     "CARGO_MAKEFLAGS",
-                     "--unsetenv",
-                     "MAKEFLAGS",
-                     "--ro-bind",
-                     "/",
-                     "/",
-                     "--proc",
-                     "/proc",
-                     "--dev",
-                     "/dev",
-                     "--bind",
-                     outputs,
-                     outputs,
-                     "--seccomp",
-                     std::to_string(filter.fd)};
-    for (auto &[k, v] : envs)
-        sandbox.insert(sandbox.end(), {"--setenv", k, v});
-    sandbox.push_back("--");
-    sandbox.insert(sandbox.end(), cmd.begin(), cmd.end());
-    std::vector<int> inherited = {filter.fd, std::stoi(envs.at("DISTCC_RUST_LOADS_FD"))};
-    if (run(sandbox, {}, diagnostics, diagnostics, &inherited))
+    Sandbox box(Root::Host);
+    box.mount(outputs, outputs, true);
+    for (auto &[k,v] : envs) box.args.insert(box.args.end(), {"--setenv", k, v});
+    box.command(cmd);
+    std::vector<int> inherited{box.filter.fd, std::stoi(envs.at("DISTCC_RUST_LOADS_FD"))};
+    if (run(box.args, {}, diagnostics, diagnostics, &inherited))
         throw Local("isolated dependency expansion failed");
 }
 bool runtime_path(const fs::path &p, const fs::path &sysroot) {
     return below(p, sysroot) ||
-           std::any_of(runtime.begin(), runtime.end(), [&](auto &r) { return below(p, r); });
+           std::any_of(std::begin(runtime), std::end(runtime), [&](auto &r) { return below(p, r); });
 }
 bool audit(const fs::path &depfile, int loads, const fs::path &sysroot, const std::set<fs::path> &search,
            std::set<fs::path> &inputs, std::set<fs::path> &dirs) {

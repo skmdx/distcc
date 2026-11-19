@@ -1,3 +1,4 @@
+#include "rust/runtime.hh"
 /* Path journal for the isolated dependency pass. Loader bookkeeping and
  * journal IO use raw filesystem syscalls so they cannot reenter these hooks. */
 #include <atomic>
@@ -9,7 +10,6 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <initializer_list>
 #include <limits.h>
 #include <spawn.h>
 #include <sys/socket.h>
@@ -80,7 +80,7 @@ extern "C" void dcc_rust_watch_library(int fd, const char *name) {
     const char *root = getenv("DISTCC_RUST_SYSROOT");
     if (root && below(name, root))
         return;
-    for (auto p : {"/usr/lib64", "/lib64", "/lib", "/usr/lib/gcc", "/usr/lib/llvm"})
+    for (auto p : rust::runtime)
         if (below(name, p))
             return;
     journal.store(fd, std::memory_order_relaxed);

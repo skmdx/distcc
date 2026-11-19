@@ -55,7 +55,7 @@
 #include "implicit.h"
 #include "compile.h"
 #include "job.h"
-#include "rust_job.h"
+#include "rust/api.h"
 #include "emaillog.h"
 #include "native_worker.h"
 

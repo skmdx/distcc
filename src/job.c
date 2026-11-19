@@ -12,7 +12,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include "job.h"
-#include "rust_job.h"
+#include "rust/api.h"
 #include "distcc.h"
 
 const char *const dcc_gcc_locale_names[DCC_GCC_LOCALE_COUNT] = {
@@ -144,7 +144,7 @@ void dcc_job_free(struct dcc_job *job)
     if (job->stdin_fd) close(job->stdin_fd - 1);
     if (job->argv) for (i = 0; job->argv[i]; ++i) free(job->argv[i]);
     free(job->argv);
-    free(job->rust.compiler); free(job->rust.host); free(job->rust.cpu); free(job->rust.features);
+    free(job->rust.crate_types); free(job->rust.linker); free(job->rust.compiler); free(job->rust.host); free(job->rust.cpu); free(job->rust.features);
     if (job->rust.directories) {
         for (char **p = job->rust.directories; *p; ++p) free(*p);
         free(job->rust.directories);
@@ -205,13 +205,21 @@ static void strings(struct metadata *m, char **words)
 
 /* Each list contains nonempty path or NAME=value records, followed by the
  * empty string. The metadata parser owns all storage even on a short read. */
-static int get_strings(struct metadata *m, char ***words)
+static int rust_environment(const char *entry)
+{
+    const char *eq = strchr(entry, '=');
+    return eq && eq != entry && strncmp(entry, "LD_", 3) && strncmp(entry, "DYLD_", 5) &&
+        strncmp(entry, "RUSTC_WRAPPER=", sizeof("RUSTC_WRAPPER=") - 1) &&
+        strncmp(entry, "RUSTC_WORKSPACE_WRAPPER=", sizeof("RUSTC_WORKSPACE_WRAPPER=") - 1);
+}
+static int get_strings(struct metadata *m, char ***words, int (*accept)(const char *))
 {
     unsigned count = 0, capacity = 0;
     for (;;) {
         char *s = get_string(m);
         if (!s) return -1;
         if (!*s) { free(s); return 0; }
+        if (!accept(s)) { free(s); return -1; }
         if (count == capacity) {
             if (capacity == DCC_JOB_INPUT_MAX) { free(s); return -1; }
             capacity = capacity ? 2 * capacity : 8;
@@ -242,6 +250,9 @@ unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
     for (i = 0; i < argc; ++i) string(&m, job->argv[i]);
     if (job->kind == DCC_JOB_RUST) {
         number(&m, job->rust.phase);
+        number(&m, job->rust.pipeline);
+        string(&m, job->rust.linker);
+        string(&m, job->rust.crate_types);
         string(&m, job->rust.compiler);
         string(&m, job->rust.host);
         string(&m, job->rust.cpu);
@@ -308,14 +319,31 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
     job->cwd = get_string(&m);
     if (!absolute_path(job->cwd)) goto failed;
     for (i = 0; i < argc; ++i) if (!(job->argv[i] = get_string(&m))) goto failed;
+    if (kind == DCC_JOB_RUST_CGU && (argc != 2 || count != 1 || !*job->argv[1])) goto failed;
     if (kind == DCC_JOB_RUST) {
-        uint64_t phase = get_number(&m);
-        if (phase > DCC_RUST_OPTIMIZED ||
+        uint64_t phase = get_number(&m), pipeline = get_number(&m);
+        if (phase > DCC_RUST_OPTIMIZED || pipeline > 1 ||
+            !(job->rust.linker = get_string(&m)) || strchr(job->rust.linker, '/') ||
+            !strcmp(job->rust.linker, ".") || !strcmp(job->rust.linker, "..") ||
+            !(job->rust.crate_types = get_string(&m)) ||
             !(job->rust.compiler = get_string(&m)) || !*job->rust.compiler ||
             !(job->rust.host = get_string(&m)) ||
             !(job->rust.cpu = get_string(&m)) || !(job->rust.features = get_string(&m)) ||
-            get_strings(&m, &job->rust.directories) || get_strings(&m, &job->rust.environment)) goto failed;
+            get_strings(&m, &job->rust.directories, absolute_path) ||
+            get_strings(&m, &job->rust.environment, rust_environment)) goto failed;
+        /* Crate types have their own field. A second spelling in the raw
+         * arguments would give the compiler a different command contract. */
+        for (i = 0; i < argc; ++i)
+            if (!strcmp(job->argv[i], "--crate-type") || !strncmp(job->argv[i], "--crate-type=", 13))
+                goto failed;
+        for (const char *p = job->rust.crate_types; *p;) {
+            size_t n = strcspn(p, ",");
+            if (n == sizeof("proc-macro") - 1 && !memcmp(p, "proc-macro", n)) goto failed;
+            p += n;
+            if (*p) ++p;
+        }
         job->rust.phase = phase;
+        job->rust.pipeline = pipeline;
     }
     for (i = 0; i < count; ++i) {
         struct dcc_job_input *in = &job->inputs[i];

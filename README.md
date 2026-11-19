@@ -178,8 +178,8 @@ namespace with a seccomp filter. The preload library journals paths after a
 procedural macro loads, including library dependencies and attempted writes.
 A compatible
 worker with the same rustc host triple receives the macro and its inputs.
-On LLVM 23, workers also advertise their LLVM patch version and registered
-targets. For large multi-CGU builds with available peers, the client runs a
+Each installed LLVM slot advertises its major and minor version and registered
+targets. Patch releases within a slot can exchange CGUs. For large multi-CGU builds with available peers, the client runs a
 single rustc frontend and sends individual LLVM modules for optimization and
 object generation. A local frontend can run a procedural macro even when
 the available workers have a different Rust host ABI. Rustc retains ownership
@@ -187,10 +187,9 @@ of ThinLTO imports, embedded bitcode, Cargo metadata notifications and final
 archives. Small modules and unsupported LLVM configurations use rustc's own
 pass managers. Other unsupported macro operations select local compilation.
 Building the transport and probe requires json-c and libseccomp development
-headers and libraries. Transport or toolchain failures
-retry locally unless `DISTCC_FALLBACK=0`. Failed remote compilations also retry
-locally unless `DISTCC_SKIP_LOCAL_RETRY=1`, so an incompatible worker does not
-block a toolchain update. `DISTCC_VERBOSE=1` reports the selected worker or
+headers and libraries. A worker can decline a job before compilation when its
+toolchain is unavailable. Transport and backend failures during compilation
+reach Cargo with their exit status. `DISTCC_VERBOSE=1` reports the selected worker or
 the reason for local execution. The Gentoo jobs hook enables the Cargo wrapper
 when `FEATURES=distcc`, respecting package restrictions and existing wrappers.
 Workers require the client's compiler build identity, including vendor metadata.

@@ -31,7 +31,7 @@
 #include "trace.h"
 #include "util.h"
 #include "tcp_job.h"
-#include "rust_job.h"
+#include "rust/api.h"
 #include "workload.h"
 #include "plan_memo.h"
 #include <search.h>
@@ -582,8 +582,8 @@ int dcc_broker_cgu_capacity(const struct dcc_work_hint *hint, int *native)
 {
     struct reply reply;
     int net, fd = broker_request(CGU_CAPACITY, &reply, &net, hint, NULL, 0);
-    *native = fd >= 0 && reply.host[0];
-    if (fd < 0) return 0;
+    if (fd < 0) return -1;
+    *native = reply.host[0] != 0;
     dcc_session_finish(fd);
     return reply.slots;
 }
@@ -1269,15 +1269,20 @@ static int pipeline_slots(const struct dcc_hostdef *host, int lanes)
 static int compatible_cgu(const char *required, const char *offered)
 {
     size_t version = strcspn(required, " ");
-    if (!version || required[version] != ' ' || strncmp(required, offered, version + 1))
-        return 0;
+    if (!version || required[version] != ' ') return 0;
     const char *target = required + version + 1;
-    size_t target_length = strcspn(target, " ");
-    for (const char *p = offered + version + 1; *p;) {
-        size_t n = strcspn(p, " ");
-        if (n == target_length && !strncmp(p, target, n)) return 1;
-        p += n;
-        while (*p == ' ') ++p;
+    size_t length = strcspn(target, " ");
+    while (*offered) {
+        const char *end = offered + strcspn(offered, ";");
+        if ((size_t)(end - offered) > version && !strncmp(required, offered, version + 1)) {
+            for (const char *p = offered + version + 1; p < end;) {
+                size_t n = strcspn(p, " ;");
+                if (n == length && !memcmp(p, target, n)) return 1;
+                p += n;
+                if (p < end) ++p;
+            }
+        }
+        offered = *end ? end + 1 : end;
     }
     return 0;
 }
@@ -1365,16 +1370,19 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         struct dcc_capacity observed = observed_capacity(p, broker->cpp_busy);
         const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
         if (client->hint.kind == DCC_WORK_RUST_CGU) {
-            if (!cap || !p->host->tcp_jobs || !compatible_cgu(client->hint.cgu_backend, cap->llvm_cgu) ||
+            if (!cap || !p->host->tcp_jobs ||
                 p->retry_at > now || p->full_until > now || !p->address_len ||
                 cap->available <= 0 || cap->queued > 0 || cap->memory_pressure >= 10 ||
                 p->busy >= dcc_capacity_slots(p->host, cap)) continue;
             if (client->command == CGU_CAPACITY) {
+                const char *host = strrchr(client->hint.cgu_backend, ' ');
+                if (host && !strcmp(host + 1, cap->rust_host)) reply.host[0] = '1';
+            }
+            if (!compatible_cgu(client->hint.cgu_backend, cap->llvm_cgu)) continue;
+            if (client->command == CGU_CAPACITY) {
                 int limit;
                 memory_forecast(cap, &client->hint, &limit);
                 if (limit >= 0 && (cap->busy >= limit || p->busy >= limit)) continue;
-                const char *native = strrchr(client->hint.cgu_backend, ' ');
-                if (native && !strcmp(native + 1, cap->rust_host)) reply.host[0] = '1';
                 ++reply.slots;
                 continue;
             }

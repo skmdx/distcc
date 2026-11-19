@@ -1,9 +1,13 @@
+#include "rust/sandbox.hh"
+#include "rust/runtime.hh"
+#include <set>
+#include <optional>
 /* Plan the Rust dependency closure using rustc itself, and lend original
  * file descriptors to the pooled transport until the result is verified. */
-#include "rust_common.h"
-#include "rust_job.h"
-#include "rust_probe.h"
-#include "rust_link_args.h"
+#include "rust/common.hh"
+#include "rust/api.h"
+#include "rust/probe.h"
+#include "rust/response.hh"
 #include <chrono>
 #include <array>
 #include <functional>
@@ -89,51 +93,19 @@ void validate_response_text(string &text) {
     if (left || text.find('\0') != string::npos)
         throw Local("invalid response file text");
 }
+bool unavailable_input(int error) {
+    return error == ENOENT || error == ENOTDIR || error == ELOOP || error == EACCES;
+}
+template <class Read> auto read_user_input(Read read) {
+    try {
+        return read();
+    } catch (const std::system_error &error) {
+        if (unavailable_input(error.code().value())) throw Local(error.what());
+        throw;
+    }
+}
 /* rustc's -Zshell-argfiles uses shlex tokenization, with neither shell
  * expansions nor execution. Plain response files retain one argument per line. */
-Words shell_words(const string &text) {
-    Words args;
-    string word;
-    char quote = 0;
-    bool started = false;
-    for (size_t i = 0; i < text.size(); ++i) {
-        char c = text[i];
-        if (!quote && (c == ' ' || c == '\t' || c == '\n')) {
-            if (started) {
-                args.push_back(word);
-                word.clear();
-                started = false;
-            }
-        } else if (!quote && c == '#' && !started) {
-            i = text.find('\n', i);
-            if (i == string::npos)
-                break;
-        } else if (c == '\\' && quote != '\'') {
-            if (++i == text.size())
-                throw Local("unterminated response file escape");
-            c = text[i];
-            if (c == '\n')
-                continue;
-            if (quote && c != '$' && c != '`' && c != '"' && c != '\\')
-                word += '\\';
-            word += c;
-            started = true;
-        } else if (quote && c == quote)
-            quote = 0;
-        else if (!quote && (c == '\'' || c == '"')) {
-            quote = c;
-            started = true;
-        } else {
-            word += c;
-            started = true;
-        }
-    }
-    if (quote)
-        throw Local("unterminated response file quote");
-    if (started)
-        args.push_back(word);
-    return args;
-}
 struct ResponseFiles {
     Words flat;
     States files;
@@ -158,14 +130,17 @@ struct ResponseFiles {
             auto entry = files.emplace(path, st);
             string data = contents(fd.fd);
             validate_response_text(data);
-            auto args = quoted ? shell_words(data) : split(replace(data, "\r\n", "\n"), '\n');
+            auto args = quoted ? response_words(data, ResponseSyntax::RustShell)
+                               : split(replace(data, "\r\n", "\n"), '\n');
             verify(path, entry.first->second, fd.fd);
             expand(args);
             active.erase(canonical);
         }
     }
 };
-uint64_t hash(const string &s, uint64_t seed = 0) { return XXH3_64bits_withSeed(s.data(), s.size(), seed); }
+uint64_t hash(const string &s, uint64_t seed = 0) {
+    return XXH3_64bits_withSeed(s.data(), s.size(), seed);
+}
 string memo(string context, const States &dependencies, const std::function<string()> &compute) {
     auto h = XXH3_128bits(context.data(), context.size());
     string key = "rust-plan:" + std::to_string(h.high64) + ":" + std::to_string(h.low64);
@@ -207,7 +182,76 @@ string memo(string context, const States &dependencies, const std::function<stri
     }
     return computed;
 }
-fs::path absolute_name(const string &s) { return fs::absolute(s).lexically_normal(); }
+fs::path absolute_name(const string &s) {
+    return fs::absolute(s).lexically_normal();
+}
+struct Option {
+    string key;
+    std::optional<string> value;
+    void append(Words &v) const {
+        if (!key.empty())
+            v.push_back(key);
+        if (value)
+            v.push_back(*value);
+    }
+};
+inline std::vector<Option> options(const Words &args) {
+    static const std::set<string> values = {"--cap-lints",
+                                            "--cfg",
+                                            "--check-cfg",
+                                            "--crate-name",
+                                            "--crate-type",
+                                            "--edition",
+                                            "--error-format",
+                                            "--extern",
+                                            "--json",
+                                            "--remap-path-prefix",
+                                            "--target",
+                                            "--sysroot",
+                                            "--emit",
+                                            "--out-dir",
+                                            "-o",
+                                            "-C",
+                                            "-L",
+                                            "-l",
+                                            "-A",
+                                            "-W",
+                                            "-D",
+                                            "-F",
+                                            "--allow",
+                                            "--warn",
+                                            "--deny",
+                                            "--forbid",
+                                            "--force-warn",
+                                            "--diagnostic-width",
+                                            "--color",
+                                            "--codegen",
+                                            "-Z"};
+    std::vector<Option> parsed;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const string &word = args[i];
+        if (word == "--") {
+            parsed.push_back({word, {}});
+            for (++i; i < args.size(); ++i)
+                parsed.push_back({"", args[i]});
+            break;
+        }
+        auto eq = word.find('=');
+        string key = word.substr(0, eq);
+        if (values.count(key)) {
+            if (eq == string::npos && i + 1 == args.size())
+                throw Local("missing option value");
+            parsed.push_back(
+                {key == "--codegen" ? "-C" : key, eq == string::npos ? args[++i] : word.substr(eq + 1)});
+        } else if (word.size() > 2 && values.count(word.substr(0, 2))) {
+            parsed.push_back({word.substr(0, 2), word.substr(2)});
+        } else if (!word.empty() && word[0] == '-')
+            parsed.push_back({word, {}});
+        else
+            parsed.push_back({"", word});
+    }
+    return parsed;
+}
 struct Invocation {
     Words base, actions, types;
     fs::path source, outdir = fs::current_path(), scope;
@@ -215,7 +259,8 @@ struct Invocation {
     std::set<fs::path> inputs, search, native_search, dirs;
     std::set<string> libraries;
     bool trace_macro = false, needs_host = false, static_archive = false, pipeline = false;
-    bool explicit_macro = false, multi_cgu = false, cgu_allowed = true;
+    bool multi_cgu = true, incremental = false;
+    Words compiler_flags;
     string metadata_name;
     std::set<string> link_arguments;
     std::set<string> dep_names;
@@ -223,21 +268,45 @@ struct Invocation {
     Env environment;
     explicit Invocation(const Words &args) {
         auto opts = options(args);
-        actions = emits(opts);
-        pipeline = metadata_notifications(opts);
-        linker = link_driver(opts);
-        if (std::all_of(actions.begin(), actions.end(),
-                        [](auto &s) { return s.substr(0, s.find('=')) == "dep-info"; }))
-            throw Local("dependency query");
-        for (const auto &o : opts) {
+        incremental = std::any_of(opts.begin(), opts.end(), [](const Option &o) {
+            return o.key == "-C" && o.value->rfind("incremental=", 0) == 0;
+        });
+        bool notify = false, native_link = false, emits_link = false, emits_metadata = false;
+        string driver = "cc";
+        for (auto &o : opts) {
+            if (o.key == "-C" && o.value->rfind("incremental=", 0) == 0)
+                continue;
+            if (incremental && o.key == "-C" && o.value->rfind("codegen-units=", 0) == 0) {
+                auto count = o.value->substr(sizeof("codegen-units=") - 1);
+                char *end;
+                auto units = strtoul(count.c_str(), &end, 10);
+                if (!count.empty() && !*end && units > 16)
+                    o.value = "codegen-units=16";
+            }
+            if (incremental)
+                o.append(compiler_flags);
             const auto &k = o.key;
             string v = o.value.value_or("");
             if (k == "-" || (k.empty() && v == "-"))
                 throw Local("standard input requires local compilation");
             if (k == "--explain" || k == "--print" || k.compare(0, 8, "--print=") == 0)
                 throw Local("local rustc query or test");
-            if (k == "--emit")
+            if (k == "--")
                 continue;
+            if (k == "--test")
+                native_link = true;
+            if (k == "--json")
+                for (const auto &notice : split(v, ','))
+                    notify |= notice == "artifacts";
+            if (k == "--emit") {
+                for (const auto &item : split(v, ',')) {
+                    const string output = item.substr(0, item.find('='));
+                    emits_link |= output == "link";
+                    emits_metadata |= output == "metadata";
+                    actions.push_back(item);
+                }
+                continue;
+            }
             if (k == "--out-dir") {
                 outdir = absolute_name(v);
                 continue;
@@ -250,13 +319,20 @@ struct Invocation {
                 if (v == "-" || !source.empty())
                     throw Local("expected one source file");
                 source = v;
+                base.push_back(!v.empty() && v.front() == '-' ? "./" + v : v);
+                continue;
             }
             if (k == "--crate-name")
                 name = v;
             if (k == "--crate-type") {
                 types.push_back(v);
-                for (auto &type : split(v, ','))
+                for (auto &type : split(v, ',')) {
+                    if (type == "proc-macro")
+                        throw Local("procedural macro compiler plugin");
+                    native_link |= type == "bin" || type == "cdylib" || type == "dylib";
                     static_archive |= type == "staticlib";
+                }
+                continue;
             }
             if (k == "--sysroot")
                 sysroot = v;
@@ -267,17 +343,11 @@ struct Invocation {
             }
             auto eq = v.find('=');
             string key = v.substr(0, eq), val = eq == string::npos ? "" : v.substr(eq + 1);
-            if (k == "-Z" && (key == "large-data-threshold" || key == "llvm-plugins" ||
-                              key == "self-profile" || key == "llvm-time-trace" || key == "verify-llvm-ir"))
-                cgu_allowed = false;
             if (k == "-C") {
-                if (key == "codegen-units") {
+                if (key == "linker")
+                    driver = val;
+                if (key == "codegen-units")
                     multi_cgu = val != "1";
-                    cgu_allowed &= multi_cgu;
-                }
-                if (key == "llvm-args" || key == "profile-generate" || key == "profile-use" ||
-                    key == "passes" || key == "linker-plugin-lto")
-                    cgu_allowed = false;
                 if (key == "link-arg" || key == "link-args") {
                     Words expanded;
                     std::set<fs::path> active;
@@ -288,8 +358,6 @@ struct Invocation {
                         if (!arg.empty() && arg.front() != '-' && fs::is_regular_file(arg))
                             inputs.insert(absolute_name(arg));
                 }
-                if (key == "incremental")
-                    continue;
                 if (key == "profile-use")
                     inputs.insert(absolute_name(val));
                 if (key == "target-cpu")
@@ -300,8 +368,7 @@ struct Invocation {
             if (k == "-O")
                 opt = "2";
             if (k == "--extern" && eq != string::npos) {
-                explicit_macro |= fs::path(val).extension() == ".so";
-                trace_macro |= explicit_macro;
+                trace_macro |= fs::path(val).extension() == ".so";
                 inputs.insert(absolute_name(val));
             }
             if (k == "-l") {
@@ -321,14 +388,22 @@ struct Invocation {
             }
             o.append(base);
         }
+        if (actions.empty()) {
+            actions.push_back("link");
+            emits_link = true;
+        }
+        if (std::all_of(actions.begin(), actions.end(),
+                        [](const string &a) { return a.substr(0, a.find('=')) == "dep-info"; }))
+            throw Local("dependency query");
+        pipeline = notify && emits_metadata && emits_link;
+        if (emits_link && (native_link || types.empty()))
+            linker = driver;
         if (source.empty())
             throw Local("compiler query");
         if (name.empty())
             name = source.stem();
         if (!single_output.empty())
             outdir = absolute_name(single_output).parent_path();
-        if (scope.empty())
-            scope = outdir;
     }
     string destination(const string &spelling) {
         if (spelling == "-")
@@ -375,6 +450,8 @@ struct Invocation {
                     {"LD_PRELOAD", native_library().string() + " " + env("LD_PRELOAD")}};
         Words cmd = compiler_command(compiler);
         cmd.insert(cmd.end(), base.begin(), base.end());
+        for (auto &type : types)
+            cmd.emplace_back("--crate-type=" + type);
         if (sysroot.empty())
             cmd.insert(cmd.end(), {"--sysroot", root});
         auto staging = work.dir / "probe";
@@ -535,10 +612,10 @@ class Inputs {
         Digests digests;
         for (const auto &p : paths) {
             if (below(p, DCC_RUST_ROOT) || below(p, "/dev") || below(p, "/proc") || below(p, "/sys") ||
-                std::any_of(runtime.begin(), runtime.end(), [&](auto &r) { return below(p, r); }))
+                std::any_of(std::begin(runtime), std::end(runtime), [&](auto &r) { return below(p, r); }))
                 throw Local("input overlaps worker runtime");
             int opened = open(p.c_str(), O_RDONLY | O_CLOEXEC);
-            if (opened < 0 && (errno == ENOENT || errno == ENOTDIR || errno == ELOOP || errno == EACCES))
+            if (opened < 0 && unavailable_input(errno))
                 throw Local("unavailable Rust input " + p.string());
             held.emplace_back(opened);
             int fd = held.back().fd;
@@ -622,41 +699,27 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
             continue;
         }
         if (fs::path(f.destination).parent_path() != work)
-            throw Local("invalid linker artifact");
+            throw std::runtime_error("invalid linker artifact");
         check(!rename(f.temporary, f.destination), f.destination);
         free(f.temporary);
         f.temporary = nullptr;
         if (fs::path(name).extension() == ".plan")
             plans.push_back(f.destination);
         else if (fs::path(name).extension() != ".input")
-            throw Local("invalid linker artifact type");
+            throw std::runtime_error("invalid linker artifact type");
     }
     for (auto &plan : plans) {
         auto args = split(read(plan), '\0');
         if (args.size() < 2 || !outputs.count(args.front()))
-            throw Local("invalid linker output");
+            throw std::runtime_error("invalid linker output");
         auto &f = *outputs.at(args.front());
         Work final(fs::path(f.destination).parent_path());
         auto linked = final.dir / args.front();
         auto driver = executable(inv.linker);
-        auto filter = namespace_filter();
+        Sandbox box(Root::HostWithOutputs);
+        auto &cmd = box.args;
         fs::path tools = sysroot / "lib/rustlib" / host / "bin";
-        Words cmd = {"/usr/bin/bwrap", "--unshare-all", "--die-with-parent"};
-        // The reserved linker mount points need a parent on the sandbox root.
-        // Bind root entries individually so /etc, /opt and toolchain submounts
-        // remain visible even on clients without a host /__distcc_rust.
-        for (const auto &entry : fs::directory_iterator("/")) {
-            auto p = entry.path();
-            if (p == "/dev" || p == "/proc" || p == "/tmp" || p == DCC_RUST_ROOT)
-                continue;
-            if (entry.is_symlink())
-                cmd.insert(cmd.end(), {"--symlink", fs::read_symlink(p), p});
-            else
-                cmd.insert(cmd.end(), {"--ro-bind", p, p});
-        }
-        cmd.insert(cmd.end(),
-                   {"--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--clearenv", "--setenv", "PATH",
-                    tools.string() + ":" + env("PATH"), "--seccomp", std::to_string(filter.fd)});
+        cmd.insert(cmd.end(), {"--setenv", "PATH", tools.string() + ":" + env("PATH")});
         // Preserve declared inputs and toolchains residing on the shadowed temporary mount.
         auto mounts = inv.search;
         mounts.insert(inv.inputs.begin(), inv.inputs.end());
@@ -668,8 +731,9 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         auto cwd = fs::current_path();
         if (below(cwd, "/tmp"))
             cmd.insert(cmd.end(), {"--dir", cwd});
-        cmd.insert(cmd.end(), {"--chdir", cwd, "--ro-bind", work, DCC_RUST_OUT, "--bind", final.dir,
-                               DCC_RUST_FINAL, "--remount-ro", "/", "--", driver});
+        cmd.insert(cmd.end(),
+                   {"--chdir", cwd, "--ro-bind", work, DCC_RUST_OUT, "--bind", final.dir, DCC_RUST_FINAL});
+        box.command({driver});
         unsigned destinations = 0;
         Words command;
         for (auto it = args.begin() + 1; it != args.end(); ++it) {
@@ -682,38 +746,17 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
             arg = replace(std::move(arg), DCC_RUST_COMPILER, compiler_root);
             if (arg == "-o") {
                 if (++it == args.end() || *it != (fs::path(DCC_RUST_FINAL) / f.name).string())
-                    throw Local("invalid link destination");
+                    throw std::runtime_error("invalid link destination");
                 ++destinations;
                 command.insert(command.end(), {"-o", *it});
                 continue;
             }
-            // The driver also accepts nested ld arguments. Check executable extensions
-            // and their operands against arguments supplied by the local compiler invocation.
-            auto components = split(arg, ',');
-            for (size_t j = 0; j < components.size(); ++j) {
-                const string &part = components[j];
-                auto key = part.substr(0, part.find('='));
-                if (key == "-plugin" || key == "--plugin" || key == "-fplugin" || key == "-wrapper" ||
-                    key == "-specs" || key == "--specs" || key == "--ld-path" ||
-                    (key == "-fuse-ld" && part.find('/') != string::npos) ||
-                    (part.rfind("-B", 0) == 0 && part != "-Bstatic" && part != "-Bdynamic" &&
-                     !below(part.substr(2), (sysroot / "lib/rustlib").string()))) {
-                    if (!inv.link_arguments.count(arg))
-                        throw Local("undeclared linker extension");
-                    if (part == key && j + 1 == components.size() &&
-                        (it + 1 == args.end() || !inv.link_arguments.count(it[1])))
-                        throw Local("undeclared linker extension operand");
-                }
-                if (part.empty())
-                    continue;
-                if (part[0] == '@' || part == "--output" || part.rfind("--output=", 0) == 0 ||
-                    (part.rfind("-o", 0) == 0 && (j || part.size() > 2)))
-                    throw Local("unexpected linker response or output");
-            }
+            if (arg == "--output" || arg.rfind("--output=", 0) == 0 || (!arg.empty() && arg.front() == '@'))
+                throw std::runtime_error("invalid captured linker output or nested response");
             command.push_back(std::move(arg));
         }
         if (destinations != 1)
-            throw Local("missing linker destination");
+            throw std::runtime_error("missing linker destination");
         string response;
         for (const auto &arg : command) {
             response += '"';
@@ -728,15 +771,14 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         Fd response_fd(open(response_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600));
         put(response_fd.fd, response);
         cmd.push_back(string("@") + DCC_RUST_OUT + "/link.rsp");
-        const std::vector<int> inherited{filter.fd};
+        const std::vector<int> inherited{box.filter.fd};
         int rc = run(cmd, {}, 1, 2, &inherited);
         if (rc)
             return rc;
-        struct stat st = metadata(linked);
-        check(S_ISREG(st.st_mode) && !rename(linked.c_str(), f.temporary), f.temporary);
-        close(f.fd);
-        f.fd = open(f.temporary, O_RDWR | O_CLOEXEC);
-        check(f.fd >= 0, f.temporary);
+        Fd output(open(linked.c_str(), O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+        auto st = descriptor_state(output.fd);
+        check(!rename(linked.c_str(), f.temporary), f.temporary);
+        std::swap(f.fd, output.fd);
         f.mode = st.st_mode & 0777;
     }
     return 0;
@@ -794,56 +836,85 @@ std::optional<int> try_local_frontend(char **original, const States &responses, 
     lease.id = -1;
     return status;
 }
-std::optional<int> try_cgu_frontend(const Invocation &inv, const fs::path &exe, char **original,
-                                    const States &responses, const string &version, dcc_work_hint hint) {
-    auto llvm = field(version, "LLVM version: ");
-    auto shim = native_library().parent_path() / "distcc-rust-cgu.so";
-    if (llvm != DCC_CGU_LLVM_VERSION || !fs::is_regular_file(shim))
-        return {};
+struct CguRoute {
+    fs::path shim;
+    int peers = 0;
+    bool native = false;
+};
+CguRoute cgu_route(const Invocation &inv, const string &version, const fs::path &sysroot,
+                   dcc_work_hint hint) {
+    auto llvm = llvm_abi(field(version, "LLVM version: "));
     auto host = field(version, "host: ");
     auto triple = inv.target.empty() ? host : inv.target;
-    auto arch = triple.substr(0, triple.find('-'));
-    string backend;
-    if (arch == "x86_64")
-        backend = "x86-64";
-    else if (arch == "i386" || arch == "i586" || arch == "i686")
-        backend = "x86";
-    else if (arch == "aarch64")
-        backend = arch;
-    else {
-        fs::path helper;
-        try {
-            helper = executable("distcc-rust-cgu");
-        } catch (const std::exception &) {
-            return {};
-        }
-        auto context = "cgu-target:" + helper.string() + '\0' + triple;
-        backend = memo(context, {{helper, metadata(helper)}}, [&] {
+    for (auto &helper : backend_helpers(sysroot, llvm)) {
+        auto shim = helper.parent_path() / "distcc-rust-cgu.so";
+        if (!fs::is_regular_file(shim))
+            continue;
+        auto key = "cgu-target:" + helper.string() + '\0' + llvm + '\0' + triple;
+        auto target = memo(key, {{helper, metadata(helper)}}, [&] {
             Fd output(dcc_job_memfd("rust-target"));
-            if (run({helper, "--target-name", triple}, {}, output.fd, 2))
-                return string("-");
+            int rc = run({helper, "--target-name", llvm, triple}, {}, output.fd, 2);
+            if (rc == EXIT_LOCAL_COMPILE)
+                return string{};
+            if (rc)
+                throw std::runtime_error("LLVM target query failed: " + helper.string());
             return contents(output.fd);
         });
-        if (backend == "-")
-            return {};
+        if (target.empty())
+            continue;
+        string requirement = llvm + " " + target + " " + host;
+        if (requirement.size() >= sizeof(hint.cgu_backend))
+            throw Local("CGU target record too long");
+        hint.kind = DCC_WORK_RUST_CGU;
+        hint.memory_class = 1 + DCC_JOB_RUST_CGU * DCC_MEMORY_BUCKETS + dcc_resource_bucket(hint.bytes);
+        strcpy(hint.cgu_backend, requirement.c_str());
+        int native;
+        int peers = dcc_broker_cgu_capacity(&hint, &native);
+        check(peers >= 0, "Rust capacity request");
+        return {shim, peers, bool(native)};
     }
-    string requirement = llvm + " " + backend + " " + host;
-    if (requirement.size() >= sizeof(hint.cgu_backend))
-        return {};
-    hint.kind = DCC_WORK_RUST_CGU;
-    hint.memory_class = 1 + DCC_JOB_RUST_CGU * DCC_MEMORY_BUCKETS + dcc_resource_bucket(hint.bytes);
-    strcpy(hint.cgu_backend, requirement.c_str());
-    int native;
-    int peers = dcc_broker_cgu_capacity(&hint, &native);
-    bool large = hint.bytes > 65536 || inv.multi_cgu;
-    if (!peers || (native && peers < 2 && !(large && inv.explicit_macro)))
-        return {};
+    return {};
+}
+int cgu_frontend(const CguRoute &route, const Invocation &inv, const fs::path &exe, char **original,
+                 const States &responses) {
     for (auto &[p, st] : responses)
         verify(p, st);
     auto local = compiler_command(exe);
-    for (auto p = original + 1; *p; ++p)
-        local.emplace_back(*p);
-    Env vars = {{"LD_PRELOAD", shim.string() + " " + env("LD_PRELOAD")},
+    std::optional<Work> argfile;
+    if (!inv.incremental) {
+        for (auto p = original + 1; *p; ++p)
+            local.emplace_back(*p);
+    } else if (responses.empty()) {
+        local.insert(local.end(), inv.compiler_flags.begin(), inv.compiler_flags.end());
+    } else {
+        argfile.emplace();
+        unsigned sequence = 0;
+        string lines;
+        auto flush = [&] {
+            if (lines.empty())
+                return;
+            auto path = argfile->dir / ("args-" + std::to_string(++sequence));
+            Fd fd(open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600));
+            put(fd.fd, lines);
+            local.push_back("@" + path.string());
+            lines.clear();
+        };
+        for (auto &arg : inv.compiler_flags) {
+            if (arg.find_first_of("\r\n") == string::npos)
+                lines += arg + "\n";
+            else {
+                flush();
+                local.push_back(arg);
+            }
+        }
+        flush();
+    }
+    bool machine_outputs = std::all_of(inv.actions.begin(), inv.actions.end(), [](const string &action) {
+        auto emit = action.substr(0, action.find('='));
+        return emit == "metadata" || emit == "link" || emit == "dep-info" || emit == "obj";
+    });
+    Env vars = {{"DISTCC_RUST_CGU_OBJECT_ONLY", machine_outputs ? "1" : "0"},
+                {"LD_PRELOAD", route.shim.string() + " " + env("LD_PRELOAD")},
                 {"DISTCC_RUST_CGU_CLIENT", fs::canonical("/proc/self/exe")},
                 {"DISTCC_RUST_CGU_PREVIOUS", env("LD_PRELOAD")}};
     pid_t pid;
@@ -870,11 +941,13 @@ int distributed(char **original, const Words &args, const States &responses) {
     const string compiler = *original;
     if (env("DISTCC_BROKER").empty())
         throw Local("Rust distribution requires DISTCC_BROKER");
-    Invocation inv(args);
+    auto inv = read_user_input([&] { return Invocation(args); });
     auto exe = executable(compiler);
     struct stat source;
-    if (stat(inv.source.c_str(), &source))
-        throw Local("source unavailable");
+    if (stat(inv.source.c_str(), &source)) {
+        if (unavailable_input(errno)) throw Local("source unavailable");
+        check(false, inv.source);
+    }
     dcc_work_hint hint{};
     hint.kind = DCC_WORK_RUST;
     hint.key = hash(inv.source.string());
@@ -882,7 +955,7 @@ int distributed(char **original, const Words &args, const States &responses) {
         hint.key = hash(s, hint.key);
     if (!hint.key)
         hint.key = 1;
-    hint.scope_key = hash(inv.scope);
+    hint.scope_key = hash(inv.scope.empty() ? inv.outdir : inv.scope);
     hint.family = hash(inv.opt, hash(inv.name));
     for (auto &s : inv.types)
         hint.family = hash(s, hint.family);
@@ -905,9 +978,9 @@ int distributed(char **original, const Words &args, const States &responses) {
     hint.work_units = dcc_rust_source_bytes(&job);
     hint.bytes = std::max<uint64_t>(1, source.st_size);
     hint.memory_class = dcc_resource_class(&job);
-    bool small = hint.bytes <= 65536;
-    bool cgu = !metadata_only && inv.cgu_allowed && (!small || inv.trace_macro || inv.multi_cgu);
-    if (small && !cgu)
+    constexpr size_t split_source_bytes = 64 * 1024;
+    bool small = hint.bytes <= split_source_bytes;
+    if (small && !inv.trace_macro && !inv.incremental && inv.scope.empty())
         if (auto status = try_local_frontend(original, responses, hint))
             return *status;
     States tool = {{exe, metadata(exe)}};
@@ -918,16 +991,32 @@ int distributed(char **original, const Words &args, const States &responses) {
         throw std::runtime_error("invalid Rust compiler memo");
     string version = info.substr(0, separator);
     string id = identity(version), cpu, features;
-    if (cgu) {
-        if (auto status = try_cgu_frontend(inv, exe, original, responses, version, hint))
-            return *status;
-        if (small)
-            if (auto status = try_local_frontend(original, responses, hint))
-                return *status;
-    }
+    CguRoute route;
+    auto root = info.substr(separator + 1);
+    if (!metadata_only)
+        route = cgu_route(inv, version, root, hint);
+    if (route.peers && (!route.native || (!small && inv.multi_cgu && route.peers >= 2)))
+        return cgu_frontend(route, inv, exe, original, responses);
+    auto refused = [&](const Local &reason) {
+        if (!route.peers)
+            throw reason;
+        if (env("DISTCC_VERBOSE") == "1")
+            fprintf(stderr, "distcc-rust: local: %s\n", reason.what());
+        return cgu_frontend(route, inv, exe, original, responses);
+    };
     Work work;
     job.rust.compiler = id.data();
-    auto cmd = inv.command(field(version, "host: "), info.substr(separator + 1));
+    string driver = fs::path(inv.linker).filename();
+    job.rust.linker = driver.data();
+    string crate_types;
+    for (auto &type : inv.types) {
+        if (!crate_types.empty())
+            crate_types += ',';
+        crate_types += type;
+    }
+    job.rust.crate_types = crate_types.data();
+    job.rust.pipeline = inv.pipeline;
+    auto cmd = inv.command(field(version, "host: "), root);
     if (inv.cpu == "native") {
         auto value = profile(exe, work, tool);
         auto sep = value.find('\0');
@@ -938,7 +1027,11 @@ int distributed(char **original, const Words &args, const States &responses) {
     }
     timespec start;
     clock_gettime(CLOCK_REALTIME, &start);
-    inv.discover(exe, info.substr(separator + 1), work);
+    try {
+        inv.discover(exe, root, work);
+    } catch (const Local &reason) {
+        return refused(reason);
+    }
     string host = inv.needs_host ? field(version, "host: ") : "";
     if (host.size() >= sizeof(hint.rust_host))
         throw Local("Rust host triple too long");
@@ -1004,7 +1097,7 @@ int distributed(char **original, const Words &args, const States &responses) {
                     json_field(obj.get(), "artifact") != (fs::path(DCC_RUST_OUT) / f->name).string() ||
                     (e.inv.metadata_name.empty() ? fs::path(f->name).extension() != ".rmeta"
                                                  : e.inv.metadata_name != f->name))
-                    throw Local("invalid metadata notification");
+                    throw std::runtime_error("invalid metadata notification");
                 json_object_object_add(obj.get(), "artifact", json_object_new_string(f->destination));
                 string notice =
                     string(json_object_to_json_string_ext(obj.get(), JSON_C_TO_STRING_PLAIN)) + '\n';
@@ -1027,37 +1120,28 @@ int distributed(char **original, const Words &args, const States &responses) {
             }
         };
     int transport = dcc_transfer_prepared(&job, nullptr, nullptr, &hint, -1, &result);
-    if (job.metadata_published) {
-        try {
-            verify_job();
-        } catch (const std::exception &e) {
-            fprintf(stderr, "distcc-rust: %s\n", e.what());
-            return EXIT_DISTCC_FAILED;
-        }
-        if (transport)
-            return EXIT_DISTCC_FAILED;
-    } else
+    try {
         verify_job();
+    } catch (const Local &e) {
+        throw std::runtime_error(e.what());
+    }
+    if (job.metadata_published && transport)
+        return EXIT_DISTCC_FAILED;
     if (transport == EXIT_LOCAL_COMPILE)
-        throw Local("no worker with the required Rust host ABI");
+        return refused(Local("no worker with the required Rust host ABI"));
     if (transport)
         throw std::runtime_error("Rust transport failed (" + std::to_string(transport) + ")");
     int status = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
     if (status == EXIT_LOCAL_COMPILE)
-        throw Local("worker has no matching Rust toolchain");
-    if (status && !job.metadata_published && env("DISTCC_FALLBACK") != "0" &&
-        env("DISTCC_SKIP_LOCAL_RETRY") != "1")
-        throw Local("worker compilation failed; retrying locally");
+        return job.metadata_published ? EXIT_DISTCC_FAILED
+                                      : refused(Local("worker has no matching Rust toolchain"));
     try {
         if (!status && !inv.linker.empty())
-            status = finish_links(result, inv, linkdir, exe,
-                                  inv.sysroot.empty() ? info.substr(separator + 1) : inv.sysroot,
+            status = finish_links(result, inv, linkdir, exe, inv.sysroot.empty() ? root : inv.sysroot,
                                   field(version, "host: "));
         if (!status)
             publish(result, inv);
     } catch (const std::exception &e) {
-        if (!job.metadata_published)
-            throw;
         fprintf(stderr, "distcc-rust: %s\n", e.what());
         return EXIT_DISTCC_FAILED;
     }
@@ -1086,7 +1170,7 @@ extern "C" int dcc_rust_submit_cgu(const char *version, const char *target, cons
         dcc_job job{};
         job.kind = DCC_JOB_RUST_CGU;
         job.cwd = const_cast<char *>("/");
-        char *args[] = {const_cast<char *>("distcc-rust-cgu"), nullptr};
+        char *args[] = {const_cast<char *>("distcc-rust-cgu"), const_cast<char *>(version), nullptr};
         job.argv = args;
         job.inputs = &in;
         job.count = 1;
@@ -1104,10 +1188,12 @@ extern "C" int dcc_rust_submit_cgu(const char *version, const char *target, cons
         int rc = dcc_transfer_prepared(&job, nullptr, nullptr, &hint, -1, &result);
         if (rc)
             return rc;
+        if (result.fd[DCC_JOB_STDERR] >= 0)
+            put(STDERR_FILENO, contents(result.fd[DCC_JOB_STDERR]));
         if (result.status) {
-            if (env("DISTCC_VERBOSE") == "1" && result.fd[DCC_JOB_STDERR] >= 0)
-                put(STDERR_FILENO, contents(result.fd[DCC_JOB_STDERR]));
-            return EXIT_LOCAL_COMPILE;
+            if (WIFEXITED(result.status) && WEXITSTATUS(result.status) == EXIT_LOCAL_COMPILE)
+                return EXIT_LOCAL_COMPILE;
+            return EXIT_DISTCC_FAILED;
         }
         if (env("DISTCC_VERBOSE") == "1")
             fprintf(stderr, "distcc-rust-cgu: finished %s\n", phase);
@@ -1120,7 +1206,8 @@ extern "C" int dcc_rust_submit_cgu(const char *version, const char *target, cons
                 return EXIT_IO_ERROR;
         }
         return 0;
-    } catch (const std::exception &) {
+    } catch (const std::exception &e) {
+        fprintf(stderr, "distcc-rust-cgu: %s\n", e.what());
         return EXIT_DISTCC_FAILED;
     }
 }
@@ -1128,28 +1215,16 @@ extern "C" int dcc_rust_client(char **argv) {
     Words args;
     for (char **p = argv + 1; *p; ++p)
         args.emplace_back(*p);
-    auto expand_args = [&]() {
-        ResponseFiles response;
-        try {
-            response.expand(args);
-        } catch (const std::system_error &e) {
-            throw Local(e.what());
-        }
-        return response;
-    };
     try {
-        auto response = expand_args();
+        ResponseFiles response;
+        read_user_input([&] { response.expand(args); });
         return distributed(argv, response.flat, response.files);
     } catch (const Local &e) {
         if (env("DISTCC_VERBOSE") == "1")
             fprintf(stderr, "distcc-rust: local: %s\n", e.what());
-    } catch (const fs::filesystem_error &e) {
-        if (env("DISTCC_VERBOSE") == "1")
-            fprintf(stderr, "distcc-rust: local: %s\n", e.what());
     } catch (const std::exception &e) {
         fprintf(stderr, "distcc-rust: %s\n", e.what());
-        if (env("DISTCC_FALLBACK") == "0")
-            return EXIT_DISTCC_FAILED;
+        return EXIT_DISTCC_FAILED;
     }
     execvp(*argv, argv);
     return EXIT_COMPILER_MISSING;

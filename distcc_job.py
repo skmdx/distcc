@@ -4,6 +4,7 @@ import mmap
 import os
 import shutil
 import struct
+from typing import NamedTuple
 
 import distcc_python
 import xxhash
@@ -40,6 +41,19 @@ def fingerprint(path):
     return size, digest
 
 
+class RustCommand(NamedTuple):
+    phase: int
+    compiler: str
+    pipeline: bool = False
+    linker: str = ''
+    crate_types: str = ''
+    host: str = ''
+    cpu: str = ''
+    features: str = ''
+    directories: tuple[str, ...] = ()
+    environment: tuple[str, ...] = ()
+
+
 def manifest(kind, cwd, argv, inputs, *, rust=None):
     """Encode the bounded BEGIN manifest, including its first-use parent table."""
     data = bytearray()
@@ -68,9 +82,10 @@ def manifest(kind, cwd, argv, inputs, *, rust=None):
     if kind == 3:
         if rust is None:
             raise ValueError('Rust command metadata is required')
-        phase, compiler, host, cpu, features, directories, environment = rust
-        number(phase)
-        for field in (compiler, host, cpu, features, *directories, '', *environment, ''):
+        number(rust.phase)
+        number(rust.pipeline)
+        for field in (rust.linker, rust.crate_types, rust.compiler, rust.host, rust.cpu, rust.features,
+                      *rust.directories, '', *rust.environment, ''):
             string(field)
     for name, size, digest, cached in inputs:
         for value in (0, 0, cached, size, size):

@@ -39,7 +39,7 @@ from test_adaptive import free_port
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-from distcc_job import manifest as job_manifest
+from distcc_job import RustCommand, manifest as job_manifest
 
 
 def required_match(pattern, text):
@@ -3670,7 +3670,7 @@ ssize_t write(int fd, const void *data, size_t size) {
             (p, len(body), xxhash.xxh3_64(body).digest(), cached) for p in paths]
         if verification is not None:
             inputs.append((b'/.distcc-system/check', len(verification), xxhash.xxh3_64(verification).digest(), 0))
-        rust = (1, 'admission fixture', '', '', '', [], []) if job_kind == 3 else None
+        rust = RustCommand(phase=1, compiler='admission fixture') if job_kind == 3 else None
         manifest = struct.pack('!Q', identity) + job_manifest(job_kind, '/src', args, inputs, rust=rust)
         if net is None:
             net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)

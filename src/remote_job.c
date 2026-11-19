@@ -24,7 +24,6 @@
 #include "trace.h"
 #include "workload.h"
 #include "resource.h"
-#include "rust_job.h"
 
 struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char **files,
                                  const struct dcc_snapshot_metadata *metadata)

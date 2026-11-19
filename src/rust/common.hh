@@ -9,14 +9,13 @@
 #include <map>
 #include <memory>
 #include <json-c/json.h>
-#include <optional>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
 #include <fcntl.h>
+#include <glob.h>
 #include <linux/close_range.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -91,15 +90,22 @@ inline std::vector<char *> pointers(const Words &words) {
     args.push_back(nullptr);
     return args;
 }
-inline fs::path executable(const string &compiler) {
-    if (compiler.find('/') != string::npos)
-        return fs::canonical(compiler);
-    for (const auto &dir : split(env("PATH"), ':')) {
-        fs::path candidate = fs::path(dir) / compiler;
-        if (!access(candidate.c_str(), X_OK))
-            return fs::canonical(candidate);
+inline fs::path find_program(const string &compiler) {
+    auto dirs = compiler.find('/') == string::npos ? split(env("PATH"), ':') : Words{""};
+    for (auto &dir : dirs) {
+        fs::path path = fs::path(dir) / compiler;
+        if (!access(path.c_str(), X_OK))
+            return fs::canonical(path);
+        if (errno != ENOENT && errno != ENOTDIR && errno != EACCES)
+            check(false, path.string());
     }
-    throw Local("compiler unavailable");
+    return {};
+}
+inline fs::path executable(const string &compiler) {
+    fs::path path = find_program(compiler);
+    if (path.empty())
+        throw Local("compiler unavailable: " + compiler);
+    return path;
 }
 inline fs::path native_library() {
     fs::path beside = fs::read_symlink("/proc/self/exe").parent_path() / "distcc-rust-native.so";
@@ -188,91 +194,6 @@ inline string replace(string s, const string &from, const string &to) {
         s.replace(i, from.size(), to);
     return s;
 }
-inline const Words runtime = {"/lib",         "/lib64",        "/usr/lib64",
-                              "/usr/lib/gcc", "/usr/lib/llvm", "/etc/ld.so.cache"};
-struct Option {
-    string key;
-    std::optional<string> value;
-    void append(Words &v) const {
-        if (!key.empty())
-            v.push_back(key);
-        if (value)
-            v.push_back(*value);
-    }
-};
-inline std::vector<Option> options(const Words &args) {
-    static const std::set<string> values = {"--cap-lints",
-                                            "--cfg",
-                                            "--check-cfg",
-                                            "--crate-name",
-                                            "--crate-type",
-                                            "--edition",
-                                            "--error-format",
-                                            "--extern",
-                                            "--json",
-                                            "--remap-path-prefix",
-                                            "--target",
-                                            "--sysroot",
-                                            "--emit",
-                                            "--out-dir",
-                                            "-o",
-                                            "-C",
-                                            "-L",
-                                            "-l",
-                                            "-A",
-                                            "-W",
-                                            "-D",
-                                            "-F",
-                                            "--allow",
-                                            "--warn",
-                                            "--deny",
-                                            "--forbid",
-                                            "--force-warn",
-                                            "--diagnostic-width",
-                                            "--color",
-                                            "--codegen",
-                                            "-Z"};
-    std::vector<Option> parsed;
-    for (size_t i = 0; i < args.size(); ++i) {
-        const string &word = args[i];
-        if (word == "--") {
-            for (++i; i < args.size(); ++i)
-                parsed.push_back({"", args[i]});
-            break;
-        }
-        auto eq = word.find('=');
-        string key = word.substr(0, eq);
-        if (values.count(key)) {
-            if (eq == string::npos && i + 1 == args.size())
-                throw Local("missing option value");
-            parsed.push_back(
-                {key == "--codegen" ? "-C" : key, eq == string::npos ? args[++i] : word.substr(eq + 1)});
-        } else if (word.size() > 2 && values.count(word.substr(0, 2))) {
-            parsed.push_back({word.substr(0, 2), word.substr(2)});
-        } else if (!word.empty() && word[0] == '-')
-            parsed.push_back({word, {}});
-        else
-            parsed.push_back({"", word});
-    }
-    return parsed;
-}
-inline bool metadata_notifications(const std::vector<Option> &opts) {
-    bool meta = false, link = false, notify = false;
-    for (const auto &o : opts) {
-        if (!o.value || (o.key != "--emit" && o.key != "--json"))
-            continue;
-        for (auto &word : split(*o.value, ',')) {
-            auto key = word.substr(0, word.find('='));
-            if (o.key == "--json")
-                notify |= key == "artifacts";
-            else {
-                meta |= key == "metadata";
-                link |= key == "link";
-            }
-        }
-    }
-    return meta && link && notify;
-}
 using Json = std::unique_ptr<json_object, decltype(&json_object_put)>;
 inline string json_field(json_object *obj, const char *name) {
     json_object *v;
@@ -280,45 +201,46 @@ inline string json_field(json_object *obj, const char *name) {
                ? string(json_object_get_string(v), json_object_get_string_len(v))
                : "";
 }
-inline Words emits(const std::vector<Option> &opts) {
-    Words types, actions;
-    for (const auto &o : opts) {
-        if (o.key != "--emit" && o.key != "--crate-type")
-            continue;
-        auto &v = o.key == "--emit" ? actions : types;
-        auto items = split(*o.value, ',');
-        v.insert(v.end(), items.begin(), items.end());
-    }
-    if (actions.empty())
-        actions.push_back("link");
-    if (types.empty())
-        types.push_back("bin");
-    for (const auto &type : types)
-        if (type == "proc-macro")
-            throw Local("procedural macro compiler plugin");
-    return actions;
+inline string llvm_abi(const string &version) {
+    auto minor = version.find('.');
+    if (minor == string::npos)
+        throw Local("missing LLVM ABI in " + version);
+    auto end = version.find_first_not_of("0123456789", minor + 1);
+    return version.substr(0, end);
 }
-// Match the linker driver name rustc uses for its target flavor. The actual
-// executable is selected on the client from this local invocation.
-inline string link_driver(const std::vector<Option> &opts) {
-    bool native = false, explicit_type = false;
-    string driver = "cc";
-    auto actions = emits(opts);
-    if (std::none_of(actions.begin(), actions.end(),
-                     [](const string &a) { return a.substr(0, a.find('=')) == "link"; }))
-        return {};
-    for (auto &o : opts) {
-        if (o.key == "--test")
-            native = true;
-        if (o.key == "--crate-type") {
-            explicit_type = true;
-            for (auto &kind : split(*o.value, ','))
-                native |= kind == "bin" || kind == "cdylib" || kind == "dylib";
+inline std::vector<fs::path> backend_helpers(const fs::path &sysroot = {}, const string &abi = {}) {
+    auto bin = fs::read_symlink("/proc/self/exe").parent_path();
+    std::vector<fs::path> found;
+    auto add = [&](const fs::path &path) {
+        if (access(path.c_str(), X_OK) == 0) {
+            auto real = fs::canonical(path);
+            if (std::find(found.begin(), found.end(), real) == found.end())
+                found.push_back(real);
         }
-        if (o.key == "-C" && o.value->compare(0, 7, "linker=") == 0)
-            driver = o.value->substr(7);
+    };
+    add(bin / "distcc-rust-cgu");
+    if (!sysroot.empty()) {
+        auto lib = sysroot / "lib";
+        add(lib / "distcc/distcc-rust-cgu");
+        auto llvm = lib / ("libLLVM.so." + abi);
+        if (fs::exists(llvm))
+            add(fs::canonical(llvm).parent_path() / "distcc/distcc-rust-cgu");
     }
-    return native || !explicit_type ? driver : "";
+    add(bin / "llvm-lto/distcc-rust-cgu");
+    for (auto &pattern :
+         Words{(bin / "llvm-lto-[0-9]*/distcc-rust-cgu").string(),
+               "/usr/lib/llvm/*/lib*/distcc/distcc-rust-cgu", "/usr/lib/llvm-*/lib/distcc/distcc-rust-cgu"}) {
+        glob_t paths{};
+        int rc = glob(pattern.c_str(), GLOB_NOESCAPE, nullptr, &paths);
+        if (rc && rc != GLOB_NOMATCH)
+            throw std::runtime_error("cannot enumerate LLVM backends");
+        for (size_t i = 0; i < paths.gl_pathc; ++i)
+            add(paths.gl_pathv[i]);
+        globfree(&paths);
+    }
+    for (const auto &dir : split(env("PATH"), ':'))
+        add(fs::path(dir) / "distcc-rust-cgu");
+    return found;
 }
 inline bool below(const string &path, const string &base) {
     return path == base || path.compare(0, base.size() + 1, base + "/") == 0;

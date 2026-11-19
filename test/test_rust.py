@@ -66,7 +66,7 @@ class RustTest(BrokerTestCase):
 
     def wire_plan(self, source, *, flags=(), requested=None, logical=None, extra=(), host=''):
         """A real rustc closure for tests which hold or alter an individual TCP transaction."""
-        from distcc_job import fingerprint, manifest
+        from distcc_job import RustCommand, fingerprint, manifest
         root = subprocess.check_output([self.rustc, '--print=sysroot'], text=True).strip()
         depfile = self.work/'wire.d'
         subprocess.run([self.rustc, '--crate-type=rlib', '-Zbinary-dep-depinfo',
@@ -74,10 +74,11 @@ class RustTest(BrokerTestCase):
                        env=dict(self.env, RUSTC_BOOTSTRAP='1'), cwd=self.work)
         paths = [Path(line[:-1].replace('\\ ', ' ')) for line in depfile.read_text().split('\n\n',1)[1].splitlines()
                  if line.endswith(':')] + list(extra)
-        args = ['--sysroot', root, '--crate-type=rlib', logical or source,
+        args = ['--sysroot', root, logical or source,
                 '-o', '/__distcc_rust/out/libwire.rlib', *flags]
         entries = [(logical if logical and path==source else path, *fingerprint(path), 1) for path in paths]
-        return manifest(3, self.work, args, entries, rust=(1, requested or self.version(self.rustc), host, '', '', [], [])), paths
+        command = RustCommand(phase=1, compiler=requested or self.version(self.rustc), crate_types='rlib', host=host)
+        return manifest(3, self.work, args, entries, rust=command), paths
 
     def wire_result(self, net, identity, first=None):
         codec = runpy.run_path(str(self.build/'distcc-link'))['Lz4Chunks']()
@@ -169,15 +170,15 @@ class RustTest(BrokerTestCase):
                               cwd=self.work, capture_output=True, text=True, timeout=90)
 
     def cgu_toolchain(self):
-        tool = self.build/'distcc-rust-cgu'
-        if not tool.is_file() or not (self.build/'distcc-rust-cgu.so').is_file():
+        tool = self.build/'llvm-lto/distcc-rust-cgu'
+        if not tool.is_file() or not (tool.parent/'distcc-rust-cgu.so').is_file():
             self.skipTest('build does not include the LLVM CGU backend')
         fields = dict(line.split(': ', 1) for line in subprocess.check_output([self.rustc, '-vV'],
                       text=True).splitlines() if ': ' in line)
         offered = subprocess.check_output([tool, '--capabilities'], text=True).split()
-        if fields['LLVM version'] != offered[0]:
+        if '.'.join(fields['LLVM version'].split('.')[:2]) != offered[0]:
             self.skipTest('rustc uses another LLVM version')
-        target = subprocess.check_output([tool, '--target-name', fields['host']], text=True)
+        target = subprocess.check_output([tool, '--target-name', offered[0], fields['host']], text=True)
         return offered[0], target
 
     @staticmethod
@@ -191,14 +192,63 @@ class RustTest(BrokerTestCase):
             return False
         return any(RustTest.cgu_executing(child) for child in children)
 
+    def completed_jobs(self):
+        return [int(next(line.split()[1] for line in self.get_stats(port).splitlines()
+                         if line.startswith('dcc_compile_ok '))) for port in self.stats_ports]
+
+    def assert_one_job_per_cgu(self, messages, counts):
+        modules = re.findall(r'^distcc-rust-cgu: completed \S+ (\S+)$', messages, re.M)
+        self.assertGreater(len(modules), 1, messages)
+        self.assertEqual(len(modules), len(set(modules)), modules)
+        self.assertCountEqual(modules, re.findall(r'^distcc-rust-cgu: emitted (\S+)$', messages, re.M))
+        self.assertEqual(sum(self.completed_jobs()) - sum(counts), len(modules), messages)
+
+    def test_started_cgu_failure_reaches_the_compiler(self):
+        version, target = self.cgu_toolchain()
+        request = self.work/'invalid-module.bc'
+        request.write_bytes(b'{"llvm":"'+version.encode()+b'"}\ninvalid bitcode')
+        with request.open('rb') as ir, (self.work/'object').open('wb') as obj:
+            result = subprocess.run([self.build/'distcc', '--rust-cgu', version, target, 'object'],
+                                    cwd=self.work, stdin=ir, stdout=obj, stderr=subprocess.PIPE,
+                                    env=dict(self.env, DISTCC_FALLBACK='0'), text=True, timeout=15)
+        self.assertEqual(result.returncode, 100, result.stderr)
+        self.assertIn('missing CGU flags', result.stderr)
+        self.assertEqual((self.work/'object').stat().st_size, 0)
+
+    def test_small_cargo_crates_use_both_whole_crate_workers(self):
+        self.cgu_toolchain()
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p}', slots=1)
+                                   for i, p in enumerate(self.stats_ports)), name='small-workspace')
+        counts = self.completed_jobs()
+        crates = [f'leaf{n}' for n in range(8)]
+        (self.work/'Cargo.toml').write_text('[workspace]\nresolver="2"\nmembers=' + json.dumps(crates))
+        for crate in crates:
+            directory = self.work/crate
+            directory.mkdir()
+            (directory/'Cargo.toml').write_text(f'[package]\nname="{crate}"\nversion="0.1.0"\n'
+                                                'edition="2021"\n[lib]\npath="lib.rs"\n')
+            (directory/'lib.rs').write_text('pub fn answer(x: u64) -> u64 { x + 42 }')
+        env = dict(self.env, RUSTC=self.rustc, RUSTC_WRAPPER=str(self.build/'distcc'),
+                   CARGO_INCREMENTAL='1', RUSTFLAGS='-Ccodegen-units=256')
+        result = subprocess.run(['cargo', 'build', '-vv', '--offline', '-j8'], cwd=self.work,
+                                env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('-L dependency=', result.stderr)
+        self.assertIn('incremental=', result.stderr)
+        self.assertEqual(result.stderr.count('distcc-rust: compiled on'), len(crates), result.stderr)
+        self.assertNotIn('distcc-rust-cgu: completed', result.stderr)
+        after = self.completed_jobs()
+        self.assertTrue(all(b > a for a, b in zip(counts, after)), (counts, after))
+        self.assertEqual(sum(after) - sum(counts), len(crates))
+
     def test_parallel_cgu_backend(self):
         version, backend = self.cgu_toolchain()
         hosts = ' '.join(self.host(i, f',tcp,stats={p}', slots=3) for i,p in enumerate(self.stats_ports))
         self.start_broker(hosts, name='cgu')
         for p in self.stats_ports:
             row = next(s for s in self.get_stats(p).splitlines() if s.startswith('dcc_llvm_cgu '))
-            self.assertEqual(row.split()[1], version)
-            self.assertIn(backend, row.split()[2:])
+            offers = [s.split() for s in row.removeprefix('dcc_llvm_cgu ').split(';')]
+            self.assertTrue(any(x[0] == version and backend in x[1:] for x in offers))
         src = self.work/'wide.rs'
         modules = []
         for i in range(16):
@@ -208,13 +258,15 @@ class RustTest(BrokerTestCase):
             modules.append(f'pub mod m{i} {{ {funcs} pub fn all(x:u64)->u64 {{ {expr} }} }}')
         src.write_text('\n'.join(modules) + '\nfn main(){println!("{}",' +
                        '^'.join(f'm{i}::all(std::hint::black_box(19))' for i in range(16)) + ');}')
-        args = (src, '-Ccodegen-units=8', '-Copt-level=2', '-Cdebuginfo=1', '-Cembed-bitcode=yes')
+        args = (src, '-Ccodegen-units=8', '-Copt-level=z', '-Cllvm-args=-import-instr-limit=5',
+                '-Cdebuginfo=1', '-Cembed-bitcode=yes')
         expected = self.work/'reference'
         actual = self.work/'parallel'
         local = self.rust(*args, '-o', expected, remote=False)
         self.assertEqual(local.returncode, 0, local.stderr)
 
         overlap = False
+        counts = self.completed_jobs()
         trace = self.work/'compiler.log'
         with trace.open('w') as log, subprocess.Popen(
                 [self.build/'distcc', self.rustc, *args, '-o', actual],
@@ -229,7 +281,8 @@ class RustTest(BrokerTestCase):
         messages = trace.read_text()
         self.assertEqual(build.returncode, 0, messages)
         self.assertIn('distcc-rust-cgu: finished thin-postlink', messages)
-        self.assertIn('distcc-rust-cgu: finished object', messages)
+        self.assertIn('distcc-rust-cgu: completed', messages)
+        self.assert_one_job_per_cgu(messages, counts)
         self.assertTrue(overlap, messages)
         self.assertEqual(subprocess.check_output([actual]), subprocess.check_output([expected]))
 
@@ -279,8 +332,29 @@ class RustTest(BrokerTestCase):
         messages = log.read_text()
         self.assertEqual(cargo.returncode, 0, messages)
         self.assertRegex(messages, r'--extern producer=[^\s]+\.rmeta')
-        self.assertIn('distcc-rust-cgu: finished object', messages)
+        self.assertIn('distcc-rust-cgu: completed', messages)
         self.assertTrue(overlap, messages)
+
+    def worker_with_patch_level(self, patch):
+        # Only the patch reported by the real LLVM C API changes. The daemon
+        # advertises this helper and executes it inside the ordinary sandbox.
+        folder = self.work/'patch-worker'
+        folder.mkdir()
+        daemon = folder/'distccd'
+        os.link(self.build/'distccd', daemon)
+        shim = folder/'version.c'
+        shim.write_text('#include <stdio.h>\n#include <unistd.h>\n'
+                        'void __real_LLVMGetVersion(unsigned*,unsigned*,unsigned*);\n'
+                        'void __wrap_LLVMGetVersion(unsigned *a,unsigned *b,unsigned *c) { '
+                        f'__real_LLVMGetVersion(a,b,c); *c={patch}; '
+                        'if (!access("/input", R_OK)) fprintf(stderr, "LLVM worker %u.%u.%u\\n", *a, *b, *c); }\n')
+        obj = shim.with_suffix('.o')
+        subprocess.run(['cc', '-c', shim, '-o', obj], check=True)
+        helper = folder/'distcc-rust-cgu'
+        subprocess.run(['make', '-s', 'LTO_BUILD=' + str(folder), 'CXXFLAGS=-O0',
+                        f'LDFLAGS={obj} -Wl,--wrap=LLVMGetVersion', str(helper)],
+                       cwd=self.build, check=True)
+        return daemon
 
     def test_foreign_host_cgu_with_impure_macro_and_embedded_bitcode(self):
         llvm, backend = self.cgu_toolchain()
@@ -288,10 +362,15 @@ class RustTest(BrokerTestCase):
         native = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
         foreign_host = 'aarch64-unknown-linux-gnu' if native.startswith('x86') else 'x86_64-unknown-linux-gnu'
         foreign = self.work/'foreign-rustc'
-        # Simulate only the Rust frontend ABI. No frontend on this worker can
-        # run the client plugin. All LLVM work still runs in the real daemon.
+        match = re.search(r'^LLVM version: \d+\.\d+\.(\d+)', version, re.M)
+        assert match is not None, version
+        client_patch = int(match[1])
+        worker_patch = 3 if client_patch != 3 else 5
+        daemon = self.worker_with_patch_level(worker_patch)
+        foreign_version = version.replace('host: '+native, 'host: '+foreign_host)
+        foreign_version = re.sub(r'(?m)^(LLVM version: \d+\.\d+)\.\d+', rf'\g<1>.{worker_patch}', foreign_version)
         foreign.write_text('#!/bin/sh\n[ "$1" = -vV ] || exit 121\nprintf "%s" ' +
-                           shlex.quote(version.replace('host: '+native, 'host: '+foreign_host)) + '\n')
+                           shlex.quote(foreign_version) + '\n')
         foreign.chmod(0o755)
 
         writes = self.work/'side-effect'
@@ -311,34 +390,44 @@ class RustTest(BrokerTestCase):
         out = self.work/'liblibrary.rlib'
         trace = self.work/'frontend.trace'
         args = ['--crate-type=rlib', src, '--extern', 'writer='+str(plugin), '-Clto=off',
-                '-Cembed-bitcode=yes', '-Copt-level=2', '-Ccodegen-units=8', '-Cdebuginfo=2', '-o', out]
+                '-Cembed-bitcode=yes', '-Copt-level=2', '-Ccodegen-units=256',
+                '-Cincremental='+str(self.work/'incremental'), '-Cdebuginfo=2', '-o', out]
         # Run the same impure crate on one matching worker and one foreign
         # worker independently. The local frontend must execute once in each case.
         for host in (native, foreign_host):
             with self.subTest(worker_rust_host=host):
                 if host == foreign_host:
-                    self.restart_server(self.build/'distccd', DISTCCD_RUSTC=str(foreign))
+                    self.restart_server(daemon, DISTCCD_RUSTC=str(foreign))
                     self.addCleanup(self.restart_server, self.build/'distccd')
                 self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='foreign' if host == foreign_host else 'native')
                 stats = self.get_stats(self.stats_ports[0])
                 self.assertIn('dcc_rust_host '+host, stats)
-                self.assertIn('dcc_llvm_cgu '+llvm, stats)
+                self.assertIn(llvm+' '+backend, next(l for l in stats.splitlines() if l.startswith('dcc_llvm_cgu ')))
                 for incompatible in ('0.0.0 '+backend, llvm+' absent-backend'):
                     request = self.request(10, work=(1, 65536, 11), memory_class=1+8*64+16,
                                            rust_host=incompatible.encode())
                     self.assertEqual(struct.unpack_from('=i', request.recv(1032))[0], 121)
+                counts = self.completed_jobs()
                 result = subprocess.run(['strace', '-f', '-s', '256', '-e', 'execve', '-o', trace,
                                          self.build/'distcc', self.rustc, *args], cwd=self.work, env=self.env,
                                         capture_output=True, text=True, timeout=90)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('distcc-rust-cgu: finished module-opt', result.stderr)
-                self.assertIn('distcc-rust-cgu: finished object', result.stderr)
+                self.assertIn('distcc-rust-cgu: completed', result.stderr)
+                self.assert_one_job_per_cgu(result.stderr, counts)
+                if host == foreign_host:
+                    self.assertEqual(result.stderr.count(f'LLVM worker {llvm}.{worker_patch}\n'),
+                                     result.stderr.count('distcc-rust-cgu: completed'))
                 self.assertEqual(writes.read_bytes(), b'x')
                 writes.unlink()
                 calls = trace.read_text()
-                self.assertNotIn('-Zbinary-dep-depinfo', calls)
+                self.assertEqual('-Zbinary-dep-depinfo' in calls, host == native)
                 frontend = 'execve("' + str(Path(self.rustc).resolve()) + '",'
-                self.assertEqual(sum(frontend in line and '"--crate-type=rlib"' in line for line in calls.splitlines()), 1)
+                full = [line for line in calls.splitlines() if frontend in line and
+                        re.search(r'"--crate-type(?:=rlib"|", "rlib")', line) and '-Zbinary-dep-depinfo' not in line]
+                self.assertEqual(len(full), 1, calls)
+                self.assertIn('"codegen-units=16"', full[0])
+                self.assertNotIn('incremental=', full[0])
         members = subprocess.check_output(['ar', 't', out], text=True).splitlines()
         self.assertTrue(any('rmeta' in name for name in members))
         obj = self.work/'unit.o'
@@ -653,8 +742,7 @@ class RustTest(BrokerTestCase):
                 result = self.rust('--crate-type=rlib', source, '-o', output, env=env)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('mismatched types', result.stderr)
-                self.assertEqual('worker compilation failed; retrying locally' in result.stderr,
-                                 fallback == '1')
+                self.assertNotIn('retrying locally', result.stderr)
                 self.assertEqual(output.read_bytes(), b'previous artifact')
 
     def test_json_artifacts_exist_when_cargo_is_notified(self):
@@ -1023,14 +1111,13 @@ class RustTest(BrokerTestCase):
                     output.unlink()
 
     def test_worker_rejects_plugin_producer_hidden_by_later_crate_type(self):
-        for kind in ('proc-macro',):
-            src = self.work/(kind.replace('-', '_')+'.rs')
-            src.write_text('// '+kind+'\npub fn answer() {}')
-            status, err, outputs = self.raw_compile(src, flags=['--crate-type='+kind,'--crate-type=rlib',
-                                                               '--emit=link','--emit=dep-info'])
-            self.assertNotEqual(status, 0)
-            self.assertIn('procedural macro compiler plugin', err)
-            self.assertFalse(outputs)
+        src = self.work/'plugin.rs'
+        src.write_text('pub fn answer() {}')
+        body, _ = self.wire_plan(src, flags=['--crate-type=proc-macro', '--crate-type=rlib'])
+        with socket.create_connection((self.worker_address, self.ports[0])) as net:
+            self.send(net, 0x54000300, struct.pack('!Q', 1) + body)
+            # A second encoding of a typed field is rejected at BEGIN.
+            self.assertEqual(net.recv(1), b'')
 
     def test_repeated_emits_preserve_remote_outputs(self):
         source = self.work / 'emissions.rs'
@@ -1557,12 +1644,13 @@ pub fn read_only() -> bool {
         output = self.work/'libruntime.rlib'
         for marker in (None, 'b'*64):
             if marker: (root/'.distcc-complete').write_text(marker+'\n')
-            r = self.rust('--crate-type=rlib', source, '-o', output)
-            self.assertIn('local: worker has no matching Rust toolchain', r.stderr)
+            status, _, files = self.raw_compile(source)
+            self.assertEqual(status, 121)
+            self.assertFalse(files)
         (root/'.distcc-complete').write_text('c'*64 + '\n')
-        result = self.rust('--crate-type=rlib', source, '-o', output)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('compiled on', result.stderr)
+        status, diagnostics, files = self.raw_compile(source)
+        self.assertEqual(status, 0, diagnostics)
+        output.write_bytes(files['libwire.rlib'])
         source.write_text('fn main() { assert_eq!(runtime::answer(), "runtime"); }')
         result = self.rust(source, '--extern', 'runtime='+str(output), '-o', self.work/'main', remote=False)
         self.assertEqual(result.returncode, 0, result.stderr)

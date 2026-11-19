@@ -14,7 +14,6 @@
 #define DCC_RUST_COMPILER (DCC_RUST_ROOT "/compiler")
 struct dcc_job;
 struct dcc_job_result;
-struct dcc_work_hint;
 struct dcc_rust_artifacts;
 #ifdef __cplusplus
 extern "C" {
@@ -24,18 +23,15 @@ int dcc_rust_catalog_fd(void);
 int dcc_rust_catalog_attach(int fd);
 const char *dcc_rust_host(void);
 const char *dcc_rust_cgu_capabilities(void);
-int dcc_spawn_rust_cgu(pid_t *, const char *tree, const char *output, const char *stdout_path,
-                       const char *stderr_path);
+int dcc_spawn_rust_cgu(pid_t *, const char *abi, const char *tree, const char *output,
+                       const char *stdout_path, const char *stderr_path);
 int dcc_rust_submit_cgu(const char *version, const char *target, const char *phase);
 int dcc_rust_capture(char **argv);
-int dcc_rust_pipelined(const struct dcc_job *);
 struct dcc_rust_artifacts *dcc_rust_watch(const char *root, int *watchfd);
 int dcc_rust_next_metadata(struct dcc_rust_artifacts *, const char **name, const char **line, int *file);
 void dcc_rust_watch_free(struct dcc_rust_artifacts *);
 int dcc_rust_worker(const struct dcc_job *, const char *root, int cancel, const char *out, const char *err,
                     struct dcc_job_result *);
-int dcc_transfer_prepared(struct dcc_job *, char **files, const char *output, const struct dcc_work_hint *,
-                          int queued_fd, struct dcc_job_result *);
 #ifdef __cplusplus
 }
 #endif

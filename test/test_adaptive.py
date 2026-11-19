@@ -792,7 +792,7 @@ int main(void) {
     assert(dcc_resource_class_slots(16, pump, 0) >= 2);
     assert(dcc_resource_input_bytes(&job) == 2048);
     struct dcc_job_input profiled_inputs[] = {
-        {.plain_size = 2048}, {.kind = DCC_JOB_READONLY, .plain_size = 80*M}
+        {.path="/main.c", .plain_size = 2048}, {.path="/data.rlib", .kind = DCC_JOB_READONLY, .plain_size = 80*M}
     };
     struct dcc_job profiled = {.kind = DCC_JOB_PUMP, .count = 2, .inputs = profiled_inputs};
     assert(dcc_resource_class(&profiled) == pump);
