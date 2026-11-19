@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """LLVM-generated link jobs over distcc's shared input transport."""
-import json
+from contextlib import ExitStack
 from functools import cached_property
+import json
 import os
 from pathlib import Path
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -35,6 +38,14 @@ class InputSnapshot:
 
 def absolute(name):
     return str(Path(os.path.abspath(name)))
+
+
+def open_regular(path, dir_fd=None):
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=dir_fd)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ValueError('expected regular ThinLTO file')
+    return fd
 
 
 def llvm_tools(compiler):
@@ -69,6 +80,13 @@ def work_key(job, files):
     return xxhash.xxh3_64_intdigest(json.dumps(identity).encode()) or 1
 
 
+def stage_output(source, destination, stack):
+    with tempfile.NamedTemporaryFile(dir=Path(destination).parent, prefix='.distcc-', delete=False) as out:
+        stack.callback(Path(out.name).unlink, missing_ok=True)
+        shutil.copyfileobj(source, out, 256 * 1024)
+        return out.name
+
+
 def publish_archive(archive, destinations):
     """Stage the complete result before replacing any declared artifact."""
     with tarfile.open(archive) as tar:
@@ -77,20 +95,14 @@ def publish_archive(archive, destinations):
                 or any(not m.isfile() for m in members)):
             raise ValueError('invalid LLVM job result archive')
         staged = []
-        try:
+        with ExitStack() as stack:
             for member, destination in zip(members, destinations):
-                with tempfile.NamedTemporaryFile(dir=Path(destination).parent,
-                                                 prefix='.distcc-', delete=False) as output:
-                    staged.append((output.name, destination))
-                    source = tar.extractfile(member)
-                    assert source is not None  # Regular members were validated above.
-                    with source:
-                        shutil.copyfileobj(source, output, 256 * 1024)
+                source = tar.extractfile(member)
+                assert source is not None  # Regular members were validated above.
+                with source:
+                    staged.append((stage_output(source, destination, stack), destination))
             for source, destination in staged:
                 os.replace(source, destination)
-        finally:
-            for source, _ in staged:
-                Path(source).unlink(missing_ok=True)
 
 
 def distribute(request, kind, link=None):
@@ -116,27 +128,29 @@ def distribute(request, kind, link=None):
         # Freeze every input before jobs publish any outputs. Fingerprinting
         # is deferred until transfer; local preparation needs no content key.
         files = {}
-        def register(task):
+        def register(task, opener):
             for name in [*task['inputs'], *common['inputs']]:
                 name = absolute(name)
                 if name not in files:
                     path = work / ('input-' + str(len(files)))
-                    files[name] = InputSnapshot(link.open_input(name) if link else name, path)
+                    files[name] = InputSnapshot(opener(name) if opener else name, path)
             names = task['inputs'][:1] if kind == 4 else [*task['inputs'], *common['inputs']]
             task['bytes'] = sum(files[name].size for name in {absolute(p) for p in names})
 
         for task in jobs:
-            register(task)
+            register(task, link.open_input if link else None)
+            task['destinations'] = [link.outputs[absolute(p)] if link else absolute(p) for p in task['outputs']]
             task['instructions'] = 0
             task['partitions'] = 1
         total_bytes = sum(task['bytes'] for task in jobs)
         total_instructions = 0
-        tools = llvm_tools(common['args'][0]) if kind == 4 and link is None else None
+        tools = llvm_tools(common['args'][0]) if kind == 4 else None
         indexes = [next((arg.split('=', 1)[1] for arg in task['args']
                          if arg.startswith('-fthinlto-index=')), None) for task in jobs]
         if tools and all(indexes):
             plan = work / 'plan.json'
-            plan.write_text(json.dumps([dict(source=task['inputs'][0], index=index)
+            # source is the module ID stored in the index. The planner opens only the frozen index.
+            plan.write_text(json.dumps([dict(source=task['inputs'][0], index=str(files[absolute(index)].path))
                                         for task, index in zip(jobs, indexes)]))
             weights = json.loads(subprocess.check_output([tools['plan'], 'plan', plan], text=True))
             if len(weights) != len(jobs):
@@ -204,10 +218,10 @@ def distribute(request, kind, link=None):
                     process.kill()
                     process.communicate()
                     raise
-            return process, job, archive
+            return process, job, archive, task['destinations']
 
         def collect(started):
-            process, job, archive = started
+            process, job, archive, destinations = started
             stdout, stderr = process.communicate()
             sys.stdout.buffer.write(stdout)
             sys.stderr.buffer.write(stderr)
@@ -216,7 +230,7 @@ def distribute(request, kind, link=None):
                     print(helper + ': retrying backend locally', file=sys.stderr)
                     return subprocess.call(job['args'])
                 return process.returncode
-            publish_archive(archive, [link.outputs[p] for p in job['outputs']] if link else job['outputs'])
+            publish_archive(archive, destinations)
             return 0
 
         def prepare(index, task):
@@ -231,44 +245,51 @@ def distribute(request, kind, link=None):
             manifest = str(jobdir / 'partitions.json')
             job['outputs'] = [manifest]
             job['partitions'] = task['partitions']
-            job['args'][job['args'].index('-o') + 1] = manifest + '.unused.o'
+            job['args'][len(common['args']) + task['args'].index('-o') + 1] = manifest + '.unused.o'
             result = run_job(root, job, kind, tools['prepare'])
             if result:
                 raise subprocess.CalledProcessError(result, job['args'])
-            partition = json.loads((root / manifest.lstrip('/')).read_text())
-            for part in partition['parts']:
-                part['path'] = str(root / part['path'].lstrip('/'))
+            with os.fdopen(open_regular(root / manifest.lstrip('/')), 'rb') as source:
+                partition = json.load(source)
+            if not 0 < len(partition['parts']) <= task['partitions']:
+                raise ValueError('unexpected LLVM partition count')
             if env.get('DISTCC_VERBOSE') == '1':
                 print(helper + ': partitioned ' + task['inputs'][0] + ' into '
                       + str(len(partition['parts'])), file=sys.stderr)
-            outputs = [str(jobdir / f'part-{i}.o') for i in range(len(partition['parts']))]
-            group = dict(directory=jobdir, outputs=outputs, locals=partition['locals'],
-                         destination=absolute(task['outputs'][0]), remaining=len(outputs))
+            merge_dir = jobdir / 'merge'
+            merge_dir.mkdir()
+            outputs = [str(merge_dir / f'part-{i}.o') for i in range(len(partition['parts']))]
+            group = dict(directory=merge_dir, outputs=outputs, locals=partition['locals'],
+                         destination=task['destinations'][0], remaining=len(outputs))
             children = []
             primary = absolute(task['inputs'][0])
-            for part, output in zip(partition['parts'], outputs):
-                args = [part['path'] if absolute(arg) == primary else arg for arg in task['args']]
+            for i, (part, output) in enumerate(zip(partition['parts'], outputs)):
+                expected = f'{manifest}.part-{i}.bc'
+                if part['path'] != expected:
+                    raise ValueError('unexpected LLVM partition path')
+                path = str(root / expected.lstrip('/'))
+                args = [path if absolute(arg) == primary else arg for arg in task['args']]
                 args[args.index('-o') + 1] = output
                 args.extend(['-mllvm', '-thinlto-assume-merged'])
-                children.append(dict(args=args, inputs=[part['path'], task['index']],
-                    outputs=[output], instructions=part['instructions'], group=group))
+                children.append(dict(args=args, inputs=[path, task['index']], outputs=[output],
+                    destinations=[output], instructions=part['instructions'], group=group))
             return children
 
         def merge(group):
             assert tools is not None
-            merged = group['directory'] / 'merged.o'
-            subprocess.run([tools['linker'], '-r', '-o', merged, *group['outputs']], check=True)
-            with tempfile.NamedTemporaryFile(dir=Path(group['destination']).parent,
-                                             prefix='.distcc-', delete=False) as output:
-                staged = output.name
-            try:
-                response = group['directory'] / 'localize.rsp'
-                response.write_text(shlex.join([*['--localize-symbol=' + name for name in group['locals']],
-                                                str(merged), staged]))
-                subprocess.run([tools['objcopy'], '@' + str(response)], check=True)
-                os.replace(staged, group['destination'])
-            finally:
-                Path(staged).unlink(missing_ok=True)
+            directory = group['directory']
+            sandbox = llvm_sandbox(tools['linker'].parent)
+            sandbox.extend(['--bind', str(directory), CONTROL, '--remount-ro', '/',
+                            '--chdir', CONTROL, '--clearenv', '--'])
+            environment = dict(os.environ, SANDBOX_ON='0')
+            parts = [Path(p).name for p in group['outputs']]
+            (directory / 'localize.rsp').write_text(shlex.join(
+                ['--localize-symbol=' + name for name in group['locals']] + ['merged.o', 'localized.o']))
+            subprocess.run([*sandbox, tools['linker'], '-r', '-o', 'merged.o', *parts], env=environment, check=True)
+            subprocess.run([*sandbox, tools['objcopy'], '@localize.rsp'], env=environment, check=True)
+            destination = group['destination']
+            with os.fdopen(open_regular(directory / 'localized.o'), 'rb') as source, ExitStack() as stack:
+                os.replace(stage_output(source, destination, stack), destination)
 
         # Preparation and ordinary backends share one bounded scheduler. Ready
         # partitions rejoin its priority queue immediately; there is no barrier
@@ -298,7 +319,7 @@ def distribute(request, kind, link=None):
                     result = future.result()
                     if action == 'prepare':
                         for child in result:
-                            register(child)
+                            register(child, open_regular)
                             enqueue('backend', child, priority(child))
                     elif action == 'backend':
                         if result:
@@ -309,6 +330,28 @@ def distribute(request, kind, link=None):
                             if not group['remaining']:
                                 enqueue('merge', group, float('inf'))
         return 0
+
+
+def llvm_sandbox(tool_dir, root=None):
+    namespaces = ['--unshare-all']
+    if os.geteuid() == 0:
+        # Portage installs as root below the build user's mode-0700 directory.
+        # A new user namespace loses host DAC override before bwrap opens the
+        # bind sources. Keep it for mount setup, then drop every capability
+        # before executing Clang in the isolated, read-only filesystem.
+        namespaces = ['--unshare-ipc', '--unshare-pid', '--unshare-net',
+                      '--unshare-uts', '--unshare-cgroup-try', '--cap-drop', 'ALL']
+    sandbox = [shutil.which('bwrap', path=os.defpath) or '/usr/bin/bwrap', *namespaces, '--die-with-parent']
+    if root is not None:
+        sandbox.extend(['--bind', str(root), '/'])
+    for runtime in RUNTIME:
+        if Path(runtime).exists():
+            sandbox.extend(['--ro-bind', runtime, runtime])
+    # Keep the installed tool directory and its symlinks intact: Clang locates
+    # LLD and resource files relative to its executable. Binding a symlink as
+    # an individual mount target is also rejected by bubblewrap.
+    sandbox.extend(['--ro-bind', str(tool_dir), str(tool_dir), '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp'])
+    return sandbox
 
 
 def run_job(root, job, kind, prepare_library=None):
@@ -337,27 +380,9 @@ def run_job(root, job, kind, prepare_library=None):
         raise OSError('worker Clang is not installed')
     # Keep embedded import paths in LLVM indexes unchanged. A private mount
     # namespace gives Clang the client path layout and read-only cached inputs.
-    namespaces = ['--unshare-all']
-    if os.geteuid() == 0:
-        # Portage installs as root below the build user's mode-0700 directory.
-        # A new user namespace loses host DAC override before bwrap opens the
-        # bind sources. Keep it for mount setup, then drop every capability
-        # before executing Clang in the isolated, read-only filesystem.
-        namespaces = ['--unshare-ipc', '--unshare-pid', '--unshare-net',
-                      '--unshare-uts', '--unshare-cgroup-try', '--cap-drop', 'ALL']
-    sandbox = [shutil.which('bwrap', path=os.defpath) or '/usr/bin/bwrap',
-               *namespaces, '--die-with-parent', '--bind', str(root), '/']
     rooted(job['cwd']).mkdir(parents=True, exist_ok=True)
-    for runtime in RUNTIME:
-        if Path(runtime).exists():
-            sandbox.extend(['--ro-bind', runtime, runtime])
-    # Keep the installed tool directory and its symlinks intact: Clang locates
-    # LLD and resource files relative to its executable. Binding a symlink as
-    # an individual mount target is also rejected by bubblewrap.
-    compiler_dir = str(Path(compiler).parent)
-    sandbox.extend(['--ro-bind', compiler_dir, compiler_dir,
-                    '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
-                    '--dir', job['cwd']])
+    sandbox = llvm_sandbox(Path(compiler).parent, root)
+    sandbox.extend(['--dir', job['cwd']])
     outputs = [rooted(name) for name in job['outputs']]
     # LLD publishes with a temporary sibling and rename; a writable file mount
     # alone is insufficient. The per-job tree owns these writable directories.
@@ -399,10 +424,108 @@ def worker(root, archive, kind):
     return 0
 
 
+class LinkFiles:
+    def __init__(self, work, linked, temporary, stack):
+        self.work = Path(work)
+        self.linked = Path(linked)
+        self.writable = (self.linked.parent, Path(temporary))
+        self.stack = stack
+        self.directories = {}
+        self.outputs = {}
+        for root in (self.work, *self.writable):
+            self.directory(root, root)
+        declared = (self.work / 'dtlto-inputs').read_bytes().split(b'\0')
+        self.declared = {os.fsdecode(p): os.path.realpath(p) for p in declared if p}
+
+    def directory(self, root, path):
+        # Keep each parent pinned across the read or publication. The linker
+        # can concurrently rename entries inside its two writable mounts.
+        if path not in self.directories:
+            parent = None if path == root else self.directory(root, path.parent)
+            fd = os.open(path if parent is None else path.name,
+                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            self.stack.callback(os.close, fd)
+            self.directories[path] = fd
+        return self.directories[path]
+
+    def locate(self, path, roots):
+        if not path.is_absolute() or '..' in path.parts:
+            raise ValueError('invalid ThinLTO path')
+        for root in roots:
+            if root in path.parents:
+                return self.directory(root, path.parent)
+        raise ValueError('ThinLTO path outside link directories: ' + str(path))
+
+    def open_input(self, name, *, description=False):
+        path = Path(name)
+        if not description and name in self.declared:
+            return open_regular(self.declared[name])
+        roots = self.writable if description else (*self.writable, self.work)
+        return open_regular(path.name, self.locate(path, roots))
+
+    def request(self, description, compiler):
+        with os.fdopen(self.open_input(description, description=True), 'rb') as stream:
+            limit = 16 * 1024 * 1024
+            data = stream.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError('ThinLTO description too large')
+        request = json.loads(data)
+        common = request['common']
+        if common['linker_output'] != str(self.linked) or common.get('outputs'):
+            raise ValueError('unexpected ThinLTO link output')
+        args = common['args']
+        if not isinstance(args, list) or args[:2] != [compiler, '-c'] or not all(
+                isinstance(arg, str) and not arg.startswith('@') for arg in args):
+            raise ValueError('unexpected ThinLTO compiler arguments')
+        jobs = []
+        self.outputs.clear()
+        for job in request['jobs']:
+            inputs = job['inputs']
+            output, = job['outputs']
+            path = Path(output)
+            parent = self.locate(path, self.writable)
+            if (str(path) != output or output in self.outputs or path == self.linked or len(inputs) < 2 or
+                    job['args'] != [inputs[0], '-fthinlto-index=' + inputs[1], '-o', output]):
+                raise ValueError('unexpected ThinLTO backend job')
+            self.outputs[output] = Path('/proc/self/fd') / str(parent) / path.name
+            jobs.append(dict(args=job['args'], inputs=inputs, outputs=[output]))
+        return dict(common=dict(args=args, inputs=common['inputs']), jobs=jobs)
+
+
+def run_link(work, linked, temporary, compiler, filter_fd, command):
+    with ExitStack() as stack:
+        files = LinkFiles(work, linked, temporary, stack)
+        parent, child = socket.socketpair(type=socket.SOCK_SEQPACKET)
+        stack.enter_context(parent)
+        stack.enter_context(child)
+        fd = child.fileno()
+        process = subprocess.Popen(command, pass_fds=(int(filter_fd), fd),
+                                   env=dict(os.environ, DISTCC_RUST_DTLTO_FD=str(fd)))
+        child.close()
+        try:
+            failed = 0
+            while message := parent.recv(4097):
+                if len(message) > 4096:
+                    raise ValueError('invalid ThinLTO description name')
+                request = files.request(os.fsdecode(message), compiler)
+                try:
+                    status = distribute(request, 4, files)
+                except subprocess.CalledProcessError as error:
+                    status = error.returncode
+                status = 128 - status if status < 0 else status
+                failed = failed or status
+                parent.sendall(bytes([status]))
+            status = process.wait()
+            return failed or (128 - status if status < 0 else status)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
 def main(kind):
     try:
         if kind == 4 and sys.argv[1:2] == ['--rust-link']:
-            from distcc_rust_lto import run_link
             work, linked, temporary, compiler, filter_fd, *command = sys.argv[2:]
             return run_link(work, linked, temporary, compiler, filter_fd, command)
         if len(sys.argv) == 4 and sys.argv[1] == '--worker':

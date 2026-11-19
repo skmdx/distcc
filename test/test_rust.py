@@ -722,9 +722,42 @@ class RustTest(BrokerTestCase):
                 self.assertIn('distcc-thinlto: compiled on ', result.stderr)
                 self.assertEqual(subprocess.check_output([output], text=True), 'distributed Rust ThinLTO\n')
 
+    def test_single_cgu_thinlto_partitions_with_size_optimization(self):
+        from distcc_lto import llvm_tools
+        clang = shutil.which('clang')
+        if not clang or not llvm_tools(clang):
+            self.skipTest('matching LLVM partition helpers required')
+        hosts = [self.host(i, f',tcp,stats={self.stats_ports[i]}', slots=1) for i in range(2)]
+        self.start_broker(' '.join(hosts), name='thinlto')
+        source = self.work/'functions.rs'
+        functions = [f'#[inline(never)] fn f{i}(x:u32)->u32 {{ let y=unsafe {{core::ptr::read_volatile(&x)}}; '
+                     f'y.wrapping_mul({i+1}) + (y ^ x) }}'
+                     for i in range(32)]
+        total = ' + '.join(f'f{i}(x)' for i in range(len(functions)))
+        source.write_text('#![no_std]\n' + '\n'.join(functions) + '\n#[inline(never)] pub fn total(x:u32)->u32 {'
+                          + total + '}')
+        library = self.work/'libfunctions.rlib'
+        codegen = ['-Clinker-plugin-lto', '-Ccodegen-units=1', '-Copt-level=z']
+        compiled = self.rust(source, '--crate-type=rlib', *codegen, '-o', library)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        main = self.work/'main.rs'
+        main.write_text('extern crate functions; fn main() { let n=std::env::args().count() as u32; '
+                        'println!("{}", functions::total(n)); }')
+        output = self.work/'program'
+        result = self.rust(main, '--extern', 'functions='+str(library), '-Clinker='+clang, *codegen,
+                           '-Clink-arg=-fuse-ld=lld', '-Clink-arg=-Wl,--thinlto-remote-compiler-arg=-Oz',
+                           '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        partitions = re.findall(r'distcc-thinlto: partitioned .* into (\d+)', result.stderr)
+        self.assertTrue(any(int(count) > 1 for count in partitions), result.stderr)
+        weights = re.findall(r'distcc-thinlto: submitting .*\.part-\d+\.bc instructions=(\d+)', result.stderr)
+        self.assertGreaterEqual(sum(int(weight) > 0 for weight in weights), 2, result.stderr)
+        self.assertGreaterEqual(result.stderr.count('distcc-thinlto: compiled on '), len(weights))
+        self.assertEqual(subprocess.check_output([output, 'argument'], text=True), '1056\n')
+
     def test_thinlto_output_directories(self):
         from contextlib import ExitStack
-        from distcc_rust_lto import LinkFiles
+        from distcc_lto import LinkFiles
         work, final, temporary = (self.work/p for p in ('inputs', 'final', 'lto'))
         for directory in (work, final, temporary):
             directory.mkdir()
@@ -740,6 +773,12 @@ class RustTest(BrokerTestCase):
 
         with ExitStack() as stack:
             files = LinkFiles(work, linked, temporary, stack)
+            for invalid_arg in ('@more-options', 1):
+                with self.subTest(arg=invalid_arg):
+                    description.write_text(json.dumps(dict(common=dict(common, args=['clang', '-c', invalid_arg]),
+                                                           jobs=[job(final/'ok.o')])))
+                    with self.assertRaisesRegex(ValueError, 'compiler arguments'):
+                        files.request(str(description), 'clang')
             for invalid in (work/'bad.o', temporary/'..'/'bad.o', temporary/'alias'/'bad.o'):
                 with self.subTest(path=invalid):
                     description.write_text(json.dumps(dict(common=common, jobs=[job(final/'ok.o'), job(invalid)])))

@@ -228,7 +228,6 @@ dist_extra =							\
 	distcc-thinlto \
 	distcc-offload-link \
 	distcc_lto.py \
-	distcc_rust_lto.py \
 	src/lto.cc \
 	src/lto_prepare.cc \
 	src/lto_partition.cc \
@@ -1300,7 +1299,6 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc-thinlto"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-offload-link" "$(DESTDIR)$(bindir)/distcc-offload-link"
 	$(INSTALL_DATA) "$(srcdir)/distcc_lto.py" "$(DESTDIR)$(bindir)/distcc_lto.py"
-	$(INSTALL_DATA) "$(srcdir)/distcc_rust_lto.py" "$(DESTDIR)$(bindir)/distcc_rust_lto.py"
 	if test -n "$(LINKER_WRAPPER_TARGET)"; then \
 	  $(INSTALL_PROGRAM) distcc-linker-wrapper "$(DESTDIR)$(bindir)/distcc-linker-wrapper"; \
 	fi
@@ -1455,7 +1453,6 @@ uninstall-programs:
 	rm -f "$(DESTDIR)$(bindir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc_job.py"
 	rm -f "$(DESTDIR)$(bindir)/distcc_python.py"
 	rm -f "$(DESTDIR)$(bindir)/distcc-offload-link" "$(DESTDIR)$(bindir)/distcc_lto.py" "$(DESTDIR)$(bindir)/distcc-linker-wrapper"
-	rm -f "$(DESTDIR)$(bindir)/distcc_rust_lto.py"
 	rm -f "$(DESTDIR)$(bindir)/distcc-offload"
 	rm -f "$(DESTDIR)$(bindir)/distcc-clang"
 	for p in $(bin_PROGRAMS) pump; do			\
