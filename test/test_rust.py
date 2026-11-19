@@ -168,6 +168,206 @@ class RustTest(BrokerTestCase):
         return subprocess.run([*cmd, *map(str, args)], env=env or self.env,
                               cwd=self.work, capture_output=True, text=True, timeout=90)
 
+    def cgu_toolchain(self):
+        tool = self.build/'distcc-rust-cgu'
+        if not tool.is_file() or not (self.build/'distcc-rust-cgu.so').is_file():
+            self.skipTest('build does not include the LLVM CGU backend')
+        fields = dict(line.split(': ', 1) for line in subprocess.check_output([self.rustc, '-vV'],
+                      text=True).splitlines() if ': ' in line)
+        offered = subprocess.check_output([tool, '--capabilities'], text=True).split()
+        if fields['LLVM version'] != offered[0]:
+            self.skipTest('rustc uses another LLVM version')
+        target = subprocess.check_output([tool, '--target-name', fields['host']], text=True)
+        return offered[0], target
+
+    @staticmethod
+    def cgu_executing(pid):
+        proc = Path('/proc')/str(pid)
+        try:
+            if (proc/'cmdline').read_bytes().startswith(b'/backend\0--execute\0'):
+                return True
+            children = (proc/'task'/str(pid)/'children').read_text().split()
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        return any(RustTest.cgu_executing(child) for child in children)
+
+    def test_parallel_cgu_backend(self):
+        version, backend = self.cgu_toolchain()
+        hosts = ' '.join(self.host(i, f',tcp,stats={p}', slots=3) for i,p in enumerate(self.stats_ports))
+        self.start_broker(hosts, name='cgu')
+        for p in self.stats_ports:
+            row = next(s for s in self.get_stats(p).splitlines() if s.startswith('dcc_llvm_cgu '))
+            self.assertEqual(row.split()[1], version)
+            self.assertIn(backend, row.split()[2:])
+        src = self.work/'wide.rs'
+        modules = []
+        for i in range(16):
+            funcs = '\n'.join(f'#[inline(never)] pub fn f{j}(x:u64)->u64 {{ x.wrapping_mul({j+1}).rotate_left({j%61}) ^ {i} }}'
+                              for j in range(100))
+            expr = 'x' + ''.join(f'.wrapping_add(f{j}(x))' for j in range(100))
+            modules.append(f'pub mod m{i} {{ {funcs} pub fn all(x:u64)->u64 {{ {expr} }} }}')
+        src.write_text('\n'.join(modules) + '\nfn main(){println!("{}",' +
+                       '^'.join(f'm{i}::all(std::hint::black_box(19))' for i in range(16)) + ');}')
+        args = (src, '-Ccodegen-units=8', '-Copt-level=2', '-Cdebuginfo=1', '-Cembed-bitcode=yes')
+        expected = self.work/'reference'
+        actual = self.work/'parallel'
+        local = self.rust(*args, '-o', expected, remote=False)
+        self.assertEqual(local.returncode, 0, local.stderr)
+
+        overlap = False
+        trace = self.work/'compiler.log'
+        with trace.open('w') as log, subprocess.Popen(
+                [self.build/'distcc', self.rustc, *args, '-o', actual],
+                env=self.env, cwd=self.work, stderr=log) as build:
+            deadline = time.monotonic() + 90
+            while build.poll() is None:
+                overlap |= sum(self.cgu_executing(d.pid) for d in self.daemons) >= 2
+                if time.monotonic() > deadline:
+                    build.kill()
+                    self.fail('parallel compiler timed out')
+                time.sleep(.005)
+        messages = trace.read_text()
+        self.assertEqual(build.returncode, 0, messages)
+        self.assertIn('distcc-rust-cgu: finished thin-postlink', messages)
+        self.assertIn('distcc-rust-cgu: finished object', messages)
+        self.assertTrue(overlap, messages)
+        self.assertEqual(subprocess.check_output([actual]), subprocess.check_output([expected]))
+
+    def test_cargo_pipelines_local_frontend_with_remote_cgus(self):
+        self.cgu_toolchain()
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p}') for i,p in enumerate(self.stats_ports)),
+                          name='pipeline-cgus')
+        for crate in ('producer', 'consumer'):
+            directory = self.work/crate
+            directory.mkdir()
+            manifest = f'[package]\nname="{crate}"\nversion="0.1.0"\nedition="2021"\n[lib]\npath="lib.rs"\n'
+            if crate == 'consumer':
+                manifest += '[dependencies]\nproducer={path="../producer"}\n'
+            (directory/'Cargo.toml').write_text(manifest)
+        (self.work/'Cargo.toml').write_text('[workspace]\nmembers=["producer","consumer"]\nresolver="2"\n')
+        (self.work/'producer/lib.rs').write_text('\n'.join(
+            f'pub mod m{i} {{' + ''.join(
+                f'#[inline(never)] pub fn f{j}(mut x:u64)->u64 {{for k in 1..20 {{x=x.wrapping_mul({j+3}).rotate_left(k)}} x}}'
+                for j in range(128)) + '}' for i in range(16)))
+        (self.work/'consumer/lib.rs').write_text('pub fn result(x:u64)->u64{producer::m1::f2(x)}')
+        # Wrap the actual distcc command to record Cargo's per-crate start and
+        # finish boundaries. The diagnostic stream passes through immediately.
+        wrapper = self.work/'observe-cargo'
+        wrapper.write_text('#!/bin/sh\ncase " $* " in\n'
+            '  *" --crate-name producer "*) crate=producer;;\n'
+            '  *" --crate-name consumer "*) crate=consumer;;\n  *) exec "$DISTCC_UNDER_TEST" "$@";;\nesac\n'
+            'date +%s%N >"$EVENTS/$crate.start"\n"$DISTCC_UNDER_TEST" "$@"\nrc=$?\n'
+            'date +%s%N >"$EVENTS/$crate.end"\nexit "$rc"\n')
+        wrapper.chmod(0o755)
+        env = dict(self.env, EVENTS=str(self.work), DISTCC_UNDER_TEST=str(self.build/'distcc'),
+                   RUSTC=self.rustc, RUSTC_WRAPPER=str(wrapper), CARGO_INCREMENTAL='0',
+                   RUSTFLAGS='-Ccodegen-units=8 -Copt-level=2')
+        log = self.work/'cargo.log'
+        # Only producer modules exceed the CGU threshold. Observe actual
+        # worker LLVM processes after Cargo has started the metadata consumer.
+        overlap = False
+        with log.open('w') as output, subprocess.Popen(['cargo','build','-vv','--offline','-j4','-p','consumer'],
+                env=env, cwd=self.work, stdout=output, stderr=output) as cargo:
+            deadline = time.monotonic() + 100
+            while cargo.poll() is None:
+                if (self.work/'consumer.start').exists() and not (self.work/'producer.end').exists():
+                    overlap |= any(self.cgu_executing(d.pid) for d in self.daemons)
+                if time.monotonic() > deadline:
+                    cargo.kill()
+                    self.fail('Cargo pipeline timed out')
+                time.sleep(.005)
+        messages = log.read_text()
+        self.assertEqual(cargo.returncode, 0, messages)
+        self.assertRegex(messages, r'--extern producer=[^\s]+\.rmeta')
+        self.assertIn('distcc-rust-cgu: finished object', messages)
+        self.assertTrue(overlap, messages)
+
+    def test_foreign_host_cgu_with_impure_macro_and_embedded_bitcode(self):
+        llvm, backend = self.cgu_toolchain()
+        version = subprocess.check_output([self.rustc, '-vV'], text=True)
+        native = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
+        foreign_host = 'aarch64-unknown-linux-gnu' if native.startswith('x86') else 'x86_64-unknown-linux-gnu'
+        foreign = self.work/'foreign-rustc'
+        # Simulate only the Rust frontend ABI. No frontend on this worker can
+        # run the client plugin. All LLVM work still runs in the real daemon.
+        foreign.write_text('#!/bin/sh\n[ "$1" = -vV ] || exit 121\nprintf "%s" ' +
+                           shlex.quote(version.replace('host: '+native, 'host: '+foreign_host)) + '\n')
+        foreign.chmod(0o755)
+
+        writes = self.work/'side-effect'
+        plugin_src = self.work/'writer.rs'
+        plugin_src.write_text('extern crate proc_macro; use std::io::Write; #[proc_macro] '
+            'pub fn counter(_:proc_macro::TokenStream)->proc_macro::TokenStream { '
+            'std::fs::OpenOptions::new().append(true).create(true).open(' + json.dumps(str(writes)) +
+            ').unwrap().write_all(b"x").unwrap(); "42".parse().unwrap() }')
+        plugin = self.work/'libwriter.so'
+        r = self.rust(plugin_src, '--crate-type=proc-macro', '-o', plugin, remote=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        src = self.work/'library.rs'
+        src.write_text('extern crate writer; pub const N:u64 = writer::counter!();\n' +
+            '\n'.join(f'pub mod m{i} {{' + ''.join(
+                f'#[inline(never)] pub fn f{j}(x:u64)->u64 {{ x.wrapping_mul({j+1}).rotate_left({j%32}) }}'
+                for j in range(100)) + '}' for i in range(8)))
+        out = self.work/'liblibrary.rlib'
+        trace = self.work/'frontend.trace'
+        args = ['--crate-type=rlib', src, '--extern', 'writer='+str(plugin), '-Clto=off',
+                '-Cembed-bitcode=yes', '-Copt-level=2', '-Ccodegen-units=8', '-Cdebuginfo=2', '-o', out]
+        # Run the same impure crate on one matching worker and one foreign
+        # worker independently. The local frontend must execute once in each case.
+        for host in (native, foreign_host):
+            with self.subTest(worker_rust_host=host):
+                if host == foreign_host:
+                    self.restart_server(self.build/'distccd', DISTCCD_RUSTC=str(foreign))
+                    self.addCleanup(self.restart_server, self.build/'distccd')
+                self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='foreign' if host == foreign_host else 'native')
+                stats = self.get_stats(self.stats_ports[0])
+                self.assertIn('dcc_rust_host '+host, stats)
+                self.assertIn('dcc_llvm_cgu '+llvm, stats)
+                for incompatible in ('0.0.0 '+backend, llvm+' absent-backend'):
+                    request = self.request(10, work=(1, 65536, 11), memory_class=1+8*64+16,
+                                           rust_host=incompatible.encode())
+                    self.assertEqual(struct.unpack_from('=i', request.recv(1032))[0], 121)
+                result = subprocess.run(['strace', '-f', '-s', '256', '-e', 'execve', '-o', trace,
+                                         self.build/'distcc', self.rustc, *args], cwd=self.work, env=self.env,
+                                        capture_output=True, text=True, timeout=90)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-rust-cgu: finished module-opt', result.stderr)
+                self.assertIn('distcc-rust-cgu: finished object', result.stderr)
+                self.assertEqual(writes.read_bytes(), b'x')
+                writes.unlink()
+                calls = trace.read_text()
+                self.assertNotIn('-Zbinary-dep-depinfo', calls)
+                frontend = 'execve("' + str(Path(self.rustc).resolve()) + '",'
+                self.assertEqual(sum(frontend in line and '"--crate-type=rlib"' in line for line in calls.splitlines()), 1)
+        members = subprocess.check_output(['ar', 't', out], text=True).splitlines()
+        self.assertTrue(any('rmeta' in name for name in members))
+        obj = self.work/'unit.o'
+        obj.write_bytes(subprocess.check_output(['ar', 'p', out, next(n for n in members if n.endswith('.rcgu.o'))]))
+        sections = subprocess.check_output(['readelf', '-SW', obj], text=True)
+        for section in ('.llvmbc', '.llvmcmd', '.debug_info'):
+            self.assertIn(section, sections)
+        main = self.work/'uses.rs'
+        main.write_text('fn main(){ assert_eq!(library::N + library::m2::f0(2), 44); }')
+        r = self.rust(main, '--extern', 'library='+str(out), '-Ldependency='+str(self.work),
+                      '-Clto=fat', '-o', self.work/'uses', remote=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        subprocess.run([self.work/'uses'], check=True)
+
+    def test_probe_executes_no_tracer_or_unpretty_pass(self):
+        src = self.work/'attr.rs'
+        src.write_text('#[link(wasm_import_module="js")] unsafe extern "C" { fn unused(); } pub fn ok(){}')
+        log = self.work/'executed'
+        r = subprocess.run(['strace', '-f', '-s', '256', '-e', 'execve', '-o', log, self.build/'distcc',
+                            self.rustc, '--crate-type=rlib', src, '-Ldependency='+str(self.work),
+                            '-Lnative='+str(self.work)], env=self.env, cwd=self.work,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('distcc-rust: compiled on', r.stderr)
+        calls = log.read_text()
+        self.assertIn('-Zbinary-dep-depinfo', calls)
+        self.assertNotRegex(calls, r'execve\("[^"]*/strace"')
+        self.assertNotIn('-Zunpretty', calls)
+
     def test_rust_uses_measured_workload_feedback(self):
         self.source = self.work / 'library.rs'
         self.source.write_text('pub fn value() -> u32 { 42 }')
@@ -291,10 +491,20 @@ class RustTest(BrokerTestCase):
                             (['--crate-type=staticlib'],'libproduct.a')):
             with self.subTest(flags=flags):
                 output = self.work/name
+                if name in ('program', 'libproduct.so'):
+                    flags = [*flags, '-Cstrip=symbols', '-Crpath']
                 result = self.rust(*flags, src, '-o', output)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('compiled on', result.stderr)
                 self.assertGreater(output.stat().st_size, 4096)
+                if name in ('program', 'libproduct.so'):
+                    native = self.rust(*flags, src, '-o', self.work/'local-product', remote=False)
+                    self.assertEqual(native.returncode, 0, native.stderr)
+                    def rpath(p):
+                        dynamic = subprocess.check_output(['readelf', '-d', p], text=True)
+                        return [line.split('[', 1)[1] for line in dynamic.splitlines()
+                                if '(RUNPATH)' in line or '(RPATH)' in line]
+                    self.assertEqual(rpath(output), rpath(self.work/'local-product'))
                 if name in ('program','tests'):
                     subprocess.run([output], check=True, capture_output=True)
         driver=self.work/'client-cc'

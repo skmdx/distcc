@@ -13,7 +13,6 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <sys/syscall.h>
-#include <sys/time.h>
 #include <unistd.h>
 #include <fstream>
 #include <iterator>
@@ -124,6 +123,8 @@ extern "C" char *LLVMGetHostCPUFeatures()
 
 /* The real dependency pass expands transitive procedural macros. Record the
  * libraries it executes rather than interpreting Rust crate metadata. */
+extern "C" void dcc_rust_watch_library(int, const char *);
+extern "C" void dcc_rust_library_record(int, const char *, const char *, const char *);
 extern "C" void *dlopen(const char *name, int flags)
 {
     const char *descriptor = std::getenv("DISTCC_RUST_LOADS_FD");
@@ -141,41 +142,18 @@ extern "C" void *dlopen(const char *name, int flags)
         return paths;
     };
     auto previous = mapped();
-    timeval start{};
-    gettimeofday(&start, nullptr);
+    int fd = std::atoi(descriptor);
+    dcc_rust_watch_library(fd, name);
     void *handle = original<void *(*)(const char *, int)>("dlopen")(name, flags);
     int saved_errno = errno;
     if (handle) {
         struct link_map *map;
         if (dlinfo(handle, RTLD_DI_LINKMAP, &map)) fail("cannot inspect loaded library");
-        int fd = std::atoi(descriptor);
-        char time[40];
-        snprintf(time, sizeof(time), "%ld.%06ld", long(start.tv_sec), long(start.tv_usec));
-        std::string record(time);
-        record += '\0';
-        record += name ? name : "";
-        record += '\0';
-        record += map->l_name;
-        record += '\0';
-        for (const auto &dependency : mapped()) {
-            if (dependency == map->l_name || previous.count(dependency))
-                continue;
-            record += time;
-            record.append(2, '\0');
-            record += dependency;
-            record += '\0';
-        }
-        const char *data = record.data();
-        size_t remaining = record.size();
-        while (remaining) {
-            /* The parent opened this permitted log before starting rustc.
-             * Loader callbacks must not reenter sandbox's filesystem hooks. */
-            ssize_t size = syscall(SYS_write, fd, data, remaining);
-            if (size < 0 && errno == EINTR) continue;
-            if (size <= 0) fail("cannot record loaded library");
-            data += size;
-            remaining -= size;
-        }
+        dcc_rust_watch_library(fd, map->l_name);
+        dcc_rust_library_record(fd, "L", name ? name : "", map->l_name);
+        for (const auto &dependency : mapped())
+            if (dependency != map->l_name && !previous.count(dependency))
+                dcc_rust_library_record(fd, "D", "", dependency.c_str());
     }
     errno = saved_errno;
     return handle;

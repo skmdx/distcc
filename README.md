@@ -174,10 +174,18 @@ native library search paths. Static archives can finish on the worker.
 The client tracks nested `@file` inputs and preserves the original invocation
 for local rustc. Procedural macro producers compile locally. To distribute a
 consumer, the client runs the dependency pass in a read-only bubblewrap mount
-namespace with a seccomp filter. Its loader hook and `strace` identify loaded
-libraries, read-only dependencies and attempted side effects. A compatible
+namespace with a seccomp filter. The preload library journals paths after a
+procedural macro loads, including library dependencies and attempted writes.
+A compatible
 worker with the same rustc host triple receives the macro and its inputs.
-Unsupported operations cause the client to run the original compiler locally.
+On LLVM 23, workers also advertise their LLVM patch version and registered
+targets. For large multi-CGU builds with available peers, the client runs a
+single rustc frontend and sends individual LLVM modules for optimization and
+object generation. A local frontend can run a procedural macro even when
+the available workers have a different Rust host ABI. Rustc retains ownership
+of ThinLTO imports, embedded bitcode, Cargo metadata notifications and final
+archives. Small modules and unsupported LLVM configurations use rustc's own
+pass managers. Other unsupported macro operations select local compilation.
 Building the transport and probe requires json-c and libseccomp development
 headers and libraries. Transport or toolchain failures
 retry locally unless `DISTCC_FALLBACK=0`. Failed remote compilations also retry

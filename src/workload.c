@@ -115,13 +115,13 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
 int dcc_work_valid(const struct dcc_work_hint *hint)
 {
     if (!memchr(hint->rust_host,0,sizeof(hint->rust_host)) ||
-        (*hint->rust_host && hint->kind != DCC_WORK_RUST)) return 0;
+        (*hint->rust_host && hint->kind != DCC_WORK_RUST && hint->kind != DCC_WORK_RUST_CGU)) return 0;
     if (hint->memory_class > DCC_JOB_KIND_COUNT * DCC_MEMORY_BUCKETS ||
         (!!hint->key != !!hint->memory_class)) return 0;
     /* Backend snapshots include dependency artifacts and compiler data;
      * their size is not bounded by the C/C++ preprocessor input limit. */
     if (hint->kind == DCC_WORK_RUST || hint->kind == DCC_WORK_THINLTO ||
-        hint->kind == DCC_WORK_OFFLOAD_LINK) return hint->key && hint->bytes;
+        hint->kind == DCC_WORK_OFFLOAD_LINK || hint->kind == DCC_WORK_RUST_CGU) return hint->key && hint->bytes;
     return hint->work_units <= 512U * 1024 * 1024 &&
            ((!hint->key && !hint->bytes && !hint->kind && !hint->work_units && !hint->family && !hint->scope_key) ||
            (hint->key && hint->bytes && hint->bytes <= 512ULL * 1024 * 1024 &&

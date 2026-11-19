@@ -1,10 +1,11 @@
 /* Adaptive host selection.  SPDX-License-Identifier: GPL-2.0-or-later */
 #include "resource.h"
-#define DCC_STATS_SIZE 16384
+#define DCC_STATS_SIZE 32768
 struct dcc_hostdef;
 struct dcc_capacity {
     int cpus, cores, jobs;
     char rust_host[96];
+    char llvm_cgu[1024]; /* LLVM version followed by space-separated registered target names. */
     double core_scale, smt_gain;
     double cpu_scale, cpu_age;
     int cpu_probe, live_report;
@@ -20,9 +21,9 @@ struct dcc_capacity {
     int offload_capacity[DCC_MEMORY_BUCKETS];
     /* Frontend jobs fetch inputs lazily and have no uploaded input tree. */
     int frontend_capacity[DCC_MEMORY_BUCKETS];
-    unsigned long long frontend_memory[DCC_MEMORY_BUCKETS];
+    int cgu_capacity[DCC_MEMORY_BUCKETS];
     unsigned long long memory_headroom, memory_reserved, job_memory;
-    unsigned long long memory_estimates[5][DCC_MEMORY_BUCKETS];
+    unsigned long long memory_estimates[7][DCC_MEMORY_BUCKETS];
 };
 struct dcc_load_report;
 int dcc_capacity_update(struct dcc_capacity *, const struct dcc_load_report *, int owned);

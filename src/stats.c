@@ -354,6 +354,7 @@ static size_t dcc_stats_reply(char reply[DCC_STATS_SIZE]) {
     char rust_capacity[DCC_MEMORY_BUCKETS * 12];
     char thinlto_capacity[DCC_MEMORY_BUCKETS * 12];
     char frontend_capacity[DCC_MEMORY_BUCKETS * 12], frontend_memory[DCC_MEMORY_BUCKETS * 21];
+    char cgu_capacity[DCC_MEMORY_BUCKETS * 12], cgu_memory[DCC_MEMORY_BUCKETS * 21];
     char offload_capacity[DCC_MEMORY_BUCKETS * 12];
     char compile_memory[DCC_MEMORY_BUCKETS * 21];
     char pump_memory[DCC_MEMORY_BUCKETS * 21];
@@ -394,6 +395,7 @@ dcc_longest_job_compiler %s\n\
 dcc_longest_job_time_msecs %d\n\
 dcc_max_kids %d\n\
 dcc_rust_host %s\n\
+dcc_llvm_cgu %s\n\
 dcc_cpus %d\n\
 dcc_cores %d\n\
 dcc_core_scale %.3f\n\
@@ -429,6 +431,7 @@ dcc_rust_capacity %s\n\
 dcc_thinlto_capacity %s\n\
 dcc_offload_capacity %s\n\
 dcc_frontend_capacity %s\n\
+dcc_cgu_capacity %s\n\
 dcc_memory_headroom_bytes %llu\n\
 dcc_memory_reserved_bytes %llu\n\
 dcc_compile_memory %s\n\
@@ -437,6 +440,7 @@ dcc_rust_memory %s\n\
 dcc_thinlto_memory %s\n\
 dcc_offload_memory %s\n\
 dcc_frontend_memory %s\n\
+dcc_cgu_memory %s\n\
 dcc_local_input_jobs %llu\n\
 dcc_local_input_bytes %llu\n\
 dcc_tcp_ready_idle_ns %llu\n\
@@ -474,6 +478,7 @@ dcc_free_mem %d MB\n\
     format_capacity(rust_capacity, sizeof(rust_capacity), rust_memory, sizeof(rust_memory), DCC_JOB_RUST, cpu_limit, &load);
     format_capacity(thinlto_capacity, sizeof(thinlto_capacity), thinlto_memory, sizeof(thinlto_memory), DCC_JOB_THINLTO, cpu_limit, &load);
     format_capacity(frontend_capacity, sizeof(frontend_capacity), frontend_memory, sizeof(frontend_memory), DCC_JOB_FRONTEND, cpu_limit, &load);
+    format_capacity(cgu_capacity, sizeof(cgu_capacity), cgu_memory, sizeof(cgu_memory), DCC_JOB_RUST_CGU, cpu_limit, &load);
     format_capacity(offload_capacity, sizeof(offload_capacity), offload_memory, sizeof(offload_memory), DCC_JOB_OFFLOAD_LINK, cpu_limit, &load);
 #ifdef __linux__
     capacity = dcc_cpu_perf_limit(dcc_resource_slots(dcc_max_kids));
@@ -516,7 +521,7 @@ dcc_free_mem %d MB\n\
                                dcc_stats.longest_job_compiler,
                                dcc_stats.longest_job_time,
                                dcc_max_kids,
-                               dcc_rust_host(),
+                               dcc_rust_host(), dcc_rust_cgu_capabilities(),
                                ncpus,
                                ncores, core_scale, smt_gain,
                                perf.scale, perf.age, perf.probe,
@@ -530,10 +535,10 @@ dcc_free_mem %d MB\n\
                                capacity, dcc_resource_job_bytes(), dcc_resource_samples(),
                                dcc_resource_peak_bytes(), dcc_resource_spare_bytes(),
                                compile_capacity, pump_capacity, rust_capacity, thinlto_capacity, offload_capacity,
-                               frontend_capacity,
+                               frontend_capacity, cgu_capacity,
                                dcc_resource_headroom(load.reserved), load.reserved,
                                compile_memory, pump_memory, rust_memory, thinlto_memory, offload_memory,
-                               frontend_memory,
+                               frontend_memory, cgu_memory,
                                (unsigned long long)dcc_tcp_local_input_jobs(),
                                (unsigned long long)dcc_tcp_local_input_bytes(),
                                ready_idle_ns, parallel_tasks, parallel_peak,

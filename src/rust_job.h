@@ -1,5 +1,6 @@
 /* Native Rust planner and isolated worker. */
 #pragma once
+#include <sys/types.h>
 #define DCC_RUST_ROOT "/__distcc_rust"
 #define DCC_RUST_DIGEST_TABLE "rust-input-digests-v1"
 #define DCC_RUST_OUT (DCC_RUST_ROOT "/out")
@@ -22,6 +23,10 @@ int dcc_rust_client(char **argv);
 int dcc_rust_catalog_fd(void);
 int dcc_rust_catalog_attach(int fd);
 const char *dcc_rust_host(void);
+const char *dcc_rust_cgu_capabilities(void);
+int dcc_spawn_rust_cgu(pid_t *, const char *tree, const char *output, const char *stdout_path,
+                       const char *stderr_path);
+int dcc_rust_submit_cgu(const char *version, const char *target, const char *phase);
 int dcc_rust_capture(char **argv);
 int dcc_rust_pipelined(const struct dcc_job *);
 struct dcc_rust_artifacts *dcc_rust_watch(const char *root, int *watchfd);

@@ -275,6 +275,9 @@ int main(int argc, char **argv)
     if (argc > 2 && !strcmp(argv[1], "--local-command"))
         dcc_exit(dcc_run_local_command(argv + 2));
 
+    if (argc == 5 && !strcmp(argv[1], "--rust-cgu"))
+        dcc_exit(dcc_rust_submit_cgu(argv[2], argv[3], argv[4]));
+
     /* Private transport entry point used by file-based compiler planners. */
     if ((argc == 5 || argc == 6) && !strcmp(argv[1], "--file-job")) {
         long queued_fd = -1;

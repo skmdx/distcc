@@ -3,6 +3,8 @@
 #include "rust_job.h"
 #include <fstream>
 #include <glob.h>
+#include <chrono>
+#include <mutex>
 #include <limits.h>
 #include <json-c/json.h>
 #include <sys/inotify.h>
@@ -58,7 +60,7 @@ string cached_identity(const fs::path &path) {
     return id;
 }
 fs::path select_compiler(const string &requested, const string &host, string *advertised = nullptr) {
-    if (!catalog && dcc_rust_catalog_attach(dcc_rust_catalog_fd()))
+    if (dcc_rust_catalog_attach(-1))
         throw std::runtime_error("cannot initialize worker Rust catalog");
     CatalogGuard guard;
     auto key = fingerprint(requested + '\0' + host + '\0' + env("DISTCCD_RUSTC") + '\0' + env("PATH"));
@@ -210,14 +212,77 @@ int execute(const dcc_job *job, const fs::path &root, int cancel, const char *ou
     return status;
 }
 } // namespace
-extern "C" const char *dcc_rust_host(void) {
-    static string host;
-    host = "-";
+extern "C" int dcc_spawn_rust_cgu(pid_t *pid, const char *tree, const char *output, const char *stdout_path,
+                                  const char *stderr_path) {
     try {
-        select_compiler("", "", &host);
+        // Pin the prepared input before crossing the mount boundary. Only
+        // the result descriptor is writable, and LLVM starts inside bwrap.
+        Fd in(open((fs::path(tree) / "cgu").c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK));
+        Fd out(open(output, O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW, 0600));
+        struct stat st;
+        if (fstat(in.fd, &st) || !S_ISREG(st.st_mode))
+            return EXIT_PROTOCOL_ERROR;
+        auto descriptor = [](int fd) { return "/proc/self/fd/" + std::to_string(fd); };
+        Words cmd{"/usr/bin/bwrap",
+                  "--unshare-all",
+                  "--die-with-parent",
+                  "--clearenv",
+                  "--ro-bind",
+                  "/usr",
+                  "/usr",
+                  "--dev",
+                  "/dev",
+                  "--proc",
+                  "/proc",
+                  "--tmpfs",
+                  "/tmp"};
+        for (auto p : {"/lib", "/lib64", "/etc/ld.so.cache"})
+            if (fs::exists(p))
+                cmd.insert(cmd.end(), {"--ro-bind", p, p});
+        cmd.insert(cmd.end(), {"--ro-bind", executable("distcc-rust-cgu"), "/backend", "--ro-bind",
+                               descriptor(in.fd), "/input", "--bind", descriptor(out.fd), "/output",
+                               "--remount-ro", "/", "--", "/backend", "--execute"});
+        auto argv = pointers(cmd);
+        return dcc_spawn_child(argv.data(), pid, "/dev/null", stdout_path, stderr_path);
     } catch (const std::exception &) {
+        return EXIT_IO_ERROR;
     }
-    return host.c_str();
+}
+extern "C" const char *dcc_rust_cgu_capabilities(void) {
+    static const string capabilities = []() -> string {
+        try {
+            Fd out(dcc_job_memfd("llvm-capabilities"));
+            if (run({executable("distcc-rust-cgu"), "--capabilities"}, {}, out.fd, 2))
+                return "-";
+            auto data = contents(out.fd);
+            if (data.empty() || data.back() != '\n' || data.size() >= 1024)
+                return "-";
+            data.pop_back();
+            return data;
+        } catch (const std::exception &) {
+            return "-";
+        }
+    }();
+    return capabilities.c_str();
+}
+extern "C" const char *dcc_rust_host(void) {
+    static std::mutex lock;
+    static std::chrono::steady_clock::time_point expires;
+    static char host[96] = "-";
+    thread_local char snapshot[sizeof(host)];
+    std::lock_guard<std::mutex> guard(lock);
+    auto now = std::chrono::steady_clock::now();
+    if (now >= expires) {
+        string found = "-";
+        try {
+            select_compiler("", "", &found);
+        } catch (const std::exception &) {
+        }
+        snprintf(host, sizeof(host), "%s", found.size() < sizeof(host) ? found.c_str() : "-");
+        expires = now + std::chrono::seconds(5);
+    }
+    memcpy(snapshot, host, sizeof(host));
+    return snapshot;
 }
 extern "C" int dcc_rust_pipelined(const dcc_job *job) {
     if (!job || job->kind != DCC_JOB_RUST)
@@ -297,46 +362,39 @@ extern "C" int dcc_rust_next_metadata(dcc_rust_artifacts *s, const char **name, 
     }
 }
 extern "C" int dcc_rust_catalog_attach(int fd) {
-    if (catalog)
+    static std::once_flag initialized;
+    try {
+        std::call_once(initialized, [fd] {
+            int source = fd < 0 ? dcc_rust_catalog_fd() : fd;
+            auto p = mmap(nullptr, sizeof(Catalog), PROT_READ | PROT_WRITE, MAP_SHARED, source, 0);
+            check(p != MAP_FAILED, "attach Rust catalog");
+            catalog = static_cast<Catalog *>(p);
+        });
         return 0;
-    auto p = mmap(nullptr, sizeof(Catalog), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (p == MAP_FAILED)
-        return -1;
-    catalog = static_cast<Catalog *>(p);
-    return 0;
+    } catch (const std::exception &) { return -1; }
 }
 extern "C" int dcc_rust_catalog_fd(void) {
-    static int shared = -1;
-    if (shared >= 0)
-        return shared;
-    int fd = dcc_job_memfd("distccd-rust-catalog");
-    if (fd < 0)
-        return -1;
-    if (ftruncate(fd, sizeof(Catalog)) || dcc_rust_catalog_attach(fd)) {
-        close(fd);
-        return -1;
-    }
-    pthread_mutexattr_t attr;
-    int rc = pthread_mutexattr_init(&attr);
-    if (!rc) {
-        rc = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-        if (!rc)
-            rc = pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-        if (!rc)
-            rc = pthread_mutex_init(&catalog->lock, &attr);
-        pthread_mutexattr_destroy(&attr);
-    }
-    munmap(catalog, sizeof(Catalog));
-    catalog = nullptr;
-    if (rc) {
-        close(fd);
-        return -1;
-    }
-    // The spawn file actions install descriptors 3 through 5. Keep the
-    // source above them so earlier dup2/close actions cannot overwrite it.
-    shared = fcntl(fd, F_DUPFD_CLOEXEC, 6);
-    close(fd);
-    return shared;
+    try {
+        static const Fd shared([] {
+            Fd file(dcc_job_memfd("distccd-rust-catalog"));
+            check(!ftruncate(file.fd, sizeof(Catalog)), "size Rust catalog");
+            auto p = mmap(nullptr, sizeof(Catalog), PROT_READ | PROT_WRITE, MAP_SHARED, file.fd, 0);
+            check(p != MAP_FAILED, "map Rust catalog");
+            pthread_mutexattr_t attr;
+            int rc = pthread_mutexattr_init(&attr);
+            if (!rc) {
+                rc = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+                if (!rc) rc = pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+                if (!rc) rc = pthread_mutex_init(&static_cast<Catalog *>(p)->lock, &attr);
+                pthread_mutexattr_destroy(&attr);
+            }
+            munmap(p, sizeof(Catalog));
+            if (rc) throw std::system_error(rc, std::generic_category(), "initialize Rust catalog");
+            // Worker spawn actions install descriptors 3 through 5.
+            return fcntl(file.fd, F_DUPFD_CLOEXEC, 6);
+        }());
+        return shared.fd;
+    } catch (const std::exception &) { return -1; }
 }
 extern "C" int dcc_rust_worker(const dcc_job *job, const char *root, int cancel, const char *out,
                                const char *err, dcc_job_result *result) {

@@ -23,6 +23,8 @@ void dcc_broker_return(const struct dcc_hostdef *host, int fd, const struct dcc_
 #define DCC_BROKER_COLD_FAMILY (1 << 28)
 #define DCC_TCP_PIPELINE 4
 int dcc_broker_jobs(char **capacity);
+/* Number of distinct peers with a free compatible LLVM backend. */
+int dcc_broker_cgu_capacity(const struct dcc_work_hint *, int *native);
 void dcc_broker_cpp_done(const struct dcc_hostdef *host);
 
 /* A cache miss returns a publishing lease; closing it abandons the probe.

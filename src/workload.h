@@ -7,7 +7,8 @@
 #define DCC_WORK_THINLTO 8
 #define DCC_WORK_OFFLOAD 9
 #define DCC_WORK_OFFLOAD_LINK 10
-#define DCC_WORK_CLASSES DCC_WORK_OFFLOAD_LINK
+#define DCC_WORK_RUST_CGU 11
+#define DCC_WORK_CLASSES DCC_WORK_RUST_CGU
 #define DCC_WORK_HISTORY 4096
 #define DCC_WORK_WAYS 4
 struct dcc_work_hint {
@@ -16,7 +17,10 @@ struct dcc_work_hint {
     uint64_t family; /* Source-content prior across command/configuration changes. */
     uint64_t scope_key;
     uint64_t memory_class; /* Same resource class as the serialized worker job. */
-    char rust_host[96]; /* Exact rustc host triple required by a procedural macro. */
+    union {
+        char rust_host[96]; /* Required rustc host for a procedural macro. */
+        char cgu_backend[96]; /* Required LLVM version and registered target. */
+    };
 };
 struct dcc_work_class {
     double weight, x, y, z;

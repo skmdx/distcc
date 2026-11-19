@@ -1002,8 +1002,10 @@ static int dcc_run_helper_job(int in_fd, int out_fd,
     argv[2] = archive;
     argv[3] = output;
     argv[4] = NULL;
-    if ((ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname)) ||
-        (ret = dcc_collect_child(helper, pid, status, in_fd,
+    ret = !strcmp(helper, "distcc-rust-cgu")
+        ? dcc_spawn_rust_cgu(&pid, archive, output, out_fname, err_fname)
+        : dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname);
+    if (ret || (ret = dcc_collect_child(helper, pid, status, in_fd,
                                  result ? &result->peak_bytes : NULL,
                                  result ? &result->cpu_ns : NULL)))
         *status = W_EXITCODE(ret, 0);

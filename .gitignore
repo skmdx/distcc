@@ -30,6 +30,8 @@ __pycache__/
 /h_*
 /cpp_lookup.so
 /distcc-rust-native.so
+/distcc-rust-cgu
+/distcc-rust-cgu.so
 /distcc-rust
 /clang_driver.so
 /gcc_plan.so

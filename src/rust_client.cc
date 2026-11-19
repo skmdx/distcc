@@ -4,7 +4,6 @@
 #include "rust_job.h"
 #include "rust_probe.h"
 #include "rust_link_args.h"
-#include <regex>
 #include <chrono>
 #include <array>
 #include <functional>
@@ -12,6 +11,7 @@
 #include <memory>
 #include <sys/resource.h>
 #include <sys/mman.h>
+#include <sys/sendfile.h>
 #include <sched.h>
 extern "C" {
 #include "broker.h"
@@ -215,6 +215,7 @@ struct Invocation {
     std::set<fs::path> inputs, search, native_search, dirs;
     std::set<string> libraries;
     bool trace_macro = false, needs_host = false, static_archive = false, pipeline = false;
+    bool explicit_macro = false, multi_cgu = false, cgu_allowed = true;
     string metadata_name;
     std::set<string> link_arguments;
     std::set<string> dep_names;
@@ -266,7 +267,17 @@ struct Invocation {
             }
             auto eq = v.find('=');
             string key = v.substr(0, eq), val = eq == string::npos ? "" : v.substr(eq + 1);
+            if (k == "-Z" && (key == "large-data-threshold" || key == "llvm-plugins" ||
+                              key == "self-profile" || key == "llvm-time-trace" || key == "verify-llvm-ir"))
+                cgu_allowed = false;
             if (k == "-C") {
+                if (key == "codegen-units") {
+                    multi_cgu = val != "1";
+                    cgu_allowed &= multi_cgu;
+                }
+                if (key == "llvm-args" || key == "profile-generate" || key == "profile-use" ||
+                    key == "passes" || key == "linker-plugin-lto")
+                    cgu_allowed = false;
                 if (key == "link-arg" || key == "link-args") {
                     Words expanded;
                     std::set<fs::path> active;
@@ -289,7 +300,8 @@ struct Invocation {
             if (k == "-O")
                 opt = "2";
             if (k == "--extern" && eq != string::npos) {
-                trace_macro |= fs::path(val).extension() == ".so";
+                explicit_macro |= fs::path(val).extension() == ".so";
+                trace_macro |= explicit_macro;
                 inputs.insert(absolute_name(val));
             }
             if (k == "-l") {
@@ -369,31 +381,21 @@ struct Invocation {
         fs::create_directory(staging);
         auto depfile = staging / "probe.d";
         cmd.insert(cmd.end(), {"-Zbinary-dep-depinfo", "--emit=dep-info=" + depfile.string()});
-        Fd expanded(dcc_job_memfd("rust-expanded"));
-        if (!native_search.empty())
-            cmd.push_back("-Zunpretty=expanded");
         {
             ProbeSlot slot;
-            probe(cmd, envs, work.dir, staging, trace_macro, expanded.fd, quiet.fd);
+            envs["DISTCC_RUST_SYSROOT"] = root;
+            probe(cmd, envs, staging, trace_macro, quiet.fd);
         }
-        if (!native_search.empty()) {
-            string src = contents(expanded.fd);
-            const std::regex attribute(R"re(#\s*\[\s*(?:unsafe\s*\(\s*)?link\s*\(([^\]]*)\)\s*\])re");
-            const std::regex libname(R"re(\bname\s*=\s*"([A-Za-z0-9_.+-]+)")re");
-            for (std::sregex_iterator it(src.begin(), src.end(), attribute), end; it != end; ++it) {
-                std::smatch m;
-                string body = (*it)[1];
-                if (!std::regex_search(body, m, libname))
-                    throw Local("unresolved native library attribute");
-                libraries.insert(m[1]);
-            }
-            for (auto &dir : native_search)
-                for (auto &lib : libraries)
-                    for (auto &name : {lib, "lib" + lib + ".a"}) {
-                        auto path = dir / name;
-                        if (fs::is_regular_file(path))
-                            inputs.insert(path);
-                    }
+        for (const auto &dir : native_search) {
+            if (runtime_path(dir, root))
+                continue;
+            for (const auto &entry : fs::directory_iterator(dir))
+                if (entry.path().extension() == ".a" && entry.is_regular_file())
+                    inputs.insert(entry.path());
+            for (const auto &lib : libraries)
+                for (const auto &name : {lib, "lib" + lib + ".so"})
+                    if (fs::is_regular_file(dir / name))
+                        inputs.insert(dir / name);
         }
         string data = read(depfile);
         auto first = data.find("\n\n");
@@ -434,7 +436,7 @@ struct Invocation {
         }
         if (!any)
             throw Local("empty dependency records");
-        needs_host = audit(work.dir, depfile, loads.fd, root, search, inputs, dirs);
+        needs_host = audit(depfile, loads.fd, root, search, inputs, dirs);
         if (needs_host) {
             for (auto key : {"CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "OUT_DIR"})
                 if (getenv(key))
@@ -593,9 +595,24 @@ string relocated(string data, const Invocation &inv) {
         data = replace(std::move(data), string(DCC_RUST_OUT) + "/" + item.first, item.second);
     return replace(std::move(data), DCC_RUST_OUT, inv.outdir.string());
 }
-int finish_links(Result &result, const Invocation &inv, const fs::path &work, const fs::path &compiler) {
+// rustc computed its runpaths relative to the worker's output directory.
+string relocate_runpath(string arg, const fs::path &destination, const fs::path &compiler_root) {
+    size_t start = 0;
+    while ((start = arg.find("$ORIGIN/", start)) != string::npos) {
+        auto end = arg.find_first_of(",:", start);
+        auto base = start + sizeof("$ORIGIN/") - 1;
+        auto path = (fs::path(DCC_RUST_OUT) / arg.substr(base, end - base)).lexically_normal();
+        if (below(path, DCC_RUST_COMPILER))
+            path = compiler_root / path.lexically_relative(DCC_RUST_COMPILER);
+        auto relative = path.lexically_relative(destination).string();
+        arg.replace(base, end - base, relative);
+        start = base + relative.size();
+    }
+    return arg;
+}
+int finish_links(Result &result, const Invocation &inv, const fs::path &work, const fs::path &compiler,
+                 const fs::path &sysroot, const string &host) {
     std::map<string, dcc_named_output *> outputs;
-    std::set<fs::path> generated;
     Words plans;
     for (unsigned i = 0; i < result.named_count; ++i) {
         auto &f = result.named[i];
@@ -611,9 +628,7 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         f.temporary = nullptr;
         if (fs::path(name).extension() == ".plan")
             plans.push_back(f.destination);
-        else if (fs::path(name).extension() == ".input")
-            generated.insert(fs::path(DCC_RUST_OUT) / name);
-        else
+        else if (fs::path(name).extension() != ".input")
             throw Local("invalid linker artifact type");
     }
     for (auto &plan : plans) {
@@ -624,70 +639,47 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         Work final(fs::path(f.destination).parent_path());
         auto linked = final.dir / args.front();
         auto driver = executable(inv.linker);
-        Words cmd = {"/usr/bin/bwrap", "--unshare-all", "--die-with-parent",
-                     "--ro-bind",      "/usr",          "/usr",
-                     "--dev",          "/dev",          "--proc",
-                     "/proc",          "--tmpfs",       "/tmp",
-                     "--clearenv",     "--setenv",      "PATH",
-                     "/usr/bin:/bin"};
-        for (auto p : {"/bin", "/lib", "/lib64", "/etc/ld.so.cache"})
-            if (fs::exists(p))
+        auto filter = namespace_filter();
+        fs::path tools = sysroot / "lib/rustlib" / host / "bin";
+        Words cmd = {"/usr/bin/bwrap", "--unshare-all", "--die-with-parent"};
+        // The reserved linker mount points need a parent on the sandbox root.
+        // Bind root entries individually so /etc, /opt and toolchain submounts
+        // remain visible even on clients without a host /__distcc_rust.
+        for (const auto &entry : fs::directory_iterator("/")) {
+            auto p = entry.path();
+            if (p == "/dev" || p == "/proc" || p == "/tmp" || p == DCC_RUST_ROOT)
+                continue;
+            if (entry.is_symlink())
+                cmd.insert(cmd.end(), {"--symlink", fs::read_symlink(p), p});
+            else
                 cmd.insert(cmd.end(), {"--ro-bind", p, p});
-        std::set<fs::path> needed = inv.search;
-        needed.insert(driver);
-        needed.insert(inv.inputs.begin(), inv.inputs.end());
-        for (auto &path : needed) {
-            if (!below(path, "/usr") && !below(path, "/lib") && !below(path, "/lib64"))
-                cmd.insert(cmd.end(), {"--ro-bind", path, path});
         }
+        cmd.insert(cmd.end(),
+                   {"--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--clearenv", "--setenv", "PATH",
+                    tools.string() + ":" + env("PATH"), "--seccomp", std::to_string(filter.fd)});
+        // Preserve declared inputs and toolchains residing on the shadowed temporary mount.
+        auto mounts = inv.search;
+        mounts.insert(inv.inputs.begin(), inv.inputs.end());
+        mounts.insert(driver);
+        mounts.insert(sysroot);
+        for (const auto &path : mounts)
+            if (below(path, "/tmp"))
+                cmd.insert(cmd.end(), {"--ro-bind", path, path});
         auto cwd = fs::current_path();
-        cmd.insert(cmd.end(), {"--dir", cwd, "--chdir", cwd, "--ro-bind", work, DCC_RUST_OUT, "--bind",
-                               final.dir, DCC_RUST_FINAL, "--", driver});
+        if (below(cwd, "/tmp"))
+            cmd.insert(cmd.end(), {"--dir", cwd});
+        cmd.insert(cmd.end(), {"--chdir", cwd, "--ro-bind", work, DCC_RUST_OUT, "--bind", final.dir,
+                               DCC_RUST_FINAL, "--remount-ro", "/", "--", driver});
         unsigned destinations = 0;
         Words command;
-        fs::path sysroot = inv.sysroot.empty() ? compiler.parent_path().parent_path() : fs::path(inv.sysroot);
-        auto path_arg = [&](const fs::path &p, bool directory) {
-            if (!p.is_absolute() || p.lexically_normal() != p)
-                return false;
-            if (directory)
-                return inv.search.count(p) != 0 || below(p, sysroot / "lib/rustlib");
-            return generated.count(p) != 0 || inv.inputs.count(p) != 0;
-        };
-        const std::set<string> switches = {"-m64",
-                                           "-m32",
-                                           "-shared",
-                                           "-pie",
-                                           "-no-pie",
-                                           "-static",
-                                           "-static-pie",
-                                           "-nodefaultlibs",
-                                           "-nostdlib",
-                                           "-nostartfiles",
-                                           "-rdynamic",
-                                           "-s",
-                                           "-pthread",
-                                           "-Wl,--as-needed",
-                                           "-Wl,--no-as-needed",
-                                           "-Wl,-Bstatic",
-                                           "-Wl,-Bdynamic",
-                                           "-Wl,--eh-frame-hdr",
-                                           "-Wl,--gc-sections",
-                                           "-Wl,--no-gc-sections",
-                                           "-Wl,--no-undefined-version",
-                                           "-Wl,--export-dynamic",
-                                           "-Wl,-z,relro,-z,now",
-                                           "-Wl,-z,relro",
-                                           "-Wl,-z,now",
-                                           "-Wl,-z,noexecstack",
-                                           "-Wl,--whole-archive",
-                                           "-Wl,--no-whole-archive",
-                                           "-Wl,--start-group",
-                                           "-Wl,--end-group",
-                                           "-Wl,--push-state",
-                                           "-Wl,--pop-state",
-                                           "-fuse-ld=lld"};
         for (auto it = args.begin() + 1; it != args.end(); ++it) {
-            string arg = replace(*it, DCC_RUST_COMPILER, compiler.parent_path().parent_path());
+            auto compiler_root = compiler.parent_path().parent_path();
+            string arg = *it;
+            if (!inv.link_arguments.count(arg) &&
+                (arg.find("-rpath") != string::npos || (it[-1] == "-rpath" || it[-1] == "--rpath")))
+                arg = relocate_runpath(std::move(arg), fs::canonical(fs::path(f.destination).parent_path()),
+                                       compiler_root);
+            arg = replace(std::move(arg), DCC_RUST_COMPILER, compiler_root);
             if (arg == "-o") {
                 if (++it == args.end() || *it != (fs::path(DCC_RUST_FINAL) / f.name).string())
                     throw Local("invalid link destination");
@@ -695,25 +687,29 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
                 command.insert(command.end(), {"-o", *it});
                 continue;
             }
-            if (arg == "-L") {
-                if (++it == args.end())
-                    throw Local("incomplete linker search directory");
-                string path = replace(*it, DCC_RUST_COMPILER, compiler.parent_path().parent_path());
-                if (!path_arg(path, true))
-                    throw Local("unexpected linker search directory: " + path);
-                command.insert(command.end(), {"-L", path});
-                continue;
+            // The driver also accepts nested ld arguments. Check executable extensions
+            // and their operands against arguments supplied by the local compiler invocation.
+            auto components = split(arg, ',');
+            for (size_t j = 0; j < components.size(); ++j) {
+                const string &part = components[j];
+                auto key = part.substr(0, part.find('='));
+                if (key == "-plugin" || key == "--plugin" || key == "-fplugin" || key == "-wrapper" ||
+                    key == "-specs" || key == "--specs" || key == "--ld-path" ||
+                    (key == "-fuse-ld" && part.find('/') != string::npos) ||
+                    (part.rfind("-B", 0) == 0 && part != "-Bstatic" && part != "-Bdynamic" &&
+                     !below(part.substr(2), (sysroot / "lib/rustlib").string()))) {
+                    if (!inv.link_arguments.count(arg))
+                        throw Local("undeclared linker extension");
+                    if (part == key && j + 1 == components.size() &&
+                        (it + 1 == args.end() || !inv.link_arguments.count(it[1])))
+                        throw Local("undeclared linker extension operand");
+                }
+                if (part.empty())
+                    continue;
+                if (part[0] == '@' || part == "--output" || part.rfind("--output=", 0) == 0 ||
+                    (part.rfind("-o", 0) == 0 && (j || part.size() > 2)))
+                    throw Local("unexpected linker response or output");
             }
-            bool ok = path_arg(arg, false) || switches.count(arg) || inv.link_arguments.count(arg);
-            if (arg.compare(0, 2, "-l") == 0 && arg.size() > 2)
-                ok |= arg.find_first_not_of(
-                          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+.-:", 2) ==
-                      string::npos;
-            for (string prefix : {"-Wl,--version-script=", "-Wl,--dynamic-list="})
-                if (arg.compare(0, prefix.size(), prefix) == 0)
-                    ok |= generated.count(arg.substr(prefix.size())) != 0;
-            if (!ok)
-                throw Local("unsupported client linker argument: " + arg);
             command.push_back(std::move(arg));
         }
         if (destinations != 1)
@@ -732,7 +728,7 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         Fd response_fd(open(response_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600));
         put(response_fd.fd, response);
         cmd.push_back(string("@") + DCC_RUST_OUT + "/link.rsp");
-        const std::vector<int> inherited;
+        const std::vector<int> inherited{filter.fd};
         int rc = run(cmd, {}, 1, 2, &inherited);
         if (rc)
             return rc;
@@ -777,6 +773,99 @@ void publish(Result &result, const Invocation &inv) {
         f.temporary = nullptr;
     }
 }
+std::optional<int> try_local_frontend(char **original, const States &responses, const dcc_work_hint &hint) {
+    Lease lease{dcc_broker_try_local(&hint)};
+    if (lease.id < 0)
+        return {};
+    for (auto &[p, st] : responses)
+        verify(p, st);
+    Words cmd;
+    for (auto p = original; *p; ++p)
+        cmd.emplace_back(*p);
+    auto start = std::chrono::steady_clock::now();
+    int status = run(cmd, {}, 1, 2);
+    struct rusage usage{};
+    getrusage(RUSAGE_CHILDREN, &usage);
+    uint64_t cpu = (usage.ru_stime.tv_sec + usage.ru_utime.tv_sec) * 1000000000ULL +
+                   (usage.ru_stime.tv_usec + usage.ru_utime.tv_usec) * 1000ULL;
+    dcc_broker_local_done(lease.id,
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+                          cpu, status);
+    lease.id = -1;
+    return status;
+}
+std::optional<int> try_cgu_frontend(const Invocation &inv, const fs::path &exe, char **original,
+                                    const States &responses, const string &version, dcc_work_hint hint) {
+    auto llvm = field(version, "LLVM version: ");
+    auto shim = native_library().parent_path() / "distcc-rust-cgu.so";
+    if (llvm != DCC_CGU_LLVM_VERSION || !fs::is_regular_file(shim))
+        return {};
+    auto host = field(version, "host: ");
+    auto triple = inv.target.empty() ? host : inv.target;
+    auto arch = triple.substr(0, triple.find('-'));
+    string backend;
+    if (arch == "x86_64")
+        backend = "x86-64";
+    else if (arch == "i386" || arch == "i586" || arch == "i686")
+        backend = "x86";
+    else if (arch == "aarch64")
+        backend = arch;
+    else {
+        fs::path helper;
+        try {
+            helper = executable("distcc-rust-cgu");
+        } catch (const std::exception &) {
+            return {};
+        }
+        auto context = "cgu-target:" + helper.string() + '\0' + triple;
+        backend = memo(context, {{helper, metadata(helper)}}, [&] {
+            Fd output(dcc_job_memfd("rust-target"));
+            if (run({helper, "--target-name", triple}, {}, output.fd, 2))
+                return string("-");
+            return contents(output.fd);
+        });
+        if (backend == "-")
+            return {};
+    }
+    string requirement = llvm + " " + backend + " " + host;
+    if (requirement.size() >= sizeof(hint.cgu_backend))
+        return {};
+    hint.kind = DCC_WORK_RUST_CGU;
+    hint.memory_class = 1 + DCC_JOB_RUST_CGU * DCC_MEMORY_BUCKETS + dcc_resource_bucket(hint.bytes);
+    strcpy(hint.cgu_backend, requirement.c_str());
+    int native;
+    int peers = dcc_broker_cgu_capacity(&hint, &native);
+    bool large = hint.bytes > 65536 || inv.multi_cgu;
+    if (!peers || (native && peers < 2 && !(large && inv.explicit_macro)))
+        return {};
+    for (auto &[p, st] : responses)
+        verify(p, st);
+    auto local = compiler_command(exe);
+    for (auto p = original + 1; *p; ++p)
+        local.emplace_back(*p);
+    Env vars = {{"LD_PRELOAD", shim.string() + " " + env("LD_PRELOAD")},
+                {"DISTCC_RUST_CGU_CLIENT", fs::canonical("/proc/self/exe")},
+                {"DISTCC_RUST_CGU_PREVIOUS", env("LD_PRELOAD")}};
+    pid_t pid;
+    {
+        ProbeSlot frontend;
+        int pipefd[2];
+        check(!pipe2(pipefd, O_CLOEXEC), "CGU frontend completion pipe");
+        Fd reader(pipefd[0]);
+        {
+            Fd writer(pipefd[1]);
+            check(!fcntl(writer.fd, F_SETFD, 0), "inherit frontend completion pipe");
+            vars["DISTCC_RUST_CGU_STARTED"] = std::to_string(writer.fd);
+            pid = spawn(local, vars, 1, 2);
+        }
+        // EOF releases the frontend slot when LLVM starts, or on early
+        // compiler exit. Cargo can now schedule a metadata-dependent crate.
+        char unused;
+        while (read(reader.fd, &unused, 1) < 0 && errno == EINTR) {
+        }
+    }
+    return collect(pid);
+}
 int distributed(char **original, const Words &args, const States &responses) {
     const string compiler = *original;
     if (env("DISTCC_BROKER").empty())
@@ -816,28 +905,11 @@ int distributed(char **original, const Words &args, const States &responses) {
     hint.work_units = dcc_rust_source_bytes(&job);
     hint.bytes = std::max<uint64_t>(1, source.st_size);
     hint.memory_class = dcc_resource_class(&job);
-    if (hint.bytes <= 65536) {
-        Lease lease{dcc_broker_try_local(&hint)};
-        if (lease.id >= 0) {
-            for (auto &[p, st] : responses)
-                verify(p, st);
-            Words cmd;
-            for (auto p = original; *p; ++p)
-                cmd.emplace_back(*p);
-            auto start = std::chrono::steady_clock::now();
-            int status = run(cmd, {}, 1, 2);
-            struct rusage usage{};
-            getrusage(RUSAGE_CHILDREN, &usage);
-            uint64_t cpu = (usage.ru_stime.tv_sec + usage.ru_utime.tv_sec) * 1000000000ULL +
-                           (usage.ru_stime.tv_usec + usage.ru_utime.tv_usec) * 1000ULL;
-            dcc_broker_local_done(
-                lease.id, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
-                cpu, status);
-            lease.id = -1;
-            return status;
-        }
-    }
-    Work work;
+    bool small = hint.bytes <= 65536;
+    bool cgu = !metadata_only && inv.cgu_allowed && (!small || inv.trace_macro || inv.multi_cgu);
+    if (small && !cgu)
+        if (auto status = try_local_frontend(original, responses, hint))
+            return *status;
     States tool = {{exe, metadata(exe)}};
     string info = memo("compiler:" + profile_context(exe), tool,
                        [&] { return query(exe, "-vV") + '\0' + query(exe, "--print=sysroot"); });
@@ -846,6 +918,14 @@ int distributed(char **original, const Words &args, const States &responses) {
         throw std::runtime_error("invalid Rust compiler memo");
     string version = info.substr(0, separator);
     string id = identity(version), cpu, features;
+    if (cgu) {
+        if (auto status = try_cgu_frontend(inv, exe, original, responses, version, hint))
+            return *status;
+        if (small)
+            if (auto status = try_local_frontend(original, responses, hint))
+                return *status;
+    }
+    Work work;
     job.rust.compiler = id.data();
     auto cmd = inv.command(field(version, "host: "), info.substr(separator + 1));
     if (inv.cpu == "native") {
@@ -931,6 +1011,9 @@ int distributed(char **original, const Words &args, const States &responses) {
                 mode_t mask = umask(0);
                 umask(mask);
                 check(!fchmod(f->fd, f->mode & ~mask), "set metadata mode");
+                int written = f->fd;
+                f->fd = -1;
+                check(!close(written), "close metadata before publication");
                 check(!renameat(AT_FDCWD, f->temporary, AT_FDCWD, f->destination), f->destination);
                 e.job.metadata_published = 1;
                 free(f->temporary);
@@ -967,7 +1050,9 @@ int distributed(char **original, const Words &args, const States &responses) {
         throw Local("worker compilation failed; retrying locally");
     try {
         if (!status && !inv.linker.empty())
-            status = finish_links(result, inv, linkdir, exe);
+            status = finish_links(result, inv, linkdir, exe,
+                                  inv.sysroot.empty() ? info.substr(separator + 1) : inv.sysroot,
+                                  field(version, "host: "));
         if (!status)
             publish(result, inv);
     } catch (const std::exception &e) {
@@ -987,6 +1072,58 @@ int distributed(char **original, const Words &args, const States &responses) {
     return status;
 }
 } // namespace
+extern "C" int dcc_rust_submit_cgu(const char *version, const char *target, const char *phase) {
+    try {
+        struct stat st = descriptor_state(STDIN_FILENO);
+        if (!S_ISREG(st.st_mode) || !st.st_size)
+            return EXIT_BAD_ARGUMENTS;
+        dcc_job_input in{};
+        in.path = const_cast<char *>("/cgu");
+        in.fd = STDIN_FILENO;
+        in.wire_size = in.plain_size = st.st_size;
+        if (dcc_file_digest(in.fd, st.st_size, in.digest))
+            return EXIT_IO_ERROR;
+        dcc_job job{};
+        job.kind = DCC_JOB_RUST_CGU;
+        job.cwd = const_cast<char *>("/");
+        char *args[] = {const_cast<char *>("distcc-rust-cgu"), nullptr};
+        job.argv = args;
+        job.inputs = &in;
+        job.count = 1;
+        dcc_work_hint hint{};
+        hint.kind = DCC_WORK_RUST_CGU;
+        hint.bytes = st.st_size;
+        hint.work_units = std::min<uint64_t>(st.st_size, UINT32_MAX);
+        hint.key = hash(string(reinterpret_cast<char *>(in.digest), sizeof(in.digest))) | 1;
+        hint.memory_class = dcc_resource_class(&job);
+        string required = string(version) + " " + target;
+        if (required.size() >= sizeof(hint.cgu_backend))
+            return EXIT_BAD_ARGUMENTS;
+        strcpy(hint.cgu_backend, required.c_str());
+        Result result;
+        int rc = dcc_transfer_prepared(&job, nullptr, nullptr, &hint, -1, &result);
+        if (rc)
+            return rc;
+        if (result.status) {
+            if (env("DISTCC_VERBOSE") == "1" && result.fd[DCC_JOB_STDERR] >= 0)
+                put(STDERR_FILENO, contents(result.fd[DCC_JOB_STDERR]));
+            return EXIT_LOCAL_COMPILE;
+        }
+        if (env("DISTCC_VERBOSE") == "1")
+            fprintf(stderr, "distcc-rust-cgu: finished %s\n", phase);
+        off_t offset = 0;
+        while (uint64_t(offset) < result.size[DCC_JOB_OBJECT]) {
+            ssize_t n = sendfile(STDOUT_FILENO, result.fd[DCC_JOB_OBJECT], &offset, 1U << 30);
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+                return EXIT_IO_ERROR;
+        }
+        return 0;
+    } catch (const std::exception &) {
+        return EXIT_DISTCC_FAILED;
+    }
+}
 extern "C" int dcc_rust_client(char **argv) {
     Words args;
     for (char **p = argv + 1; *p; ++p)

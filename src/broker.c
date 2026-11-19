@@ -433,7 +433,7 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
           command == ACQUIRE_READY) && !direct && *net < 0) ||
         (direct && *net >= 0) ||
         ((command == JOBS || command == LOCAL_CPP || command == LOCAL_ANALYSIS ||
-          command == TRY_LOCAL) && *net >= 0)) {
+          command == TRY_LOCAL || command == CGU_CAPACITY) && *net >= 0)) {
         errno = EPROTO;
         goto failed;
     }
@@ -575,6 +575,16 @@ int dcc_broker_jobs(char **capacity)
     dcc_session_finish(fd);
     if (capacity && !(*capacity = strdup(reply.host)))
         return -1;
+    return reply.slots;
+}
+
+int dcc_broker_cgu_capacity(const struct dcc_work_hint *hint, int *native)
+{
+    struct reply reply;
+    int net, fd = broker_request(CGU_CAPACITY, &reply, &net, hint, NULL, 0);
+    *native = fd >= 0 && reply.host[0];
+    if (fd < 0) return 0;
+    dcc_session_finish(fd);
     return reply.slots;
 }
 
@@ -1169,6 +1179,7 @@ static unsigned long long memory_forecast(const struct dcc_capacity *cap,
     const int *capacities;
     switch (kind) {
     case DCC_JOB_FRONTEND: row = 5; capacities = cap->frontend_capacity; break;
+    case DCC_JOB_RUST_CGU: row = 6; capacities = cap->cgu_capacity; break;
     case DCC_JOB_COMPILE: row = 0; capacities = cap->compile_capacity; break;
     case DCC_JOB_PUMP: row = 1; capacities = cap->pump_capacity; break;
     case DCC_JOB_RUST: row = 2; capacities = cap->rust_capacity; break;
@@ -1176,7 +1187,7 @@ static unsigned long long memory_forecast(const struct dcc_capacity *cap,
     case DCC_JOB_OFFLOAD_LINK: row = 4; capacities = cap->offload_capacity; break;
     default: return cap->job_memory;
     }
-    uint64_t bytes = row == 5 ? cap->frontend_memory[bucket] : cap->memory_estimates[row][bucket];
+    uint64_t bytes = cap->memory_estimates[row][bucket];
     if (slots) {
         *slots = capacities[bucket];
         if (cap->live_report && bytes) {
@@ -1253,6 +1264,22 @@ static int pipeline_slots(const struct dcc_hostdef *host, int lanes)
     if (!host->tcp_jobs || host->mode != DCC_MODE_TCP || lanes < 2) return 0;
     int staging = (lanes + 3) / 4;
     return staging < DCC_TCP_PIPELINE ? staging : DCC_TCP_PIPELINE;
+}
+
+static int compatible_cgu(const char *required, const char *offered)
+{
+    size_t version = strcspn(required, " ");
+    if (!version || required[version] != ' ' || strncmp(required, offered, version + 1))
+        return 0;
+    const char *target = required + version + 1;
+    size_t target_length = strcspn(target, " ");
+    for (const char *p = offered + version + 1; *p;) {
+        size_t n = strcspn(p, " ");
+        if (n == target_length && !strncmp(p, target, n)) return 1;
+        p += n;
+        while (*p == ' ') ++p;
+    }
+    return 0;
 }
 
 static int dispatch(struct broker *broker, struct client *client, double now, struct dispatch_batch *batch)
@@ -1337,7 +1364,21 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         if (direct && !client->hint.key && !p->local) continue;
         struct dcc_capacity observed = observed_capacity(p, broker->cpp_busy);
         const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
-        if (*client->hint.rust_host && (!cap || strcmp(cap->rust_host,client->hint.rust_host))) {
+        if (client->hint.kind == DCC_WORK_RUST_CGU) {
+            if (!cap || !p->host->tcp_jobs || !compatible_cgu(client->hint.cgu_backend, cap->llvm_cgu) ||
+                p->retry_at > now || p->full_until > now || !p->address_len ||
+                cap->available <= 0 || cap->queued > 0 || cap->memory_pressure >= 10 ||
+                p->busy >= dcc_capacity_slots(p->host, cap)) continue;
+            if (client->command == CGU_CAPACITY) {
+                int limit;
+                memory_forecast(cap, &client->hint, &limit);
+                if (limit >= 0 && (cap->busy >= limit || p->busy >= limit)) continue;
+                const char *native = strrchr(client->hint.cgu_backend, ' ');
+                if (native && !strcmp(native + 1, cap->rust_host)) reply.host[0] = '1';
+                ++reply.slots;
+                continue;
+            }
+        } else if (*client->hint.rust_host && (!cap || strcmp(cap->rust_host,client->hint.rust_host))) {
             if (cap && *cap->rust_host) ++abi_mismatches;
             continue;
         }
@@ -1607,6 +1648,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     if (direct && !(best.peer >= 0 && (best.forecast.finish > 0 || best.idle) && !best.wait &&
                     broker->peers[best.peer].local && broker->peers[best.peer].host->tcp_jobs)) {
         reply.slots = 0;
+        send_reply(client->fd, &reply, -1);
+        release_client(broker, client);
+    } else if (client->command == CGU_CAPACITY ||
+               (client->hint.kind == DCC_WORK_RUST_CGU && !available)) {
+        reply.status = client->command == CGU_CAPACITY ? 0 : EXIT_LOCAL_COMPILE;
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
     } else if (client->command == JOBS || !available) {
@@ -2289,7 +2335,8 @@ int dcc_broker_serve(const char *path)
                     continue;
                 }
                 int compile = request.command == ACQUIRE_POOL || request.command == ACQUIRE_CPP ||
-                              request.command == ACQUIRE_READY || request.command == TRY_LOCAL;
+                              request.command == ACQUIRE_READY || request.command == TRY_LOCAL ||
+                              request.command == CGU_CAPACITY;
                 int local_cpp = request.command == LOCAL_CPP || request.command == LOCAL_ANALYSIS;
                 if (c->state != REQUEST || length != (ssize_t)(sizeof(request) +
                         (compile ? sizeof(struct dcc_work_hint) : local_cpp ? sizeof(uint32_t) : 0)) ||
@@ -2297,13 +2344,16 @@ int dcc_broker_serve(const char *path)
                     (request.command != ACQUIRE && request.command != ACQUIRE_POOL &&
                      request.command != ACQUIRE_LINK && request.command != ACQUIRE_CPP &&
                      request.command != ACQUIRE_READY && request.command != LOCAL_CPP && request.command != LOCAL_ANALYSIS &&
-                     request.command != JOBS && request.command != TRY_LOCAL)) {
+                     request.command != JOBS && request.command != TRY_LOCAL && request.command != CGU_CAPACITY)) {
                     release_client(broker, c);
                     continue;
                 }
                 if (compile) {
                     memcpy(&c->hint, packet.payload, sizeof(c->hint));
-                    if (!dcc_work_valid(&c->hint)) { release_client(broker, c); continue; }
+                    if (!dcc_work_valid(&c->hint) ||
+                        (request.command == CGU_CAPACITY && c->hint.kind != DCC_WORK_RUST_CGU)) {
+                        release_client(broker, c); continue;
+                    }
                 }
                 if (local_cpp) {
                     memcpy(&c->local_limit, packet.payload, sizeof(c->local_limit));
@@ -2314,7 +2364,8 @@ int dcc_broker_serve(const char *path)
                 if (tag && request.command == TRY_LOCAL && c->hint.key) {
                     session->preflight = now;
                     session->kind = c->hint.kind;
-                } else if (tag && session->preflight && compile && request.command != TRY_LOCAL) {
+                } else if (tag && session->preflight && compile && request.command != TRY_LOCAL &&
+                           request.command != CGU_CAPACITY) {
                     double sample = now - session->preflight;
                     double *estimate = &broker->local_prepare[session->kind - 1];
                     if (sample > 0 && sample < 86400)
@@ -2440,6 +2491,7 @@ int dcc_broker_jobs(char **capacity)
     (void)capacity;
     return -1;
 }
+int dcc_broker_cgu_capacity(const struct dcc_work_hint *hint, int *native) { (void)hint; *native = 0; return 0; }
 void dcc_broker_cpp_done(const struct dcc_hostdef *host)
 {
     (void)host;

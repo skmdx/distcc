@@ -114,8 +114,8 @@ inline Words compiler_command(const fs::path &compiler, const fs::path &mount = 
                 (prefix / "bin/rustc").string()};
     return {mount.empty() ? compiler.string() : (mount / "bin/rustc").string()};
 }
-inline int run(const Words &cmd, const Env &environment, int out, int err,
-               const std::vector<int> *inherited = nullptr) {
+inline pid_t spawn(const Words &cmd, const Env &environment, int out, int err,
+                   const std::vector<int> *inherited = nullptr) {
     auto args = pointers(cmd);
     pid_t pid = fork();
     check(pid >= 0, "fork rustc");
@@ -138,11 +138,18 @@ inline int run(const Words &cmd, const Env &environment, int out, int err,
         execvp(args[0], args.data());
         _exit(110);
     }
+    return pid;
+}
+inline int collect(pid_t pid) {
     int status;
     while (waitpid(pid, &status, 0) < 0)
         if (errno != EINTR)
             check(false, "wait for rustc");
     return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+inline int run(const Words &cmd, const Env &environment, int out, int err,
+               const std::vector<int> *inherited = nullptr) {
+    return collect(spawn(cmd, environment, out, err, inherited));
 }
 inline string query(const fs::path &compiler, const string &flag) {
     Fd output(dcc_job_memfd("rustc-query"));
