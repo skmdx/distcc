@@ -215,6 +215,70 @@ class RustTest(BrokerTestCase):
         self.assertIn('missing CGU flags', result.stderr)
         self.assertEqual((self.work/'object').stat().st_size, 0)
 
+    def test_saturated_cgu_worker_waits_then_returns_object(self):
+        import select
+        import threading
+        version, target = self.cgu_toolchain()
+        requested, publish = threading.Event(), threading.Event()
+        def worker_stats():
+            requested.set()
+            publish.wait(timeout=5)
+            return self.get_stats(self.stats_ports[0]).encode()
+
+        peer = self.peer(worker_stats)
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=1), name='one-lane')
+        def request_cgu(command):
+            return self.request(command, work=(1, 65536, 11), memory_class=1+8*64+16,
+                                rust_host=f'{version} {target}'.encode())
+
+        cold = request_cgu(20)
+        try:
+            self.assertTrue(requested.wait(timeout=5))
+            self.assertFalse(select.select([cold], [], [], 0)[0])
+        finally:
+            publish.set()
+        self.assertEqual(self.receive(cold), (0, 1, []))
+        lease = request_cgu(10)
+        status, _, fds = self.receive(lease)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(fds), 1)
+        connection = socket.socket(fileno=fds[0])
+        self.addCleanup(connection.close)
+
+        # Discovery must still advertise this occupied backend. The next
+        # real rustc codegen unit then competes for the same single lease.
+        capacity = request_cgu(20)
+        self.assertEqual(self.receive(capacity), (0, 1, []))
+        source = self.work / 'queued.rs'
+        steps = ''.join(f'x = std::hint::black_box(x).wrapping_add({i});\n' for i in range(64))
+        source.write_text('fn main() { let mut x = 0u64;\n' + steps + 'println!("{x}"); }')
+        started = self.work / 'submitting'
+        submit = self.work / 'submit'
+        submit.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(started)) + '\nexec ' +
+                          shlex.quote(str(self.build/'distcc')) + ' "$@"\n')
+        submit.chmod(0o755)
+        executable = self.work / 'queued'
+        env = dict(self.env, LD_PRELOAD=str(self.build/'llvm-lto/distcc-rust-cgu.so'),
+                   DISTCC_RUST_CGU_CLIENT=str(submit), DISTCC_RUST_CGU_OBJECT_ONLY='1')
+        before = self.completed_jobs()
+        with subprocess.Popen([self.rustc, '-Copt-level=2', '-Ccodegen-units=1', source, '-o', executable],
+                              env=env, cwd=self.work, stderr=subprocess.PIPE, text=True) as compiler:
+            try:
+                deadline = time.monotonic() + 10
+                while not started.exists() and compiler.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue(started.exists(), 'rustc did not submit its CGU')
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    compiler.wait(timeout=.3)
+            finally:
+                connection.close()
+                lease.close()
+            _, log = compiler.communicate(timeout=30)
+        self.assertEqual(compiler.returncode, 0, log)
+        self.assertIn('distcc-rust-cgu: compiled on ', log)
+        self.assertGreater(self.completed_jobs()[0], before[0])
+        self.assertEqual(subprocess.check_output([executable], text=True).strip(), str(sum(range(64))))
+
     def test_small_cargo_crates_use_both_whole_crate_workers(self):
         self.cgu_toolchain()
         self.start_broker(' '.join(self.host(i, f',tcp,stats={p}', slots=1)
@@ -609,6 +673,38 @@ class RustTest(BrokerTestCase):
         symbols=subprocess.check_output(['nm',output],text=True)
         self.assertIn('verified_client_link',symbols)
         self.assertIn('verified_response_arg',symbols)
+
+    @unittest.skipUnless(shutil.which('cargo') and shutil.which('clang'), 'Cargo and Clang required')
+    def test_cargo_link_driver_skips_masquerade_symlinks(self):
+        import ctypes
+        links = []
+        for binary in (self.build / 'distcc', shutil.which('ccache')):
+            if binary:
+                directory = self.work / (Path(binary).name + '-bin')
+                directory.mkdir()
+                alias = directory / 'clang'
+                alias.symlink_to(binary)
+                links.append(alias)
+        src = self.work / 'src'
+        src.mkdir()
+        (self.work/'Cargo.toml').write_text('[package]\nname="wrapped"\nversion="0.1.0"\nedition="2021"\n'
+                                            '[lib]\ncrate-type=["cdylib"]\n')
+        (self.work/'build.rs').write_text('fn main() { println!("cargo:rustc-env=ANSWER=42"); }')
+        (src/'main.rs').write_text('fn main() { println!("{}", env!("ANSWER")); }')
+        (src/'lib.rs').write_text('#[no_mangle] pub extern "C" fn answer() -> i32 { '
+                                  'env!("ANSWER").parse().unwrap() }')
+        path = os.pathsep.join([*(str(alias.parent) for alias in links), self.env['PATH']])
+        for i, driver in enumerate(['clang', *links]):
+            with self.subTest(driver=driver):
+                out = self.work / f'cargo-{i}'
+                env = dict(self.env, PATH=path, RUSTC=self.rustc, RUSTC_WRAPPER=str(self.build/'distcc'),
+                           CARGO_INCREMENTAL='0', CARGO_TARGET_DIR=str(out), RUSTFLAGS=f'-C linker={driver}')
+                result = subprocess.run(['cargo', 'build', '--offline', '-v'], env=env, cwd=self.work,
+                                        capture_output=True, text=True, timeout=90)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertGreaterEqual(result.stderr.count('distcc-rust: compiled on '), 3, result.stderr)
+                self.assertEqual(subprocess.check_output([out/'debug/wrapped'], text=True).strip(), '42')
+                self.assertEqual(ctypes.CDLL(str(out/'debug/libwrapped.so')).answer(), 42)
 
     def test_large_rust_artifacts_do_not_use_small_runtime_tmpfs(self):
         runtime = self.work / 'runtime'

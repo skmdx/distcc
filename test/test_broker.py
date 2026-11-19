@@ -143,7 +143,7 @@ class BrokerTestCase(DistccTestCase):
         payload = struct.pack("=II", self.protocol_version, command)
         if command in (12, 13):
             payload += struct.pack('=I', cpp_limit)
-        if command & 65535 in (6, 9, 10, 15):
+        if command & 65535 in (6, 9, 10, 15, 20):
             if memory_class is None:
                 kind = {7: 3, 8: 4, 10: 5}.get(work[2], 1 if 4 <= work[2] <= 6 else 0)
                 memory_class = 1 + kind * 64 + max(0, work[1].bit_length() - 1) if work[0] else 0

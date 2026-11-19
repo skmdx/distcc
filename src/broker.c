@@ -1314,7 +1314,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         }
         return 0;
     }
-    int i, slots, available = 0, ready_hosts = 0, abi_mismatches = 0;
+    int i, slots, available = 0, ready_hosts = 0, abi_mismatches = 0, pending_cgu_probe = 0;
     double work_rate = 0, min_rate = 0;
     struct selection {
         int peer, probe, wait, idle, enqueue;
@@ -1336,7 +1336,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     }
     double cost = dcc_work_predict(&broker->model, &client->hint);
     int link = client->command == ACQUIRE_LINK;
-    int link_backend = client->hint.kind == DCC_WORK_THINLTO ||
+    int link_backend = client->hint.kind == DCC_WORK_RUST_CGU || client->hint.kind == DCC_WORK_THINLTO ||
                        client->hint.kind == DCC_WORK_OFFLOAD_LINK;
     int local_cpp = !link && !direct && client->command != ACQUIRE_CPP && client->command != ACQUIRE_READY;
     /* Placement history is only a locality hint. The receiving worker still
@@ -1370,19 +1370,26 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         struct dcc_capacity observed = observed_capacity(p, broker->cpp_busy);
         const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
         if (client->hint.kind == DCC_WORK_RUST_CGU) {
-            if (!cap || !p->host->tcp_jobs ||
-                p->retry_at > now || p->full_until > now || !p->address_len ||
-                cap->available <= 0 || cap->queued > 0 || cap->memory_pressure >= 10 ||
-                p->busy >= dcc_capacity_slots(p->host, cap)) continue;
+            if (!p->host->tcp_jobs || !p->host->stats_port) {
+                ++abi_mismatches;
+                continue;
+            }
+            if (!cap) {
+                /* Wait for an observation for this request. A failed probe
+                 * is a connection failure, not an incompatible ABI. */
+                pending_cgu_probe |= p->address_len &&
+                    (p->stats_fd >= 0 || p->deadline < client->waiting_since);
+                continue;
+            }
             if (client->command == CGU_CAPACITY) {
                 const char *host = strrchr(client->hint.cgu_backend, ' ');
                 if (host && !strcmp(host + 1, cap->rust_host)) reply.host[0] = '1';
             }
-            if (!compatible_cgu(client->hint.cgu_backend, cap->llvm_cgu)) continue;
+            if (!compatible_cgu(client->hint.cgu_backend, cap->llvm_cgu)) {
+                ++abi_mismatches;
+                continue;
+            }
             if (client->command == CGU_CAPACITY) {
-                int limit;
-                memory_forecast(cap, &client->hint, &limit);
-                if (limit >= 0 && (cap->busy >= limit || p->busy >= limit)) continue;
                 ++reply.slots;
                 continue;
             }
@@ -1658,9 +1665,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         reply.slots = 0;
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
-    } else if (client->command == CGU_CAPACITY ||
-               (client->hint.kind == DCC_WORK_RUST_CGU && !available)) {
-        reply.status = client->command == CGU_CAPACITY ? 0 : EXIT_LOCAL_COMPILE;
+    } else if (pending_cgu_probe && (client->command == CGU_CAPACITY || !available)) {
+        return 0;
+    } else if (client->command == CGU_CAPACITY) {
+        reply.status = reply.slots || abi_mismatches == broker->count ? 0 : EXIT_CONNECT_FAILED;
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
     } else if (client->command == JOBS || !available) {

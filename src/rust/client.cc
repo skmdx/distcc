@@ -697,6 +697,22 @@ string relocate_runpath(string arg, const fs::path &destination, const fs::path 
     }
     return arg;
 }
+fs::path link_driver(const fs::path &name) {
+    auto wrapper = [](const fs::path &binary) {
+        return binary.filename() == "distcc" || binary.filename() == "ccache";
+    };
+    if (name.has_parent_path() && !wrapper(executable(name)))
+        return fs::absolute(name);
+    // The sandbox needs the driver itself. Keep its invocation name for
+    // multicall drivers such as clang++ and ld.lld.
+    for (const auto &dir : split(env("PATH"), ':')) {
+        auto candidate = fs::absolute(fs::path(dir) / name.filename());
+        auto binary = find_program(candidate);
+        if (!binary.empty() && !wrapper(binary))
+            return candidate;
+    }
+    throw std::runtime_error("link driver unavailable: " + name.string());
+}
 int finish_links(Result &result, const Invocation &inv, const fs::path &work, const fs::path &compiler,
                  const fs::path &sysroot, const string &host) {
     std::map<string, dcc_named_output *> outputs;
@@ -725,7 +741,7 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         auto &f = *outputs.at(args.front());
         Work final(fs::path(f.destination).parent_path());
         auto linked = final.dir / args.front();
-        auto driver = executable(inv.linker);
+        auto driver = link_driver(inv.linker);
         Sandbox box(Root::HostWithOutputs);
         auto &cmd = box.args;
         fs::path tools = sysroot / "lib/rustlib" / host / "bin";
