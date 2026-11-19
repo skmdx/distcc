@@ -40,7 +40,7 @@ def fingerprint(path):
     return size, digest
 
 
-def manifest(kind, cwd, argv, inputs):
+def manifest(kind, cwd, argv, inputs, *, rust=None):
     """Encode the bounded BEGIN manifest, including its first-use parent table."""
     data = bytearray()
     parents = {}
@@ -65,6 +65,13 @@ def manifest(kind, cwd, argv, inputs):
     string(cwd)
     for arg in argv:
         string(arg)
+    if kind == 3:
+        if rust is None:
+            raise ValueError('Rust command metadata is required')
+        phase, compiler, cpu, features, directories, environment = rust
+        number(phase)
+        for field in (compiler, cpu, features, *directories, '', *environment, ''):
+            string(field)
     for name, size, digest, cached in inputs:
         for value in (0, 0, cached, size, size):
             number(value)

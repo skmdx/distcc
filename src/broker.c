@@ -862,7 +862,8 @@ static void memo_request(struct broker *broker, struct client *client,
             memo->length = size - 1;
             if (!memo->value) goto done;
             broker->memo_bytes+=memo->length+1;
-            if ((!strncmp(memo->key, "gcc-plan:", 9) || !strncmp(memo->key, "clang-plan:", 11)) &&
+            if ((!strncmp(memo->key, "gcc-plan:", 9) || !strncmp(memo->key, "clang-plan:", 11) ||
+                 !strncmp(memo->key, "rust-plan:", 10)) &&
                 session_plan_access(broker, session))
                 memo->watch = dcc_plan_watch_new(broker->plans, memo->value, memo->length, &memo->watch_bytes);
             broker->memo_bytes += memo->watch_bytes;
@@ -1308,7 +1309,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
      * validates its compiler/input certificate; this never authorizes reuse.
      * Keep the hint in the existing bounded cost history, and consult live
      * leases for work whose frontend may have completed before its backend. */
-    int locality = !direct && !link && (client->hint.kind == 4 || client->hint.kind == 5);
+    int locality = !direct && !link && (client->hint.kind == 4 || client->hint.kind == 5 ||
+                                        client->hint.kind == DCC_WORK_RUST);
     /* A cold byte prior is not evidence for a finite completion comparison. */
     int completion_model = locality && broker->model.classes[client->hint.kind - 1].xx > 0;
     int previous = locality ? dcc_work_peer(&broker->model, &client->hint) : -1;
@@ -1900,12 +1902,14 @@ static int initialize(struct broker *broker, struct dcc_hostdef *hosts)
                 if (!getifaddrs(&interfaces)) {
                     for (struct ifaddrs *a = interfaces; a; a = a->ifa_next) {
                         if (!a->ifa_addr || a->ifa_addr->sa_family != peer->address.ss_family) continue;
-                        if (peer->address.ss_family == AF_INET)
-                            peer->local |= ((struct sockaddr_in *)a->ifa_addr)->sin_addr.s_addr ==
-                                           ((struct sockaddr_in *)&peer->address)->sin_addr.s_addr;
-                        else if (peer->address.ss_family == AF_INET6)
-                            peer->local |= !memcmp(&((struct sockaddr_in6 *)a->ifa_addr)->sin6_addr,
-                                &((struct sockaddr_in6 *)&peer->address)->sin6_addr, sizeof(struct in6_addr));
+                        size_t offset, length;
+                        if (peer->address.ss_family == AF_INET) {
+                            offset = offsetof(struct sockaddr_in, sin_addr); length = sizeof(struct in_addr);
+                        } else if (peer->address.ss_family == AF_INET6) {
+                            offset = offsetof(struct sockaddr_in6, sin6_addr); length = sizeof(struct in6_addr);
+                        } else continue;
+                        peer->local |= !memcmp((char *)a->ifa_addr + offset,
+                                               (char *)&peer->address + offset, length);
                     }
                     freeifaddrs(interfaces);
                 }

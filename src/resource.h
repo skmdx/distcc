@@ -1,6 +1,7 @@
 /* Host and cgroup resource admission, shared by clients and workers. */
 #ifndef DCC_RESOURCE_H
 #define DCC_RESOURCE_H
+#include <stdint.h>
 #define DCC_MEMORY_BUCKETS 64
 double dcc_memory_pressure(void);
 int dcc_resource_slots(int maximum);
@@ -12,6 +13,7 @@ void dcc_resource_analysis_wait(int occupied, unsigned timeout_ms);
 struct dcc_job;
 unsigned dcc_resource_bucket(unsigned long long bytes);
 unsigned dcc_resource_class(const struct dcc_job *);
+uint32_t dcc_rust_source_bytes(const struct dcc_job *);
 unsigned long long dcc_resource_input_bytes(const struct dcc_job *);
 int dcc_resource_known(unsigned memory_class);
 unsigned long long dcc_resource_estimate(unsigned memory_class);

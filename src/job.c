@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include "job.h"
+#include "rust_job.h"
 #include "distcc.h"
 
 const char *const dcc_gcc_locale_names[DCC_GCC_LOCALE_COUNT] = {
@@ -143,6 +144,15 @@ void dcc_job_free(struct dcc_job *job)
     if (job->stdin_fd) close(job->stdin_fd - 1);
     if (job->argv) for (i = 0; job->argv[i]; ++i) free(job->argv[i]);
     free(job->argv);
+    free(job->rust.compiler); free(job->rust.cpu); free(job->rust.features);
+    if (job->rust.directories) {
+        for (char **p = job->rust.directories; *p; ++p) free(*p);
+        free(job->rust.directories);
+    }
+    if (job->rust.environment) {
+        for (char **p = job->rust.environment; *p; ++p) free(*p);
+        free(job->rust.environment);
+    }
     if (job->fs_roots) {
         for (i = 0; job->fs_roots[i]; ++i) free(job->fs_roots[i]);
         free(job->fs_roots);
@@ -165,6 +175,13 @@ void dcc_job_result_init(struct dcc_job_result *r)
 void dcc_job_result_free(struct dcc_job_result *r)
 {
     unsigned i;
+    for (i = 0; i < r->named_count; ++i) {
+        struct dcc_named_output *f = r->named + i;
+        if (f->fd >= 0) close(f->fd);
+        if (f->temporary) unlink(f->temporary);
+        free(f->name); free(f->temporary); free(f->destination);
+    }
+    free(r->named); r->named = NULL; r->named_count = 0;
     for (i = 0; i < DCC_JOB_RESULT_COUNT; ++i) {
         if (r->fd[i] >= 0) { close(r->fd[i]); r->fd[i] = -1; }
         if (r->temporary[i]) { unlink(r->temporary[i]); free(r->temporary[i]); r->temporary[i] = NULL; }
@@ -179,6 +196,33 @@ static int parent_order(const void *aa, const void *bb)
     return memcmp(a->path, b->path, a->length);
 }
 static void keep_parent(void *parent) { (void)parent; }
+
+static void strings(struct metadata *m, char **words)
+{
+    for (; words && *words; ++words) string(m, *words);
+    string(m, "");
+}
+
+/* Each list contains nonempty path or NAME=value records, followed by the
+ * empty string. The metadata parser owns all storage even on a short read. */
+static int get_strings(struct metadata *m, char ***words)
+{
+    unsigned count = 0, capacity = 0;
+    for (;;) {
+        char *s = get_string(m);
+        if (!s) return -1;
+        if (!*s) { free(s); return 0; }
+        if (count == capacity) {
+            if (capacity == DCC_JOB_INPUT_MAX) { free(s); return -1; }
+            capacity = capacity ? 2 * capacity : 8;
+            char **next = realloc(*words, (capacity + 1) * sizeof(*next));
+            if (!next) { free(s); return -1; }
+            *words = next;
+        }
+        (*words)[count++] = s;
+        (*words)[count] = NULL;
+    }
+}
 
 unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
 {
@@ -196,6 +240,14 @@ unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
     number(&m, job->count);
     string(&m, job->cwd);
     for (i = 0; i < argc; ++i) string(&m, job->argv[i]);
+    if (job->kind == DCC_JOB_RUST) {
+        number(&m, job->rust.phase);
+        string(&m, job->rust.compiler);
+        string(&m, job->rust.cpu);
+        string(&m, job->rust.features);
+        strings(&m, job->rust.directories);
+        strings(&m, job->rust.environment);
+    }
     for (i = 0; i < job->count; ++i) {
         const struct dcc_job_input *in = &job->inputs[i];
         number(&m, in->kind);
@@ -255,6 +307,14 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
     job->cwd = get_string(&m);
     if (!absolute_path(job->cwd)) goto failed;
     for (i = 0; i < argc; ++i) if (!(job->argv[i] = get_string(&m))) goto failed;
+    if (kind == DCC_JOB_RUST) {
+        uint64_t phase = get_number(&m);
+        if (phase > DCC_RUST_OPTIMIZED ||
+            !(job->rust.compiler = get_string(&m)) || !*job->rust.compiler ||
+            !(job->rust.cpu = get_string(&m)) || !(job->rust.features = get_string(&m)) ||
+            get_strings(&m, &job->rust.directories) || get_strings(&m, &job->rust.environment)) goto failed;
+        job->rust.phase = phase;
+    }
     for (i = 0; i < count; ++i) {
         struct dcc_job_input *in = &job->inputs[i];
         uint64_t type = get_number(&m), encoding = get_number(&m), cached = get_number(&m);
@@ -288,6 +348,8 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
         free(base);
         in->target = get_string(&m);
         if (!absolute_path(in->path) || !strcmp(in->path, "/") ||
+            (kind == DCC_JOB_RUST && (in->kind != DCC_JOB_FILE ||
+             !strcmp(in->path,DCC_RUST_ROOT) || !strncmp(in->path,DCC_RUST_ROOT "/",sizeof(DCC_RUST_ROOT)))) ||
             in->path[strlen(in->path) - 1] == '/' || !in->target ||
             (in->kind != DCC_JOB_SYMLINK && *in->target) ||
             (!dcc_job_file(in) && (in->cached || in->wire_size || in->plain_size)) ||

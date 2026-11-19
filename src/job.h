@@ -18,6 +18,12 @@ enum dcc_job_input_kind { DCC_JOB_FILE, DCC_JOB_SYMLINK, DCC_JOB_EMPTY,
                          DCC_JOB_READONLY };
 enum dcc_job_encoding { DCC_JOB_RAW, DCC_JOB_LZ4 };
 enum dcc_input_cache { DCC_UNCACHED, DCC_CACHE_LOOKUP, DCC_CACHE_PUSH };
+enum dcc_rust_phase { DCC_RUST_METADATA, DCC_RUST_CODEGEN, DCC_RUST_OPTIMIZED };
+struct dcc_rust_command {
+    char *compiler, *cpu, *features;
+    char **directories, **environment; /* environment entries are NAME=value */
+    enum dcc_rust_phase phase;
+};
 #define DCC_SOURCE_PUSH_MAX 65536
 enum dcc_job_artifact { DCC_JOB_STDERR, DCC_JOB_STDOUT, DCC_JOB_OBJECT, DCC_JOB_DEPS };
 struct dcc_job_input {
@@ -36,6 +42,7 @@ struct dcc_job {
     char **argv;
     unsigned count;
     struct dcc_job_input *inputs;
+    struct dcc_rust_command rust;
     unsigned main_input; /* Client-only pump source index plus one. */
     /* Client-only authorization roots; never accepted from a remote peer. */
     char **fs_roots;
@@ -45,6 +52,9 @@ struct dcc_job {
     int fs_channel;
     /* Borrowed resident compiler IPC, represented as fd + 1; never serialized. */
     int compiler_channel;
+    /* Local publication policy, borrowed from the Rust planner. */
+    const char *outdir;
+    char **destinations; /* basename, destination pairs, NULL terminated */
 };
 static inline int dcc_job_file(const struct dcc_job_input *in)
 {
@@ -78,6 +88,12 @@ struct dcc_load_report {
     unsigned char busy[4], queued[4], preparing[4], returning[4], suspended[4], links[4];
     unsigned char capacity[4], running[4], pressure[4], cpu_scale[4], cpu_state[4], memory_class[4];
 };
+struct dcc_named_output {
+    char *name, *temporary, *destination;
+    uint64_t size;
+    unsigned mode;
+    int fd;
+};
 struct dcc_job_result {
     struct dcc_load_report load;
     int status, mode;
@@ -88,6 +104,8 @@ struct dcc_job_result {
     int fd[DCC_JOB_RESULT_COUNT];
     /* Local unpublished destinations, never part of wire metadata. */
     char *temporary[DCC_JOB_RESULT_COUNT];
+    unsigned named_count;
+    struct dcc_named_output *named;
 };
 void dcc_job_free(struct dcc_job *);
 struct dcc_snapshot_metadata;

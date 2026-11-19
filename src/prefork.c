@@ -66,6 +66,7 @@ static void dcc_sigchld_handler(int sig);
 static void dcc_create_kids(void);
 
 #include "tcp_job.h"
+#include "rust_job.h"
 #include "tcp_async.h"
 #include "clang_worker.h"
 /* Only the parent owns idle sockets. Legacy workers borrow an active socket;
@@ -139,6 +140,7 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
         struct worker *w = &workers[i];
         if (w->fd < 0 || w->busy) continue;
         size_t length = offsetof(struct dcc_tcp_run, root) + strlen(run->root) + 1;
+        if (description->kind == DCC_JOB_RUST && (input = dcc_rust_catalog_fd()) < 0) return -1;
         int descriptors[3] = {fd, input, -1};
         unsigned count = input >= 0 ? 2 : 1;
         if (description->kind == DCC_JOB_FRONTEND) {

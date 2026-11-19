@@ -56,11 +56,10 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <setjmp.h>
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
-#include <errno.h>
+#include <errno.h>  /* IWYU pragma: keep (logging macros) */
 #include <time.h>
 #include <dirent.h>
 
@@ -91,6 +90,7 @@
 #include "dotd.h"
 #include "fix_debug_info.h"
 #include "job.h"
+#include "rust_job.h"
 #include "clang_worker.h"
 #include "tcp_job.h"
 #ifdef HAVE_GSSAPI
@@ -1132,6 +1132,14 @@ static int dcc_run_job(int in_fd,
         orig_input = strdup(helper);
         if (!argv || !(argv[0] = strdup(helper)) || !orig_input) {
             ret = EXIT_OUT_OF_MEMORY;
+            goto out_cleanup;
+        }
+        if (job && job->kind == DCC_JOB_RUST) {
+            status = dcc_rust_worker(job, root, in_fd, out_fname, err_fname, result);
+            result->status = status;
+            ret = retain_artifact(result, DCC_JOB_STDERR, err_fname);
+            if (!ret) ret = retain_artifact(result, DCC_JOB_STDOUT, out_fname);
+            job_result = ret || status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
             goto out_cleanup;
         }
         char *input_archive = NULL;

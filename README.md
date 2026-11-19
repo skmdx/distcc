@@ -134,35 +134,28 @@ RUSTC_WRAPPER=distcc cargo build --release
 distcc rustc --crate-type=rlib library.rs
 ```
 
-Rust requires the local `DISTCC_BROKER` socket and workers configured with
-`,tcp`, plus worker Rust, Python xxhash and bubblewrap. Workers prefer a matching
-Rust build but do not reject differing version, commit or LLVM metadata.
-Compatibility is determined by rustc accepting the inputs and the client
-successfully linking the artifacts. Options and output kinds are passed to rustc;
-the wrapper interprets only the operands needed for input/output transfer. Linux workers
-must permit unprivileged user namespaces. The client supplies its target
-standard library, so workers can compile for another architecture with the
-compatible Rust compiler. Rust does not need an include server.
+Rust requires the local `DISTCC_BROKER` socket and TCP workers with bubblewrap
+and unprivileged user namespaces. The worker selects a rustc with the client's
+release string, commit hash and LLVM version. If it cannot find a match, the
+client runs rustc locally. The client supplies the target standard library.
 
 Distribution operates on library crates and explicit metadata/object emissions.
 The real client rustc discovers modules, included data, binary dependencies and
 observed environment variables. Its dependency-only probe uses
-`-Zbinary-dep-depinfo` with `RUSTC_BOOTSTRAP=1`; actual compilation keeps the
-caller's feature policy. Only the reported Rust dependency closure is sent,
-instead of all crates in dependency search directories. Native archives from
-library search directories are also included. Input snapshots and dependency
-crates use the existing LZ4 TCP
-transport and content cache. Large inputs use bounded cache chunks. The worker
-compiles in a private namespace with original client paths and returns all
-artifacts, including Cargo metadata and dependency files. Local incremental
-state is not sent or updated by remote jobs.
-Artifacts are installed before forwarding rustc's JSON notifications, so Cargo
-can immediately start dependent crates when metadata becomes visible.
-Rust `-Cprofile-use` data is transferred with the other read-only inputs.
-Rust also reports snapshot and source sizes to the broker. Memory admission uses
-the Rust workload class, while execution-time predictions learn from completed
-Rust jobs. Before that first sample, placement uses available capacity without
-assuming that precompiled dependencies cost the same as C++ source to compile.
+`-Zbinary-dep-depinfo` with `RUSTC_BOOTSTRAP=1`. Compilation keeps the caller's
+feature policy. The client opens the reported dependencies, native archives
+from library search directories and any `-Cprofile-use` data read-only. It
+sends missing inputs from those descriptors over the existing LZ4 TCP
+transport. The broker shares input digests and compiler discovery across
+Cargo processes. The worker compiles in a private namespace using the original
+client paths. Incremental state stays on the client.
+The broker grants a local slot for dependency discovery and can run small
+crates directly on a free client lane. Placement considers the dependency
+directory, source size, optimization phase and previous crate timings.
+Workers stream named artifacts, including Cargo metadata and dependency files,
+directly into temporary files beside their destinations. When compilation
+finishes, the client verifies the input generations, publishes the files and
+forwards rustc's JSON notifications to Cargo.
 
 `-C target-cpu=native` uses the client's CPU even on a different worker CPU or
 architecture. The installed `distcc-rust-native.so` records the client's actual
@@ -175,7 +168,8 @@ LLVM version. Install it on clients and workers before using distributed native
 jobs. A worker verifies that rustc consumed the profile before returning results.
 
 Final executable/native links, build scripts, procedural macro crates,
-explicit dynamic Rust dependencies and response files run locally. The client
+and explicit dynamic Rust dependencies run locally. The client expands nested
+line-oriented `@file` arguments and tracks their input generations. It
 also records libraries loaded by the real dependency pass, keeping transitive
 procedural macro execution on the client CPU. Unrelated procedural macros in a dependency search directory do
 not prevent distribution. Local linking

@@ -147,11 +147,14 @@ static double initial_rate(unsigned kind)
     return kind % 3 == 1 ? 1 : kind % 3 == 2 ? .0625 : .25;
 }
 
+static const double rust_work_rate = .15;
+
 static double computation_size(const struct dcc_work_hint *hint)
 {
     /* LLVM instruction counts measure optimizer work directly; bitcode and
      * imported constant-data bytes remain the independent input-size feature. */
     if (hint->kind == DCC_WORK_THINLTO) return hint->work_units / 1048576.0;
+    if (hint->kind == DCC_WORK_RUST) return log1p(hint->work_units / 65536.0);
     if (hint->kind < DCC_WORK_RUST) return hint->work_units / 16384.0;
     double size = hint->work_units / 1048576.0;
     /* Large source text can be generated tables rather than optimizer work. */
@@ -164,6 +167,7 @@ static void learn_class(struct dcc_work_class *c, const struct dcc_work_hint *hi
     if (!c->xx) {
         c->xx = c->yy = .001;
         c->xz = .001 * initial_rate(hint->kind - 1);
+        if (hint->kind == DCC_WORK_RUST) c->yz = .001 * rust_work_rate;
     }
     double x = hint->bytes / 1048576.0, y = computation_size(hint);
     c->weight = .98 * c->weight + .02;
@@ -255,7 +259,8 @@ double dcc_work_predict(const struct dcc_work_model *model, const struct dcc_wor
     const struct dcc_work_class *c = &model->classes[kind];
     /* Start file-based backends with occupancy-based placement and learn from execution,
      * rather than treating precompiled dependencies as C++ parsing work. */
-    if (hint->kind >= DCC_WORK_RUST && !c->xx) return 0;
+    if (hint->kind == DCC_WORK_RUST && !c->xx) return .03 + rust_work_rate * computation_size(hint);
+    if (hint->kind > DCC_WORK_RUST && !c->xx) return 0;
     double seconds = c->fixed + hint->bytes / 1048576.0 * (c->xx ? c->input_rate : initial_rate(kind))
                    + computation_size(hint) * c->work_rate;
     return seconds > .01 ? seconds : .01;

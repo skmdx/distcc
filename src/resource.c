@@ -253,8 +253,24 @@ unsigned long long dcc_resource_input_bytes(const struct dcc_job *job)
     return bytes;
 }
 
+uint32_t dcc_rust_source_bytes(const struct dcc_job *job)
+{
+    uint32_t bytes = 0;
+    for (unsigned i = 0; i < job->count; ++i) {
+        const struct dcc_job_input *in = job->inputs + i;
+        const char *ext = strrchr(in->path,'.');
+        if (!ext || strcmp(ext,".rs")) continue;
+        if (in->plain_size > UINT32_MAX - bytes) return UINT32_MAX;
+        bytes += in->plain_size;
+    }
+    return bytes;
+}
 unsigned dcc_resource_class(const struct dcc_job *job)
 {
+    if (job->kind == DCC_JOB_RUST) {
+        unsigned size = dcc_resource_bucket(dcc_rust_source_bytes(job) / 1024);
+        return 1 + DCC_JOB_RUST * DCC_MEMORY_BUCKETS + job->rust.phase * 21 + (size < 21 ? size : 20);
+    }
     if (dcc_job_frontend(job)) {
         enum { C, CXX, ASM, OBJC, OBJCXX, GPU };
         unsigned language = C, phase = 0;

@@ -81,7 +81,7 @@ int dcc_tcp_frame_header(struct dcc_tcp_frame *f, size_t available)
     f->type = dcc_tcp_get32(f->header);
     f->size = dcc_tcp_get32(f->header + 4);
     uint32_t kind = f->type & ~DCC_TCP_FLAGS;
-    return kind < DCC_TCP_BEGIN || kind > DCC_TCP_FS_REPLY ||
+    return kind < DCC_TCP_BEGIN || kind > DCC_TCP_OUTPUT_NAMES ||
         f->size > available ||
         f->size > (kind == DCC_TCP_BEGIN ? DCC_JOB_METADATA_MAX + 8U :
                    kind == DCC_TCP_NEED ? dcc_tcp_bitmap_size(DCC_JOB_INPUT_MAX) : DCC_TCP_CHUNK + 8U) ||
@@ -121,10 +121,11 @@ int dcc_tcp_frame_read(int fd, struct dcc_tcp_frame *f, size_t available)
         if (n >= 0) for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
             if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) { invalid = 1; continue; }
             unsigned count = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-            int *fds = (int *)CMSG_DATA(c);
             for (unsigned i = 0; i < count; ++i) {
-                if (f->fd_plus_one || f->used || invalid) { close(fds[i]); invalid = 1; }
-                else f->fd_plus_one = fds[i] + 1;
+                int received;
+                memcpy(&received, CMSG_DATA(c) + i * sizeof(received), sizeof(received));
+                if (f->fd_plus_one || f->used || invalid) { close(received); invalid = 1; }
+                else f->fd_plus_one = received + 1;
             }
         }
         if (n >= 0 && invalid) return -1;

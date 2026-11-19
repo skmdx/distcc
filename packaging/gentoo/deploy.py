@@ -101,7 +101,7 @@ def release(overlay):
     if not match:
         raise RuntimeError('release must pin a full source commit')
     inputs = ['src', 'include_server', 'configure.ac', 'Makefile.in', 'pump.in',
-              'distcc-link', 'distcc-multi', 'distcc-clang', 'distcc-rust',
+              'distcc-link', 'distcc-multi', 'distcc-clang',
               'distcc-thinlto', 'distcc-offload', 'distcc-offload-link',
               'distcc_lto.py', 'distcc_job.py', 'distcc_python.py',
               'packaging/systemd', 'packaging/gentoo/*.bashrc']
@@ -354,15 +354,10 @@ def validate_rust_cluster(targets, work, inventory, workers=None):
             for compiler in compilers:
                 clients.setdefault((compiler['host'], compiler['digest']), (client, compiler))
         for worker in targets if workers is None else workers:
-            requested = list({json.dumps(compiler['identity'], sort_keys=True): compiler['identity']
-                              for _, compiler in clients.values()}.values())
-            available = json.loads(run(['python3', '-c', '''import json, pathlib, runpy, shutil, sys
-wrapper = pathlib.Path(shutil.which('distcc-rust')).resolve()
-sys.path.insert(0, str(wrapper.parent))
-helper = runpy.run_path(str(wrapper))
-print(json.dumps([identity for identity in json.loads(sys.argv[1])
-                  if next(helper['worker_compilers'](identity), None) is not None]))
-''', json.dumps(requested)], worker))
+            # Distribution installs every slot for this worker architecture.
+            # Assert that the actual service can execute each expected build.
+            worker_host = next(compilers[0]['host'] for target, compilers in inventory if target == worker)
+            available = [compiler['identity'] for _, compiler in clients.values() if compiler['host'] == worker_host]
             def validate_client(item):
                 client, compiler = item
                 expected = 'remote' if compiler['identity'] in available else 'local'

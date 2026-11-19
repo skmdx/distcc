@@ -228,6 +228,7 @@ fi
 AC_SUBST(WERROR_CFLAGS)
 AC_SUBST(PYTHON_CFLAGS)
 AC_SEARCH_LIBS([strerror],[cposix])
+AC_SEARCH_LIBS([log1p],[m])
 AC_CHECK_HEADER([xxhash.h], [], [AC_MSG_ERROR([xxHash headers are required])])
 AC_CHECK_LIB([xxhash], [XXH3_64bits_reset], [],
              [AC_MSG_ERROR([libxxhash with XXH3 support is required])])

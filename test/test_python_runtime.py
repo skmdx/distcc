@@ -21,7 +21,7 @@ class PythonBuildEnvironmentTest(unittest.TestCase):
             subprocess.run([clang, '-x', 'c', '-fPIC', '-c', '-', '-o', str(obj)],
                            input='int answer(void) { return 42; }\n', text=True,
                            check=True, capture_output=True)
-            for helper in ('distcc-link', 'distcc-clang', 'distcc-rust',
+            for helper in ('distcc-link', 'distcc-clang',
                            'distcc-thinlto', 'distcc-offload-link'):
                 with self.subTest(helper=helper):
                     result = subprocess.run([sys.executable, '-S', '-c', '''

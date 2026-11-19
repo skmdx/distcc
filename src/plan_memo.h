@@ -46,7 +46,6 @@ void dcc_clang_plan_template(struct dcc_plan_template *, char **argv, const char
 void dcc_free_plan_template(struct dcc_plan_template *);
 int dcc_bind_plan(const struct dcc_plan_template *, char **argv);
 char *dcc_plan_key(char **argv, const char *input);
-int dcc_plan_memo_decode(const char *memo, size_t size, int output, unsigned *dependencies, int verified);
 #ifdef __linux__
 #define DCC_PLAN_WATCH_EVENT (UINT64_C(1) << 63)
 struct dcc_plan_watch;
@@ -60,8 +59,9 @@ struct dcc_plan_watch *dcc_plan_watch_new(struct dcc_plan_monitor *monitor, cons
 void dcc_plan_watch_free(struct dcc_plan_watch *);
 unsigned dcc_plan_watch_verified(struct dcc_plan_watch *);
 #endif
-char *dcc_plan_memo_encode(int journal, int output, unsigned *dependencies, size_t *length);
 #endif
+char *dcc_plan_memo_encode(int journal, int output, unsigned *dependencies, size_t *length);
+int dcc_plan_memo_decode(const char *memo, size_t size, int output, unsigned *dependencies, int verified);
 #ifdef __cplusplus
 }
 #endif

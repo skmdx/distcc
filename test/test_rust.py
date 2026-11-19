@@ -2,6 +2,7 @@
 """Rust/Cargo distributed compilation through real TCP workers."""
 import os
 import json
+import hashlib
 from pathlib import Path
 import runpy
 import re
@@ -13,7 +14,7 @@ import struct
 import sys
 import time
 import unittest
-from unittest import mock
+import test_tcp_jobs as tcp
 
 from test_broker import BrokerTestCase
 
@@ -22,6 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @unittest.skipUnless(shutil.which('rustc') and shutil.which('bwrap'), 'rustc and bubblewrap required')
 class RustTest(BrokerTestCase):
+    # A separate loopback address exercises TCP worker placement. A local
+    # interface address is eligible for TRY_LOCAL before the dependency pass.
+    worker_address = '127.0.0.2'
     def test_dependency_parent_traversal_preserves_empty_directories(self):
         (self.work/'empty'/'bits').mkdir(parents=True)
         (self.work/'value.rs').write_text('pub fn answer() -> u32 { 42 }')
@@ -41,41 +45,93 @@ class RustTest(BrokerTestCase):
         subprocess.run([executable], check=True, timeout=5)
 
     def test_dependency_symlink_parent_is_not_lexically_rewritten(self):
-        helper = runpy.run_path(str(self.build/'distcc-rust'))
         (self.work/'target'/'child').mkdir(parents=True)
         (self.work/'alias').symlink_to('target/child')
-        (self.work/'target'/'value.rs').write_text('actual input')
-        (self.work/'value.rs').write_text('different input')
-        dep = self.work/'probe.d'
-        dep.write_text('out: input\n\n'+str(self.work/'alias/../value.rs')+':\n')
-        with self.assertRaisesRegex(helper['LocalOnly'], 'crosses a symlink'):
-            helper['dependencies'](dep)
+        (self.work/'target'/'value.rs').write_text('pub const N: usize = 42;')
+        (self.work/'value.rs').write_text('compile_error!("wrong source");')
+        src = self.work/'check.rs'
+        src.write_text('#[path="alias/../value.rs"] mod value; pub use value::N;')
+        result = self.rust('--crate-type=rlib', src)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('crosses a symlink', result.stderr)
 
-    def test_source_and_output_below_tmp_survive_worker_isolation(self):
-        helper = runpy.run_path(str(self.build/'distcc-rust'))
+    send = staticmethod(tcp.TcpJobsTest.send)
+    frame = tcp.TcpJobsTest.frame
+    upload = tcp.TcpJobsTest.upload
+
+    def version(self, compiler):
+        report = subprocess.check_output([compiler, '-vV'], text=True).splitlines()
+        fields = dict(line.split(': ', 1) for line in report[1:] if ': ' in line)
+        return '\n'.join((report[0], fields['commit-hash'], fields['LLVM version']))
+
+    def wire_plan(self, source, *, flags=(), requested=None, logical=None, extra=()):
+        """A real rustc closure for tests which hold or alter an individual TCP transaction."""
+        from distcc_job import fingerprint, manifest
+        root = subprocess.check_output([self.rustc, '--print=sysroot'], text=True).strip()
+        depfile = self.work/'wire.d'
+        subprocess.run([self.rustc, '--crate-type=rlib', '-Zbinary-dep-depinfo',
+                        '--emit=dep-info='+str(depfile), source], check=True,
+                       env=dict(self.env, RUSTC_BOOTSTRAP='1'), cwd=self.work)
+        paths = [Path(line[:-1].replace('\\ ', ' ')) for line in depfile.read_text().split('\n\n',1)[1].splitlines()
+                 if line.endswith(':')] + list(extra)
+        args = ['--sysroot', root, '--crate-type=rlib', logical or source,
+                '-o', '/__distcc_rust/out/libwire.rlib', *flags]
+        entries = [(logical if logical and path==source else path, *fingerprint(path), 1) for path in paths]
+        return manifest(3, self.work, args, entries, rust=(1, requested or self.version(self.rustc), '', '', [], [])), paths
+
+    def wire_result(self, net, identity, first=None):
+        codec = runpy.run_path(str(self.build/'distcc-link'))['Lz4Chunks']()
+        kind, data = first or self.frame(net)
+        while kind == 0x54000308:
+            kind, data = self.frame(net)
+        self.assertEqual(kind, 0x54000303)
+        status, _, *sizes = struct.unpack('!II4Q', data[:40])
+        streams = [bytearray() for _ in sizes]
+        names = []
+        while True:
+            kind, data = self.frame(net)
+            if kind == 0x54000305:
+                self.assertEqual(data[:8], struct.pack('!Q', identity))
+                break
+            if kind == 0x5400030b:
+                while data:
+                    size, mode = struct.unpack_from('!QI', data)
+                    name, data = data[12:].split(b'\0', 1)
+                    names.append(os.fsdecode(name))
+                    sizes.append(size)
+                    streams.append(bytearray())
+                continue
+            self.assertEqual(kind & ~0x30000, 0x54000304)
+            index, plain = struct.unpack_from('!II', data)
+            streams[index].extend(codec.decode(data[8:], plain) if kind & 0x10000 else data[8:])
+        self.assertEqual(list(map(len, streams)), sizes)
+        return status >> 8, streams[0].decode(errors='replace'), dict(zip(names, streams[4:]))
+
+    def raw_compile(self, source, **kw):
+        body, paths = self.wire_plan(source, **kw)
+        with socket.create_connection((self.worker_address, self.ports[0]), timeout=15) as net:
+            self.send(net, 0x54000300, struct.pack('!Q',1)+body)
+            kind, needed = self.frame(net)
+            if kind != 0x54000301:
+                return self.wire_result(net, 1, (kind, needed))
+            self.assertEqual(kind, 0x54000301)
+            for i, path in enumerate(paths):
+                if needed[i//8] & (1 << (i%8)): self.upload(net, path.read_bytes(), i)
+            return self.wire_result(net, 1)
+
+    def test_source_below_tmp_survives_worker_isolation(self):
         source = self.work/'temporary.rs'
         source.write_text('pub fn answer() -> u32 { 42 }')
-        job, _, _, _ = helper['plan'](self.rustc, ['--crate-type=rlib', str(source)], self.work)
-        logical = '/tmp/distcc-client'
-        root = self.work/'worker'
-        staged = root/logical.lstrip('/')
-        staged.mkdir(parents=True)
-        shutil.copyfile(source, staged/source.name)
-        job.update(cwd=logical, output=logical+'/out', args=['--crate-name', 'temporary',
-            '--crate-type=rlib', logical+'/temporary.rs', '-o', logical+'/out/libtemporary.rlib'])
-        control = root/helper['CONTROL'].lstrip('/')
-        control.mkdir(parents=True)
-        (control/'job.json').write_text(json.dumps(job))
-        result = subprocess.run([str(self.build/'distcc-rust'), '--worker', str(root),
-            str(self.work/'result.tar')], capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        status, err, outputs = self.raw_compile(source, logical='/tmp/distcc-client/temporary.rs')
+        self.assertEqual(status, 0, err)
+        output = self.work/'libwire.rlib'
+        output.write_bytes(outputs['libwire.rlib'])
         main = self.work/'main.rs'
         main.write_text('fn main() { assert_eq!(temporary::answer(), 42); }')
         executable = self.work/'main'
-        result = self.rust(main, '--extern', 'temporary='+str(staged/'out/libtemporary.rlib'),
-                           '-o', executable, remote=False)
+        result = self.rust(main, '--extern', 'temporary='+str(output), '-o', executable, remote=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        subprocess.run([executable], check=True, timeout=5)
+        subprocess.run([executable], check=True)
 
     def test_memory_refusal_reschedules_rust_without_fallback(self):
         self.start_memory_refusal()
@@ -122,12 +178,49 @@ class RustTest(BrokerTestCase):
                    for line in (self.work / 'broker.log').read_text().splitlines()
                    if 'job cost:' in line and 'kind=7 ' in line]
         self.assertEqual(len(records), 2)
-        self.assertEqual(float(records[0]['predicted']), 0)
+        self.assertGreater(float(records[0]['predicted']), 0)
         self.assertGreater(float(records[1]['predicted']), 0)
         self.assertGreater(int(records[0]['units']), 0)
         self.assertGreater(int(records[0]['bytes']), int(records[0]['units']))
+        self.assertNotEqual(int(records[0]['family'], 16), 0)
+        self.assertEqual(records[0]['family'], records[1]['family'])
         stats = self.get_stats(self.stats_ports[0])
         self.assertIn('dcc_rust_capacity ', stats)
+
+    def test_tiny_crate_uses_local_preflight(self):
+        address = '127.0.0.1'
+        self.restart_server(self.build/'distccd', address=address)
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        self.start_broker(f'{address}:{self.ports[0]}/1,tcp,stats={self.stats_ports[0]}', name='local')
+        source = self.work/'tiny.rs'
+        output = self.work/'libtiny.rlib'
+        source.write_text('pub fn tiny() {}')
+        result = self.rust('--crate-type=rlib', source, '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(output.stat().st_size, 0)
+        stats = subprocess.check_output([self.build/'distcc','--lto-capacity'], env=self.env)
+        self.assertEqual(json.loads(stats)['direct_completed'], 1)
+        self.assertNotIn('input preparation command=', (self.work/'local.log').read_text())
+
+    def test_warm_compiler_and_rlib_reuse(self):
+        dep, artifact = self.work/'leaf.rs', self.work/'libleaf.rlib'
+        # Include incompressible extents so the cold transfer exercises sendfile.
+        (self.work/'data.bin').write_bytes(hashlib.shake_256(b'leaf').digest(1048576))
+        dep.write_text('pub static DATA: [u8; 1048576] = *include_bytes!("data.bin");')
+        subprocess.run([self.rustc, '--crate-type=rlib', dep, '-o', artifact], check=True)
+        src = self.work/'caller.rs'
+        src.write_text('extern crate leaf; pub fn answer() -> u8 { leaf::DATA[0] }')
+        args = ['--crate-type=rlib', '-Ctarget-cpu=native', '--extern', 'leaf='+str(artifact),
+                src, '--emit=dep-info,metadata,link']
+        for label in ('cold', 'warm'):
+            outdir = self.work/label
+            outdir.mkdir()
+            result = self.rust(*args, '--out-dir', outdir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('compiled on', result.stderr)
+            self.assertEqual(sorted(p.name for p in outdir.iterdir()), ['caller.d','libcaller.rlib','libcaller.rmeta'])
+        self.assertIn('input cache: 0 of', result.stderr)
+        self.assertEqual((self.work/'broker.log').read_text().count('input preparation command=12 '), 2)
 
     def test_large_rust_artifacts_do_not_use_small_runtime_tmpfs(self):
         runtime = self.work / 'runtime'
@@ -220,16 +313,14 @@ class RustTest(BrokerTestCase):
         args = ['--edition=2021', '--crate-type=rlib', str(source),
                 '--extern', 'middle=' + str(deps / 'libmiddle.rlib'),
                 '-Ldependency=' + str(deps), '-Lnative=' + str(native), '-Clto', '-o', str(output)]
-        helper = runpy.run_path(str(self.build / 'distcc-rust'))
-        discovery = self.work / 'discovery'
-        discovery.mkdir()
-        _, inputs, _, _ = helper['plan'](self.rustc, args, discovery)
-        self.assertIn(deps / 'libleaf.rlib', inputs)
-        self.assertIn(deps / 'libmiddle.rlib', inputs)
-        self.assertNotIn(unrelated, inputs)
-        self.assertNotIn(unused_archive, inputs)
-        self.assertIn(native / 'libanswer.a', inputs)
-        result = self.rust(*args)
+        trace = self.work/'closure.trace'
+        result = subprocess.run(['strace', '-o', trace, '-e', 'openat', self.build/'distcc',
+                                 self.rustc, *args], env=self.env, cwd=self.work, capture_output=True, text=True)
+        opened = trace.read_text()
+        for path in [deps/'libleaf.rlib', deps/'libmiddle.rlib', native/'libanswer.a']:
+            self.assertIn(str(path), opened)
+        for path in [unrelated, unused_archive]:
+            self.assertNotIn(str(path), opened)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('distcc-rust: compiled on', result.stderr)
         main = self.work / 'main.rs'
@@ -306,7 +397,7 @@ class RustTest(BrokerTestCase):
         import threading
         listener = socket.socket()
         self.addCleanup(listener.close)
-        listener.bind(('127.0.0.1', 0))
+        listener.bind((self.worker_address, 0))
         listener.listen()
         listener.settimeout(10)
         stopped = threading.Event()
@@ -317,7 +408,7 @@ class RustTest(BrokerTestCase):
                 first.settimeout(10)
                 self.assertEqual(first.recv(4, socket.MSG_WAITALL), struct.pack('!I', 0x54000300))
             second, _ = listener.accept()
-            with second, socket.create_connection(('127.0.0.1', self.ports[0]), timeout=10) as worker:
+            with second, socket.create_connection((self.worker_address, self.ports[0]), timeout=10) as worker:
                 peers = {second: worker, worker: second}
                 while not stopped.is_set():
                     for source in select.select(list(peers), [], [], .1)[0]:
@@ -325,7 +416,7 @@ class RustTest(BrokerTestCase):
                         if not data:
                             return
                         peers[source].sendall(data)
-        self.start_broker(f'127.0.0.1:{listener.getsockname()[1]}/1,tcp', name='retry', backoff=0)
+        self.start_broker(f'{self.worker_address}:{listener.getsockname()[1]}/1,tcp', name='retry', backoff=0)
         self.env.update(DISTCC_VERBOSE='1', PATH=str(self.build) + os.pathsep + os.environ['PATH'])
         source = self.work / 'retry.rs'
         source.write_text('pub fn answer() -> u32 { 42 }')
@@ -385,17 +476,14 @@ class RustTest(BrokerTestCase):
         result = self.rust(*args)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('distcc-rust: compiled on', result.stderr)
-        cache = self.ddir / 'rust-native.json'
-        before = cache.stat().st_mtime_ns
-        result = self.rust(*args)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(cache.stat().st_mtime_ns, before)
-        cache.unlink()
-        # An earlier native is overridden by the last explicit CPU setting.
-        result = self.rust(*args, '-Ctarget-cpu=generic')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('distcc-rust: compiled on', result.stderr)
-        self.assertFalse(cache.exists())
+        for overrides in ([], ['-Ctarget-cpu=generic']):
+            trace = self.work/'native.trace'
+            result = subprocess.run(['strace', '-f', '-e', 'execve', '-o', trace, self.build/'distcc',
+                                     self.rustc, *args, *overrides], env=self.env, cwd=self.work,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('distcc-rust: compiled on', result.stderr)
+            self.assertNotIn('"--print=cfg"', trace.read_text())
 
     def test_native_discovery_serializes_and_refreshes_after_compiler_change(self):
         import concurrent.futures
@@ -589,16 +677,14 @@ class RustTest(BrokerTestCase):
                     output.unlink()
 
     def test_worker_rejects_native_action_hidden_by_later_crate_type(self):
-        helper = runpy.run_path(str(self.build / 'distcc-rust'))
-        control = self.work / '__distcc_rust'
-        control.mkdir()
         for kind in ('staticlib', 'cdylib', 'proc-macro', 'bin'):
-            with self.subTest(kind=kind):
-                (control / 'job.json').write_text(json.dumps({
-                    'args': ['--crate-type=' + kind, '--crate-type=rlib',
-                             '--emit=link', '--emit=dep-info']}))
-                with self.assertRaisesRegex(helper['LocalOnly'], 'native linking'):
-                    helper['worker'](self.work, self.work / 'unused.tar')
+            src = self.work/(kind.replace('-', '_')+'.rs')
+            src.write_text('// '+kind+'\npub fn answer() {}')
+            status, err, outputs = self.raw_compile(src, flags=['--crate-type='+kind,'--crate-type=rlib',
+                                                               '--emit=link','--emit=dep-info'])
+            self.assertNotEqual(status, 0)
+            self.assertIn('native linking', err)
+            self.assertFalse(outputs)
 
     def test_repeated_emits_preserve_remote_outputs(self):
         source = self.work / 'emissions.rs'
@@ -649,6 +735,10 @@ class RustTest(BrokerTestCase):
         source.write_text('extern crate bridge; pub fn value() -> u32 { bridge::answer!() }')
         output = self.work / 'libconsumer.rlib'
         search = ('-L', 'dependency=' + str(self.work))
+        store = self.work / 'store'
+        store.mkdir()
+        library.rename(store / library.name)
+        library.symlink_to(store / library.name)
         result = self.rust('--crate-type=rlib', '-Ctarget-cpu=native', source,
                            '--extern', 'bridge=' + str(self.work / 'libbridge.rlib'), *search, '-o', output)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -774,19 +864,16 @@ class RustTest(BrokerTestCase):
 
     def test_client_takes_over_inputs_from_unresponsive_peer(self):
         import concurrent.futures
-        helper = runpy.run_path(str(self.build / 'distcc-rust'))
         source, output = self.work / 'recovery.rs', self.work / 'librecovery.rlib'
         source.write_text('pub fn answer() -> u32 { 42 }')
-        job, inputs, outdir, outputs = helper['plan'](self.rustc,
-            ['--crate-name=recovery', '--crate-type=rlib', str(source), '-o', str(output)], self.work)
-        metadata, snapshots = helper['metadata'](job, inputs, self.work)
+        body, _ = self.wire_plan(source)
         self.restart_server(self.build / 'distccd', DISTCC_IO_TIMEOUT='2')
         self.addCleanup(self.restart_server, self.build / 'distccd')
         env = dict(self.env, DISTCC_IO_TIMEOUT='2')
-        with socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5) as owner:
+        with socket.create_connection((self.worker_address, self.ports[0]), timeout=5) as owner:
             # Reserve the actual Rust inputs, then stop sending as a disconnected
             # uploader would. The real file-job client has the same inputs.
-            manifest = struct.pack('!Q', 999) + metadata.read_bytes()[struct.calcsize('!QI'):]
+            manifest = struct.pack('!Q', 999) + body
             owner.sendall(struct.pack('!II', 0x54000300, len(manifest)) + manifest)
             header = bytearray()
             while len(header) < 8:
@@ -799,19 +886,14 @@ class RustTest(BrokerTestCase):
                 part = owner.recv(size)
                 self.assertTrue(part)
                 size -= len(part)
-            archives = [self.work / f'recovered-{i}.tar' for i in range(3)]
-            def compile(archive):
-                return subprocess.run([self.build / 'distcc', '--file-job', metadata, snapshots, archive],
-                                      env=env, cwd=self.work, capture_output=True, text=True, timeout=30)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(archives)) as pool:
-                results = list(pool.map(compile, archives))
-            for result in results:
-                self.assertEqual(result.returncode, 0, result.stderr)
+            def compile(index):
+                return self.rust('--crate-type=rlib', source, '-o', output.with_name(f'lib{index}.rlib'), env=env)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                for result in pool.map(compile, range(3)):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('compiled on', result.stderr)
             self.assertEqual(owner.recv(1), b'')
-        for index, archive in enumerate(archives):
-            received = self.work / f'received-{index}'
-            received.mkdir()
-            helper['install_outputs'](archive, job, outdir, outputs, received)
+        output = output.with_name('lib2.rlib')
         main = self.work / 'recovery-main.rs'
         main.write_text('fn main() { assert_eq!(recovery::answer(), 42); }')
         result = self.rust(main, '--extern', 'recovery=' + str(output),
@@ -827,7 +909,7 @@ class RustTest(BrokerTestCase):
         digest = struct.pack('!Q', identity)
         manifest = digest + job_manifest(1, '/src', args, [
             ('/src/held.c', size, digest, 0), ('/src/marker', 1, digest, 1)])
-        net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
+        net = socket.create_connection((self.worker_address, self.ports[0]), timeout=5)
         self.addCleanup(net.close)
         net.sendall(struct.pack('!II', 0x54000300, len(manifest)) + manifest)
         return net
@@ -835,13 +917,12 @@ class RustTest(BrokerTestCase):
     def test_shared_inputs_survive_cancel_and_eviction_and_are_read_only(self):
         import select
         import xxhash
-        helper = runpy.run_path(str(self.build / 'distcc-rust'))
         source, payload = self.work / 'shared.rs', self.work / 'shared.bin'
         source.write_text('pub fn size() -> usize { include_bytes!("shared.bin").len() }')
         payload.write_bytes(b'abcde' * (1024 * 1024))
         output = self.work / 'libshared.rlib'
-        job, inputs, outdir, outputs = helper['plan'](self.rustc,
-            ['--crate-name=shared', '--crate-type=rlib', str(source), '-o', str(output)], self.work)
+        marker = self.work/'ready'
+        marker.write_text('wait until the owning uploader disconnects')
         # This worker fixture reads its own mount table, which deliberately
         # cannot be supplied by the client's dependency scanner.
         source.write_text(source.read_text() + '''
@@ -852,49 +933,28 @@ pub fn read_only() -> bool {
     })
 }
 ''')
-        inputs[source] = helper['stamp'](source.stat())
-        metadata, snapshots = helper['metadata'](job, inputs, self.work)
-        manifest_index = len(inputs)
-
-        def send(net, kind, data):
-            net.sendall(struct.pack('!II', kind, len(data)) + data)
-
-        def frame(net):
-            def read(size):
-                result = bytearray()
-                while len(result) < size:
-                    data = net.recv(size - len(result))
-                    self.assertTrue(data, 'unexpected connection EOF')
-                    result.extend(data)
-                return bytes(result)
-            kind, size = struct.unpack('!II', read(8))
-            return kind, read(size)
-
-        def upload(net, index):
-            data = (snapshots / str(index)).read_bytes()
-            for offset in range(0, len(data) or 1, 256 * 1024):
-                chunk = data[offset:offset + 256 * 1024]
-                final = offset + len(chunk) == len(data)
-                send(net, 0x54000302 | (0x20000 if final else 0),
-                     struct.pack('!II', index, len(chunk)) + chunk)
-
+        # The probe observes the client's /proc; the mount table is a worker runtime file.
+        # Use a cfg to defer that expression until the isolated compilation.
+        text = source.read_text().replace('pub fn read_only()', '#[cfg(worker_view)] pub fn read_only()')
+        source.write_text(text)
+        body, paths = self.wire_plan(source, flags=['--cfg','worker_view'], extra=[marker])
+        inputs, manifest_index = paths[:-1], len(paths)-1
         sockets = []
         held = None
         for identity in range(1, 4):
-            net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=15)
+            net = socket.create_connection((self.worker_address, self.ports[0]), timeout=15)
             self.addCleanup(net.close)
             sockets.append(net)
             # The planner's scheduling hint is consumed locally, before the
             # transport encodes the unchanged worker job description.
-            send(net, 0x54000300, struct.pack('!Q', identity) +
-                 metadata.read_bytes()[struct.calcsize('!QI'):])
+            self.send(net, 0x54000300, struct.pack('!Q', identity) + body)
             if identity == 1:
-                kind, requested = frame(net)
+                kind, requested = self.frame(net)
                 self.assertEqual(kind, 0x54000301)
                 for index in range(len(requested) * 8):
                     if not requested[index // 8] & (1 << (index % 8)): continue
                     if index != manifest_index:
-                        upload(net, index)
+                        self.upload(net, paths[index].read_bytes(), index)
                 deadline = time.monotonic() + 10
                 while True:
                     roots = list(self.root.glob('distcc-tcp-*'))
@@ -907,7 +967,7 @@ pub fn read_only() -> bool {
                 # Leave only 8 MiB of unreserved capacity. The other jobs fit
                 # only if admission counts shared files as already stored.
                 held = self.reserve_input_space(999)
-                self.assertEqual(frame(held), (0x54000301, b'\x02'))
+                self.assertEqual(self.frame(held), (0x54000301, b'\x02'))
 
         deadline = time.monotonic() + 10
         relative = str(payload).lstrip('/')
@@ -934,32 +994,14 @@ pub fn read_only() -> bool {
         sockets[0].close()
         promoted = select.select(sockets[1:], [], [], 5)[0]
         self.assertEqual(len(promoted), 1)
-        kind, requested = frame(promoted[0])
+        kind, requested = self.frame(promoted[0])
         self.assertEqual(kind, 0x54000301)
         self.assertEqual(int.from_bytes(requested, 'little'), 1 << manifest_index)
-        upload(promoted[0], manifest_index)
-        codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
+        self.upload(promoted[0], marker.read_bytes(), manifest_index)
         for identity, net in enumerate(sockets[1:], 2):
-            kind, description = frame(net)
-            self.assertEqual(kind, 0x54000303)
-            status, mode, *sizes = struct.unpack('!II4Q', description[:40])
-            buffers = [bytearray() for _ in sizes]
-            while True:
-                kind, data = frame(net)
-                if kind == 0x54000305:
-                    self.assertEqual(len(data), 96)
-                    self.assertEqual(data[:8], struct.pack('!Q', identity))
-                    break
-                self.assertEqual(kind & ~0x30000, 0x54000304)
-                index, plain = struct.unpack('!II', data[:8])
-                buffers[index].extend(codec.decode(data[8:], plain) if kind & 0x10000 else data[8:])
-            self.assertEqual(status, 0, buffers[0].decode(errors='replace'))
-            self.assertEqual(list(map(len, buffers)), sizes)
-            received = self.work / f'result-{identity}'
-            received.mkdir()
-            artifact = received / 'shared-result.tar'
-            artifact.write_bytes(buffers[2])
-            helper['install_outputs'](artifact, job, outdir, outputs, received)
+            status, err, outputs = self.wire_result(net, identity)
+            self.assertEqual(status, 0, err)
+            output.write_bytes(outputs['libwire.rlib'])
             main = self.work / 'shared-main.rs'
             main.write_text(f'fn main() {{ assert!(shared::read_only()); assert_eq!(shared::size(), {payload.stat().st_size}); }}')
             result = self.rust(main, '--extern', 'shared=' + str(output), '-o', self.work / 'shared-check', remote=False)
@@ -1021,127 +1063,70 @@ pub fn read_only() -> bool {
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('distcc-rust: compiled on', result.stderr)
 
-    def test_changed_snapshot_is_rejected(self):
-        helper = runpy.run_path(str(self.build / 'distcc-rust'))
-        source = self.work / 'changing.rs'
-        source.write_text('pub fn answer() -> u32 { 1 }')
-        job, inputs, _, _ = helper['plan'](self.rustc, ['--crate-type=rlib', str(source)], self.work)
-        source.write_text('pub fn answer() -> u32 { 2 }')
-        with self.assertRaises(helper['LocalOnly']):
-            helper['metadata'](job, inputs, self.work)
+    def test_response_files_expand_recursively_and_refresh_on_change(self):
+        src = self.work/'response.rs'
+        src.write_text('#[cfg(good)] pub fn answer() -> u32 { 42 }')
+        inner = self.work/'inner args'
+        inner.write_text('--cfg\ngood\n')
+        outer = self.work/'outer'
+        output = self.work/'libresponse.rlib'
+        outer.write_text('\n'.join(['@'+str(inner),'--crate-type=rlib',str(src),'-o',str(output)])+'\n')
+        result = self.rust('@'+str(outer))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('compiled on', result.stderr)
+        quoted = self.work/'quoted'
+        quoted.write_text(shlex.join(['--crate-type=rlib','--cfg','good',str(src),'-o',str(output)]))
+        result = self.rust('-Zshell-argfiles','@shell:'+str(quoted), env=dict(self.env,RUSTC_BOOTSTRAP='1'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('compiled on', result.stderr)
+        compiler = self.work/'rustc'
+        compiler.write_text('#!/bin/sh\ncase " $* " in *" -Zbinary-dep-depinfo "*) echo --cfg=changed > '
+                            + shlex.quote(str(inner)) + ';; esac\nexec '+shlex.quote(self.rustc)+' "$@"\n')
+        compiler.chmod(0o755)
+        self.rustc = str(compiler)
+        result = self.rust('@'+str(outer))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('input changed:', result.stderr)
+        self.assertNotIn('compiled on', result.stderr)
 
     def test_worker_refuses_unknown_build_without_compiling(self):
-        helper = runpy.run_path(str(self.build / 'distcc-rust'))
-        source = self.work / 'version.rs'
-        source.write_text('pub fn answer() -> u32 { 1 }')
-        output = self.work / 'libversion.rlib'
-        job, inputs, outdir, outputs = helper['plan'](self.rustc,
-            ['--crate-name=version', '--crate-type=rlib', str(source), '-o', str(output)], self.work)
-        job['compiler'] = dict(version='rustc 0.0.0 (different build)', commit='different', llvm='0.0.0')
-        metadata, snapshots = helper['metadata'](job, inputs, self.work)
-        artifact = self.work / 'result.tar'
-        result = subprocess.run([str(self.build / 'distcc'), '--file-job', str(metadata),
-                                 str(snapshots), str(artifact)], env=self.env,
-                                capture_output=True, text=True, timeout=90)
-        self.assertEqual(result.returncode, 121, result.stderr)
-        self.assertIn('worker has no matching Rust toolchain', result.stderr)
-        self.assertNotIn('E0514', result.stderr)
-        self.assertFalse(artifact.exists())
-        self.assertFalse(output.exists())
+        source = self.work/'unknown.rs'
+        source.write_text('pub fn unknown() {}')
+        status, err, outputs = self.raw_compile(source, requested='rustc unknown build')
+        self.assertEqual(status, 121, err)
+        self.assertIn('worker has no matching Rust toolchain', err)
+        self.assertFalse(outputs)
 
     def test_worker_selects_matching_build_without_incompatible_attempt(self):
-        helper = runpy.run_path(str(self.build / 'distcc-rust'))
-        selected = helper['identity'](self.rustc)[0]
-        alternatives = [path for root, pattern in ((Path('/usr/lib/rust'), '*/bin/rustc'),
-                                                   (Path('/opt'), 'rust-bin-*/bin/rustc'))
-                        for path in root.glob(pattern)
-                        if helper['identity'](path)[0] != selected]
-        if not alternatives:
-            self.skipTest('a second Rust metadata version is required')
-        incompatible = alternatives[0]
-        self.addCleanup(self.restart_server, self.build / 'distccd')
-        for diagnostic in ('json', 'human'):
-            with self.subTest(diagnostic=diagnostic):
-                work = self.work / diagnostic
-                work.mkdir()
-                source = work / 'library.rs'
-                source.write_text('pub fn answer() -> String { String::from("compatible") }')
-                output = work / 'libmetadata.rlib'
-                job, inputs, outdir, outputs = helper['plan'](self.rustc,
-                    ['--crate-name=metadata', '--crate-type=rlib', '--error-format=' + diagnostic,
-                     '--color=always', str(source), '-o', str(output)], work)
-                metadata, snapshots = helper['metadata'](job, inputs, work)
-                artifact = work / 'result.tar'
-                command = [str(self.build / 'distcc'), '--file-job', str(metadata),
-                           str(snapshots), str(artifact)]
-                self.restart_server(self.build / 'distccd', DISTCCD_RUSTC=str(incompatible))
-                result = subprocess.run(command, env=self.env, capture_output=True,
-                                        text=True, timeout=90)
-                self.assertEqual(result.returncode, 121, result.stderr)
-                self.assertNotIn('E0514', result.stderr)
-                self.assertFalse(artifact.exists())
-                # Capability refusal is a deliberate local route even with
-                # DISTCC_FALLBACK=0; compilation errors still remain failures.
-                result = self.rust('--crate-name=metadata', '--crate-type=rlib',
-                                   source, '-o', output)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('local: worker has no matching Rust toolchain', result.stderr)
-                self.assertNotIn('compiled on', result.stderr)
-                self.restart_server(self.build / 'distccd',
-                                    DISTCCD_RUSTC=os.pathsep.join((str(incompatible), self.rustc)))
-                result = subprocess.run(command, env=self.env, capture_output=True,
-                                        text=True, timeout=90)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertNotIn('E0514', result.stderr)
-                self.assertIn('distcc-rust: compiled on', result.stderr)
-                helper['install_outputs'](artifact, job, outdir, outputs, work)
-                main = work / 'main.rs'
-                main.write_text('fn main() { assert_eq!(metadata::answer(), "compatible"); }')
-                executable = work / 'linked'
-                result = self.rust(main, '--extern', 'metadata=' + str(output),
-                                   '-o', executable, remote=False)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                subprocess.run([executable], check=True, timeout=5)
-
-                # A matching identity is necessary, not permission to hide a
-                # real compiler rejection (for example mixed dependency builds).
-                job['compiler'] = helper['identity'](incompatible)[0]
-                mixed = work / 'mixed'
-                mixed.mkdir()
-                metadata, snapshots = helper['metadata'](job, inputs, mixed)
-                artifact.unlink()
-                result = subprocess.run([str(self.build/'distcc'), '--file-job', str(metadata),
-                                         str(snapshots), str(artifact)], env=self.env, capture_output=True,
-                                        text=True, timeout=90)
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn('E0514', result.stderr)
-                self.assertFalse(artifact.exists())
+        other = next((p for p in Path('/usr/lib/rust').glob('*/bin/rustc')
+                      if self.version(p) != self.version(self.rustc)), None)
+        if not other: self.skipTest('a second installed Rust compiler is required')
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        src = self.work/'version.rs'
+        src.write_text('pub fn answer() -> u32 { 42 }')
+        self.restart_server(self.build/'distccd', DISTCCD_RUSTC=str(other))
+        r = self.rust('--crate-type=rlib', src)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('local: worker has no matching Rust toolchain', r.stderr)
+        self.restart_server(self.build/'distccd', DISTCCD_RUSTC=os.pathsep.join((str(other), self.rustc)))
+        r = self.rust('--crate-type=rlib', src)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('compiled on', r.stderr)
+        src.write_text(src.read_text()+' // mixed metadata')
+        status, err, outputs = self.raw_compile(src, requested=self.version(other))
+        self.assertEqual(status, 1, err)
+        self.assertIn('E0514', err)
+        self.assertFalse(outputs)
 
     def test_worker_build_identity_is_not_release_number(self):
-        helper = runpy.run_path(str(self.build / 'distcc-rust'))
-        selected = helper['identity'](self.rustc)[0]
-        vendor = dict(selected, version=selected['version'] + ' (vendor)')
-        select = helper['worker_compilers']
-        with mock.patch.dict(os.environ, DISTCCD_RUSTC=self.rustc), \
-             mock.patch.dict(select.__globals__, identity=lambda path: (vendor, 'host')):
-            self.assertEqual(list(select(selected)), [])
-            self.assertEqual(list(select(vendor)), [Path(self.rustc).resolve()])
+        src = self.work/'vendor.rs'
+        src.write_text('pub fn vendor() {}')
+        ident = self.version(self.rustc).replace('\n', ' (vendor)\n', 1)
+        status, _, outputs = self.raw_compile(src, requested=ident)
+        self.assertEqual(status, 121)
+        self.assertFalse(outputs)
 
-    def test_worker_ignores_interrupted_distributed_tree(self):
-        helper = runpy.run_path(str(self.build/'distcc-rust'))
-        selected = helper['identity'](self.rustc)[0]
-        root = self.work/('rust-distcc-' + 'a'*64)
-        (root/'bin').mkdir(parents=True)
-        compiler = root/'bin/rustc'
-        version = subprocess.check_output([self.rustc, '-vV'], text=True)
-        compiler.write_text('#!/bin/sh\nprintf %s ' + shlex.quote(version) + '\n')
-        compiler.chmod(0o700)
-        with mock.patch.dict(os.environ, DISTCCD_RUSTC=str(compiler)):
-            self.assertEqual(list(helper['worker_compilers'](selected)), [])
-            (root/'.distcc-complete').write_text('b'*64)
-            self.assertEqual(list(helper['worker_compilers'](selected)), [])
-            (root/'.distcc-complete').write_text('a'*64 + '\n')
-            self.assertEqual(list(helper['worker_compilers'](selected)), [compiler])
+
 
     def test_distributed_runtime_loader_executes_real_compiler(self):
         original = Path(self.rustc).resolve()
@@ -1157,12 +1142,16 @@ pub fn read_only() -> bool {
                                          env=dict(os.environ, LC_ALL='C'))
         loader, = re.findall(r'^\s*(/\S+) \(', loaded, re.M)
         (root/'distcc-runtime/ld.so').symlink_to(loader)
-        (root/'.distcc-complete').write_text('c'*64 + '\n')
         self.restart_server(self.build/'distccd', DISTCCD_RUSTC=str(root/'bin/rustc'))
         self.addCleanup(self.restart_server, self.build/'distccd')
         source = self.work/'runtime.rs'
         source.write_text('pub fn answer() -> String { String::from("runtime") }')
         output = self.work/'libruntime.rlib'
+        for marker in (None, 'b'*64):
+            if marker: (root/'.distcc-complete').write_text(marker+'\n')
+            r = self.rust('--crate-type=rlib', source, '-o', output)
+            self.assertIn('local: worker has no matching Rust toolchain', r.stderr)
+        (root/'.distcc-complete').write_text('c'*64 + '\n')
         result = self.rust('--crate-type=rlib', source, '-o', output)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('compiled on', result.stderr)
@@ -1172,19 +1161,12 @@ pub fn read_only() -> bool {
         subprocess.run([self.work/'main'], check=True, timeout=5)
 
     def test_worker_does_not_retry_source_errors(self):
-        helper = runpy.run_path(str(self.build / 'distcc-rust'))
-        source = self.work / 'error.rs'
-        source.write_text('#[cfg(broken)] compile_error!("original diagnostic");')
-        job, inputs, _, _ = helper['plan'](self.rustc,
-            ['--crate-type=rlib', str(source)], self.work)
-        job['args'] += ['--cfg', 'broken']
-        metadata, snapshots = helper['metadata'](job, inputs, self.work)
-        result = subprocess.run([str(self.build / 'distcc'), '--file-job', str(metadata),
-                                 str(snapshots), str(self.work / 'result.tar')],
-                                env=self.env, capture_output=True, text=True, timeout=90)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('original diagnostic', result.stderr)
-        self.assertNotIn('E0514', result.stderr)
+        src = self.work/'error.rs'
+        src.write_text('#[cfg(broken)] compile_error!("original diagnostic");')
+        status, err, outputs = self.raw_compile(src, flags=['--cfg','broken'])
+        self.assertEqual(status, 1, err)
+        self.assertIn('original diagnostic', err)
+        self.assertFalse(outputs)
 
 
 if __name__ == '__main__':

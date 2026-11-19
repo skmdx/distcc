@@ -28,6 +28,7 @@
 #include "tcp_job.h"
 #include "frontend_fs.h"
 #include "tcp_async.h"
+#include "rust_job.h"
 
 enum phase { PREPARING, RUNNING, RETURNING };
 struct packet {
@@ -677,8 +678,19 @@ static int begin(struct dcc_tcp_server *s, struct dcc_tcp_frame *f)
     if (s->job || s->phase != PREPARING || f->size <= 8 || !(s->run.id = dcc_tcp_get64(f->data))) return -1;
     s->begun_at = monotonic_ns();
     s->metadata = dcc_job_memfd("distcc-tcp-manifest");
-    if (s->metadata < 0 || dcc_writex(s->metadata, f->data + 8, f->size - 8) ||
-        dcc_job_decode_buffer(f->data + 8, f->size - 8, &s->job)) return -1;
+    if (s->metadata < 0 || dcc_job_decode_buffer(f->data + 8, f->size - 8, &s->job)) return -1;
+    if (s->job->kind == DCC_JOB_RUST) {
+        /* The receiver owns the input table and prepares the tree. The
+         * execution process only needs the compiler command and its cwd. */
+        struct dcc_job execution = *s->job;
+        execution.count = 0;
+        size_t size;
+        unsigned char *command = dcc_job_encode_buffer(&execution, &size);
+        if (!command) return -1;
+        int ret = dcc_writex(s->metadata, command, size);
+        free(command);
+        if (ret) return -1;
+    } else if (dcc_writex(s->metadata, f->data + 8, f->size - 8)) return -1;
     if (f->fd_plus_one) {
         struct stat st;
         int fd = f->fd_plus_one - 1;
@@ -828,6 +840,38 @@ void dcc_tcp_server_lost(struct dcc_tcp_server *s)
         if (s->socket < 0) dcc_tcp_server_free(s);
     }
 }
+/* The worker creates this directory itself in the private job tree. Open
+ * each output before returning that tree to the asynchronous cleanup queue. */
+static int retain_named(struct dcc_tcp_server *s, uint64_t *bytes)
+{
+    struct dcc_job_result *r = &s->result;
+    char path[PATH_MAX];
+    size_t header = 0;
+    if (snprintf(path, sizeof(path), "%s%s", s->run.root, DCC_RUST_OUT) >= (int)sizeof(path)) return -1;
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+    int ret = -1;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (!entry) { ret = errno || !r->named_count ? -1 : 0; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        header += 13 + strlen(entry->d_name);
+        if (header > DCC_TCP_CHUNK) break;
+        void *next = realloc(r->named, (r->named_count + 1) * sizeof(*r->named));
+        if (!next) break;
+        r->named = next;
+        struct dcc_named_output *f = &r->named[r->named_count++];
+        *f = (struct dcc_named_output){.fd = openat(dirfd(dir), entry->d_name, O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW)};
+        struct stat st;
+        if (f->fd < 0 || fstat(f->fd, &st) || !S_ISREG(st.st_mode) ||
+            (uint64_t)st.st_size > DCC_TCP_BYTES - *bytes || !(f->name = strdup(entry->d_name))) break;
+        f->size = st.st_size; f->mode = st.st_mode & 0777;
+        *bytes += f->size;
+    }
+    closedir(dir);
+    return ret;
+}
 void dcc_tcp_server_finished(struct dcc_tcp_server *s, const struct dcc_tcp_finished *r,
                              int *fds, unsigned count)
 {
@@ -848,6 +892,7 @@ void dcc_tcp_server_finished(struct dcc_tcp_server *s, const struct dcc_tcp_fini
         s->result.size[i] = r->size[i];
     }
     if (used != count) goto fail;
+    if (s->job->kind == DCC_JOB_RUST && !r->status && retain_named(s, &bytes)) goto fail;
     /* Result FDs now own the output inodes. Input lifetime ends here, not
      * when a slow receiver eventually consumes the last result byte. */
     s->memory_class = dcc_resource_class(s->job);
@@ -886,27 +931,45 @@ static int publish_result(struct dcc_tcp_server *s)
     dcc_tcp_put64(description + 48, s->result.queue_ns);
     dcc_tcp_put64(description + 56, s->result.execute_ns);
     dcc_tcp_put64(description + 64, s->result.cpu_ns);
-    return queue(s, DCC_TCP_RESULT, description, sizeof(description));
+    if (queue(s, DCC_TCP_RESULT, description, sizeof(description))) return -1;
+    if (s->result.named_count) {
+        size_t offset = 0;
+        for (unsigned i = 0; i < s->result.named_count; ++i) {
+            const struct dcc_named_output *f = s->result.named + i;
+            dcc_tcp_put64(s->buffer + offset, f->size);
+            dcc_tcp_put32(s->buffer + offset + 8, f->mode);
+            size_t name = strlen(f->name) + 1;
+            memcpy(s->buffer + offset + 12, f->name, name);
+            offset += 12 + name;
+        }
+        return queue(s, DCC_TCP_OUTPUT_NAMES, s->buffer, offset);
+    }
+    return 0;
+}
+static uint64_t output_size(struct dcc_job_result *r, unsigned i)
+{
+    return i < DCC_JOB_RESULT_COUNT ? r->size[i] : r->named[i-DCC_JOB_RESULT_COUNT].size;
 }
 static void encode_output(void *argument)
 {
     struct dcc_tcp_server *s = argument;
     unsigned i = s->output_index;
-    uint64_t left = s->result.size[i] - s->output_offset;
+    uint64_t left = output_size(&s->result, i) - s->output_offset;
+    int fd = i < DCC_JOB_RESULT_COUNT ? s->result.fd[i] : s->result.named[i-DCC_JOB_RESULT_COUNT].fd;
     size_t amount = left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK;
     struct packet *p = calloc(1, sizeof(*p));
     if (!p) return;
     p->data = malloc(amount + 16);
     /* RETURNING no longer decodes inputs or filesystem replies. The server's
      * existing scratch is exclusive to this encoder; queued packets own data. */
-    if (!p->data || !dcc_tcp_file_chunk(DCC_TCP_OUTPUT, i, s->result.fd[i],
+    if (!p->data || !dcc_tcp_file_chunk(DCC_TCP_OUTPUT, i, fd,
             s->output_offset, amount, amount == left, 1, p->data, s->buffer, &p->size)) {
         free(p->data); free(p); return;
     }
     p->header_size = p->size;
     p->file = -1;
     if (p->size == 16) {
-        p->file = s->result.fd[i]; p->file_left = amount; p->file_offset = s->output_offset;
+        p->file = fd; p->file_left = amount; p->file_offset = s->output_offset;
     }
     unsigned char *compact = realloc(p->data, p->size);
     if (!compact) { free(p->data); free(p); return; }
@@ -933,10 +996,10 @@ static void output_complete(void *argument)
 }
 static int output_available(struct dcc_tcp_server *s)
 {
-    for (unsigned i = s->output_index; i < DCC_JOB_RESULT_COUNT; ++i) {
-        uint64_t left = s->result.size[i] - (i == s->output_index ? s->output_offset : 0);
+    for (unsigned i = s->output_index; i < DCC_JOB_RESULT_COUNT + s->result.named_count; ++i) {
+        uint64_t left = output_size(&s->result, i) - (i == s->output_index ? s->output_offset : 0);
         if (!left) continue;
-        size_t amount = s->local ? 12 : (left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK) + 16;
+        size_t amount = s->local && i < DCC_JOB_RESULT_COUNT ? 12 : (left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK) + 16;
         return amount <= DCC_TCP_BYTES - retained;
     }
     return 1;
@@ -946,11 +1009,11 @@ static int output(struct dcc_tcp_server *s)
     if (s->work.run) return 0;
     if (s->head && s->head->next) return 0;
     if (!output_available(s)) return 0;
-    while (s->output_index < DCC_JOB_RESULT_COUNT) {
+    while (s->output_index < DCC_JOB_RESULT_COUNT + s->result.named_count) {
         unsigned i = s->output_index;
-        uint64_t left = s->result.size[i] - s->output_offset;
+        uint64_t left = output_size(&s->result, i) - s->output_offset;
         if (!left) { ++s->output_index; s->output_offset = 0; continue; }
-        if (s->local) {
+        if (s->local && i < DCC_JOB_RESULT_COUNT) {
             unsigned char index[4];
             dcc_tcp_put32(index, i);
             if (queue(s, DCC_TCP_RESULT_FD, index, sizeof(index))) return -1;

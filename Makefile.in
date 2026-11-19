@@ -75,6 +75,7 @@ include_server_builddir = $(builddir)/_include_server
 DIR_DEFS = -DLIBDIR="\"${prefix}/lib\"" -DSYSCONFDIR="\"${sysconfdir}\"" -DICONDIR="\"${icondir}\""
 DIR_DEFS += -DCPP_LOOKUP_LIBRARY='"$(libdir)/distcc/cpp_lookup.so"'
 DIR_DEFS += -DGCC_PLAN_LIBRARY='"$(libdir)/distcc/gcc_plan.so"'
+DIR_DEFS += -DRUST_NATIVE_LIBRARY='"$(libdir)/distcc/distcc-rust-native.so"'
 CPP_LOOKUP_TARGET = @CPP_LOOKUP_TARGET@
 
 # arguments to pkgconfig
@@ -224,7 +225,6 @@ update_distcc_symlinks_PY = update-distcc-symlinks.py
 dist_extra =							\
 	distcc-link \
 	distcc-multi \
-	distcc-rust \
 	distcc-thinlto \
 	distcc-offload-link \
 	distcc_lto.py \
@@ -238,6 +238,7 @@ dist_extra =							\
 	distcc_job.py \
 	distcc_python.py \
 	src/rust_native.cc \
+	src/rust_client.cc src/rust_worker.cc src/rust_common.h src/rust_job.h \
 	src/clang_driver.cc \
 	src/argv_file.h \
 	src/clang_inputs.h \
@@ -418,6 +419,8 @@ distcc_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_front
 distccd_obj += src/tcp_server.o src/tcp_worker.o src/tcp_async.o src/clang_worker.o src/gcc_files.o src/plan_memo.o
 h_compile_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o src/plan_memo.o
 distcc_obj += src/remote_job.o src/file_cache.o
+distcc_obj += src/rust_client.o
+distccd_obj += src/rust_worker.o
 h_compile_obj += src/remote_job.o src/file_cache.o
 
 # All source files, for the purposes of building the distribution
@@ -561,7 +564,10 @@ check_include_server_PY = \
 
 ## NOTE: "all" must be the first (default) rule, aside from patterns.
 
-all: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) $(LINKER_WRAPPER_TARGET) $(LTO_TARGETS) gcc_plan.so pump include-server
+all: $(bin_PROGRAMS) $(sbin_PROGRAMS) distcc-rust $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) $(LINKER_WRAPPER_TARGET) $(LTO_TARGETS) gcc_plan.so pump include-server
+
+distcc-rust: distcc@EXEEXT@
+	ln -sf distcc@EXEEXT@ $@
 
 llvm-linker-wrapper/.patched: $(srcdir)/src/llvm-linker-wrapper.patch
 	mkdir -p llvm-linker-wrapper
@@ -610,6 +616,9 @@ install-lto: $(LTO_TARGETS)
 src/rust_native.o: $(srcdir)/src/rust_native.cc
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -c $< -o $@
 
+src/rust_client.o src/rust_worker.o: src/%.o: $(srcdir)/src/%.cc $(srcdir)/src/rust_common.h $(srcdir)/src/rust_job.h $(srcdir)/src/job.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -std=gnu++17 -c $< -o $@
+
 distcc-rust-native.so: src/rust_native.o
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -shared $(LDFLAGS) -o $@ $< -ldl
 
@@ -623,7 +632,7 @@ gcc_plan.so: $(srcdir)/src/gcc_plan.cc $(srcdir)/src/gcc_dependencies.cc $(srcdi
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=gnu++17 -fPIC -fvisibility=hidden -shared $(LDFLAGS) -o $@ $(srcdir)/src/gcc_plan.cc $(srcdir)/src/gcc_dependencies.cc $(srcdir)/src/native_worker.cc src/argv_file.pic.o -ldl
 
 CLIENT_CONTRACT_SOURCES = src/hosts.c src/hostfile.c src/loadfile.c src/lock.c src/io.c src/tempfile.c \
-	src/trace.c src/util.c src/argutil.c src/rpc.c src/filename.c src/snprintf.c src/cleanup.c
+	src/trace.c src/util.c src/argutil.c src/rpc.c src/filename.c src/snprintf.c src/cleanup.c @ZEROCONF_COMMON_OBJS@
 # Host configuration must link without the client-only scheduler, as in distccd.
 h_client_hotpaths: test/client_hotpaths.c src/tcp_client.c src/tcp_job.c src/tcp_job.h src/local_clang.c src/broker.c src/broker_session.c src/broker_protocol.h src/broker_session.h src/epoll_set.h src/lane_schedule.h src/workload.h src/argv_file.c src/frontend_fs.c src/frontend_identity.h $(CLIENT_CONTRACT_SOURCES)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/tcp_job.c src/local_clang.c src/broker.c src/broker_session.c src/argv_file.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
@@ -670,7 +679,7 @@ src/tcp_async.o src/tcp_server.o src/prefork.o src/stats.o: src/tcp_async.h
 src/tcp_async.o: CFLAGS += -pthread
 
 distcc@EXEEXT@: $(distcc_obj)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(distcc_obj) $(LIBS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $(distcc_obj) $(LIBS)
 
 distccd@EXEEXT@: $(distccd_obj)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -pthread -o $@ $(distccd_obj) $(LIBS) @FUSE_LIBS@
@@ -1145,7 +1154,7 @@ benchmark:
 clean: clean-autoconf clean-lzo clean-include-server
 	rm -f src/*.[od]
 	rm -f test/*.pyc
-	rm -f $(check_PROGRAMS) $(bin_PROGRAMS) $(sbin_PROGRAMS)
+	rm -f $(check_PROGRAMS) $(bin_PROGRAMS) $(sbin_PROGRAMS) distcc-rust
 	rm -f cpp_lookup.so distcc-rust-native.so clang_driver.so gcc_plan.so src/argv_file.pic.o
 	rm -rf "$(LTO_BUILD)"
 	rm -f distcc-linker-wrapper
@@ -1276,7 +1285,7 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	$(mkinstalldirs) "$(DESTDIR)$(sbindir)"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-link" "$(DESTDIR)$(bindir)/distcc-link"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-multi" "$(DESTDIR)$(bindir)/distcc-multi"
-	$(INSTALL_SCRIPT) "$(srcdir)/distcc-rust" "$(DESTDIR)$(bindir)/distcc-rust"
+	ln -sf distcc "$(DESTDIR)$(bindir)/distcc-rust"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc-thinlto"
 	$(INSTALL_SCRIPT) "$(srcdir)/distcc-offload-link" "$(DESTDIR)$(bindir)/distcc-offload-link"
 	$(INSTALL_DATA) "$(srcdir)/distcc_lto.py" "$(DESTDIR)$(bindir)/distcc_lto.py"
@@ -1290,7 +1299,6 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
 	  $(INSTALL_PROGRAM) distcc-rust-native.so "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"; \
 	fi
-	sed -i 's|^NATIVE_LIBRARY = .*|NATIVE_LIBRARY = "$(libdir)/distcc/distcc-rust-native.so"|' "$(DESTDIR)$(bindir)/distcc-rust"
 	if test -n "$(CLANG_DRIVER_TARGET)"; then \
 	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
 	  $(INSTALL_PROGRAM) clang_driver.so "$(DESTDIR)$(libdir)/distcc/clang_driver.so"; \

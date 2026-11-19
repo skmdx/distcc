@@ -55,6 +55,7 @@
 #include "implicit.h"
 #include "compile.h"
 #include "job.h"
+#include "rust_job.h"
 #include "emaillog.h"
 #include "native_worker.h"
 
@@ -288,15 +289,9 @@ int main(int argc, char **argv)
         dcc_exit(dcc_file_transfer(argv[2], argv[3], argv[4], (int)queued_fd));
     }
 
-    if (argc > 1 && (!strcmp(dcc_find_basename(argv[1]), "rustc") ||
+    if (argc > 1 && (!strcmp(compiler_name, "distcc-rust") || !strcmp(dcc_find_basename(argv[1]), "rustc") ||
                     !strncmp(dcc_find_basename(argv[1]), "rustc-", 6))) {
-        char **args = calloc(argc + 1, sizeof(*args));
-        if (!args) dcc_exit(EXIT_OUT_OF_MEMORY);
-        args[0] = (char *)"distcc-rust";
-        for (int i = 1; i < argc; ++i) args[i] = argv[i];
-        execvp(args[0], args);
-        rs_log_error("cannot execute distcc-rust: %s", strerror(errno));
-        dcc_exit(EXIT_COMPILER_MISSING);
+        dcc_exit(dcc_rust_client(argv + 1));
     }
 
     sg_level = dcc_recursion_safeguard();

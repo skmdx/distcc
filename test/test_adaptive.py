@@ -768,7 +768,7 @@ int main(void) {
     setenv("DISTCC_JOB_MEMORY", "512", 1);
     setenv("DISTCC_MEMORY_LEARNING", "1", 1);
     assert(dcc_resource_job_bytes() == 512*M);
-    struct dcc_job_input input = {.plain_size = 1024};
+    struct dcc_job_input input = {.path = "/src/main.rs", .plain_size = 1024};
     struct dcc_job job = {.kind = DCC_JOB_COMPILE, .count = 1, .inputs = &input};
     unsigned small = dcc_resource_class(&job);
     input.plain_size = 2048;
@@ -778,6 +778,15 @@ int main(void) {
     assert(small != large && pump != large);
     assert(dcc_resource_bucket(0) == 0);
     assert(dcc_resource_bucket(ULLONG_MAX) == 63);
+    struct dcc_job_input rust_files[] = {input, {.path="/deps/libfoo.rlib", .plain_size=128*M}};
+    struct dcc_job rust = {.kind=DCC_JOB_RUST, .rust.phase=DCC_RUST_CODEGEN, .count=2, .inputs=rust_files};
+    unsigned rust_class = dcc_resource_class(&rust);
+    rust_files[1].plain_size = 1;
+    assert(dcc_resource_class(&rust) == rust_class);
+    rust_files[0].plain_size = 2*M;
+    assert(dcc_resource_class(&rust) != rust_class);
+    rust.rust.phase = DCC_RUST_OPTIMIZED;
+    assert(dcc_resource_class(&rust) > rust_class + 20);
     assert(!dcc_resource_known(small));
     assert(dcc_resource_class_slots(16, small, 0) >= 2);
     assert(dcc_resource_class_slots(16, pump, 0) >= 2);

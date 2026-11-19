@@ -311,7 +311,8 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         result = self.run_command([self.build / 'distcc', '--lto-capacity'])
         self.assertEqual(result.returncode, 0, result.stderr)
         capacity = json.loads(result.stdout)
-        self.assertEqual(capacity['jobs'], 8)
+        # Each worker also admits one prepared job while its CPUs are busy.
+        self.assertEqual(capacity['jobs'], 10)
         self.assertAlmostEqual(capacity['work_rate'], 5)
         self.assertAlmostEqual(capacity['min_rate'], .25)
         result = self.run_command([self.build / 'distcc', '-j'])
@@ -326,7 +327,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
             result = self.run_command([self.build / 'distcc', '--lto-capacity'])
             self.assertEqual(result.returncode, 0, result.stderr)
             updated = json.loads(result.stdout)
-            if updated['jobs'] == 6:
+            if updated['jobs'] == 8:
                 break
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.02)

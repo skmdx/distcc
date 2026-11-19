@@ -24,6 +24,7 @@
 #include "trace.h"
 #include "workload.h"
 #include "resource.h"
+#include "rust_job.h"
 
 struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char **files,
                                  const struct dcc_snapshot_metadata *metadata)
@@ -238,11 +239,10 @@ done:
 int dcc_file_transfer(const char *metadata, const char *snapshots, const char *output, int queued_fd)
 {
     struct dcc_job *job = NULL;
-    struct dcc_hostdef *host = NULL;
     struct dcc_job_result result;
     struct dcc_work_hint hint = {0};
     char **files = NULL;
-    int lease = -1, ret = EXIT_IO_ERROR;
+    int ret = EXIT_IO_ERROR;
     int fd = open(metadata, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     uint32_t estimate[3];
     dcc_job_result_init(&result);
@@ -250,9 +250,9 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
     ret = dcc_readx(fd, estimate, sizeof(estimate));
     if (!ret) ret = dcc_job_decode(fd, sizeof(estimate), &job);
     close(fd);
-    if (ret || !dcc_job_tree(job) || !job->count) { ret = EXIT_PROTOCOL_ERROR; goto done; }
-    hint.kind = job->kind == DCC_JOB_RUST ? DCC_WORK_RUST :
-                job->kind == DCC_JOB_OFFLOAD_LINK ? DCC_WORK_OFFLOAD_LINK : DCC_WORK_THINLTO;
+    if (ret || (job->kind != DCC_JOB_THINLTO && job->kind != DCC_JOB_OFFLOAD_LINK) ||
+        !job->count) { ret = EXIT_PROTOCOL_ERROR; goto done; }
+    hint.kind = job->kind == DCC_JOB_OFFLOAD_LINK ? DCC_WORK_OFFLOAD_LINK : DCC_WORK_THINLTO;
     hint.bytes = dcc_resource_input_bytes(job);
     hint.memory_class = dcc_resource_class(job);
     hint.key = (uint64_t)ntohl(estimate[0]) << 32 | ntohl(estimate[1]);
@@ -278,12 +278,39 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
             files[i] = NULL; ret = EXIT_OUT_OF_MEMORY; goto done;
         }
     }
+    ret = dcc_transfer_prepared(job, files, output, &hint, queued_fd, &result);
+    queued_fd = -1;
+    if (ret) goto done;
+    for (unsigned i = DCC_JOB_STDERR; i <= DCC_JOB_STDOUT; ++i) {
+        struct dcc_buffer buffer = {0};
+        if ((ret = buffer_result(result.fd[i], &result, i, &buffer))) goto done;
+        ret = dcc_writex(i == DCC_JOB_STDERR ? STDERR_FILENO : STDOUT_FILENO,
+                         buffer.data, buffer.size);
+        dcc_free_buffer(&buffer);
+        if (ret) goto done;
+    }
+    if (!result.status && (ret = publish(&result.fd[DCC_JOB_OBJECT], &result,
+                                         DCC_JOB_OBJECT, output))) goto done;
+    ret = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
+done:
+    if (queued_fd >= 0) close(queued_fd);
+    dcc_job_result_free(&result);
+    if (files) { for (unsigned i = 0; job && i < job->count; ++i) free(files[i]); free(files); }
+    dcc_job_free(job);
+    return ret < 0 ? EXIT_PROTOCOL_ERROR : ret;
+}
+
+int dcc_transfer_prepared(struct dcc_job *job, char **files, const char *output,
+                          const struct dcc_work_hint *hint, int queued_fd, struct dcc_job_result *result)
+{
     unsigned failures = 0;
+    struct dcc_hostdef *host = NULL;
+    int lease = -1, ret;
     for (;;) {
-        if ((ret = dcc_broker_acquire(&host, &lease, 1, 0, &hint, &queued_fd))) goto done;
+        if ((ret = dcc_broker_acquire(&host, &lease, 1, 0, hint, &queued_fd))) goto done;
         if (!host->tcp_jobs) { ret = EXIT_PROTOCOL_ERROR; goto done; }
         dcc_broker_cpp_done(host);
-        ret = dcc_tcp_exchange(host, job, files, NULL, output, NULL, &result);
+        ret = dcc_tcp_exchange(host, job, files, NULL, output, NULL, result);
         if (!ret) break;
         /* A pooled connection can close between acquisition and BEGIN. Job
          * inputs are immutable and no result has been published: retry once
@@ -294,33 +321,19 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
             if (failures++ || ret != EXIT_IO_ERROR) goto done;
             rs_log_warning("retrying file job on a fresh connection");
         }
-        dcc_job_result_free(&result);
-        dcc_job_result_init(&result);
+        dcc_job_result_free(result);
+        dcc_job_result_init(result);
         dcc_free_hostdef(host); host = NULL;
         if (lease >= 0) dcc_broker_release(lease);
         lease = -1;
     }
-    dcc_broker_return(host, host->broker_fd, &result);
-    for (unsigned i = DCC_JOB_STDERR; i <= DCC_JOB_STDOUT; ++i) {
-        struct dcc_buffer buffer = {0};
-        if ((ret = buffer_result(result.fd[i], &result, i, &buffer))) goto done;
-        ret = dcc_writex(i == DCC_JOB_STDERR ? STDERR_FILENO : STDOUT_FILENO,
-                        buffer.data, buffer.size);
-        dcc_free_buffer(&buffer);
-        if (ret) goto done;
-    }
-    if (!result.status && (ret = publish(&result.fd[DCC_JOB_OBJECT], &result,
-                                         DCC_JOB_OBJECT, output))) goto done;
-    ret = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
-    if (!ret && getenv("DISTCC_VERBOSE") && !strcmp(getenv("DISTCC_VERBOSE"), "1"))
+    dcc_broker_return(host, host->broker_fd, result);
+    if (!result->status && getenv("DISTCC_VERBOSE") && !strcmp(getenv("DISTCC_VERBOSE"), "1"))
         fprintf(stderr, "%s: compiled on %s\n",
                 dcc_job_helper(job), host->hostname);
 done:
     if (queued_fd >= 0) close(queued_fd);
-    dcc_job_result_free(&result);
     if (host) dcc_free_hostdef(host);
     if (lease >= 0) dcc_broker_release(lease);
-    if (files) { for (unsigned i = 0; job && i < job->count; ++i) free(files[i]); free(files); }
-    dcc_job_free(job);
     return ret < 0 ? EXIT_PROTOCOL_ERROR : ret;
 }
