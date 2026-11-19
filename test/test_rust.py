@@ -1248,6 +1248,42 @@ class RustTest(BrokerTestCase):
         self.assertIn('distcc-rust: compiled on', result.stderr)
 
     @unittest.skipUnless(shutil.which('sandbox'), 'Portage sandbox required')
+    def test_portage_cargo_native_probe_in_build_tree(self):
+        source = self.work / 'caller.rs'
+        source.write_text('pub fn answer() -> u32 { '
+                          'include!(concat!("answer-", env!("SANDBOX_ON"), ".rs")) }')
+        (self.work / 'answer-1.rs').write_text('42')
+        log = self.work / 'sandbox.log'
+        env = dict(self.env, SANDBOX_LOG=str(log), SANDBOX_DEBUG_LOG=str(self.work/'sandbox.debug'))
+        # sandbox adds the machine defaults at startup. Install the package's
+        # write list for the build command, as Portage does in the ebuild phase.
+        check_sandbox = ('test "$SANDBOX_ON" = 1\n'
+                         'case "$LD_PRELOAD" in *libsandbox.so*) ;; *) exit 1;; esac\n'
+                         'exec "$@"')
+        build = ['sandbox', 'sh', '-ec', check_sandbox, 'sh', 'env', '-u', 'TMPDIR', '-u', 'T',
+                 'SANDBOX_WRITE=' + str(self.work), self.build/'distcc']
+        main = self.work / 'main.rs'
+        main.write_text('fn main() { assert_eq!(caller::answer(), 42); }')
+        # Portage can select different tracing methods for source-built and
+        # binary rustc. Both must load the native CPU and dependency hooks.
+        compilers = {Path(self.rustc).resolve(), *Path('/opt').glob('rust-bin-*/bin/rustc')}
+        for index, compiler in enumerate(sorted(compilers)):
+            with self.subTest(compiler=compiler):
+                out = self.work / f'deps-{index}'
+                out.mkdir()
+                result = subprocess.run([*build, compiler, '--crate-type=rlib', '--out-dir', out,
+                                         '-L', 'dependency=' + str(out), '-Ctarget-cpu=native', source],
+                                        cwd=self.work, env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-rust: compiled on ', result.stderr)
+                self.assertNotIn('distcc-rust: local:', result.stderr)
+                self.assertFalse(log.exists(), result.stderr)
+                executable = out / 'check'
+                subprocess.run([compiler, main, '--extern', 'caller=' + str(out/'libcaller.rlib'),
+                                '-o', executable], cwd=self.work, check=True, timeout=60)
+                subprocess.run([executable], check=True, timeout=5)
+
+    @unittest.skipUnless(shutil.which('sandbox'), 'Portage sandbox required')
     def test_dependency_probe_with_portage_sandbox(self):
         import signal
         source, library = self.work / 'sandbox.rs', self.work / 'libsandbox_test.rlib'

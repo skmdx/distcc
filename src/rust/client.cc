@@ -34,10 +34,7 @@ namespace {
 using States = std::map<fs::path, struct stat>;
 struct Work {
     fs::path dir;
-    explicit Work(fs::path parent = {}) {
-        auto base = env("TMPDIR");
-        if (parent.empty())
-            parent = base.empty() ? "/tmp" : base;
+    explicit Work(const fs::path &parent) {
         string tmp = (parent / "distcc-rust-XXXXXX").string();
         check(mkdtemp(tmp.data()) != nullptr, "Rust working directory");
         dir = fs::absolute(tmp);
@@ -407,6 +404,15 @@ struct Invocation {
         if (!single_output.empty())
             outdir = absolute_name(single_output).parent_path();
     }
+    fs::path work_parent() const {
+        auto tmp = env("TMPDIR");
+        if (!tmp.empty())
+            return tmp;
+        if (env("SANDBOX_ON") != "1")
+            return "/tmp";
+        auto phase_tmp = env("T");
+        return phase_tmp.empty() ? outdir : fs::path(phase_tmp);
+    }
     string destination(const string &spelling) {
         if (spelling == "-")
             throw Local("non-file output");
@@ -448,8 +454,7 @@ struct Invocation {
         Fd loads(dcc_job_memfd("rust-libraries")), quiet(dcc_job_memfd("rust-probe-diagnostics"));
         check(!fcntl(loads.fd, F_SETFD, 0), "trace descriptor");
         Env envs = {{"RUSTC_BOOTSTRAP", "1"},
-                    {"DISTCC_RUST_LOADS_FD", std::to_string(loads.fd)},
-                    {"LD_PRELOAD", native_library().string() + " " + env("LD_PRELOAD")}};
+                    {"DISTCC_RUST_LOADS_FD", std::to_string(loads.fd)}};
         Words cmd = compiler_command(compiler);
         cmd.insert(cmd.end(), base.begin(), base.end());
         for (auto &type : types)
@@ -463,7 +468,8 @@ struct Invocation {
         {
             ProbeSlot slot;
             envs["DISTCC_RUST_SYSROOT"] = root;
-            probe(cmd, envs, staging, trace_macro, quiet.fd);
+            if (run_probe(cmd, envs, staging, trace_macro, quiet.fd, {loads.fd}))
+                throw Local(trace_macro ? "isolated dependency expansion failed" : "dependency expansion failed");
         }
         for (const auto &dir : native_search) {
             if (runtime_path(dir, root))
@@ -658,14 +664,16 @@ string profile(const fs::path &compiler, const Work &work, const States &tool) {
                    read("/proc/sys/kernel/random/boot_id") +
                    string(reinterpret_cast<char *>(&mask), sizeof(mask));
     return memo(context, watched, [&] {
-        Env envs = {{"LD_PRELOAD", library.string() + " " + env("LD_PRELOAD")},
-                    {"DISTCC_RUST_NATIVE", work.dir},
+        Env envs = {{"DISTCC_RUST_NATIVE", work.dir},
                     {"DISTCC_RUST_NATIVE_CAPTURE", "1"}};
         Fd quiet(dcc_job_memfd("rust-native-diagnostics"));
         auto cmd = compiler_command(compiler);
         cmd.insert(cmd.end(), {"-Ctarget-cpu=native", "--print=cfg"});
-        if (run(cmd, envs, quiet.fd, quiet.fd))
-            throw Local("native CPU discovery failed");
+        if (int status = run_probe(cmd, envs, work.dir, false, quiet.fd))
+            throw std::runtime_error("native CPU discovery failed (" + std::to_string(status) + "): " +
+                                     contents(quiet.fd));
+        if (!fs::is_regular_file(work.dir / "cpu") || !fs::is_regular_file(work.dir / "features"))
+            throw std::runtime_error("rustc did not report its native CPU and features");
         return read(work.dir / "cpu") + '\0' + read(work.dir / "features");
     });
 }
@@ -908,7 +916,7 @@ int cgu_frontend(const CguRoute &route, const Invocation &inv, const fs::path &e
     } else if (responses.empty()) {
         local.insert(local.end(), inv.compiler_flags.begin(), inv.compiler_flags.end());
     } else {
-        argfile.emplace();
+        argfile.emplace(inv.work_parent());
         unsigned sequence = 0;
         string lines;
         auto flush = [&] {
@@ -1025,7 +1033,7 @@ int distributed(char **original, const Words &args, const States &responses) {
             fprintf(stderr, "distcc-rust: local: %s\n", reason.what());
         return cgu_frontend(route, inv, exe, original, responses);
     };
-    Work work;
+    Work work(inv.work_parent());
     job.rust.compiler = id.data();
     string driver = fs::path(inv.linker).filename();
     job.rust.linker = driver.data();

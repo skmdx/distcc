@@ -26,6 +26,17 @@ void Sandbox::mount(const fs::path &from, const fs::path &to, bool writable) {
 }
 Sandbox::Sandbox(Root policy, const fs::path &tree)
     : filter(namespace_filter()), args{"/usr/bin/bwrap", "--unshare-all", "--die-with-parent"} {
+    if (env("SANDBOX_ON") == "1") {
+        // Keep preloads out of namespace setup. bwrap prepares the payload
+        // environment before writing uid_map. Host probes inherit Portage's
+        // policy at exec; the other roots already use a clean environment.
+        args.insert(args.begin(), {"/usr/bin/env", "-u", "LD_PRELOAD", "SANDBOX_ON=0"});
+        if (policy == Root::Host) {
+            args.insert(args.end(), {"--setenv", "SANDBOX_ON", "1"});
+            if (const char *preload = getenv("LD_PRELOAD"))
+                args.insert(args.end(), {"--setenv", "LD_PRELOAD", preload});
+        }
+    }
     if (policy == Root::Host) {
         mount("/", "/");
         args.insert(args.end(), {"--unsetenv", "CARGO_MAKEFLAGS", "--unsetenv", "MAKEFLAGS"});
