@@ -123,9 +123,9 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
                 if (length != sizeof(request) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) ||
                     received != (request.operation == 'G' ? 7 : request.operation == 'D' || request.operation == 'S' ? 6 : 5) ||
                     (request.operation != 'C' && request.operation != 'P' && request.operation != 'L' && request.operation != 'D' &&
-                     request.operation != 'G' && request.operation != 'S') ||
+                     request.operation != 'G' && request.operation != 'S' && request.operation != 'I') ||
                     request.group > INT_MAX) return 1;
-                if (plan && request.operation == 'P') {
+                if (plan && (request.operation == 'P' || request.operation == 'I')) {
                     // Only planning runs in the serial dispatcher. Compiler children
                     // retain their own descriptor tables and working directories.
                     int cwd = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC), saved = dup(STDERR_FILENO);

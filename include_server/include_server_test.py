@@ -57,18 +57,20 @@ class IncludeServerTest(unittest.TestCase):
       self.reports.append((stream.read(), force, never))
       stream.close()
       raise
-    self.analyzer.email_sender = mock.Mock(MaybeSendEmail=report)
+    self.sender = mock.Mock(MaybeSendEmail=report)
 
   def handle(self, source):
     class StreamHandler:
-      def __init__(self):
+      def __init__(self, request, client_address, server):
         self.rfile = self.wfile = mock.Mock(fileno=lambda: 27)
-        self.request = mock.Mock()
+        self.request = request
     with (mock.patch.object(include_server.socketserver, 'StreamRequestHandler', StreamHandler),
+          mock.patch.object(include_server, '_EmailSender', return_value=self.sender),
           mock.patch.object(distcc_pump_c_extensions, 'RCwd', return_value=str(self.root)),
           mock.patch.object(distcc_pump_c_extensions, 'RArgv', return_value=(['gcc', source], 'lzo')),
           mock.patch.object(distcc_pump_c_extensions, 'XArgv') as reply):
-      include_server.DistccIncludeHandlerGenerator(self.analyzer)().handle()
+      handler = include_server.DistccIncludeHandlerGenerator(self.analyzer)
+      handler(mock.Mock(), ('localhost', 0), mock.Mock()).handle()
       return reply.call_args.args[1]
 
   def test_pch_requests_original_compilation_without_warning(self):

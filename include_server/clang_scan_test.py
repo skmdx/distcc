@@ -136,6 +136,7 @@ with tempfile.TemporaryDirectory() as directory:
       for directory in ('first', 'second'):
         root = self.root / directory
         for mode in ('1', '2'):
+          assert self.compiler is not None
           result = clang_scan.scan([self.compiler, '-DMODE='+mode, '-c', str(root/'a.c')], str(root))
           self.assertEqual(result['preamble_hit'], repeat)
           self.assertEqual(bytes(result['files'][str(root/'h.h')]), b'#define VALUE 42\n')
@@ -580,7 +581,7 @@ with tempfile.TemporaryDirectory() as directory:
     keeper = basics.ClientRootKeeper()
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
-    with mock.patch.object(clang_scan, 'scan') as frontend:
+    with mock.patch.object(clang_scan, 'scan_for_manifest') as frontend:
       analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
       self.assertIn(str(header), analyzer.realpath_map.string)
       self.assertEqual(frontend.call_count, 0)
@@ -604,7 +605,7 @@ with tempfile.TemporaryDirectory() as directory:
         self.addCleanup(keeper.CleanOutClientRoots)
         analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
         with (mock.patch.object(gcc_scan, 'scan', wraps=gcc_scan.scan) as probe,
-              mock.patch.object(clang_scan, 'scan', wraps=clang_scan.scan) as frontend):
+              mock.patch.object(clang_scan, 'scan_for_manifest', wraps=clang_scan.scan_for_manifest) as frontend):
           files = analyzer.DoCompilationCommand([gcc, '-c', str(self.source)], str(self.root), keeper)
         self.assertTrue(any(path.endswith('/gcc.h.lzo') for path in files))
         self.assertFalse(any(path.endswith('/clang.h.lzo') for path in files))
@@ -627,7 +628,7 @@ with tempfile.TemporaryDirectory() as directory:
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
     with (mock.patch.object(gcc_scan, 'scan', wraps=gcc_scan.scan) as probe,
-          mock.patch.object(clang_scan, 'scan', wraps=clang_scan.scan) as frontend):
+          mock.patch.object(clang_scan, 'scan_for_manifest', wraps=clang_scan.scan_for_manifest) as frontend):
       files = analyzer.DoCompilationCommand(command, str(self.root), keeper)
     self.assertTrue(any(path.endswith('/second/header.h.lzo') for path in files))
     self.assertEqual(frontend.call_count, 0)
@@ -687,6 +688,7 @@ with tempfile.TemporaryDirectory() as directory:
                                             str(self.root), keeper, 'lz4s')
     image = next(path for path in earlier if path.endswith('/prior.h.lz4s'))
     old_image = Path(image).read_bytes()
+    assert keeper.lease is not None
     self.addCleanup(os.close, os.dup(keeper.lease))
     native_scan = compiler_analyzer.gcc_scan.scan
     calls = []
@@ -724,6 +726,7 @@ with tempfile.TemporaryDirectory() as directory:
         original = analyzer.DoCompilationCommand(command, str(self.root), keeper, 'lz4s')
         old_image = next(path for path in original if path.endswith('/header.h.lz4s'))
         old_bytes = Path(old_image).read_bytes()
+        assert keeper.lease is not None
         self.addCleanup(os.close, os.dup(keeper.lease))
         for mapped, data in ((False, b'int hardlink;\n'), (True, b'int mmapdata;\n')):
           with alias.open('r+b') as stream:
@@ -909,7 +912,7 @@ else:
     keeper = basics.ClientRootKeeper()
     self.addCleanup(keeper.CleanOutClientRoots)
     analyzer = compiler_analyzer.CompilerAnalyzer(keeper)
-    native = clang_scan.scan
+    native = clang_scan.scan_for_manifest
     calls = []
     def mutate(*args):
       result = native(*args)
@@ -917,7 +920,7 @@ else:
       if len(calls) == 1:
         header.write_text('#include "new.h"\n')
       return result
-    with mock.patch.object(clang_scan, 'scan', side_effect=mutate):
+    with mock.patch.object(clang_scan, 'scan_for_manifest', side_effect=mutate):
       files = analyzer.DoCompilationCommand([self.compiler, '-c', str(self.source)],
                                              str(self.root), keeper, 'lz4s')
     self.assertEqual(len(calls), 2)

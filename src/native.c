@@ -185,7 +185,7 @@ int dcc_expand_native(char ***argvp, const char *input, const char *output)
     for (i = 1; argv[i]; i++) native |= native_option(argv[i]);
     if (!native) return 0;
     key = dcc_native_cache_key(argv, input, output);
-    if (key) lease = dcc_broker_memo_get(key, &text, NULL);
+    if (key) lease = dcc_broker_memo_get(key, &text, NULL, NULL);
     if (text) {
         rs_trace("native expansion cache hit");
         options = unpack_options(text, &clang);

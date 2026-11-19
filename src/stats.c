@@ -79,16 +79,16 @@ struct stats_s {
     int io_rate; /* read/write sectors per second */
     int compile_timeseries[300]; /* 300 3-sec time intervals */
 
-    /*
-     * linked list of statsdata. This is to keep the last
-     * couple of minutes of compile stats for analysis.
-     */
-    struct statsdata *sd_root;
+    /* Completed job occupancy per UTC minute. Keep the delayed 15-minute
+     * window, its one-minute reporting lag, and the current partial minute. */
+    struct {
+        time_t minute;
+        int64_t usec;
+    } occupancy[17];
 } dcc_stats;
 
 struct statsdata {
     enum stats_e type;
-    struct statsdata *next;
 
     /* used only for STATS_COMPILE_OK */
     struct timeval start;
@@ -158,11 +158,6 @@ void dcc_stats_compile_ok(char *compiler, char *filename, struct timeval start,
  * tracks the compile times
  */
 static void dcc_stats_update_compile_times(struct statsdata *sd) {
-    struct statsdata *prev_sd = NULL;
-    struct statsdata *curr_sd = NULL;
-    struct statsdata *new_sd;
-    time_t two_min_ago = time(NULL) - 120;
-
     /* Record file with longest runtime */
     if (dcc_stats.longest_job_time < sd->time) {
         dcc_stats.longest_job_time = sd->time;
@@ -172,101 +167,37 @@ static void dcc_stats_update_compile_times(struct statsdata *sd) {
                 MAX_FILENAME_LEN);
     }
 
-    /* store stats for compile time calcs */
-    new_sd = malloc(sizeof(struct statsdata));
-    memcpy(new_sd, sd, sizeof(struct statsdata));
-    new_sd->next = dcc_stats.sd_root;
-    dcc_stats.sd_root = new_sd;
-
-
-    /* drop elements older than 2min */
-    curr_sd = dcc_stats.sd_root;
-    while (curr_sd != NULL) {
-        if (curr_sd->stop.tv_sec < two_min_ago) {
-            /* delete the stat */
-            if (prev_sd == NULL) {
-                dcc_stats.sd_root = curr_sd->next;
-            } else {
-                prev_sd->next = curr_sd->next;
-            }
-            free(curr_sd);
-            curr_sd = prev_sd->next;
-        } else {
-            /* we didn't delete anything. move forward by one */
-            prev_sd = curr_sd;
-            curr_sd = curr_sd->next;
+    const time_t minute = time(NULL) / 60;
+    const int64_t start = (int64_t)sd->start.tv_sec * 1000000 + sd->start.tv_usec;
+    const int64_t stop = (int64_t)sd->stop.tv_sec * 1000000 + sd->stop.tv_usec;
+    if (stop <= start) return;
+    time_t first = sd->start.tv_sec / 60, last = sd->stop.tv_sec / 60;
+    if (first < minute - 16) first = minute - 16;
+    if (last > minute) last = minute;
+    for (time_t t = first; t <= last; ++t) {
+        if (t < 0) continue;
+        unsigned slot = (uint64_t)t % 17;
+        if (dcc_stats.occupancy[slot].minute != t) {
+            dcc_stats.occupancy[slot].minute = t;
+            dcc_stats.occupancy[slot].usec = 0;
         }
+        int64_t lower = (int64_t)t * 60000000, upper = lower + 60000000;
+        dcc_stats.occupancy[slot].usec += (stop < upper ? stop : upper) -
+                                          (start > lower ? start : lower);
     }
 }
 
-/* caclulate the avg kids used */
 static void dcc_stats_calc_kid_avg(void) {
-    static int total_5m[5] = {0};
-    static int total_15m[15] = {0};
-    static int pos_5m = 0;
-    static int pos_15m = 0;
-    static time_t last = 0;
-    struct timeval now;
-    struct timeval time_p;
-    struct statsdata *curr_sd;
-    int total_running = 0;
-    int running = 0;
-    int t = 0;
-    int x = 0;
-    int total = 0;
-
-    gettimeofday(&now, NULL);
-    
-    /* calculate average kids used over the last minute */
-    if ((now.tv_sec - 60) >= last) {
-        /* we look at 1min ago back to 2 min ago because we only register
-         * compiles when they complete. If we look right now, we miss all 
-         * the current compiles that haven't completed.
-         */
-        for (t=60; t<120; t++) {
-            time_p.tv_usec = now.tv_usec;
-            time_p.tv_sec = now.tv_sec - t;
-            running = 0;
-            curr_sd = dcc_stats.sd_root;
-
-            while (curr_sd != NULL) {
-                if ((dcc_timecmp(curr_sd->start, time_p) <= 0) &&
-                    (dcc_timecmp(curr_sd->stop, time_p) >= 0)) {
-                    running++;
-                }
-                curr_sd = curr_sd->next;
-            }
-            total_running += running;
-        }
-        dcc_stats.kids_avg[0] = total_running / 60;
-
-
-        /* populate 5m kid avgs */
-        total_5m[pos_5m] = dcc_stats.kids_avg[0];
-        pos_5m++;
-        if (pos_5m >= 5)
-            pos_5m = 0;
-
-        /* calc 5m kid avg */
-        total = 0;
-        for (x=0; x<5; x++)
-            total += total_5m[x];
-        dcc_stats.kids_avg[1] = total/5;
-
-
-        /* populate 15m kid avgs */
-        total_15m[pos_15m] = dcc_stats.kids_avg[0];
-        pos_15m++;
-        if (pos_15m >= 15)
-            pos_15m = 0;
-
-        /* calc 15m kid avg */
-        total = 0;
-        for (x=0; x<15; x++)
-            total += total_15m[x];
-        dcc_stats.kids_avg[2] = total/15;
-
-        last = now.tv_sec;
+    const time_t minute = time(NULL) / 60;
+    int64_t total = 0;
+    /* Allow one whole minute for jobs to report their completed intervals. */
+    for (int i = 1; i <= 15; ++i) {
+        time_t t = minute - 1 - i;
+        unsigned slot = (uint64_t)t % 17;
+        if (t >= 0 && dcc_stats.occupancy[slot].minute == t)
+            total += dcc_stats.occupancy[slot].usec;
+        if (i == 1 || i == 5 || i == 15)
+            dcc_stats.kids_avg[i == 1 ? 0 : i == 5 ? 1 : 2] = total / (60000000LL * i);
     }
 }
 

@@ -26,6 +26,63 @@
 #include "where.h"
 #include "lock.h"
 #include "plan_memo.h"
+#define XXH_STATIC_LINKING_ONLY
+#include <xxhash.h>
+
+char *dcc_plan_key(char **argv, const char *input)
+{
+    const char *library = getenv("DISTCC_GCC_PLAN_LIBRARY");
+    static const char *const omitted[] = {"DISTCC_LOG", "DISTCC_VERBOSE", NULL};
+    char context[80], *compiler = NULL, cwd[PATH_MAX];
+    const char *extension = dcc_find_extension_const(input), *parent = strrchr(input, '/');
+    if (!getenv("DISTCC_BROKER") || !extension || !strcmp(input, "-") ||
+        !getcwd(cwd, sizeof(cwd))) return NULL;
+    if (!library) library = GCC_PLAN_LIBRARY;
+    if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
+    else if (dcc_which(argv[0], &compiler)) return NULL;
+    if (!compiler) return NULL;
+    int failed = dcc_local_worker_key(compiler, library, omitted, context, sizeof(context));
+    free(compiler);
+    if (failed) return NULL;
+    XXH3_state_t hash;
+    XXH3_128bits_reset(&hash);
+#define ADD(s) XXH3_128bits_update(&hash, (s), strlen(s)+1)
+    ADD("gcc-plan-1"); ADD(context); ADD(cwd); ADD(extension);
+    if (parent) XXH3_128bits_update(&hash, input, parent-input+1);
+    else ADD(".");
+    unsigned inputs = 0, compile = 0;
+    size_t bytes = 0;
+    for (unsigned i=0; argv[i]; ++i) {
+        const char *s = argv[i];
+        bytes += strlen(s)+1;
+        if (bytes > DCC_MEMO_LIMIT || *s=='@' || !strcmp(s,"-") ||
+            !strcmp(s,"-E") || !strcmp(s,"-v") || !strcmp(s,"-###") ||
+            !strncmp(s,"-specs",6) || !strncmp(s,"--specs",7) ||
+            !strncmp(s,"-wrapper",8) || !strncmp(s,"-fplugin",8) ||
+            !strncmp(s,"--config",8)) return NULL;
+        if (!strcmp(s,"-c")) compile = 1;
+        if (!strcmp(s,"-o") || !strcmp(s,"-MF") || !strcmp(s,"-MT") || !strcmp(s,"-MQ")) {
+            ADD(s);
+            if (!argv[++i]) return NULL;
+            bytes += strlen(argv[i])+1;
+            continue;
+        }
+        if (!strcmp(s,input)) { ++inputs; ADD("<input>"); }
+        else {
+            /* The caller already owns single-input option validation. Reject
+             * a second source operand here rather than interpreting options. */
+            if (i && *s!='-' && dcc_is_source(s)) return NULL;
+            ADD(s);
+        }
+    }
+    if (!compile || inputs!=1 || bytes>DCC_MEMO_LIMIT) return NULL;
+    XXH128_hash_t value=XXH3_128bits_digest(&hash);
+    char *key=NULL;
+    if (asprintf(&key,"gcc-plan:%016llx%016llx",(unsigned long long)value.high64,
+                 (unsigned long long)value.low64)<0) return NULL;
+    return key;
+#undef ADD
+}
 
 extern char **environ;
 static int plan_dependencies = -1;
@@ -278,6 +335,7 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
     int lease = -1, cpu = -1;
     char *key = NULL, *memo = NULL;
     size_t memo_size = 0;
+    int verified = 0;
     unsigned dependencies = 0;
     char **command = NULL, **groups[2] = {NULL, NULL};
     struct dcc_job *job = NULL;
@@ -314,14 +372,14 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
     }
     key = dcc_plan_key(argv, input);
     if (key) {
-        lease = dcc_broker_memo_get(key, &memo, &memo_size);
+        lease = dcc_broker_memo_get(key, &memo, &memo_size, &verified);
         while (memo) {
-            if (dcc_plan_memo_decode(memo, memo_size, descriptor, &dependencies)) {
-                rs_trace("GCC plan memo hit dependencies=%u", dependencies);
+            if (dcc_plan_memo_decode(memo, memo_size, descriptor, &dependencies, verified)) {
+                rs_trace("GCC plan memo hit dependencies=%u watched=%d", dependencies, !!verified);
                 goto decoded;
             }
             char *stale = memo; memo = NULL;
-            lease = dcc_broker_memo_refresh(key, stale, memo_size, &memo, &memo_size);
+            lease = dcc_broker_memo_refresh(key, stale, memo_size, &memo, &memo_size, &verified);
             free(stale);
         }
     }

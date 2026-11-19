@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include "distcc.h"
 #include "exitcode.h"
 #include "tcp_job.h"
@@ -75,6 +76,15 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
         finished.error = EXIT_OUT_OF_MEMORY;
     free(saved_tmp);
     finished.status = result.status;
+    if (isolated) {
+        /* Count the job child's filesystem threads alongside its compiler. */
+        struct rusage usage;
+        if (!getrusage(RUSAGE_SELF, &usage)) {
+            result.cpu_ns += (uint64_t)(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1000000000 +
+                             (uint64_t)(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) * 1000;
+            result.peak_bytes += (unsigned long long)usage.ru_maxrss * 1024;
+        }
+    }
     finished.peak_bytes = result.peak_bytes;
     finished.cpu_ns = result.cpu_ns;
     finished.mode = result.mode;

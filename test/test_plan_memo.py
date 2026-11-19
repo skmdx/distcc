@@ -9,16 +9,22 @@ import socket
 import struct
 import subprocess
 import tempfile
+from typing import NamedTuple
 import unittest
 
 from test_broker import BrokerTestCase
 from test_tcp_jobs import GccFrontendTest
 
 
+class PlanResult(NamedTuple):
+    stdout: bytes
+    stderr: str
+
+
 class PlanMemoTest(BrokerTestCase):
     worker_address = '127.0.0.1'
     start_frontend = GccFrontendTest.start_frontend
-    compile = GccFrontendTest.compile
+    compile_frontend = GccFrontendTest.compile_frontend
 
     def prepare(self):
         self.start_frontend()
@@ -37,7 +43,7 @@ class PlanMemoTest(BrokerTestCase):
         log = Path(self.env['DISTCC_LOG'])
         offset = log.stat().st_size if log.exists() else 0
         command = [self.cc,'-c',str(source),'-DVALUE=3','-MD','-MF',str(dep),'-o',str(output),*flags]
-        self.compile(command)
+        self.compile_frontend(command)
         trace = log.read_text()[offset:]
         if expect: self.assertTrue('GCC plan memo '+expect in trace,
                                   '\n'.join(line for line in trace.splitlines() if 'GCC ' in line))
@@ -125,8 +131,7 @@ class PlanMemoTest(BrokerTestCase):
                                '-o',str(self.outputs/(name+'.o')),*flags],cwd=self.work,
                               env=env or self.env,capture_output=True,timeout=10)
         self.assertEqual(result.returncode,0,result.stderr.decode())
-        result.stderr=result.stderr.decode()
-        return result
+        return PlanResult(result.stdout, result.stderr.decode())
 
     def test_live_plan_equality_and_concurrent_cold_requests(self):
         self.prepare()
@@ -210,6 +215,46 @@ class PlanMemoTest(BrokerTestCase):
             self.assertEqual(owner.recv(1), b'')
         with self.request_memo(b'binary') as reader:
             self.assertEqual(reader.recv(64), value+b'\0')
+
+    def test_shared_watches_and_persistent_plan_hits(self):
+        broker = self.start_broker()
+        keys = [f'gcc-plan:shared-{i:03}'.encode() for i in range(150)]
+        first, other = self.work/'first.cfg', self.work/'other.cfg'
+        first.write_text('first')
+        other.write_text('other')
+        def journal(path):
+            raw = self.work/'journal'
+            subprocess.run([self.build/'h_plan_dependencies', raw, 'stat', path],
+                           cwd=self.work, check=True)
+            return subprocess.check_output([self.build/'h_compile', 'plan_journal', raw], cwd=self.work)
+        journals = [journal(first), journal(other)]
+        fdroot = Path(f'/proc/{broker.pid}/fd')
+        tag = 1 << 17
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as session:
+            session.settimeout(5)
+            session.connect(self.env['DISTCC_BROKER'])
+            def send(command, data):
+                session.sendall(struct.pack('=II', self.protocol_version, command | tag) + data + b'\0')
+            def get(key):
+                send(4, key)
+                return session.recv(65536)
+            def watches():
+                fds = [p.name for p in fdroot.iterdir() if os.readlink(p) == 'anon_inode:inotify']
+                self.assertEqual(len(fds), 1)
+                return Path(f'/proc/{broker.pid}/fdinfo/{fds[0]}').read_text().count('inotify wd:')
+            def publish(i, key):
+                self.assertEqual(get(key), b'\0')
+                send(5, journals[i % 2])
+                self.assertEqual(get(key)[-1:], b'\1')
+            for i in range(2): publish(i, keys[i])
+            shared_count = watches()
+            self.assertGreater(shared_count, 0)
+            for i in range(2, len(keys)): publish(i, keys[i])
+            self.assertEqual(watches(), shared_count)
+            for key in keys: self.assertEqual(get(key)[-1:], b'\1')
+            first.write_text('changed')
+            for i, key in enumerate(keys):
+                self.assertEqual(get(key)[-1:], b'\1' if i % 2 else b'\0')
 
     def request_memo(self, key, command=4):
         peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)

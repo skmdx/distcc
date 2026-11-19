@@ -89,7 +89,7 @@ int main(int argc, char *argv[])
             char *key=dcc_plan_key(argv+3,argv[2]),*memo=NULL;
             int owner=-1;
             size_t size=0;
-            if (key) owner=dcc_broker_memo_get(key,&memo,&size);
+            if (key) owner=dcc_broker_memo_get(key,&memo,&size,NULL);
             if (!memo) {
                 if (owner>=0) dcc_broker_release(owner);
                 free(key); return 1;
@@ -112,7 +112,7 @@ int main(int argc, char *argv[])
         fclose(file);
         if (!strcmp(argv[1],"plan_validate")) {
             unsigned count=0; int output=dcc_job_memfd("test-plan");
-            int valid=dcc_plan_memo_decode((const char *)data,bytes,output,&count);
+            int valid=dcc_plan_memo_decode((const char *)data,bytes,output,&count,0);
             close(output); return valid ? 0 : 1;
         }
         /* Test-only journal inspection uses this host's public struct stat

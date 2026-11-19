@@ -96,6 +96,16 @@ struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char 
         }
     }
     if (savings < 16384) for (i = 0; i < job->count; ++i) job->inputs[i].cached = 0;
+    if (files && savings >= 16384) {
+        char canonical[PATH_MAX];
+        if (realpath(source, canonical)) for (i = 0; i < job->count; ++i) {
+            const struct dcc_job_input *in = &job->inputs[i];
+            if (in->cached && in->plain_size <= DCC_SOURCE_PUSH_MAX && !strcmp(in->path, canonical)) {
+                job->main_input = i + 1;
+                break;
+            }
+        }
+    }
     return job;
 failed:
     dcc_job_free(job);
@@ -193,6 +203,8 @@ int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char 
         if (dcc_copy_argv(argv, &job->argv, 0)) goto done;
     }
     if (!job || auxiliary_inputs(job, auxiliary)) goto done;
+    if (job->main_input)
+        job->inputs[job->main_input-1].cached = host->cold_family ? DCC_CACHE_PUSH : DCC_CACHE_LOOKUP;
     ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result);
     if (ret == EXIT_BUSY) dcc_broker_defer(host);
     if (ret) goto done;

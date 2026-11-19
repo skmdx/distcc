@@ -3,6 +3,8 @@
 #include <config.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <search.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,10 +71,13 @@ static void put(struct metadata *m, const void *data, size_t size)
 }
 static void number(struct metadata *m, uint64_t n)
 {
-    unsigned char bytes[8];
-    int i;
-    for (i = 7; i >= 0; --i) { bytes[i] = n & 255; n >>= 8; }
-    put(m, bytes, sizeof(bytes));
+    unsigned char bytes[10];
+    unsigned length = 0;
+    do {
+        bytes[length++] = (n & 127) | (n >= 128 ? 128 : 0);
+        n >>= 7;
+    } while (n);
+    put(m, bytes, length);
 }
 static void string(struct metadata *m, const char *s)
 {
@@ -90,11 +95,15 @@ static const unsigned char *take(struct metadata *m, size_t size)
 }
 static uint64_t get_number(struct metadata *m)
 {
-    const unsigned char *p = take(m, 8);
     uint64_t n = 0;
-    int i;
-    if (p) for (i = 0; i < 8; ++i) n = (n << 8) | p[i];
-    return n;
+    for (unsigned shift = 0; shift < 64; shift += 7) {
+        const unsigned char *p = take(m, 1);
+        if (!p || (shift == 63 && *p > 1) || (shift && !*p)) break;
+        n |= (uint64_t)(*p & 127) << shift;
+        if (*p < 128) return n;
+    }
+    m->error = 1;
+    return 0;
 }
 static char *get_string(struct metadata *m)
 {
@@ -114,8 +123,8 @@ static int load(int fd, size_t offset, struct metadata *m)
 {
     struct stat st;
     size_t done = 0;
-    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 8 ||
-        (uint64_t)st.st_size < offset || st.st_size - offset < 8 ||
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uint64_t)st.st_size < offset || st.st_size - offset == 0 ||
         st.st_size - offset > DCC_JOB_METADATA_MAX) return -1;
     m->size = st.st_size - offset;
     if (!(m->data = malloc(m->size))) return -1;
@@ -161,6 +170,16 @@ void dcc_job_result_free(struct dcc_job_result *r)
         if (r->temporary[i]) { unlink(r->temporary[i]); free(r->temporary[i]); r->temporary[i] = NULL; }
     }
 }
+/* IDs are assigned on first use. Zero introduces the next parent. */
+struct parent_name { const char *path; size_t length; unsigned id; };
+static int parent_order(const void *aa, const void *bb)
+{
+    const struct parent_name *a = aa, *b = bb;
+    if (a->length != b->length) return a->length < b->length ? -1 : 1;
+    return memcmp(a->path, b->path, a->length);
+}
+static void keep_parent(void *parent) { (void)parent; }
+
 unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
 {
     struct metadata m = {0};
@@ -168,6 +187,10 @@ unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
     if (!job || job->kind >= DCC_JOB_KIND_COUNT || job->count > DCC_JOB_INPUT_MAX ||
         (job->count && !job->inputs) || !job->argv || !job->cwd) return NULL;
     while (job->argv[argc]) if (++argc > DCC_JOB_INPUT_MAX) return NULL;
+    void *tree = NULL;
+    unsigned parents = 0;
+    struct parent_name *names = calloc(job->count, sizeof(*names));
+    if (job->count && !names) return NULL;
     number(&m, job->kind);
     number(&m, argc);
     number(&m, job->count);
@@ -181,9 +204,22 @@ unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
         number(&m, in->wire_size);
         number(&m, in->plain_size);
         put(&m, in->digest, sizeof(in->digest));
-        string(&m, in->path);
+        const char *slash = in->path ? strrchr(in->path, '/') : NULL;
+        if (!slash || !slash[1]) { m.error = 1; break; }
+        names[i] = (struct parent_name){ in->path, slash - in->path + 1, parents + 1 };
+        struct parent_name **entry = tsearch(&names[i], &tree, parent_order);
+        if (!entry) { m.error = 1; break; }
+        if (*entry == &names[i]) {
+            ++parents;
+            number(&m, 0);
+            number(&m, names[i].length);
+            put(&m, in->path, names[i].length);
+        } else number(&m, (*entry)->id);
+        string(&m, slash + 1);
         string(&m, in->target);
     }
+    if (tree) tdestroy(tree, keep_parent);
+    free(names);
     if (m.error) { free(m.data); return NULL; }
     *size = m.size;
     return m.data;
@@ -199,9 +235,12 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
     struct metadata m = { .data = (unsigned char *)data, .size = size };
     struct dcc_job *job = NULL;
     uint64_t kind, argc, count;
+    char **parents = NULL;
+    unsigned parent_count = 0;
+    size_t path_bytes = 0;
     unsigned i;
     *out = NULL;
-    if (!data || size < 8 || size > DCC_JOB_METADATA_MAX) return -1;
+    if (!data || !size || size > DCC_JOB_METADATA_MAX) return -1;
     kind = get_number(&m);
     argc = get_number(&m);
     count = get_number(&m);
@@ -210,6 +249,7 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
     job->kind = kind;
     if (!(job->argv = calloc(argc + 1, sizeof(*job->argv))) ||
         (count && !(job->inputs = calloc(count, sizeof(*job->inputs))))) goto failed;
+    if (count && !(parents = calloc(count, sizeof(*parents)))) goto failed;
     job->count = count;
     for (i = 0; i < count; ++i) job->inputs[i].fd = -1;
     job->cwd = get_string(&m);
@@ -222,13 +262,30 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
         in->wire_size = get_number(&m);
         in->plain_size = get_number(&m);
         digest = take(&m, sizeof(in->digest));
-        if (m.error || type > DCC_JOB_READONLY || encoding > DCC_JOB_LZ4 || cached > 1 ||
+        if (m.error || type > DCC_JOB_READONLY || encoding > DCC_JOB_LZ4 || cached > DCC_CACHE_PUSH ||
+            (cached == DCC_CACHE_PUSH && (job->kind != DCC_JOB_PUMP || in->plain_size > DCC_SOURCE_PUSH_MAX)) ||
             in->wire_size > INT64_MAX || in->plain_size > INT64_MAX) goto failed;
         in->kind = type;
         in->encoding = encoding;
         in->cached = cached;
         memcpy(in->digest, digest, sizeof(in->digest));
-        in->path = get_string(&m);
+        uint64_t id = get_number(&m);
+        if (id > parent_count || m.error) goto failed;
+        if (!id) {
+            char *parent = get_string(&m);
+            parents[parent_count++] = parent;
+            if (!absolute_path(parent) || parent[strlen(parent)-1] != '/') goto failed;
+            id = parent_count;
+        }
+        char *base = get_string(&m);
+        if (!base) goto failed;
+        size_t length = strlen(parents[id-1]) + strlen(base) + 1;
+        if (*base && !strchr(base, '/') && length <= DCC_JOB_METADATA_MAX - path_bytes) {
+            path_bytes += length;
+            in->path = malloc(length);
+            if (in->path) snprintf(in->path, length, "%s%s", parents[id-1], base);
+        }
+        free(base);
         in->target = get_string(&m);
         if (!absolute_path(in->path) || !strcmp(in->path, "/") ||
             in->path[strlen(in->path) - 1] == '/' || !in->target ||
@@ -239,10 +296,11 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
     }
     if (m.error || m.offset != m.size) goto failed;
     *out = job;
-    return 0;
 failed:
-    dcc_job_free(job);
-    return -1;
+    for (i = 0; i < parent_count; ++i) free(parents[i]);
+    free(parents);
+    if (!*out) dcc_job_free(job);
+    return *out ? 0 : -1;
 }
 int dcc_job_decode(int fd, size_t offset, struct dcc_job **out)
 {

@@ -1,14 +1,16 @@
 /* distcc adaptive host selection. SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
 #include <errno.h>
-#include <signal.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <pthread.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/select.h>
-#include <sys/wait.h>
+#include <sys/socket.h>
 
 #include "distcc.h"
 #include "hosts.h"
@@ -19,26 +21,54 @@
 #include "exitcode.h"
 #include "adaptive.h"
 
-/* Parse complete stats responses only. Missing, nonfinite or out-of-range
- * metrics cannot silently turn into a high-capacity host. */
-static int read_capacity(int fd, struct dcc_capacity *cap)
+/* All phases of one HTTP probe share the same monotonic deadline. */
+static int64_t milliseconds(void)
 {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static int wait_socket(int fd, short events, int64_t deadline)
+{
+    struct pollfd p = { .fd = fd, .events = events };
+    for (;;) {
+        int64_t remaining = deadline - milliseconds();
+        if (remaining <= 0) return -1;
+        int ret = poll(&p, 1, remaining);
+        if (ret < 0 && errno == EINTR) continue;
+        return ret > 0 ? 0 : -1;
+    }
+}
+static int capacity_at(const struct sockaddr *address, socklen_t size,
+                       int64_t deadline, struct dcc_capacity *cap)
+{
+    static const char query[] = "GET / HTTP/1.0\r\n\r\n";
+    int fd = socket(address->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    int ret = -1, error = 0;
+    socklen_t len = sizeof(error);
+    if (connect(fd, address, size) && (errno != EINPROGRESS ||
+        wait_socket(fd, POLLOUT, deadline) || getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) ||
+        error)) goto done;
+    for (size_t sent = 0; sent < sizeof(query)-1;) {
+        if (wait_socket(fd, POLLOUT, deadline)) goto done;
+        ssize_t n = send(fd, query + sent, sizeof(query)-1-sent, MSG_NOSIGNAL);
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+        if (n <= 0) goto done;
+        sent += n;
+    }
     char buf[DCC_STATS_SIZE];
     size_t used = 0;
-    ssize_t n;
-
-    while (used < sizeof(buf) - 1) {
-        n = read(fd, buf + used, sizeof(buf) - 1 - used);
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n < 0)
-            return -1;
-        if (!n)
-            break;
+    while (used < sizeof(buf)-1 && !wait_socket(fd, POLLIN, deadline)) {
+        ssize_t n = read(fd, buf + used, sizeof(buf)-1-used);
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+        if (n < 0) break;
+        if (!n) { buf[used] = 0; ret = dcc_parse_capacity(buf, cap); break; }
         used += n;
     }
-    buf[used] = '\0';
-    return used == sizeof(buf) - 1 ? -1 : dcc_parse_capacity(buf, cap);
+done:
+    close(fd);
+    return ret;
 }
 
 #ifdef __linux__
@@ -243,45 +273,65 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
             (cap->cpu_scale > 0 && cap->cpu_age >= 0)) ? 0 : -1;
 }
 
-/* Isolate the existing resolver and socket code so the entire probe, including
- * DNS and a stalled HTTP peer, has a 250ms deadline. Always reap the worker. */
+/* NSS can block past the deadline. Only hostname probes need a resolver
+ * thread. It owns its request and socket even if the caller has timed out. */
+struct name_query { int fd, port; char name[]; };
+static void *resolve_capacity(void *argument)
+{
+    struct name_query *query = argument;
+    struct addrinfo hints = { .ai_socktype = SOCK_STREAM, .ai_flags = AI_NUMERICSERV }, *addresses;
+    char port[16];
+    snprintf(port, sizeof(port), "%d", query->port);
+    if (!getaddrinfo(query->name, port, &hints, &addresses)) {
+        for (struct addrinfo *a = addresses; a; a = a->ai_next)
+            if (send(query->fd, a->ai_addr, a->ai_addrlen, MSG_NOSIGNAL) < 0) break;
+        freeaddrinfo(addresses);
+    }
+    close(query->fd);
+    free(query);
+    return NULL;
+}
 static int query_capacity(const struct dcc_hostdef *host, struct dcc_capacity *cap)
 {
-    int channel[2], fd, ret = -1, status;
-    pid_t pid;
-    fd_set fds;
-    struct timeval timeout = {0, 250000};
-    const char request[] = "GET / HTTP/1.0\r\n\r\n";
-
-    if (pipe(channel))
-        return -1;
-    pid = fork();
-    if (pid == 0) {
-        close(channel[0]);
-        if (!dcc_connect_by_name(host->hostname, host->stats_port, &fd)) {
-            dcc_set_blocking(fd);
-            if (!dcc_writex(fd, request, sizeof(request) - 1) &&
-                !read_capacity(fd, cap)) {
-                /* One small atomic pipe write, before closing the socket. */
-                if (write(channel[1], cap, sizeof(*cap)) != sizeof(*cap))
-                    _exit(1);
-            }
-            close(fd);
+    int64_t deadline = milliseconds() + 250;
+    struct sockaddr_in v4 = { .sin_family = AF_INET, .sin_port = htons(host->stats_port) };
+    struct sockaddr_in6 v6 = { .sin6_family = AF_INET6, .sin6_port = htons(host->stats_port) };
+    if (inet_pton(AF_INET, host->hostname, &v4.sin_addr) == 1)
+        return capacity_at((struct sockaddr *)&v4, sizeof(v4), deadline, cap);
+    if (inet_pton(AF_INET6, host->hostname, &v6.sin6_addr) == 1)
+        return capacity_at((struct sockaddr *)&v6, sizeof(v6), deadline, cap);
+    int pair[2], ret = -1;
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair)) return -1;
+    struct name_query *query = malloc(sizeof(*query) + strlen(host->hostname) + 1);
+    if (query) {
+        query->fd = pair[1]; query->port = host->stats_port;
+        strcpy(query->name, host->hostname);
+        pthread_t thread;
+        pthread_attr_t attr;
+        int started = 0;
+        if (!pthread_attr_init(&attr)) {
+            size_t stack = 128U * 1024;
+            if (stack < (size_t)PTHREAD_STACK_MIN) stack = PTHREAD_STACK_MIN;
+            started = !pthread_attr_setstacksize(&attr, stack) &&
+                      !pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) &&
+                      !pthread_create(&thread, &attr, resolve_capacity, query);
+            pthread_attr_destroy(&attr);
         }
-        _exit(0);
+        if (started) {
+            while (wait_socket(pair[0], POLLIN, deadline) == 0) {
+                struct sockaddr_storage address;
+                ssize_t n = recv(pair[0], &address, sizeof(address), MSG_DONTWAIT);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                ret = capacity_at((struct sockaddr *)&address, n, deadline, cap);
+                if (!ret) break;
+            }
+            close(pair[0]);
+            return ret;
+        }
+        free(query);
     }
-    close(channel[1]);
-    if (pid > 0) {
-        FD_ZERO(&fds);
-        FD_SET(channel[0], &fds);
-        if (select(channel[0] + 1, &fds, NULL, NULL, &timeout) > 0 &&
-            read(channel[0], cap, sizeof(*cap)) == sizeof(*cap))
-            ret = 0;
-        kill(pid, SIGKILL);
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
-            ;
-    }
-    close(channel[0]);
+    close(pair[0]); close(pair[1]);
     return ret;
 }
 

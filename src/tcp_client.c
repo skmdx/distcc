@@ -205,6 +205,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     int shared_input = -1;
     static struct dcc_frontend_reply filesystem = {.fd = -1};
     uint64_t fs_offset = 0, fs_requests = 0, fs_bytes = 0;
+    unsigned needs = 0, reads = 0, read_batches = 0;
     time_t active = time(NULL);
     dcc_job_result_init(result);
     if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested) goto done;
@@ -229,7 +230,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     memcpy(outgoing + 16, manifest, metadata_size);
     free(manifest);
     for (unsigned i = 0; i < job->count; ++i)
-        if (!local_input && dcc_job_file(&job->inputs[i]) && !job->inputs[i].cached) {
+        if (!local_input && dcc_job_file(&job->inputs[i]) && job->inputs[i].cached != DCC_CACHE_LOOKUP) {
             requested[i] = 1; requests[count++] = i;
         }
     for (;;) {
@@ -321,6 +322,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     /* Worker execution can exceed the transport idle timeout. */
                 } else if (type == DCC_TCP_NEED && !have_result && incoming.size &&
                            incoming.size == dcc_tcp_bitmap_size(job->count)) {
+                    ++needs;
                     for (unsigned index = 0; index < incoming.size * 8; ++index) {
                         if (!(incoming.data[index / 8] & (1U << (index % 8)))) continue;
                         if (index >= job->count || requested[index] || !job->inputs[index].cached ||
@@ -331,6 +333,10 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                            dcc_job_frontend(job) && !have_result &&
                            !length && stream.fd < 0 && !filesystem.size && read_request == count) {
                     if (dcc_frontend_fs_reply(job, incoming.data, incoming.size, &filesystem)) goto done;
+                    unsigned op = dcc_tcp_get32(incoming.data);
+                    reads += op == DCC_FS_READ;
+                    read_batches += op == DCC_FS_BATCH && incoming.size >= 12 &&
+                                    dcc_tcp_get32(incoming.data + 8) == DCC_FS_READ;
                     ++fs_requests; fs_bytes += filesystem.size + filesystem.file_size;
                     fs_offset = 0;
                 } else if (type == DCC_TCP_RESULT && !have_result && incoming.size == DCC_TCP_RESULT_SIZE) {
@@ -409,16 +415,18 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         }
     }
 done:
-    if (fs_requests) rs_trace("frontend filesystem: %llu requests, %llu bytes",
-        (unsigned long long)fs_requests, (unsigned long long)fs_bytes);
+    if (fs_requests) rs_trace("frontend filesystem: %llu requests, %llu bytes, %u reads, %u read batches",
+        (unsigned long long)fs_requests, (unsigned long long)fs_bytes, reads, read_batches);
     if (ret)
         rs_trace("TCP exchange failed: inputs %u/%u, result %d, received frame %x (%zu bytes), pending write %zu/%zu",
                  read_request, count, have_result, incoming.type, incoming.used, sent, length);
     if (shared_input >= 0) close(shared_input);
     if (!ret) {
+        rs_trace("BEGIN %zu bytes, NEED %u, main pushed %d", metadata_size + 8, needs,
+                 job->main_input && job->inputs[job->main_input - 1].cached == DCC_CACHE_PUSH);
         unsigned cached = 0, transferred = 0;
         for (unsigned i = 0; i < job->count; ++i) {
-            cached += job->inputs[i].cached;
+            cached += !!job->inputs[i].cached;
             transferred += job->inputs[i].cached && requested[i];
         }
         if (cached) rs_trace("input cache: %u of %u entries transferred", transferred, job->count);

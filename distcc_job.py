@@ -40,31 +40,48 @@ def fingerprint(path):
     return size, digest
 
 
-def write_metadata(kind, cwd, helper, entries, path, *, work_key=0, work_units=0):
-    # This prefix belongs to the local planner/transport contract. The TCP
-    # worker receives the job description, not client scheduling estimates.
-    data = bytearray(struct.pack('!QI', work_key, min(work_units, 2**32 - 1)))
+def manifest(kind, cwd, argv, inputs):
+    """Encode the bounded BEGIN manifest, including its first-use parent table."""
+    data = bytearray()
+    parents = {}
 
     def number(value):
-        data.extend(struct.pack('!Q', value))
+        if not 0 <= value < 1 << 64:
+            raise ValueError('manifest integer out of range')
+        while value >= 128:
+            data.append(128 | (value & 127))
+            value >>= 7
+        data.append(value)
 
     def string(value):
         encoded = os.fsencode(value)
         number(len(encoded))
         data.extend(encoded)
 
-    if len(entries) > 65536:
+    if len(inputs) > 65536:
         raise LocalOnly('too many job inputs')
-    for value in (kind, 1, len(entries)):
+    for value in (kind, len(argv), len(inputs)):
         number(value)
     string(cwd)
-    string(helper)
-    for name, size, digest in entries:
-        for value in (0, 0, 1, size, size):
+    for arg in argv:
+        string(arg)
+    for name, size, digest, cached in inputs:
+        for value in (0, 0, cached, size, size):
             number(value)
         data.extend(digest)
-        string(name)
+        parent, slash, base = os.fsencode(name).rpartition(b'/')
+        parent += slash
+        number(parents.get(parent, 0))
+        if parent not in parents:
+            parents[parent] = len(parents) + 1
+            string(parent)
+        string(base)
         string('')
     if len(data) > 16 * 1024 * 1024:
         raise LocalOnly('job metadata is too large')
-    path.write_bytes(data)
+    return data
+
+
+def write_metadata(kind, cwd, helper, entries, path, *, work_key=0, work_units=0):
+    prefix = struct.pack('!QI', work_key, min(work_units, 2**32 - 1))
+    path.write_bytes(prefix + manifest(kind, cwd, [helper], [(*entry, 1) for entry in entries]))

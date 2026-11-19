@@ -215,18 +215,21 @@ public:
         out = {data, data.get(), size};
         return {};
     }
-    struct Query { unsigned op; std::string path; };
+    struct Query { unsigned op; std::string path; uint64_t reply_size = 0; };
     template<typename Apply>
     std::error_code batch(unsigned op, const std::vector<Query> &queries, Apply apply) {
         size_t first = 0;
         while (first < queries.size()) {
             std::string packet;
             size_t end = first;
+            uint64_t bodies = 0;
             while (end < queries.size()) {
                 const auto &q = queries[end];
                 size_t size = 8 + q.path.size();
                 if (size + 4 > DCC_FS_QUERY_MAX) return std::make_error_code(std::errc::filename_too_long);
-                if (packet.size() + size + 4 > DCC_FS_QUERY_MAX) break;
+                if (packet.size() + size + 4 > DCC_FS_QUERY_MAX ||
+                    (end != first && bodies + q.reply_size > DCC_TCP_CHUNK)) break;
+                bodies += q.reply_size;
                 uint32_t header[] = {htonl(size - 4), htonl(q.op)};
                 packet.append(reinterpret_cast<const char *>(header), sizeof(header));
                 packet += q.path;
@@ -292,36 +295,38 @@ public:
         // lose a prefetch opportunity, never a filesystem freshness check.
         cache.write(records, key.data(), key.size(), hints.data(), hints.size());
     }
-    std::error_code read(std::string_view path, const char *version, Snapshot &out) {
-        std::string key;
-        if (version) {
-            key.reserve(identity.size()+1+DCC_FS_METADATA+path.size());
-            key.append(identity); key += '\0'; key.append(version, DCC_FS_METADATA); key.append(path);
-            auto bytes = cached(key);
-            if (bytes.owner && bytes.size == number(version+24, 8)) {
-                memcpy(out.version.data(), version, DCC_FS_METADATA);
-                out.bytes = std::move(bytes);
-                return {};
-            }
-        }
-        Buffer response;
-        if (auto error = request(DCC_FS_READ, path, response)) return error;
+    std::string file_key(std::string_view path, const char *version) const {
+        std::string key(identity);
+        key += '\0'; key.append(version, DCC_FS_METADATA); key.append(path);
+        return key;
+    }
+    bool cached_file(std::string_view path, const char *version, Snapshot &out) {
+        auto bytes = cached(file_key(path, version));
+        if (!bytes.owner || bytes.size != number(version+24, 8)) return false;
+        memcpy(out.version.data(), version, DCC_FS_METADATA);
+        out.bytes = std::move(bytes);
+        return true;
+    }
+    std::error_code snapshot(std::string_view path, const char *version, const Buffer &response, Snapshot &out) {
         if (response.size < DCC_FS_METADATA ||
             number(response.data+24, 8) != response.size-DCC_FS_METADATA)
             return std::make_error_code(std::errc::protocol_error);
         memcpy(out.version.data(), response.data, DCC_FS_METADATA);
         out.bytes = {response.owner, response.data+DCC_FS_METADATA, response.size-DCC_FS_METADATA};
-        if (!version) {
-            if (write_root.empty()) return {};
-            key.append(identity); key += '\0'; key.append(out.version.data(), DCC_FS_METADATA); key.append(path);
-        }
-        if (!version || !memcmp(version, out.version.data(), DCC_FS_METADATA)) {
+        if ((!version && !write_root.empty()) || (version && !memcmp(version, response.data, DCC_FS_METADATA))) {
+            auto key = file_key(path, response.data);
             if (!write_root.empty() && !shared) {
                 if (!writer) writer = std::make_unique<Writer>(cache, write_root);
                 writer->put(std::move(key), out.bytes);
             } else cache.write(records, key.data(), key.size(), out.bytes.data, out.bytes.size);
         }
         return {};
+    }
+    std::error_code read(std::string_view path, const char *version, Snapshot &out) {
+        if (version && cached_file(path, version, out)) return {};
+        Buffer response;
+        if (auto error = request(DCC_FS_READ, path, response)) return error;
+        return snapshot(path, version, response, out);
     }
 };
 }

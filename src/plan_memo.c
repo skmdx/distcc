@@ -1,4 +1,4 @@
-/* Memoized GCC plans are validated by the requesting sandboxed client. */
+/* Driver plan templates and filesystem dependency journals. */
 #include <config.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -15,63 +15,13 @@
 #include "broker.h"
 #include "plan_memo.h"
 #include "trace.h"
-#define XXH_STATIC_LINKING_ONLY
-#include <xxhash.h>
+#ifdef __linux__
+#include <sys/inotify.h>
+#include <sys/queue.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+#endif
 
-char *dcc_plan_key(char **argv, const char *input)
-{
-    const char *library = getenv("DISTCC_GCC_PLAN_LIBRARY");
-    static const char *const omitted[] = {"DISTCC_LOG", "DISTCC_VERBOSE", NULL};
-    char context[80], *compiler = NULL, cwd[PATH_MAX];
-    const char *extension = dcc_find_extension_const(input), *parent = strrchr(input, '/');
-    if (!getenv("DISTCC_BROKER") || !extension || !strcmp(input, "-") ||
-        !getcwd(cwd, sizeof(cwd))) return NULL;
-    if (!library) library = GCC_PLAN_LIBRARY;
-    if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
-    else if (dcc_which(argv[0], &compiler)) return NULL;
-    if (!compiler) return NULL;
-    int failed = dcc_local_worker_key(compiler, library, omitted, context, sizeof(context));
-    free(compiler);
-    if (failed) return NULL;
-    XXH3_state_t hash;
-    XXH3_128bits_reset(&hash);
-#define ADD(s) XXH3_128bits_update(&hash, (s), strlen(s)+1)
-    ADD("gcc-plan-1"); ADD(context); ADD(cwd); ADD(extension);
-    if (parent) XXH3_128bits_update(&hash, input, parent-input+1);
-    else ADD(".");
-    unsigned inputs = 0, compile = 0;
-    size_t bytes = 0;
-    for (unsigned i=0; argv[i]; ++i) {
-        const char *s = argv[i];
-        bytes += strlen(s)+1;
-        if (bytes > DCC_MEMO_LIMIT || *s=='@' || !strcmp(s,"-") ||
-            !strcmp(s,"-E") || !strcmp(s,"-v") || !strcmp(s,"-###") ||
-            !strncmp(s,"-specs",6) || !strncmp(s,"--specs",7) ||
-            !strncmp(s,"-wrapper",8) || !strncmp(s,"-fplugin",8) ||
-            !strncmp(s,"--config",8)) return NULL;
-        if (!strcmp(s,"-c")) compile = 1;
-        if (!strcmp(s,"-o") || !strcmp(s,"-MF") || !strcmp(s,"-MT") || !strcmp(s,"-MQ")) {
-            ADD(s);
-            if (!argv[++i]) return NULL;
-            bytes += strlen(argv[i])+1;
-            continue;
-        }
-        if (!strcmp(s,input)) { ++inputs; ADD("<input>"); }
-        else {
-            /* The caller already owns single-input option validation. Reject
-             * a second source operand here rather than interpreting options. */
-            if (i && *s!='-' && dcc_is_source(s)) return NULL;
-            ADD(s);
-        }
-    }
-    if (!compile || inputs!=1 || bytes>DCC_MEMO_LIMIT) return NULL;
-    XXH128_hash_t value=XXH3_128bits_digest(&hash);
-    char *key=NULL;
-    if (asprintf(&key,"gcc-plan:%016llx%016llx",(unsigned long long)value.high64,
-                 (unsigned long long)value.low64)<0) return NULL;
-    return key;
-#undef ADD
-}
 
 void dcc_free_plan_template(struct dcc_plan_template *plan)
 {
@@ -246,7 +196,7 @@ static int order(const void *aa, const void *bb)
     if (a->d.operation!=b->d.operation) return a->d.operation<b->d.operation ? -1 : 1;
     return a->d.flags<b->d.flags ? -1 : a->d.flags>b->d.flags;
 }
-static int journal_records(const unsigned char *data, size_t length,
+static int parse_journal(const unsigned char *data, size_t length,
                            struct record **records, unsigned *count)
 {
     if (length<4 || data[0]!=1 || data[1]!=1 || data[2] || data[3]) {
@@ -271,6 +221,15 @@ static int journal_records(const unsigned char *data, size_t length,
             if (r->target[r->d.target_length-1] || strlen(r->target)!=r->d.target_length-1) goto bad;
         }
     }
+    *records=all; *count=used; return 1;
+bad:
+    free(all); return 0;
+}
+static int journal_records(const unsigned char *data, size_t length, struct record **records, unsigned *count)
+{
+    struct record *all;
+    unsigned used;
+    if (!parse_journal(data, length, &all, &used)) return 0;
     qsort(all,used,sizeof(*all),order);
     for (unsigned i=0;i<used;++i) {
         if (i && !order(&all[i-1],&all[i])) {
@@ -329,7 +288,7 @@ out:
     free(records); free(data); free(plan); return memo;
 }
 
-int dcc_plan_memo_decode(const char *memo, size_t size, int output, unsigned *dependencies)
+int dcc_plan_memo_decode(const char *memo, size_t size, int output, unsigned *dependencies, int verified)
 {
     if (size < 12 || size >= DCC_MEMO_LIMIT) return 0;
     const unsigned char *data = (const unsigned char *)memo;
@@ -337,10 +296,281 @@ int dcc_plan_memo_decode(const char *memo, size_t size, int output, unsigned *de
     struct record *records=NULL;
     uint32_t lengths[2]; memcpy(lengths,data,8);
     if ((uint64_t)lengths[0]+lengths[1]+8!=size || lengths[0]>DCC_PLAN_JOURNAL_LIMIT ||
-        !journal_records(data+8,lengths[0],&records,dependencies)) goto out;
+        (!verified && !journal_records(data+8,lengths[0],&records,dependencies))) goto out;
+    if (verified) *dependencies = verified;
     if (ftruncate(output,0) || lseek(output,0,SEEK_SET)<0 ||
         write(output,data+8+lengths[0],lengths[1])!=(ssize_t)lengths[1]) goto out;
     valid=1;
 out:
     free(records); return valid;
 }
+
+#ifdef __linux__
+/* The kernel assigns one wd per inode on this instance, including aliases.
+ * Each subscription also belongs to one memo, so eviction can unlink it
+ * directly and remove the kernel watch when its last subscriber leaves. */
+LIST_HEAD(watch_interests, watch_interest);
+LIST_HEAD(watched_inodes, watched_inode);
+struct watched_inode {
+    int wd;
+    LIST_ENTRY(watched_inode) bucket;
+    struct watch_interests users;
+};
+struct watch_interest {
+    struct watched_inode *inode;
+    struct dcc_plan_watch *plan;
+    LIST_ENTRY(watch_interest) by_inode, by_plan;
+    int children;
+    char name[];
+};
+struct dcc_plan_monitor {
+    int fd;
+    struct watched_inodes buckets[256];
+    uid_t uid;
+    gid_t gid;
+    struct stat context[3];
+    int ngroups;
+    gid_t groups[]; /* Broker groups followed by scratch for one peer. */
+};
+struct dcc_plan_watch {
+    struct dcc_plan_monitor *monitor;
+    struct watch_interests paths;
+    unsigned count; /* Zero once invalidated. */
+    size_t bytes;
+};
+
+static int read_context(pid_t pid, struct stat *context)
+{
+    static const char *const paths[] = {"root", "ns/mnt", "ns/user"};
+    for (unsigned i = 0; i < sizeof(paths)/sizeof(*paths); ++i) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%ld/%s", (long)pid, paths[i]);
+        if (stat(path, &context[i])) return 0;
+    }
+    return 1;
+}
+
+struct dcc_plan_monitor *dcc_plan_monitor_new(int ep)
+{
+    int ngroups = getgroups(0, NULL);
+    if (ngroups < 0 || getuid() != geteuid() || getgid() != getegid()) return NULL;
+    struct dcc_plan_monitor *m = calloc(1, sizeof(*m) + (2*(size_t)ngroups+1)*sizeof(gid_t));
+    if (!m) return NULL;
+    m->uid = geteuid(); m->gid = getegid(); m->ngroups = ngroups;
+    m->fd = -1;
+    if (getgroups(ngroups, m->groups) != ngroups || !read_context(getpid(), m->context))
+        goto failed;
+    m->fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    struct epoll_event event = {.events = EPOLLIN, .data.u64 = DCC_PLAN_WATCH_EVENT};
+    if (m->fd >= 0 && !epoll_ctl(ep, EPOLL_CTL_ADD, m->fd, &event)) return m;
+failed:
+    dcc_plan_monitor_free(m);
+    return NULL;
+}
+
+void dcc_plan_monitor_free(struct dcc_plan_monitor *m)
+{
+    if (!m) return;
+    if (m->fd >= 0) close(m->fd);
+    free(m);
+}
+
+int dcc_plan_peer_matches(struct dcc_plan_monitor *m, int socket, pid_t pid, uid_t uid, gid_t gid)
+{
+    struct stat peer[3];
+    if (!m || m->uid != uid || m->gid != gid || !read_context(pid, peer)) return 0;
+    for (unsigned i = 0; i < sizeof(peer)/sizeof(*peer); ++i)
+        if (peer[i].st_dev != m->context[i].st_dev || peer[i].st_ino != m->context[i].st_ino) return 0;
+    gid_t *groups = m->groups + m->ngroups;
+    socklen_t bytes = (m->ngroups+1)*sizeof(*groups);
+    return !getsockopt(socket, SOL_SOCKET, SO_PEERGROUPS, groups, &bytes) &&
+           bytes == m->ngroups*sizeof(*groups) && !memcmp(groups, m->groups, bytes);
+}
+
+static struct watched_inode *find_inode(struct dcc_plan_monitor *m, int wd)
+{
+    struct watched_inode *inode;
+    LIST_FOREACH(inode, &m->buckets[(unsigned)wd % 256], bucket)
+        if (inode->wd == wd) return inode;
+    return NULL;
+}
+
+static void drop_inode(struct dcc_plan_monitor *m, struct watched_inode *inode)
+{
+    LIST_REMOVE(inode, bucket);
+    if (m->fd >= 0) inotify_rm_watch(m->fd, inode->wd);
+    free(inode);
+}
+
+/* NULL selects inode events only. An empty child name selects the directory
+ * listing. Any other child name selects that entry in its parent. */
+static int subscribe(struct dcc_plan_watch *w, const char *path, const char *name, size_t length,
+                     int content)
+{
+    uint32_t mask = IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF | IN_DONT_FOLLOW | IN_MASK_ADD;
+    if (name) mask |= IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO;
+    if (content) mask |= IN_MODIFY | IN_CLOSE_WRITE;
+    struct dcc_plan_monitor *m = w->monitor;
+    int wd = inotify_add_watch(m->fd, path, mask);
+    if (wd < 0) return 0;
+    struct watched_inode *inode = find_inode(m, wd);
+    if (!inode) {
+        inode = calloc(1, sizeof(*inode));
+        if (!inode) { inotify_rm_watch(m->fd, wd); return 0; }
+        inode->wd = wd;
+        LIST_INSERT_HEAD(&m->buckets[(unsigned)wd % 256], inode, bucket);
+    }
+    struct watch_interest *interest;
+    LIST_FOREACH(interest, &w->paths, by_plan)
+        if (interest->inode == inode && interest->children == !!name &&
+            (!name || (strlen(interest->name) == length && !memcmp(interest->name, name, length)))) return 1;
+    size_t bytes = sizeof(*interest) + length + 1;
+    interest = malloc(bytes);
+    if (!interest) {
+        if (LIST_EMPTY(&inode->users)) drop_inode(m, inode);
+        return 0;
+    }
+    interest->plan = w;
+    interest->inode = inode;
+    interest->children = !!name;
+    if (name) memcpy(interest->name, name, length);
+    interest->name[length] = 0;
+    LIST_INSERT_HEAD(&inode->users, interest, by_inode);
+    LIST_INSERT_HEAD(&w->paths, interest, by_plan);
+    /* Charge a whole inode to this subscriber as an upper bound. */
+    w->bytes += bytes + sizeof(*inode);
+    return 1;
+}
+
+static int watch_path(struct dcc_plan_watch *w, const char *path, int listing, int content, unsigned links)
+{
+    char prefix[PATH_MAX] = "/";
+    if (strlen(path) >= sizeof(prefix) || links > 40) return 0;
+    const char *p = path;
+    while (*p) {
+        while (*p == '/') ++p;
+        if (!*p) break;
+        size_t n = strcspn(p, "/"), offset = p - path;
+        if (!subscribe(w, prefix, p, n, 0)) return 0;
+        memcpy(prefix, path, offset+n);
+        prefix[offset+n] = 0;
+        char target[PATH_MAX];
+        ssize_t size = readlink(prefix, target, sizeof(target));
+        p += n;
+        if (size < 0) {
+            if (errno == EINVAL) continue;
+            return errno == ENOENT || errno == ENOTDIR;
+        }
+        if (size == sizeof(target) || !subscribe(w, prefix, NULL, 0, 0)) return 0;
+        target[size] = 0;
+        char resolved[PATH_MAX];
+        prefix[offset] = 0;
+        int length = snprintf(resolved, sizeof(resolved), "%s%s%s", target[0] == '/' ? "" : prefix, target, p);
+        return length >= 0 && length < (int)sizeof(resolved) && watch_path(w, resolved, listing, content, links+1);
+    }
+    return subscribe(w, prefix, listing ? "" : NULL, 0, content);
+}
+/* The broker only inspects dependencies. Never replay a client's open flags
+ * or stdio mode in the broker. Unsupported results retain client validation. */
+static int watched_record(const struct record *r)
+{
+    const struct dcc_plan_dependency *d = &r->d;
+    if (d->operation != DCC_PLAN_OPEN && d->operation != DCC_PLAN_STREAM && d->operation != DCC_PLAN_DIRECTORY)
+        return validate(d, r->path, r->target);
+    struct stat st;
+    if (stat(r->path, &st))
+        return (errno == ENOENT || errno == ENOTDIR) && d->error == errno;
+    return !d->error && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode) || !strcmp(r->path, "/dev/null")) &&
+           !access(r->path, R_OK) && dcc_plan_stat_equal(d->operation, &st, &d->metadata);
+}
+void dcc_plan_watch_free(struct dcc_plan_watch *w)
+{
+    if (!w) return;
+    while (!LIST_EMPTY(&w->paths)) {
+        struct watch_interest *interest = LIST_FIRST(&w->paths);
+        struct watched_inode *inode = interest->inode;
+        LIST_REMOVE(interest, by_plan);
+        LIST_REMOVE(interest, by_inode);
+        if (LIST_EMPTY(&inode->users)) drop_inode(w->monitor, inode);
+        free(interest);
+    }
+    free(w);
+}
+
+static void invalidate_all(struct dcc_plan_monitor *m)
+{
+    for (size_t i = 0; i < sizeof(m->buckets)/sizeof(*m->buckets); ++i) {
+        struct watched_inode *inode;
+        LIST_FOREACH(inode, &m->buckets[i], bucket) {
+            struct watch_interest *interest;
+            LIST_FOREACH(interest, &inode->users, by_inode) interest->plan->count = 0;
+        }
+    }
+}
+
+void dcc_plan_monitor_drain(struct dcc_plan_monitor *m)
+{
+    if (!m || m->fd < 0) return;
+    union { struct inotify_event align; char bytes[8192]; } events;
+    for (;;) {
+        ssize_t n = read(m->fd, events.bytes, sizeof(events.bytes));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && errno == EAGAIN) return;
+        if (n <= 0) {
+            invalidate_all(m);
+            close(m->fd); m->fd = -1;
+            return;
+        }
+        for (ssize_t at = 0; at < n;) {
+            const struct inotify_event *e = (const void *)(events.bytes + at);
+            at += sizeof(*e) + e->len;
+            if (e->mask & IN_Q_OVERFLOW) { invalidate_all(m); continue; }
+            struct watched_inode *inode = find_inode(m, e->wd);
+            if (!inode) continue;
+            struct watch_interest *interest;
+            LIST_FOREACH(interest, &inode->users, by_inode)
+                if (!e->len || (interest->children &&
+                    (!*interest->name || !strcmp(interest->name, e->name))))
+                    interest->plan->count = 0;
+        }
+    }
+}
+
+struct dcc_plan_watch *dcc_plan_watch_new(struct dcc_plan_monitor *m, const char *memo, size_t size,
+                                          size_t *bytes)
+{
+    uint32_t lengths[2];
+    if (!m || m->fd < 0 || size < 12) return NULL;
+    memcpy(lengths, memo, 8);
+    if ((uint64_t)lengths[0]+lengths[1]+8 != size || lengths[0] > DCC_PLAN_JOURNAL_LIMIT) return NULL;
+    struct dcc_plan_watch *w = calloc(1, sizeof(*w));
+    struct record *records = NULL;
+    if (!w) return NULL;
+    w->monitor = m;
+    w->bytes = sizeof(*w);
+    if (!parse_journal((const unsigned char *)memo+8, lengths[0], &records, &w->count)) goto failed;
+    for (unsigned i = 0; i < w->count; ++i) {
+        const struct record *r = &records[i];
+        int listing = S_ISDIR(r->d.metadata.st_mode) && (r->d.operation == DCC_PLAN_DIRECTORY ||
+            r->d.operation == DCC_PLAN_STREAM || r->d.operation == DCC_PLAN_OPEN);
+        int content = !r->d.error && S_ISREG(r->d.metadata.st_mode);
+        if (!watch_path(w, r->path, listing, content, 0) || !watched_record(r)) goto failed;
+    }
+    if (dcc_plan_watch_verified(w)) {
+        *bytes = w->bytes;
+        free(records);
+        return w;
+    }
+failed:
+    free(records);
+    dcc_plan_watch_free(w);
+    return NULL;
+}
+
+unsigned dcc_plan_watch_verified(struct dcc_plan_watch *w)
+{
+    if (!w || !w->count) return 0;
+    dcc_plan_monitor_drain(w->monitor);
+    return w->count;
+}
+#endif

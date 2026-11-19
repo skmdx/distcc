@@ -20,6 +20,7 @@ void dcc_broker_defer(const struct dcc_hostdef *host);
 void dcc_broker_return(const struct dcc_hostdef *host, int fd, const struct dcc_job_result *);
 #define DCC_BROKER_POOLED (1 << 30)
 #define DCC_BROKER_DIRECT (1 << 29)
+#define DCC_BROKER_COLD_FAMILY (1 << 28)
 #define DCC_TCP_PIPELINE 4
 int dcc_broker_jobs(char **capacity);
 void dcc_broker_cpp_done(const struct dcc_hostdef *host);
@@ -29,10 +30,10 @@ void dcc_broker_cpp_done(const struct dcc_hostdef *host);
  * retains live owners and waiters until publication or EOF; compiler startup
  * must not be cut short by the initial IPC request's handshake deadline. */
 #define DCC_MEMO_LIMIT 65536
-int dcc_broker_memo_get(const char *key, char **value, size_t *length);
+int dcc_broker_memo_get(const char *key, char **value, size_t *length, int *verified);
 /* Replace only the exact stale value observed by this client. A competing
  * publisher's newer value is returned for validation, never invalidated. */
-int dcc_broker_memo_refresh(const char *key, const char *stale, size_t stale_length, char **value, size_t *length);
+int dcc_broker_memo_refresh(const char *key, const char *stale, size_t stale_length, char **value, size_t *length, int *verified);
 void dcc_broker_memo_put(int lease, const char *value, size_t length);
 /* The same publishing lease can retain a compiler helper's control socket.
  * Helpers are scoped to the authenticated caller, not shared across UIDs. */

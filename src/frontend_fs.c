@@ -110,7 +110,7 @@ static int append(struct dcc_frontend_reply *reply, const void *bytes, size_t le
         if (!data) return -1;
         reply->data = data; reply->capacity = capacity;
     }
-    memcpy(reply->data + reply->size, bytes, length);
+    if (bytes) memcpy(reply->data + reply->size, bytes, length);
     reply->size = needed;
     return 0;
 }
@@ -304,17 +304,38 @@ static int metadata_batch(struct dcc_job *job, unsigned batch, const unsigned ch
         if (size < 4) return -1;
         unsigned length = dcc_tcp_get32(data);
         data += 4; size -= 4;
-        /* Only metadata queries belong here: no nesting or open file bodies. */
         if (length < 4 || length > size) return -1;
         unsigned operation = dcc_tcp_get32(data);
         int valid = batch == DCC_FS_DIRECTORIES ?
             (operation == DCC_FS_STAT || operation == DCC_FS_LSTAT || operation == DCC_FS_ATTRIBUTES) :
-            (operation == DCC_FS_STATUS || operation == DCC_FS_REALPATH);
+            (operation == DCC_FS_STATUS || operation == DCC_FS_REALPATH || operation == DCC_FS_READ);
+        size_t start = reply->size;
         if (!valid ||
             append_query(job, data, length, reply)) return -1;
         data += length; size -= length;
+        if (reply->fd >= 0 && size) {
+            /* The last body streams from its fd. Earlier bodies share one
+             * bounded buffer, even if a hinted file grew since STATUS. */
+            size_t offset = reply->size, bytes = reply->file_size;
+            int error = 0;
+            if (offset + bytes > DCC_TCP_CHUNK + 8) error = EFBIG;
+            else if (append(reply, NULL, bytes)) return -1;
+            else for (size_t done = 0; done < bytes;) {
+                ssize_t n = pread(reply->fd, reply->data + offset + done, bytes - done, done);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) { error = n < 0 ? errno : EIO; break; }
+                done += n;
+            }
+            close(reply->fd); reply->fd = -1; reply->file_size = 0;
+            if (error) {
+                reply->size = start + 8;
+                dcc_tcp_put32(reply->data + start, error);
+                dcc_tcp_put32(reply->data + start + 4, 0);
+            }
+        }
     }
-    dcc_tcp_put32(reply->data + 4, reply->size - 8);
+    if (reply->size + reply->file_size > DCC_TCP_BYTES) return -1;
+    dcc_tcp_put32(reply->data + 4, reply->size + reply->file_size - 8);
     return 0;
 }
 
@@ -374,7 +395,7 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
             open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (reply->fd < 0 || fstat(reply->fd, &st)) error = errno;
         else if (!S_ISREG(st.st_mode)) error = EINVAL;
-        else if ((uint64_t)st.st_size > DCC_TCP_BYTES - 8 - DCC_FS_METADATA) error = EFBIG;
+        else if ((uint64_t)st.st_size + reply->size + DCC_FS_METADATA > DCC_TCP_BYTES) error = EFBIG;
         else if (metadata(reply, &st)) error = errno;
         else reply->file_size = st.st_size;
     } else if (operation == DCC_FS_REALPATH) {

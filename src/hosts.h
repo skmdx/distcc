@@ -76,6 +76,7 @@ struct dcc_hostdef {
     int broker_fd;
     int broker_lease;
     int broker_cpp_reserved;
+    int cold_family;
     int broker_pooled;
     int tcp_jobs;
 };

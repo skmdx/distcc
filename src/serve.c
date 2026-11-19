@@ -1511,7 +1511,7 @@ out_cleanup:
         ret = EXIT_IO_ERROR;
       }
     }
-    if (filesystem && dcc_gcc_files_stop(filesystem, &result->cpu_ns, &result->peak_bytes)) ret = EXIT_IO_ERROR;
+    if (filesystem && dcc_gcc_files_stop(filesystem)) ret = EXIT_IO_ERROR;
 
     switch (ret) {
     case EXIT_BUSY: /* overloaded */

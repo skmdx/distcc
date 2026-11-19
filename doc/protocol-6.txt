@@ -81,6 +81,9 @@ dependant has a read-only link or private copy.
 The network exchange is BEGIN(manifest), NEED(missing cached inputs), input
 chunks, RESULT(status and artifact sizes), output chunks, COMPLETE(job id).
 Uncached inputs start immediately after BEGIN, without waiting for NEED.
+Until a worker returns a completed Pump job from the same source family, a
+cacheable main input up to 64 KiB can also follow BEGIN immediately. The
+worker verifies and stores it as it would a requested upload.
 Further NEED messages can promote a cache waiter after an uploader disconnects.
 Both endpoints continue to service control traffic during transfers. There is
 no per-file ACK, artifact GET or job DELETE. Every frame has a type/flags word
@@ -96,7 +99,7 @@ support SSH or GSSAPI. BEGIN is type 0x54000300, followed
 by NEED, INPUT, RESULT, OUTPUT and COMPLETE in numeric order. The eight-byte
 frame header contains a uint32 type/flags and uint32 payload length. Flag
 0x10000 means compressed; 0x20000 means final, both valid only on data frames.
-All integers use network byte order. Payloads are:
+Frame integers use network byte order. The BEGIN manifest uses unsigned LEB128. Payloads are:
 
   BEGIN:    uint64 nonzero job ID, then the binary manifest described below.
   NEED:     a bitmap of ceil(input count / 8) bytes. Input i uses bit i % 8 of
@@ -160,13 +163,22 @@ Use bench/rpc.py to compare actual builds with fallback and retries disabled.
 Job manifest
 ------------
 
-Manifest scalars are unsigned 64-bit integers in network byte order. Strings
-are a length scalar followed by bytes, without NUL. Fields are: job kind
-(0 compile, 1 pump, 2 link), argc, input count, cwd, argv strings, then inputs.
-Each input carries kind (0 file, 1 symlink, 2 empty placeholder), encoding
-(0 raw, 1 LZ4 chunks), cached flag, wire size, expanded size, eight raw XXH3-64
-digest bytes, absolute path and link target strings. Count and argc are at
-most 65536; metadata is at most 16 MiB. Paths have no empty/dot components.
+Manifest integers use shortest-form unsigned LEB128 (at most ten bytes for a
+uint64). Strings carry their byte length followed by their bytes without NUL.
+The fields are job kind, argc, input count, cwd, argv strings, then inputs.
+Each input carries kind, encoding, cache mode, wire size, expanded size, eight
+raw XXH3-64 digest bytes, parent directory ID, basename and link target. ID zero
+introduces a directory string immediately before the basename. Directory
+strings are absolute and end in a slash. Subsequent inputs can refer to them
+by ID starting at one in insertion order. Basenames contain one component.
+Counts are bounded by 65536. Both the manifest and the sum of expanded input
+pathname lengths (including terminators) are bounded by 16 MiB.
+
+Cache mode zero streams immediately. Mode one uses NEED and shared upload
+ownership. Mode two streams immediately and publishes verified content as a
+cache entry. A client uses it for a pump main source up to 64 KiB when broker
+history has no matching source family on the selected worker. The receiver
+consumes that input even if another job has already cached the same digest.
 
 Input cache
 -----------

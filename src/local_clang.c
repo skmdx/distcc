@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include <config.h>
 #include <errno.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -203,7 +204,7 @@ static int start_worker(const char *compiler)
 static int request(char **argv, char operation, int output, int errors, int journal, int templated, int *status, uint64_t *cpu_ns)
 {
     int reuse = dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0);
-    int planning = operation == 'P';
+    int planning = operation == 'P' || operation == 'I';
     const char *driver = argv[0];
     if ((!reuse && !planning) || !strstr(dcc_find_basename(driver), "clang")) return -1;
     /* Internal tool entry points bypass Clang's driver in the native binary. */
@@ -255,6 +256,46 @@ out:
     return ret;
 }
 
+int dcc_prepare_clang(char ***argv, char ***files)
+{
+    int needed = 0;
+    if (dcc_offload_language(*argv)) return 0;
+    if (!strstr(dcc_find_basename((*argv)[0]), "clang")) return 0;
+    for (char **p = *argv + 1; *p; ++p)
+        if (str_endswith(".a", *p) ||
+            (str_startswith("-fprofile", *p) && !str_startswith("-fprofile-generate", *p)) ||
+            str_startswith("-fauto-profile", *p) ||
+            str_startswith("-fmemory-profile-use", *p)) needed = 1;
+    if (!needed) return 0;
+    char **normalized = NULL;
+    const char *broker = getenv("DISTCC_BROKER");
+    if (broker && *broker) {
+        int output = dcc_job_memfd("distcc-clang-inputs"), status = 0;
+        if (output < 0) return EXIT_IO_ERROR;
+        char **groups[2];
+        int ret = request(*argv, 'I', output, STDERR_FILENO, -1, 0, &status, NULL);
+        if (!ret && !status && lseek(output, 0, SEEK_SET) >= 0)
+            ret = dcc_r_argv_file(output, 2, groups);
+        else ret = EXIT_DISTCC_FAILED;
+        close(output);
+        if (ret) return ret;
+        normalized = groups[0]; *files = groups[1];
+        char *resolved = normalized[0];
+        normalized[0] = (*argv)[0];
+        (*argv)[0] = resolved;
+    } else {
+        void *handle = dcc_clang_driver();
+        if (!handle) return EXIT_DISTCC_FAILED;
+        int (*inputs)(char **, char ***, char ***) = dlsym(handle, "dcc_clang_inputs");
+        int ret = inputs ? inputs(*argv, &normalized, files) : -1;
+        dlclose(handle);
+        if (ret) return EXIT_DISTCC_FAILED;
+    }
+    dcc_free_argv(*argv);
+    *argv = normalized;
+    return 0;
+}
+
 int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
 {
     /* Recursive compiler probes are already admitted by their caller. They
@@ -270,6 +311,7 @@ static int dcc_clang_local_prepare(char **argv, const char *input, char ***comma
     int journal = -1, errors = -1;
     int lease = -1, cpu = -1;
     struct dcc_plan_template plan = {0};
+    int verified = 0;
     unsigned dependencies = 0;
     size_t length = 0;
     char *memo = NULL, *compiler = NULL, *cwd = getcwd(NULL, 0);
@@ -287,15 +329,15 @@ static int dcc_clang_local_prepare(char **argv, const char *input, char ***comma
         XXH128_hash_t digest = XXH3_128bits_digest(&hash);
         snprintf(key, sizeof(key), "clang-plan:%c:%016llx%016llx", plan.argv ? 't' : 'v',
                  (unsigned long long)digest.high64, (unsigned long long)digest.low64);
-        lease = dcc_broker_memo_get(key, &memo, &length);
+        lease = dcc_broker_memo_get(key, &memo, &length, &verified);
         while (memo) {
-            if (dcc_plan_memo_decode(memo, length, output, &dependencies)) {
-                rs_trace("Clang plan memo hit dependencies=%u", dependencies);
+            if (dcc_plan_memo_decode(memo, length, output, &dependencies, verified)) {
+                rs_trace("Clang plan memo hit dependencies=%u watched=%d", dependencies, !!verified);
                 goto decode;
             }
             char *stale = memo;
             memo = NULL;
-            lease = dcc_broker_memo_refresh(key, stale, length, &memo, &length);
+            lease = dcc_broker_memo_refresh(key, stale, length, &memo, &length, &verified);
             free(stale);
         }
     }

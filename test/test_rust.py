@@ -820,17 +820,13 @@ class RustTest(BrokerTestCase):
         subprocess.run([self.work / 'recovery-check'], check=True, timeout=5)
 
     def reserve_input_space(self, identity):
-        def string(value):
-            return struct.pack('!Q', len(value)) + value
+        from distcc_job import manifest as job_manifest
         args = [b'gcc', b'-c', b'/src/held.c', b'-o', b'/src/held.o']
         space = os.statvfs(self.root)
         size = space.f_bavail * space.f_frsize - 8 * 1024 * 1024
-        manifest = struct.pack('!4Q', identity, 1, len(args), 2) + string(b'/src')
-        manifest += b''.join(map(string, args))
-        manifest += (struct.pack('!6Q', 0, 0, 0, size, size, identity) +
-                     string(b'/src/held.c') + string(b''))
-        manifest += (struct.pack('!6Q', 0, 0, 1, 1, 1, identity) +
-                     string(b'/src/marker') + string(b''))
+        digest = struct.pack('!Q', identity)
+        manifest = digest + job_manifest(1, '/src', args, [
+            ('/src/held.c', size, digest, 0), ('/src/marker', 1, digest, 1)])
         net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
         self.addCleanup(net.close)
         net.sendall(struct.pack('!II', 0x54000300, len(manifest)) + manifest)

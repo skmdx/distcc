@@ -558,10 +558,13 @@ class Lz4Chunks:
         return self.ctypes.string_at(self.buffer, n)
 
 
-class ChunkWriter:
+class ChunkWriter(io.RawIOBase):
     def __init__(self, stream, codec):
         self.stream, self.codec = stream, codec
         self.pending = bytearray()
+
+    def writable(self):
+        return True
 
     def write(self, data):
         self.pending.extend(data)
@@ -634,9 +637,7 @@ def tcp_link(net, archive, output):
     codec = Lz4Chunks()
     identity = int.from_bytes(os.urandom(8), 'big') or 1
 
-    def string(value):
-        value = value.encode()
-        return struct.pack('!Q', len(value)) + value
+    from distcc_job import manifest
 
     def send(kind, body):
         net.sendall(struct.pack('!II', kind, len(body)) + body)
@@ -675,9 +676,7 @@ def tcp_link(net, archive, output):
                 for descriptor in descriptors:
                     os.close(descriptor)
 
-    metadata = (struct.pack('!3Q', 2, 1, 1) + string(os.getcwd()) + string('distcc-link') +
-                struct.pack('!5Q', 0, 0, 0, archive.size, archive.size) + bytes(8) +
-                string('/input.tar') + string(''))
+    metadata = manifest(2, os.getcwd(), ['distcc-link'], [('/input.tar', archive.size, bytes(8), 0)])
     send(begin, struct.pack('!Q', identity) + metadata)
 
     class Writer:
@@ -728,6 +727,8 @@ def tcp_link(net, archive, output):
             while True:
                 kind, body, descriptor = receive()
                 if kind == TCP_RESULT_FD:
+                    if descriptor is None:
+                        raise OSError('missing TCP link artifact descriptor')
                     with os.fdopen(descriptor, 'rb') as source:
                         if len(body) != 4:
                             raise OSError('invalid TCP link artifact descriptor')
@@ -902,7 +903,10 @@ def worker(archive, output):
                     raise ValueError('link request metadata too large')
                 path = work / member.name
                 path.parent.mkdir(exist_ok=True)
-                with tar.extractfile(member) as source, path.open('wb') as target:
+                source = tar.extractfile(member)
+                if source is None:
+                    raise ValueError('missing link archive member data')
+                with source, path.open('wb') as target:
                     shutil.copyfileobj(source, target, 65536)
                 if member.name != 'job.json':
                     validate_input(path)
@@ -1201,8 +1205,8 @@ def sync_sysroot(root, compiler, profile_path, destinations, *, refresh=False):
                 for host, base in targets):
             print('sysroot ' + key + ' unchanged')
             return
+    local = next((dest for dest in targets if dest[0] is None), None) if source_host else None
     if source_host:
-        local = next((dest for dest in targets if dest[0] is None), None)
         if local is None:
             raise ValueError('a remote source requires a local cache destination for rsync staging')
         description = json.loads(subprocess.check_output(remote_command(source_host,
@@ -1219,7 +1223,7 @@ def sync_sysroot(root, compiler, profile_path, destinations, *, refresh=False):
         listing.write_bytes(b'\0'.join(os.fsencode(f) for f in files) + b'\0')
         metadata = scratch / '.distcc-link.json'
         metadata.write_text(json.dumps(profile, sort_keys=True) + '\n')
-        if source_host:
+        if local is not None:
             # Pull once into this controller's cache, then synchronize workers.
             # No credentials need to be forwarded or installed on the source.
             source_path = transfer_generation(root, listing, metadata, key, *local)

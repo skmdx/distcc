@@ -832,7 +832,7 @@ dcc_build_somewhere(char *argv[],
     int retry_count = 0, max_retries, remote_unsupported = 0;
     struct dcc_hostdef *host = NULL;
     struct dcc_work_hint work = {0};
-    uint64_t input_hash = 0;
+    struct dcc_source_features source_features = {0};
     char *discrepancy_filename = NULL;
     char **new_argv;
 
@@ -933,7 +933,7 @@ dcc_build_somewhere(char *argv[],
      * but needs neither native expansion nor a duplicate header/input tree. */
     if (!ret && !dcc_scan_includes && !dcc_offload_language(argv) &&
         broker && *broker) {
-        dcc_work_describe(&work, argv, input_fname, NULL, -1, 0, &input_hash);
+        dcc_work_describe(&work, argv, input_fname, NULL, -1, 0, &source_features);
         direct_lease = dcc_broker_try_local(&work);
         if (direct_lease >= 0) goto run_local;
     }
@@ -1060,13 +1060,16 @@ dcc_build_somewhere(char *argv[],
 
     if (broker)
         if (cpp_ready || !work.key)
-            dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready, &input_hash);
+            dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready, &source_features);
     if (prepared_job && !dcc_job_frontend(prepared_job) && work.key)
         work.bytes = dcc_resource_input_bytes(prepared_job);
     else if (!cpp_ready && (!prepared_job || !dcc_job_frontend(prepared_job)))
         work = (struct dcc_work_hint){0};
-    if (prepared_job && work.key)
+    if (prepared_job && work.key) {
         work.memory_class = dcc_resource_class(prepared_job);
+        if (dcc_job_frontend(prepared_job) && prepared_job->fs_roots)
+            work.work_units += dcc_argv_len(prepared_job->fs_roots);
+    }
 
     /* Lock ordering invariant: always acquire the lock for the
      * remote host (if any) first. */
@@ -1375,7 +1378,13 @@ dcc_build_somewhere(char *argv[],
             prepared_stdin = stdin_path;
         }
         if (direct_lease >= 0) clock_gettime(CLOCK_MONOTONIC, &started);
-        if (direct_lease >= 0 && cpp_ready && dcc_cpp_ir(argv, input_fname))
+        if (!ret && !remote_ret && prepared_job && prepared_job->kind == DCC_JOB_FRONTEND) {
+            char **command = prepared_job->argv + 2;
+            char *identity = command[0];
+            command[0] = prepared_job->argv[0];
+            ret = dcc_compile_local(command, input_fname, prepared_stdin, &cpu_ns);
+            command[0] = identity;
+        } else if (!ret && !remote_ret && cpp_ready && dcc_cpp_ir(argv, input_fname))
             ret = dcc_compile_local_ir(argv, input_fname, cpp_fname, cpp_fd, &cpu_ns);
         else
             ret = dcc_compile_local(argv, input_fname, prepared_stdin, &cpu_ns);

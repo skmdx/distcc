@@ -84,15 +84,17 @@ static void read_pressure(const char *path)
 
 static void sample_resources(void)
 {
-    static time_t sampled;
+    static int64_t next_sample;
     static char group[PATH_MAX];
     static int located;
     char path[PATH_MAX], data[16384];
     unsigned long long own = 0, backing = 0, value;
     unsigned long long own_sample = ULLONG_MAX;
-    time_t now = time(NULL);
-    if (sampled == now) return;
-    sampled = now;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    if (ms < next_sample) return;
+    next_sample = ms + 100;
     pressure = -1;
     available = budget = ULLONG_MAX;
     swap_available = 0;

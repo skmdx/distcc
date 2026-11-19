@@ -131,7 +131,7 @@ class DistccTestCase(unittest.TestCase):
         if not compiler:
             raise unittest.SkipTest("GCC is required")
         cls.cc = compiler
-        cls.storage = tempfile.TemporaryDirectory(prefix="distcc-adaptive-")
+        cls.storage = tempfile.TemporaryDirectory(prefix="dc-")
         cls.root = Path(cls.storage.name)
         cls.base_env = {k: v for k, v in os.environ.items()
                         if not k.startswith("DISTCC")}
@@ -222,8 +222,8 @@ class DistccTestCase(unittest.TestCase):
                 response += chunk
 
     def setUp(self):
-        self.work = self.root / self._testMethodName
-        self.work.mkdir()
+        # Broker and pump sockets beneath this directory must fit sockaddr_un.
+        self.work = Path(tempfile.mkdtemp(prefix="", dir=self.root))
         self.ddir = self.work / "distcc"
         self.ddir.mkdir()
         self.source = self.work / "hello.c"

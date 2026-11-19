@@ -28,6 +28,7 @@ LLD_HAS_DRIVER(elf)
 
 extern "C" int dcc_clang_frontend(char **, char ***, char ***, int, bool);
 extern "C" int dcc_clang_link_plan(char **, char ***);
+extern "C" int dcc_clang_inputs(char **, char ***, char ***);
 
 namespace {
 const dcc_argv_file_api *command_api;
@@ -128,12 +129,18 @@ int prepare(int fd, char **args, unsigned operation, int journal, bool templated
             free(values);
         }
     });
-    if (operation == 'L' ? dcc_clang_link_plan(args, &command) :
-                           dcc_clang_frontend(args, &command, &roots, journal, templated)) return 1;
+    int error;
+    switch (operation) {
+    case 'L': error = dcc_clang_link_plan(args, &command); break;
+    case 'I': error = dcc_clang_inputs(args, &command, &roots); break;
+    case 'P': error = dcc_clang_frontend(args, &command, &roots, journal, templated); break;
+    default: return 1;
+    }
+    if (error) return 1;
     // The complete input is now owned in memory. Reuse its file for the reply.
     if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) return 1;
     return command_api->write(fd, "ARGC", "ARGV", command) ||
-           (operation == 'P' && command_api->write(fd, "ARGC", "ARGV", roots));
+           (roots && command_api->write(fd, "ARGC", "ARGV", roots));
 }
 int execute(int fd, unsigned operation, int journal) {
     CompilerCommand command(*command_api);

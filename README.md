@@ -465,7 +465,8 @@ and can queue at the server. The server's `--jobs` limit applies to both.
 
 Link requests bypass local preprocessing slots. Admission permits one link
 per server at a time. Linux admission for both compiles and links checks host
-available memory, accessible cgroup memory limits and memory PSI once per second.
+available memory, accessible cgroup memory limits and memory PSI. It reuses
+each sample for 100 milliseconds of monotonic time.
 `DISTCC_JOB_MEMORY` sets the estimated memory per job in MiB, with an additional
 quarter-job margin. Without an explicit setting, workers start at 1024 MiB;
 client local compile and preprocessing slots use 256 MiB plus a 64 MiB margin.
@@ -766,16 +767,16 @@ image before its main function runs, then forks a fresh planner on a memo miss.
 Planning stops after GCC registers its include chains, before opening the source.
 The broker retains the resulting defaults/roots with the live driver's and
 planner's filesystem observations. Public libc calls still perform the real
-operations through the caller's sandbox. Each hit revalidates the recorded
-positive and negative probes in the requesting client's credentials, namespace
-and sandbox. Inode, ownership, mode, errors and link targets must agree.
-Regular files and directory enumeration/open probes also retain size,
-link count and mtime/ctime. A directory existence/type probe retains its
-identity rather than its entry-change timestamps: creating object/dependency
-files beside headers does not change GCC's include chains. Separate child
-probes still detect newly created include/specs paths, and access operations
-are repeated through the sandbox. This does not cache input read authorization
-or input bytes.
+operations through the caller's sandbox. The broker shares one inotify instance
+across plan journals and checks a session's filesystem and credentials on first
+use. It watches dependency paths, their ancestors and symlink targets, and
+drains events before replying. Use ordinary writes or atomic replacement for
+live toolchain updates. Inotify can miss changes made through a shared mapping
+while the writer keeps it open.
+A changed watch, different identity or unavailable watch budget returns the
+journal for validation by the requesting client. Directory identity probes
+survive unrelated output creation. Directory enumeration retains its content
+timestamps. The compiler authorizes input reads during execution.
 
 Keys retain the compiler/helper, environment, cwd, input extension and parent,
 macros and other arguments. Only the single input name and separate `-o`, `-MF`,
@@ -819,13 +820,13 @@ changes to a header invalidate its snapshot, even with equal size and mtime.
 GCC's native search directories and their ancestors are queried in bounded
 batches before filesystem lookups begin. The client checks each path with the
 same permissions and freshness rules as an individual request; unexpected
-paths still use on-demand queries. The filesystem service alone owns the FUSE
-device, so its exit also releases any pending compiler lookup.
+paths still use on-demand queries. Each isolated job owns a close-on-exec
+FUSE descriptor and runs its filesystem loop in a thread.
 The worker requests libfuse's advertised io_uring transport at queue depth one;
 unsupported kernels or libraries keep the classic session. A cancellable
-semaphore serializes callbacks around the single Files/RPC owner. After joining
-the Files child, the parent includes its transport, request counts and status
-in the existing job summary, without a separate diagnostic stream.
+semaphore serializes callbacks around the single Files/RPC owner. At shutdown
+the job exits the session, detaches the mount and joins the thread before
+reporting its transport, request count and status in the job summary.
 The Gentoo package requires the public libfuse io_uring API and the libfuse NUMA
 capability fix. Enabling libfuse's `io-uring` USE flag remains an administrator
 choice. Its systemd drop-in loads the FUSE module and uses tmpfiles to enable

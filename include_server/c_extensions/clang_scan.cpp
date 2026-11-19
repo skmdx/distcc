@@ -500,6 +500,7 @@ bool requiresModules(llvm::StringRef source) {
     return false;
 }
 
+template<bool publish>
 PyObject *scan(PyObject *, PyObject *arguments) {
     PyObject *argv;
     const char *cwd;
@@ -556,7 +557,10 @@ PyObject *scan(PyObject *, PyObject *arguments) {
             if (action.module_syntax && it != inputs->contents.end() && it->second->hasModules())
                 result.unsupported = true;
         }
-        ok = inputs->validate() && ok && !result.unsupported;
+        ok = ok && !result.unsupported;
+        // A manifest consumer validates these stamps after compression.
+        // A standalone result and a failed scan have no later publication check.
+        if (publish || !ok) ok = inputs->validate() && ok;
     }
     Py_END_ALLOW_THREADS
     if (inputs->previous) *inputs->previous = ok ? inputs->contents : Images{};
@@ -650,7 +654,8 @@ PyMethodDef methods[] = {
     {"tokenize_command", tokenize_command, METH_VARARGS, "Decode Clang driver diagnostics with LLVM's argument parser."},
     {"format_command", format_command, METH_VARARGS, "Format a Clang verbose command with LLVM's argument printer."},
     {"compile", dcc_clang_compile, METH_VARARGS, "Compile once with the client's source identity."},
-    {"scan", scan, METH_VARARGS, "Scan using libclang-cpp; return immutable inputs and lookup paths."},
+    {"scan", scan<true>, METH_VARARGS, "Return validated immutable inputs and lookup paths."},
+    {"scan_for_manifest", scan<false>, METH_VARARGS, "Collect inputs for validation at manifest publication."},
     {nullptr, nullptr, 0, nullptr}};
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_scan", nullptr, -1, methods, nullptr, nullptr, nullptr, nullptr};
 }

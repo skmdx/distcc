@@ -39,6 +39,15 @@ from test_adaptive import free_port
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+from distcc_job import manifest as job_manifest
+
+
+def required_match(pattern, text):
+    match = re.search(pattern, text)
+    assert match is not None, f"missing {pattern!r} in {text[-2000:]!r}"
+    return match
+
+
 def bitmap_indices(data):
     return [i for i in range(len(data) * 8) if data[i // 8] & (1 << (i % 8))]
 
@@ -400,7 +409,7 @@ class GccFrontendTest(BrokerTestCase):
         expected = (self.work/'out.o').read_bytes()
         for _ in range(2):
             (self.work/'out.o').unlink()
-            self.compile(command)
+            self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     worker_address = '127.0.0.1'
@@ -411,14 +420,14 @@ class GccFrontendTest(BrokerTestCase):
         self.env.pop('DISTCC_GCC_SCAN_LIBRARY')
         source = self.work/'preloaded.c'
         source.write_text('int preloaded(void) { return 17; }\n')
-        self.compile([self.cc, '-c', str(source), '-o', str(self.work/'preloaded.o')])
+        self.compile_frontend([self.cc, '-c', str(source), '-o', str(self.work/'preloaded.o')])
         log = (self.work/'client.log').read_text()
         planner = re.search(r'started reusable GCC planner pid=(\d+)', log)
-        self.assertIsNotNone(planner, log)
+        assert planner is not None, log
         self.assertIn('distcc_gcc_scan.so', Path(f'/proc/{planner[1]}/maps').read_text())
 
     def start_frontend(self, backoff=60, **settings):
-        self.module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
+        self.module = os.environ.get('DISTCC_GCC_SCAN_LIBRARY', '')
         if not self.module:
             directory = subprocess.check_output([self.cc, '-print-file-name=plugin'], text=True).strip()
             self.module = str(Path(directory)/'distcc_gcc_scan.so')
@@ -431,7 +440,7 @@ class GccFrontendTest(BrokerTestCase):
                         DISTCC_GCC_SCAN_LIBRARY=self.module, DISTCC_SKIP_LOCAL_RETRY='1',
                         INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
 
-    def compile(self, command, source=None):
+    def compile_frontend(self, command, source=None):
         log = Path(self.env['DISTCC_LOG']) if self.env.get('DISTCC_LOG') else None
         offset = log.stat().st_size if log and log.exists() else 0
         result = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
@@ -455,7 +464,7 @@ class GccFrontendTest(BrokerTestCase):
                                    check=True, capture_output=True)
                     expected = [(self.work/name).read_bytes() for name in ('out.s', 'out.d')]
                     for name in ('out.s', 'out.d'): (self.work/name).unlink()
-                    self.compile(command, text)
+                    self.compile_frontend(command, text)
                     self.assertEqual((self.work/'out.s').read_bytes(), expected[0])
                     self.assertEqual((self.work/'out.d').read_bytes().replace(b'\\\n', b'').split(),
                                      expected[1].replace(b'\\\n', b'').split())
@@ -504,7 +513,7 @@ class GccFrontendTest(BrokerTestCase):
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = [(self.work/name).read_bytes() for name in ('out.o', 'out.d')]
         for name in ('out.o', 'out.d'): (self.work/name).unlink()
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected[0])
         self.assertEqual((self.work/'out.d').read_bytes().replace(b'\\\n', b'').split(),
                          expected[1].replace(b'\\\n', b'').split())
@@ -529,7 +538,7 @@ class GccFrontendTest(BrokerTestCase):
                 subprocess.run([real, *args], cwd=self.work, check=True, capture_output=True)
                 expected = (self.work/'out.o').read_bytes()
                 (self.work/'out.o').unlink()
-                result = self.compile([compiler, *args])
+                result = self.compile_frontend([compiler, *args])
                 self.assertIn('reused GCC driver status=0', result.stderr)
                 self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
@@ -549,7 +558,7 @@ class GccFrontendTest(BrokerTestCase):
         expected = (self.work/'out.o').read_bytes()
         marker = self.work/'send-events'
         self.env.update(LD_PRELOAD=str(library), DISTCC_TEST_SEND_LOG=str(marker))
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
         self.assertTrue({'B', 'S'} <= set(marker.read_text()))
         # A new file version forces another file reply, even with a warm cache.
@@ -564,7 +573,7 @@ class GccFrontendTest(BrokerTestCase):
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
         for name in ('LD_PRELOAD', 'DISTCC_TEST_SEND_LOG', 'DISTCC_TEST_SEND_DROP'):
             self.env.pop(name)
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_planner_does_not_open_the_source(self):
@@ -601,7 +610,7 @@ class GccFrontendTest(BrokerTestCase):
                    '-o', 'out.o', '-MMD', '-MF', 'out.d']
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = [(self.work/name).read_bytes() for name in ('out.o', 'out.d')]
-        result = self.compile(command)
+        result = self.compile_frontend(command)
         self.assertIn('frontend filesystem:', result.stderr)
         self.assertEqual((self.work/'out.o').read_bytes(), expected[0])
         self.assertEqual((self.work/'out.d').read_bytes().replace(b'\\\n', b'').split(),
@@ -632,7 +641,7 @@ class GccFrontendTest(BrokerTestCase):
                            '-Ialias', '-c', name, '-o', 'out.o']
                 subprocess.run(command, cwd=self.work, check=True, capture_output=True)
                 expected = (self.work/'out.o').read_bytes()
-                result = self.compile(command)
+                result = self.compile_frontend(command)
                 self.assertIn('frontend filesystem:', result.stderr)
                 self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
@@ -822,9 +831,9 @@ class GccFrontendTest(BrokerTestCase):
         expected = (self.work/'out.o').read_bytes()
         log = self.work/'startup-context.log'
         self.env.update(LD_PRELOAD=str(library), DISTCC_TEST_STARTUP='allow', DISTCC_LOG=str(log))
-        self.compile(command)
+        self.compile_frontend(command)
         self.env = dict(reversed(list(self.env.items())))
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
         trace = log.read_text()
         self.assertEqual(trace.count('started reusable GCC driver pid='), 1, trace)
@@ -838,7 +847,7 @@ class GccFrontendTest(BrokerTestCase):
         self.assertNotEqual(failed.returncode, 0, failed.stderr)
         self.assertFalse((self.work/'out.o').exists())
         self.env['DISTCC_TEST_STARTUP'] = 'allow'
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_planner_failure_preserves_compiler_diagnostics(self):
@@ -911,7 +920,7 @@ class GccFrontendTest(BrokerTestCase):
         for value in ('first-request', 'second-request'):
             log = self.work/(value+'.log')
             self.env.update(CFLAGS=value, DISTCC_LOG=str(log))
-            self.compile(command)
+            self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
             values = environment_marker.read_text().splitlines()
             # Planning finishes before the remote compiler/as invocations.
@@ -1015,7 +1024,7 @@ class GccFrontendTest(BrokerTestCase):
                 self.assertLess(time.monotonic(), deadline, 'cancelled driver remains')
                 time.sleep(.01)
             self.assertTrue(Path(f'/proc/{parent}').exists(), 'cancellation killed shared driver')
-            self.compile([self.cc, '-c', str(self.source), '-o', 'next.o'])
+            self.compile_frontend([self.cc, '-c', str(self.source), '-o', 'next.o'])
             self.assertEqual(log.read_text().count('started reusable GCC driver pid='), 1)
             os.kill(parent, signal.SIGKILL)
             deadline = time.monotonic()+5
@@ -1023,11 +1032,11 @@ class GccFrontendTest(BrokerTestCase):
                 if Path(f'/proc/{parent}/stat').read_text().rsplit(')', 1)[1].split()[0] == 'Z': break
                 self.assertLess(time.monotonic(), deadline)
                 time.sleep(.01)
-            self.compile([self.cc, '-c', str(self.source), '-o', 'replacement.o'])
+            self.compile_frontend([self.cc, '-c', str(self.source), '-o', 'replacement.o'])
             # A validated plan does not need the dead compiler process. A new
             # option signature must still replace it and execute a live plan.
             self.assertEqual(log.read_text().count('started reusable GCC driver pid='), 1)
-            self.compile([self.cc, '-DREPLACEMENT=1', '-c', str(self.source), '-o', 'new-plan.o'])
+            self.compile_frontend([self.cc, '-DREPLACEMENT=1', '-c', str(self.source), '-o', 'new-plan.o'])
             self.assertEqual(log.read_text().count('started reusable GCC driver pid='), 2)
         finally:
             if process.poll() is None:
@@ -1044,7 +1053,7 @@ class GccFrontendTest(BrokerTestCase):
         command = [str(script), '-c', str(self.source), '-o', 'out.o']
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
         self.assertNotIn('started reusable GCC driver pid=', log.read_text())
         self.assertIn('pooled TCP job completed', log.read_text())
@@ -1052,7 +1061,7 @@ class GccFrontendTest(BrokerTestCase):
     def test_cpp_search_classes_macros_symlinks_and_warm_cache(self):
         self.start_frontend(DISTCCD_FILE_CACHE=str(self.work/'cache'))
         compiler = shutil.which('g++')
-        self.assertIsNotNone(compiler)
+        assert compiler is not None
         headers = self.work/'headers'
         (headers/'inner').mkdir(parents=True)
         (self.work/'alias').symlink_to('headers/inner')
@@ -1071,7 +1080,7 @@ class GccFrontendTest(BrokerTestCase):
         expected = (self.work/'out.o').read_bytes()
         for _ in range(2):
             (self.work/'out.o').unlink()
-            self.compile(command)
+            self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
             subprocess.run([compiler, 'out.o', '-o', 'program'], cwd=self.work, check=True)
             subprocess.run([str(self.work/'program')], check=True)
@@ -1094,7 +1103,7 @@ class GccFrontendTest(BrokerTestCase):
             '#include <second.h>\n#include <common.h>\n'
             'int value(void) { return SECOND + COMMON; }\n')
         command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'first/part.c', '-o', 'out.o']
-        first = self.compile(command)
+        first = self.compile_frontend(command)
         second = [*command[:5], 'second/part.c', *command[6:]]
         subprocess.run(second, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
@@ -1113,7 +1122,7 @@ class GccFrontendTest(BrokerTestCase):
         self.assertNotIn(f'<{headers}>', listings, 'directory names stopped being shared')
         reads = '\n'.join(line for line in lines if 'openat(' in line)
         self.assertNotIn('common.h', reads, 'an unchanged shared header was transferred again')
-        again = self.compile(command)
+        again = self.compile_frontend(command)
         counts = [int(n) for n in re.findall(r'frontend filesystem: (\d+) requests',
                                              first.stderr + again.stderr)]
         self.assertEqual(len(counts), 2)
@@ -1130,12 +1139,12 @@ class GccFrontendTest(BrokerTestCase):
         (self.work/'part.c').write_text('#include <value.h>\nint value(void) { return VALUE; }\n')
         command = [self.cc, '-nostdinc', *('-I'+str(path) for path in directories),
                    '-O2', '-c', 'part.c', '-o', 'out.o']
-        self.compile(command)
+        self.compile_frontend(command)
         for value in (41, 42):
             header.write_text(f'#define VALUE {value}\n')
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
-            result = self.compile(command)
+            result = self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
             counts = re.findall(r'frontend filesystem: (\d+) requests', result.stderr)
             self.assertEqual(len(counts), 1)
@@ -1157,8 +1166,8 @@ class GccFrontendTest(BrokerTestCase):
             command = [self.cc, '-nostdinc', '-I'+str(headers), '-O2', '-c', str(source), '-o', 'out.o']
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
-            self.compile(command)
-            warm = self.compile(command)
+            self.compile_frontend(command)
+            warm = self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
             requests = re.search(r'frontend filesystem: (\d+) requests', warm.stderr)
             assert requests is not None, warm.stderr
@@ -1181,7 +1190,7 @@ class GccFrontendTest(BrokerTestCase):
                    '-O2', '-c', 'hello.c', '-o', 'out.o']
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
-        self.compile(command)
+        self.compile_frontend(command)
         trace = self.work/'unused-directories.trace'
         result = subprocess.run(['strace', '-f', '-yy', '-e',
                                  'trace=newfstatat,statx,openat', '-o', str(trace),
@@ -1202,7 +1211,7 @@ class GccFrontendTest(BrokerTestCase):
         self.source.write_text('#include <other.h>\nint value(void) { return OTHER; }\n')
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_large_directory_names_survive_cold_warm_and_changed_lookups(self):
@@ -1228,7 +1237,7 @@ class GccFrontendTest(BrokerTestCase):
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
             for _ in range(2):
-                self.compile(command)
+                self.compile_frontend(command)
                 self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
         compare(names[-1], 0)
@@ -1249,7 +1258,7 @@ class GccFrontendTest(BrokerTestCase):
         header.write_text('#define VALUE 11\n')
         self.source.write_text('#include <value.h>\nint value(void) { return VALUE; }\n')
         command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'hello.c', '-o', 'out.o']
-        self.compile(command)
+        self.compile_frontend(command)
         trace = self.work/'changed-directory.trace'
         for value in (11, 23):
             # GCC also checks unknown .gch names. Refresh their name index
@@ -1275,7 +1284,7 @@ class GccFrontendTest(BrokerTestCase):
                                'int value(void) { return VALUE + ADDED; }\n')
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_changed_empty_footprint_keeps_batched_negative_lookups(self):
@@ -1285,13 +1294,13 @@ class GccFrontendTest(BrokerTestCase):
         self.source.write_text(''.join(f'#if __has_include(<absent-{i}.h>)\n#error unexpected header\n#endif\n'
                                       for i in range(64)) + 'int value(void) { return 17; }\n')
         command = [self.cc, '-nostdinc', '-Inegative-headers', '-O2', '-c', 'hello.c', '-o', 'out.o']
-        self.compile(command)
-        warm = self.compile(command)
+        self.compile_frontend(command)
+        warm = self.compile_frontend(command)
         expected = (self.work/'out.o').read_bytes()
         (headers/'unrelated.o').touch()
-        changed = self.compile(command)
+        changed = self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
-        counts = [int(re.search(r'frontend filesystem: (\d+) requests', result.stderr)[1])
+        counts = [int(required_match(r'frontend filesystem: (\d+) requests', result.stderr)[1])
                   for result in (warm, changed)]
         print(f'Negative lookup RPC counts (warm, changed directory): {counts}')
         self.assertLessEqual(counts[1], counts[0] + 2,
@@ -1309,18 +1318,18 @@ class GccFrontendTest(BrokerTestCase):
             '#else\n#define GENERATED 0\n#endif\n'
             'int value(void) { return KNOWN + GENERATED; }\n')
         command = [self.cc, '-nostdinc', '-Ipartial-headers', '-O2', '-c', 'hello.c', '-o', 'out.o']
-        self.compile(command)
-        warm = self.compile(command)
-        counts = [int(re.search(r'frontend filesystem: (\d+) requests', warm.stderr)[1])]
+        self.compile_frontend(command)
+        warm = self.compile_frontend(command)
+        counts = [int(required_match(r'frontend filesystem: (\d+) requests', warm.stderr)[1])]
         for action in ('unrelated', 'created', 'removed'):
             if action == 'unrelated': (headers/'output.o').touch()
             elif action == 'created': (headers/'generated.h').write_text('#define GENERATED 23\n')
             else: (headers/'generated.h').unlink()
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
-            result = self.compile(command)
+            result = self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected, action)
-            count = int(re.search(r'frontend filesystem: (\d+) requests', result.stderr)[1])
+            count = int(required_match(r'frontend filesystem: (\d+) requests', result.stderr)[1])
             counts.append(count)
             self.assertLessEqual(count, counts[0]+3,
                                  f'{action}: partial names produced {count} RPCs versus {counts[0]} warm')
@@ -1338,7 +1347,7 @@ class GccFrontendTest(BrokerTestCase):
         command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'hello.c', '-o', 'out.o']
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
-        self.compile(command)
+        self.compile_frontend(command)
         trace = self.work/'directory-metadata.trace'
         result = subprocess.run(['strace', '-f', '-yy', '-e',
                                  'trace=newfstatat,statx,openat', '-o', str(trace),
@@ -1377,8 +1386,8 @@ class GccFrontendTest(BrokerTestCase):
             command = [self.cc, '-nostdinc', '-I'+str(headers), '-O2', '-c', f'{name}/part.c', '-o', 'out.o']
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
-            self.compile(command)
-            warm = self.compile(command)
+            self.compile_frontend(command)
+            warm = self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
             requests = re.search(r'frontend filesystem: (\d+) requests', warm.stderr)
             assert requests is not None, warm.stderr
@@ -1398,7 +1407,7 @@ class GccFrontendTest(BrokerTestCase):
                 nested.symlink_to('moved', target_is_directory=True)
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
-            self.compile(command)
+            self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected, action)
 
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
@@ -1415,16 +1424,16 @@ class GccFrontendTest(BrokerTestCase):
             ''.join(f'#include <branch{i}/nested/value.h>\n' for i in range(branches)) +
             'int value(void) { return ' + '+'.join(f'VALUE_{i}' for i in range(branches)) + '; }\n')
         self.source.write_text(wide)
-        self.compile(command)
+        self.compile_frontend(command)
         # Keep the same context but stop using the other subtrees. Predictions
         # from the preceding job must not become observations of this one.
         self.source.write_text('#include <branch0/nested/value.h>\n'
                                'int value(void) { return VALUE_0; }\n')
-        self.compile(command)
+        self.compile_frontend(command)
         # A different source in the same directory must not overwrite this
         # source's learned footprint with its much wider one.
         (self.work/'other.c').write_text(wide)
-        self.compile([*command[:5], 'other.c', *command[6:]])
+        self.compile_frontend([*command[:5], 'other.c', *command[6:]])
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
         trace = self.work/'unused-subtrees.trace'
@@ -1446,7 +1455,7 @@ class GccFrontendTest(BrokerTestCase):
                                'int value(void) { return VALUE_11; }\n')
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_directory_batch_replies_and_failed_prefetch_release_mount(self):
@@ -1475,7 +1484,7 @@ class GccFrontendTest(BrokerTestCase):
                                '#include <generated.h>\n#else\n#define EXTRA 0\n#endif\n'
                                'int value(void) { return VALUE + EXTRA; }\n')
         command = [self.cc, '-nostdinc', '-Iheaders', '-O2', '-c', 'hello.c', '-o', 'out.o']
-        cold = self.compile(command)
+        cold = self.compile_frontend(command)
         trace = self.work/'metadata.trace'
         result = subprocess.run(['strace', '-f', '-yy', '-e', 'trace=newfstatat,statx,getdents64', '-o', str(trace),
                                  str(self.build/'distcc'), *command], cwd=self.work,
@@ -1508,7 +1517,7 @@ class GccFrontendTest(BrokerTestCase):
             os.utime(headers, ns=(previous.st_atime_ns, previous.st_mtime_ns))
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
-            self.compile(command)
+            self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected, action)
 
     @unittest.skipIf(os.geteuid() == 0, 'root bypasses directory read permission')
@@ -1520,12 +1529,12 @@ class GccFrontendTest(BrokerTestCase):
         used.write_text('#define VALUE 17\n')
         self.source.write_text('#include <used.h>\nint value(void) { return VALUE; }\n')
         command = [self.cc, '-nostdinc', '-Iheaders', '-c', 'hello.c', '-o', 'out.o']
-        self.compile(command)
+        self.compile_frontend(command)
         self.addCleanup(headers.chmod, 0o700)
         headers.chmod(0o100)
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
         used.chmod(0)
         local = subprocess.run(command, cwd=self.work, capture_output=True, text=True)
@@ -1557,7 +1566,7 @@ class GccFrontendTest(BrokerTestCase):
         self.assertIn('! headers/value.h.gch/valid', local.stderr)
         expected = (self.work/'out.o').read_bytes()
         for _ in range(2):
-            result = self.compile(command)
+            result = self.compile_frontend(command)
             self.assertIn('! headers/value.h.gch/valid', result.stderr)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
         if os.geteuid() != 0:
@@ -1586,7 +1595,7 @@ class GccFrontendTest(BrokerTestCase):
                 expected.append((self.work/(name+'.o')).read_bytes())
                 commands.append(command)
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                results = list(pool.map(self.compile, commands))
+                results = list(pool.map(self.compile_frontend, commands))
             self.assertEqual(len(results), 2)
             for name, content in zip(('first', 'second'), expected):
                 self.assertEqual((self.work/(name+'.o')).read_bytes(), content)
@@ -1610,7 +1619,7 @@ class GccFrontendTest(BrokerTestCase):
         command = [self.cc, '-nostdinc', '-c', 'hello.c', '-o', 'out.o']
 
         def compile_and_measure():
-            result = self.compile(command)
+            result = self.compile_frontend(command)
             match = re.search(r'frontend filesystem: (\d+) requests, (\d+) bytes', result.stderr)
             self.assertIsNotNone(match, result.stderr)
             assert match is not None
@@ -1650,7 +1659,7 @@ class GccFrontendTest(BrokerTestCase):
         expected = (self.work/'out.d').read_text().replace('\\\n', '').split()
         expected_object = (self.work/'out.o').read_bytes()
         (self.work/'out.o').unlink()
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.d').read_text().replace('\\\n', '').split(), expected)
         self.assertEqual((self.work/'out.o').read_bytes(), expected_object)
 
@@ -1670,7 +1679,7 @@ class GccFrontendTest(BrokerTestCase):
         # A saved external footprint is usable only after this job traverses
         # the client-authorized link, including on the warm invocation.
         for _ in range(2):
-            self.compile(command)
+            self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_precompiled_header_and_cache_invalidation_use_native_gcc(self):
@@ -1685,7 +1694,7 @@ class GccFrontendTest(BrokerTestCase):
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
         (self.work/'out.o').unlink()
-        self.compile(command)
+        self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
         (self.work/'prefix.h.gch').unlink()
         for value in (42, 43):
@@ -1693,13 +1702,13 @@ class GccFrontendTest(BrokerTestCase):
             subprocess.run(command, cwd=self.work, check=True, capture_output=True)
             expected = (self.work/'out.o').read_bytes()
             (self.work/'out.o').unlink()
-            self.compile(command)
+            self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
     def test_disconnect_reaps_gcc_and_filesystem_and_allows_next_job(self):
         self.start_frontend()
         compiler = shutil.which('g++')
-        self.assertIsNotNone(compiler)
+        assert compiler is not None
         (self.work/'slow.cc').write_text('#include <regex>\nstd::regex expression("[a-z]+[0-9]*");\n')
         def descendants(pid):
             try:
@@ -1739,7 +1748,7 @@ class GccFrontendTest(BrokerTestCase):
                 for child in stopped:
                     try: os.kill(child, signal.SIGCONT)
                     except ProcessLookupError: pass
-        self.compile([self.cc, '-c', 'hello.c', '-o', 'next.o'])
+        self.compile_frontend([self.cc, '-c', 'hello.c', '-o', 'next.o'])
 
 
 class FrontendTest(BrokerTestCase):
@@ -2250,7 +2259,7 @@ class FrontendTest(BrokerTestCase):
                         *map(str, self.work.glob('*.profraw')), '-o', str(profile)],
                        check=True, capture_output=True)
         before = self.get_stats(self.stats_ports[0])
-        self.assertEqual(set(re.search(r'dcc_frontend_memory ([\d,]+)', before)[1].split(',')), {'1610612736'})
+        self.assertEqual(set(required_match(r'dcc_frontend_memory ([\d,]+)', before)[1].split(',')), {'1610612736'})
         for index in range(2):
             result = subprocess.run([str(self.build/'distcc'), clang, '-O3', '-c', str(source),
                                      '-fprofile-use='+str(profile),
@@ -2983,7 +2992,7 @@ int main(int argc, char **argv) {
         # job is active, additional capacity is zero, but total occupancy must
         # still include that job, as on every other RPC path.
         initial = self.get_stats(self.stats_ports[0])
-        headroom = int(re.search(r'dcc_memory_headroom_bytes (\d+)', initial)[1])
+        headroom = int(required_match(r'dcc_memory_headroom_bytes (\d+)', initial)[1])
         reservation_mib = max(1, 3 * headroom // (4 * 1024**2))
         clang = self.start_frontend(DISTCC_JOB_MEMORY=str(reservation_mib), DISTCC_MEMORY_LEARNING='0')
         source = self.work/'cancel.c'
@@ -2997,8 +3006,8 @@ int main(int argc, char **argv) {
                     self.assertIsNone(process.poll(), 'worker did not execute the job')
                     self.assertLess(time.monotonic(), deadline)
                     time.sleep(.01)
-                busy = int(re.search(r'dcc_busy (\d+)', active)[1])
-                capacity = int(re.search(r'dcc_frontend_capacity (\d+)', active)[1])
+                busy = int(required_match(r'dcc_busy (\d+)', active)[1])
+                capacity = int(required_match(r'dcc_frontend_capacity (\d+)', active)[1])
                 self.assertEqual(capacity, busy, active)
                 process.kill(); process.wait(timeout=5)
                 deadline = time.monotonic()+5
@@ -3084,12 +3093,21 @@ class TcpJobsTest(TcpJobTestCase):
     def test_memory_refusal_is_a_reusable_unstarted_boundary(self):
         self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='1048576')
         self.addCleanup(self.restart_server, self.build / 'distccd')
+        self.start_tcp()
         body = b'int value(void) { return 7; }\n'
-        net = None
         for identity in (37, 38):
-            net = self.wire_job(body, cached=False, identity=identity, net=net)
-            self.upload(net, body)
-            self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', identity)))
+            with self.request(9, (37, len(body), 4), 1, family=37) as lease:
+                status, capabilities, fds = self.receive(lease)
+                self.assertEqual(status, 0)
+                self.assertEqual(len(fds), 1)
+                with socket.socket(fileno=fds[0]) as net:
+                    self.assertTrue(capabilities & (1 << 28), 'unstarted family must remain cold')
+                    self.wire_job(body, cached=2, identity=identity, net=net)
+                    self.upload(net, body)
+                    self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', identity)))
+                    lease.sendmsg([struct.pack('=II', self.protocol_version, 14)],
+                                  [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+                    self.assertEqual(lease.recv(1), b'')
         stats = self.get_stats(self.stats_ports[0])
         self.assertIn('dcc_compile_ok 0\n', stats)
         self.assertIn('dcc_busy 0\n', stats)
@@ -3246,12 +3264,12 @@ sys.exit(result.returncode)
             self.assertEqual(connection.getpeername(), f'{prefix}-{self.ports[0]}.sock')
         lease.close()
         after = self.get_stats(self.stats_ports[0])
-        self.assertEqual(re.search(r'dcc_tcp_accept (\d+)', before)[1],
-                         re.search(r'dcc_tcp_accept (\d+)', after)[1])
-        self.assertEqual(int(re.search(r'dcc_compile_ok (\d+)', after)[1]) -
-                         int(re.search(r'dcc_compile_ok (\d+)', before)[1]), 4)
+        self.assertEqual(required_match(r'dcc_tcp_accept (\d+)', before)[1],
+                         required_match(r'dcc_tcp_accept (\d+)', after)[1])
+        self.assertEqual(int(required_match(r'dcc_compile_ok (\d+)', after)[1]) -
+                         int(required_match(r'dcc_compile_ok (\d+)', before)[1]), 4)
         self.assertIn('dcc_local_input_jobs 4\n', after)
-        self.assertGreater(int(re.search(r'dcc_local_input_bytes (\d+)', after)[1]), 0)
+        self.assertGreater(int(required_match(r'dcc_local_input_bytes (\d+)', after)[1]), 0)
 
     def file_gate(self):
         hook, library = self.work / 'file-gate.c', self.work / 'file-gate.so'
@@ -3339,8 +3357,9 @@ int unlinkat(int fd, const char *path, int flags) {
                         time.sleep(.01)
                 arm.touch()
                 owner = None
+                before = 0
                 if kind == 'copy':
-                    before = int(re.search(r'dcc_tcp_parallel_tasks (\d+)', self.get_stats(self.stats_ports[0]))[1])
+                    before = int(required_match(r'dcc_tcp_parallel_tasks (\d+)', self.get_stats(self.stats_ports[0]))[1])
                     owner = self.wire_job(body)
                     self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
                 net = self.wire_job(body, cached=kind != 'cleanup')
@@ -3349,7 +3368,7 @@ int unlinkat(int fd, const char *path, int flags) {
                     while True:
                         stats = self.get_stats(self.stats_ports[0])
                         if ('dcc_preparing 2\n' in stats and
-                            int(re.search(r'dcc_tcp_parallel_tasks (\d+)', stats)[1]) >= before + 2): break
+                            int(required_match(r'dcc_tcp_parallel_tasks (\d+)', stats)[1]) >= before + 2): break
                         self.assertLess(time.monotonic(), deadline)
                         time.sleep(.01)
                     self.upload(owner, body)
@@ -3418,19 +3437,16 @@ int unlinkat(int fd, const char *path, int flags) {
             self.assertIn('sendfile(', calls)  # Result publication, not an input snapshot.
             self.assertNotRegex(calls, r'sendfile\([^\n]*distcc-preprocessed')
             returned = re.search(r'sendmsg\([^\n]*iov_len=128[^\n]*SCM_RIGHTS', calls)
-            self.assertIsNotNone(returned, 'pooled connection was not returned')
+            assert returned is not None, 'pooled connection was not returned'
             self.assertLess(returned.start(), calls.index('sendfile('), 'copy held the pooled connection')
             self.assertEqual(actual.read_bytes(), expected.read_bytes())
-        self.assertGreater(int(re.search(r'dcc_local_input_bytes (\d+)',
+        self.assertGreater(int(required_match(r'dcc_local_input_bytes (\d+)',
                                         self.get_stats(self.stats_ports[0]))[1]), 2 * 1024 * 1024)
         # A writable handle must not be inherited into a compiler. Include a
         # valid manifest so rejection tests FD validation, not framing.
-        def string(s): return struct.pack('!Q', len(s)) + s
         args = [b'gcc', b'-c', b'/input.i', b'-o', b'/out.o']
         body = b'int input;\n'
-        manifest = struct.pack('!4Q', 7, 0, len(args), 1) + string(b'/')
-        manifest += b''.join(map(string, args))
-        manifest += struct.pack('!5Q', 0, 0, 0, len(body), len(body)) + bytes(8) + string(b'/input.i') + string(b'')
+        manifest = struct.pack('!Q', 7) + job_manifest(0, '/', args, [('/input.i', len(body), bytes(8), 0)])
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as net, (self.work/'bad.i').open('w+b') as f:
             f.write(body); f.flush()
             net.settimeout(3); net.connect(f'{prefix}-{self.ports[0]}.sock')
@@ -3448,18 +3464,18 @@ int unlinkat(int fd, const char *path, int flags) {
         for i in range(8):
             self.job(f'memory-{i}')
         after = self.get_stats(self.stats_ports[0])
-        estimate = int(re.search(r'dcc_job_memory_bytes (\d+)', after)[1])
+        estimate = int(required_match(r'dcc_job_memory_bytes (\d+)', after)[1])
         self.assertGreaterEqual(estimate, 256 * 1024 * 1024)
         self.assertLess(estimate, 512 * 1024 * 1024)
         self.assertIn('dcc_job_memory_samples 8\n', after)
 
     def test_compile_and_pool_reuse(self):
         self.start_tcp()
-        before = int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
+        before = int(required_match(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
         for i in range(5):
             self.job(i, 'cc' if i % 2 else 'c')
         stats = self.get_stats(self.stats_ports[0])
-        self.assertEqual(int(re.search(r'dcc_tcp_accept (\d+)', stats)[1]) - before, 1)
+        self.assertEqual(int(required_match(r'dcc_tcp_accept (\d+)', stats)[1]) - before, 1)
         self.assertIn('dcc_busy 0\n', stats)
 
     def test_parallel_compile(self):
@@ -3576,7 +3592,7 @@ time_t time(time_t *out) {
         self.env.update(DISTCC_MAX_RETRIES='1', DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_VERBOSE='1')
         destination = self.work / 'directory.o'
         destination.mkdir()
-        before = int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
+        before = int(required_match(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
         result = subprocess.run([str(self.build / 'distcc'), 'gcc', '-c', str(self.source),
                                  '-o', str(destination)], env=self.env, capture_output=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
@@ -3584,7 +3600,7 @@ time_t time(time_t *out) {
         self.assertTrue(destination.is_dir())
         self.assertFalse(list(self.work.glob('directory.o.distcc-*')))
         self.job('after-publication-failure')
-        after = int(re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
+        after = int(required_match(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))[1])
         self.assertEqual(after - before, 1)
 
     def test_parallel_compressed_inputs_and_disconnect(self):
@@ -3614,7 +3630,7 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.send(cancelled, 0x54010302, struct.pack('!II', 0, 262144) + first[8:])
         self.send(cancelled, 0x54010302, struct.pack('!II', 0, 262144) + first[8:])
         deadline = time.monotonic() + 3
-        while not int(re.search(r'dcc_tcp_input_prefetch_bytes (\d+)',
+        while not int(required_match(r'dcc_tcp_input_prefetch_bytes (\d+)',
                                self.get_stats(self.stats_ports[0]))[1]):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.01)
@@ -3630,8 +3646,8 @@ ssize_t write(int fd, const void *data, size_t size) {
         for net in streams:
             self.result(net)
         stats = self.get_stats(self.stats_ports[0])
-        self.assertGreaterEqual(int(re.search(r'dcc_tcp_parallel_tasks (\d+)', stats)[1]), 24)
-        self.assertIn(int(re.search(r'dcc_tcp_parallel_peak (\d+)', stats)[1]), (1, 2))
+        self.assertGreaterEqual(int(required_match(r'dcc_tcp_parallel_tasks (\d+)', stats)[1]), 24)
+        self.assertIn(int(required_match(r'dcc_tcp_parallel_peak (\d+)', stats)[1]), (1, 2))
 
     def test_partial_manifest_does_not_reserve_worker(self):
         self.start_tcp()
@@ -3647,23 +3663,14 @@ ssize_t write(int fd, const void *data, size_t size) {
                 net.close()
         self.job('after-cancel')
 
-    def wire_job(self, body, cached=True, paths=(b'/src/source.c',), identity=1, receive_buffer=None,
+    def wire_job(self, body, cached: int=True, paths=(b'/src/source.c',), identity=1, receive_buffer=None,
                  verification: bytes | None = b'DCSI\0\0\0\0', net=None, job_kind=1):
-        def string(value):
-            return struct.pack('!Q', len(value)) + value
         args = [b'gcc', b'-c', paths[0], b'-o', b'/src/result.o']
-        count = len(paths) + (verification is not None)
-        manifest = struct.pack('!Q3Q', identity, job_kind, len(args), count) + string(b'/src')
-        manifest += b''.join(map(string, args))
-        for path in paths:
-            manifest += (struct.pack('!5Q', 0, 0, cached, len(body), len(body)) +
-                         xxhash.xxh3_64(body).digest() + string(path) + string(b''))
+        inputs: list[tuple[bytes, int, bytes, int]] = [
+            (p, len(body), xxhash.xxh3_64(body).digest(), cached) for p in paths]
         if verification is not None:
-            # These wire fixtures contain no system includes. Production
-            # analyzer manifests are exercised by test_preprocess.
-            manifest += (struct.pack('!5Q', 0, 0, 0, len(verification), len(verification)) +
-                         xxhash.xxh3_64(verification).digest() +
-                         string(b'/.distcc-system/check') + string(b''))
+            inputs.append((b'/.distcc-system/check', len(verification), xxhash.xxh3_64(verification).digest(), 0))
+        manifest = struct.pack('!Q', identity) + job_manifest(job_kind, '/src', args, inputs)
         if net is None:
             net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
         net.settimeout(5)
@@ -4026,7 +4033,7 @@ subprocess.run(['objcopy', '--add-section', {'noise=' + str(noise)!r}, args[args
         self.job('after-daemon-restart')
 
     def test_large_raw_result_keeps_the_last_partial_chunk(self):
-        before = int(re.search(r'dcc_tcp_output_overlaps (\d+)',
+        before = int(required_match(r'dcc_tcp_output_overlaps (\d+)',
                                self.get_stats(self.stats_ports[0]))[1])
         wrapper = self.root / 'bin' / 'gcc'
         original = wrapper.read_text()
@@ -4044,7 +4051,7 @@ with open(args[args.index('-o') + 1], 'ab') as output:
         self.upload(net, body)
         outputs = self.result(net)
         self.assertEqual(outputs[2][-size:], random.Random(764).randbytes(size))
-        after = int(re.search(r'dcc_tcp_output_overlaps (\d+)',
+        after = int(required_match(r'dcc_tcp_output_overlaps (\d+)',
                               self.get_stats(self.stats_ports[0]))[1])
         self.assertGreater(after, before)
         obj = self.work / 'large.o'
@@ -4190,7 +4197,7 @@ class RemoteTcpJobsTest(TcpJobTestCase):
         log = (self.work / 'memory-refusal.log').read_text()
         self.assertIn('rescheduling unstarted job', log)
         after = self.get_stats(self.stats_ports[1])
-        count = lambda text: int(re.search(r'dcc_compile_ok (\d+)', text)[1])
+        count = lambda text: int(required_match(r'dcc_compile_ok (\d+)', text)[1])
         self.assertEqual(count(after) - count(before), 1)
         self.assertNotIn('job cost:', log.split('rescheduling unstarted job', 1)[0])
 
@@ -4302,7 +4309,7 @@ os.execv({self.cc!r}, [{self.cc!r}, *sys.argv[1:]])
         for i in range(2):
             self.start_broker(hosts, name=f'shared-{i}')
             environments.append(dict(self.env, DISTCC_VERBOSE='1'))
-        before = [int(re.search(r'dcc_compile_ok (\d+)', self.get_stats(port))[1])
+        before = [int(required_match(r'dcc_compile_ok (\d+)', self.get_stats(port))[1])
                   for port in self.stats_ports]
 
         def compile_job(i):
@@ -4320,7 +4327,7 @@ os.execv({self.cc!r}, [{self.cc!r}, *sys.argv[1:]])
             list(pool.map(compile_job, range(32)))
         for i, port in enumerate(self.stats_ports):
             stats = self.get_stats(port)
-            self.assertGreater(int(re.search(r'dcc_compile_ok (\d+)', stats)[1]), before[i])
+            self.assertGreater(int(required_match(r'dcc_compile_ok (\d+)', stats)[1]), before[i])
 
 
 @unittest.skipUnless(os.geteuid() == 0, 'cross-UID integration requires root')
@@ -4342,7 +4349,9 @@ class LocalCrossUidTest(unittest.TestCase):
                        DISTCC_HOSTS=f'127.0.0.1:{port}/1,tcp',
                        DISTCC_DIR=str(client), DISTCC_BROKER=str(client/'broker.sock'),
                        DISTCC_FALLBACK='0', DISTCC_SKIP_LOCAL_RETRY='1', TMPDIR=str(client))
-            server_env = dict(env, TMPDIR=str(root), DISTCCD_PATH=os.path.dirname(shutil.which('gcc'))+os.pathsep+os.defpath)
+            compiler = shutil.which('gcc')
+            assert compiler is not None
+            server_env = dict(env, TMPDIR=str(root), DISTCCD_PATH=os.path.dirname(compiler)+os.pathsep+os.defpath)
             processes = []
             with (root/'server.log').open('w+') as log:
                 try:

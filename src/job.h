@@ -17,6 +17,8 @@ enum dcc_job_kind { DCC_JOB_COMPILE, DCC_JOB_PUMP, DCC_JOB_LINK, DCC_JOB_RUST, D
 enum dcc_job_input_kind { DCC_JOB_FILE, DCC_JOB_SYMLINK, DCC_JOB_EMPTY,
                          DCC_JOB_READONLY };
 enum dcc_job_encoding { DCC_JOB_RAW, DCC_JOB_LZ4 };
+enum dcc_input_cache { DCC_UNCACHED, DCC_CACHE_LOOKUP, DCC_CACHE_PUSH };
+#define DCC_SOURCE_PUSH_MAX 65536
 enum dcc_job_artifact { DCC_JOB_STDERR, DCC_JOB_STDOUT, DCC_JOB_OBJECT, DCC_JOB_DEPS };
 struct dcc_job_input {
     char *path, *target;
@@ -24,7 +26,7 @@ struct dcc_job_input {
     enum dcc_job_encoding encoding;
     uint64_t wire_size, plain_size;
     unsigned char digest[8];
-    int cached;
+    enum dcc_input_cache cached;
     /* Owned local reference, never serialized. Open on demand to bound FD use. */
     int fd;
 };
@@ -34,6 +36,7 @@ struct dcc_job {
     char **argv;
     unsigned count;
     struct dcc_job_input *inputs;
+    unsigned main_input; /* Client-only pump source index plus one. */
     /* Client-only authorization roots; never accepted from a remote peer. */
     char **fs_roots;
     /* Owned stdin snapshot, represented as fd + 1; client-only. */

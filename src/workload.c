@@ -14,32 +14,38 @@
 #include "job.h"
 #include "resource.h"
 
-static uint64_t hash_source(const char *path, off_t size)
+static void describe_source(const char *path, off_t size, struct dcc_source_features *source)
 {
-    if (size <= 0 || size > 512LL * 1024 * 1024) return 0;
+    if (size <= 0 || size > 512LL * 1024 * 1024) return;
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     struct stat st;
-    if (fd < 0) return 0;
+    if (fd < 0) return;
     /* Check the opened object as well: it may have replaced the pathname
      * described by the caller, and a pipe/device must not block hashing. */
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
-        st.st_size > 512LL * 1024 * 1024) { close(fd); return 0; }
-    uint64_t result = 0;
+        st.st_size > 512LL * 1024 * 1024) { close(fd); return; }
+    uint32_t lines = 1;
+    off_t total = 0;
     XXH3_state_t hash = {0};
     XXH3_64bits_reset(&hash);
     char buffer[65536];
     ssize_t length;
     while ((length = read(fd, buffer, sizeof(buffer))) != 0) {
         if (length < 0) { if (errno == EINTR) continue; break; }
+        total += length;
+        if (total > size) break;
+        for (ssize_t i = 0; i < length; ++i) lines += buffer[i] == '\n';
         XXH3_64bits_update(&hash, buffer, length);
     }
-    if (!length) result = XXH3_64bits_digest(&hash);
+    if (!length && total == size) {
+        source->hash = XXH3_64bits_digest(&hash);
+        source->lines = lines;
+    }
     close(fd);
-    return result;
 }
 
 void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *input,
-                       const char *prepared, int fd, int ready, uint64_t *input_hash)
+                       const char *prepared, int fd, int ready, struct dcc_source_features *source)
 {
     *hint = (struct dcc_work_hint){0};
     struct stat st;
@@ -95,10 +101,13 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
     uint64_t family = XXH3_64bits_withSeed(name, strlen(name), kind);
     hint->scope_key = XXH3_64bits_withSeed(&directory, sizeof(directory), family);
     if (!gpu) {
-        if (!*input_hash) *input_hash = hash_source(input, hint->work_units);
-        if (*input_hash) {
+        if (!source->hash) describe_source(input, hint->work_units, source);
+        /* Count logical source lines during the existing content hash. A
+         * generated literal and many declarations of equal size cost differently. */
+        hint->work_units = source->lines;
+        if (source->hash) {
             uint64_t phase = XXH3_64bits_withSeed(name, strlen(name), hint->kind);
-            hint->family = XXH3_64bits_withSeed(input_hash, sizeof(*input_hash), phase);
+            hint->family = XXH3_64bits_withSeed(&source->hash, sizeof(source->hash), phase);
         }
     }
 }
@@ -142,8 +151,9 @@ static double computation_size(const struct dcc_work_hint *hint)
 {
     /* LLVM instruction counts measure optimizer work directly; bitcode and
      * imported constant-data bytes remain the independent input-size feature. */
+    if (hint->kind == DCC_WORK_THINLTO) return hint->work_units / 1048576.0;
+    if (hint->kind < DCC_WORK_RUST) return hint->work_units / 16384.0;
     double size = hint->work_units / 1048576.0;
-    if (hint->kind == DCC_WORK_THINLTO) return size;
     /* Large source text can be generated tables rather than optimizer work. */
     return size < 1 ? size : 1;
 }

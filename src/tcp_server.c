@@ -540,7 +540,7 @@ static int input_missing(struct dcc_tcp_server *s, unsigned i)
     struct input *in = &s->inputs[i];
     const struct dcc_job_input *description = &s->job->inputs[i];
     ++s->remaining;
-    if (!description->cached) { reserve_input(in); in->wanted = 1; return 0; }
+    if (description->cached != DCC_CACHE_LOOKUP) { reserve_input(in); in->wanted = 1; return 0; }
     struct upload **bucket = &uploads[description->digest[0]], *u;
     for (u = *bucket; u; u = u->next)
         if (u->size == description->plain_size && !memcmp(u->digest, description->digest, 8)) break;
@@ -623,7 +623,7 @@ static void prepare_inputs(void *argument)
             cache = job_cache(s->job);
             checked = 1;
         }
-        s->inputs[i].wanted = !file->cached ||
+        s->inputs[i].wanted = file->cached != DCC_CACHE_LOOKUP ||
             !dcc_file_cache_get(cache, file->digest, file->plain_size,
                                 s->inputs[i].path, dcc_job_shared(s->job, i));
     }
@@ -640,7 +640,7 @@ static int request_inputs(struct dcc_tcp_server *s)
     memset(wanted, 0, size);
     int any = 0;
     for (unsigned i = 0; i < s->job->count; ++i) {
-        if (s->inputs[i].wanted && s->job->inputs[i].cached) {
+        if (s->inputs[i].wanted && s->job->inputs[i].cached == DCC_CACHE_LOOKUP) {
             wanted[i / 8] |= 1U << (i % 8);
             any = 1;
         }

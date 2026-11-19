@@ -9,17 +9,19 @@
 #include <errno.h>
 #include <time.h>
 static int fixture_open(const char *, int);
-static time_t fixture_now = 1;
-static time_t fixture_time(time_t *value)
+/* Advance by one 100ms sample, including updates within a single second. */
+static unsigned fixture_now = 1;
+static int fixture_clock(clockid_t clock, struct timespec *value)
 {
-    if (value) *value = fixture_now;
-    return fixture_now;
+    assert(clock == CLOCK_MONOTONIC);
+    *value = (struct timespec){fixture_now / 10, fixture_now % 10 * 100000000};
+    return 0;
 }
 #define open fixture_open
-#define time fixture_time
+#define clock_gettime fixture_clock
 #include "../src/resource.c"
 #undef open
-#undef time
+#undef clock_gettime
 
 static int limited, missing, own_reads, parent_reads;
 static unsigned available_mib;

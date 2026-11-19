@@ -264,7 +264,7 @@ class CompilerAnalyzer(include_analyzer.IncludeAnalyzer):
       if clang:
         import clang_scan
         try:
-          result = clang_scan.scan([compiler, *command[1:], *options, '-c'], currdir)
+          result = clang_scan.scan_for_manifest([compiler, *command[1:], *options, '-c'], currdir)
         except clang_scan.InputChangedError as error:
           raise include_analyzer.CacheInvalidated(str(error)) from error
         statistics.preamble_hits += result['preamble_hit']

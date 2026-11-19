@@ -323,26 +323,31 @@ class Queuingsocketserver(socketserver.UnixStreamServer):
 
 # HANDLER FOR SOCKETSERVER
 
-def RecordMemory(path):
+def RecordMemory(path, previous_peak):
   """Publish a monotonic pool-wide resident plus native frontend high-water mark."""
   peak = 1024 * (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss +
                  resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+  if peak <= previous_peak:
+    return previous_peak
   with open(path, 'r+b', buffering=0) as output:
     fcntl.lockf(output, fcntl.LOCK_EX)
     previous, = struct.unpack('=Q', output.read(8))
     if peak > previous:
       output.seek(0)
       output.write(struct.pack('=Q', peak))
+  return peak
 
 
 def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
   """Wrap a socketserver based on the include_analyzer object inside a new
   type that is a class named IncludeHandler."""
 
-  # TODO(klarlund): Can we do this without dynamic type generation?
+  email_sender = _EmailSender()
 
   class IncludeHandler(socketserver.StreamRequestHandler):
     """Define a handle() method that invokes the include closure algorithm ."""
+
+    peak = 0
 
     def handle(self):
       """Using distcc protocol, read command and return include closure.
@@ -380,7 +385,7 @@ def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
             (inst.args and inst.args[0] or "unknown reason",
              include_analyzer.translation_unit)), file=fd, end=' ')
         # We don't include a stack trace here.
-        include_analyzer.email_sender.MaybeSendEmail(fd,
+        email_sender.MaybeSendEmail(fd,
                                                      never=not inst.send_email)
         # The empty argv list denotes failure. Communicate this
         # information back to the distcc client, so that it can fall
@@ -408,7 +413,7 @@ def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
            + "translation unit '%s'") % (
           (inst.args, include_analyzer.translation_unit)), file=fd, end=' ')
         _PrintStackTrace(fd)
-        include_analyzer.email_sender.MaybeSendEmail(fd, force=True)
+        email_sender.MaybeSendEmail(fd, force=True)
         distcc_pump_c_extensions.XArgv(self.wfile.fileno(), [])
         sys.exit("Now terminating include server.")
       # All other exceptions are trapped here.
@@ -423,13 +428,13 @@ def DistccIncludeHandlerGenerator(include_analyzer, memory_path=None):
         _PrintStackTrace(fd)
         # # Force this email through (if basics.opt_send_email is True), because
         # # this is the last one and this is an important case to report.
-        include_analyzer.email_sender.MaybeSendEmail(fd, force=True)
+        email_sender.MaybeSendEmail(fd, force=True)
         distcc_pump_c_extensions.XArgv(self.wfile.fileno(), [])
         raise SignalSIGTERM  # to be caught in Main with no further stack trace
       else:
         # No exception raised, include closure can be trusted.
         if memory_path is not None:
-          RecordMemory(memory_path)
+          IncludeHandler.peak = RecordMemory(memory_path, IncludeHandler.peak)
         distcc_pump_c_extensions.XArgv(self.wfile.fileno(), files_and_links)
         metadata = include_analyzer.compress_files.metadata
         other = bytes(8) + struct.pack('!QQ', 2**64-1, 0)
@@ -598,7 +603,6 @@ class AnalyzerPool:
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
         analyzer = self.analyzer_type(
             self.keeper, basics.opt_stat_reset_triggers)
-        analyzer.email_sender = _EmailSender()
         self.server.RequestHandlerClass = DistccIncludeHandlerGenerator(analyzer, self.memory_path)
         gc.set_threshold(basics.GC_THRESHOLD)
         os.write(write_fd, b'\n')

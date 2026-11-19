@@ -74,7 +74,7 @@ class ClientRootKeeper(object):
     # Preserve the old minimum prefix depth; deeper temporary roots need no padding.
     self.number_missing_levels = max(0, 3 - len(self.client_tmp.split('/')))
     self.client_root = None
-    self.cas = None
+    self.cas: str | None = None
     # A shared directory lock follows published snapshots through SCM_RIGHTS.
     # Closing the analyzer's descriptor does not release a client's reference.
     self.lease = None

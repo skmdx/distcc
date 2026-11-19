@@ -3,6 +3,8 @@
 #include <sys/mount.h>
 #include <sys/syscall.h>
 #include <signal.h>
+#include <atomic>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <dlfcn.h>
@@ -10,17 +12,17 @@
 #define FUSE_USE_VERSION 312
 #include <fuse3/fuse_lowlevel.h>
 static bool inject_read_shutdown;
-static sem_t *read_shutdown;
-static fuse_session *read_session;
+static sem_t read_shutdown;
+static std::atomic<fuse_session *> read_session;
 static unsigned session_reads;
 extern "C" ssize_t read(int fd, void *buffer, size_t size) {
     static auto libc_read = reinterpret_cast<ssize_t (*)(int, void *, size_t)>(dlsym(RTLD_NEXT, "read"));
-    if (read_session && fd == fuse_session_fd(read_session) && ++session_reads == 2) {
-        auto *session = read_session;
+    auto *session = read_session.load();
+    if (session && fd == fuse_session_fd(session) && ++session_reads == 2) {
         read_session = nullptr;
         // Shutdown in the check-to-read gap, with no pending FUSE request.
         fuse_session_exit(session);
-        sem_post(read_shutdown);
+        sem_post(&read_shutdown);
     }
     return libc_read(fd, buffer, size);
 }
@@ -28,17 +30,16 @@ static int observed_loop(fuse_session *session, fuse_loop_config *config) {
     if (inject_read_shutdown) read_session = session;
     return fuse_session_loop_mt(session, config);
 }
-static unsigned *attribute_calls;
-static unsigned *read_calls;
+static std::atomic<unsigned> attribute_calls, read_calls;
 static void (*original_read)(fuse_req_t, fuse_ino_t, size_t, off_t, struct fuse_file_info *);
 static void counted_read(fuse_req_t request, fuse_ino_t inode, size_t size, off_t offset,
                          struct fuse_file_info *info) {
-    ++*read_calls;
+    ++read_calls;
     original_read(request, inode, size, offset, info);
 }
 static void (*original_lookup)(fuse_req_t, fuse_ino_t, const char *);
 static void counted_lookup(fuse_req_t request, fuse_ino_t parent, const char *name) {
-    ++*attribute_calls;
+    ++attribute_calls;
     original_lookup(request, parent, name);
 }
 static struct fuse_session *counted_session_new(struct fuse_args *args, const struct fuse_lowlevel_ops *operations,
@@ -57,18 +58,10 @@ static struct fuse_session *counted_session_new(struct fuse_args *args, const st
     fuse_opt_free_args(&classic);
     return session;
 }
-static pid_t mounted_child;
-static bool reader_alive_at_unmount;
-static int checked_unmount(const char *path, int flags) {
-    if (mounted_child && !kill(mounted_child, 0)) reader_alive_at_unmount = true;
-    return syscall(SYS_umount2, path, flags);
-}
-#define umount2 checked_unmount
 #undef fuse_session_new
 #define fuse_session_new counted_session_new
 #define fuse_session_loop_mt observed_loop
 #include "src/gcc_files.cc"
-#undef umount2
 #undef fuse_session_new
 #undef fuse_session_loop_mt
 #include <thread>
@@ -270,17 +263,8 @@ static void disconnected_mount(const char *root)
     std::string mountpoint = std::string(root)+"/files";
     void *mount = dcc_gcc_files_start(pair[0], mountpoint.c_str(), "fixture", root,
                                      "/tree", "part.c", directories);
-    require(mount, "FUSE mount");
+    require(!mount, "disconnected prefetch accepted");
     close(pair[0]);
-    // This lookup may already be waiting in the kernel when prefetch fails.
-    struct stat info;
-    require(lstat((mountpoint+"/probe").c_str(), &info) < 0, "failed service answered lookup");
-    uint64_t cpu = 0;
-    unsigned long long peak = 0;
-    job_summary.clear();
-    require(dcc_gcc_files_stop(mount, &cpu, &peak) != 0, "failed prefetch reported success");
-    require(job_summary.find(" status=0 ") == std::string::npos,
-            "failed Files service logged success");
     int status;
     require(waitpid(peer, &status, 0) == peer && WIFEXITED(status) && !WEXITSTATUS(status), "peer exit");
     require(!rmdir(mountpoint.c_str()), "mount cleanup");
@@ -359,14 +343,10 @@ static void clean_mount(const char *root, bool lookup, int size_change = 0)
     close(pair[0]);
     struct stat info;
     if (inject_read_shutdown) {
-        while (sem_wait(read_shutdown) && errno == EINTR) {}
-        siginfo_t exited{};
-        require(!waitid(P_PID, static_cast<Mount *>(mount)->child, &exited, WEXITED | WNOWAIT),
-                "shutdown reader did not exit without a second signal");
-        require(exited.si_code == CLD_EXITED && !exited.si_status, "shutdown reader failed");
+        while (sem_wait(&read_shutdown) && errno == EINTR) {}
     }
     if (lookup) {
-        unsigned reads = *read_calls;
+        unsigned reads = read_calls;
         std::string filename = mountpoint+"/tree/include/data.h";
         for (unsigned pass = 0; pass < 2; ++pass) {
             int fd = open(filename.c_str(), O_RDONLY);
@@ -380,15 +360,15 @@ static void clean_mount(const char *root, bool lookup, int size_change = 0)
             require(mapped != MAP_FAILED && !memcmp(mapped, contents.data(), contents.size()), "snapshot mmap contents");
             munmap(mapped, contents.size()); close(fd);
         }
-        printf("First read/mmap and reopen READ callbacks: %u\n", *read_calls-reads);
+        printf("First read/mmap and reopen READ callbacks: %u\n", read_calls-reads);
         int fd = open(filename.c_str(), O_RDONLY);
         require(fd >= 0, "snapshot reopen before page reclamation");
         require(!posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED), "discard cached snapshot pages");
-        reads = *read_calls;
+        reads = read_calls;
         std::string reclaimed(contents.size(), '\0');
         require(read(fd, reclaimed.data(), reclaimed.size()) == static_cast<ssize_t>(contents.size()) &&
                 reclaimed == contents, "immutable snapshot must refill reclaimed kernel pages");
-        require(*read_calls > reads, "reclamation did not exercise the refill callback");
+        require(read_calls > reads, "reclamation did not exercise the refill callback");
         close(fd);
         filename = mountpoint+"/tree/include/denied.h";
         require(!stat(filename.c_str(), &info), "metadata visibility must not authorize a read");
@@ -398,16 +378,16 @@ static void clean_mount(const char *root, bool lookup, int size_change = 0)
         std::string missing = mountpoint+"/tree/include/absent.h";
         require(open(missing.c_str(), O_RDONLY) == -1 && errno == ENOENT,
                 "initial negative lookup");
-        unsigned calls = *attribute_calls;
+        unsigned calls = attribute_calls;
         for (unsigned i = 0; i < 16; ++i)
             require(open(missing.c_str(), O_RDONLY) == -1 && errno == ENOENT,
                     "cached negative lookup");
-        printf("Repeated absent-file lookups: 16, service callbacks: %u\n", *attribute_calls-calls);
-        require(*attribute_calls == calls, "negative lookup woke the FUSE service again");
+        printf("Repeated absent-file lookups: 16, service callbacks: %u\n", attribute_calls-calls);
+        require(attribute_calls == calls, "negative lookup woke the FUSE service again");
         for (unsigned i = 0; i < 16; ++i)
             require(open((missing+"/header-"+std::to_string(i)+".h").c_str(), O_RDONLY) == -1 &&
                     errno == ENOENT, "cached absent search directory");
-        require(*attribute_calls == calls, "absent search directory woke the FUSE service again");
+        require(attribute_calls == calls, "absent search directory woke the FUSE service again");
         // Distinct first lookups still reach the service. Exercise that hot
         // path, then check that the kernel retains every negative result.
         for (unsigned pass = 0; pass < 2; ++pass) {
@@ -416,25 +396,18 @@ static void clean_mount(const char *root, bool lookup, int size_change = 0)
                 require(lstat(path.c_str(), &info) == -1 && errno == ENOENT,
                         "first-lookup metadata result");
             }
-            require(*attribute_calls == calls+4096, "first lookup lost or repeated");
+            require(attribute_calls == calls+4096, "first lookup lost or repeated");
         }
     }
-    mounted_child = static_cast<Mount *>(mount)->child;
-    uint64_t cpu = 0;
-    unsigned long long peak = 0;
+    require(fcntl(fuse_session_fd(static_cast<Mount *>(mount)->fs), F_GETFD) & FD_CLOEXEC,
+            "FUSE device inherited across compiler exec");
     job_summary.clear();
-    int result = dcc_gcc_files_stop(mount, &cpu, &peak);
-    mounted_child = 0;
+    int result = dcc_gcc_files_stop(mount);
     require(!result, "clean shutdown reported failure");
     require(job_summary.find(" status=0 ") != std::string::npos,
             "joined Files service did not append its result to the job summary");
     if (lookup) require(job_summary.find(" transport=unused") == std::string::npos,
                         "actual FUSE requests were not accounted");
-    if (lookup) printf("Filesystem service CPU for 4096 first lookups: %llu ns\n",
-                       static_cast<unsigned long long>(cpu));
-    // Detaching while the kernel read is in flight can return ECONNABORTED,
-    // even for a regular unmount. The reader must have exited first.
-    require(!reader_alive_at_unmount, "unmount raced the live FUSE reader");
     int status;
     require(waitpid(peer, &status, 0) == peer && WIFEXITED(status) && !WEXITSTATUS(status), "clean peer exit");
     require(!rmdir(mountpoint.c_str()), "clean mount cleanup");
@@ -442,15 +415,7 @@ static void clean_mount(const char *root, bool lookup, int size_change = 0)
 
 int main(int argc, char **argv)
 {
-    read_shutdown = static_cast<sem_t *>(mmap(nullptr, sizeof(sem_t), PROT_READ | PROT_WRITE,
-                                            MAP_SHARED | MAP_ANONYMOUS, -1, 0));
-    require(read_shutdown != MAP_FAILED && !sem_init(read_shutdown, 1, 0), "shutdown semaphore");
-    attribute_calls = static_cast<unsigned *>(mmap(nullptr, sizeof(unsigned), PROT_READ | PROT_WRITE,
-                                                   MAP_SHARED | MAP_ANONYMOUS, -1, 0));
-    require(attribute_calls != MAP_FAILED, "shared callback counter");
-    read_calls = static_cast<unsigned *>(mmap(nullptr, sizeof(unsigned), PROT_READ | PROT_WRITE,
-                                             MAP_SHARED | MAP_ANONYMOUS, -1, 0));
-    require(read_calls != MAP_FAILED, "shared read callback counter");
+    require(!sem_init(&read_shutdown, 0, 0), "shutdown semaphore");
     cached_links();
     negative_hints();
     for (const char *mode : {"valid", "denied", "short", "length", "flags", "missing",
@@ -464,8 +429,5 @@ int main(int argc, char **argv)
     clean_mount(argv[1], false);
     inject_read_shutdown = false;
     disconnected_mount(argv[1]);
-    sem_destroy(read_shutdown);
-    munmap(read_shutdown, sizeof(sem_t));
-    munmap(attribute_calls, sizeof(unsigned));
-    munmap(read_calls, sizeof(unsigned));
+    sem_destroy(&read_shutdown);
 }

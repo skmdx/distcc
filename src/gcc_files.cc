@@ -6,11 +6,10 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <sched.h>
-#include <signal.h>
+#include <thread>
 #include <semaphore.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
-#include <sys/wait.h>
 #include <sys/resource.h>
 #include <map>
 #include <filesystem>
@@ -422,21 +421,14 @@ struct Mount {
     std::unique_ptr<Files> files;
     struct fuse_session *fs = nullptr;
     std::string mountpoint;
-    pid_t child = -1;
+    std::thread service;
     sem_t serial;
-    struct Traffic { unsigned long uring, classic; int status; } *traffic;
+    unsigned long uring = 0, classic = 0;
+    int status = 0;
     Mount() {
-        traffic = static_cast<Traffic *>(mmap(nullptr, sizeof(Traffic), PROT_READ | PROT_WRITE,
-                                              MAP_SHARED | MAP_ANONYMOUS, -1, 0));
-        if (traffic == MAP_FAILED) throw std::system_error(errno, std::generic_category());
-        traffic->status = -1;
-        if (sem_init(&serial, 0, 1)) {
-            int error = errno;
-            munmap(traffic, sizeof(Traffic));
-            throw std::system_error(error, std::generic_category());
-        }
+        if (sem_init(&serial, 0, 1)) throw std::system_error(errno, std::generic_category());
     }
-    ~Mount() { sem_destroy(&serial); munmap(traffic, sizeof(Traffic)); }
+    ~Mount() { sem_destroy(&serial); }
 };
 // sem_wait is cancellable; pthread_mutex_lock is not. libfuse cancels and
 // joins queue threads in order, including waiters behind a blocked RPC owner.
@@ -446,7 +438,7 @@ struct Callback {
     Mount &mount;
     explicit Callback(fuse_req_t request) : mount(*static_cast<Mount *>(fuse_req_userdata(request))) {
         while (sem_wait(&mount.serial)) if (errno != EINTR) _exit(120);
-        if (fuse_req_is_uring(request)) ++mount.traffic->uring; else ++mount.traffic->classic;
+        if (fuse_req_is_uring(request)) ++mount.uring; else ++mount.classic;
     }
     ~Callback() { sem_post(&mount.serial); }
     bool stopped() const { return fuse_session_exited(mount.fs); }
@@ -655,86 +647,41 @@ extern "C" void *dcc_gcc_files_start(int channel, const char *mountpoint,
     fuse_opt_free_args(&args);
     if (!state->fs) { errno = EINVAL; return nullptr; }
     if (fuse_session_mount(state->fs, mountpoint)) { fuse_session_destroy(state->fs); return nullptr; }
-    // Shutdown may arrive before the child installs libfuse's handler. Keep it
-    // pending across fork, without changing the worker's own signal policy.
-    sigset_t stop_signal, previous_mask;
-    sigemptyset(&stop_signal); sigaddset(&stop_signal, SIGTERM);
-    sigprocmask(SIG_BLOCK, &stop_signal, &previous_mask);
-    state->child = fork();
-    if (state->child) sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
-    if (state->child < 0) {
-        fuse_session_unmount(state->fs); fuse_session_destroy(state->fs); return nullptr;
-    }
-    if (!state->child) {
-        auto session = state->fs;
-        struct sigaction action{};
-        action.sa_handler = SIG_DFL;
-        sigemptyset(&action.sa_mask);
-        if (sigaction(SIGTERM, &action, nullptr) || fuse_set_signal_handlers(session)) {
-            perror("distcc GCC filesystem signal handlers"); _exit(1);
-        }
-        sigdelset(&previous_mask, SIGTERM);
-        sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
-        // This service must not keep the worker's cancellation/result sockets
-        // alive. It owns only the FUSE device and its filesystem RPC stream.
-        int device = fuse_session_fd(state->fs);
-        int first = std::min(device, channel), last = std::max(device, channel);
-        if (first > 3) close_range(3, first-1, 0);
-        if (last > first+1) close_range(first+1, last-1, 0);
-        close_range(last+1, ~0U, 0);
-        // TMPDIR is already the job root here. Like the Clang frontend, keep
-        // immutable snapshots in its parent so job cleanup cannot remove them.
-        auto cache_root = std::filesystem::path(job_root).parent_path().string();
-        state->files = std::make_unique<Files>(channel, mountpoint, identity, cache_root.c_str(), cwd, input);
-        int result = state->files->prefetch(cwd, directories);
-        if (result) {
-            fprintf(stderr, "distcc GCC directory prefetch: %s\n", strerror(result));
-            fuse_session_unmount(state->fs);
-        } else {
-            result = run_session(state->fs);
-            if (result == SIGTERM) result = 0;
-        }
-        state->traffic->status = result;
-        state->files.reset();
-        fuse_remove_signal_handlers(session);
-        fuse_session_destroy(state->fs);
-        _exit(result ? 1 : 0);
-    }
-    // Destroying the parent's handle closes its device fd without unmounting.
-    // The service is the sole owner: its death must abort pending kernel reads.
-    fuse_session_destroy(state->fs);
-    state->fs = nullptr;
-    return state.release();
-}
-extern "C" int dcc_gcc_files_stop(void *opaque, uint64_t *cpu_ns, unsigned long long *peak_bytes) {
-    std::unique_ptr<Mount> state(static_cast<Mount *>(opaque));
     int error = 0;
-    // Stop the reader before detaching. Linux can return ECONNABORTED when a
-    // regular unmount races its transition from pending to in-flight reads.
-    if (kill(state->child, SIGTERM) && errno != ESRCH) {
-        error = errno;
-        fprintf(stderr, "distcc GCC filesystem stop: %s\n", strerror(error));
+    int rpc = fcntl(channel, F_DUPFD_CLOEXEC, 3);
+    if (rpc < 0) error = errno;
+    else {
+        auto cache_root = std::filesystem::path(job_root).parent_path().string();
+        state->files = std::make_unique<Files>(rpc, mountpoint, identity, cache_root.c_str(), cwd, input);
+        if (fcntl(fuse_session_fd(state->fs), F_SETFD, FD_CLOEXEC)) error = errno;
+        else error = state->files->prefetch(cwd, directories);
     }
-    int status;
-    struct rusage usage{};
-    pid_t result;
-    do { result = wait4(state->child, &status, 0, &usage); } while (result < 0 && errno == EINTR);
-    // The job's normal logger owns the record. Read the shared counters only
-    // after joining the Files child; short-lived FUSE services need no extra
-    // stderr/syslog stream or inherited logging descriptors.
+    if (!error) {
+        try {
+            state->service = std::thread([mount = state.get()] {
+                mount->status = run_session(mount->fs);
+                // Release any pending kernel requests if the loop failed.
+                if (mount->status) umount2(mount->mountpoint.c_str(), MNT_DETACH);
+            });
+            return state.release();
+        } catch (const std::system_error &e) { error = e.code().value(); }
+    }
+    fuse_session_unmount(state->fs);
+    fuse_session_destroy(state->fs);
+    errno = error;
+    return nullptr;
+}
+extern "C" int dcc_gcc_files_stop(void *opaque) {
+    std::unique_ptr<Mount> state(static_cast<Mount *>(opaque));
+    fuse_session_exit(state->fs);
+    int error = umount2(state->mountpoint.c_str(), MNT_DETACH) && errno != EINVAL && errno != ENOENT;
+    if (error) perror("distcc GCC filesystem unmount");
+    state->service.join();
+    fuse_session_destroy(state->fs);
     char traffic[192];
     snprintf(traffic, sizeof(traffic), " DCC_URING done job_pid=%ld uring=%lu classic=%lu status=%d transport=%s",
-             (long)state->child, state->traffic->uring, state->traffic->classic, state->traffic->status,
-             state->traffic->uring ? "uring" : state->traffic->classic ? "classic" : "unused");
+             (long)getpid(), state->uring, state->classic, state->status,
+             state->uring ? "uring" : state->classic ? "classic" : "unused");
     dcc_job_summary_append(traffic);
-    if (umount2(state->mountpoint.c_str(), MNT_DETACH) && errno != EINVAL && errno != ENOENT) {
-        error = errno;
-        fprintf(stderr, "distcc GCC filesystem unmount: %s\n", strerror(error));
-    }
-    if (result >= 0) {
-        *cpu_ns += (uint64_t)(usage.ru_utime.tv_sec+usage.ru_stime.tv_sec)*1000000000 +
-                   (uint64_t)(usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)*1000;
-        *peak_bytes += (unsigned long long)usage.ru_maxrss*1024;
-    }
-    return !error && result >= 0 && WIFEXITED(status) && !WEXITSTATUS(status) ? 0 : -1;
+    return error || state->status ? -1 : 0;
 }

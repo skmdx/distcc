@@ -249,6 +249,11 @@ public:
             return std::error_code{};
         });
     }
+    void retain(llvm::StringRef name, dccfs::Snapshot snapshot) {
+        auto &record = remember(name, snapshot.version.data());
+        record.contents = std::make_shared<SnapshotBuffer>(
+            llvm::StringRef(snapshot.bytes.data, snapshot.bytes.size), name.str(), std::move(snapshot.bytes.owner));
+    }
     void prepare(const clang::CompilerInvocation &invocation) {
         std::set<std::string> directories;
         for (const auto &entry : invocation.getHeaderSearchOpts().UserEntries)
@@ -269,11 +274,30 @@ public:
         queries.clear();
         while (!names.empty()) {
             auto pair = names.split('\0');
-            if (pair.first.starts_with("/") && !entries.count(pair.first))
+            if (pair.first.starts_with("/"))
                 queries.push_back({DCC_FS_STATUS, pair.first.str()});
             names = pair.second;
         }
-        (void)prefetch(DCC_FS_BATCH, queries);
+        if (prefetch(DCC_FS_BATCH, queries)) return;
+        std::vector<Query> missing;
+        for (const auto &q : queries) {
+            auto it = entries.find(q.path);
+            if (it == entries.end() || it->second.error || !S_ISREG(it->second.mode())) continue;
+            const char *version = it->second.version.data();
+            dccfs::Snapshot snapshot;
+            if (connection.cached_file(q.path, version, snapshot)) retain(q.path, std::move(snapshot));
+            else missing.push_back({DCC_FS_READ, q.path, 8 + DCC_FS_METADATA + number(version+24, 8)});
+        }
+        (void)connection.batch(DCC_FS_BATCH, missing, [this](const Query &q, std::error_code ec, std::string_view data) {
+            if (ec) return std::error_code{}; // Retry speculative failures on actual open.
+            // LLVM requires a NUL after every individual source image.
+            auto bytes = std::make_shared<std::string>(data);
+            dccfs::Snapshot snapshot;
+            auto error = connection.snapshot(q.path, entries.find(q.path)->second.version.data(),
+                {bytes, bytes->data(), bytes->size()}, snapshot);
+            if (!error) retain(q.path, std::move(snapshot));
+            return error;
+        });
     }
     void finish() {
         connection.finish_writes();
@@ -415,9 +439,8 @@ public:
         if (auto error = connection.read({name.data(), name.size()},
                 found != entries.end() && S_ISREG(found->second.mode()) ? version.data() : nullptr, snapshot))
             return error;
-        auto &record = remember(name, snapshot.version.data());
-        record.contents = std::make_shared<SnapshotBuffer>(
-            llvm::StringRef(snapshot.bytes.data, snapshot.bytes.size), name.str(), std::move(snapshot.bytes.owner));
+        retain(name, std::move(snapshot));
+        auto &record = entries.find(name)->second;
         return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));
     }
     llvm::vfs::directory_iterator dir_begin(const llvm::Twine &path, std::error_code &error) override {

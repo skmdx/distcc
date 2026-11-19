@@ -32,6 +32,7 @@
 #include "util.h"
 #include "tcp_job.h"
 #include "workload.h"
+#include "plan_memo.h"
 #include <search.h>
 #include <xxhash.h>
 
@@ -74,6 +75,9 @@ struct peer {
     double prepare_cost[DCC_WORK_CLASSES];
     double mean_cost;
     uint64_t scopes[16], report_stamp;
+    /* A collision suppresses speculative transmission. Keep this independent
+     * of timings, which are unavailable for preprocessor-only requests. */
+    uint64_t dispatched[1024];
     unsigned next_scope;
     double report_until;
 };
@@ -97,9 +101,16 @@ struct client {
     double cost, ready_at, run_at, factor, waiting_since;
 };
 struct memo { char *key, *value; size_t length; uid_t owner; int worker, socket;
+              struct dcc_plan_watch *watch;
+              size_t watch_bytes;
               struct memo *previous, *next; };
 struct idle_connection { int fd, peer, next, previous; double expires; uint32_t generation; };
-struct session { int fd, denied; double deadline, preflight; unsigned kind; };
+struct session {
+    int fd, denied, plan_access;
+    struct ucred peer;
+    double deadline, preflight;
+    unsigned kind;
+};
 enum { LISTENER, STATS, CONTROL = STATS + MAX_HOSTS, NETWORK = CONTROL + MAX_CLIENTS,
        IDLE_SOCKET = NETWORK + MAX_CLIENTS, WATCH_COUNT = IDLE_SOCKET + MAX_CLIENTS };
 struct broker {
@@ -113,6 +124,7 @@ struct broker {
     double refresh_at, first_probe_until;
     double local_prepare[DCC_WORK_CLASSES];
     void *memos;
+    struct dcc_plan_monitor *plans;
     struct memo *memo_first, *memo_last;
     size_t memo_bytes;
     unsigned memo_workers;
@@ -142,7 +154,7 @@ static int reconnect_wait(struct reconnect *retry, int error, int allow_unreacha
     return 1;
 }
 
-static int memo_get_once(const char *key, char **value, size_t *length, int *worker, unsigned command, double deadline)
+static int memo_get_once(const char *key, char **value, size_t *length, int *worker, unsigned command, int *verified, double deadline)
 {
     unsigned tag;
     struct request request = { BROKER_VERSION, command };
@@ -151,9 +163,10 @@ static int memo_get_once(const char *key, char **value, size_t *length, int *wor
     struct timeval timeout = { dcc_get_io_timeout(), 0 };
     char short_reply[2];
     char *buffer = NULL;
-    size_t capacity = worker ? sizeof(short_reply) : DCC_MEMO_LIMIT;
+    size_t capacity = worker ? sizeof(short_reply) : DCC_MEMO_LIMIT + sizeof(uint32_t);
     int fd, error;
     ssize_t size;
+    if (verified) *verified = 0;
     if (value) *value = NULL;
     if (worker) *worker = -1;
     if (strlen(key) >= DCC_MEMO_LIMIT) { errno = EINVAL; return -1; }
@@ -191,6 +204,15 @@ static int memo_get_once(const char *key, char **value, size_t *length, int *wor
         if (!worker) free(buffer);
         return lease;
     }
+    if (value && size > 5 && buffer[size-1] == 1) {
+        uint32_t count;
+        size -= sizeof(count);
+        memcpy(&count, buffer + size - 1, sizeof(count));
+        if (verified && getuid() == geteuid() && getgid() == getegid() &&
+            count <= DCC_PLAN_JOURNAL_LIMIT / sizeof(struct dcc_plan_dependency))
+            *verified = count;
+        buffer[size-1] = 0;
+    }
     if (value && size > 1 && size <= DCC_MEMO_LIMIT && !buffer[size - 1]) {
         *value = buffer;
         if (length) *length = (size_t)size - 1;
@@ -207,31 +229,31 @@ failed:
     return -1;
 }
 
-static int memo_get(const char *key, char **value, size_t *length, int *worker, unsigned command)
+static int memo_get(const char *key, char **value, size_t *length, int *worker, unsigned command, int *verified)
 {
     struct reconnect retry = {0};
     int fd;
     do {
-        fd = memo_get_once(key, value, length, worker, command, retry.deadline);
+        fd = memo_get_once(key, value, length, worker, command, verified, retry.deadline);
         if (fd >= 0 || (value && *value) || (worker && *worker >= 0)) return fd;
     } while (reconnect_wait(&retry, errno, 0));
     return -1;
 }
 
-int dcc_broker_memo_get(const char *key, char **value, size_t *length) { return memo_get(key, value, length, NULL, MEMO_GET); }
-int dcc_broker_worker_get(const char *key, int *worker) { return memo_get(key, NULL, NULL, worker, WORKER_GET); }
+int dcc_broker_memo_get(const char *key, char **value, size_t *length, int *verified) { return memo_get(key, value, length, NULL, MEMO_GET, verified); }
+int dcc_broker_worker_get(const char *key, int *worker) { return memo_get(key, NULL, NULL, worker, WORKER_GET, NULL); }
 
 static void memo_digest(const char *value, size_t size, char digest[33])
 {
     XXH128_hash_t h=XXH3_128bits(value,size);
     snprintf(digest,33,"%016llx%016llx",(unsigned long long)h.high64,(unsigned long long)h.low64);
 }
-int dcc_broker_memo_refresh(const char *key, const char *stale, size_t stale_length, char **value, size_t *length)
+int dcc_broker_memo_refresh(const char *key, const char *stale, size_t stale_length, char **value, size_t *length, int *verified)
 {
     char digest[33], *payload=NULL;
     memo_digest(stale,stale_length,digest);
     if (asprintf(&payload,"%s\n%s",key,digest)<0) return -1;
-    int lease=memo_get(payload,value,length,NULL,MEMO_REFRESH);
+    int lease=memo_get(payload,value,length,NULL,MEMO_REFRESH,verified);
     free(payload); return lease;
 }
 
@@ -497,6 +519,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int
     }
     (*host)->broker_managed = 1;
     (*host)->broker_cpp_reserved = !remote_cpp && !cpp_ready;
+    (*host)->cold_family = !!(reply.slots & DCC_BROKER_COLD_FAMILY);
     if (reply.slots & DCC_BROKER_DIRECT) (*host)->mode = DCC_MODE_LOCAL;
     if (remote_cpp || cpp_ready) {
         (*host)->cpp_where = remote_cpp ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT;
@@ -749,15 +772,32 @@ static void memo_forget(struct broker *broker, struct memo *memo)
     memo_unlink(broker,memo);
     tdelete(memo,&broker->memos,memo_order);
     broker->memo_bytes-=sizeof(*memo)+strlen(memo->key)+1;
-    if (memo->value) broker->memo_bytes-=memo->length+1;
+    if (memo->value) broker->memo_bytes-=memo->length+1+memo->watch_bytes;
     if (memo->socket) { close(memo->socket-1); --broker->memo_workers; }
+    dcc_plan_watch_free(memo->watch);
     free(memo->key); free(memo->value); free(memo);
 }
 
-static void memo_reply(int fd, const struct memo *memo)
+static int session_plan_access(struct broker *broker, struct session *session)
 {
+    if (!session->plan_access)
+        session->plan_access = dcc_plan_peer_matches(broker->plans, session->fd, session->peer.pid,
+                                                     session->peer.uid, session->peer.gid) ? 1 : -1;
+    return session->plan_access > 0;
+}
+
+static void memo_reply(struct broker *broker, struct session *session, const struct memo *memo)
+{
+    int fd = session->fd;
     if (memo->socket) dcc_send_fd(fd, "W", 2, memo->socket - 1);
-    else if (memo->value) send(fd, memo->value, memo->length + 1, MSG_NOSIGNAL);
+    else if (memo->value) {
+        uint32_t count = memo->watch && session_plan_access(broker, session)
+                ? dcc_plan_watch_verified(memo->watch) : 0;
+        struct iovec parts[] = {{memo->value, memo->length}, {&count, count ? sizeof(count) : 0},
+                                {(void *)(count ? "\1" : ""), 1}};
+        struct msghdr msg = {.msg_iov = parts, .msg_iovlen = 3};
+        sendmsg(fd, &msg, MSG_NOSIGNAL);
+    }
 }
 
 static void memo_request(struct broker *broker, struct client *client,
@@ -768,16 +808,14 @@ static void memo_request(struct broker *broker, struct client *client,
     char *replacement=NULL, *expected=NULL;
     (void)now;
     int worker = command == WORKER_GET || command == WORKER_PUT;
-    struct ucred credentials;
-    socklen_t length = sizeof(credentials);
-    if (getsockopt(client->fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length)) goto done;
+    struct session *session = &broker->sessions[client->session];
     if ((command == MEMO_GET || command == WORKER_GET || command == MEMO_REFRESH) && client->state == REQUEST) {
         if (command==MEMO_REFRESH) {
             replacement=strdup(payload);
             if (!replacement || !(expected=strrchr(replacement,'\n')) || strlen(expected+1)!=32) goto done;
             *expected++=0; payload=replacement;
         }
-        struct memo lookup={.key=(char *)payload,.owner=credentials.uid,.worker=worker};
+        struct memo lookup={.key=(char *)payload,.owner=session->peer.uid,.worker=worker};
         struct memo **found=tfind(&lookup,&broker->memos,memo_order);
         memo=found ? *found : NULL;
         if (memo && memo->socket) {
@@ -791,7 +829,9 @@ static void memo_request(struct broker *broker, struct client *client,
             char digest[33]; memo_digest(memo->value,memo->length,digest);
             if (!strcmp(digest,expected)) {
                 memo_unlink(broker,memo);
-                broker->memo_bytes-=memo->length+1;
+                broker->memo_bytes-=memo->length+1+memo->watch_bytes;
+                memo->watch_bytes=0;
+                dcc_plan_watch_free(memo->watch); memo->watch = NULL;
                 free(memo->value); memo->value=NULL;
                 client->state=MEMO_OWNER; client->memo=memo;
                 if (send(client->fd,"",1,MSG_NOSIGNAL)!=1) goto done;
@@ -799,13 +839,13 @@ static void memo_request(struct broker *broker, struct client *client,
             }
         }
         if (memo) {
-            if (memo_ready(memo)) { memo_touch(broker,memo); memo_reply(client->fd,memo); }
+            if (memo_ready(memo)) { memo_touch(broker,memo); memo_reply(broker,session,memo); }
             else { client->state=MEMO_WAIT; client->memo=memo; free(replacement); return; }
             goto done;
         }
         memo=calloc(1,sizeof(*memo));
         if (!memo) goto done;
-        memo->key=strdup(payload); memo->owner=credentials.uid; memo->worker=worker;
+        memo->key=strdup(payload); memo->owner=session->peer.uid; memo->worker=worker;
         if (!memo->key || !tsearch(memo,&broker->memos,memo_order)) {
             free(memo->key); free(memo); goto done;
         }
@@ -822,11 +862,15 @@ static void memo_request(struct broker *broker, struct client *client,
             memo->length = size - 1;
             if (!memo->value) goto done;
             broker->memo_bytes+=memo->length+1;
+            if ((!strncmp(memo->key, "gcc-plan:", 9) || !strncmp(memo->key, "clang-plan:", 11)) &&
+                session_plan_access(broker, session))
+                memo->watch = dcc_plan_watch_new(broker->plans, memo->value, memo->length, &memo->watch_bytes);
+            broker->memo_bytes += memo->watch_bytes;
         }
         for (i = 0; i < MAX_CLIENTS; i++) {
             struct client *waiter = &broker->clients[i];
             if (waiter->fd >= 0 && waiter->state == MEMO_WAIT && waiter->memo == client->memo) {
-                memo_reply(waiter->fd, memo);
+                memo_reply(broker, &broker->sessions[waiter->session], memo);
                 release_client(broker, waiter);
             }
         }
@@ -907,12 +951,24 @@ static void pool_store(struct broker *broker, struct client *client, int fd, dou
     close(fd);
 }
 
+static uint64_t *family_word(struct peer *peer, uint64_t family)
+{
+    return &peer->dispatched[(family >> 6) % (sizeof(peer->dispatched) / sizeof(peer->dispatched[0]))];
+}
+
+static uint64_t family_bit(uint64_t family) { return UINT64_C(1) << (family & 63); }
+
 static void deliver_connection(struct broker *broker, struct client *client)
 {
     struct reply reply = { .slots = client->direct ?
         (client->command == TRY_LOCAL ? 1 : DCC_BROKER_DIRECT) :
         client->pooled ? DCC_BROKER_POOLED : 0 };
-    strcpy(reply.host, broker->peers[client->peer].host->hostdef_string);
+    struct peer *peer = &broker->peers[client->peer];
+    uint64_t family = client->hint.family;
+    strcpy(reply.host, peer->host->hostdef_string);
+    if (!client->direct && client->command == ACQUIRE_CPP && family &&
+        !(*family_word(peer, family) & family_bit(family)))
+        reply.slots |= DCC_BROKER_COLD_FAMILY;
     dcc_watch_drop(broker->ep, &broker->watches[NETWORK + (client - broker->clients)]);
     if (send_reply(client->fd, &reply, client->net)) {
         release_client(broker, client);
@@ -1008,7 +1064,7 @@ static struct prediction predict(struct broker *broker, const struct client *cli
     result.prepare = bulk ? client->hint.bytes * prepare + .005 : prepare;
     if (client->command == TRY_LOCAL) {
         double local_prepare = broker->local_prepare[client->hint.kind - 1];
-        if (!local_prepare) local_prepare = .001 + client->hint.work_units / (256.0 * 1048576);
+        if (!local_prepare) local_prepare = .001 + client->hint.bytes / (256.0 * 1048576);
         result.prepare = peer->local ? 0 : result.prepare + local_prepare;
     }
     if (!s->cpu.count) {
@@ -1876,7 +1932,8 @@ static void accept_client(struct broker *broker, int listener_fd)
             --i;
             continue;
         }
-        *session = (struct session){.fd = fd, .denied = credentials.uid != geteuid() && credentials.uid != 0,
+        *session = (struct session){.fd = fd, .peer = credentials,
+                                    .denied = credentials.uid != geteuid() && credentials.uid != 0,
                                     .deadline = now_seconds() + 3};
     }
 }
@@ -1931,6 +1988,7 @@ int dcc_broker_serve(const char *path)
         return EXIT_OUT_OF_MEMORY;
     broker->ep = epoll_create1(EPOLL_CLOEXEC);
     if (broker->ep < 0) { free(broker); return EXIT_IO_ERROR; }
+    broker->plans = dcc_plan_monitor_new(broker->ep);
     for (count = MAX_CLIENTS; count--;) {
         broker->pool[count].fd = broker->sessions[count].fd = -1;
         broker->pool[count].next = broker->free_idle;
@@ -2066,6 +2124,10 @@ int dcc_broker_serve(const char *path)
         }
         if (!n) broker->dirty = 1;
         for (int j = 0; j < n; ++j) {
+            if (events[j].data.u64 == DCC_PLAN_WATCH_EVENT) {
+                dcc_plan_monitor_drain(broker->plans);
+                continue;
+            }
             unsigned token = events[j].data.u64 >> 32;
             if (token >= IDLE_SOCKET) {
                 int slot = token - IDLE_SOCKET;
@@ -2182,6 +2244,8 @@ int dcc_broker_serve(const char *path)
                         struct peer *p = &broker->peers[c->peer];
                         struct feedback timing;
                         memcpy(&timing, packet.payload, sizeof(timing));
+                        if (c->command == ACQUIRE_CPP && c->hint.family)
+                            *family_word(p, c->hint.family) |= family_bit(c->hint.family);
                         observe(broker, c, &timing, now);
                         const struct dcc_load_report *report = (const void *)(packet.payload + sizeof(timing));
                         if (length == sizeof(request) + sizeof(timing) + sizeof(*report) && p->metrics.jobs &&
@@ -2293,6 +2357,7 @@ done:
     if (lock_fd >= 0)
         close(lock_fd);
     free_hosts(hosts);
+    dcc_plan_monitor_free(broker->plans);
     close(broker->ep);
     free(broker);
     return ret;
@@ -2326,16 +2391,16 @@ void dcc_broker_return(const struct dcc_hostdef *host, int fd, const struct dcc_
     (void)fd;
     (void)result;
 }
-int dcc_broker_memo_get(const char *key, char **value, size_t *length)
+int dcc_broker_memo_get(const char *key, char **value, size_t *length, int *verified)
 {
     (void)key;
     *value = NULL;
     return -1;
 }
-int dcc_broker_memo_refresh(const char *key, const char *stale, size_t stale_length, char **value, size_t *length)
+int dcc_broker_memo_refresh(const char *key, const char *stale, size_t stale_length, char **value, size_t *length, int *verified)
 {
     (void)stale;
-    return dcc_broker_memo_get(key,value,length);
+    return dcc_broker_memo_get(key,value,length,verified);
 }
 void dcc_broker_memo_put(int lease, const char *value, size_t length)
 {
