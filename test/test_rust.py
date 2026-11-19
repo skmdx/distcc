@@ -64,7 +64,7 @@ class RustTest(BrokerTestCase):
         fields = dict(line.split(': ', 1) for line in report[1:] if ': ' in line)
         return '\n'.join((report[0], fields['commit-hash'], fields['LLVM version']))
 
-    def wire_plan(self, source, *, flags=(), requested=None, logical=None, extra=(), host=''):
+    def wire_plan(self, source, *, flags=(), requested=None, logical=None, extra=(), host='', crate_types='rlib'):
         """A real rustc closure for tests which hold or alter an individual TCP transaction."""
         from distcc_job import RustCommand, fingerprint, manifest
         root = subprocess.check_output([self.rustc, '--print=sysroot'], text=True).strip()
@@ -77,7 +77,7 @@ class RustTest(BrokerTestCase):
         args = ['--sysroot', root, logical or source,
                 '-o', '/__distcc_rust/out/libwire.rlib', *flags]
         entries = [(logical if logical and path==source else path, *fingerprint(path), 1) for path in paths]
-        command = RustCommand(phase=1, compiler=requested or self.version(self.rustc), crate_types='rlib', host=host)
+        command = RustCommand(phase=1, compiler=requested or self.version(self.rustc), crate_types=crate_types, host=host)
         return manifest(3, self.work, args, entries, rust=command), paths
 
     def wire_result(self, net, identity, first=None):
@@ -164,9 +164,9 @@ class RustTest(BrokerTestCase):
         self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
         self.env.update(DISTCC_VERBOSE='1', PATH=str(self.build) + os.pathsep + os.environ['PATH'])
 
-    def rust(self, *args, remote=True, env=None):
+    def rust(self, *args, remote=True, env=None, prefix=()):
         cmd = ([str(self.build / 'distcc'), self.rustc] if remote else [self.rustc])
-        return subprocess.run([*cmd, *map(str, args)], env=env or self.env,
+        return subprocess.run([*prefix, *cmd, *map(str, args)], env=env or self.env,
                               cwd=self.work, capture_output=True, text=True, timeout=90)
 
     def cgu_toolchain(self):
@@ -506,6 +506,25 @@ class RustTest(BrokerTestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         subprocess.run([self.work/'uses'], check=True)
 
+    def test_plain_probe_inherits_only_its_journal(self):
+        source = self.work / 'plain.rs'
+        source.write_text('pub fn value() {}')
+        compiler = self.work / 'rustc'
+        compiler.write_text('#!/bin/sh\nif test -n "$DISTCC_RUST_LOADS_FD"; then\n'
+                            '  test -e "/proc/self/fd/$DISTCC_RUST_LOADS_FD" || exit 1\n'
+                            '  test "$(readlink "/proc/self/fd/$CHECK_FD")" != "$CHECK_PIPE" || exit 1\n'
+                            '  echo checked > checked-probe\nfi\nexec ' + shlex.quote(self.rustc) + ' "$@"\n')
+        compiler.chmod(0o755)
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, 'rb'), os.fdopen(write_fd, 'wb'):
+            env = dict(self.env, CHECK_FD=str(read_fd), CHECK_PIPE=os.readlink(f'/proc/self/fd/{read_fd}'))
+            result = subprocess.run([self.build / 'distcc', compiler, '--crate-type=rlib', source],
+                                    env=env, cwd=self.work, pass_fds=(read_fd,),
+                                    capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('compiled on', result.stderr)
+        self.assertTrue((self.work / 'checked-probe').is_file())
+
     def test_probe_executes_no_tracer_or_unpretty_pass(self):
         src = self.work/'attr.rs'
         src.write_text('#[link(wasm_import_module="js")] unsafe extern "C" { fn unused(); } pub fn ok(){}')
@@ -629,7 +648,7 @@ class RustTest(BrokerTestCase):
         src.write_text('pub fn value() {}')
         rsp=self.work/'args.rsp'
         rsp.write_text('--crate-type=proc-macro\n'+str(src)+'\n--cfg='+'x'*140000+'\n')
-        # The producer runs locally. rustc itself diagnoses its invalid exported item.
+        # rustc itself diagnoses the invalid invocation from the original response file.
         plain=self.rust('@'+str(rsp),remote=False)
         result=self.rust('@'+str(rsp))
         self.assertEqual(result.returncode,plain.returncode)
@@ -661,18 +680,71 @@ class RustTest(BrokerTestCase):
                 if name in ('program','tests'):
                     subprocess.run([output], check=True, capture_output=True)
         driver=self.work/'client-cc'
-        driver.write_text('#!/bin/sh\nexec cc "$@" -Wl,--defsym,verified_client_link=42\n')
+        driver.write_text('#!/bin/sh\nexec "${MOZ_CARGO_WRAP_LD:?}" "$@" -Wl,--defsym,verified_client_link=42\n')
         driver.chmod(0o755)
         output=self.work/'client-linked'
         inner,outer=self.work/'inner args',self.work/'outer args'
         inner.write_text('"-Wl,--defsym,verified_response_arg=17"\n')
         outer.write_text(shlex.quote('@'+str(inner))+'\n')
-        result=self.rust(src,'-Clinker='+str(driver),'-Clink-arg=@'+str(outer),'-o',output)
+        mask = self.work/'masquerade'
+        mask.mkdir()
+        (mask/'cc').symlink_to(self.build/'distcc')
+        env = dict(self.env, MOZ_CARGO_WRAP_LD='cc', PATH=str(mask)+os.pathsep+self.env['PATH'])
+        result=self.rust(src,'-Clinker='+str(driver),'-Clink-arg=@'+str(outer),'-o',output,env=env)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('compiled on',result.stderr)
         symbols=subprocess.check_output(['nm',output],text=True)
         self.assertIn('verified_client_link',symbols)
         self.assertIn('verified_response_arg',symbols)
+
+    @unittest.skipUnless(shutil.which('clang') and shutil.which('ld.lld'), 'Clang and LLD required')
+    def test_linker_plugin_lto_distributes_from_confined_linker(self):
+        source = self.work/'thin.rs'
+        source.write_text('fn main() { println!("distributed Rust ThinLTO"); }')
+        output = self.work/'thin'
+        wrapper = self.work/'cargo-linker'
+        wrapper.write_text('#!/bin/sh\nexec "${MOZ_CARGO_WRAP_LD:?}" "$@"\n')
+        wrapper.chmod(0o755)
+        mask = self.work/'masquerade'
+        mask.mkdir()
+        (mask/'clang').symlink_to(self.build/'distcc')
+        env = dict(self.env, MOZ_CARGO_WRAP_LD='clang', PATH=str(mask)+os.pathsep+self.env['PATH'])
+        prefix = []
+        if shutil.which('sandbox'):
+            env.update(SANDBOX_LOG=str(self.work/'sandbox.log'), SANDBOX_DEBUG_LOG=str(self.work/'sandbox.debug'))
+            prefix = ['sandbox', 'env', 'SANDBOX_WRITE='+str(self.work), 'TMPDIR='+str(self.work),
+                      'PYTHONDONTWRITEBYTECODE=1']
+        for driver in ('clang', str(wrapper)):
+            with self.subTest(driver=driver):
+                result = self.rust(source, '-Clinker='+driver, '-Clinker-plugin-lto',
+                                   '-Clink-arg=-fuse-ld=lld', '-o', output, env=env, prefix=prefix)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-thinlto: compiled on ', result.stderr)
+                self.assertEqual(subprocess.check_output([output], text=True), 'distributed Rust ThinLTO\n')
+
+    def test_thinlto_output_directories(self):
+        from contextlib import ExitStack
+        from distcc_rust_lto import LinkFiles
+        work, final, temporary = (self.work/p for p in ('inputs', 'final', 'lto'))
+        for directory in (work, final, temporary):
+            directory.mkdir()
+        (work/'dtlto-inputs').touch()
+        linked = final/'program'
+        (temporary/'alias').symlink_to(work, target_is_directory=True)
+        description = temporary/'dtlto.json'
+        common = dict(linker_output=str(linked), args=['clang', '-c'], inputs=[])
+
+        def job(destination):
+            return dict(args=['primary', '-fthinlto-index=index', '-o', str(destination)],
+                        inputs=['primary', 'index'], outputs=[str(destination)])
+
+        with ExitStack() as stack:
+            files = LinkFiles(work, linked, temporary, stack)
+            for invalid in (work/'bad.o', temporary/'..'/'bad.o', temporary/'alias'/'bad.o'):
+                with self.subTest(path=invalid):
+                    description.write_text(json.dumps(dict(common=common, jobs=[job(final/'ok.o'), job(invalid)])))
+                    with self.assertRaises((ValueError, NotADirectoryError)):
+                        files.request(str(description), 'clang')
 
     @unittest.skipUnless(shutil.which('cargo') and shutil.which('clang'), 'Cargo and Clang required')
     def test_cargo_link_driver_skips_masquerade_symlinks(self):
@@ -1206,14 +1278,15 @@ class RustTest(BrokerTestCase):
                     self.assertGreater(output.stat().st_size, 0)
                     output.unlink()
 
-    def test_worker_rejects_plugin_producer_hidden_by_later_crate_type(self):
+    def test_worker_validates_proc_macro_crate_types_and_host(self):
         src = self.work/'plugin.rs'
         src.write_text('pub fn answer() {}')
-        body, _ = self.wire_plan(src, flags=['--crate-type=proc-macro', '--crate-type=rlib'])
-        with socket.create_connection((self.worker_address, self.ports[0])) as net:
-            self.send(net, 0x54000300, struct.pack('!Q', 1) + body)
-            # A second encoding of a typed field is rejected at BEGIN.
-            self.assertEqual(net.recv(1), b'')
+        for flags, types in ((['--crate-type=proc-macro', '--crate-type=rlib'], 'rlib'), ([], 'proc-macro')):
+            with self.subTest(flags=flags, types=types):
+                body, _ = self.wire_plan(src, flags=flags, crate_types=types)
+                with socket.create_connection((self.worker_address, self.ports[0])) as net:
+                    self.send(net, 0x54000300, struct.pack('!Q', 1) + body)
+                    self.assertEqual(net.recv(1), b'')
 
     def test_repeated_emits_preserve_remote_outputs(self):
         source = self.work / 'emissions.rs'
@@ -1233,14 +1306,19 @@ class RustTest(BrokerTestCase):
                 self.assertIn('distcc-rust: compiled on', result.stderr)
                 self.assertEqual([path.read_bytes() for path in (library, deps)], expected)
 
-    def test_pure_macro_consumer_runs_on_matching_worker(self):
+    def build_pure_macro(self):
         source = self.work / 'macros.rs'
         source.write_text('extern crate proc_macro; use proc_macro::TokenStream; '
                           '#[proc_macro] pub fn answer(_: TokenStream) -> TokenStream { "42".parse().unwrap() }')
         library = self.work / 'libmacros.so'
         result = self.rust('--crate-type=proc-macro', source, '-o', library)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('distcc-rust: local:', result.stderr)
+        self.assertIn('proc-macro host ABI', result.stderr)
+        self.assertIn('compiled on', result.stderr)
+        return library
+
+    def test_pure_macro_producer_and_consumer_run_on_matching_worker(self):
+        library = self.build_pure_macro()
         source = self.work / 'consumer.rs'
         source.write_text('extern crate macros; pub fn value() -> u32 { macros::answer!() }')
         result = self.rust('--crate-type=rlib', source, '--extern', 'macros=' + str(library),
@@ -1248,6 +1326,29 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('proc-macro host ABI', result.stderr)
         self.assertIn('compiled on', result.stderr)
+
+    @unittest.skipUnless(shutil.which('sandbox'), 'Portage sandbox required')
+    def test_pure_macro_with_portage_and_jobserver_pipe(self):
+        library = self.build_pure_macro()
+        source = self.work / 'sandbox_consumer.rs'
+        source.write_text('extern crate macros; fn main() { assert_eq!(macros::answer!(), 42); }')
+        output = self.work / 'consumer'
+        env = dict(self.env, SANDBOX_LOG=str(self.work / 'sandbox.log'),
+                   SANDBOX_DEBUG_LOG=str(self.work / 'sandbox.debug'))
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, 'rb') as tokens, os.fdopen(write_fd, 'wb', buffering=0) as writer:
+            writer.write(b'+')
+            env['CARGO_MAKEFLAGS'] = f'-j --jobserver-auth=3,{write_fd}'
+            result = subprocess.run(['sandbox', 'sh', '-ec',
+                'test "$SANDBOX_ON" = 1; exec 3<&0; test -p /proc/self/fd/3; exec "$@"', 'sh',
+                'env', 'SANDBOX_WRITE=' + str(self.work), 'TMPDIR=' + str(self.work),
+                self.build / 'distcc', self.rustc, source, '--extern', 'macros=' + str(library),
+                '-o', output], cwd=self.work, env=env, stdin=tokens, pass_fds=(write_fd,),
+                capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('proc-macro host ABI', result.stderr)
+        self.assertIn('compiled on', result.stderr)
+        subprocess.run([output], check=True)
 
     def test_broker_and_worker_refuse_mismatching_macro_host(self):
         source=self.work/'host.rs'

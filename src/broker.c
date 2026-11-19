@@ -1638,8 +1638,9 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
      * waiting for a faster worker concentrates later jobs there and leaves
      * capacity idle even with learned costs. Rank the available workers by
      * completion time, and retain queued work until any lane actually opens. */
+    /* A source byte prior cannot justify leaving an available worker idle. */
     if (best.wait && ready.peer >= 0 &&
-        (link_backend || best.forecast.finish >= ready.forecast.finish))
+        (link_backend || (locality && !completion_model) || best.forecast.finish >= ready.forecast.finish))
         best = ready;
     if (!backlogged && completion.peer >= 0) {
         if (completion.peer != best.peer)

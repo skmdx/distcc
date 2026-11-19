@@ -93,7 +93,7 @@ def publish_archive(archive, destinations):
                 Path(source).unlink(missing_ok=True)
 
 
-def distribute(description, kind):
+def distribute(request, kind, link=None):
     # Only the client schedules tasks. Importing its executor on every worker
     # job also initializes logging/traceback, before LLVM can start.
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -102,7 +102,6 @@ def distribute(description, kind):
     import math
     import shlex
 
-    request = json.loads(Path(description).read_text())
     common, jobs = request['common'], request['jobs']
     if not jobs:
         return 0
@@ -122,7 +121,7 @@ def distribute(description, kind):
                 name = absolute(name)
                 if name not in files:
                     path = work / ('input-' + str(len(files)))
-                    files[name] = InputSnapshot(name, path)
+                    files[name] = InputSnapshot(link.open_input(name) if link else name, path)
             names = task['inputs'][:1] if kind == 4 else [*task['inputs'], *common['inputs']]
             task['bytes'] = sum(files[name].size for name in {absolute(p) for p in names})
 
@@ -132,7 +131,7 @@ def distribute(description, kind):
             task['partitions'] = 1
         total_bytes = sum(task['bytes'] for task in jobs)
         total_instructions = 0
-        tools = llvm_tools(common['args'][0]) if kind == 4 else None
+        tools = llvm_tools(common['args'][0]) if kind == 4 and link is None else None
         indexes = [next((arg.split('=', 1)[1] for arg in task['args']
                          if arg.startswith('-fthinlto-index=')), None) for task in jobs]
         if tools and all(indexes):
@@ -213,11 +212,11 @@ def distribute(description, kind):
             sys.stdout.buffer.write(stdout)
             sys.stderr.buffer.write(stderr)
             if process.returncode:
-                if env.get('DISTCC_FALLBACK') != '0' and env.get('DISTCC_SKIP_LOCAL_RETRY') != '1':
+                if link is None and env.get('DISTCC_FALLBACK') != '0' and env.get('DISTCC_SKIP_LOCAL_RETRY') != '1':
                     print(helper + ': retrying backend locally', file=sys.stderr)
                     return subprocess.call(job['args'])
                 return process.returncode
-            publish_archive(archive, job['outputs'])
+            publish_archive(archive, [link.outputs[p] for p in job['outputs']] if link else job['outputs'])
             return 0
 
         def prepare(index, task):
@@ -402,10 +401,14 @@ def worker(root, archive, kind):
 
 def main(kind):
     try:
+        if kind == 4 and sys.argv[1:2] == ['--rust-link']:
+            from distcc_rust_lto import run_link
+            work, linked, temporary, compiler, filter_fd, *command = sys.argv[2:]
+            return run_link(work, linked, temporary, compiler, filter_fd, command)
         if len(sys.argv) == 4 and sys.argv[1] == '--worker':
             return worker(sys.argv[2], sys.argv[3], kind)
         if len(sys.argv) == 2:
-            return distribute(sys.argv[1], kind)
+            return distribute(json.loads(Path(sys.argv[1]).read_text()), kind)
         print('usage: ' + Path(sys.argv[0]).name + ' LLVM-JOB.json', file=sys.stderr)
         return 1
     except (LocalOnly, OSError, ValueError, KeyError, subprocess.SubprocessError, tarfile.TarError) as error:

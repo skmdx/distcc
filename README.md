@@ -169,10 +169,15 @@ LLVM version. Install it on clients and workers before using distributed native
 jobs. A worker verifies that rustc consumed the profile before returning results.
 
 For native links the worker captures rustc's generated objects and linker
-arguments. The client runs its linker with the original Rust dependencies and
-native library search paths. Static archives can finish on the worker.
+arguments. The client runs its configured linker in a read-only bubblewrap
+namespace with the caller's environment and the real compiler drivers on PATH.
+For Clang ThinLTO links with a broker, LLD sends its backend description over
+an inherited socket. The client distributes those jobs and publishes their
+objects inside the link's private output and temporary directories.
+Static archives can finish on the worker.
 The client tracks nested `@file` inputs and preserves the original invocation
-for local rustc. Procedural macro producers compile locally. To distribute a
+for local rustc. Procedural macro producers use a worker with the client's
+rustc host triple and link the shared library on the client. To distribute a
 consumer, the client runs the dependency pass in a read-only bubblewrap mount
 namespace with a seccomp filter. The preload library journals paths after a
 procedural macro loads, including library dependencies and attempted writes.

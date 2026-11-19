@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """LLD's DTLTO distributor."""
 import sys
+
+if __name__ == '__main__' and sys.argv[0] == '/__distcc_rust/dtlto-distributor':
+    import os
+    fd = int(os.environ['DISTCC_RUST_DTLTO_FD'])
+    path, = sys.argv[1:]
+    os.write(fd, os.fsencode(path))
+    sys.exit((os.read(fd, 1) or b'\x01')[0])
+
 from distcc_lto import main
 
 if __name__ == '__main__':

@@ -258,7 +258,7 @@ struct Invocation {
     std::set<fs::path> inputs, search, native_search, dirs;
     std::set<string> libraries;
     bool trace_macro = false, needs_host = false, static_archive = false, pipeline = false;
-    bool multi_cgu = true, incremental = false;
+    bool multi_cgu = true, incremental = false, linker_plugin_lto = false;
     Words compiler_flags;
     string metadata_name;
     std::set<string> link_arguments;
@@ -326,9 +326,8 @@ struct Invocation {
             if (k == "--crate-type") {
                 types.push_back(v);
                 for (auto &type : split(v, ',')) {
-                    if (type == "proc-macro")
-                        throw Local("procedural macro compiler plugin");
-                    native_link |= type == "bin" || type == "cdylib" || type == "dylib";
+                    needs_host |= type == "proc-macro";
+                    native_link |= type == "bin" || type == "cdylib" || type == "dylib" || type == "proc-macro";
                     static_archive |= type == "staticlib";
                 }
                 continue;
@@ -345,6 +344,8 @@ struct Invocation {
             if (k == "-C") {
                 if (key == "linker")
                     driver = val;
+                if (key == "linker-plugin-lto")
+                    linker_plugin_lto = val != "no" && val != "off" && val != "false";
                 if (key == "codegen-units")
                     multi_cgu = val != "1";
                 if (key == "link-arg" || key == "link-args") {
@@ -452,7 +453,6 @@ struct Invocation {
     }
     void discover(const string &compiler, const string &root, const Work &work) {
         Fd loads(dcc_job_memfd("rust-libraries")), quiet(dcc_job_memfd("rust-probe-diagnostics"));
-        check(!fcntl(loads.fd, F_SETFD, 0), "trace descriptor");
         Env envs = {{"RUSTC_BOOTSTRAP", "1"},
                     {"DISTCC_RUST_LOADS_FD", std::to_string(loads.fd)}};
         Words cmd = compiler_command(compiler);
@@ -521,7 +521,7 @@ struct Invocation {
         }
         if (!any)
             throw Local("empty dependency records");
-        needs_host = audit(depfile, loads.fd, root, search, inputs, dirs);
+        needs_host |= audit(depfile, loads.fd, root, search, inputs, dirs);
         if (needs_host) {
             for (auto key : {"CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "OUT_DIR"})
                 if (getenv(key))
@@ -697,10 +697,10 @@ string relocate_runpath(string arg, const fs::path &destination, const fs::path 
     }
     return arg;
 }
+bool wrapper(const fs::path &binary) {
+    return binary.filename() == "distcc" || binary.filename() == "ccache";
+}
 fs::path link_driver(const fs::path &name) {
-    auto wrapper = [](const fs::path &binary) {
-        return binary.filename() == "distcc" || binary.filename() == "ccache";
-    };
     if (name.has_parent_path() && !wrapper(executable(name)))
         return fs::absolute(name);
     // The sandbox needs the driver itself. Keep its invocation name for
@@ -712,6 +712,40 @@ fs::path link_driver(const fs::path &name) {
             return candidate;
     }
     throw std::runtime_error("link driver unavailable: " + name.string());
+}
+string link_path(const fs::path &tools, const fs::path &name) {
+    string path = tools;
+    for (const auto &dir : split(env("PATH"), ':')) {
+        auto alias = [&](const fs::path &tool) {
+            return wrapper(find_program(fs::absolute(fs::path(dir) / tool)));
+        };
+        auto directory = fs::path(dir);
+        if (!wrapper(directory) && !wrapper(directory.parent_path()) &&
+            !alias("cc") && !alias("gcc") && !alias("clang") && !alias(name.filename()))
+            path += ":" + dir;
+    }
+    return path;
+}
+fs::path thinlto_compiler(const fs::path &driver, const Sandbox &box) {
+    auto binary = fs::canonical(driver);
+    auto name = binary.filename().string();
+    if (name == "clang" || (name.rfind("clang-", 0) == 0 && name.size() > 6 &&
+                            name.find_first_not_of("0123456789.", 6) == string::npos))
+        return binary;
+    // An environment-dependent wrapper can select a different LLVM slot
+    // than the client's default clang. Ask through the same confined PATH.
+    Words query = box.args;
+    query.insert(query.end(), {"--remount-ro", "/", "--", driver, "--version"});
+    Fd version(dcc_job_memfd("rust-link-driver")), quiet(dcc_job_memfd("rust-link-driver-diagnostics"));
+    const std::vector<int> inherited{box.filter.fd};
+    auto status = run(query, {}, version.fd, quiet.fd, &inherited);
+    check(lseek(box.filter.fd, 0, SEEK_SET) == 0, "rewind linker seccomp filter");
+    auto banner = contents(version.fd);
+    if (!status && banner.substr(0, banner.find('\n')).find("clang version ") != string::npos)
+        for (const auto &line : split(banner, '\n'))
+            if (line.rfind("InstalledDir: /", 0) == 0)
+                return find_program((fs::path(line.substr(sizeof("InstalledDir: ") - 1)) / "clang").string());
+    return {};
 }
 int finish_links(Result &result, const Invocation &inv, const fs::path &work, const fs::path &compiler,
                  const fs::path &sysroot, const string &host) {
@@ -745,7 +779,7 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         Sandbox box(Root::HostWithOutputs);
         auto &cmd = box.args;
         fs::path tools = sysroot / "lib/rustlib" / host / "bin";
-        cmd.insert(cmd.end(), {"--setenv", "PATH", tools.string() + ":" + env("PATH")});
+        cmd.insert(cmd.end(), {"--setenv", "PATH", link_path(tools, inv.linker)});
         // Preserve declared inputs and toolchains residing on the shadowed temporary mount.
         auto mounts = inv.search;
         mounts.insert(inv.inputs.begin(), inv.inputs.end());
@@ -757,24 +791,30 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         auto cwd = fs::current_path();
         if (below(cwd, "/tmp"))
             cmd.insert(cmd.end(), {"--dir", cwd});
-        cmd.insert(cmd.end(),
-                   {"--chdir", cwd, "--ro-bind", work, DCC_RUST_OUT, "--bind", final.dir, DCC_RUST_FINAL});
-        box.command({driver});
+        cmd.insert(cmd.end(), {"--chdir", cwd});
+        box.mount(work, work);
+        box.mount(final.dir, final.dir, true);
         unsigned destinations = 0;
         Words command;
+        bool thin = inv.linker_plugin_lto, distributed = false;
         for (auto it = args.begin() + 1; it != args.end(); ++it) {
             auto compiler_root = compiler.parent_path().parent_path();
             string arg = *it;
+            for (const auto &option : split(arg, ',')) {
+                thin |= option == "-flto=thin" || option == "-plugin-opt=thinlto";
+                distributed |= option.rfind("--thinlto-distributor=", 0) == 0;
+            }
             if (!inv.link_arguments.count(arg) &&
                 (arg.find("-rpath") != string::npos || (it[-1] == "-rpath" || it[-1] == "--rpath")))
                 arg = relocate_runpath(std::move(arg), fs::canonical(fs::path(f.destination).parent_path()),
                                        compiler_root);
             arg = replace(std::move(arg), DCC_RUST_COMPILER, compiler_root);
+            arg = replace(std::move(arg), string(DCC_RUST_OUT) + "/", work.string() + "/");
             if (arg == "-o") {
                 if (++it == args.end() || *it != (fs::path(DCC_RUST_FINAL) / f.name).string())
                     throw std::runtime_error("invalid link destination");
                 ++destinations;
-                command.insert(command.end(), {"-o", *it});
+                command.insert(command.end(), {"-o", linked});
                 continue;
             }
             if (arg == "--output" || arg.rfind("--output=", 0) == 0 || (!arg.empty() && arg.front() == '@'))
@@ -783,6 +823,28 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         }
         if (destinations != 1)
             throw std::runtime_error("missing linker destination");
+        // Only the local driver's identity selects the remote compiler.
+        fs::path binary;
+        if (thin && !distributed && !env("DISTCC_BROKER").empty())
+            binary = thinlto_compiler(driver, box);
+        Words launcher;
+        std::optional<Work> temporary;
+        if (!binary.empty()) {
+            temporary.emplace(work.parent_path());
+            auto helper = fs::read_symlink("/proc/self/exe").parent_path() / "distcc-thinlto";
+            const string shim = DCC_RUST_ROOT "/dtlto-distributor";
+            box.mount(helper, shim);
+            box.mount(temporary->dir, temporary->dir, true);
+            cmd.insert(cmd.end(), {"--setenv", "TMPDIR", temporary->dir});
+            command.emplace_back("-Wl,--thinlto-distributor=" + shim +
+                                 ",--thinlto-remote-compiler=" + binary.string());
+            auto declared = work / "dtlto-inputs";
+            Fd list(open(declared.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600));
+            for (const auto &path : inv.inputs)
+                put(list.fd, path.string() + '\0');
+            launcher = {helper, "--rust-link", work, linked, temporary->dir, binary, std::to_string(box.filter.fd)};
+        }
+        box.command({driver});
         string response;
         for (const auto &arg : command) {
             response += '"';
@@ -796,9 +858,10 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         auto response_path = work / "link.rsp";
         Fd response_fd(open(response_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600));
         put(response_fd.fd, response);
-        cmd.push_back(string("@") + DCC_RUST_OUT + "/link.rsp");
+        cmd.push_back("@" + response_path.string());
         const std::vector<int> inherited{box.filter.fd};
-        int rc = run(cmd, {}, 1, 2, &inherited);
+        launcher.insert(launcher.end(), cmd.begin(), cmd.end());
+        int rc = run(launcher, {}, 1, 2, &inherited);
         if (rc)
             return rc;
         Fd output(open(linked.c_str(), O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));

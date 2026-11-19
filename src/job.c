@@ -338,7 +338,7 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
                 goto failed;
         for (const char *p = job->rust.crate_types; *p;) {
             size_t n = strcspn(p, ",");
-            if (n == sizeof("proc-macro") - 1 && !memcmp(p, "proc-macro", n)) goto failed;
+            if (n == sizeof("proc-macro") - 1 && !memcmp(p, "proc-macro", n) && !*job->rust.host) goto failed;
             p += n;
             if (*p) ++p;
         }

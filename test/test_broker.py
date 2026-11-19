@@ -333,6 +333,20 @@ class BrokerDirectTest(BrokerTestCase):
         full = self.request(15, (3, 1024, 1))
         self.assertEqual(self.receive(full), (0, 0, []))
 
+    def test_analysis_lease_charges_local_preflight(self):
+        metrics = stats_response(cpus=2, cores=1, jobs=2, capacity=2,
+                                 busy=0, queued=0, preparing=0, returning=0, running=0)
+        local = self.peer(metrics)
+        remote = self.peer(metrics, address='127.0.0.2')
+        self.start_broker(self.host(0, f',tcp,stats={local.port}') +
+                          f' 127.0.0.2:{self.ports[1]}/2,tcp,stats={remote.port},speed=0.8')
+        frontend = self.request(13)
+        self.assertEqual(self.receive(frontend), (0, 1, []))
+        hint = (1, 4 * 1024**2, 5)
+        self.assertEqual(self.receive(self.request(15, hint)), (0, 0, []))
+        frontend.close()
+        self.assertEqual(self.receive(self.request(15, hint)), (0, 1, []))
+
     def test_preflight_and_prepared_jobs_share_contention_policy(self):
         metrics = stats_response(cpus=2, cores=1, jobs=2, capacity=2,
                                  busy=0, queued=0, preparing=0, returning=0, running=0)
@@ -1253,6 +1267,20 @@ class BrokerTest(BrokerTestCase):
         self.assertEqual(len(descriptors), 1)
         with socket.socket(fileno=descriptors[0]) as selected:
             self.assertEqual(selected.getpeername()[1], self.ports[0])
+
+    def test_unlearned_cpp_source_uses_ready_worker(self):
+        metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                                 busy=0, running=0, queued=0, preparing=0, returning=0)
+        peers = [self.peer(metrics), self.peer(metrics)]
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={speed}', slots=1)
+                                   for i, (p, speed) in enumerate(zip(peers, (2, .1)))))
+        _, first = self.acquire_reserved(10, (1, 4 * 1024**2, 5))
+        self.assertEqual(first.getpeername()[1], self.ports[0])
+        _, ready = self.acquire_reserved(10, (2, 64 * 1024**2, 5))
+        self.assertEqual(ready.getpeername()[1], self.ports[1])
+        log = (self.work / 'broker.log').read_text()
+        self.assertNotRegex(log, r'waiting for host=.* ready=1 .* key=2\b')
 
     def test_independent_cores_precede_smt_that_displaces_more_work(self):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16,

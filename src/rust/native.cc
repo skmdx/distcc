@@ -143,8 +143,14 @@ extern "C" void *dlopen(const char *name, int flags)
     };
     auto previous = mapped();
     int fd = std::atoi(descriptor);
-    dcc_rust_watch_library(fd, name);
-    void *handle = original<void *(*)(const char *, int)>("dlopen")(name, flags);
+    auto load = original<void *(*)(const char *, int)>("dlopen");
+    // Reopening a resident DSO by soname runs no constructors. Classify it
+    // by its resolved path below: libsandbox opens libc.so.6 during startup.
+    void *handle = name && !std::strchr(name, '/') ? load(name, flags | RTLD_NOLOAD) : nullptr;
+    if (!handle) {
+        dcc_rust_watch_library(fd, name);
+        handle = load(name, flags);
+    }
     int saved_errno = errno;
     if (handle) {
         struct link_map *map;

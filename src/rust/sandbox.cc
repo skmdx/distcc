@@ -29,7 +29,7 @@ Sandbox::Sandbox(Root policy, const fs::path &tree)
     if (env("SANDBOX_ON") == "1") {
         // Keep preloads out of namespace setup. bwrap prepares the payload
         // environment before writing uid_map. Host probes inherit Portage's
-        // policy at exec; the other roots already use a clean environment.
+        // policy at exec; linkers use the namespace's writable output mounts.
         args.insert(args.begin(), {"/usr/bin/env", "-u", "LD_PRELOAD", "SANDBOX_ON=0"});
         if (policy == Root::Host) {
             args.insert(args.end(), {"--setenv", "SANDBOX_ON", "1"});
@@ -62,7 +62,9 @@ Sandbox::Sandbox(Root policy, const fs::path &tree)
     }
     args.insert(args.end(), {"--proc", "/proc", "--dev", "/dev", "--seccomp", std::to_string(filter.fd)});
     if (policy != Root::Host)
-        args.insert(args.end(), {"--tmpfs", "/tmp", "--clearenv"});
+        args.insert(args.end(), {"--tmpfs", "/tmp"});
+    if (policy == Root::Inputs || policy == Root::Backend)
+        args.push_back("--clearenv");
 }
 void Sandbox::command(const Words &argv) {
     args.insert(args.end(), {"--remount-ro", "/", "--"});

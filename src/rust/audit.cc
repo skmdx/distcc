@@ -20,6 +20,16 @@
 
 namespace {
 std::atomic<int> journal{-1};
+thread_local bool observing;
+// libsandbox and libc can call other interposed functions while servicing
+// the outer call. Only the operation requested by the compiler is an input.
+struct Observation {
+    bool previous = observing;
+    Observation() { observing = true; }
+    ~Observation() { observing = previous; }
+    void path_event(const char *kind, int dir, const char *path, bool succeeded) const;
+    void operation(const char *name) const;
+};
 bool below(const char *name, const char *root) {
     size_t n = strlen(root);
     return n && !strncmp(name, root, n) && (name[n] == '/' || !name[n]);
@@ -35,9 +45,9 @@ void record(int fd, const char *kind, const char *path, const char *real) {
     if (n != total)
         _exit(100);
 }
-void path_event(const char *kind, int dir, const char *path, bool succeeded) {
+void Observation::path_event(const char *kind, int dir, const char *path, bool succeeded) const {
     int fd = journal.load(std::memory_order_relaxed);
-    if (fd < 0)
+    if (previous || fd < 0)
         return;
     int saved = errno;
     if (!succeeded && (*kind == 'R' || *kind == 'S')) {
@@ -65,9 +75,9 @@ void path_event(const char *kind, int dir, const char *path, bool succeeded) {
     record(fd, kind, path, "");
     errno = saved;
 }
-void operation(const char *name) {
+void Observation::operation(const char *name) const {
     auto fd = journal.load(std::memory_order_relaxed);
-    if (fd >= 0) {
+    if (!previous && fd >= 0) {
         int saved = errno;
         record(fd, "X", name, "");
         errno = saved;
@@ -89,9 +99,10 @@ extern "C" void dcc_rust_library_record(int fd, const char *kind, const char *re
                                         const char *resolved) {
     record(fd, kind, requested, resolved);
 }
-#define NEXT(name) static auto fn = reinterpret_cast<decltype(&name)>(dlsym(RTLD_NEXT, #name))
+#define NEXT(name) Observation observe; static auto fn = reinterpret_cast<decltype(&name)>(dlsym(RTLD_NEXT, #name))
 #define FILE_OPEN(name, params, dir, args)                                                                   \
     extern "C" int name params {                                                                             \
+        Observation observe;                                                                                 \
         using Open = int(*) params;                                                                          \
         static Open fn = reinterpret_cast<Open>(dlsym(RTLD_NEXT, #name));                                    \
         mode_t mode = 0;                                                                                     \
@@ -102,7 +113,7 @@ extern "C" void dcc_rust_library_record(int fd, const char *kind, const char *re
             va_end(ap);                                                                                      \
         }                                                                                                    \
         int fd = fn args;                                                                                    \
-        path_event((flags & (O_ACCMODE | O_CREAT | O_TRUNC)) ? "W" : "R", dir, path, fd >= 0);               \
+        observe.path_event((flags & (O_ACCMODE | O_CREAT | O_TRUNC)) ? "W" : "R", dir, path, fd >= 0);       \
         return fd;                                                                                           \
     }
 FILE_OPEN(open, (const char *path, int flags, ...), AT_FDCWD, (path, flags, mode))
@@ -113,7 +124,7 @@ FILE_OPEN(openat64, (int dir, const char *path, int flags, ...), dir, (dir, path
     extern "C" FILE *name(const char *path, const char *mode) {                                              \
         NEXT(name);                                                                                          \
         auto *f = fn(path, mode);                                                                            \
-        path_event(strpbrk(mode, "wa+") ? "W" : "R", AT_FDCWD, path, f);                                     \
+        observe.path_event(strpbrk(mode, "wa+") ? "W" : "R", AT_FDCWD, path, f);                             \
         return f;                                                                                            \
     }
 STREAM_OPEN(fopen)
@@ -122,7 +133,7 @@ STREAM_OPEN(fopen64)
     extern "C" int name params noexcept {                                                                    \
         NEXT(name);                                                                                          \
         int rc = fn args;                                                                                    \
-        path_event("R", dir, path, !rc);                                                                     \
+        observe.path_event("R", dir, path, !rc);                                                             \
         return rc;                                                                                           \
     }
 PATH_STAT(stat, (const char *path, struct stat *st), AT_FDCWD, (path, st))
@@ -141,26 +152,26 @@ PATH_STAT(faccessat, (int dir, const char *path, int mode, int flags), dir, (dir
 extern "C" ssize_t readlink(const char *path, char *buf, size_t n) noexcept {
     NEXT(readlink);
     auto size = fn(path, buf, n);
-    path_event("S", AT_FDCWD, path, size >= 0);
+    observe.path_event("S", AT_FDCWD, path, size >= 0);
     return size;
 }
 extern "C" ssize_t readlinkat(int dir, const char *path, char *buf, size_t n) noexcept {
     NEXT(readlinkat);
     auto size = fn(dir, path, buf, n);
-    path_event("S", dir, path, size >= 0);
+    observe.path_event("S", dir, path, size >= 0);
     return size;
 }
 extern "C" DIR *opendir(const char *path) {
     NEXT(opendir);
     auto *d = fn(path);
-    path_event("directory enumeration", AT_FDCWD, path, d);
+    observe.path_event("directory enumeration", AT_FDCWD, path, d);
     return d;
 }
 // Read-only mounts enforce the write policy even when a macro ignores errno.
 #define MUTATION(name, params, args)                                                                         \
     extern "C" int name params noexcept {                                                                    \
         NEXT(name);                                                                                          \
-        operation(#name);                                                                                    \
+        observe.operation(#name);                                                                            \
         return fn args;                                                                                      \
     }
 MUTATION(unlink, (const char *path), (path))
@@ -182,18 +193,18 @@ MUTATION(execve, (const char *path, char *const argv[], char *const envp[]), (pa
     extern "C" int name(pid_t *pid, const char *path, const posix_spawn_file_actions_t *files,               \
                         const posix_spawnattr_t *attr, char *const args[], char *const vars[]) {             \
         NEXT(name);                                                                                          \
-        operation(#name);                                                                                    \
+        observe.operation(#name);                                                                            \
         return fn(pid, path, files, attr, args, vars);                                                       \
     }
 SPAWN(posix_spawn)
 SPAWN(posix_spawnp)
 extern "C" int socket(int domain, int type, int protocol) noexcept {
     NEXT(socket);
-    operation("socket");
+    observe.operation("socket");
     return fn(domain, type, protocol);
 }
 extern "C" int connect(int fd, const sockaddr *addr, socklen_t n) {
     NEXT(connect);
-    operation("connect");
+    observe.operation("connect");
     return fn(fd, addr, n);
 }

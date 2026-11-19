@@ -253,6 +253,17 @@ def finish_profile(config, out, descriptor):
     return valid
 
 
+def prepare_runtime(runtime):
+    account = pwd.getpwnam('portage')
+    runtime.mkdir(mode=0o755)
+    # A root preflight can be the first distcc client to open the log.
+    log = runtime / 'client.log'
+    log.touch(mode=0o600, exist_ok=False)
+    os.chown(log, account.pw_uid, account.pw_gid)
+    os.chown(runtime, account.pw_uid, account.pw_gid)
+    return log
+
+
 def measure(config, out, buildroot):
     group = cgroup()
     # Preserve Portage's short paths (pump uses Unix sockets under T), while all
@@ -262,9 +273,7 @@ def measure(config, out, buildroot):
     out.mkdir()
     (out / 'implementation.json').write_text(json.dumps(implementation(), indent=2) + '\n')
     runtime = out / 'runtime'
-    runtime.mkdir(mode=0o755)
-    account = pwd.getpwnam('portage')
-    os.chown(runtime, account.pw_uid, account.pw_gid)
+    client_log = prepare_runtime(runtime)
     configroot = out / 'config'
     (configroot / 'etc').mkdir(parents=True)
     copy_configuration(Path('/etc/portage'), configroot / 'etc/portage')
@@ -296,7 +305,7 @@ def measure(config, out, buildroot):
         'export DISTCC_PUMP=1 CCACHE_DISABLE=1 DISTCC_FALLBACK=0 DISTCC_SKIP_LOCAL_RETRY=1 DISTCC_VERBOSE=1\n'
         'export DISTCC_HOSTS=' + shlex.quote(hosts) + '\n'
         'export DISTCC_BROKER=' + shlex.quote(socket_path) + '\n'
-        'export DISTCC_LOG=' + shlex.quote(str(runtime / 'client.log')) + '\n'
+        'export DISTCC_LOG=' + shlex.quote(str(client_log)) + '\n'
         'PORTAGE_TMPDIR=/var/tmp\n')
     env = dict(os.environ, PORTAGE_CONFIGROOT=str(configroot),
                PORTAGE_TMPDIR='/var/tmp', CCACHE_DISABLE='1')
@@ -402,7 +411,7 @@ def measure(config, out, buildroot):
     buildlogs = list(buildtree.glob('*/*/temp/build.log'))
     for index, source in enumerate(buildlogs):
         shutil.copyfile(source, out / f'build-{index}.log')
-    summary = log_summary([out / 'emerge.log', runtime / 'client.log', out / 'broker.log', *buildlogs])
+    summary = log_summary([out / 'emerge.log', client_log, out / 'broker.log', *buildlogs])
     objects = set()
     for index, source in enumerate(sorted(buildtree.glob('*/*/work/**/.ninja_log'))):
         shutil.copyfile(source, out / f'ninja-{index}.log')

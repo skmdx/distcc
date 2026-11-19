@@ -105,7 +105,7 @@ def release(overlay):
     inputs = ['src', 'include_server', 'configure.ac', 'Makefile.in', 'pump.in',
               'distcc-link', 'distcc-multi', 'distcc-clang',
               'distcc-thinlto', 'distcc-offload', 'distcc-offload-link',
-              'distcc_lto.py', 'distcc_job.py', 'distcc_python.py',
+              'distcc_lto.py', 'distcc_rust_lto.py', 'distcc_job.py', 'distcc_python.py',
               'packaging/systemd', 'packaging/gentoo/*.bashrc']
     # Do not silently deploy an older implementation over pending changes.
     for tree, paths in ((ROOT, inputs), (Path(overlay), ['sys-devel/distcc'])):

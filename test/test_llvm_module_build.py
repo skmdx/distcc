@@ -33,7 +33,7 @@ class LLVMModuleBuildTest(unittest.TestCase):
             built = subprocess.run(['make', '-f', str(root/'Makefile.in'), 'distcc-rust-native.so',
                                     'SHELL=/bin/sh', 'srcdir='+str(root),
                                     'CXX='+shlex.quote(compiler)+' -stdlib=libstdc++',
-                                    'CXXFLAGS=-O2', 'CPPFLAGS=', 'LDFLAGS=',
+                                    'CXXFLAGS=-O2', 'CPPFLAGS=-I'+shlex.quote(str(root/'src')), 'LDFLAGS=',
                                     'LLVM_CONFIG='+str(wrapper)], cwd=work, capture_output=True, timeout=60)
             self.assertEqual(built.returncode, 0, built.stderr)
             loaded = subprocess.run(['/bin/true'], capture_output=True,

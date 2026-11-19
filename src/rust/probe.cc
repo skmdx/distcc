@@ -1,4 +1,4 @@
-/* Macro probes and native links share the kernel-enforced namespace policy. */
+/* Discover dependencies and audit operations after a procedural macro loads. */
 #include "rust/probe.h"
 #include "rust/runtime.hh"
 #include "rust/sandbox.hh"
@@ -9,7 +9,7 @@ int run_probe(const Words &cmd, Env envs, const fs::path &outputs, bool isolate,
     // Portage can trace rustc without forwarding LD_PRELOAD. Install the
     // instrumentation and caller's preload together at the confined exec.
     if (!isolate && env("SANDBOX_ON") != "1")
-        return run(cmd, envs, diagnostics, diagnostics);
+        return run(cmd, envs, diagnostics, diagnostics, &inherited);
     Sandbox box(Root::Host);
     box.mount(outputs, outputs, true);
     for (auto &[k,v] : envs) box.args.insert(box.args.end(), {"--setenv", k, v});
