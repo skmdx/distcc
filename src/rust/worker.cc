@@ -50,14 +50,47 @@ struct CatalogGuard {
 XXH128_hash_t fingerprint(const string &text) {
     return XXH3_128bits(text.data(), text.size());
 }
-string cached_identity(const fs::path &path) {
-    string generation = path.string() + ":" + stamp(metadata(path));
-    auto key = fingerprint(generation);
+std::optional<XXH128_hash_t> compiler_generation(const fs::path &path, bool validate) {
+    auto root = path.parent_path().parent_path();
+    string state = path.string() + stamp(metadata(path)), name = root.filename();
+    if (name.compare(0, 12, "rust-distcc-") == 0) {
+        auto digest = name.substr(12);
+        auto marker = root / ".distcc-complete";
+        if (digest.size() != 64 || digest.find_first_not_of("0123456789abcdef") != string::npos ||
+            !fs::is_regular_file(fs::symlink_status(marker)))
+            return {};
+        state += stamp(metadata(marker));
+        if (validate && read(marker) != "isa-checked " + digest + "\n")
+            return {};
+    }
+    return fingerprint(state);
+}
+string cached_identity(const fs::path &path, XXH128_hash_t key) {
     for (auto &e : catalog->entries)
-        if (e.identity[0] && XXH128_isEqual(e.key, key))
+        if (XXH128_isEqual(e.key, key))
             return e.identity;
-    string id = query(path, "-vV");
-    if (generation != path.string() + ":" + stamp(metadata(path)))
+    string id;
+    try {
+        auto report = query(path, "-vV");
+        compiler_key(report); // Validate the identity before caching it.
+        // A compiler can start successfully but fault during LLVM codegen.
+        Work probe(fs::temp_directory_path());
+        auto source = probe.dir / "probe.rs", output = probe.dir / "probe.o";
+        Fd file(open(source.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600));
+        put(file.fd, "pub fn value(x: u64) -> u64 { x.rotate_left(7) }");
+        auto command = compiler_command(path);
+        if (command.size() > 1)
+            command.insert(command.end(), {"--sysroot", path.parent_path().parent_path()});
+        command.insert(command.end(), {"--crate-name", "distcc_probe", "--crate-type=lib", "--emit=obj",
+                                       "-O", source, "-o", output});
+        if (run(command, {}, 2, 2) || !fs::is_regular_file(output) || !fs::file_size(output))
+            throw Local("worker compiler failed codegen probe");
+        id = report;
+    } catch (const Local &e) {
+        fprintf(stderr, "distccd: cannot run %s: %s\n", path.c_str(), e.what());
+    }
+    auto state = compiler_generation(path, false);
+    if (!state || !XXH128_isEqual(key, *state))
         throw Local("worker compiler changed");
     auto &e = catalog->entries[catalog->next++ % 32];
     if (id.size() < sizeof(e.identity)) {
@@ -66,31 +99,20 @@ string cached_identity(const fs::path &path) {
     }
     return id;
 }
-fs::path select_compiler(const string &requested, const string &host, string *advertised = nullptr) {
+struct CompilerOffer {
+    string host = "-";
+    std::set<uint64_t> keys;
+};
+fs::path select_compiler(const string &requested, const string &host, CompilerOffer *offer = nullptr) {
     if (dcc_rust_catalog_attach(-1))
         throw std::runtime_error("cannot initialize worker Rust catalog");
     CatalogGuard guard;
     auto key = fingerprint(requested + '\0' + host + '\0' + env("DISTCCD_RUSTC") + '\0' + env("PATH"));
     auto &route = catalog->routes[key.low64 % 32];
-    auto generation = [](const fs::path &path, bool validate) -> std::optional<XXH128_hash_t> {
-        auto root = path.parent_path().parent_path();
-        string state = path.string() + stamp(metadata(path)), name = root.filename();
-        if (name.compare(0, 12, "rust-distcc-") == 0 && name.size() == 76) {
-            auto marker = root / ".distcc-complete";
-            if (!fs::is_regular_file(marker))
-                return std::nullopt;
-            state += stamp(metadata(marker));
-            if (validate && read(marker) != name.substr(12) + "\n")
-                return std::nullopt;
-        }
-        return fingerprint(state);
-    };
-    if (route.candidate[0] && XXH128_isEqual(key, route.request)) {
+    if (!offer && route.candidate[0] && XXH128_isEqual(key, route.request)) {
         auto path = find_program(route.candidate);
-        auto state = path.empty() ? std::nullopt : generation(path, false);
+        auto state = path.empty() ? std::nullopt : compiler_generation(path, false);
         if (state && XXH128_isEqual(*state, route.generation)) {
-            if (advertised)
-                *advertised = field(cached_identity(path), "host: ");
             return path;
         }
         route.candidate[0] = 0;
@@ -110,15 +132,20 @@ fs::path select_compiler(const string &requested, const string &host, string *ad
         auto path = find_program(candidate);
         if (path.empty() || !visited.insert(path).second)
             continue;
-        auto current = generation(path, true);
+        auto current = compiler_generation(path, true);
         if (!current)
             continue;
-        auto report = cached_identity(path);
-        auto triple = field(report, "host: ");
-        if ((!advertised && identity(report) != requested) || (!host.empty() && triple != host))
+        auto report = cached_identity(path, *current);
+        if (report.empty())
             continue;
-        if (advertised)
-            *advertised = triple;
+        auto triple = field(report, "host: ");
+        if (offer) {
+            if (offer->keys.empty()) offer->host = triple;
+            offer->keys.insert(compiler_key(report));
+            continue;
+        }
+        if (identity(report) != requested || (!host.empty() && triple != host))
+            continue;
         if (candidate.size() < sizeof(route.candidate)) {
             route.request = key;
             route.generation = *current;
@@ -273,28 +300,34 @@ extern "C" const char *dcc_rust_cgu_capabilities(void) {
         return nullptr;
     }
 }
-extern "C" const char *dcc_rust_host(void) {
+extern "C" const char *dcc_rust_compilers(const char **first_host) {
     static std::mutex lock;
     static std::chrono::steady_clock::time_point expires;
-    static char host[96] = "-";
-    thread_local char snapshot[sizeof(host)];
+    static std::pair<string, string> cached;
+    thread_local std::pair<string, string> snapshot;
     std::lock_guard<std::mutex> guard(lock);
     auto now = std::chrono::steady_clock::now();
     if (now >= expires) {
-        string found = "-";
         try {
-            select_compiler("", "", &found);
-            if (found.size() >= sizeof(host))
-                throw std::runtime_error("Rust host exceeds stats field");
+            CompilerOffer offer;
+            select_compiler("", "", &offer);
+            string keys;
+            for (auto key : offer.keys) {
+                char hex[17];
+                snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)key);
+                if (!keys.empty()) keys += ' ';
+                keys += hex;
+            }
+            cached = {offer.host, keys.empty() ? "-" : keys};
         } catch (const std::exception &e) {
             fprintf(stderr, "distccd: Rust host query: %s\n", e.what());
             return nullptr;
         }
-        strcpy(host, found.c_str());
         expires = now + std::chrono::seconds(5);
     }
-    memcpy(snapshot, host, sizeof(host));
-    return snapshot;
+    snapshot = cached;
+    *first_host = snapshot.first.c_str();
+    return snapshot.second.c_str();
 }
 struct dcc_rust_artifacts {
     fs::path output;

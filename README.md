@@ -138,10 +138,12 @@ RUSTC_WRAPPER=distcc cargo build --release
 distcc rustc --crate-type=rlib library.rs
 ```
 
-Rust requires the local `DISTCC_BROKER` socket and TCP workers with bubblewrap
-and unprivileged user namespaces. The worker selects a rustc with the client's
-release string, commit hash and LLVM version. If it cannot find a match, the
-client runs rustc locally. The client supplies the target standard library.
+Rust requires the local `DISTCC_BROKER` socket and TCP workers with a configured
+statistics port (for example `,tcp,stats=3633`), bubblewrap and unprivileged
+user namespaces. Each worker advertises its executable compilers in
+`dcc_rust_compilers`. Whole-crate jobs require the client's release string
+including vendor metadata, commit hash, LLVM version and host triple. The
+client supplies the target standard library.
 
 Distribution supports libraries, executables, build scripts and test harnesses.
 The real client rustc discovers modules, included data, binary dependencies and
@@ -185,7 +187,7 @@ rustc host triple and link the shared library on the client. To distribute a
 consumer, the client runs the dependency pass in a read-only bubblewrap mount
 namespace with a seccomp filter. The preload library journals paths after a
 procedural macro loads, including library dependencies and attempted writes.
-A worker with the same rustc host triple receives the macro and its inputs.
+A worker with the matching compiler receives the macro and its inputs.
 The journal also discovers regular files in the Cargo package directory, Cargo's
 registry source cache and the Portage work directory. A symlink in the path to
 one of these directories preserves access to the same source tree.
@@ -201,8 +203,11 @@ object generation. A local frontend can run a procedural macro even when
 the available workers have a different Rust host ABI. Rustc retains ownership
 of ThinLTO imports, embedded bitcode, Cargo metadata notifications and final
 archives. With linker-plugin LTO, a matching worker compiles the whole crate
-and the client distributes the final ThinLTO link. When the frontend must run
-locally, CGU workers can return optimized IR to rustc's bitcode writer.
+unless the crate is large and more workers support its CGUs than its rustc.
+In that case a single client frontend dispatches CGUs and receives optimized
+bitcode. Small crates prefer a matching whole-crate worker. If no worker has
+the requested rustc, the client uses a local frontend with compatible CGU
+workers, or compiles locally when neither route is available.
 Small modules and unsupported LLVM configurations use rustc's own
 pass managers. Other unsupported macro operations select local compilation.
 Building the transport and probe requires json-c and libseccomp development
@@ -211,12 +216,8 @@ toolchain is unavailable. Transport and backend failures during compilation
 reach Cargo with their exit status. `DISTCC_VERBOSE=1` reports the selected worker or
 the reason for local execution. The Gentoo jobs hook enables the Cargo wrapper
 when `FEATURES=distcc`, respecting package restrictions and existing wrappers.
-Workers require the client's compiler build identity, including vendor metadata.
-If it is unavailable, the worker declines before compilation (`EXIT_LOCAL_COMPILE`)
-and the client executes locally, as for other unsupported distributed actions.
-This is distinct from failure of a selected compiler: all compiler errors,
-including incompatible crate metadata (`E0514`), are returned without trying
-different builds. Set the worker's
+Compiler errors, including incompatible crate metadata (`E0514`), are
+returned to the client. Set the worker's
 `DISTCCD_RUSTC` to a colon-separated list of compiler paths to select its candidates;
 otherwise PATH, `/usr/lib/rust/*/bin/rustc` and `/opt/rust-*/bin/rustc` are searched.
 Gentoo's Rust eclass selects its compiler independently of `eselect` and prefers
@@ -514,19 +515,16 @@ Use names such as `clang` and `clang++` in `compiler_paths` to follow each targe
 selected toolchain; they are resolved before sudo changes the environment.
 Explicit paths select a specific installation. After rollout, each installed Rust
 build/architecture compiles a library against every worker, links it locally and
-executes the result with fallback disabled. The checks assert the expected remote
-or explicit unsupported-toolchain local route.
-Deployment copies all installed Rust slots to a separate `/opt/rust-distcc-*`
-directory on peers of the same compiler host architecture, preserving the user's
-selected compiler. Existing distributed copies are not source slots.
-The resolved ELF runtime libraries and loader accompany the compiler and enter
-its digest. The worker invokes that loader with the toolchain's library paths,
-without changing the system loader, installed libraries or process-wide settings.
-Distribution verifies every transferred byte, flushes the complete tree, then
-writes a durable completion marker. Workers ignore digest-named copies without
-that marker; interrupted or older unmarked copies are revalidated on deployment.
-A foreign architecture without the matching build declines the job; identical release
-numbers alone do not establish compatibility. Rust checks require worker addresses reachable from all clients
+executes the result with fallback disabled. The checks derive the expected
+whole-crate, CGU or local route from the worker's live advertisements.
+Deployment shares missing Rust builds in `/opt/rust-distcc-<digest>` only when
+the machine architecture matches and every destination CPU supports the
+source CPUs' reported features. This conservative check covers host-native
+code in the compiler, ELF loader and runtime libraries. The loader and
+libraries travel with the compiler and enter its digest. Before publishing
+a copy the destination compiles and runs a program with that loader and
+sysroot. Deployment removes retired digest directories carrying a matching
+deployment marker. Rust checks require worker addresses reachable from all clients
 in `server_hosts`. Source archives are fetched and verified locally,
 then synchronized to targets; remote internet access is not required. Source
 builds use distcc and enable ccache when it is installed on the actual build

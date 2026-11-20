@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 from urllib.parse import urlsplit
+import xxhash
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -334,7 +335,7 @@ def validate(target, work):
             'python3', '-B', remote + '/validate-installed.py']
     with (work / (target['name'] + '-validation.log')).open('w') as log:
         for hosts in dict.fromkeys([target['server_hosts'], target['validation_hosts']]):
-            args[2] = 'VALIDATE_DISTCC_HOSTS=' + hosts
+            args[2] = 'VALIDATE_DISTCC_HOSTS=' + ' '.join(with_stats(h) for h in hosts.split())
             bounded(args, target, 'check', log)
     run(['sudo', '-n', 'rm', '--', *[remote+'/'+name for name in VALIDATION_FILES]], target)
     run(['sudo', '-n', 'rmdir', remote], target)
@@ -355,14 +356,25 @@ test -f "$directory/distcc-rust-cgu.so" && test -x "$directory/distcc-rust-cgu" 
     return (abi, target) if target else None
 
 
+def with_stats(hostspec):
+    options = hostspec.split(',')[1:]
+    if 'tcp' in options and not any(option.startswith('stats=') for option in options):
+        return hostspec + ',stats=3633'
+    return hostspec
+
+
+def rust_compiler_key(slot):
+    identity = slot['identity']
+    report = '\n'.join((identity['version'], identity['commit'], identity['llvm'], slot['host']))
+    return xxhash.xxh3_64_hexdigest(report.encode())
+
+
 def rust_worker_capabilities(hostspec):
+    hostspec = with_stats(hostspec)
     endpoint, *options = hostspec.split(',')
     address = urlsplit('//' + endpoint).hostname
     assert address and 'tcp' in options, hostspec
-    port = next((int(s[6:]) for s in options if s.startswith('stats=')), None)
-    if port is None:
-        port = 3633
-        hostspec += ',stats=' + str(port)
+    port = next(int(s[6:]) for s in options if s.startswith('stats='))
     connection = http.client.HTTPConnection(address, port, timeout=10)
     try:
         connection.request('GET', '/')
@@ -377,7 +389,12 @@ def rust_worker_capabilities(hostspec):
     for record in fields['dcc_llvm_cgu'].split(';'):
         abi, *names = record.split()
         backends.update((abi, name) for name in names)
-    return hostspec, fields['dcc_rust_host'], backends
+    compilers = fields['dcc_rust_compilers'].split()
+    if compilers == ['-']:
+        compilers = []
+    if not all(re.fullmatch(r'[0-9a-f]{16}', key) for key in compilers):
+        raise ValueError('invalid worker Rust compiler identities')
+    return hostspec, set(compilers), backends
 
 
 def validate_rust_cluster(targets, work, inventory, workers=None):
@@ -387,24 +404,19 @@ def validate_rust_cluster(targets, work, inventory, workers=None):
     try:
         parallel(targets, lambda target: transfer(
             [str(ROOT / 'packaging/gentoo'/name) for name in VALIDATION_FILES], path(target), target))
-        # Exercise every installed build/architecture against each worker.
+        # The same rustc bytes on different clients can target different native ISAs.
         clients = {}
         for client, compilers in inventory:
-            for compiler in compilers:
-                clients.setdefault((compiler['host'], compiler['digest']), (client, compiler))
-        requirements = {key: rust_cgu_requirement(*item) for key, item in clients.items()}
+            slots = {slot['digest']: slot for slot in compilers}
+            clients[client['name']] = [(slot, rust_cgu_requirement(client, slot)) for slot in slots.values()]
+        builds = sum(map(len, clients.values()))
+        if not builds:
+            raise RuntimeError('no executable Rust compiler for cluster validation')
         for worker in targets if workers is None else workers:
-            # Distribution installs every slot for this worker architecture.
-            # Assert that the actual service can execute each expected build.
-            hosts, worker_host, backends = rust_worker_capabilities(worker['server_hosts'])
-            available = [compiler['identity'] for _, compiler in clients.values() if compiler['host'] == worker_host]
-            def validate_client(item):
-                client, compiler = item
-                requirement = requirements[compiler['host'], compiler['digest']]
-                if compiler['host'] != worker_host and requirement in backends:
-                    expected = 'cgu'
-                else:
-                    expected = 'remote' if compiler['identity'] in available else 'local'
+            hosts, compilers, backends = rust_worker_capabilities(worker['server_hosts'])
+            def validate_client(client, compiler, requirement):
+                expected = ('remote' if rust_compiler_key(compiler) in compilers else
+                            'cgu' if requirement in backends else 'local')
                 name = client['name'] + '-' + compiler['digest'][:12] + '-to-' + worker['name']
                 with (work / ('rust-' + name + '.log')).open('w') as log:
                     bounded(['env', 'TMPDIR=' + client['temporary'],
@@ -417,89 +429,55 @@ def validate_rust_cluster(targets, work, inventory, workers=None):
             # Several slots can belong to one client; bounded() uses one unit
             # per client/worker, so keep those slots sequential on that client.
             def validate_slots(client):
-                for item in clients.values():
-                    if item[0] == client:
-                        validate_client(item)
+                for compiler, requirement in clients[client['name']]:
+                    validate_client(client, compiler, requirement)
             parallel(targets, validate_slots)
     finally:
         parallel(targets, lambda target: run(['sudo', '-n', 'rm', '-rf', '--', path(target)], target))
-    return len(clients) * len(targets if workers is None else workers)
+    return builds * len(targets if workers is None else workers)
+
+
+def rust_slot(target, action, *arguments, privileged=False):
+    command = (['sudo', '-n'] if privileged else []) + ['python3', '-', action, *arguments]
+    return json.loads(run(command, target, input=(ROOT / 'packaging/gentoo/rust-slots.py').read_text()))
+
+
+def rust_copies(targets, inventories):
+    """Plan one compatible copy per missing compiler identity on each worker."""
+    copies = {}
+    for target, inventory in zip(targets, inventories):
+        cpu = inventory['cpu']
+        available = {rust_compiler_key(slot) for slot in inventory['slots']}
+        for source, origin in zip(targets, inventories):
+            required = origin['cpu']['required']
+            if (source == target or not required or origin['cpu']['machine'] != cpu['machine'] or
+                    not set(required).issubset(cpu['available'])):
+                continue
+            for slot in origin['slots']:
+                identity = rust_compiler_key(slot)
+                if identity in available:
+                    continue
+                available.add(identity)
+                copies.setdefault(slot['digest'], (source, slot, []))[2].append(target)
+    return copies
 
 
 def distribute_rust_compilers(targets, work):
-    """Share all installed Rust slots with native peers without changing PATH."""
-    def inspect(target):
-        info = json.loads(run(['python3', '-c', '''import glob, hashlib, json, os, pathlib, re, shutil, subprocess
-paths = [shutil.which('rustc'), *glob.glob('/usr/lib/rust/*/bin/rustc'),
-         *glob.glob('/opt/rust-bin-*/bin/rustc')]
-result = []
-for compiler in dict.fromkeys(pathlib.Path(p).resolve() for p in paths if p):
-    root = compiler.parent.parent
-    if root.name.startswith('rust-distcc-'):
-        continue
-    version = subprocess.check_output([compiler, '-vV'], text=True)
-    lines = version.splitlines()
-    fields = dict(line.split(': ', 1) for line in lines[1:] if ': ' in line)
-    host = fields['host']
-    identity = dict(version=lines[0], commit=fields['commit-hash'], llvm=fields['LLVM version'])
-    # Preserve the resolved dependency closure and its ELF loader together.
-    # Mixing a system-LLVM build with a peer's C++ or libc runtime is not a
-    # portable toolchain, even when rustc -vV happens to start successfully.
-    loaded = subprocess.check_output(['ldd', str(compiler)], text=True,
-                                     env=dict(os.environ, LC_ALL='C'))
-    runtime = [dict(name=name, path=path) for name, path in
-               re.findall(r'^\\s*(\\S+) => (/\\S+)', loaded, re.M)
-               if not name.startswith('/') and not pathlib.Path(path).resolve().is_relative_to(root)]
-    loaders = re.findall(r'^\\s*(/\\S+)(?: => (/\\S+))? \\(', loaded, re.M)
-    if len(loaders) != 1:
-        raise RuntimeError('Rust ELF loader was not resolved: ' + str(compiler))
-    runtime.append(dict(name='ld.so', path=loaders[0][1] or loaders[0][0]))
-    digest = hashlib.sha256()
-    files = [compiler, *sorted((root / 'lib').glob('librustc_driver*')),
-             *sorted((root / 'lib/rustlib' / host / 'codegen-backends').glob('*')),
-             *(pathlib.Path(item['path']) for item in runtime)]
-    for path in files:
-        if path.is_file():
-            digest.update(path.name.encode() + b'\\0')
-            with path.open('rb') as stream:
-                digest.update(hashlib.file_digest(stream, 'sha256').digest())
-    result.append(dict(root=str(root), host=host, digest=digest.hexdigest(), identity=identity,
-                       runtime=runtime))
-if not result:
-    raise RuntimeError('no installed Rust slot found')
-print(json.dumps(result))
-'''], target))
-        return target, info
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets) or 1) as pool:
-        inventory = list(pool.map(inspect, targets))
-    slots = [(target, info) for target, compilers in inventory for info in compilers]
-    for identity in dict.fromkeys(info['digest'] for _, info in slots):
-        source, info = next(item for item in slots if item[1]['digest'] == identity)
-        peers = [target for target, compilers in inventory
-                 if compilers[0]['host'] == info['host'] and
-                 not any(other['digest'] == identity for other in compilers)]
-        if not peers:
-            continue
-        destination = '/opt/rust-distcc-' + identity
-        def needs_install(target):
-            return not json.loads(run(['python3', '-c', '''import json, pathlib, subprocess, sys
-root = pathlib.Path(sys.argv[1])
-compiler = root / 'bin/rustc'
-try:
-    ready = ((root / '.distcc-complete').read_text().strip() == root.name.removeprefix('rust-distcc-')
-        and compiler.is_file() and subprocess.run([root/'distcc-runtime/ld.so', '--library-path',
-            str(root/'lib') + ':' + str(root/'distcc-runtime'), compiler, '-vV'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    )
-except OSError:
-    ready = False
-print(json.dumps(ready))
-''', destination], target))
+        inventories = list(pool.map(lambda t: rust_slot(t, 'inventory', t['temporary']), targets))
+    if not any(inventory['slots'] for inventory in inventories):
+        raise RuntimeError('no executable Rust compiler in deployment inventory')
+    keep = {t['name']: [] for t in targets}
+    for digest, (source, info, peers) in rust_copies(targets, inventories).items():
+        for peer in peers:
+            keep[peer['name']].append(digest)
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as pool:
-            peers = [target for target, missing in zip(peers, pool.map(needs_install, peers)) if missing]
+            ready = pool.map(lambda t: rust_slot(t, 'ready', digest, t['temporary']), peers)
+            peers = [peer for peer, present in zip(peers, ready) if not present]
         if not peers:
             continue
-        stage = work / ('rust-' + identity)
+        destination = '/opt/rust-distcc-' + digest
+        stage = work / ('rust-' + digest)
         stage.mkdir()
         origin = info['root'] + '/'
         if source.get('ssh'):
@@ -516,36 +494,22 @@ print(json.dumps(ready))
             if Path(library['path']).name != library['name']:
                 (runtime / Path(library['path']).name).rename(runtime / library['name'])
         def install_peer(target):
-            run(['sudo', '-n', 'mkdir', '-p', destination], target)
-            run(['sudo', '-n', 'rm', '-f', destination + '/.distcc-complete'], target)
+            rust_slot(target, 'prepare', digest, privileged=True)
             remote = (target['ssh'] + ':' if target.get('ssh') else '') + destination + '/'
             prefix = ['rsync', '--rsync-path=sudo -n rsync'] if target.get('ssh') else ['sudo', '-n', 'rsync']
-            # Recheck all bytes after an interrupted deployment, including files
-            # whose size and timestamp already match. No worker may use this
-            # digest until the entire tree and completion record are durable.
-            run([*prefix, '-rlpt', '--checksum', '--delete', str(stage) + '/', remote])
-            run([destination + '/distcc-runtime/ld.so', '--library-path',
-                 destination + '/lib:' + destination + '/distcc-runtime',
-                 destination + '/bin/rustc', '-vV'], target)
+            run([*prefix, '-rlpt', '--checksum', '--delete', '--exclude=/.distcc-complete',
+                 str(stage) + '/', remote])
+            if not rust_slot(target, 'verify', digest, target['temporary']):
+                keep[target['name']].remove(digest)
+                print(f"Rust {target['name']}: {digest} failed compile/execute; retiring copy", flush=True)
+                return
             run(['sudo', '-n', 'sync', '-f', destination], target)
-            run(['sudo', '-n', 'python3', '-c', '''import os, pathlib, sys
-root = pathlib.Path(sys.argv[1])
-with (root / '.distcc-complete').open('w') as marker:
-    os.fchmod(marker.fileno(), 0o644)
-    marker.write(root.name.removeprefix('rust-distcc-') + '\\n')
-    marker.flush()
-    os.fsync(marker.fileno())
-fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-try:
-    os.fsync(fd)
-finally:
-    os.close(fd)
-''', destination], target)
+            rust_slot(target, 'publish', digest, privileged=True)
         parallel(peers, install_peer)
         shutil.rmtree(stage)
-    (work / 'rust-inventory.json').write_text(json.dumps(inventory, indent=2) + '\n')
-    print('Rust: all installed slots available on matching worker architectures', flush=True)
-    return inventory
+    parallel(targets, lambda t: rust_slot(t, 'prune', *keep[t['name']], privileged=True))
+    (work / 'rust-inventory.json').write_text(json.dumps(inventories, indent=2) + '\n')
+    return [(target, inventory['slots']) for target, inventory in zip(targets, inventories)]
 
 
 def validate_thinlto_cluster(targets, work):

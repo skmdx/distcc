@@ -3,7 +3,7 @@
 #ifndef DCC_BROKER_PROTOCOL_H
 #define DCC_BROKER_PROTOCOL_H
 #include <stdint.h>
-#define BROKER_VERSION 5
+#define BROKER_VERSION 6
 #define DCC_BROKER_CLIENT_MAX 256
 enum { ACQUIRE = 1, JOBS = 2, CPP_DONE = 3, MEMO_GET = 4, MEMO_PUT = 5,
        ACQUIRE_POOL = 6, RETURN = 7, ACQUIRE_LINK = 8, ACQUIRE_CPP = 9,
@@ -19,5 +19,5 @@ struct request { uint32_t version, command; };
 /* LOCAL_CPP and LOCAL_ANALYSIS carry the client's memory-limited concurrency. */
 struct local_cpp_request { struct request header; uint32_t limit; };
 struct feedback { uint64_t prepare_ns, queue_ns, execute_ns, cpu_ns; };
-struct reply { int32_t status, slots; char host[1024]; };
+struct reply { int32_t status, slots; union { char host[1024]; int32_t native_peers; }; };
 #endif

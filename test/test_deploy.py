@@ -3,6 +3,8 @@ import importlib.util
 import contextlib
 import io
 import json
+import re
+import runpy
 from pathlib import Path
 import tempfile
 import unittest
@@ -18,6 +20,7 @@ spec = importlib.util.spec_from_file_location('deploy', Path(__file__).resolve()
 assert spec is not None and spec.loader is not None
 deploy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(deploy)
+rust_slots = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'packaging/gentoo/rust-slots.py'))
 
 class RustDistributionTest(unittest.TestCase):
     def test_inventory_collects_slots_once_and_never_redistributes_copies(self):
@@ -31,87 +34,143 @@ class RustDistributionTest(unittest.TestCase):
                 compiler = slot/'bin/rustc'
                 compiler.write_text('#!/bin/sh\nprintf "rustc test\\ncommit-hash: commit\\nhost: arch\\nLLVM version: llvm\\n"\n')
                 compiler.chmod(0o700)
-            def run(args, target=None, **kwargs):
-                self.assertEqual(args[:2], ['python3', '-c'])
-                def paths(pattern):
-                    return [str(slots[0]/'bin/rustc')] if pattern.startswith('/usr/lib') else [
-                        str(slots[1]/'bin/rustc'), str(slots[0]/'bin/rustc')]
-                output = io.StringIO()
-                check_output = subprocess.check_output
-                def output_for(command, **options):
-                    if command[0] == 'ldd':
-                        alias = '/lib/interpreter => ' if 'native' in command[1] else ''
-                        return '\tlibdependency.so => ' + str(root/'libdependency.so') + ' (0x1)\n\t' + alias + str(root/'loader') + ' (0x2)\n'
-                    return check_output(command, **options)
-                with mock.patch('glob.glob', side_effect=paths), \
-                     mock.patch('shutil.which', return_value=str(slots[2]/'bin/rustc')), \
-                     mock.patch('subprocess.check_output', side_effect=output_for), \
-                     contextlib.redirect_stdout(output):
-                    exec(args[2], {})
-                return output.getvalue()
-            with mock.patch.object(deploy, 'run', side_effect=run):
-                inventory = deploy.distribute_rust_compilers([{'name': 'worker'}], root)
-            self.assertEqual([info['root'] for info in inventory[0][1]],
+            def paths(pattern):
+                if pattern.startswith('/usr/lib'):
+                    return [str(slots[0]/'bin/rustc'), str(slots[0]/'bin/rustc-version')]
+                return [str(slots[1]/'bin/rustc'), str(slots[0]/'bin/rustc')]
+            os.link(slots[0]/'bin/rustc', slots[0]/'bin/rustc-version')
+            check_output = subprocess.check_output
+            def output_for(command, **options):
+                if command[0] == 'ldd':
+                    alias = '/lib/interpreter => ' if 'native' in command[1] else ''
+                    return ('\tlibdependency.so => ' + str(root/'libdependency.so') + ' (0x1)\n\t' +
+                            alias + str(root/'loader') + ' (0x2)\n')
+                return check_output(command, **options)
+            with mock.patch('glob.glob', side_effect=paths), \
+                 mock.patch('shutil.which', return_value=str(slots[2]/'bin/rustc')), \
+                 mock.patch('subprocess.check_output', side_effect=output_for), \
+                 mock.patch.dict(rust_slots['inventory'].__globals__, compile_probe=lambda cmd, tmp: True):
+                inventory = rust_slots['inventory'](directory)['slots']
+            self.assertEqual([info['root'] for info in inventory],
                              [str(slots[0]), str(slots[1])])
-            self.assertEqual(inventory[0][1][0]['identity']['commit'], 'commit')
-            self.assertEqual([item['name'] for item in inventory[0][1][0]['runtime']],
+            self.assertEqual(inventory[0]['identity']['commit'], 'commit')
+            self.assertEqual([item['name'] for item in inventory[0]['runtime']],
                              ['libdependency.so', 'ld.so'])
-            self.assertEqual(inventory[0][1][0]['runtime'], inventory[0][1][1]['runtime'])
+            self.assertEqual(inventory[0]['runtime'], inventory[1]['runtime'])
 
-    def test_parallel_inventory_skips_installed_and_only_stages_missing(self):
-        targets = [{'name': 'first'}, {'name': 'second'}]
-        for state in ('complete', 'unmarked', 'wrong-marker', 'broken'):
-            installed = state == 'complete'
-            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
-                barrier = threading.Barrier(2, timeout=5)
-                transfers = []
-                def run(args, target=None, **kwargs):
-                    if args[:2] == ['python3', '-c']:
-                        assert target is not None
-                        if len(args) == 3:
-                            barrier.wait()  # Serial inventory would time out.
-                            name = target['name']
-                            return json.dumps([dict(root='/toolchain/' + name, host='test-arch', digest=name,
-                                                    runtime=[dict(name='libLLVM.so', path='/backend/libLLVM.so')]),
-                                               dict(root='/toolchain/common', host='test-arch', digest='common', runtime=[])])
-                        # Exercise the actual presence/-vV probe locally.
-                        root = Path(directory)/target['name']
-                        compiler = root/'bin/rustc'
-                        compiler.parent.mkdir(parents=True, exist_ok=True)
-                        compiler.write_text('#!/bin/sh\nexit ' + ('1' if state == 'broken' else '0') + '\n')
-                        compiler.chmod(0o700)
-                        (root/'distcc-runtime').mkdir(exist_ok=True)
-                        shutil.copy2(compiler, root/'distcc-runtime/ld.so')
-                        if state != 'unmarked':
-                            (root/'.distcc-complete').write_text('wrong' if state == 'wrong-marker' else root.name)
-                        return subprocess.check_output([*args[:3], str(root)], text=True).strip()
-                    transfers.append((args, target))
-                    if args[:2] == ['rsync', '-rlpt']:
-                        # The source transfer creates the toolchain root.
-                        (Path(args[-1])/'lib').mkdir()
-                    if args[:4] == ['sudo', '-n', 'python3', '-c']:
-                        root = Path(directory)/target['name']
-                        subprocess.run([sys.executable, '-c', args[4], str(root)], check=True)
-                        self.assertEqual((root/'.distcc-complete').read_text().strip(), root.name)
-                    return ''
-                with mock.patch.object(deploy, 'run', side_effect=run):
-                    deploy.distribute_rust_compilers(targets, Path(directory))
-                if installed:
-                    self.assertEqual(transfers, [])
-                else:
-                    self.assertEqual(sum(args[0] == 'rsync' for args, _ in transfers), 4)
-                    self.assertEqual(sum(args[:2] == ['rsync', '-Lpt'] for args, _ in transfers), 2)
-                    self.assertEqual(sum(args[:3] == ['sudo', '-n', 'rsync'] for args, _ in transfers), 2)
-                    self.assertEqual(sum(args[-1] == '-vV' for args, _ in transfers), 2)
-                    for args, _ in transfers:
-                        if args[:3] == ['sudo', '-n', 'rsync']:
-                            self.assertIn('--checksum', args)
-                            self.assertIn('--delete', args)
-                    for target in targets:
-                        commands = [args for args, peer in transfers if peer == target]
-                        self.assertEqual(commands[-2][:4], ['sudo', '-n', 'sync', '-f'])
-                        self.assertEqual(commands[-1][:4], ['sudo', '-n', 'python3', '-c'])
-                self.assertFalse([path for path in Path(directory).glob('rust-*') if path.is_dir()])
+    def test_copy_plan_checks_all_cores_and_skips_installed_builds(self):
+        cpu = rust_slots['cpu_features']
+        wide = cpu('processor: 0\nflags: sse sse4a\n\nprocessor: 1\nflags: sse')
+        narrow = cpu('processor: 0\nflags: sse')
+        targets = [dict(name=str(i)) for i in range(4)]
+        slot = dict(host='triple', identity=dict(version='rustc', commit='a', llvm='1'), digest='a'*64)
+        systems = [dict(cpu=wide, slots=[slot]), dict(cpu=narrow, slots=[]),
+                   dict(cpu=cpu('processor: 0\nflags: sse4a sse'), slots=[]),
+                   dict(cpu=cpu('processor: 0\nflags: sse4a sse\n\nprocessor: 1'), slots=[])]
+        jobs = deploy.rust_copies(targets, systems)
+        self.assertEqual(jobs[slot['digest']][2], [targets[2]])
+        systems[2]['slots'].append(dict(slot, digest='b'*64))
+        self.assertEqual(deploy.rust_copies(targets, systems), {})
+
+    def test_distribution_checks_before_copy_and_publishes_after_verification(self):
+        targets = [dict(name=name, temporary='work') for name in ('source', 'compatible', 'incompatible')]
+        barrier = threading.Barrier(3, timeout=5)
+        digest = 'a'*64
+        slot = dict(host='triple', identity=dict(version='v', commit='h', llvm='1'),
+                    digest=digest, root='/rust', runtime=[dict(name='ld.so', path='/lib/ld.so')])
+        for ready, works in ((True, True), (False, True), (False, False)):
+            calls = []
+            def remote(target, action, *args, privileged=False):
+                name = target['name']
+                if action == 'inventory':
+                    barrier.wait()
+                    features = ['sse4a'] if name != 'incompatible' else ['sse2']
+                    return dict(cpu=dict(machine='x86', required=features, available=features),
+                                slots=[slot] if name == 'source' else [])
+                calls.append((name, action, args))
+                if action == 'ready':
+                    return ready
+                if action == 'verify':
+                    return works
+            with tempfile.TemporaryDirectory() as directory, mock.patch.object(deploy, 'rust_slot', remote), \
+                 mock.patch.object(deploy, 'run') as run:
+                deploy.distribute_rust_compilers(targets, Path(directory))
+                checks = [] if ready else ['prepare', 'verify'] + (['publish'] if works else [])
+                self.assertEqual([act for name, act, _ in calls if name == 'compatible'],
+                                 ['ready', *checks, 'prune'])
+                self.assertIn(('compatible', 'prune', (digest,) if works else ()), calls)
+                self.assertEqual([c[1:] for c in calls if c[0]=='incompatible'], [('prune', ())])
+                copies = [c.args[0] for c in run.call_args_list if '--delete' in c.args[0]]
+                self.assertEqual(len(copies), int(not ready))
+                if copies:
+                    self.assertIn('--checksum', copies[0])
+                    self.assertIn('--exclude=/.distcc-complete', copies[0])
+
+    def test_validation_checks_each_client_against_actual_worker_offers(self):
+        targets = [dict(name=name, temporary='work', server_hosts=name) for name in ('a', 'b', 'c')]
+        slot = dict(root='/rust', digest='a'*64, host='same-triple',
+                    identity=dict(version='rustc vendor', commit='hash', llvm='23.1.5'))
+        requirement = ('23.1', 'x86-64')
+        offers = {'a': ({deploy.rust_compiler_key(slot)}, {requirement}),
+                  'b': ({'1234567890abcdef'}, {requirement}), 'c': (set(), set())}
+        inventory = [(targets[0], [slot]), (targets[1], [slot]), (targets[2], [])]
+        routes = []
+        def check(args, client, unit, log):
+            env = dict(arg.split('=', 1) for arg in args if arg.startswith('VALIDATE_'))
+            routes.append((client['name'], env['VALIDATE_DISTCC_HOSTS'], env['VALIDATE_DISTCC_RUST_ROUTE']))
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(deploy, 'transfer'), \
+             mock.patch.object(deploy, 'run'), mock.patch.object(deploy, 'bounded', check), \
+             mock.patch.object(deploy, 'rust_cgu_requirement', return_value=requirement), \
+             mock.patch.object(deploy, 'rust_worker_capabilities', side_effect=lambda h: (h, *offers[h])):
+            self.assertEqual(deploy.validate_rust_cluster(targets, Path(work), inventory), 6)
+        self.assertCountEqual(routes, [(client, worker, route) for client in ('a', 'b')
+                              for worker, route in zip(('a', 'b', 'c'), ('remote', 'cgu', 'local'))])
+
+    def test_retirement_requires_owned_directory_and_matching_marker(self):
+        manage = rust_slots['manage']
+        with tempfile.TemporaryDirectory() as work:
+            base = Path(work)
+            roots = [base/('rust-distcc-' + c*64) for c in 'abcdef']
+            for root in roots[:-1]:
+                root.mkdir()
+            for root, state in zip(roots, ('', 'isa-checked ', 'installing ')):
+                (root/'.distcc-complete').write_text(state + root.name[-64:] + '\n')
+            (roots[3]/'.distcc-complete').write_text('unrelated')
+            (roots[4]/'.distcc-complete').symlink_to(roots[0]/'.distcc-complete')
+            roots[5].symlink_to(roots[1], target_is_directory=True)
+            manage(base, 'prune', 'b'*64)
+            self.assertEqual(set(base.iterdir()), {roots[1], *roots[3:]})
+            for root in roots[3:]:
+                with self.assertRaises(RuntimeError):
+                    manage(base, 'prepare', root.name[-64:])
+            with self.assertRaises(ValueError):
+                manage(base, 'prune', '../other')
+
+    @unittest.skipUnless(shutil.which('rustc'), 'requires an installed Rust slot')
+    def test_managed_slot_compiles_and_executes_before_advertisement(self):
+        manage = rust_slots['manage']
+        executable = shutil.which('rustc')
+        assert executable is not None
+        compiler = Path(executable).resolve()
+        sysroot = Path(subprocess.check_output([compiler, '--print=sysroot'], text=True).strip())
+        loaded = subprocess.check_output(['ldd', str(compiler)], text=True)
+        loader = re.search(r'^\s*(/\S+)(?: => (/\S+))? \(', loaded, re.M)
+        assert loader is not None, loaded
+        with tempfile.TemporaryDirectory() as work:
+            base, digest = Path(work), '1'*64
+            root = base/('rust-distcc-' + digest)
+            manage(base, 'prepare', digest)
+            (root/'bin').symlink_to(sysroot/'bin')
+            (root/'lib').symlink_to(sysroot/'lib')
+            runtime = root/'distcc-runtime'
+            runtime.mkdir()
+            (runtime/'ld.so').symlink_to(loader[2] or loader[1])
+            self.assertFalse(manage(base, 'ready', digest, work))
+            self.assertTrue(manage(base, 'verify', digest, work))
+            manage(base, 'publish', digest)
+            self.assertTrue(manage(base, 'ready', digest, work))
+            (runtime/'ld.so').unlink()
+            self.assertFalse(manage(base, 'ready', digest, work))
 
 
 class TimeoutEvidenceTest(unittest.TestCase):

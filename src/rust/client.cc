@@ -32,18 +32,6 @@ extern "C" {
 using namespace rust;
 namespace {
 using States = std::map<fs::path, struct stat>;
-struct Work {
-    fs::path dir;
-    explicit Work(const fs::path &parent) {
-        string tmp = (parent / "distcc-rust-XXXXXX").string();
-        check(mkdtemp(tmp.data()) != nullptr, "Rust working directory");
-        dir = fs::absolute(tmp);
-    }
-    ~Work() {
-        std::error_code ec;
-        fs::remove_all(dir, ec);
-    }
-};
 struct Lease {
     int id = -1;
     ~Lease() {
@@ -934,8 +922,8 @@ std::optional<int> try_local_frontend(char **original, const States &responses, 
 }
 struct CguRoute {
     fs::path shim;
-    int peers = 0;
-    bool native = false;
+    int cgu_peers = 0;
+    int native_peers = 0;
 };
 // A rustc-private LLVM and a system LLVM can report the same version but
 // cannot exchange C++ objects inside rustc. Trace the loader without running
@@ -952,12 +940,13 @@ fs::path linked_llvm(const Words &command) {
     return {};
 }
 CguRoute cgu_route(const Invocation &inv, const string &version, const fs::path &sysroot,
-                   dcc_work_hint hint) {
+                   dcc_work_hint hint, bool metadata_only) {
+    CguRoute route;
     auto llvm = llvm_abi(field(version, "LLVM version: "));
     auto host = field(version, "host: ");
     auto triple = inv.target.empty() ? host : inv.target;
     auto compiler = sysroot / "bin/rustc";
-    for (auto &helper : backend_helpers(sysroot, llvm)) {
+    for (auto &helper : metadata_only ? std::vector<fs::path>{} : backend_helpers(sysroot, llvm)) {
         auto shim = helper.parent_path() / "distcc-rust-cgu.so";
         if (!fs::is_regular_file(shim))
             continue;
@@ -977,18 +966,18 @@ CguRoute cgu_route(const Invocation &inv, const string &version, const fs::path 
         });
         if (target.empty())
             continue;
-        string requirement = llvm + " " + target + " " + host;
+        string requirement = llvm + " " + target;
         if (requirement.size() >= sizeof(hint.cgu_backend))
             throw Local("CGU target record too long");
-        hint.kind = DCC_WORK_RUST_CGU;
-        hint.memory_class = 1 + DCC_JOB_RUST_CGU * DCC_MEMORY_BUCKETS + dcc_resource_bucket(hint.bytes);
         strcpy(hint.cgu_backend, requirement.c_str());
-        int native;
-        int peers = dcc_broker_cgu_capacity(&hint, &native);
-        check(peers >= 0, "Rust capacity request");
-        return {shim, peers, bool(native)};
+        route.shim = shim;
+        break;
     }
-    return {};
+    hint.kind = DCC_WORK_RUST_CGU;
+    hint.memory_class = 1 + DCC_JOB_RUST_CGU * DCC_MEMORY_BUCKETS + dcc_resource_bucket(hint.bytes);
+    route.cgu_peers = dcc_broker_cgu_capacity(&hint, &route.native_peers);
+    check(route.cgu_peers >= 0, "Rust capacity request");
+    return route;
 }
 int cgu_frontend(const CguRoute &route, const Invocation &inv, const fs::path &exe, char **original,
                  const States &responses) {
@@ -1129,10 +1118,7 @@ int distributed(char **original, const Words &args, const States &responses) {
     hint.work_units = dcc_rust_source_bytes(&job);
     hint.bytes = std::max<uint64_t>(1, source.st_size);
     hint.memory_class = dcc_resource_class(&job);
-    bool small = !inv.linker_plugin_lto && small_crate(inv.source, hint.bytes);
-    if (small && !inv.trace_macro && !inv.incremental && inv.scope.empty())
-        if (auto status = try_local_frontend(original, responses, hint))
-            return *status;
+    bool small = small_crate(inv.source, hint.bytes);
     States tool = {{exe, metadata(exe)}};
     string info = memo("compiler:" + profile_context(exe), tool,
                        [&] { return query(exe, "-vV") + '\0' + query(exe, "--print=sysroot"); });
@@ -1141,14 +1127,19 @@ int distributed(char **original, const Words &args, const States &responses) {
         throw std::runtime_error("invalid Rust compiler memo");
     string version = info.substr(0, separator);
     string id = identity(version), cpu, features;
-    CguRoute route;
     auto root = info.substr(separator + 1);
-    if (!metadata_only)
-        route = cgu_route(inv, version, root, hint);
-    if (route.peers && (!route.native || (!inv.linker_plugin_lto && !small && inv.multi_cgu && route.peers >= 2)))
+    hint.rust_compiler = compiler_key(version);
+    auto route = cgu_route(inv, version, root, hint, metadata_only);
+    bool mixed = route.cgu_peers > route.native_peers;
+    if (!route.native_peers && !route.cgu_peers)
+        throw Local("worker has no matching Rust toolchain");
+    if (!route.native_peers || (!small && (inv.linker_plugin_lto ? mixed : inv.multi_cgu && route.cgu_peers >= 2)))
         return cgu_frontend(route, inv, exe, original, responses);
+    if (small && !mixed && !inv.linker_plugin_lto && !inv.trace_macro && !inv.incremental && inv.scope.empty())
+        if (auto status = try_local_frontend(original, responses, hint))
+            return *status;
     auto refused = [&](const Local &reason) {
-        if (!route.peers)
+        if (!route.cgu_peers)
             throw reason;
         if (env("DISTCC_VERBOSE") == "1")
             fprintf(stderr, "distcc-rust: local: %s\n", reason.what());
@@ -1182,12 +1173,9 @@ int distributed(char **original, const Words &args, const States &responses) {
     } catch (const Local &reason) {
         return refused(reason);
     }
-    string host = inv.needs_host ? field(version, "host: ") : "";
-    if (host.size() >= sizeof(hint.rust_host))
-        throw Local("Rust host triple too long");
-    if (!host.empty() && env("DISTCC_VERBOSE") == "1")
+    string host = field(version, "host: ");
+    if (inv.needs_host && env("DISTCC_VERBOSE") == "1")
         fprintf(stderr, "distcc-rust: proc-macro host ABI %s\n", host.c_str());
-    strcpy(hint.rust_host, host.c_str());
     job.rust.host = host.data();
     job.rust.cpu = cpu.data();
     job.rust.features = features.data();

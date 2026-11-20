@@ -67,7 +67,7 @@ class MemoReconnectTest(unittest.TestCase):
 
 
 class BrokerTestCase(DistccTestCase):
-    protocol_version = 5
+    protocol_version = 6
 
     def start_memory_refusal(self):
         # The first snapshot fits; before execution the real daemon's memory
@@ -75,8 +75,11 @@ class BrokerTestCase(DistccTestCase):
         self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='1048576')
         self.addCleanup(self.restart_server, self.build / 'distccd')
         actual = self.get_stats(self.stats_ports[0]).encode()
+        compilers = next(line.split(' ', 1)[1] for line in actual.decode().splitlines()
+                         if line.startswith('dcc_rust_compilers '))
         initial = stats_response(cpus=4, cores=4, jobs=4, capacity=4,
-                                 busy=0, queued=0, preparing=0, returning=0, running=0)
+                                 busy=0, queued=0, preparing=0, returning=0, running=0,
+                                 rust_compilers=compilers)
         replies = iter((initial,))
         peer = self.peer(lambda: next(replies, actual))
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1',
@@ -136,7 +139,7 @@ class BrokerTestCase(DistccTestCase):
         return proc
 
     def request(self, command=1, work=(0, 0, 0), work_units=0, family=0, memory_class=None,
-                cpp_limit=2147483647, scope_key=0, rust_host=b''):
+                cpp_limit=2147483647, scope_key=0, rust_compiler=0, cgu_backend=b''):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
@@ -147,7 +150,8 @@ class BrokerTestCase(DistccTestCase):
             if memory_class is None:
                 kind = {7: 3, 8: 4, 10: 5}.get(work[2], 1 if 4 <= work[2] <= 6 else 0)
                 memory_class = 1 + kind * 64 + max(0, work[1].bit_length() - 1) if work[0] else 0
-            payload += struct.pack('=QQIIQQQ96s', *work, work_units, family, scope_key, memory_class, rust_host)
+            payload += struct.pack('=QQIIQQQQ96s', *work, work_units, family, scope_key,
+                                   memory_class, rust_compiler, cgu_backend)
         sock.sendall(payload)
         self.addCleanup(sock.close)
         return sock
@@ -163,8 +167,9 @@ class BrokerTestCase(DistccTestCase):
             descriptors.extend(array.array("i", data))
         return status, slots, descriptors
 
-    def acquire_reserved(self, command=6, work=(0, 0, 0), work_units=0, family=0, memory_class=None):
-        lease = self.request(command, work, work_units, family, memory_class)
+    def acquire_reserved(self, command=6, work=(0, 0, 0), work_units=0, family=0, memory_class=None,
+                         rust_compiler=0):
+        lease = self.request(command, work, work_units, family, memory_class, rust_compiler=rust_compiler)
         status, capabilities, fds = self.receive(lease)
         self.assertEqual(status, 0)
         self.assertTrue(capabilities & (1 << 30))
@@ -547,7 +552,7 @@ class BrokerPlacementTest(BrokerTestCase):
             self.assertEqual(net.getpeername()[1],self.ports[expected],index)
 
     def test_cold_file_jobs_remain_movable_until_a_cpu_lane_opens(self):
-        metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+        metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1, rust_compilers='0000000000000001',
                                 busy=1, running=1, queued=0, preparing=0, returning=0)
         fast = self.peer(metrics)
         next_ready = self.peer(lambda: metrics)
@@ -555,14 +560,14 @@ class BrokerPlacementTest(BrokerTestCase):
                 self.host(1, f',tcp,stats={next_ready.port},speed=1')
         for kind in (7, 8, 10):
             with self.subTest(kind=kind):
-                metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1, rust_compilers='0000000000000001',
                     busy=1, running=1, queued=0, preparing=0, returning=0)
                 self.start_broker(hosts, name=f'cold-movable-{kind}')
-                request = self.request(10, (1905, 4 * 1024**2, kind), 1048576)
+                request = self.request(10, (1905, 4 * 1024**2, kind), 1048576, rust_compiler=int(kind == 7))
                 request.settimeout(.05)
                 with self.assertRaises(socket.timeout):
                     request.recv(1032)
-                metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                metrics = stats_response(cpus=1, cores=1, jobs=1, capacity=1, rust_compilers='0000000000000001',
                     busy=0, running=0, queued=0, preparing=0, returning=0)
                 request.settimeout(3)
                 status, _, descriptors = self.receive(request)
@@ -1692,15 +1697,15 @@ class BrokerTest(BrokerTestCase):
             with self.subTest(busy=busy):
                 peers = [self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=busy,
                              queued=0, preparing=0, returning=0, running=busy,
-                             rust_capacity=[-1] * 64)),
-                         self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
+                             rust_capacity=[-1] * 64, rust_compilers='0000000000000001')),
+                         self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0, rust_compilers='0000000000000001',
                              queued=0, preparing=0, returning=0, running=0))]
                 hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={10 if i == 0 else 1}')
                                  for i, p in enumerate(peers))
                 self.start_broker(hosts, name=f'rust-calibration-{busy}')
                 # Sysroots can exceed the preprocessed C input limit.
-                _, first = self.acquire_reserved(10, (1990, 2 * 1024**3, 7))
-                _, second = self.acquire_reserved(10, (1991, 2 * 1024**3, 7))
+                _, first = self.acquire_reserved(10, (1990, 2 * 1024**3, 7), rust_compiler=1)
+                _, second = self.acquire_reserved(10, (1991, 2 * 1024**3, 7), rust_compiler=1)
                 self.assertEqual(first.getpeername()[1], self.ports[0])
                 self.assertEqual(second.getpeername()[1], self.ports[0])
 

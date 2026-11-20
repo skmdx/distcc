@@ -395,6 +395,7 @@ dcc_longest_job_compiler %s\n\
 dcc_longest_job_time_msecs %d\n\
 dcc_max_kids %d\n\
 dcc_rust_host %s\n\
+dcc_rust_compilers %s\n\
 dcc_llvm_cgu %s\n\
 dcc_cpus %d\n\
 dcc_cores %d\n\
@@ -507,8 +508,8 @@ dcc_free_mem %d MB\n\
 #endif
         struct timespec stamp = {0};
         clock_gettime(CLOCK_MONOTONIC, &stamp);
-        const char *rust_host = dcc_rust_host(), *llvm = dcc_rust_cgu_capabilities();
-        if (!rust_host || !llvm) return 0;
+        const char *rust_host, *compilers = dcc_rust_compilers(&rust_host), *llvm = dcc_rust_cgu_capabilities();
+        if (!compilers || !llvm) return 0;
         reply_len = snprintf(reply, DCC_STATS_SIZE, replytemplate,
                                (unsigned long long)stamp.tv_sec * 1000000000 + stamp.tv_nsec,
                                dcc_stats.counters[STATS_TCP_ACCEPT],
@@ -523,7 +524,7 @@ dcc_free_mem %d MB\n\
                                dcc_stats.longest_job_compiler,
                                dcc_stats.longest_job_time,
                                dcc_max_kids,
-                               rust_host, llvm,
+                               rust_host, compilers, llvm,
                                ncpus,
                                ncores, core_scale, smt_gain,
                                perf.scale, perf.age, perf.probe,

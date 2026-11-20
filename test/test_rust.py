@@ -229,7 +229,7 @@ class RustTest(BrokerTestCase):
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=1), name='one-lane')
         def request_cgu(command):
             return self.request(command, work=(1, 65536, 11), memory_class=1+8*64+16,
-                                rust_host=f'{version} {target}'.encode())
+                                cgu_backend=f'{version} {target}'.encode())
 
         cold = request_cgu(20)
         try:
@@ -328,6 +328,80 @@ class RustTest(BrokerTestCase):
                       if ' --crate-name build_script_build ' in job)
         self.assertIn('distcc-rust: compiled on', script)
         subprocess.run([self.work/'target/debug/consumer'], check=True)
+
+    def test_same_triple_mixed_compilers_route_whole_crates_and_cgus(self):
+        deploy = runpy.run_path(str(self.build/'packaging/gentoo/deploy.py'))
+        abi, backend = self.cgu_toolchain()
+        report = subprocess.check_output([self.rustc, '-vV'], text=True)
+        host = next(line[6:] for line in report.splitlines() if line.startswith('host: '))
+        identity = self.version(self.rustc)
+        candidates = [*Path('/opt').glob('rust-bin-*/bin/rustc'), *Path('/usr/lib/rust').glob('*/bin/rustc')]
+        other = next((p for p in sorted(candidates, reverse=True)
+                      if self.version(p) != identity and 'host: '+host+'\n' in
+                      subprocess.check_output([p, '-vV'], text=True)), None)
+        if not other:
+            self.skipTest('requires a second installed Rust build for the same triple')
+        def key(version):
+            identity = dict(zip(('version', 'commit', 'llvm'), version.splitlines(), strict=True))
+            return deploy['rust_compiler_key'](dict(identity=identity, host=host))
+        self.restart_server(self.build/'distccd', DISTCCD_RUSTC=str(other))
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        hosts = [self.host(i, f',tcp,stats={p}', slots=1) for i, p in enumerate(self.stats_ports)]
+        self.start_broker(' '.join(hosts), name='mixed')
+        offers = [deploy['rust_worker_capabilities'](endpoint) for endpoint in hosts]
+        self.assertEqual(offers[0][1], {key(self.version(other))})
+        self.assertIn(key(identity), offers[1][1])
+        self.assertTrue(all((abi, backend) in backends for _, _, backends in offers))
+        capacity = self.request(20, work=(1, 65536, 11), memory_class=1+8*64+16,
+                                cgu_backend=f'{abi} {backend}'.encode(), rust_compiler=int(key(identity), 16))
+        self.assertEqual(struct.unpack_from('=iii', capacity.recv(1032)), (0, 2, 1))
+        (self.work/'Cargo.toml').touch()
+        source = self.work/'src'
+        source.mkdir()
+        main = source/'main.rs'
+        modules = []
+        for i in range(16):
+            functions = ''.join(f'#[inline(never)] pub fn f{j}(x:u64)->u64 {{ x.wrapping_add({i+j}) }}\n'
+                                for j in range(100))
+            (source/f'm{i}.rs').write_text(functions + 'pub fn sum(x:u64)->u64 { ' +
+                '+'.join(f'f{j}(x)' for j in range(100)) + ' }')
+            modules.append(f'mod m{i};')
+        main.write_text('\n'.join(modules) + '\nfn main(){ assert_eq!(' +
+                        '+'.join(f'm{i}::sum(std::hint::black_box(1))' for i in range(16)) +
+                        f', {sum(1+i+j for i in range(16) for j in range(100))}); }}')
+        build = self.work/'build.rs'
+        build.write_text('fn main(){println!("cargo:rustc-cfg=checked");}')
+        program = self.work/'program'
+        counts = self.completed_jobs()
+        result = self.rust(build, '-Ccodegen-units=8', '-o', program)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        self.assertEqual(subprocess.check_output([program], text=True).strip(), 'cargo:rustc-cfg=checked')
+        self.assertEqual(self.completed_jobs(), [counts[0], counts[1]+1])
+        for flags in ([], ['-Clinker-plugin-lto', '-Clinker=clang', '-Clink-arg=-fuse-ld=lld']):
+            with self.subTest(flags=flags):
+                counts = self.completed_jobs()
+                trace = self.work/'frontend.trace'
+                result = self.rust(main, '-Copt-level=2', '-Ccodegen-units=8', *flags, '-o', program,
+                                   prefix=['strace', '-f', '-s', '2048', '-e', 'execve', '-o', str(trace)])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('-Zbinary-dep-depinfo', trace.read_text())
+                if flags:
+                    modules = re.findall(r'^distcc-rust-cgu: completed thin-prelink (\S+)$', result.stderr, re.M)
+                    self.assertGreater(len(modules), 1, result.stderr)
+                    self.assertEqual(len(set(modules)), len(modules))
+                    self.assertEqual(sum(self.completed_jobs()) - sum(counts), len(modules))
+                else:
+                    self.assert_one_job_per_cgu(result.stderr, counts)
+                self.assertTrue(all(b > a for a, b in zip(counts, self.completed_jobs())), result.stderr)
+                subprocess.run([program], check=True, timeout=5)
+        self.start_broker(hosts[0], name='same-triple-cgu-only')
+        counts = self.completed_jobs()
+        result = self.rust(main, '-Copt-level=2', '-Ccodegen-units=8', '-o', program)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_one_job_per_cgu(result.stderr, counts)
+        self.assertEqual(self.completed_jobs()[1], counts[1])
+        subprocess.run([program], check=True, timeout=5)
 
     def test_parallel_cgu_backend(self):
         version, backend = self.cgu_toolchain()
@@ -490,11 +564,11 @@ class RustTest(BrokerTestCase):
                     self.addCleanup(self.restart_server, self.build/'distccd')
                 self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='foreign' if host == foreign_host else 'native')
                 stats = self.get_stats(self.stats_ports[0])
-                self.assertIn('dcc_rust_host '+host, stats)
+                self.assertIn('dcc_rust_host '+(native if host == native else '-'), stats)
                 self.assertIn(llvm+' '+backend, next(l for l in stats.splitlines() if l.startswith('dcc_llvm_cgu ')))
                 for incompatible in ('0.0.0 '+backend, llvm+' absent-backend'):
                     request = self.request(10, work=(1, 65536, 11), memory_class=1+8*64+16,
-                                           rust_host=incompatible.encode())
+                                           cgu_backend=incompatible.encode())
                     self.assertEqual(struct.unpack_from('=i', request.recv(1032))[0], 121)
                 counts = self.completed_jobs()
                 result = subprocess.run(['strace', '-f', '-s', '256', '-e', 'execve', '-o', trace,
@@ -766,6 +840,8 @@ class RustTest(BrokerTestCase):
                                    '-Clink-arg=-fuse-ld=lld', '-o', output, env=env, prefix=prefix)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('distcc-thinlto: compiled on ', result.stderr)
+                self.assertIn('distcc-rust: compiled on ', result.stderr)
+                self.assertNotIn('distcc-rust-cgu: completed ', result.stderr)
                 self.assertNotIn('Read-only file system', result.stderr)
                 self.assertGreater(log.stat().st_size, 0)
                 self.assertEqual(subprocess.check_output([output], text=True), 'distributed Rust ThinLTO\n')
@@ -1106,7 +1182,8 @@ class RustTest(BrokerTestCase):
                         if not data:
                             return
                         peers[source].sendall(data)
-        self.start_broker(f'{self.worker_address}:{listener.getsockname()[1]}/1,tcp', name='retry', backoff=0)
+        self.start_broker(f'{self.worker_address}:{listener.getsockname()[1]}/1,tcp,stats={self.stats_ports[0]}',
+                          name='retry', backoff=0)
         self.env.update(DISTCC_VERBOSE='1', PATH=str(self.build) + os.pathsep + os.environ['PATH'])
         source = self.work / 'retry.rs'
         source.write_text('pub fn answer() -> u32 { 42 }')
@@ -1442,7 +1519,7 @@ class RustTest(BrokerTestCase):
         source.write_text('pub fn value() {}')
         self.assertEqual(self.rust('--crate-type=rlib',source).returncode,0)
         foreign='incompatible-test-host'
-        request=self.request(10,work=(1,1024,7),work_units=1,rust_host=foreign.encode())
+        request=self.request(10,work=(1,1024,7),work_units=1,rust_compiler=1)
         status,=struct.unpack_from('=i',request.recv(1032))
         self.assertEqual(status,121)
         status,err,outputs=self.raw_compile(source,host=foreign)
@@ -1973,10 +2050,11 @@ pub fn read_only() -> bool {
         src = self.work/'version.rs'
         src.write_text('pub fn answer() -> u32 { 42 }')
         self.restart_server(self.build/'distccd', DISTCCD_RUSTC=str(other))
-        r = self.rust('--crate-type=rlib', src)
+        r = self.rust('--crate-type=rlib', '--emit=metadata', src)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('local: worker has no matching Rust toolchain', r.stderr)
         self.restart_server(self.build/'distccd', DISTCCD_RUSTC=os.pathsep.join((str(other), self.rustc)))
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='refreshed-catalog')
         r = self.rust('--crate-type=rlib', src)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('compiled on', r.stderr)
@@ -2003,6 +2081,7 @@ pub fn read_only() -> bool {
         (root/'distcc-runtime').mkdir()
         shutil.copy2(original, root/'bin/rustc')
         (root/'lib').mkdir()
+        (root/'lib/rustlib').symlink_to(original.parent.parent/'lib/rustlib')
         subprocess.run(['cp', '-L', '--reflink=auto',
                         *map(str, (original.parent.parent/'lib').glob('*.so*')),
                         str(root/'lib')], check=True)
@@ -2015,12 +2094,12 @@ pub fn read_only() -> bool {
         source = self.work/'runtime.rs'
         source.write_text('pub fn answer() -> String { String::from("runtime") }')
         output = self.work/'libruntime.rlib'
-        for marker in (None, 'b'*64):
+        for marker in (None, 'b'*64, 'c'*64):
             if marker: (root/'.distcc-complete').write_text(marker+'\n')
             status, _, files = self.raw_compile(source)
             self.assertEqual(status, 121)
             self.assertFalse(files)
-        (root/'.distcc-complete').write_text('c'*64 + '\n')
+        (root/'.distcc-complete').write_text('isa-checked ' + 'c'*64 + '\n')
         status, diagnostics, files = self.raw_compile(source)
         self.assertEqual(status, 0, diagnostics)
         output.write_bytes(files['libwire.rlib'])

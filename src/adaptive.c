@@ -138,8 +138,18 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
         if (!strncmp(line, "dcc_completion_clock_ns ", 24)) {
             if (cap->report_stamp || sscanf(line + 24, "%llu %c", &cap->report_stamp, &extra) != 1)
                 return -1;
-        } else if (!strncmp(line, "dcc_rust_host ", 14)) {
-            if (sscanf(line+14,"%95s %c",cap->rust_host,&extra)!=1) return -1;
+        } else if (!strncmp(line, "dcc_rust_compilers ", 19)) {
+            const char *p = line + 19;
+            if (!strcmp(p, "-")) continue;
+            for (;;) {
+                if (strspn(p, "0123456789abcdef") != 16 ||
+                    cap->rust_compiler_count == sizeof(cap->rust_compilers) / sizeof(cap->rust_compilers[0]))
+                    return -1;
+                cap->rust_compilers[cap->rust_compiler_count++] = strtoull(p, NULL, 16);
+                p += 16;
+                if (!*p) break;
+                if (*p++ != ' ') return -1;
+            }
         } else if (!strncmp(line, "dcc_llvm_cgu ", 13)) {
             if (strlen(line + 13) >= sizeof(cap->llvm_cgu)) return -1;
             strcpy(cap->llvm_cgu, line + 13);

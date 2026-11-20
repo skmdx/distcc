@@ -17,10 +17,8 @@ struct dcc_work_hint {
     uint64_t family; /* Source-content prior across command/configuration changes. */
     uint64_t scope_key;
     uint64_t memory_class; /* Same resource class as the serialized worker job. */
-    union {
-        char rust_host[96]; /* Required rustc host for a procedural macro. */
-        char cgu_backend[96]; /* Required LLVM version and registered target. */
-    };
+    uint64_t rust_compiler; /* rustc identity and host triple for a whole crate. */
+    char cgu_backend[96]; /* LLVM version and registered target for a CGU. */
 };
 struct dcc_work_class {
     double weight, x, y, z;

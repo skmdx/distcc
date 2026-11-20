@@ -4,7 +4,8 @@
 struct dcc_hostdef;
 struct dcc_capacity {
     int cpus, cores, jobs;
-    char rust_host[96];
+    uint64_t rust_compilers[128];
+    unsigned rust_compiler_count;
     char llvm_cgu[4096]; /* Semicolon-separated ABI and registered-target records. */
     double core_scale, smt_gain;
     double cpu_scale, cpu_age;

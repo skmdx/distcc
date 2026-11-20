@@ -583,7 +583,7 @@ int dcc_broker_cgu_capacity(const struct dcc_work_hint *hint, int *native)
     struct reply reply;
     int net, fd = broker_request(CGU_CAPACITY, &reply, &net, hint, NULL, 0);
     if (fd < 0) return -1;
-    *native = reply.host[0] != 0;
+    *native = reply.native_peers;
     dcc_session_finish(fd);
     return reply.slots;
 }
@@ -1371,7 +1371,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         if (direct && !client->hint.key && !p->local) continue;
         struct dcc_capacity observed = observed_capacity(p, broker->cpp_busy);
         const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
-        if (client->hint.kind == DCC_WORK_RUST_CGU) {
+        if (client->hint.kind == DCC_WORK_RUST || client->hint.kind == DCC_WORK_RUST_CGU) {
             if (!p->host->tcp_jobs || !p->host->stats_port) {
                 ++abi_mismatches;
                 continue;
@@ -1383,21 +1383,21 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                     (p->stats_fd >= 0 || p->deadline < client->waiting_since);
                 continue;
             }
+            int native = 0;
+            for (unsigned k = 0; k < cap->rust_compiler_count; ++k)
+                if (cap->rust_compilers[k] == client->hint.rust_compiler) { native = 1; break; }
+            int cgu = client->hint.kind == DCC_WORK_RUST_CGU &&
+                      compatible_cgu(client->hint.cgu_backend, cap->llvm_cgu);
             if (client->command == CGU_CAPACITY) {
-                const char *host = strrchr(client->hint.cgu_backend, ' ');
-                if (host && !strcmp(host + 1, cap->rust_host)) reply.host[0] = '1';
+                reply.native_peers += native;
+                reply.slots += cgu;
+                if (!native && !cgu) ++abi_mismatches;
+                continue;
             }
-            if (!compatible_cgu(client->hint.cgu_backend, cap->llvm_cgu)) {
+            if (!(client->hint.kind == DCC_WORK_RUST ? native : cgu)) {
                 ++abi_mismatches;
                 continue;
             }
-            if (client->command == CGU_CAPACITY) {
-                ++reply.slots;
-                continue;
-            }
-        } else if (*client->hint.rust_host && (!cap || strcmp(cap->rust_host,client->hint.rust_host))) {
-            if (cap && *cap->rust_host) ++abi_mismatches;
-            continue;
         }
         struct dcc_capacity projected;
         int memory_full = 0;
@@ -1669,7 +1669,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     } else if (pending_cgu_probe && (client->command == CGU_CAPACITY || !available)) {
         return 0;
     } else if (client->command == CGU_CAPACITY) {
-        reply.status = reply.slots || abi_mismatches == broker->count ? 0 : EXIT_CONNECT_FAILED;
+        reply.status = reply.slots || reply.native_peers || abi_mismatches == broker->count ? 0 : EXIT_CONNECT_FAILED;
         send_reply(client->fd, &reply, -1);
         release_client(broker, client);
     } else if (client->command == JOBS || !available) {

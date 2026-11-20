@@ -36,6 +36,18 @@ inline void check(bool ok, const string &what) {
     if (!ok)
         throw std::system_error(errno, std::generic_category(), what);
 }
+struct Work {
+    fs::path dir;
+    explicit Work(const fs::path &parent) {
+        string tmp = (parent / "distcc-rust-XXXXXX").string();
+        check(mkdtemp(tmp.data()) != nullptr, "Rust working directory");
+        dir = fs::absolute(tmp);
+    }
+    ~Work() {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+};
 struct Fd {
     int fd;
     explicit Fd(int n) : fd(n) { check(n >= 0, "open descriptor"); }
@@ -177,6 +189,10 @@ inline string field(const string &report, const string &name) {
 inline string identity(const string &report) {
     return report.substr(0, report.find('\n')) + "\n" + field(report, "commit-hash: ") + "\n" +
            field(report, "LLVM version: ");
+}
+inline uint64_t compiler_key(const string &report) {
+    auto key = identity(report) + '\n' + field(report, "host: ");
+    return XXH3_64bits(key.data(), key.size());
 }
 inline struct stat metadata(const fs::path &p) {
     struct stat s;
