@@ -203,6 +203,35 @@ class RustTest(BrokerTestCase):
         self.assertCountEqual(modules, re.findall(r'^distcc-rust-cgu: emitted (\S+)$', messages, re.M))
         self.assertEqual(sum(self.completed_jobs()) - sum(counts), len(modules), messages)
 
+    def test_cgu_constructor_exports_are_checked_before_compilation(self):
+        self.cgu_toolchain()
+        shim = self.build/'llvm-lto/distcc-rust-cgu.so'
+        # objcopy needs an ELF object even when the normal build uses linker-plugin LTO.
+        native = self.work/'native-hook'
+        subprocess.run(['make', '-s', f'LTO_BUILD={native}', 'CXXFLAGS=-O1 -fno-lto', native/'cgu_hook.o'],
+                       cwd=self.build, check=True)
+        exports = subprocess.check_output(['nm', '-DP', '--defined-only', shim], text=True).splitlines()
+        for ctor in ('_ZN4llvm11PassBuilderC1', '_ZN4llvm14raw_fd_ostreamC1'):
+            with self.subTest(ctor=ctor):
+                # Re-link so that the broken export has a valid ELF hash and relocations.
+                name, = [line.split()[0] for line in exports if line.startswith(ctor)]
+                missing = name.replace(ctor, ctor[:-2] + 'X1', 1)
+                folder = self.work/ctor
+                folder.mkdir()
+                shutil.copy2(native/'cgu-libcpp.h', folder)
+                subprocess.run(['objcopy', '--redefine-sym', f'{name}={missing}',
+                                native/'cgu_hook.o', folder/'cgu_hook.o'], check=True)
+                target = folder/shim.name
+                check = subprocess.run(['make', '-s', f'LTO_BUILD={folder}', target], cwd=self.build,
+                                       capture_output=True, text=True)
+                self.assertNotEqual(check.returncode, 0)
+                self.assertIn(missing, check.stderr)
+                self.assertFalse(target.exists())
+                env = dict(self.env, LD_PRELOAD=str(target)+'.tmp', DISTCC_RUST_CGU_CLIENT=str(self.build/'distcc'))
+                load = self.rust('-vV', remote=False, env=env)
+                self.assertEqual(load.returncode, 100, load.stderr)
+                self.assertIn('missing LLVM entry point ' + missing, load.stderr)
+
     def test_started_cgu_failure_reaches_the_compiler(self):
         version, target = self.cgu_toolchain()
         request = self.work/'invalid-module.bc'
