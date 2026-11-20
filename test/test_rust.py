@@ -319,7 +319,8 @@ class RustTest(BrokerTestCase):
             funcs = '\n'.join(f'#[inline(never)] pub fn f{j}(x:u64)->u64 {{ x.wrapping_mul({j+1}).rotate_left({j%61}) ^ {i} }}'
                               for j in range(100))
             expr = 'x' + ''.join(f'.wrapping_add(f{j}(x))' for j in range(100))
-            modules.append(f'pub mod m{i} {{ {funcs} pub fn all(x:u64)->u64 {{ {expr} }} }}')
+            (src.parent / f'm{i}.rs').write_text(f'{funcs} pub fn all(x:u64)->u64 {{ {expr} }}')
+            modules.append(f'pub mod m{i};')
         src.write_text('\n'.join(modules) + '\nfn main(){println!("{}",' +
                        '^'.join(f'm{i}::all(std::hint::black_box(19))' for i in range(16)) + ');}')
         args = (src, '-Ccodegen-units=8', '-Copt-level=z', '-Cllvm-args=-import-instr-limit=5',
@@ -492,6 +493,17 @@ class RustTest(BrokerTestCase):
                 self.assertEqual(len(full), 1, calls)
                 self.assertIn('"codegen-units=16"', full[0])
                 self.assertNotIn('incremental=', full[0])
+                bitcode = self.work / 'libplugin.rlib'
+                result = self.rust(*args[:-2], '-Clinker-plugin-lto', '-o', bitcode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-rust-cgu: completed ', result.stderr)
+                self.assertEqual(writes.read_bytes(), b'x')
+                writes.unlink()
+                members = subprocess.check_output(['ar', 't', bitcode], text=True).splitlines()
+                member = next(name for name in members if name.endswith('.rcgu.o'))
+                module = subprocess.check_output(['ar', 'p', bitcode, member])
+                self.assertTrue(module.startswith(b'BC\xc0\xde'))
+                subprocess.run(['llvm-dis', '-o', os.devnull, '-'], input=module, check=True)
         members = subprocess.check_output(['ar', 't', out], text=True).splitlines()
         self.assertTrue(any('rmeta' in name for name in members))
         obj = self.work/'unit.o'
@@ -505,6 +517,11 @@ class RustTest(BrokerTestCase):
                       '-Clto=fat', '-o', self.work/'uses', remote=False)
         self.assertEqual(r.returncode, 0, r.stderr)
         subprocess.run([self.work/'uses'], check=True)
+        r = self.rust(main, '--extern', 'library='+str(self.work/'libplugin.rlib'),
+                      '-Ldependency='+str(self.work), '-Clinker=clang', '-Clinker-plugin-lto',
+                      '-Clink-arg=-fuse-ld=lld', '-o', self.work/'plugin-uses', remote=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        subprocess.run([self.work/'plugin-uses'], check=True)
 
     def test_plain_probe_inherits_only_its_journal(self):
         source = self.work / 'plain.rs'
@@ -700,7 +717,10 @@ class RustTest(BrokerTestCase):
     @unittest.skipUnless(shutil.which('clang') and shutil.which('ld.lld'), 'Clang and LLD required')
     def test_linker_plugin_lto_distributes_from_confined_linker(self):
         source = self.work/'thin.rs'
-        source.write_text('fn main() { println!("distributed Rust ThinLTO"); }')
+        source.write_text('mod padding; fn main() { println!("distributed Rust ThinLTO"); }')
+        (self.work / 'padding.rs').write_text('// ' + 'x' * 65536)
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p}') for i, p in enumerate(self.stats_ports)),
+                          name='plugin-lto')
         output = self.work/'thin'
         wrapper = self.work/'cargo-linker'
         wrapper.write_text('#!/bin/sh\nexec "${MOZ_CARGO_WRAP_LD:?}" "$@"\n')
@@ -708,7 +728,9 @@ class RustTest(BrokerTestCase):
         mask = self.work/'masquerade'
         mask.mkdir()
         (mask/'clang').symlink_to(self.build/'distcc')
-        env = dict(self.env, MOZ_CARGO_WRAP_LD='clang', PATH=str(mask)+os.pathsep+self.env['PATH'])
+        log = self.work / 'distcc.log'
+        env = dict(self.env, MOZ_CARGO_WRAP_LD='clang', DISTCC_LOG=str(log),
+                   PATH=str(mask)+os.pathsep+self.env['PATH'])
         prefix = []
         if shutil.which('sandbox'):
             env.update(SANDBOX_LOG=str(self.work/'sandbox.log'), SANDBOX_DEBUG_LOG=str(self.work/'sandbox.debug'))
@@ -716,10 +738,12 @@ class RustTest(BrokerTestCase):
                       'PYTHONDONTWRITEBYTECODE=1']
         for driver in ('clang', str(wrapper)):
             with self.subTest(driver=driver):
-                result = self.rust(source, '-Clinker='+driver, '-Clinker-plugin-lto',
+                result = self.rust(source, '-Ccodegen-units=8', '-Clinker='+driver, '-Clinker-plugin-lto',
                                    '-Clink-arg=-fuse-ld=lld', '-o', output, env=env, prefix=prefix)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('distcc-thinlto: compiled on ', result.stderr)
+                self.assertNotIn('Read-only file system', result.stderr)
+                self.assertGreater(log.stat().st_size, 0)
                 self.assertEqual(subprocess.check_output([output], text=True), 'distributed Rust ThinLTO\n')
 
     def test_single_cgu_thinlto_partitions_with_size_optimization(self):
@@ -1406,21 +1430,35 @@ class RustTest(BrokerTestCase):
         c=self.work/'helper.c'
         c.write_text('int add(void) {return 2;}')
         subprocess.run(['cc','-shared','-fPIC',c,'-o',library],check=True)
-        data=self.work/'number.txt'
+        upstream = self.work / 'vendor'
+        upstream.mkdir()
+        data = upstream / 'number.txt'
         data.write_text('40')
+        (upstream / 'marker').touch()
         source=self.work/'derive.rs'
         source.write_text('extern crate proc_macro; #[link(name="helper")] extern "C" { fn add()->i32; } '
             '#[proc_macro] pub fn value(_:proc_macro::TokenStream)->proc_macro::TokenStream { '
+            'assert_eq!(std::fs::read("/rustc/distcc-test/library/core/src/span.rs").unwrap_err().kind(), '
+            'std::io::ErrorKind::NotFound); '
+            'assert_eq!(std::fs::read('+json.dumps(str(upstream/'marker'/'missing'))+
+            ').unwrap_err().kind(), std::io::ErrorKind::NotADirectory); '
             'let n:i32=std::fs::read_to_string('+json.dumps(str(data))+').unwrap().parse().unwrap(); '
             '(n+unsafe{add()}).to_string().parse().unwrap() }')
         plugin=self.work/'libderive.so'
         result=self.rust(source,'--crate-type=proc-macro','-Lnative='+str(self.work),
                          '-Clink-arg=-Wl,-rpath,$ORIGIN','-o',plugin,remote=False)
         self.assertEqual(result.returncode,0,result.stderr)
-        src=self.work/'app.rs'
+        consumer = self.work / 'consumer'
+        consumer.mkdir()
+        src=consumer/'app.rs'
         src.write_text('extern crate derive; fn main(){assert_eq!(derive::value!(),42)}')
         output=self.work/'app'
-        result=self.rust(src,'--extern','derive='+str(plugin),'-o',output)
+        plugins = consumer / 'plugins'
+        plugins.mkdir()
+        shutil.copy2(plugin, plugins)
+        shutil.copy2(library, plugins)
+        result=self.rust(src,'--extern','derive='+str(plugins/plugin.name),'-o',output,
+                         env=dict(self.env, DISTCC_FRONTEND_ROOTS=str(upstream)))
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('proc-macro host ABI',result.stderr)
         self.assertIn('compiled on',result.stderr)

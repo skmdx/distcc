@@ -51,7 +51,7 @@ void Observation::path_event(const char *kind, int dir, const char *path, bool s
         return;
     int saved = errno;
     if (!succeeded && (*kind == 'R' || *kind == 'S')) {
-        kind = saved == ENOENT || saved == ENOTDIR ? "N" : "X";
+        kind = saved == ENOENT ? "N" : saved == ENOTDIR ? "T" : "X";
     }
     char base[PATH_MAX + 1], joined[PATH_MAX + 1];
     if (!path)

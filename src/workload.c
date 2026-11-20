@@ -3,6 +3,7 @@
 #include <config.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -14,6 +15,48 @@
 #include "job.h"
 #include "resource.h"
 
+/* Unity generators put quoted implementation-file includes in a short stub.
+ * Inspect its first buffer only. Headers and transitive includes belong to
+ * the compiler, and preprocessed jobs already carry their expanded size. */
+static uint32_t included_sources(const char *path, const char *text, size_t size)
+{
+    const char *end = text + size, *slash = strrchr(path, '/');
+    size_t prefix = slash ? (size_t)(slash - path + 1) : 0;
+    uint64_t bytes = 0;
+    unsigned lookups = 0;
+    while (text < end && lookups < 64) {
+        const char *line = text, *nl = memchr(text, '\n', end - text);
+        const char *stop = nl ? nl : end;
+        text = nl ? nl + 1 : end;
+        while (line < stop && (*line == ' ' || *line == '\t')) ++line;
+        if (line == stop || *line++ != '#') continue;
+        while (line < stop && (*line == ' ' || *line == '\t')) ++line;
+        if (stop - line < 7 || memcmp(line, "include", 7)) continue;
+        line += 7;
+        while (line < stop && (*line == ' ' || *line == '\t')) ++line;
+        if (line == stop || *line++ != '"') continue;
+        const char *quote = memchr(line, '"', stop - line);
+        if (!quote || quote == line) continue;
+        size_t n = quote - line, base = *line == '/' ? 0 : prefix;
+        char name[PATH_MAX];
+        if (base + n >= sizeof(name) || memchr(line, 0, n)) continue;
+        memcpy(name, path, base);
+        memcpy(name + base, line, n);
+        name[base + n] = 0;
+        const char *ext = strrchr(name + base, '.');
+        if (!ext || (strcmp(ext, ".c") && strcmp(ext, ".cc") && strcmp(ext, ".cpp") &&
+                     strcmp(ext, ".cxx") && strcmp(ext, ".C"))) continue;
+        ++lookups;
+        struct stat st;
+        if (stat(name, &st) && (!base || stat(name + base, &st))) continue;
+        if (S_ISREG(st.st_mode) && st.st_size > 0) {
+            bytes += st.st_size;
+            if (bytes >= 512U * 1024 * 1024) return 512U * 1024 * 1024;
+        }
+    }
+    return bytes;
+}
+
 static void describe_source(const char *path, off_t size, struct dcc_source_features *source)
 {
     if (size <= 0 || size > 512LL * 1024 * 1024) return;
@@ -24,7 +67,7 @@ static void describe_source(const char *path, off_t size, struct dcc_source_feat
      * described by the caller, and a pipe/device must not block hashing. */
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
         st.st_size > 512LL * 1024 * 1024) { close(fd); return; }
-    uint32_t lines = 1;
+    uint32_t lines = 1, included = 0;
     off_t total = 0;
     XXH3_state_t hash = {0};
     XXH3_64bits_reset(&hash);
@@ -32,6 +75,7 @@ static void describe_source(const char *path, off_t size, struct dcc_source_feat
     ssize_t length;
     while ((length = read(fd, buffer, sizeof(buffer))) != 0) {
         if (length < 0) { if (errno == EINTR) continue; break; }
+        if (!total) included = included_sources(path, buffer, length);
         total += length;
         if (total > size) break;
         for (ssize_t i = 0; i < length; ++i) lines += buffer[i] == '\n';
@@ -40,6 +84,7 @@ static void describe_source(const char *path, off_t size, struct dcc_source_feat
     if (!length && total == size) {
         source->hash = XXH3_64bits_digest(&hash);
         source->lines = lines;
+        source->included_bytes = included;
     }
     close(fd);
 }
@@ -102,6 +147,10 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
     hint->scope_key = XXH3_64bits_withSeed(&directory, sizeof(directory), family);
     if (!gpu) {
         if (!source->hash) describe_source(input, hint->work_units, source);
+        if (!ready) {
+            hint->bytes += source->included_bytes;
+            if (hint->bytes > 512U * 1024 * 1024) hint->bytes = 512U * 1024 * 1024;
+        }
         /* Count logical source lines during the existing content hash. A
          * generated literal and many declarations of equal size cost differently. */
         hint->work_units = source->lines;

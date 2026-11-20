@@ -1789,6 +1789,29 @@ class FrontendTest(BrokerTestCase):
         self.assertEqual(remote.returncode, 0, remote.stderr)
         self.assertEqual((output.read_bytes(), deps.read_bytes()), expected)
 
+    def test_unity_source_size_reaches_broker(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        clang = self.start_frontend()
+        sources = self.work / 'src'
+        sources.mkdir()
+        part = sources / 'part.cpp'
+        part.write_text('/*' + 'x' * 70000 + '*/\nint answer() { return 42; }\n')
+        generated = self.work / 'generated.cpp'
+        generated.write_text('int extra() { return 0; }\n')
+        unity = sources / 'Unified_cpp_test.cpp'
+        unity.write_text('#include "part.cpp"\n# include "generated.cpp"\n')
+        probe = self.work / 'configure.cpp'
+        probe.write_text('int probe() { return 0; }\n')
+        for source in (unity, probe):
+            result = subprocess.run([self.build/'distcc', clang, '-I.', '-c', source, '-o',
+                                     source.with_suffix('.o')], env=self.env, cwd=self.work,
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.work / 'broker.log').read_text()
+        sizes = set(map(int, re.findall(r'job cost: key=\w+ kind=5 bytes=(\d+)', log)))
+        self.assertIn(sum(p.stat().st_size for p in (unity, part, generated)), sizes)
+        self.assertIn(probe.stat().st_size, sizes)
+
     def test_remote_result_reuse_preserves_artifacts_and_revalidates_inputs(self):
         clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
         source, header = self.work/'source.c', self.work/'value.h'

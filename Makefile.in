@@ -230,6 +230,7 @@ dist_extra =							\
 	distcc_lto.py \
 	src/lto.cc \
 	src/lto_prepare.cc \
+	src/lto_worker.cc \
 	src/lto_partition.cc \
 	src/lto_partition.h \
 	src/llvm-split-module.patch \
@@ -420,7 +421,7 @@ distccd_obj += src/tcp_server.o src/tcp_worker.o src/tcp_async.o src/clang_worke
 h_compile_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o src/plan_memo.o
 distcc_obj += src/remote_job.o src/file_cache.o
 distcc_obj += src/rust/sandbox.o src/rust/client.o src/rust/probe.o
-distccd_obj += src/rust/sandbox.o src/rust/worker.o src/rust/link.o
+distccd_obj += src/rust/sandbox.o src/rust/worker.o src/rust/link.o src/lto_worker.o
 h_compile_obj += src/remote_job.o src/file_cache.o
 
 # All source files, for the purposes of building the distribution
@@ -617,7 +618,7 @@ src/rust/native.o src/rust/audit.o: src/%.o: $(srcdir)/src/%.cc
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -MMD -fPIC -c $< -o $@
 
-src/rust/sandbox.o src/rust/client.o src/rust/probe.o src/rust/worker.o src/rust/link.o: src/%.o: $(srcdir)/src/%.cc $(srcdir)/src/rust/common.hh $(srcdir)/src/rust/api.h $(srcdir)/src/job.h
+src/lto_worker.o src/rust/sandbox.o src/rust/client.o src/rust/probe.o src/rust/worker.o src/rust/link.o: src/%.o: $(srcdir)/src/%.cc $(srcdir)/src/rust/common.hh $(srcdir)/src/rust/api.h $(srcdir)/src/job.h
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -std=gnu++17 -c $< -o $@
 

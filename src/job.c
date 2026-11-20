@@ -144,6 +144,10 @@ void dcc_job_free(struct dcc_job *job)
     if (job->stdin_fd) close(job->stdin_fd - 1);
     if (job->argv) for (i = 0; job->argv[i]; ++i) free(job->argv[i]);
     free(job->argv);
+    if (job->llvm_outputs) {
+        for (char **p = job->llvm_outputs; *p; ++p) free(*p);
+        free(job->llvm_outputs);
+    }
     free(job->rust.crate_types); free(job->rust.linker); free(job->rust.compiler); free(job->rust.host); free(job->rust.cpu); free(job->rust.features);
     if (job->rust.directories) {
         for (char **p = job->rust.directories; *p; ++p) free(*p);
@@ -248,6 +252,7 @@ unsigned char *dcc_job_encode_buffer(const struct dcc_job *job, size_t *size)
     number(&m, job->count);
     string(&m, job->cwd);
     for (i = 0; i < argc; ++i) string(&m, job->argv[i]);
+    if (dcc_job_llvm(job)) strings(&m, job->llvm_outputs);
     if (job->kind == DCC_JOB_RUST) {
         number(&m, job->rust.phase);
         number(&m, job->rust.pipeline);
@@ -319,6 +324,8 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
     job->cwd = get_string(&m);
     if (!absolute_path(job->cwd)) goto failed;
     for (i = 0; i < argc; ++i) if (!(job->argv[i] = get_string(&m))) goto failed;
+    if (dcc_job_llvm(job) && (get_strings(&m, &job->llvm_outputs, absolute_path) || !job->llvm_outputs))
+        goto failed;
     if (kind == DCC_JOB_RUST_CGU && (argc != 2 || count != 1 || !*job->argv[1])) goto failed;
     if (kind == DCC_JOB_RUST) {
         uint64_t phase = get_number(&m), pipeline = get_number(&m);
@@ -378,6 +385,8 @@ int dcc_job_decode_buffer(const void *data, size_t size, struct dcc_job **out)
         free(base);
         in->target = get_string(&m);
         if (!absolute_path(in->path) || !strcmp(in->path, "/") ||
+            (dcc_job_llvm(job) && (in->kind != DCC_JOB_FILE || !strcmp(in->path, DCC_LLVM_ROOT) ||
+                                   !strncmp(in->path, DCC_LLVM_ROOT "/", sizeof(DCC_LLVM_ROOT)))) ||
             (kind == DCC_JOB_RUST && (in->kind != DCC_JOB_FILE ||
              !strcmp(in->path,DCC_RUST_ROOT) || !strncmp(in->path,DCC_RUST_ROOT "/",sizeof(DCC_RUST_ROOT)))) ||
             in->path[strlen(in->path) - 1] == '/' || !in->target ||

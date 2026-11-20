@@ -235,12 +235,13 @@ done:
 /* Planners own immutable numbered snapshots. Scheduling, caching, compression,
  * cancellation and connection reuse stay on the ordinary path. queued_fd is
  * consumed after enqueueing, or closed on an earlier failure. */
-int dcc_file_transfer(const char *metadata, const char *snapshots, const char *output, int queued_fd)
+int dcc_file_transfer(const char *metadata, const char *snapshots, char **outputs, int queued_fd)
 {
     struct dcc_job *job = NULL;
     struct dcc_job_result result;
     struct dcc_work_hint hint = {0};
     char **files = NULL;
+    unsigned output_count = 0;
     int ret = EXIT_IO_ERROR;
     int fd = open(metadata, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     uint32_t estimate[3];
@@ -277,7 +278,17 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
             files[i] = NULL; ret = EXIT_OUT_OF_MEMORY; goto done;
         }
     }
-    ret = dcc_transfer_prepared(job, files, output, &hint, queued_fd, &result);
+    while (outputs[output_count]) ++output_count;
+    if (output_count != dcc_argv_len(job->llvm_outputs)) { ret = EXIT_BAD_ARGUMENTS; goto done; }
+    job->destinations = calloc(2 * output_count + 1, sizeof(char *));
+    if (!job->destinations) { ret = EXIT_OUT_OF_MEMORY; goto done; }
+    for (unsigned i = 0; i < output_count; ++i) {
+        char *name;
+        if (asprintf(&name, "%u", i) < 0) { ret = EXIT_OUT_OF_MEMORY; goto done; }
+        job->destinations[2 * i] = name;
+        job->destinations[2 * i + 1] = outputs[i];
+    }
+    ret = dcc_transfer_prepared(job, files, NULL, &hint, queued_fd, &result);
     queued_fd = -1;
     if (ret) goto done;
     for (unsigned i = DCC_JOB_STDERR; i <= DCC_JOB_STDOUT; ++i) {
@@ -288,13 +299,24 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, const char *o
         dcc_free_buffer(&buffer);
         if (ret) goto done;
     }
-    if (!result.status && (ret = publish(&result.fd[DCC_JOB_OBJECT], &result,
-                                         DCC_JOB_OBJECT, output))) goto done;
+    if (!result.status) {
+        if (result.named_count != output_count) { ret = EXIT_PROTOCOL_ERROR; goto done; }
+        for (unsigned i = 0; i < output_count; ++i) {
+            struct dcc_named_output *f = result.named + i;
+            if (rename(f->temporary, f->destination)) { ret = EXIT_IO_ERROR; goto done; }
+            free(f->temporary);
+            f->temporary = NULL;
+        }
+    }
     ret = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
 done:
     if (queued_fd >= 0) close(queued_fd);
     dcc_job_result_free(&result);
     if (files) { for (unsigned i = 0; job && i < job->count; ++i) free(files[i]); free(files); }
+    if (job && job->destinations) {
+        for (unsigned i = 0; i < output_count; ++i) free(job->destinations[2 * i]);
+        free(job->destinations);
+    }
     dcc_job_free(job);
     return ret < 0 ? EXIT_PROTOCOL_ERROR : ret;
 }

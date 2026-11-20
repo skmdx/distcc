@@ -1346,7 +1346,9 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     int locality = !direct && !link && (client->hint.kind == 4 || client->hint.kind == 5 ||
                                         client->hint.kind == DCC_WORK_RUST);
     /* A cold byte prior is not evidence for a finite completion comparison. */
-    int completion_model = locality && broker->model.classes[client->hint.kind - 1].xx > 0;
+    int thinlto = client->hint.kind == DCC_WORK_THINLTO;
+    int compare_finish = locality || thinlto;
+    int completion_model = compare_finish && broker->model.classes[client->hint.kind - 1].xx > 0;
     int previous = locality ? dcc_work_peer(&broker->model, &client->hint) : -1;
     unsigned long long headroom[MAX_HOSTS];
     for (i = 0; i < broker->count; ++i) {
@@ -1603,7 +1605,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * with which to justify waiting instead of using an idle CPU. */
             int idle = !cost && staged && cap && !blocked && work < dcc_capacity_jobs(p->host, cap);
             struct selection candidate = {i, probe, wait, idle, enqueue, score, fill, forecast};
-            if (completion_model && predicted && (!wait || enqueue) &&
+            if (locality && completion_model && predicted && (!wait || enqueue) &&
                 (completion.peer < 0 || critical < completion.score)) {
                 completion = candidate;
                 completion.score = critical;
@@ -1634,13 +1636,11 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
      * rejected, preserve throughput ranking among the available workers.
      * Compare the queued job with that actual ready choice: another worker's
      * shorter latency cannot justify choosing a slower ready alternative. */
-    /* Link backends share a completion barrier. Keep available lanes working:
-     * waiting for a faster worker concentrates later jobs there and leaves
-     * capacity idle even with learned costs. Rank the available workers by
-     * completion time, and retain queued work until any lane actually opens. */
-    /* A source byte prior cannot justify leaving an available worker idle. */
+    /* A cold prior cannot justify leaving a worker idle. ThinLTO modules
+     * with measured costs can wait for a faster lane at the link barrier. */
     if (best.wait && ready.peer >= 0 &&
-        (link_backend || (locality && !completion_model) || best.forecast.finish >= ready.forecast.finish))
+        ((link_backend && !thinlto) || (compare_finish && !completion_model) ||
+         best.forecast.finish >= ready.forecast.finish))
         best = ready;
     if (!backlogged && completion.peer >= 0) {
         if (completion.peer != best.peer)

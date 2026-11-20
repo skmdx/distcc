@@ -279,17 +279,17 @@ int main(int argc, char **argv)
         dcc_exit(dcc_rust_submit_cgu(argv[2], argv[3], argv[4]));
 
     /* Private transport entry point used by file-based compiler planners. */
-    if ((argc == 5 || argc == 6) && !strcmp(argv[1], "--file-job")) {
+    if (argc >= 6 && !strcmp(argv[1], "--file-job")) {
         long queued_fd = -1;
-        if (argc == 6) {
+        if (strcmp(argv[4], "-")) {
             char *end;
             errno = 0;
-            queued_fd = strtol(argv[5], &end, 10);
-            if (errno || !argv[5][0] || *end || queued_fd < 0 || queued_fd > INT_MAX ||
+            queued_fd = strtol(argv[4], &end, 10);
+            if (errno || !argv[4][0] || *end || queued_fd < 0 || queued_fd > INT_MAX ||
                 fcntl((int)queued_fd, F_GETFD) < 0)
                 dcc_exit(EXIT_BAD_ARGUMENTS);
         }
-        dcc_exit(dcc_file_transfer(argv[2], argv[3], argv[4], (int)queued_fd));
+        dcc_exit(dcc_file_transfer(argv[2], argv[3], argv + 5, (int)queued_fd));
     }
 
     if (argc > 1 && (!strcmp(compiler_name, "distcc-rust") || !strcmp(dcc_find_basename(argv[1]), "rustc") ||

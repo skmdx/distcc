@@ -17,7 +17,7 @@ from test_adaptive import stats_response
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from distcc_job import fingerprint, write_metadata
-from distcc_lto import InputSnapshot, llvm_tools, publish_archive, work_key
+from distcc_lto import InputSnapshot, llvm_tools, work_key
 
 
 @unittest.skipUnless(all(shutil.which(tool) for tool in ('clang', 'bwrap', 'sandbox')),
@@ -82,10 +82,10 @@ __attribute__((constructor)) static void check(void) {
             env = dict(os.environ, SANDBOX_WRITE=str(work), SANDBOX_LOG=str(work / 'sandbox.log'),
                        PYTHONDONTWRITEBYTECODE='1',
                        PYTHONPATH=str(Path(__file__).resolve().parents[1]))
-            script = ('import json, os, sys; from distcc_lto import run_job; '
+            script = ('import json, os, sys; from distcc_lto import run_preparation; '
                       'before = os.environ["SANDBOX_WRITE"]; '
                       'assert os.environ["SANDBOX_ON"] == "1"; '
-                      'result = run_job(sys.argv[1], json.load(open(sys.argv[2])), 4, '
+                      'result = run_preparation(sys.argv[1], json.load(open(sys.argv[2])), '
                       'sys.argv[3] if len(sys.argv) > 3 else None); '
                       'assert os.environ["SANDBOX_WRITE"] == before; '
                       'assert os.environ["SANDBOX_ON"] == "1"; sys.exit(result)')
@@ -248,18 +248,13 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         self.assertEqual(result.returncode, 0, result.stderr)
         name, output = str(self.work / 'input.bc'), str(self.work / 'output.o')
         cwd = '/tmp/client-build'
-        manifest = inputs / '1'
         options = ['-cc1', '-emit-obj'] if cc1 else ['-c']
-        manifest.write_text(json.dumps(dict(cwd=cwd,
-            args=[shutil.which('clang'), *options, '-x', 'ir', name, '-o', output],
-            inputs=[name], outputs=[output])))
-        metadata, archive = self.work / 'metadata', self.work / 'result.tar'
-        write_metadata(4, cwd, 'distcc-thinlto',
-                       [(name, *fingerprint(source)),
-                        ('/__distcc_lto/job.json', *fingerprint(manifest))], metadata)
-        result = self.run_command([self.build / 'distcc', '--file-job', metadata, inputs, archive])
+        job = dict(cwd=cwd, args=[shutil.which('clang'), *options, '-x', 'ir', name, '-o', output],
+                   outputs=[output])
+        metadata = self.work / 'metadata'
+        write_metadata(4, job, [(name, *fingerprint(source))], metadata)
+        result = self.run_command([self.build / 'distcc', '--file-job', metadata, inputs, '-', output])
         self.assertEqual(result.returncode, 0, result.stderr)
-        publish_archive(archive, [output])
         executable = self.work / 'linked'
         result = self.run_command(['clang', output, '-o', executable])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -548,6 +543,28 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
     def test_partitioned_backend_preserves_retained_section(self):
         self.check_used_section(retain=True)
 
+    def test_instruction_assembly_and_plain_data_section_split(self):
+        compiler = shutil.which('clang')
+        assert compiler is not None
+        tools = llvm_tools(compiler)
+        if not tools:
+            self.skipTest('matching LLVM partition helpers are not installed')
+        source = self.work / 'barrier.c'
+        source.write_text('volatile int state __attribute__((section(".data"))) = 40;\n'
+                          'int value(void) { asm volatile("" ::: "memory");\n'
+                          '#if defined(__x86_64__) || defined(__i386__)\n'
+                          'int n = 2; asm volatile("0: dec %0; jnz 0b" : "+r"(n) : : "cc");\n'
+                          '#endif\nreturn state; }\n'
+                          'int main(void) { return value() + 2 == 42 ? 0 : 1; }\n')
+        module = source.with_suffix('.bc')
+        subprocess.run([compiler, '-emit-llvm', '-c', source, '-o', module], check=True)
+        partition = subprocess.check_output([tools['plan'], 'split', module, '2', self.work/'part'])
+        parts = json.loads(partition)['parts']
+        self.assertEqual(len(parts), 2)
+        output = self.work / 'barrier'
+        subprocess.run([compiler, *(p['path'] for p in parts), '-o', output], check=True)
+        subprocess.run([output], check=True)
+
     def test_partitioned_backend_preserves_compiler_used_section(self):
         self.check_used_section(retain=False)
 
@@ -573,11 +590,17 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         result = self.run_command([compiler, '-O2', '-flto=thin', '-c', source, '-o', obj])
         self.assertEqual(result.returncode, 0, result.stderr)
         flags = ['-Wl,--gc-sections'] if retain else []
-        result = self.run_command([self.build / 'distcc', compiler, '-O2', '-flto=thin',
+        trace = self.work / 'executed'
+        prefix = ['strace', '-f', '-e', 'execve', '-o', trace] if shutil.which('strace') else []
+        result = self.run_command([*prefix, self.build / 'distcc', compiler, '-O2', '-flto=thin',
                                    '-fuse-ld=lld', *flags, obj, '-o', output])
         self.assertEqual(result.returncode, 0, result.stderr)
         counts = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
         self.assertEqual(counts, [1], result.stderr)
+        if prefix:
+            executed = trace.read_text()
+            self.assertNotRegex(executed, r'execve\("[^"]*/llvm-objcopy')
+            self.assertNotIn('"-r", "-o", "merged.o"', executed)
         self.assertEqual(self.run_command([output]).returncode, 0)
 
     def test_ranked_submission_survives_slow_process_start(self):
@@ -640,14 +663,14 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         inputs.mkdir()
         source = inputs / '0'
         source.write_bytes(b'')
-        metadata, output = self.work / 'job', self.work / 'result.tar'
-        write_metadata(4, str(self.work), 'distcc-thinlto',
-                       [(str(self.work / 'empty.bc'), *fingerprint(source))], metadata)
+        metadata, output = self.work / 'job', self.work / 'result.o'
+        job = dict(cwd=self.work, args=['clang', '-c', 'empty.bc'], outputs=[output])
+        write_metadata(4, job, [(str(self.work / 'empty.bc'), *fingerprint(source))], metadata)
         read_fd, write_fd = os.pipe()
         os.close(read_fd)
         try:
             result = subprocess.run([str(self.build / 'distcc'), '--file-job', str(metadata),
-                str(inputs), str(output), str(write_fd)], env=self.env, capture_output=True,
+                str(inputs), str(write_fd), str(output)], env=self.env, capture_output=True,
                 pass_fds=(write_fd,), timeout=3)
         finally:
             os.close(write_fd)

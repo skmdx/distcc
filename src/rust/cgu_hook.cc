@@ -64,6 +64,7 @@ thread_local Emission emission;
 thread_local bool no_builtins;
 std::vector<std::string> compiler_flags;
 bool object_only;
+bool plugin_lto;
 const char *transport;
 std::atomic<int> frontend_pipe{-1};
 void backend_started() {
@@ -98,6 +99,8 @@ __attribute__((constructor)) void compiler_environment() {
     object_only =
         getenv("DISTCC_RUST_CGU_OBJECT_ONLY") && !strcmp(getenv("DISTCC_RUST_CGU_OBJECT_ONLY"), "1");
     unsetenv("DISTCC_RUST_CGU_OBJECT_ONLY");
+    plugin_lto = getenv("DISTCC_RUST_CGU_PLUGIN_LTO") && !strcmp(getenv("DISTCC_RUST_CGU_PLUGIN_LTO"), "1");
+    unsetenv("DISTCC_RUST_CGU_PLUGIN_LTO");
     const char *previous = getenv("DISTCC_RUST_CGU_PREVIOUS");
     if (previous && *previous)
         setenv("LD_PRELOAD", previous, 1);
@@ -117,13 +120,13 @@ bool supported(const TargetMachine &tm) {
 struct Reply {
     std::unique_ptr<MemoryBuffer> buffer;
     StringRef object, bitcode;
-    explicit Reply(std::unique_ptr<MemoryBuffer> b) : buffer(std::move(b)) {
+    Reply(std::unique_ptr<MemoryBuffer> b, bool ir_only) : buffer(std::move(b)) {
         auto data = buffer->getBuffer();
         if (data.size() < 8)
             fatal("truncated CGU reply");
         auto length = support::endian::read64le(data.data());
         data = data.drop_front(8);
-        if (!length || length > data.size())
+        if (length > data.size() || (ir_only ? length != 0 || data.empty() : length == 0))
             fatal("invalid object size in CGU reply");
         object = data.take_front(length);
         bitcode = data.drop_front(length);
@@ -136,6 +139,7 @@ bool eligible(Module &m) {
            m.getInstructionCount() >= min_remote_instructions;
 }
 std::optional<Reply> dispatch(Module &m, cgu::Object spec) {
+    const bool ir_only = spec.get("ir-only") != nullptr;
     File in("rust-cgu-input"), out("rust-cgu-result");
     if (in.fd < 0 || out.fd < 0)
         fatal(strerror(errno));
@@ -188,7 +192,7 @@ std::optional<Reply> dispatch(Module &m, cgu::Object spec) {
         fatal(bytes.getError().message());
     if (getenv("DISTCC_VERBOSE") && !strcmp(getenv("DISTCC_VERBOSE"), "1"))
         errs() << "distcc-rust-cgu: completed " + kind + " " + m.getModuleIdentifier() + "\n";
-    return Reply(std::move(*bytes));
+    return Reply(std::move(*bytes), ir_only);
 }
 // rustc can hand a module to a different codegen thread. Its identity owns
 // the pending work until its object stream is opened.
@@ -248,10 +252,13 @@ struct RemotePass : PassInfoMixin<RemotePass> {
         if (late)
             spec["initial-asm"] = int64_t(cgu::assembly_size(m));
         spec["return-ir"] = int(!late);
+        if (plugin_lto)
+            spec["ir-only"] = 1;
         Pending work{std::move(spec), {}, tm};
         if (!late && !work.materialize(m, am))
             return local.run(m, am);
-        remember(m, std::move(work));
+        if (!plugin_lto)
+            remember(m, std::move(work));
         return late ? PreservedAnalyses::all() : PreservedAnalyses::none();
     }
 };
@@ -272,13 +279,15 @@ void capture_tail(ModulePassManager &pm, Module &m) {
         return;
     using Model = detail::PassModel<Module, RemotePass, ModuleAnalysisManager>;
     auto &remote = static_cast<Model &>(**marker).Pass;
-    if (builder.custom || llvm::any_of(make_range(std::next(marker), passes.end()), [](const auto &p) {
+    if (builder.custom || (!plugin_lto && llvm::any_of(make_range(std::next(marker), passes.end()), [](const auto &p) {
             return p->name() == ThinLTOBitcodeWriterPass::name() || p->name() == BitcodeWriterPass::name();
-        })) {
+        }))) {
         remote.frontend = true; // rustc needs this pre-link module for its own ThinLTO session.
         return;
     }
-    if (!object_only || !m.getTargetTriple().isOSBinFormatELF())
+    // The linker plugin consumes bitcode. Return optimized IR at the marker
+    // and leave rustc's writer and any subsequent passes on the frontend.
+    if (plugin_lto || !object_only || !m.getTargetTriple().isOSBinFormatELF())
         return;
     auto *pic = builder.pb->getPassInstrumentationCallbacks();
     bool has_names = true;
@@ -392,6 +401,15 @@ void pb_ctor(PassBuilder *self, TargetMachine *tm, PipelineTuningOptions pto, st
 PIPELINE(per_module, "_ZN4llvm11PassBuilder29buildPerModuleDefaultPipeline" LEVEL_PHASE, "per-module")
 PIPELINE(o0, "_ZN4llvm11PassBuilder22buildO0DefaultPipeline" LEVEL_PHASE, "O0")
 PIPELINE(module_opt, "_ZN4llvm11PassBuilder31buildModuleOptimizationPipeline" LEVEL_PHASE, "module-opt")
+ModulePassManager prelink(PassBuilder *, OptimizationLevel) asm(
+    "_ZN4llvm11PassBuilder34buildThinLTOPreLinkDefaultPipelineENS_17OptimizationLevelE");
+ModulePassManager prelink(PassBuilder *pb, OptimizationLevel level) {
+    static auto next = original(&prelink);
+    auto passes = next(pb, level);
+    if (!plugin_lto || !rust_caller(__builtin_return_address(0)))
+        return passes;
+    return wrap(pb, std::move(passes), "thin-prelink", level, ThinOrFullLTOPhase::ThinLTOPreLink);
+}
 ModulePassManager thin(PassBuilder *, OptimizationLevel, const ModuleSummaryIndex *) asm(
     "_ZN4llvm11PassBuilder27buildThinLTODefaultPipelineENS_17OptimizationLevelEPKNS_18ModuleSummaryIndexE");
 ModulePassManager thin(PassBuilder *pb, OptimizationLevel level, const ModuleSummaryIndex *index) {

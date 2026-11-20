@@ -11,7 +11,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import distcc_python
 import xxhash
@@ -87,27 +86,7 @@ def stage_output(source, destination, stack):
         return out.name
 
 
-def publish_archive(archive, destinations):
-    """Stage the complete result before replacing any declared artifact."""
-    with tarfile.open(archive) as tar:
-        members = tar.getmembers()
-        if ([m.name for m in members] != [str(i) for i in range(len(destinations))]
-                or any(not m.isfile() for m in members)):
-            raise ValueError('invalid LLVM job result archive')
-        staged = []
-        with ExitStack() as stack:
-            for member, destination in zip(members, destinations):
-                source = tar.extractfile(member)
-                assert source is not None  # Regular members were validated above.
-                with source:
-                    staged.append((stage_output(source, destination, stack), destination))
-            for source, destination in staged:
-                os.replace(source, destination)
-
-
 def distribute(request, kind, link=None):
-    # Only the client schedules tasks. Importing its executor on every worker
-    # job also initializes logging/traceback, before LLVM can start.
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     import heapq
     import itertools
@@ -196,17 +175,16 @@ def distribute(request, kind, link=None):
                 size, digest = files[name].identity
                 os.link(files[name].path, inputs / str(len(entries)))
                 entries.append((name, size, digest))
-            manifest = inputs / str(len(entries))
-            manifest.write_text(json.dumps(job))
-            entries.append((CONTROL + '/job.json', *fingerprint(manifest)))
-            write_metadata(kind, job['cwd'], helper, entries, jobdir / 'job',
+            write_metadata(kind, job, entries, jobdir / 'job',
                            work_key=work_key(job, files), work_units=task['instructions'])
-            archive = jobdir / 'result.tar'
+            destinations = task['destinations']
+            pinned = {int(p.parent.name) for p in map(Path, destinations)
+                      if link and p.parent.parent == Path('/proc/self/fd')}
             read_fd, write_fd = os.pipe()
             with os.fdopen(read_fd, 'rb') as queued, os.fdopen(write_fd, 'wb') as channel:
                 process = subprocess.Popen([transport, '--file-job', str(jobdir / 'job'),
-                    str(inputs), str(archive), str(write_fd)], env=env,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(write_fd,))
+                    str(inputs), str(write_fd), *destinations], env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(write_fd, *pinned))
                 channel.close()
                 try:
                     # Preserve ranked submission despite differing manifest
@@ -218,10 +196,10 @@ def distribute(request, kind, link=None):
                     process.kill()
                     process.communicate()
                     raise
-            return process, job, archive, task['destinations']
+            return process, job
 
         def collect(started):
-            process, job, archive, destinations = started
+            process, job = started
             stdout, stderr = process.communicate()
             sys.stdout.buffer.write(stdout)
             sys.stderr.buffer.write(stderr)
@@ -230,7 +208,6 @@ def distribute(request, kind, link=None):
                     print(helper + ': retrying backend locally', file=sys.stderr)
                     return subprocess.call(job['args'])
                 return process.returncode
-            publish_archive(archive, destinations)
             return 0
 
         def prepare(index, task):
@@ -246,7 +223,7 @@ def distribute(request, kind, link=None):
             job['outputs'] = [manifest]
             job['partitions'] = task['partitions']
             job['args'][len(common['args']) + task['args'].index('-o') + 1] = manifest + '.unused.o'
-            result = run_job(root, job, kind, tools['prepare'])
+            result = run_preparation(root, job, tools['prepare'])
             if result:
                 raise subprocess.CalledProcessError(result, job['args'])
             with os.fdopen(open_regular(root / manifest.lstrip('/')), 'rb') as source:
@@ -256,11 +233,18 @@ def distribute(request, kind, link=None):
             if env.get('DISTCC_VERBOSE') == '1':
                 print(helper + ': partitioned ' + task['inputs'][0] + ' into '
                       + str(len(partition['parts'])), file=sys.stderr)
-            merge_dir = jobdir / 'merge'
-            merge_dir.mkdir()
-            outputs = [str(merge_dir / f'part-{i}.o') for i in range(len(partition['parts']))]
-            group = dict(directory=merge_dir, outputs=outputs, locals=partition['locals'],
-                         destination=task['destinations'][0], remaining=len(outputs))
+            count = len(partition['parts'])
+            group = None
+            if count == 1:
+                if partition['locals']:
+                    raise ValueError('unsplit module has promoted symbols')
+                outputs = [absolute(task['outputs'][0])]
+            else:
+                merge_dir = jobdir / 'merge'
+                merge_dir.mkdir()
+                outputs = [str(merge_dir / f'part-{i}.o') for i in range(count)]
+                group = dict(directory=merge_dir, outputs=outputs, locals=partition['locals'],
+                             destination=task['destinations'][0], remaining=count)
             children = []
             primary = absolute(task['inputs'][0])
             for i, (part, output) in enumerate(zip(partition['parts'], outputs)):
@@ -271,8 +255,12 @@ def distribute(request, kind, link=None):
                 args = [path if absolute(arg) == primary else arg for arg in task['args']]
                 args[args.index('-o') + 1] = output
                 args.extend(['-mllvm', '-thinlto-assume-merged'])
-                children.append(dict(args=args, inputs=[path, task['index']], outputs=[output],
-                    destinations=[output], instructions=part['instructions'], group=group))
+                child = dict(args=args, inputs=[path, task['index']], outputs=[output],
+                             destinations=[output] if group else task['destinations'],
+                             instructions=part['instructions'])
+                if group:
+                    child['group'] = group
+                children.append(child)
             return children
 
         def merge(group):
@@ -354,7 +342,7 @@ def llvm_sandbox(tool_dir, root=None):
     return sandbox
 
 
-def run_job(root, job, kind, prepare_library=None):
+def run_preparation(root, job, prepare_library):
     root = Path(root)
 
     def rooted(name):
@@ -408,19 +396,6 @@ def run_job(root, job, kind, prepare_library=None):
         return result.returncode if result.returncode > 0 else 128 - result.returncode
     if not outputs or not outputs[0].stat().st_size:
         raise ValueError('LLVM job produced no output')
-    return 0
-
-
-def worker(root, archive, kind):
-    root = Path(root)
-    job = json.loads((root / CONTROL.lstrip('/') / 'job.json').read_text())
-    result = run_job(root, job, kind)
-    if result:
-        return result
-    with tarfile.open(archive, 'w') as tar:
-        for index, name in enumerate(job['outputs']):
-            path = root / name.lstrip('/')
-            tar.add(path, arcname=str(index), recursive=False)
     return 0
 
 
@@ -528,12 +503,10 @@ def main(kind):
         if kind == 4 and sys.argv[1:2] == ['--rust-link']:
             work, linked, temporary, compiler, filter_fd, *command = sys.argv[2:]
             return run_link(work, linked, temporary, compiler, filter_fd, command)
-        if len(sys.argv) == 4 and sys.argv[1] == '--worker':
-            return worker(sys.argv[2], sys.argv[3], kind)
         if len(sys.argv) == 2:
             return distribute(json.loads(Path(sys.argv[1]).read_text()), kind)
         print('usage: ' + Path(sys.argv[0]).name + ' LLVM-JOB.json', file=sys.stderr)
         return 1
-    except (LocalOnly, OSError, ValueError, KeyError, subprocess.SubprocessError, tarfile.TarError) as error:
+    except (LocalOnly, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print(Path(sys.argv[0]).name + ': ' + str(error), file=sys.stderr)
         return 1

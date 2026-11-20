@@ -1,5 +1,6 @@
 /* Discover dependencies and audit operations after a procedural macro loads. */
 #include "rust/probe.h"
+#include "rust/api.h"
 #include "rust/runtime.hh"
 #include "rust/sandbox.hh"
 namespace rust {
@@ -59,6 +60,11 @@ bool audit(const fs::path &depfile, int loads, const fs::path &sysroot, const st
         roots.insert(real.parent_path());
         macro = true;
     }
+    std::vector<fs::path> exports;
+    if (macro)
+        for (const auto &dir : split(env("DISTCC_FRONTEND_ROOTS"), ':'))
+            if (!dir.empty())
+                exports.push_back(fs::absolute(dir).lexically_normal());
     for (size_t i = 0; macro && i < records.size(); i += 3) {
         if (records[i] == "L" || records[i] == "D")
             continue;
@@ -67,24 +73,40 @@ bool audit(const fs::path &depfile, int loads, const fs::path &sysroot, const st
         if (p == depfile)
             continue;
         auto &kind = records[i];
-        if (kind != "R" && kind != "N" && kind != "S")
+        if (kind != "R" && kind != "N" && kind != "T" && kind != "S")
             throw Local("macro requires local operation: " + records[i + 1]);
         if (runtime_path(p, sysroot))
             continue;
-        if (!allowed(p))
-            throw Local("macro read outside declared inputs: " + p.string());
-        if (kind == "N") {
-            if (fs::exists(spelling))
+        if (kind == "N" || kind == "T") {
+            if (below(p, DCC_RUST_ROOT) || below(p, "/dev") || below(p, "/proc") || below(p, "/sys"))
+                throw Local("macro lookup overlaps worker runtime: " + p.string());
+            if (kind == "N") {
+                if (fs::exists(spelling))
+                    throw Local("macro lookup changed during discovery");
+                continue;
+            }
+            // Without the non-directory component the worker would report
+            // ENOENT. Replay it under the same file export and stability rules.
+            while (spelling.has_relative_path() && !fs::exists(spelling))
+                spelling = spelling.parent_path();
+            if (!fs::is_regular_file(spelling))
                 throw Local("macro lookup changed during discovery");
-            continue;
+            p = spelling.lexically_normal();
         }
         if (kind == "S" || (spelling != p && !fs::equivalent(spelling, p)))
             throw Local("macro observes a symbolic link: " + spelling.string());
-        if (fs::is_directory(p))
+        if (fs::is_directory(p)) {
+            if (!allowed(p))
+                throw Local("macro directory outside declared inputs: " + p.string());
             dirs.insert(p);
-        else {
+        } else {
             auto real = fs::canonical(p);
-            if (!fs::is_regular_file(real) || (!allowed(real) && !inputs.count(p)))
+            // SourceMap reads can point into another vendored crate. Only the
+            // observed file is staged from the caller's exported build tree.
+            bool exported = real == p && std::any_of(exports.begin(), exports.end(), [&](const auto &dir) {
+                return dir == "/" || below(real, dir);
+            });
+            if (!fs::is_regular_file(real) || (!exported && (!allowed(p) || (!allowed(real) && !inputs.count(p)))))
                 throw Local("unsupported macro input " + p.string());
             inputs.insert(p);
             inputs.insert(real);

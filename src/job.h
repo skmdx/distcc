@@ -46,6 +46,7 @@ struct dcc_job {
     unsigned count;
     struct dcc_job_input *inputs;
     struct dcc_rust_command rust;
+    char **llvm_outputs; /* Ordered virtual paths in an LLVM backend job. */
     unsigned main_input; /* Client-only pump source index plus one. */
     /* Client-only authorization roots; never accepted from a remote peer. */
     char **fs_roots;
@@ -71,10 +72,15 @@ static inline int dcc_job_frontend(const struct dcc_job *job)
 {
     return job->kind == DCC_JOB_FRONTEND || job->kind == DCC_JOB_GCC_FRONTEND;
 }
+#define DCC_LLVM_ROOT "/__distcc_lto"
+#define DCC_LLVM_OUT DCC_LLVM_ROOT "/results"
+static inline int dcc_job_llvm(const struct dcc_job *job)
+{
+    return job->kind == DCC_JOB_THINLTO || job->kind == DCC_JOB_OFFLOAD_LINK;
+}
 static inline int dcc_job_tree(const struct dcc_job *job)
 {
-    return job->kind == DCC_JOB_RUST || job->kind == DCC_JOB_THINLTO ||
-           job->kind == DCC_JOB_OFFLOAD_LINK || job->kind == DCC_JOB_RUST_CGU;
+    return job->kind == DCC_JOB_RUST || dcc_job_llvm(job) || job->kind == DCC_JOB_RUST_CGU;
 }
 static inline const char *dcc_job_helper(const struct dcc_job *job)
 {
@@ -133,7 +139,9 @@ struct dcc_buffer;
  * Results own open FDs before the worker removes temporary pathnames. */
 int dcc_execute_job(struct dcc_job *, const char *root, int cancel_fd, struct dcc_job_result *);
 const char *dcc_job_tmp_top(const struct dcc_job *);
-int dcc_file_transfer(const char *metadata, const char *snapshots, const char *output, int queued_fd);
+int dcc_file_transfer(const char *metadata, const char *snapshots, char **outputs, int queued_fd);
+int dcc_llvm_worker(const struct dcc_job *, const char *root, int cancel, const char *out,
+                    const char *err, struct dcc_job_result *);
 struct dcc_work_hint;
 int dcc_transfer_prepared(struct dcc_job *, char **files, const char *output, const struct dcc_work_hint *,
                           int queued_fd, struct dcc_job_result *);

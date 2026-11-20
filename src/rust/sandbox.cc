@@ -63,7 +63,7 @@ Sandbox::Sandbox(Root policy, const fs::path &tree)
     args.insert(args.end(), {"--proc", "/proc", "--dev", "/dev", "--seccomp", std::to_string(filter.fd)});
     if (policy != Root::Host)
         args.insert(args.end(), {"--tmpfs", "/tmp"});
-    if (policy == Root::Inputs || policy == Root::Backend)
+    if (policy == Root::Inputs || policy == Root::Backend || policy == Root::LLVM)
         args.push_back("--clearenv");
 }
 void Sandbox::command(const Words &argv) {

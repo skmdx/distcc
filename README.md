@@ -63,16 +63,16 @@ for each request to enter the broker queue
 before submitting the next; transfer and execution overlap. Different manifest
 sizes and process startup times therefore do not reverse submission priority.
 Execution order does not change LLD's output or constructor order.
-Link backends rank available workers by predicted completion time, including
-current CPU contention. They use available capacity immediately instead of
-waiting for a faster occupied worker. When all workers are occupied, jobs remain
-movable until an actual CPU lane opens, including before costs are learned;
-the input pipeline is not a CPU queue.
+Link backends rank workers by predicted completion time, including current CPU
+contention. Once the broker has measured ThinLTO service times, a module can
+wait for a faster occupied worker if that predicts an earlier finish. Cold
+ThinLTO jobs and offload links use the best available lane.
 Under Portage, only bubblewrap's namespace setup runs with `SANDBOX_ON=0`:
 the preload cannot track its UID maps and root switch. The isolated compiler
 still uses read-only input mounts, and the caller's sandbox environment is preserved.
-Workers preserve
-LLVM's embedded import paths in a private namespace. The final native link
+The daemon runs the installed LLVM tool in a private namespace preserving
+embedded import paths. It streams each declared output to a temporary file
+beside its client destination. The final native link
 runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache
 remains in use, so warm cache entries do not start backend jobs.
 Heavy modules are prepared through LLVM's post-import hook, partitioned with
@@ -86,7 +86,8 @@ concurrent jobs. The split is bounded by the
 available slots, function count, and total instructions divided by the largest
 function; a module dominated by one indivisible function avoids an unproductive
 import-and-split pass. Preparation overlaps ordinary backends; ready partitions
-join the same work queue. A relocatable merge restores private symbol bindings
+join the same work queue. A module that stays in one piece returns its object
+directly. For multiple partitions, a relocatable merge restores private symbol bindings
 before LLD consumes the result. Constructors, TLS and exception handling retain
 their original link semantics. Assembly with private definitions or per-object
 weak/versioned references stays together; LLVM's assembler identifies these
@@ -181,15 +182,21 @@ rustc host triple and link the shared library on the client. To distribute a
 consumer, the client runs the dependency pass in a read-only bubblewrap mount
 namespace with a seccomp filter. The preload library journals paths after a
 procedural macro loads, including library dependencies and attempted writes.
-A compatible
-worker with the same rustc host triple receives the macro and its inputs.
+A worker with the same rustc host triple receives the macro and its inputs.
+The journal can discover upstream source files in the build trees exported
+through `DISTCC_FRONTEND_ROOTS`, including the Gentoo package work directory.
 Each installed LLVM slot advertises its major and minor version and registered
-targets. Patch releases within a slot can exchange CGUs. For large multi-CGU builds with available peers, the client runs a
+targets. Patch releases within a slot can exchange CGUs. For large multi-CGU
+builds the client estimates source size across the entry point's module tree.
+With available peers, it runs a
 single rustc frontend and sends individual LLVM modules for optimization and
 object generation. A local frontend can run a procedural macro even when
 the available workers have a different Rust host ABI. Rustc retains ownership
 of ThinLTO imports, embedded bitcode, Cargo metadata notifications and final
-archives. Small modules and unsupported LLVM configurations use rustc's own
+archives. With linker-plugin LTO, a matching worker compiles the whole crate
+and the client distributes the final ThinLTO link. When the frontend must run
+locally, CGU workers can return optimized IR to rustc's bitcode writer.
+Small modules and unsupported LLVM configurations use rustc's own
 pass managers. Other unsupported macro operations select local compilation.
 Building the transport and probe requires json-c and libseccomp development
 headers and libraries. A worker can decline a job before compilation when its
@@ -407,16 +414,14 @@ also associate timings across command and working-directory changes. An exact
 command match takes precedence; otherwise timings of that source's retained
 variants provide a prior, including across multilib builds. This shares timing
 estimates only; it neither reuses artifacts nor changes compiler options.
-Unseen inputs use an online nonnegative fit of input size and original source
-size for C, C++ and assembler,
-with separate classes for raw and preprocessed source. The source-size feature
-is capped at 1 MiB so large generated tables cannot dominate the fit; input
-size still represents parsing work. ThinLTO uses LLVM instruction counts as its
+Unseen inputs use an online nonnegative fit of input bytes and original source
+lines for C, C++ and assembler, with separate classes for raw and preprocessed
+source. For raw unity builds the byte estimate includes the sizes of directly
+included implementation files found in the stub's first 64 KiB. ThinLTO uses LLVM instruction counts as its
 uncapped computation feature, independently of bitcode/dependency bytes. These
 counts and link identities travel only from the planner to its local broker;
-the worker RPC carries no extra scheduling fields. The C/C++ initial rates and
-source-size cap are heuristics; their input contents and include trees are not
-read to calculate a hint. History lasts
+the worker RPC carries no extra scheduling fields. The C/C++ initial rates are
+heuristics. History lasts
 for the broker process lifetime. Frequency or contention changes during a job
 and different optimization costs remain sources of prediction error.
 

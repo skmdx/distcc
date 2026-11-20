@@ -88,7 +88,7 @@ void execute() {
     char header_bytes[8];
     SmallVector<char, 0> object;
     raw_svector_ostream native(object);
-    {
+    if (!spec->get("ir-only")) {
         legacy::PassManager pm;
         pm.add(createTargetTransformInfoWrapperPass(tm->getTargetIRAnalysis()));
         pm.add(new TargetLibraryInfoWrapperPass(tli));

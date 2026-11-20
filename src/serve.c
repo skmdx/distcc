@@ -1138,8 +1138,10 @@ static int dcc_run_job(int in_fd,
             ret = EXIT_OUT_OF_MEMORY;
             goto out_cleanup;
         }
-        if (job && job->kind == DCC_JOB_RUST) {
-            status = dcc_rust_worker(job, root, in_fd, out_fname, err_fname, result);
+        if (job && (job->kind == DCC_JOB_RUST || dcc_job_llvm(job))) {
+            status = job->kind == DCC_JOB_RUST
+                ? dcc_rust_worker(job, root, in_fd, out_fname, err_fname, result)
+                : dcc_llvm_worker(job, root, in_fd, out_fname, err_fname, result);
             result->status = status;
             ret = retain_artifact(result, DCC_JOB_STDERR, err_fname);
             if (!ret) ret = retain_artifact(result, DCC_JOB_STDOUT, out_fname);

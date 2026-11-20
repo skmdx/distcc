@@ -1,6 +1,8 @@
 #include "lto_partition.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/GlobalAlias.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/IR/Module.h"
@@ -16,6 +18,51 @@
 #include <vector>
 
 using namespace llvm;
+
+// Function asm is an operand template, not module asm that can be fed to
+// CollectAsmSymbols. Accept instruction-only AT&T templates on ELF x86.
+// Operands may refer to IR operands, literal numbers, or a numeric label
+// resolved within this template. Named definitions and cross-template
+// references lack IR ownership and stay in one object.
+static bool independentAsm(const Module &module, const InlineAsm &assembly) {
+  StringRef text = assembly.getAsmString().trim();
+  if (text.empty()) return true;
+  if (!module.getTargetTriple().isX86() || !module.getTargetTriple().isOSBinFormatELF() ||
+      assembly.getDialect() != InlineAsm::AD_ATT || !module.getModuleInlineAsm().empty())
+    return false;
+  unsigned defined = 0, forward = 0;
+  while (!text.empty()) {
+    size_t end = text.find_first_of(";\n");
+    auto line = text.take_front(end).trim();
+    text = end == StringRef::npos ? StringRef() : text.drop_front(end + 1);
+    if (line.size() >= 2 && isDigit(line[0]) && line[1] == ':') {
+      unsigned label = 1u << (line[0] - '0');
+      defined |= label;
+      forward &= ~label;
+      line = line.drop_front(2).trim();
+    }
+    if (line.empty()) continue;
+    auto name = line.take_until([](char c) { return c == ' ' || c == '\t'; });
+    auto args = line.drop_front(name.size()).trim();
+    if (name == ".byte") {
+      do {
+        auto [value, rest] = args.split(',');
+        unsigned byte;
+        if (value.trim().getAsInteger(0, byte) || byte > 255) return false;
+        args = rest.trim();
+      } while (!args.empty());
+    } else {
+      if (!llvm::all_of(name, [](char c) { return isAlnum(c); })) return false;
+      if (args.size() == 2 && isDigit(args[0]) && (args[1] == 'b' || args[1] == 'f')) {
+        unsigned label = 1u << (args[0] - '0');
+        if (args[1] == 'f') forward |= label;
+        else if (!(defined & label)) return false;
+      } else if (args.find_first_not_of("0123456789(),$*+- \t") != StringRef::npos)
+        return false;
+    }
+  }
+  return forward == 0;
+}
 
 Expected<std::vector<std::string>>
 dcc_split_module(Module &module, unsigned count,
@@ -36,7 +83,8 @@ dcc_split_module(Module &module, unsigned count,
     for (const auto &block : function)
       for (const auto &instruction : block)
         if (const auto *call = dyn_cast<CallBase>(&instruction))
-          if (call->isInlineAsm()) keepTogether = true;
+          if (const auto *assembly = dyn_cast<InlineAsm>(call->getCalledOperand()))
+            if (!independentAsm(module, *assembly)) keepTogether = true;
   if (!module.getModuleInlineAsm().empty()) {
     InitializeAllTargetInfos();
     InitializeAllTargetMCs();
@@ -58,7 +106,10 @@ dcc_split_module(Module &module, unsigned count,
   // is observable (for example ordered option tables). Independent objects
   // cannot preserve that order through the relocatable merge.
   for (const auto &global : module.globals())
-    if (global.hasSection() && global.getSection() != "llvm.metadata")
+    if (global.hasSection() && global.getSection() != "llvm.metadata" &&
+        !(module.getTargetTriple().isOSBinFormatELF() &&
+          llvm::is_contained({StringRef(".rodata"), StringRef(".data"), StringRef(".bss"),
+                              StringRef(".tdata"), StringRef(".tbss")}, global.getSection())))
       keepTogether = true;
 
   auto emit = [&](Module &part, bool last) -> Error {

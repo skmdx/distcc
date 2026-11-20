@@ -182,6 +182,7 @@ static int stage_outputs(struct dcc_job *job, struct dcc_job_result *r,
         if (job->linkdir && !strncmp(name, ".distcc-link-", 13)) {
             if (asprintf(&f->destination,"%s/%s",job->linkdir,name)<0) return -1;
         } else if (p && *p) f->destination = strdup(p[1]);
+        else if (!job->outdir) return -1;
         else if (asprintf(&f->destination, "%s/%s", job->outdir, name) < 0) return -1;
         if (!f->destination) return -1;
         const char *base = strrchr(f->destination, '/');
@@ -445,7 +446,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     incoming.fd_plus_one = 0;
                     received[index] = result->size[index];
                     finals |= 1U << index;
-                } else if (type == DCC_TCP_OUTPUT_NAMES && job->outdir && have_result &&
+                } else if (type == DCC_TCP_OUTPUT_NAMES && (job->outdir || job->llvm_outputs) && have_result &&
                            !result->status && !names_received) {
                     if (stage_outputs(job, result, incoming.data, incoming.size)) goto done;
                     names_received = 1;
@@ -481,7 +482,8 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                            !length && stream.fd < 0 && !filesystem.size && read_request == count) {
                     ret = EXIT_BUSY; goto done;
                 } else if (type == DCC_TCP_COMPLETE && have_result && incoming.size == sizeof(struct dcc_tcp_complete) &&
-                           (!notice || job->metadata_published) && (!job->outdir || result->status || names_received) &&
+                           (!notice || job->metadata_published) &&
+                           (!(job->outdir || job->llvm_outputs) || result->status || names_received) &&
                            named_index == result->named_count &&
                            dcc_tcp_get64(incoming.data) == id && finals == (1U << DCC_JOB_RESULT_COUNT) - 1 &&
                            !length && stream.fd < 0 && !filesystem.size && read_request == count) {

@@ -622,7 +622,7 @@ class Inputs {
             if (below(p, DCC_RUST_ROOT) || below(p, "/dev") || below(p, "/proc") || below(p, "/sys") ||
                 std::any_of(std::begin(runtime), std::end(runtime), [&](auto &r) { return below(p, r); }))
                 throw Local("input overlaps worker runtime");
-            int opened = open(p.c_str(), O_RDONLY | O_CLOEXEC);
+            int opened = open(p.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
             if (opened < 0 && unavailable_input(errno))
                 throw Local("unavailable Rust input " + p.string());
             held.emplace_back(opened);
@@ -779,7 +779,7 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         Sandbox box(Root::HostWithOutputs);
         auto &cmd = box.args;
         fs::path tools = sysroot / "lib/rustlib" / host / "bin";
-        cmd.insert(cmd.end(), {"--setenv", "PATH", link_path(tools, inv.linker)});
+        cmd.insert(cmd.end(), {"--unsetenv", "DISTCC_LOG", "--setenv", "PATH", link_path(tools, inv.linker)});
         // Preserve declared inputs and toolchains residing on the shadowed temporary mount.
         auto mounts = inv.search;
         mounts.insert(inv.inputs.begin(), inv.inputs.end());
@@ -1022,6 +1022,7 @@ int cgu_frontend(const CguRoute &route, const Invocation &inv, const fs::path &e
         return emit == "metadata" || emit == "link" || emit == "dep-info" || emit == "obj";
     });
     Env vars = {{"DISTCC_RUST_CGU_OBJECT_ONLY", machine_outputs ? "1" : "0"},
+                {"DISTCC_RUST_CGU_PLUGIN_LTO", inv.linker_plugin_lto ? "1" : "0"},
                 {"LD_PRELOAD", route.shim.string() + " " + env("LD_PRELOAD")},
                 {"DISTCC_RUST_CGU_CLIENT", fs::canonical("/proc/self/exe")},
                 {"DISTCC_RUST_CGU_PREVIOUS", env("LD_PRELOAD")}};
@@ -1044,6 +1045,28 @@ int cgu_frontend(const CguRoute &route, const Invocation &inv, const fs::path &e
         }
     }
     return collect(pid);
+}
+bool small_crate(const fs::path &source, uintmax_t bytes) {
+    constexpr uintmax_t limit = 64 * 1024;
+    if (bytes > limit)
+        return false;
+    // Cargo normally puts a crate's modules beside its entry point. Stop as
+    // soon as their combined size justifies scheduling individual CGUs.
+    auto root = fs::absolute(source).parent_path();
+    std::error_code ec;
+    fs::recursive_directory_iterator it(root, ec), end;
+    while (!ec && it != end) {
+        if (it->path().extension() == ".rs" && it->path() != root / source.filename() &&
+            it->is_regular_file(ec)) {
+            auto size = it->file_size(ec);
+            if (ec || size > limit - bytes)
+                return false;
+            bytes += size;
+        }
+        if (!ec)
+            it.increment(ec);
+    }
+    return !ec;
 }
 int distributed(char **original, const Words &args, const States &responses) {
     const string compiler = *original;
@@ -1086,8 +1109,7 @@ int distributed(char **original, const Words &args, const States &responses) {
     hint.work_units = dcc_rust_source_bytes(&job);
     hint.bytes = std::max<uint64_t>(1, source.st_size);
     hint.memory_class = dcc_resource_class(&job);
-    constexpr size_t split_source_bytes = 64 * 1024;
-    bool small = hint.bytes <= split_source_bytes;
+    bool small = !inv.linker_plugin_lto && small_crate(inv.source, hint.bytes);
     if (small && !inv.trace_macro && !inv.incremental && inv.scope.empty())
         if (auto status = try_local_frontend(original, responses, hint))
             return *status;
@@ -1103,7 +1125,7 @@ int distributed(char **original, const Words &args, const States &responses) {
     auto root = info.substr(separator + 1);
     if (!metadata_only)
         route = cgu_route(inv, version, root, hint);
-    if (route.peers && (!route.native || (!small && inv.multi_cgu && route.peers >= 2)))
+    if (route.peers && (!route.native || (!inv.linker_plugin_lto && !small && inv.multi_cgu && route.peers >= 2)))
         return cgu_frontend(route, inv, exe, original, responses);
     auto refused = [&](const Local &reason) {
         if (!route.peers)

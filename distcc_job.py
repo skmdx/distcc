@@ -54,7 +54,7 @@ class RustCommand(NamedTuple):
     environment: tuple[str, ...] = ()
 
 
-def manifest(kind, cwd, argv, inputs, *, rust=None):
+def manifest(kind, cwd, argv, inputs, *, rust=None, outputs=()):
     """Encode the bounded BEGIN manifest, including its first-use parent table."""
     data = bytearray()
     parents = {}
@@ -79,6 +79,12 @@ def manifest(kind, cwd, argv, inputs, *, rust=None):
     string(cwd)
     for arg in argv:
         string(arg)
+    if kind in (4, 5):
+        if not outputs:
+            raise ValueError('LLVM job requires declared outputs')
+        for name in outputs:
+            string(name)
+        string('')
     if kind == 3:
         if rust is None:
             raise ValueError('Rust command metadata is required')
@@ -104,6 +110,7 @@ def manifest(kind, cwd, argv, inputs, *, rust=None):
     return data
 
 
-def write_metadata(kind, cwd, helper, entries, path, *, work_key=0, work_units=0):
+def write_metadata(kind, job, entries, path, *, work_key=0, work_units=0):
     prefix = struct.pack('!QI', work_key, min(work_units, 2**32 - 1))
-    path.write_bytes(prefix + manifest(kind, cwd, [helper], [(*entry, 1) for entry in entries]))
+    path.write_bytes(prefix + manifest(kind, job['cwd'], job['args'], [(*entry, 1) for entry in entries],
+                                       outputs=job['outputs']))

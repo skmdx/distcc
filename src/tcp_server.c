@@ -861,12 +861,12 @@ static int compare_outputs(const void *a, const void *b)
     return strcmp(((const struct dcc_named_output *)a)->name, ((const struct dcc_named_output *)b)->name);
 }
 
-static int retain_named(struct dcc_tcp_server *s, uint64_t *bytes)
+static int retain_named(struct dcc_tcp_server *s, const char *directory, uint64_t *bytes)
 {
     struct dcc_job_result *r = &s->result;
     char path[PATH_MAX];
     size_t header = 0;
-    if (snprintf(path, sizeof(path), "%s%s", s->run.root, DCC_RUST_OUT) >= (int)sizeof(path)) return -1;
+    if (snprintf(path, sizeof(path), "%s%s", s->run.root, directory) >= (int)sizeof(path)) return -1;
     DIR *dir = opendir(path);
     if (!dir) return -1;
     int ret = -1;
@@ -921,7 +921,8 @@ void dcc_tcp_server_finished(struct dcc_tcp_server *s, const struct dcc_tcp_fini
     }
     if (used != count) goto fail;
     if (s->artifacts && !s->early_name[0] && read_metadata(s)<0) goto fail;
-    if (s->job->kind == DCC_JOB_RUST && !r->status && retain_named(s, &bytes)) goto fail;
+    if (!r->status && (s->job->kind == DCC_JOB_RUST || dcc_job_llvm(s->job)) &&
+        retain_named(s, s->job->kind == DCC_JOB_RUST ? DCC_RUST_OUT : DCC_LLVM_OUT, &bytes)) goto fail;
     /* Result FDs now own the output inodes. Input lifetime ends here, not
      * when a slow receiver eventually consumes the last result byte. */
     s->memory_class = dcc_resource_class(s->job);

@@ -1,7 +1,7 @@
 #pragma once
 #include "rust/common.hh"
 namespace rust {
-enum class Root { Host, HostWithOutputs, Inputs, Backend };
+enum class Root { Host, HostWithOutputs, Inputs, Backend, LLVM };
 struct Sandbox {
     Fd filter;
     Words args;

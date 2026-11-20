@@ -817,15 +817,28 @@ class BrokerTest(BrokerTestCase):
                     (1901 if running_known else 1904, 4 * 1024**2, kind), 1048576)
                 if overrun:
                     time.sleep(2.05)
-                request = self.request(10, (1901 if learned else 1902, 4 * 1024**2, kind), 1048576)
                 log = self.work / f'link-wait-{kind}.log'
+                offset = log.stat().st_size
+                request = self.request(10, (1901 if learned else 1902, 4 * 1024**2, kind), 1048576)
                 request.settimeout(1)
+                if kind == 8:
+                    # After learning, the fast worker has an earlier predicted
+                    # completion even though it is occupied at submission.
+                    request.settimeout(.15)
+                    with self.assertRaises(socket.timeout):
+                        request.recv(1)
+                    occupied.close()
+                    request.settimeout(2)
                 reply = self.receive(request)
-                recorded = log.read_text()
+                with log.open() as stream:
+                    stream.seek(offset)
+                    recorded = stream.read()
                 key = 1901 if learned else 1902
                 rows = [dict(field.split('=', 1) for field in line.split() if '=' in field)
                         for line in recorded.splitlines()
-                        if '(dispatch) candidate ' in line and f'key={key:x}' in line][-2:]
+                        if '(dispatch) candidate ' in line and f'key={key:x}' in line]
+                rows = next((rows[i:i+2] for i in range(len(rows)-1)
+                             if rows[i]['wait'] == '1' and rows[i+1]['wait'] == '0'), [])
                 self.assertEqual(len(rows), 2, rows)
                 self.assertEqual((rows[0]['wait'], rows[1]['wait']), ('1', '0'), rows)
                 self.assertLess(float(rows[0]['finish']), float(rows[1]['finish']), rows)
@@ -833,19 +846,28 @@ class BrokerTest(BrokerTestCase):
                 self.assertEqual(status, 0)
                 self.assertEqual(len(descriptors), 1)
                 with socket.socket(fileno=descriptors[0]) as selected:
-                    self.assertEqual(selected.getpeername()[1], self.ports[1])
+                    self.assertEqual(selected.getpeername()[1], self.ports[0 if kind == 8 else 1])
 
-    def test_unfamiliar_link_work_uses_available_capacity(self):
+    def test_new_module_uses_learned_backend_class(self):
         self.check_link_backend_wait(False)
 
-    def test_learned_link_work_uses_available_capacity(self):
+    def test_learned_link_backend_placement(self):
         self.check_link_backend_wait(True)
 
-    def test_link_work_does_not_wait_on_unlearned_running_jobs(self):
+    def test_link_backend_placement_with_unfamiliar_running_job(self):
         self.check_link_backend_wait(True, running_known=False)
 
-    def test_link_work_does_not_wait_on_an_overrun(self):
+    def test_link_backend_placement_after_an_overrun(self):
         self.check_link_backend_wait(True, overrun=True)
+
+    def test_cold_thinlto_uses_available_lane(self):
+        peers = [self.peer(stats_response(cpus=1, cores=1, jobs=1, capacity=1,
+                          running=0, busy=0, queued=0, preparing=0, returning=0)) for _ in range(2)]
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={peer.port},speed={4 if i == 0 else 1}')
+                                   for i, peer in enumerate(peers)))
+        first, first_worker = self.acquire_reserved(10, (1901, 4 * 1024**2, 8), 1048576)
+        _, second_worker = self.acquire_reserved(10, (1902, 4 * 1024**2, 8), 1048576)
+        self.assertNotEqual(first_worker.getpeername()[1], second_worker.getpeername()[1])
 
     def test_inflight_large_job_consumes_small_job_memory_slots(self):
         small = 64 * 1024**2

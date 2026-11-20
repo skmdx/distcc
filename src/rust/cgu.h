@@ -116,6 +116,8 @@ inline ModulePassManager pipeline(PassBuilder &pb, StringRef kind, int level, in
         return pb.buildModuleOptimizationPipeline(opt, lto);
     if (kind == "thin-postlink")
         return pb.buildThinLTODefaultPipeline(opt, nullptr);
+    if (kind == "thin-prelink")
+        return pb.buildThinLTOPreLinkDefaultPipeline(opt);
     throw std::runtime_error("unknown CGU pipeline");
 }
 
