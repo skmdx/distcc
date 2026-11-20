@@ -89,17 +89,20 @@ import-and-split pass. Preparation overlaps ordinary backends; ready partitions
 join the same work queue. A module that stays in one piece returns its object
 directly. For multiple partitions, a relocatable merge restores private symbol bindings
 before LLD consumes the result. Constructors, TLS and exception handling retain
-their original link semantics. Assembly with private definitions or per-object
-weak/versioned references stays together; LLVM's assembler identifies these
-cases. On x86 ELF, instruction templates using AT&T or Intel register syntax
-and LLVM operand substitutions can be partitioned. Direct references to named
-assembly symbols and section changes keep a module together.
+their original link semantics. File assembly shares the first partition with
+its symbol definitions and object-local IR users. Weak or versioned imports
+that can rebind an implicit backend call stay in a single object.
+The first partition also owns global data and explicitly placed
+functions in declaration order, together with their COMDAT groups. On x86 ELF,
+instruction templates using registers and LLVM operands can be partitioned.
+Function assembly with untracked symbol dependencies keeps a module together.
 LLVM's symbol clusters and remaining functions are placed largest-first
 on the partition with the least instruction work, including weak definitions.
 Individual functions and the final native layout are not subdivided.
 
 `make lto install-lto` builds and installs the helpers for `LLVM_CONFIG` under
-its library directory's `distcc` subdirectory. Set `LLVM_WRAPPER_SOURCE` as
+its library directory's `distcc` subdirectory and registers `distcc-lto` beside
+that installation's compiler. Set `LLVM_WRAPPER_SOURCE` as
 described below; the same source tree supplies LLVM's `SplitModule.cpp`, built
 privately with instruction-weighted placement. Use a distinct `LTO_BUILD` when
 building for multiple installed LLVM ABIs. A compiler without its matching

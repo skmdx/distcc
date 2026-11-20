@@ -362,13 +362,14 @@ class BrokerDirectTest(BrokerTestCase):
         listener = socket.create_server(('127.0.0.2', self.ports[1]))
         self.addCleanup(listener.close)
         self.start_broker(self.host(0, f',tcp,stats={local.port}') +
-                          f' 127.0.0.2:{self.ports[1]}/2,tcp,stats={remote.port},speed=0.8')
-        first = self.request(15, (1, 4 * 1024 * 1024, 4))
+                          f' 127.0.0.2:{self.ports[1]}/2,tcp,stats={remote.port},speed=0.55')
+        first = self.request(15, (1, 4 * 1024 * 1024, 4), family=7)
         self.assertEqual(self.receive(first), (0, 1, []))
-        # With a sibling compiling, the independent remote core finishes this TU sooner.
-        declined = self.request(15, (2, 4 * 1024 * 1024, 4))
+        # The local sibling has lower single-job latency. Even a warm input
+        # cannot repay the throughput it displaces from the active compile.
+        declined = self.request(15, (2, 4 * 1024 * 1024, 4), family=7)
         self.assertEqual(self.receive(declined), (0, 0, []))
-        _, net = self.acquire_reserved(10, (2, 4 * 1024 * 1024, 4))
+        _, net = self.acquire_reserved(10, (2, 4 * 1024 * 1024, 4), family=7)
         self.assertEqual(net.getpeername()[1], self.ports[1])
 
     def test_codegen_borrow_does_not_select_a_remote_execution_method(self):
@@ -1334,16 +1335,17 @@ class BrokerTest(BrokerTestCase):
             _, net = self.acquire_reserved(10, (1000 + index, 4 * 1024 * 1024, 1))
             self.assertEqual(net.getpeername()[1], self.ports[expected], index)
 
-    def test_source_completion_distinguishes_background_tasks_and_queued_work(self):
+    def test_source_completion_charges_only_overlapping_contention(self):
         peers = [self.peer(stats_response(cpus=16, cores=8, jobs=16,
                     running=14, busy=13, queued=0, preparing=0, returning=0, capacity=16)),
                  self.peer(stats_response(cpus=4, cores=2, jobs=4,
                     running=1, busy=1, queued=0, preparing=0, returning=0, capacity=4))]
         hosts = self.host(0, f',tcp,stats={peers[0].port},speed=1', slots=16) + ' ' + \
                 self.host(1, f',tcp,stats={peers[1].port},speed=.49', slots=4)
-        for prefix, busy, queued, expected in (
-                ('admissible-tail', 13, 0, 0),
-                ('queued-work', 16, 1, 1)):
+        for prefix, busy, queued, size, expected in (
+                ('contended-sibling', 13, 0, 1, 1),
+                ('long-tail', 13, 0, 128, 0),
+                ('queued-work', 16, 1, 1, 1)):
             with self.subTest(prefix=prefix):
                 peers[0].response = stats_response(cpus=16, cores=8, jobs=16,
                     running=busy + 1, busy=busy, queued=queued, preparing=0,
@@ -1354,7 +1356,7 @@ class BrokerTest(BrokerTestCase):
                              [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                array.array('i', [net.fileno()]))])
                 self.assertEqual(seed.recv(1), b'')
-                _, net = self.acquire_reserved(10, (2100, 1048576, 5))
+                _, net = self.acquire_reserved(10, (2100, size * 1048576, 5))
                 self.assertEqual(net.getpeername()[1], self.ports[expected])
 
     def test_job_cost_learns_execution_cost(self):

@@ -31,6 +31,7 @@ RUST_NATIVE_TARGET = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),distcc-
 CLANG_DRIVER_TARGET = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),clang_driver.so)
 LTO_BUILD ?= llvm-lto
 LTO_LIBDIR ?= $(shell $(LLVM_CONFIG) --libdir)/distcc
+LTO_BINDIR ?= $(shell $(LLVM_CONFIG) --bindir)
 LTO_TARGETS = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),$(LTO_BUILD)/distcc-lto $(LTO_BUILD)/lto-prepare.so $(LTO_BUILD)/distcc-rust-cgu $(LTO_BUILD)/distcc-rust-cgu.so)
 # Upstream Clang owns extraction, device grouping and image registration.
 # Point at its clang/tools/clang-linker-wrapper source directory to build it.
@@ -622,8 +623,9 @@ lto: $(LTO_TARGETS)
 
 install-lto: $(LTO_TARGETS)
 	if test -n "$(LTO_TARGETS)"; then \
-	  $(mkinstalldirs) "$(DESTDIR)$(LTO_LIBDIR)" && \
-	  $(INSTALL_PROGRAM) $(LTO_TARGETS) "$(DESTDIR)$(LTO_LIBDIR)/"; \
+	  $(mkinstalldirs) "$(DESTDIR)$(LTO_LIBDIR)" "$(DESTDIR)$(LTO_BINDIR)" && \
+	  $(INSTALL_PROGRAM) $(LTO_TARGETS) "$(DESTDIR)$(LTO_LIBDIR)/" && \
+	  ln -srf "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_BINDIR)/distcc-lto"; \
 	fi
 
 src/rust/native.o src/rust/audit.o: src/%.o: $(srcdir)/src/%.cc
@@ -1481,7 +1483,7 @@ uninstall-programs:
 	rm -f "$(DESTDIR)$(libdir)/distcc/gcc_plan.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/clang_driver.so"
-	rm -f "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/lto-prepare.so" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu.so"
+	rm -f "$(DESTDIR)$(LTO_BINDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/lto-prepare.so" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu.so"
 	rm -f "$(DESTDIR)$(bindir)/distcc-link"
 	rm -f "$(DESTDIR)$(bindir)/distcc-multi"
 	rm -f "$(DESTDIR)$(bindir)/distcc-rust"

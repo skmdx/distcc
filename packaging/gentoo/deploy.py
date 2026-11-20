@@ -422,10 +422,10 @@ def validate_rust_cluster(targets, work, inventory, workers=None):
         offers = [(worker['name'], *rust_worker_capabilities(worker['server_hosts']))
                   for worker in (targets if workers is None else workers)]
 
-        def validate_slots(client):
-            start = targets.index(client)
-            for step in range(len(offers)):
-                worker, hosts, compilers, backends = offers[(start + step) % len(offers)]
+        # Warm one receiver at a time. Clients retain exclusive ownership of
+        # their validation unit while sharing the receiver's input cache.
+        for worker, hosts, compilers, backends in offers:
+            def validate_slots(client):
                 for compiler, requirement in clients[client['name']]:
                     expected = ('remote' if rust_compiler_key(compiler) in compilers else
                                 'cgu' if requirement in backends else 'local')
@@ -438,7 +438,7 @@ def validate_rust_cluster(targets, work, inventory, workers=None):
                                  'python3', '-B', path(client) + '/validate-installed.py', '--rust-only'],
                                 client, 'rust-' + worker, log)
                     print(f'Rust {name}: {expected} compilation and execution passed', flush=True)
-        parallel(targets, validate_slots)
+            parallel(targets, validate_slots)
     finally:
         parallel(targets, lambda target: run(['sudo', '-n', 'rm', '-rf', '--', path(target)], target))
     return builds * len(offers)

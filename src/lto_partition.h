@@ -2,18 +2,20 @@
 #define DISTCC_LTO_PARTITION_H
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
-#include <memory>
 #include <string>
 #include <vector>
 
 namespace llvm {
 class Module;
+class GlobalValue;
 // Private build of LLVM's splitter, with instruction-weighted placement.
 void dccSplitModule(Module &, unsigned,
-                    function_ref<void(std::unique_ptr<Module>)>, bool, bool);
+                    function_ref<void(Module &, bool last)>,
+                    const SmallPtrSetImpl<const GlobalValue *> &);
 }
 
 // Consume verified partitions while their IR is alive. The callback may fork

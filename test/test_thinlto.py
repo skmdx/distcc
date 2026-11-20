@@ -511,9 +511,9 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         result = self.run_command([tools['plan'], 'split', bitcode, '3', self.work / 'part'])
         self.assertEqual(result.returncode, 0, result.stderr)
         parts = json.loads(result.stdout)['parts']
-        self.assertEqual(len(parts), 1)
+        self.assertGreater(len(parts), 1)
         output = self.work / 'assembly'
-        result = self.run_command([compiler, parts[0]['path'], '-o', output])
+        result = self.run_command([compiler, *(part['path'] for part in parts), '-o', output])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.run_command([output]).returncode, 0)
 
@@ -576,6 +576,60 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     def test_partitioned_backend_preserves_compiler_used_section(self):
         self.check_used_section(retain=False)
+
+    def test_versioned_import_applies_to_implicit_backend_call(self):
+        compiler = 'clang'
+        tools = llvm_tools(compiler)
+        if not tools:
+            self.skipTest('matching LLVM partition helpers are not installed')
+        src, bc, obj = (self.work / ('import.'+ext) for ext in ('c', 'bc', 'o'))
+        src.write_text('asm(".symver memcpy, memcpy@IMPORT_1");\n'
+                       'void copy(char*a,char*b,unsigned n){__builtin_memcpy(a,b,n);}\n'
+                       'int independent(int x){return x+1;}\n')
+        subprocess.run([compiler, '-emit-llvm', '-c', src, '-o', bc], check=True)
+        parts = json.loads(subprocess.check_output([tools['plan'], 'split', bc, '2', self.work/'part']))['parts']
+        self.assertEqual(len(parts), 1)
+        subprocess.run([compiler, '-c', parts[0]['path'], '-o', obj], check=True)
+        self.assertIn('memcpy@IMPORT_1', subprocess.check_output(['llvm-nm', '-u', obj], text=True))
+
+    @unittest.skipUnless(os.uname().machine == 'x86_64', 'x86 ELF assembly')
+    def test_versioned_definition_and_section_comdat_survive_partitioned_link(self):
+        compiler = shutil.which('clang')
+        if not llvm_tools(compiler):
+            self.skipTest('matching LLVM partition helpers are not installed')
+        module = self.work / 'definitions.ll'
+        # A retained version tag and a function belong to the same COMDAT.
+        # A versioned exported definition must share its assembler's object.
+        functions = []
+        for name in ('implementation', 'group_member', 'independent', 'another'):
+            comdat = ' comdat($tag)' if name == 'group_member' else ''
+            body = '\n'.join('store volatile i32 %x, ptr @state' for _ in range(128))
+            assembly = 'call void asm sideeffect "pause", ""()' if name == 'implementation' else ''
+            functions.append(f'define i32 @{name}(i32 %x) noinline{comdat} {{\n'
+                             f'{assembly}\n{body}\nret i32 %x\n}}')
+        module.write_text('target triple = "x86_64-unknown-linux-gnu"\n'
+                          'module asm ".symver implementation,exported@@PART_1"\n'
+                          '$tag = comdat any\n@state = internal global i32 0\n'
+                          '@tag = linkonce_odr hidden constant {ptr,i64} {ptr @group_member,i64 42},'
+                          ' section "version_records", comdat, align 8\n'
+                          '@llvm.compiler.used = appending global [1 x ptr] [ptr @tag],'
+                          ' section "llvm.metadata"\n' + '\n'.join(functions))
+        main = self.work / 'caller.c'
+        main.write_text('int exported(int), independent(int), another(int);\n'
+                        'extern const struct {int (*f)(int); long v;} __start_version_records[];\n'
+                        'int main(void){return exported(5)!=5 || independent(7)!=7 || another(9)!=9 || '
+                        '__start_version_records->v!=42 || __start_version_records->f(4)!=4;}\n')
+        versions = self.work / 'version.map'
+        versions.write_text('PART_1 { global: exported; };\n')
+        obj, caller, binary = self.work/'definitions.o', self.work/'caller.o', self.work/'check'
+        for args in ([compiler, '-flto=thin', '-c', module, '-o', obj],
+                     [compiler, '-c', main, '-o', caller]):
+            subprocess.run(args, check=True)
+        result = self.run_command([self.build/'distcc', compiler, '-flto=thin', '-fuse-ld=lld',
+                                   '-Wl,--version-script=' + str(versions), obj, caller, '-o', binary])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'partitioned .* into (?:[2-9]|\d{2,})\b')
+        self.assertEqual(self.run_command([binary]).returncode, 0)
 
     def test_rust_linker_plugin_assembly_partitioning(self):
         rustc = shutil.which('rustc')
@@ -649,11 +703,13 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
                                    '-fuse-ld=lld', *flags, obj, '-o', output])
         self.assertEqual(result.returncode, 0, result.stderr)
         counts = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
-        self.assertEqual(counts, [1], result.stderr)
+        self.assertTrue(counts and min(counts) > 1, result.stderr)
         if prefix:
             executed = trace.read_text()
-            self.assertNotRegex(executed, r'execve\("[^"]*/llvm-objcopy')
-            self.assertNotIn('"-r", "-o", "merged.o"', executed)
+            self.assertIn('"-r", "-o", "merged.o"', executed)
+            self.assertNotRegex(executed, r'execve\("[^"]*/llvm-config')
+            self.assertNotIn('"--lto-capacity"]', '\n'.join(
+                line for line in executed.splitlines() if '"--file-jobs"' not in line))
         self.assertEqual(self.run_command([output]).returncode, 0)
 
     def test_ranked_submission_survives_slow_process_start(self):

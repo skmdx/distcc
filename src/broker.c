@@ -1345,7 +1345,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     double work_rate = 0, min_rate = 0;
     struct selection {
         int peer, probe, wait, idle, enqueue;
-        double score, fill;
+        double score, fill, marginal_factor;
         struct prediction forecast;
     } best = {.peer = -1}, ready = {.peer = -1}, affinity = {.peer = -1},
       completion = {.peer = -1};
@@ -1370,11 +1370,12 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
      * validates its compiler/input certificate; this never authorizes reuse.
      * Keep the hint in the existing bounded cost history, and consult live
      * leases for work whose frontend may have completed before its backend. */
-    int locality = !direct && !link && (client->hint.kind == 4 || client->hint.kind == 5 ||
-                                        client->hint.kind == DCC_WORK_RUST);
+    int source = client->hint.kind == 4 || client->hint.kind == 5 ||
+                 client->hint.kind == DCC_WORK_RUST;
+    int locality = !direct && !link && source;
     /* A cold byte prior is not evidence for a finite completion comparison. */
     int thinlto = client->hint.kind == DCC_WORK_THINLTO;
-    int compare_finish = locality || thinlto;
+    int compare_finish = source || thinlto;
     int completion_model = compare_finish && broker->model.classes[client->hint.kind - 1].xx > 0;
     int previous = locality ? dcc_work_peer(&broker->model, &client->hint) : -1;
     unsigned long long headroom[MAX_HOSTS];
@@ -1581,7 +1582,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * worker, including existing compiles on a remote SMT core.
              * Minimizing this job's latency alone packs the fastest worker's
              * SMT lanes while independent physical cores remain unused. */
-            double prior_factor = forecast.factor;
+            double critical = score, marginal_factor = forecast.factor;
             if (staged && cap && !link && !link_backend && (predicted ||
                 (!blocked && work < dcc_capacity_jobs(p->host, cap)))) {
                 struct dcc_capacity live = observed_capacity(p, broker->cpp_busy);
@@ -1599,7 +1600,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 double demand = placement + (external > 0 ? external : 0);
                 /* Include the CPU work displaced by this compile, notably
                  * client preprocessing on a machine that also runs a worker. */
-                prior_factor = execution_factor(p, placement - 1, probe, cap->capacity, broker->cpp_busy);
+                double prior_factor = execution_factor(p, placement - 1, probe, cap->capacity, broker->cpp_busy);
                 double before = demand ? demand / prior_factor : 0;
                 double gain = (demand + 1) / execution_factor(p, placement, probe, cap->capacity, broker->cpp_busy) - before;
                 /* At saturation there is no positive marginal throughput.
@@ -1608,19 +1609,28 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                  * also lets the least costly host progress when all are busy. */
                 double penalty = (demand + 1) * execution_factor(p, placement, probe, cap->capacity, broker->cpp_busy);
                 if (gain > 0 && gain * penalty > 1) penalty = 1 / gain;
+                if (penalty > marginal_factor) marginal_factor = penalty;
                 double throughput = forecast.start + (cost > 0 ? cost : 1) * penalty;
                 if (!predicted || throughput > score) score = throughput;
+                critical = score;
+                if (predicted && completion_model) {
+                    // During drain, displacement ends when the competing
+                    // work finishes. A long TU does not pay a short job's
+                    // SMT penalty for its entire execution. External tasks
+                    // have no lease; use the observed typical service time.
+                    double end = lane_ready(&p->schedule.cpu, 1);
+                    if (external > 0) {
+                        const struct dcc_work_class *learned = &broker->model.classes[client->hint.kind - 1];
+                        double competing = (p->mean_cost > 0 ? p->mean_cost : learned->z / learned->weight) * prior_factor;
+                        if (competing > end) end = competing;
+                    }
+                    double overlap = end - forecast.start;
+                    double duration = forecast.finish - forecast.start;
+                    if (overlap < duration && duration > 0)
+                        critical = forecast.finish + (score - forecast.finish) *
+                                   (overlap > 0 ? overlap / duration : 0);
+                }
             }
-            /* Without queued source work, aggregate throughput is not the
-             * completion barrier. Charge the worst delay on one competing
-             * lane, not the sum of delays on lanes that run in parallel.
-             * The existing service curve accounts for external contention on
-             * both sides; a daemon's nonzero runnable count is not a veto.
-             * Admission still requires an available CPU or existing pipeline. */
-            if (direct && predicted) score = forecast.finish;
-            double critical = forecast.finish;
-            if (forecast.factor > prior_factor)
-                critical += cost * (forecast.factor - prior_factor);
             double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;
             rs_trace("candidate host=%s work=%d capacity=%d cost=%.3f factor=%.3f prepare=%.3f start=%.3f score=%.3f wait=%d "
@@ -1635,8 +1645,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             /* Without any input description there is no completion estimate
              * with which to justify waiting instead of using an idle CPU. */
             int idle = !cost && staged && cap && !blocked && work < dcc_capacity_jobs(p->host, cap);
-            struct selection candidate = {i, probe, wait, idle, enqueue, score, fill, forecast};
-            if (locality && completion_model && predicted && (!wait || enqueue) &&
+            struct selection candidate = {i, probe, wait, idle, enqueue, score, fill, marginal_factor, forecast};
+            if (source && !link && completion_model && predicted && (!wait || (!direct && enqueue)) &&
                 (completion.peer < 0 || critical < completion.score)) {
                 completion = candidate;
                 completion.score = critical;
@@ -1644,8 +1654,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             int warm = (locality && (i == previous || batch->owners[owner_slot(batch, i, &client->hint)])) ||
                        (!direct && !link && warm_scope(batch, p, i, client->hint.scope_key));
             if (warm && staged && predicted && (!wait || enqueue) &&
-                (affinity.peer < 0 || forecast.factor < affinity.forecast.factor ||
-                 (forecast.factor == affinity.forecast.factor && score < affinity.score)))
+                (affinity.peer < 0 || marginal_factor < affinity.marginal_factor ||
+                 (marginal_factor == affinity.marginal_factor && score < affinity.score)))
                 affinity = candidate;
             if (best.peer < 0 || idle > best.idle || (idle == best.idle &&
                 (score < best.score || (score == best.score && fill < best.fill)))) best = candidate;
@@ -1686,7 +1696,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
      * the pipeline, or pin a repeat to a slower owner. No speculative cache
      * speedup is subtracted from the normal execution-cost model. */
     if (affinity.peer >= 0 && best.peer >= 0 && affinity.peer != best.peer &&
-        affinity.forecast.factor <= best.forecast.factor) {
+        affinity.forecast.factor <= best.forecast.factor &&
+        affinity.marginal_factor <= best.marginal_factor) {
         rs_trace("source affinity: key=%llx host=%s instead=%s",
                  (unsigned long long)client->hint.key, broker->peers[affinity.peer].host->hostname,
                  broker->peers[best.peer].host->hostname);

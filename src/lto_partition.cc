@@ -1,7 +1,9 @@
 #include "lto_partition.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
@@ -16,7 +18,6 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <algorithm>
-#include <memory>
 #include <vector>
 
 using namespace llvm;
@@ -60,8 +61,7 @@ static bool independentOperands(StringRef args, bool intel) {
 static bool independentAsm(const Module &module, const InlineAsm &assembly) {
   StringRef text = assembly.getAsmString().trim();
   if (text.empty()) return true;
-  if (!module.getTargetTriple().isX86() || !module.getTargetTriple().isOSBinFormatELF() ||
-      !module.getModuleInlineAsm().empty())
+  if (!module.getTargetTriple().isX86() || !module.getTargetTriple().isOSBinFormatELF())
     return false;
   unsigned defined = 0, forward = 0;
   while (!text.empty()) {
@@ -77,6 +77,13 @@ static bool independentAsm(const Module &module, const InlineAsm &assembly) {
     if (line.empty()) continue;
     auto name = line.take_until([](char c) { return c == ' ' || c == '\t'; });
     auto args = line.drop_front(name.size()).trim();
+    while (llvm::is_contained({StringRef("lock"), StringRef("rep"), StringRef("repe"),
+                               StringRef("repne"), StringRef("repz"), StringRef("repnz"),
+                               StringRef("xacquire"), StringRef("xrelease")}, name) &&
+           !args.empty()) {
+      name = args.take_until([](char c) { return c == ' ' || c == '\t'; });
+      args = args.drop_front(name.size()).trim();
+    }
     if (name == ".byte") {
       do {
         auto [value, rest] = args.split(',');
@@ -104,48 +111,98 @@ dcc_split_module(Module &module, unsigned count,
     return !function.isDeclarationForLinker();
   });
   count = std::min<unsigned>(count, definitions);
-  // Let LLVM's assembler interpret directives. Strong global declarations and
-  // definitions survive the relocatable merge with assembly in partition zero.
-  // Local assembly definitions and per-object weak/versioned references lack
-  // the IR ownership information needed to move their users between objects.
+  // Symbol declarations do not change the parser's instruction state.
+  // Other directives may define macros or select a different syntax.
+  auto changesAsmState = [](StringRef text) {
+    while (!text.empty()) {
+      auto end = text.find_first_of(";\n");
+      auto statement = text.take_front(end).trim();
+      text = end == StringRef::npos ? StringRef() : text.drop_front(end + 1);
+      auto op = statement.take_until([](char c) { return c == ' ' || c == '\t'; });
+      if (!op.empty() && !llvm::is_contained(
+          {StringRef(".symver"), StringRef(".globl"), StringRef(".global"),
+           StringRef(".weak"), StringRef(".hidden"), StringRef(".local")}, op))
+        return true;
+    }
+    return false;
+  };
+#if LLVM_VERSION_MAJOR >= 23
+  bool sharedAsmState = llvm::any_of(module.getModuleInlineAsm(),
+      [&](const Module::GlobalAsmFragment &fragment) { return changesAsmState(fragment.Asm); });
+#else
+  bool sharedAsmState = changesAsmState(module.getModuleInlineAsm());
+#endif
   bool keepTogether = false;
+  SmallPtrSet<const GlobalValue *, 32> pinned;
+  for (const auto &global : module.globals())
+    if (!global.isDeclaration()) pinned.insert(&global);
   // Function assembly may also define symbols referenced elsewhere in this
   // module. LLVM IR does not describe those edges; splitting can turn a local
   // assembler definition into an unresolved reference in another object.
   SmallPtrSet<const InlineAsm *, 16> inspected;
-  for (const auto &function : module)
+  for (const auto &function : module) {
+    if (function.hasSection()) pinned.insert(&function);
     for (const auto &block : function)
       for (const auto &instruction : block)
         if (const auto *call = dyn_cast<CallBase>(&instruction))
           if (const auto *assembly = dyn_cast<InlineAsm>(call->getCalledOperand()))
-            if (!keepTogether && inspected.insert(assembly).second && !independentAsm(module, *assembly))
-              keepTogether = true;
+            if (!assembly->getAsmString().empty()) {
+              if (inspected.insert(assembly).second && !independentAsm(module, *assembly))
+                keepTogether = true;
+              // File assembly may define macros or switch instruction modes.
+              // Its instruction templates run in that assembler's context.
+              if (sharedAsmState) pinned.insert(&function);
+            }
+  }
   if (!module.getModuleInlineAsm().empty()) {
     InitializeAllTargetInfos();
     InitializeAllTargetMCs();
     InitializeAllAsmParsers();
+    StringSet<> symbols, objectLocal, asmDefinitions, versionSources;
     ModuleSymbolTable::CollectAsmSymbols(module,
-        [&](StringRef, object::BasicSymbolRef::Flags flags) {
+        [&](StringRef name, object::BasicSymbolRef::Flags flags) {
           using Symbol = object::BasicSymbolRef;
-          if (!(flags & Symbol::SF_Undefined) && !(flags & Symbol::SF_Global))
-            keepTogether = true;
+          symbols.insert(name);
+          if (!(flags & Symbol::SF_Undefined)) asmDefinitions.insert(name);
+          // A backend libcall can also reference this symbol without an IR
+          // use. A per-object weak import must retain its binding.
           if ((flags & Symbol::SF_Undefined) && (flags & Symbol::SF_Weak))
             keepTogether = true;
+          if (!(flags & Symbol::SF_Global) || (flags & Symbol::SF_Weak))
+            objectLocal.insert(name);
         });
-    ModuleSymbolTable::CollectAsmSymvers(module, [&](StringRef, StringRef) {
-      keepTogether = true;
+    ModuleSymbolTable::CollectAsmSymvers(module, [&](StringRef source, StringRef version) {
+      symbols.insert(source);
+      versionSources.insert(source);
+      objectLocal.insert(source);
+      objectLocal.insert(version);
     });
+    for (auto &global : module.global_values()) {
+      if (!global.hasName()) continue;
+      SmallString<128> name;
+      Mangler::getNameWithPrefix(name, global.getName(), module.getDataLayout());
+      if (!global.isDeclarationForLinker() && symbols.contains(name)) {
+        pinned.insert(&global);
+        asmDefinitions.insert(name);
+      }
+      if (!objectLocal.contains(name)) continue;
+      // An IR declaration can refer to a symbol defined only by assembly.
+      // Follow constant expressions to the definitions emitting relocations.
+      SmallVector<const User *> users(global.user_begin(), global.user_end());
+      SmallPtrSet<const User *, 16> seen;
+      while (!users.empty()) {
+        const User *user = users.pop_back_val();
+        if (!seen.insert(user).second) continue;
+        if (auto *inst = dyn_cast<Instruction>(user)) pinned.insert(inst->getFunction());
+        else if (auto *gv = dyn_cast<GlobalValue>(user)) pinned.insert(gv);
+        else users.append(user->user_begin(), user->user_end());
+      }
+    }
+    // A version definition travels with its owner. A versioned import can
+    // redirect an implicit backend libcall too, including llvm.memcpy.
+    for (const auto &entry : versionSources)
+      if (!asmDefinitions.contains(entry.getKey())) keepTogether = true;
   }
-
-  // Explicit sections can be linker-assembled arrays whose declaration order
-  // is observable (for example ordered option tables). Independent objects
-  // cannot preserve that order through the relocatable merge.
-  for (const auto &global : module.globals())
-    if (global.hasSection() && global.getSection() != "llvm.metadata" &&
-        !(module.getTargetTriple().isOSBinFormatELF() &&
-          llvm::is_contained({StringRef(".rodata"), StringRef(".data"), StringRef(".bss"),
-                              StringRef(".tdata"), StringRef(".tbss")}, global.getSection())))
-      keepTogether = true;
 
   auto emit = [&](Module &part, bool last) -> Error {
     if (verifyModule(part, &errs()))
@@ -187,30 +244,36 @@ dcc_split_module(Module &module, unsigned count,
     collectUsedGlobalVariables(module, used, false);
     collectUsedGlobalVariables(module, compilerUsed, true);
     Error failure = Error::success();
-    unsigned index = 0;
-    dccSplitModule(module, count, [&](std::unique_ptr<Module> part) {
+    bool split = false;
+    dccSplitModule(module, count, [&](Module &part, bool last) {
+      if (failure) return;
+      if (&part == &module) {
+        failure = emit(part, last);
+        return;
+      }
+      split = true;
       // SplitModule hashes the retention arrays independently of their
       // definitions. Rebuild each list beside the definitions it protects,
       // so optimization and ELF section GC retain the same input objects.
       auto retain = [&](StringRef name, ArrayRef<GlobalValue *> original,
                         bool compilerOnly) {
-        if (auto *list = part->getNamedGlobal(name)) list->eraseFromParent();
+        if (auto *list = part.getNamedGlobal(name)) list->eraseFromParent();
         SmallVector<GlobalValue *, 16> values;
         for (auto *global : original) {
-          auto *copy = part->getNamedValue(global->getName());
+          auto *copy = part.getNamedValue(global->getName());
           assert(copy && "split module lost a retained global");
           if (!copy->isDeclarationForLinker()) values.push_back(copy);
         }
-        if (compilerOnly) appendToCompilerUsed(*part, values);
-        else appendToUsed(*part, values);
+        if (compilerOnly) appendToCompilerUsed(part, values);
+        else appendToUsed(part, values);
       };
       retain("llvm.used", used, false);
       retain("llvm.compiler.used", compilerUsed, true);
-      if (!failure)
-        failure = emit(*part, ++index == count);
-    }, false, true);
+      failure = emit(part, last);
+    }, pinned);
     if (failure)
       return std::move(failure);
+    if (!split) return names;
     for (auto *local : locals) {
       SmallString<128> name;
       Mangler::getNameWithPrefix(name, local->getName(), module.getDataLayout());

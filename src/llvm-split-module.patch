@@ -45,7 +45,25 @@
  } // end anonymous namespace
  
  static void addNonConstUser(ClusterMapType &GVtoClusterMap,
-@@ -164,8 +178,25 @@
+@@ -112,7 +126,7 @@
+ // Try to balance pack those partitions into N files since this roughly equals
+ // thread balancing for the backend codegen step.
+ static void findPartitions(Module &M, ClusterIDMapType &ClusterIDMap,
+-                           unsigned N) {
++                           unsigned N, const SmallPtrSetImpl<const GlobalValue *> &Pinned) {
+   // At this point module should have the proper mix of globals and locals.
+   // As we attempt to partition this module, we must not change any
+   // locals to globals.
+@@ -155,8 +169,6 @@
+       }
+     }
+ 
+-    if (GV.hasLocalLinkage())
+-      addAllGlobalValueUsers(GVtoClusterMap, &GV, &GV);
+   };
+ 
+   llvm::for_each(M.functions(), recordGVSet);
+@@ -164,31 +176,68 @@
    llvm::for_each(M.aliases(), recordGVSet);
    llvm::for_each(M.ifuncs(), recordGVSet);
  
@@ -72,8 +90,22 @@
 +  // instruction workloads first on the currently lightest partition.
    BalancingQueueType BalancingQueue(compareClusters);
    // Pre-populate priority queue with N slot blanks.
++  // CloneModule preserves definition order within a partition. Put the
++  // entire LLVM ownership cluster of each pinned value in object zero.
++  for (auto *GV : Pinned) {
++    if (ClusterIDMap.contains(GV))
++      continue;
++    ClusterIDMap[GV] = 0;
++    for (auto MI = GVtoClusterMap.findLeader(GV);
++         MI != GVtoClusterMap.member_end(); ++MI)
++      ClusterIDMap[*MI] = 0;
++  }
++  uint64_t PinnedWork = 0;
++  for (const auto &Entry : ClusterIDMap)
++    PinnedWork += partitionWork(Entry.first);
    for (unsigned i = 0; i < N; ++i)
-@@ -173,22 +204,29 @@
+-    BalancingQueue.push(std::make_pair(i, 0));
++    BalancingQueue.push({i, i == 0 ? PinnedWork : 0});
  
    SmallPtrSet<const GlobalValue *, 32> Visited;
  
@@ -81,7 +113,8 @@
 -  // When size is the same, use leader's name.
 +  SmallVector<std::pair<const GlobalValue *, uint64_t>> Clusters;
    for (const auto &C : GVtoClusterMap) {
-     if (!C->isLeader())
+-    if (!C->isLeader())
++    if (!C->isLeader() || ClusterIDMap.contains(C->getData()))
        continue;
 +    uint64_t Work = 0;
 +    for (auto MI = GVtoClusterMap.findLeader(*C);
@@ -109,7 +142,7 @@
           MI != GVtoClusterMap.member_end(); ++MI) {
        if (!Visited.insert(*MI).second)
          continue;
-@@ -196,10 +234,8 @@
+@@ -196,10 +245,8 @@
                          << ((*MI)->hasLocalLinkage() ? " l " : " e ") << "\n");
        Visited.insert(*MI);
        ClusterIDMap[*MI] = CurrentClusterID;
@@ -121,30 +154,46 @@
    }
  }
  
-@@ -236,7 +272,7 @@
+@@ -236,65 +283,59 @@
    return (R[0] | (R[1] << 8)) % N == I;
  }
  
 -void llvm::SplitModule(
 +void llvm::dccSplitModule(
      Module &M, unsigned N,
-     function_ref<void(std::unique_ptr<Module> MPart)> ModuleCallback,
-     bool PreserveLocals, bool RoundRobin) {
-@@ -256,38 +292,35 @@
+-    function_ref<void(std::unique_ptr<Module> MPart)> ModuleCallback,
+-    bool PreserveLocals, bool RoundRobin) {
+-  if (!PreserveLocals) {
+-    for (Function &F : M)
+-      externalize(&F);
+-    for (GlobalVariable &GV : M.globals())
+-      externalize(&GV);
+-    for (GlobalAlias &GA : M.aliases())
+-      externalize(&GA);
+-    for (GlobalIFunc &GIF : M.ifuncs())
+-      externalize(&GIF);
+-  }
+-
+-  // This performs splitting without a need for externalization, which might not
+-  // always be possible.
++    function_ref<void(Module &, bool)> ModuleCallback,
++    const SmallPtrSetImpl<const GlobalValue *> &Pinned) {
    ClusterIDMapType ClusterIDMap;
-   findPartitions(M, ClusterIDMap, N);
+-  findPartitions(M, ClusterIDMap, N);
++  findPartitions(M, ClusterIDMap, N, Pinned);
  
 -  // Find functions not mapped to modules in ClusterIDMap and count functions
 -  // per module. Map unmapped functions using round-robin so that they skip
 -  // being distributed by isInPartition() based on function name hashes below.
 -  // This provides better uniformity of distribution of functions to modules
 -  // in some cases - for example when the number of functions equals to N.
+-  if (RoundRobin) {
+-    DenseMap<unsigned, unsigned> ModuleFunctionCount;
+-    SmallVector<const GlobalValue *> UnmappedFunctions;
 +  // Place remaining definitions by instruction work rather than name hashes.
 +  // Weak definitions also need balancing; their symbol clusters are already
 +  // constrained by LLVM above. Cache weights so sorting does not rescan IR.
-   if (RoundRobin) {
--    DenseMap<unsigned, unsigned> ModuleFunctionCount;
--    SmallVector<const GlobalValue *> UnmappedFunctions;
++  {
 +    DenseMap<unsigned, uint64_t> ModuleWork;
 +    SmallVector<std::pair<const GlobalValue *, uint64_t>> UnmappedFunctions;
      for (const auto &F : M.functions()) {
@@ -182,12 +231,33 @@
      }
    }
  
-@@ -304,7 +337,7 @@
+-  // FIXME: We should be able to reuse M as the last partition instead of
+-  // cloning it. Note that the callers at the moment expect the module to
+-  // be preserved, so will need some adjustments as well.
++  SmallVector<bool> Occupied(N, false);
++  Occupied[0] = !M.getModuleInlineAsm().empty();
++  for (const auto &GV : M.global_values())
++    if (!GV.isDeclarationForLinker())
++      Occupied[ClusterIDMap.lookup(&GV)] = true;
++  unsigned Remaining = llvm::count(Occupied, true);
++  if (Remaining <= 1) {
++    ModuleCallback(M, true);
++    return;
++  }
++  for (auto &GV : M.global_values())
++    externalize(&GV);
+   for (unsigned I = 0; I < N; ++I) {
++    if (!Occupied[I]) continue;
+     ValueToValueMapTy VMap;
+     std::unique_ptr<Module> MPart(
+         CloneModule(M, VMap, [&](const GlobalValue *GV) {
+@@ -304,7 +345,7 @@
              return isInPartition(GV, I, N);
          }));
      if (I != 0)
 -      MPart->removeModuleInlineAsm();
+-    ModuleCallback(std::move(MPart));
 +      MPart->setModuleInlineAsm(StringRef());
-     ModuleCallback(std::move(MPart));
++    ModuleCallback(*MPart, --Remaining == 0);
    }
  }

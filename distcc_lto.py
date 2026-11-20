@@ -52,11 +52,8 @@ def llvm_tools(compiler):
     """Find the helpers registered with the compiler's own LLVM installation."""
     binary = shutil.which(compiler) or compiler
     bindir = Path(binary).resolve().parent
-    config = bindir / 'llvm-config'
-    if not config.is_file():
-        return None
-    directory = Path(subprocess.check_output([config, '--libdir'], text=True).strip()) / 'distcc'
-    paths = dict(plan=directory / 'distcc-lto', prepare=directory / 'lto-prepare.so',
+    plan = (bindir / 'distcc-lto').resolve()
+    paths = dict(plan=plan, prepare=plan.with_name('lto-prepare.so'),
                  linker=bindir / 'ld.lld', objcopy=bindir / 'llvm-objcopy')
     return paths if all(path.is_file() for path in paths.values()) else None
 
@@ -89,11 +86,14 @@ def stage_output(source, destination, stack):
 
 class FileJobs:
     """One serial distcc transport, with a separate enqueue and completion reply."""
-    def __init__(self, transport, env, pinned):
+    def __init__(self, transport, env, pinned, *, capacity=False):
         self.channel, child = socket.socketpair()
         try:
             with child:
-                self.process = subprocess.Popen([transport, '--file-jobs'], stdin=child.fileno(),
+                args = [transport, '--file-jobs']
+                if capacity:
+                    args.append('--lto-capacity')
+                self.process = subprocess.Popen(args, stdin=child.fileno(),
                                                 env=env, pass_fds=pinned)
         except BaseException:
             self.channel.close()
@@ -137,12 +137,25 @@ def distribute(request, kind, link=None):
     if not jobs:
         return 0
     transport = str(Path(__file__).resolve().with_name('distcc'))
-    capacity = json.loads(subprocess.check_output([transport, '--lto-capacity'], text=True))
-    slots = max(1, capacity['jobs'])
-    # A shard should also fit the slowest worker's share of the link, rather
-    # than giving equal-size shards to CPUs with unequal service times.
-    parallelism = capacity['work_rate'] / capacity['min_rate'] if capacity['min_rate'] else slots
-    with tempfile.TemporaryDirectory(prefix='distcc-lto-') as directory:
+    env = dict(os.environ)
+    env.pop('INCLUDE_SERVER_PORT', None)
+    pinned = {int(path.parent.name) for path in link.outputs.values()} if link else set()
+    with tempfile.TemporaryDirectory(prefix='distcc-lto-') as directory, ExitStack() as lanes:
+        idle = queue.LifoQueue()
+        def open_lane(capacity=False):
+            lane = FileJobs(transport, env, pinned, capacity=capacity)
+            lanes.callback(lane.close)
+            if env.get('DISTCC_VERBOSE') == '1':
+                print(f'{helper}: transport pid={lane.process.pid}', file=sys.stderr)
+            return lane
+
+        helper = 'distcc-thinlto' if kind == 4 else 'distcc-offload-link'
+        first_lane = open_lane(capacity=True)
+        with first_lane.channel.makefile('rb') as stream:
+            capacity = json.loads(stream.readline())
+        idle.put(first_lane)
+        slots = max(1, capacity['jobs'])
+        parallelism = capacity['work_rate'] / capacity['min_rate'] if capacity['min_rate'] else slots
         work = Path(directory)
         # Freeze every input before jobs publish any outputs. Fingerprinting
         # is deferred until transfer; local preparation needs no content key.
@@ -190,12 +203,6 @@ def distribute(request, kind, link=None):
             return max(task['instructions'] / total_instructions if total_instructions else 0,
                        task['bytes'] / total_bytes if total_bytes else 0)
 
-        helper = 'distcc-thinlto' if kind == 4 else 'distcc-offload-link'
-        env = dict(os.environ)
-        env.pop('INCLUDE_SERVER_PORT', None)
-        idle = queue.LifoQueue()
-        pinned = {int(path.parent.name) for path in link.outputs.values()} if link else set()
-
         def describe(index, task):
             jobdir = work / str(index)
             jobdir.mkdir()
@@ -222,10 +229,7 @@ def distribute(request, kind, link=None):
             try:
                 lane = idle.get_nowait()
             except queue.Empty:
-                lane = FileJobs(transport, env, pinned)
-                lanes.callback(lane.close)
-                if env.get('DISTCC_VERBOSE') == '1':
-                    print(f'{helper}: transport pid={lane.process.pid}', file=sys.stderr)
+                lane = open_lane()
             return lane, lane.submit([jobdir / 'job', inputs, *task['destinations']]), job
 
         def collect(started):
@@ -322,7 +326,7 @@ def distribute(request, kind, link=None):
 
         for task in jobs:
             enqueue('prepare' if task['partitions'] > 1 else 'backend', task, priority(task))
-        with ExitStack() as lanes, ThreadPoolExecutor(max_workers=slots) as pool:
+        with ThreadPoolExecutor(max_workers=slots) as pool:
             pending = {}
             while ready or pending:
                 while ready and len(pending) < slots:

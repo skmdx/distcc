@@ -183,7 +183,7 @@ static void dcc_show_hosts(void) {
     dcc_free_hostlist(list);
 }
 
-static void dcc_concurrency_level(int details) {
+static void dcc_concurrency_level(int details, int fd) {
     struct dcc_hostdef *list, *l;
     int nhosts;
     int nslots = 0;
@@ -195,9 +195,10 @@ static void dcc_concurrency_level(int details) {
         if (nslots < 0)
             dcc_exit(EXIT_CONNECT_FAILED);
         if (details) {
-            puts(capacity);
+            if (dprintf(fd, "%s\n", capacity) < 0)
+                dcc_exit(EXIT_IO_ERROR);
             free(capacity);
-        } else printf("%i\n", nslots);
+        } else dprintf(fd, "%i\n", nslots);
         return;
     }
     if (details) {
@@ -219,7 +220,7 @@ static void dcc_concurrency_level(int details) {
 
     dcc_free_hostlist(list);
 
-    printf("%i\n", nslots);
+    dprintf(fd, "%i\n", nslots);
 }
 
 #ifdef HAVE_GSSAPI
@@ -296,8 +297,11 @@ int main(int argc, char **argv)
         dcc_exit(dcc_rust_submit_cgu(argv[2], argv[3], argv[4]));
 
     /* Private transport entry point used by file-based compiler planners. */
-    if (argc == 2 && !strcmp(argv[1], "--file-jobs"))
+    if ((argc == 2 || (argc == 3 && !strcmp(argv[2], "--lto-capacity"))) &&
+        !strcmp(argv[1], "--file-jobs")) {
+        if (argc == 3) dcc_concurrency_level(1, STDIN_FILENO);
         dcc_exit(file_jobs(STDIN_FILENO));
+    }
     if (argc >= 6 && !strcmp(argv[1], "--file-job")) {
         long queued_fd = -1;
         if (strcmp(argv[4], "-")) {
@@ -356,7 +360,7 @@ int main(int argc, char **argv)
         }
 
         if (!strcmp(argv[1], "-j") || !strcmp(argv[1], "--lto-capacity")) {
-            dcc_concurrency_level(!strcmp(argv[1], "--lto-capacity"));
+            dcc_concurrency_level(!strcmp(argv[1], "--lto-capacity"), STDOUT_FILENO);
             ret = 0;
             goto out;
         }
