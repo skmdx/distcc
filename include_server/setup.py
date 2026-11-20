@@ -31,8 +31,11 @@ is absolutized.
 
 __author__ = 'Manos Renieris and Nils Klarlund'
 
-import copy
+import hashlib
+from pathlib import Path
+import re
 import setuptools
+from setuptools._distutils.ccompiler import gen_preprocess_options
 from setuptools.command.build_ext import build_ext
 import doctest
 import glob
@@ -221,6 +224,7 @@ scanner = setuptools.Extension(
 # Worker code generation must use the requested compiler's LLVM release.
 # Loading another release would silently change bitcode and optimization semantics.
 frontends = []
+source_flags = {}
 codegen_sources = [os.path.join(srcdir_include_server, 'c_extensions', 'clang_codegen.cpp'),
                    os.path.join(srcdir, 'src', 'lto_partition.cc'),
                    os.path.join(os.environ.get('LTO_BUILD', 'llvm-lto'), 'SplitModule.cpp')]
@@ -241,15 +245,18 @@ for config in (os.environ.get('DISTCC_CLANG_CONFIGS') or llvm_config).split(os.p
   if sysroot and bindir.startswith(sysroot + '/'):
     bindir = bindir[len(sysroot):]
   codegen_macros: list[tuple[str, str | None]] = [('DCC_LLD_PATH', '"' + os.path.join(bindir, 'ld.lld') + '"')]
+  module = 'include_server.clang' + major + '.clang_compile'
+  binding = os.path.join(srcdir_include_server, 'c_extensions', 'clang_compile.cpp')
+  source_flags[module, binding] = ['-DDCC_CLANG_COMPILE_MODULE=1']
   frontends.append(setuptools.Extension(
-      name='include_server.clang' + major + '.clang_compile',
-      sources=[os.path.join(srcdir_include_server, 'c_extensions', 'clang_compile.cpp')] + codegen_sources + worker_sources,
+      name=module,
+      sources=[binding] + codegen_sources + worker_sources,
       depends=frontend_headers + codegen_headers + worker_headers,
       language='c++', include_dirs=[llvm_option('--includedir', config), os.path.join(srcdir, 'src')],
       library_dirs=[library], runtime_library_dirs=[runtime],
       libraries=['clang-cpp', 'lldELF', 'lldCommon', 'LLVM'],
       extra_compile_args=cxxflags + ['-g0'], extra_link_args=cxxflags,
-      define_macros=[('DCC_CLANG_COMPILE_MODULE', '1')] + codegen_macros,
+      define_macros=codegen_macros,
   ))
   frontends.append(setuptools.Extension(
       name='include_server.clang' + major + '.clang_native',
@@ -267,12 +274,51 @@ for config in (os.environ.get('DISTCC_CLANG_CONFIGS') or llvm_config).split(os.p
       define_macros=codegen_macros,
   ))
 
-class VersionedBuildExt(build_ext):
-  def build_extension(self, ext):
-    # The same source has different LLVM headers and module entry points.
-    command = copy.copy(self)
-    command.build_temp = os.path.join(self.build_temp, ext.name)
-    build_ext.build_extension(command, ext)
+def make_word(path):
+  return str(path).replace('$', '$$').replace('#', '\\#').replace(' ', '\\ ')
+
+
+class SharedBuildExt(build_ext):
+  """Let GNU Make schedule each distinct compilation; setuptools links and installs."""
+  def build_extensions(self):
+    rules = {}
+    for module in self.extensions:
+      options = gen_preprocess_options(module.define_macros + self.compiler.macros,
+                                       module.include_dirs + self.compiler.include_dirs)
+      objects = []
+      for source in module.sources:
+        cxx = self.compiler.detect_language(source) == 'c++'
+        compiler = self.compiler.compiler_so_cxx if cxx else self.compiler.compiler_so
+        flags = [*compiler, *options, *module.extra_compile_args,
+                 *source_flags.get((module.name, source), [])]
+        # Include the source and the full compile command in the identity.
+        key = hashlib.sha256(os.fsencode(shlex.join([*flags, os.path.abspath(source)]))).hexdigest()
+        obj = Path(self.build_temp) / key / (Path(source).stem + '.o')
+        objects.append(str(obj))
+        if obj in rules:
+          continue
+        obj.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [*flags, '-MMD', '-MP', '-c', source, '-o', str(obj)]
+        rules[obj] = f'{make_word(obj)}: {make_word(source)}\n\t' + shlex.join(cmd).replace('$', '$$')
+      module.sources = []
+      module.extra_objects.extend(objects)
+      module.depends.extend(objects)
+    # Recursive Make shares the parent's jobserver, including pipe descriptors
+    # on GNU Make versions before named FIFOs. Standalone builds use MAKEOPTS.
+    flags = shlex.split(os.environ.get('MAKEFLAGS','').partition(' -- ')[0])
+    auth = next((s.split('=',1)[1] for s in flags if s.startswith('--jobserver-auth=')), '')
+    fds = tuple(map(int,auth.split(','))) if re.fullmatch(r'\d+,\d+',auth) else ()
+    make = shlex.split(os.environ.get('MAKE','make'))
+    if not auth and not any(s.startswith(('-j','--jobs')) for s in flags):
+      options = shlex.split(os.environ.get('MAKEOPTS',''))
+      make.extend(options)
+      if not any(s.startswith(('-j','--jobs')) for s in options):
+        make.append('-j' + str(len(os.sched_getaffinity(0))))
+    graph = ['.DELETE_ON_ERROR:', '.PHONY: all', 'all: ' + ' '.join(map(make_word,rules)),
+             *rules.values(), '-include ' + ' '.join(make_word(p.with_suffix('.d')) for p in rules)]
+    subprocess.run([*make, *(['-B'] if self.force else []), '-f','-', 'all'],
+                   input='\n'.join(graph)+'\n', text=True, pass_fds=fds, check=True)
+    super().build_extensions()
 
 
 args = {
@@ -288,7 +334,7 @@ args = {
     'packages': ['include_server'],
     'package_data': {'include_server': ['*.pyi']},
     'ext_modules': [ext, scanner, *frontends],
-    'cmdclass': {'build_ext': VersionedBuildExt},
+    'cmdclass': {'build_ext': SharedBuildExt},
     'install_requires': ['xxhash>=3.0.0'],
 }
 
