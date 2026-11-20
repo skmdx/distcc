@@ -1344,11 +1344,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     int i, slots, available = 0, ready_hosts = 0, abi_mismatches = 0, pending_cgu_probe = 0;
     double work_rate = 0, min_rate = 0;
     struct selection {
-        int peer, probe, wait, idle, enqueue;
+        int peer, probe, wait, idle, enqueue, direct;
         double score, fill, marginal_factor;
         struct prediction forecast;
-    } best = {.peer = -1}, ready = {.peer = -1}, affinity = {.peer = -1},
-      completion = {.peer = -1};
+    } best = {.peer = -1}, ready = {.peer = -1}, affinity = {.peer = -1};
     int direct = client->command == TRY_LOCAL;
     if (direct) {
         for (i = 0; i < broker->count; ++i)
@@ -1481,13 +1480,16 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         }
         if (memory_full || p->valid_until < 0) continue; /* Admission was refused: refresh first. */
         int staged = p->host->tcp_jobs;
+        int local_exec = p->local && staged && (direct ||
+            (client->can_compile_locally && cap && cap->busy >= 0 &&
+             (client->command == ACQUIRE_CPP || client->command == ACQUIRE_READY)));
         int predicted = staged && cap && cost > 0 && !link;
         int blocked = 0;
         if (cap && (cap->capacity == 0 || cap->memory_pressure >= 10)) continue;
         if (cap && cap->available == 0 && !staged) continue;
         if (p->full_until > now || (link && p->link_until > now)) continue;
         int capacity = cap && cap->capacity >= 0 && cap->capacity < slots ? cap->capacity : slots;
-        int pipeline = link_backend ? 0 : pipeline_slots(p->host, capacity);
+        int pipeline = link_backend || local_exec ? 0 : pipeline_slots(p->host, capacity);
         int inflight = slots + pipeline;
         int work = p->busy;
         if (staged && cap && cap->busy >= 0 && cap->queued >= 0 && cap->preparing >= 0) {
@@ -1564,7 +1566,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 score = forecast.finish;
                 wait = forecast.start > forecast.prepare + .02;
             } else if (cost > 0) score *= cost;
-            if (staged && cap && client->hint.key && !link) {
+            if (staged && cap && (client->hint.key || local_exec) && !link) {
                 /* Large workers may fill their bounded preparation queue;
                  * small workers and link backends keep jobs movable until an
                  * execution lane opens. Completion forecasts rank candidates
@@ -1611,7 +1613,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                     /* All times are relative to this dispatch. Convert the
                      * overlap to units of work before pricing the remainder
                      * on an empty host. Unleased tasks use typical service. */
-                    double end = lane_ready(&p->schedule.cpu, 1);
+                    /* Below one runnable job per physical core, the remaining
+                     * leases need not share our execution resources. */
+                    unsigned cores = cap->cores > 0 ? (unsigned)cap->cores : 1;
+                    double end = lane_ready(&p->schedule.cpu, cores);
                     if (external > 0) {
                         const struct dcc_work_class *learned = &broker->model.classes[client->hint.kind - 1];
                         double competing = (p->mean_cost > 0 ? p->mean_cost : learned->z / learned->weight) * prior_factor;
@@ -1634,22 +1639,19 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;
             rs_trace("candidate host=%s work=%d capacity=%d cost=%.3f factor=%.3f prepare=%.3f start=%.3f score=%.3f wait=%d "
-                     "finish=%.6f blocked=%d busy=%d preparing=%d queued=%d leases=%d direct=%d cpp=%d planned=%u "
+                     "finish=%.6f blocked=%d enqueue=%d busy=%d preparing=%d queued=%d leases=%d direct=%d cpp=%d planned=%u "
                      "now=%.6f client=%td request=%.6f key=%llx",
                      p->host->hostname, work, cap ? cap->capacity : -1, cost,
                      forecast.factor, forecast.prepare, forecast.start, score, wait,
-                     forecast.finish, blocked, cap ? cap->busy : -1, cap ? cap->preparing : -1,
+                     forecast.finish, blocked, enqueue, cap ? cap->busy : -1, cap ? cap->preparing : -1,
                      cap ? cap->queued : -1, p->busy, p->direct, p->local ? broker->cpp_busy : 0, batch->count,
                      now, client - broker->clients, client->waiting_since,
                      (unsigned long long)client->hint.key);
             /* Without any input description there is no completion estimate
              * with which to justify waiting instead of using an idle CPU. */
             int idle = !cost && staged && cap && !blocked && work < dcc_capacity_jobs(p->host, cap);
-            struct selection candidate = {i, probe, wait, idle, enqueue, score, fill, marginal_factor, forecast};
-            if (locality && completion_model && predicted &&
-                (completion.peer < 0 || forecast.finish < completion.forecast.finish ||
-                 (forecast.finish == completion.forecast.finish && (!wait || enqueue))))
-                completion = candidate;
+            struct selection candidate = {i, probe, wait, idle, enqueue, local_exec,
+                                          score, fill, marginal_factor, forecast};
             int warm = (locality && (i == previous || batch->owners[owner_slot(batch, i, &client->hint)])) ||
                        (!direct && !link && warm_scope(batch, p, i, client->hint.scope_key));
             if (warm && staged && predicted && (!wait || enqueue) &&
@@ -1678,20 +1680,16 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
      * shorter latency cannot justify choosing a slower ready alternative. */
     /* A cold prior cannot justify leaving a worker idle. ThinLTO modules
      * with measured costs can wait for a faster lane at the link barrier. */
-    /* Only a trained, waitable source request can prefer a full pipeline to
-     * every admissible peer on elapsed time. On ties keep capacity busy. */
-    if (completion.peer >= 0 && completion.wait && !completion.enqueue)
-        best = completion;
-    else if (best.wait && ready.peer >= 0 &&
+    if (best.wait && ready.peer >= 0 &&
         ((link_backend && !thinlto) || (compare_finish && !completion_model) ||
-         (completion.peer >= 0 && !best.enqueue) ||
          best.forecast.finish >= ready.forecast.finish))
         best = ready;
     /* Prefer an already populated, no-slower worker only inside its existing
      * immediate admission/pipeline bounds. Never wait for locality, increase
      * the pipeline, or pin a repeat to a slower owner. No speculative cache
      * speedup is subtracted from the normal execution-cost model. */
-    if (affinity.peer >= 0 && best.peer >= 0 && (!best.wait || best.enqueue) && affinity.peer != best.peer &&
+    if (affinity.peer >= 0 && best.peer >= 0 && affinity.peer != best.peer &&
+        (!best.wait || affinity.forecast.finish <= best.forecast.finish) &&
         affinity.forecast.factor <= best.forecast.factor &&
         affinity.marginal_factor <= best.marginal_factor) {
         rs_trace("source affinity: key=%llx host=%s instead=%s",
@@ -1754,9 +1752,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                  p->host->hostname, cost, best.score, now - client->waiting_since,
                  (unsigned long long)client->hint.key, client->hint.work_units,
                  now, client - broker->clients, client->waiting_since);
-        client->direct = direct || (client->can_compile_locally && p->local && p->host->tcp_jobs &&
-            p->valid_until > now && p->metrics.busy >= 0 &&
-            (client->command == ACQUIRE_CPP || client->command == ACQUIRE_READY));
+        client->direct = best.direct;
         if (!client->direct) {
             client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
                                 p->admission_supported && p->pool_supported >= 0;

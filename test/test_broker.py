@@ -517,6 +517,33 @@ class BrokerDirectTest(BrokerTestCase):
         lease, net = self.acquire_reserved(9, (130, 1024, 4), 1024)
         self.assertEqual(net.getpeername()[1], self.ports[0])
 
+    def test_local_direct_uses_cpu_lanes_without_tcp_staging(self):
+        peer = self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                         busy=0, queued=0, preparing=0, returning=0, running=0))
+        for command in (9, 10):
+            with self.subTest(command=command):
+                self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name=f'direct-{command}')
+                def direct(key):
+                    return self.request(command | (1 << 16), (key, 1048576, 5))
+                leases = []
+                for i in range(4):
+                    lease = direct(i+1)
+                    self.assertEqual(self.receive(lease), (0, 1 << 29, []))
+                    leases.append(lease)
+                # The same peer can stage a TCP backend with all CPUs leased.
+                backend, _ = self.acquire_reserved(command, (5, 1048576, 5))
+                backend.close()
+                waiting = direct(6)
+                waiting.settimeout(.1)
+                with self.assertRaises(socket.timeout):
+                    waiting.recv(1032)
+                leases.pop().close()
+                waiting.settimeout(3)
+                self.assertEqual(self.receive(waiting), (0, 1 << 29, []))
+                waiting.close()
+                for lease in leases:
+                    lease.close()
+
 
 class BrokerPlacementTest(BrokerTestCase):
     worker_count = 3
@@ -1359,34 +1386,65 @@ class BrokerTest(BrokerTestCase):
                 _, net = self.acquire_reserved(10, (2100, size * 1048576, 5))
                 self.assertEqual(net.getpeername()[1], self.ports[expected])
 
-    def test_trained_source_waits_for_full_fast_pipeline_only_for_long_job(self):
-        def fast(busy, queued):
-            return stats_response(cpus=4, cores=2, jobs=4, capacity=4, running=busy,
-                                  busy=busy, queued=queued, preparing=0, returning=0)
+    def test_smt_contention_ends_when_a_physical_core_is_free(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        peer = self.peer(stats_response(cpus=4, cores=2, jobs=4, capacity=4,
+                         busy=0, queued=0, preparing=0, returning=0, running=0))
+        for long_leases in (1, 2):
+            with self.subTest(long_leases=long_leases):
+                name = f'physical-{long_leases}'
+                self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name=name)
+                mib = 1024**2
+                seed, net = self.acquire_reserved(10, (201, mib, 5))
+                seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 8_000_000_000, 0)],
+                             [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+                self.assertEqual(seed.recv(1), b'')
+                for i in range(4):
+                    size, kind = (128*mib, 5) if i < long_leases else (1024, 1)
+                    self.acquire_reserved(10, (202+i, size, kind))
+                self.acquire_reserved(10, (201, mib, 5))
+                row = next(s for s in reversed((self.work/f'{name}.log').read_text().splitlines())
+                           if 'candidate host=' in s and 'key=c9' in s)
+                values = dict(re.findall(r'(\w+)=([\d.]+)', row))
+                start, finish, cost, factor = (float(values[k]) for k in ('start','finish','cost','factor'))
+                self.assertGreater(factor, 1)
+                if long_leases == 1:
+                    self.assertLess(abs(finish-start-cost), abs(finish-start-cost*factor))
+                else:
+                    self.assertAlmostEqual(finish-start, cost*factor, places=2)
 
-        fast_peer = self.peer(fast(4, 1))
+    def test_trained_source_placement_is_independent_of_staging_availability(self):
+        def fast(busy, preparing):
+            return stats_response(cpus=4, cores=2, jobs=4, capacity=4, running=busy,
+                                  busy=busy, queued=0, preparing=preparing, returning=0)
+
+        fast_peer = self.peer(fast(4, 0))
         slow_peer = self.peer(stats_response(cpus=2, cores=2, jobs=2, capacity=2, running=0,
                               busy=0, queued=0, preparing=0, returning=0))
-        self.start_broker(self.host(0, f',tcp,stats={fast_peer.port}', slots=4) + ' ' +
-                          self.host(1, f',tcp,stats={slow_peer.port},speed=.6', slots=2))
-        seed, net = self.acquire_reserved(10, (2101, 1048576, 5))
-        self.assertEqual(net.getpeername()[1], self.ports[1])
-        seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 1_000_000_000, 0)],
-                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
-        self.assertEqual(seed.recv(1), b'')
-        short, net = self.acquire_reserved(10, (2102, 1048576, 5))
-        self.assertEqual(net.getpeername()[1], self.ports[1])
-        short.close()
-        long_job = self.request(10, (2103, 128 * 1048576, 5))
-        long_job.settimeout(.1)
-        with self.assertRaises(socket.timeout):
-            long_job.recv(1032)
-        fast_peer.response = fast(0, 0)
-        long_job.settimeout(5)
-        status, _, fds = self.receive(long_job)
-        self.assertEqual(status, 0)
-        with socket.socket(fileno=fds[0]) as selected:
-            self.assertEqual(selected.getpeername()[1], self.ports[0])
+        for preparing in (0, 1):
+            with self.subTest(preparing=preparing):
+                fast_peer.response = fast(4, preparing)
+                self.start_broker(self.host(0, f',tcp,stats={fast_peer.port}', slots=4) + ' ' +
+                                  self.host(1, f',tcp,stats={slow_peer.port},speed=.6', slots=2), name=f'staging-{preparing}')
+                seed, net = self.acquire_reserved(10, (2101, 1048576, 5))
+                self.assertEqual(net.getpeername()[1], self.ports[1])
+                seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 1_000_000_000, 0)],
+                             [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+                self.assertEqual(seed.recv(1), b'')
+                short, net = self.acquire_reserved(10, (2102, 1048576, 5))
+                self.assertEqual(net.getpeername()[1], self.ports[1])
+                short.close()
+                long_job = self.request(10, (2103, 128 * 1048576, 5))
+                if preparing:
+                    long_job.settimeout(.1)
+                    with self.assertRaises(socket.timeout):
+                        long_job.recv(1032)
+                    fast_peer.response = fast(0, 0)
+                long_job.settimeout(5)
+                status, _, fds = self.receive(long_job)
+                self.assertEqual(status, 0)
+                with socket.socket(fileno=fds[0]) as selected:
+                    self.assertEqual(selected.getpeername()[1], self.ports[0])
 
     def test_job_cost_learns_execution_cost(self):
         peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
