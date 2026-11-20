@@ -256,6 +256,7 @@ struct Invocation {
     fs::path source, outdir = fs::current_path(), scope;
     string single_output, target, sysroot, name, opt = "0", cpu, linker;
     std::set<fs::path> inputs, search, native_search, dirs;
+    std::map<fs::path, fs::path> observed;
     std::set<string> libraries;
     bool trace_macro = false, needs_host = false, static_archive = false, pipeline = false;
     bool multi_cgu = true, incremental = false, linker_plugin_lto = false;
@@ -521,7 +522,7 @@ struct Invocation {
         }
         if (!any)
             throw Local("empty dependency records");
-        needs_host |= audit(depfile, loads.fd, root, search, inputs, dirs);
+        needs_host |= audit(depfile, loads.fd, root, search, inputs, dirs, observed);
         if (needs_host) {
             for (auto key : {"CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "OUT_DIR"})
                 if (getenv(key))
@@ -614,7 +615,7 @@ class Inputs {
 
   public:
     std::vector<dcc_job_input> files;
-    Inputs(const std::set<fs::path> &paths, timespec start) {
+    Inputs(const std::set<fs::path> &paths, const std::map<fs::path, fs::path> &observed, timespec start) {
         if (paths.size() > DCC_JOB_INPUT_MAX)
             throw Local("too many Rust inputs");
         Digests digests;
@@ -627,6 +628,12 @@ class Inputs {
                 throw Local("unavailable Rust input " + p.string());
             held.emplace_back(opened);
             int fd = held.back().fd;
+            // A parent symlink may have changed since the journal was
+            // resolved. Check the opened descriptor before hashing its data.
+            auto observation = observed.find(p);
+            if (observation != observed.end() &&
+                fs::read_symlink("/proc/self/fd/" + std::to_string(fd)) != observation->second)
+                throw Local("input changed during dependency discovery: " + p.string());
             auto st = descriptor_state(fd);
             auto after = [&](timespec t) {
                 return t.tv_sec > start.tv_sec || (t.tv_sec == start.tv_sec && t.tv_nsec > start.tv_nsec);
@@ -1052,12 +1059,25 @@ bool small_crate(const fs::path &source, uintmax_t bytes) {
         return false;
     // Cargo normally puts a crate's modules beside its entry point. Stop as
     // soon as their combined size justifies scheduling individual CGUs.
-    auto root = fs::absolute(source).parent_path();
+    auto entry = fs::absolute(source);
+    auto root = entry.parent_path();
     std::error_code ec;
+    bool package = fs::exists(root / "Cargo.toml", ec);
+    if (ec) return false;
+    bool package_main = package && (entry.stem() == "lib" || entry.stem() == "main");
+    if (package && !package_main) {
+        root /= entry.stem();
+        if (!fs::is_directory(root, ec))
+            return !ec || ec == std::errc::no_such_file_or_directory;
+    }
     fs::recursive_directory_iterator it(root, ec), end;
     while (!ec && it != end) {
-        if (it->path().extension() == ".rs" && it->path() != root / source.filename() &&
-            it->is_regular_file(ec)) {
+        const auto &path = it->path();
+        auto name = path.filename().string();
+        if (name.front() == '.' || name == "target" ||
+            (package_main && it.depth() == 0 && (name == "tests" || name == "benches" || name == "examples")))
+            it.disable_recursion_pending();
+        if (path.extension() == ".rs" && path != entry && it->is_regular_file(ec)) {
             auto size = it->file_size(ec);
             if (ec || size > limit - bytes)
                 return false;
@@ -1189,7 +1209,7 @@ int distributed(char **original, const Words &args, const States &responses) {
         pairs.insert(pairs.end(), {k, v});
     auto destinations = pointers(pairs);
     job.destinations = destinations.data();
-    Inputs inputs(inv.inputs, start);
+    Inputs inputs(inv.inputs, inv.observed, start);
     job.count = inputs.files.size();
     job.inputs = inputs.files.data();
     hint.bytes = std::max<uint64_t>(1, dcc_resource_input_bytes(&job));

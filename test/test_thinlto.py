@@ -568,6 +568,50 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
     def test_partitioned_backend_preserves_compiler_used_section(self):
         self.check_used_section(retain=False)
 
+    def test_rust_linker_plugin_assembly_partitioning(self):
+        rustc = shutil.which('rustc')
+        if not rustc or os.uname().machine != 'x86_64':
+            self.skipTest('x86-64 rustc required')
+        version = subprocess.check_output([rustc, '-vV'], text=True)
+        llvm = next(line.split(': ')[1].split('.')[0] for line in version.splitlines()
+                    if line.startswith('LLVM version: '))
+        compiler = shutil.which('clang-' + llvm)
+        if not compiler:
+            self.skipTest('Clang matching rustc required')
+        tools = llvm_tools(compiler)
+        if not tools:
+            self.skipTest('LLVM partition helper matching rustc required')
+        src, module = self.work/'ops.rs', self.work/'ops.bc'
+        main = self.work/'main.c'
+        main.write_text('unsigned intel(unsigned), att(unsigned);\n'
+                        'int main(void) {return intel(21) != 42 || att(11) != 22;}\n')
+        functions = '''
+            #![no_std]
+            #![allow(named_asm_labels)]
+            use core::arch::asm;
+            #[no_mangle] pub extern "C" fn intel(mut n:u32)->u32 {
+                unsafe {asm!("mov eax, {0:e}", "add {0:e}, eax", inout(reg) n,
+                             out("eax") _, options(nomem, nostack))}; n
+            }
+            #[no_mangle] pub extern "C" fn att(mut n:u32)->u32 {
+                unsafe {asm!("mov {0:e}, %eax", "add %eax, {0:e}", inout(reg) n,
+                             out("eax") _, options(att_syntax, nomem, nostack))}; n
+            }'''
+        for extra in ('', 'asm!("call outside")', 'asm!("mov eax, %eax", options(att_syntax))',
+                      'asm!(".pushsection extra", ".popsection")', 'asm!("private_label:")'):
+            with self.subTest(extra=extra):
+                src.write_text(functions + ('\n#[no_mangle] pub unsafe fn other(){' + extra + ';}' if extra else ''))
+                subprocess.run([rustc, '--edition=2021', '--crate-type=lib', '-Cpanic=abort',
+                                '-Clinker-plugin-lto', '-Ccodegen-units=1', '--emit=obj', src, '-o', module],
+                               check=True)
+                plan = subprocess.check_output([tools['plan'], 'split', module, '2', self.work/'part'])
+                parts = json.loads(plan)['parts']
+                self.assertEqual(len(parts), 1 if extra else 2)
+                if not extra:
+                    output = self.work/'check-asm'
+                    subprocess.run([compiler, main, *(p['path'] for p in parts), '-o', output], check=True)
+                    subprocess.run([output], check=True)
+
     def check_used_section(self, retain):
         compiler = shutil.which('clang')
         if not llvm_tools(compiler):

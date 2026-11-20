@@ -1,4 +1,5 @@
 #include "lto_partition.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/GlobalAlias.h"
@@ -9,6 +10,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/Object/ModuleSymbolTable.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Regex.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
@@ -19,16 +21,47 @@
 
 using namespace llvm;
 
-// Function asm is an operand template, not module asm that can be fed to
-// CollectAsmSymbols. Accept instruction-only AT&T templates on ELF x86.
-// Operands may refer to IR operands, literal numbers, or a numeric label
-// resolved within this template. Named definitions and cross-template
-// references lack IR ownership and stay in one object.
+// Only architectural register spellings are independent of the symbol table.
+// AT&T requires '%' even for a name like eax, which alone is a memory symbol.
+static bool registerOperand(StringRef word) {
+  static const Regex registers(
+      "^([re]?([abcd]x|[sb]p|[sd]i|ip)|[abcd][lh]|[sb]pl|[sd]il|"
+      "r([89]|[12][0-9]|3[01])([bwd])?|[cdefgs]s|"
+      "[xyz]mm([0-9]|[12][0-9]|3[01])|mm[0-7]|k[0-7]|tmm[0-7]|st)$",
+      Regex::IgnoreCase);
+  return registers.match(word);
+}
+
+// Recognize LLVM operand substitutions before scanning assembly tokens.
+// Printed IR operands retain their IR ownership through SplitModule.
+static bool independentOperands(StringRef args, bool intel) {
+  static const Regex operand(R"(^\$([0-9]+|\{[0-9]+(:[a-zA-Z])?\})$)");
+  constexpr StringLiteral separators(" \t(),*+-[]");
+  static constexpr StringLiteral widths[] = {"byte", "word", "dword", "qword", "tbyte",
+                                             "xmmword", "ymmword", "zmmword"};
+  while (!(args = args.ltrim(separators)).empty()) {
+    auto word = args.take_front(args.find_first_of(separators));
+    args = args.drop_front(word.size());
+    if (!intel) word.consume_front("$$"); // IR-escaped immediate prefix
+    uint64_t value;
+    if (!word.getAsInteger(0, value) || operand.match(word)) continue;
+    if (!intel && !word.consume_front("%")) return false;
+    if (registerOperand(word)) continue;
+    // In Intel syntax a size qualifier must introduce a memory operand.
+    if (!intel || !llvm::is_contained(widths, word.lower()))
+      return false;
+    args = args.ltrim();
+    if (!args.consume_front_insensitive("ptr") || !args.ltrim().starts_with("[")) return false;
+  }
+  return true;
+}
+
+// Named definitions and cross-template references lack IR ownership.
 static bool independentAsm(const Module &module, const InlineAsm &assembly) {
   StringRef text = assembly.getAsmString().trim();
   if (text.empty()) return true;
   if (!module.getTargetTriple().isX86() || !module.getTargetTriple().isOSBinFormatELF() ||
-      assembly.getDialect() != InlineAsm::AD_ATT || !module.getModuleInlineAsm().empty())
+      !module.getModuleInlineAsm().empty())
     return false;
   unsigned defined = 0, forward = 0;
   while (!text.empty()) {
@@ -57,7 +90,7 @@ static bool independentAsm(const Module &module, const InlineAsm &assembly) {
         unsigned label = 1u << (args[0] - '0');
         if (args[1] == 'f') forward |= label;
         else if (!(defined & label)) return false;
-      } else if (args.find_first_not_of("0123456789(),$*+- \t") != StringRef::npos)
+      } else if (!independentOperands(args, assembly.getDialect() == InlineAsm::AD_Intel))
         return false;
     }
   }
@@ -79,12 +112,14 @@ dcc_split_module(Module &module, unsigned count,
   // Function assembly may also define symbols referenced elsewhere in this
   // module. LLVM IR does not describe those edges; splitting can turn a local
   // assembler definition into an unresolved reference in another object.
+  SmallPtrSet<const InlineAsm *, 16> inspected;
   for (const auto &function : module)
     for (const auto &block : function)
       for (const auto &instruction : block)
         if (const auto *call = dyn_cast<CallBase>(&instruction))
           if (const auto *assembly = dyn_cast<InlineAsm>(call->getCalledOperand()))
-            if (!independentAsm(module, *assembly)) keepTogether = true;
+            if (!keepTogether && inspected.insert(assembly).second && !independentAsm(module, *assembly))
+              keepTogether = true;
   if (!module.getModuleInlineAsm().empty()) {
     InitializeAllTargetInfos();
     InitializeAllTargetMCs();

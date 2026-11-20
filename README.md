@@ -91,7 +91,10 @@ directly. For multiple partitions, a relocatable merge restores private symbol b
 before LLD consumes the result. Constructors, TLS and exception handling retain
 their original link semantics. Assembly with private definitions or per-object
 weak/versioned references stays together; LLVM's assembler identifies these
-cases. LLVM's symbol clusters and remaining functions are placed largest-first
+cases. On x86 ELF, instruction templates using AT&T or Intel register syntax
+and LLVM operand substitutions can be partitioned. Direct references to named
+assembly symbols and section changes keep a module together.
+LLVM's symbol clusters and remaining functions are placed largest-first
 on the partition with the least instruction work, including weak definitions.
 Individual functions and the final native layout are not subdivided.
 
@@ -183,11 +186,15 @@ consumer, the client runs the dependency pass in a read-only bubblewrap mount
 namespace with a seccomp filter. The preload library journals paths after a
 procedural macro loads, including library dependencies and attempted writes.
 A worker with the same rustc host triple receives the macro and its inputs.
-The journal can discover upstream source files in the build trees exported
-through `DISTCC_FRONTEND_ROOTS`, including the Gentoo package work directory.
+The journal also discovers regular files in the Cargo package directory, Cargo's
+registry source cache and the Portage work directory. A symlink in the path to
+one of these directories preserves access to the same source tree.
 Each installed LLVM slot advertises its major and minor version and registered
 targets. Patch releases within a slot can exchange CGUs. For large multi-CGU
 builds the client estimates source size across the entry point's module tree.
+At a package root, a build script counts its own source and the same-named
+module directory. Package-root libraries and executables exclude tests, benches
+and examples. The estimate skips hidden directories and Cargo target directories.
 With available peers, it runs a
 single rustc frontend and sends individual LLVM modules for optimization and
 object generation. A local frontend can run a procedural macro even when

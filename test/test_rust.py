@@ -292,6 +292,10 @@ class RustTest(BrokerTestCase):
             (directory/'Cargo.toml').write_text(f'[package]\nname="{crate}"\nversion="0.1.0"\n'
                                                 'edition="2021"\n[lib]\npath="lib.rs"\n')
             (directory/'lib.rs').write_text('pub fn answer(x: u64) -> u64 { x + 42 }')
+        for unrelated in ('tests', 'benches', 'examples', 'nested/target', 'nested/.cache'):
+            ignored = self.work / crates[0] / unrelated
+            ignored.mkdir(parents=True)
+            (ignored/'large.rs').write_text('//' + 'x' * 65536)
         env = dict(self.env, RUSTC=self.rustc, RUSTC_WRAPPER=str(self.build/'distcc'),
                    CARGO_INCREMENTAL='1', RUSTFLAGS='-Ccodegen-units=256')
         result = subprocess.run(['cargo', 'build', '-vv', '--offline', '-j8'], cwd=self.work,
@@ -304,6 +308,26 @@ class RustTest(BrokerTestCase):
         after = self.completed_jobs()
         self.assertTrue(all(b > a for a, b in zip(counts, after)), (counts, after))
         self.assertEqual(sum(after) - sum(counts), len(crates))
+
+    def test_small_build_script_beside_large_crate(self):
+        self.cgu_toolchain()
+        self.start_broker(' '.join(self.host(i, f',tcp,stats={p}', slots=2)
+                                   for i, p in enumerate(self.stats_ports)), name='build-script')
+        (self.work/'Cargo.toml').write_text('[package]\nname="consumer"\nversion="0.1.0"\nedition="2021"\n')
+        (self.work/'build.rs').write_text('fn main(){println!("cargo:rustc-env=BUILT=42");}')
+        src = self.work / 'src'
+        src.mkdir()
+        (src/'main.rs').write_text('mod large; fn main(){assert_eq!(large::answer(), env!("BUILT"));}')
+        (src/'large.rs').write_text('pub fn answer()->&\'static str {"42"}\n//' + 'x' * 65536)
+        env = dict(self.env, RUSTC=self.rustc, RUSTC_WRAPPER=str(self.build/'distcc'),
+                   CARGO_INCREMENTAL='0', RUSTFLAGS='-Ccodegen-units=8 -Copt-level=1')
+        result = subprocess.run(['cargo', 'build', '-vv', '--offline'], cwd=self.work,
+                                env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        script = next(job for job in result.stderr.split('     Running `')
+                      if ' --crate-name build_script_build ' in job)
+        self.assertIn('distcc-rust: compiled on', script)
+        subprocess.run([self.work/'target/debug/consumer'], check=True)
 
     def test_parallel_cgu_backend(self):
         version, backend = self.cgu_toolchain()
@@ -1425,13 +1449,49 @@ class RustTest(BrokerTestCase):
         self.assertEqual(status,121,err)
         self.assertFalse(outputs)
 
+    def test_cargo_upstream_span_source_text(self):
+        home = self.work / 'home'
+        home.mkdir()
+        (self.work/'storage').mkdir()
+        (home/'.cargo').symlink_to(self.work/'storage', target_is_directory=True)
+        upstream = home/'.cargo/registry/src/fixture/source-1.0.0'
+        macro = self.work/'text'
+        app = self.work/'consumer'
+        for path, name, manifest in ((upstream, 'source', ''), (macro, 'text', '[lib]\nproc-macro=true'),
+                                     (app, 'consumer', f'[dependencies]\nsource={{path="{upstream}"}}\n'
+                                                       f'text={{path="{macro}"}}')):
+            (path/'src').mkdir(parents=True)
+            (path/'Cargo.toml').write_text(f'[package]\nname="{name}"\nversion="1.0.0"\nedition="2021"\n' + manifest)
+        (upstream/'src/lib.rs').write_text('#[macro_export] macro_rules! number { () => { text::value!(0x2a) } }')
+        (macro/'src/lib.rs').write_text('extern crate proc_macro; #[proc_macro] '
+            'pub fn value(input:proc_macro::TokenStream)->proc_macro::TokenStream {'
+            'let s=input.into_iter().next().unwrap().span().source_text().unwrap();'
+            'assert_eq!(s,"0x2a"); s.parse().unwrap()}')
+        (app/'src/main.rs').write_text('fn main(){assert_eq!(source::number!(),42);}')
+        env = dict(self.env, HOME=str(home), RUSTC=self.rustc, RUSTC_WRAPPER=str(self.build/'distcc'),
+                   CARGO_INCREMENTAL='0')
+        for key in ('CARGO_HOME', 'WORKDIR', 'DISTCC_FRONTEND_ROOTS'):
+            env.pop(key, None)
+        for action in ('check', 'build'):
+            result = subprocess.run(['cargo', action, '--offline', '-vv', '-j1'], cwd=app, env=env,
+                                    capture_output=True, text=True, timeout=90)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            consumer = next(job for job in result.stderr.split('     Running `') if ' --crate-name consumer ' in job)
+            if action == 'check':
+                self.assertRegex(consumer, r'--extern source=[^ ]+\.rmeta')
+            self.assertIn('distcc-rust: compiled on', consumer)
+        subprocess.run([app/'target/debug/consumer'], check=True)
+
     def test_macro_private_shared_library_and_observed_data(self):
         library=self.work/'libhelper.so'
         c=self.work/'helper.c'
         c.write_text('int add(void) {return 2;}')
         subprocess.run(['cc','-shared','-fPIC',c,'-o',library],check=True)
-        upstream = self.work / 'vendor'
-        upstream.mkdir()
+        home = self.work / 'cargo-home'
+        home.symlink_to(self.work / 'cargo-storage', target_is_directory=True)
+        (self.work / 'cargo-storage').mkdir()
+        upstream = home / 'registry/src/example/upstream-1.0.0'
+        upstream.mkdir(parents=True)
         data = upstream / 'number.txt'
         data.write_text('40')
         (upstream / 'marker').touch()
@@ -1457,12 +1517,15 @@ class RustTest(BrokerTestCase):
         plugins.mkdir()
         shutil.copy2(plugin, plugins)
         shutil.copy2(library, plugins)
-        result=self.rust(src,'--extern','derive='+str(plugins/plugin.name),'-o',output,
-                         env=dict(self.env, DISTCC_FRONTEND_ROOTS=str(upstream)))
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertIn('proc-macro host ABI',result.stderr)
-        self.assertIn('compiled on',result.stderr)
-        subprocess.run([output],check=True)
+        for build_env in [dict(CARGO_HOME=str(home)), dict(WORKDIR=str(upstream))]:
+            with self.subTest(build_env=build_env):
+                env = dict(self.env, **build_env)
+                env.pop('DISTCC_FRONTEND_ROOTS', None)
+                result = self.rust(src, '--extern', 'derive='+str(plugins/plugin.name), '-o', output, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('proc-macro host ABI', result.stderr)
+                self.assertIn('distcc-rust: compiled on', result.stderr)
+                subprocess.run([output], check=True)
 
     def test_macro_network_attempt_executes_once_on_client(self):
         with socket.socket() as listener:

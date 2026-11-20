@@ -23,7 +23,7 @@ bool runtime_path(const fs::path &p, const fs::path &sysroot) {
            std::any_of(std::begin(runtime), std::end(runtime), [&](auto &r) { return below(p, r); });
 }
 bool audit(const fs::path &depfile, int loads, const fs::path &sysroot, const std::set<fs::path> &search,
-           std::set<fs::path> &inputs, std::set<fs::path> &dirs) {
+           std::set<fs::path> &inputs, std::set<fs::path> &dirs, std::map<fs::path, fs::path> &observed) {
     auto records = split(contents(loads), '\0');
     if (records.size() % 3)
         throw Local("incomplete Rust dependency journal");
@@ -60,12 +60,21 @@ bool audit(const fs::path &depfile, int loads, const fs::path &sysroot, const st
         roots.insert(real.parent_path());
         macro = true;
     }
-    std::vector<fs::path> exports;
-    if (macro)
-        for (const auto &dir : split(env("DISTCC_FRONTEND_ROOTS"), ':'))
-            if (!dir.empty())
-                exports.push_back(fs::absolute(dir).lexically_normal());
-    for (size_t i = 0; macro && i < records.size(); i += 3) {
+    if (!macro)
+        return false;
+    // The same journal contains rustc SourceMap reads and reads by native
+    // macros. Cargo and Portage supply their own package/source locations.
+    fs::path cargo = env("CARGO_HOME");
+    if (cargo.empty() && !env("HOME").empty())
+        cargo = fs::path(env("HOME")) / ".cargo";
+    std::set<fs::path> sources;
+    for (const auto &dir : roots)
+        sources.insert(fs::canonical(dir));
+    for (const auto &dir : {cargo.empty() ? cargo : cargo / "registry/src",
+                            fs::path(env("CARGO_MANIFEST_DIR")), fs::path(env("WORKDIR"))})
+        if (!dir.empty() && fs::is_directory(dir))
+            sources.insert(fs::canonical(dir));
+    for (size_t i = 0; i < records.size(); i += 3) {
         if (records[i] == "L" || records[i] == "D")
             continue;
         fs::path spelling(records[i + 1]);
@@ -101,17 +110,15 @@ bool audit(const fs::path &depfile, int loads, const fs::path &sysroot, const st
             dirs.insert(p);
         } else {
             auto real = fs::canonical(p);
-            // SourceMap reads can point into another vendored crate. Only the
-            // observed file is staged from the caller's exported build tree.
-            bool exported = real == p && std::any_of(exports.begin(), exports.end(), [&](const auto &dir) {
-                return dir == "/" || below(real, dir);
-            });
-            if (!fs::is_regular_file(real) || (!exported && (!allowed(p) || (!allowed(real) && !inputs.count(p)))))
+            if (!fs::is_regular_file(real) || !(inputs.count(p) ||
+                    std::any_of(sources.begin(), sources.end(), [&](const auto &dir) { return below(real, dir); })))
                 throw Local("unsupported macro input " + p.string());
+            observed.emplace(p, real);
+            observed.emplace(real, real);
             inputs.insert(p);
             inputs.insert(real);
         }
     }
-    return macro;
+    return true;
 }
 } // namespace rust
