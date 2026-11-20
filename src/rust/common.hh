@@ -1,6 +1,7 @@
 /* Common compiler discovery and argv handling for native Rust jobs. */
 #pragma once
 #include <config.h>
+#include "affinity.hh"
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
@@ -179,6 +180,11 @@ inline string query(const fs::path &compiler, const string &flag) {
     if (!value.empty() && value.back() == '\n')
         value.pop_back();
     return value;
+}
+inline string affinity_key() {
+    auto mask = affinity();
+    if (mask.empty()) throw Local("cannot determine CPU affinity");
+    return string(reinterpret_cast<const char *>(mask.data()), mask.size() * sizeof(mask[0]));
 }
 inline string field(const string &report, const string &name) {
     for (const auto &line : split(report, '\n'))

@@ -1,11 +1,14 @@
 /* Adaptive host selection.  SPDX-License-Identifier: GPL-2.0-or-later */
 #include "resource.h"
+#include "workload.h"
 #define DCC_STATS_SIZE 32768
 struct dcc_hostdef;
 struct dcc_capacity {
     int cpus, cores, jobs;
     uint64_t rust_compilers[128];
     unsigned rust_compiler_count;
+    unsigned short rust_feature_offset[128]; /* Zero when the slot has no verified host profile. */
+    char rust_host_features[DCC_RUST_FEATURE_POOL_BYTES]; /* Identical slot profiles share storage. */
     char llvm_cgu[4096]; /* Semicolon-separated ABI and registered-target records. */
     double core_scale, smt_gain;
     double cpu_scale, cpu_age;

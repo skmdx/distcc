@@ -376,6 +376,91 @@ class RustTest(BrokerTestCase):
         self.assertIn('distcc-rust: compiled on', result.stderr)
         self.assertEqual(subprocess.check_output([output], text=True), 'patch\n')
 
+    def test_host_feature_capture_respects_the_allowed_cores(self):
+        cpus = sorted(os.sched_getaffinity(0))[:2]
+        if len(cpus) != 2:
+            self.skipTest('requires two allowed CPUs')
+        # Exercise the real preload's pinning and LLVM ABI on a homogeneous
+        # test machine. Only the per-core answer from LLVM is substituted.
+        source = self.work/'features.c'
+        source.write_text('#define _GNU_SOURCE\n#include <unistd.h>\n#include <sys/syscall.h>\n#include <string.h>\n'
+                          'char *LLVMGetHostCPUFeatures(void) { unsigned cpu; syscall(SYS_getcpu, &cpu, 0, 0); '
+                          'return strdup(cpu == '
+                          f'{cpus[0]} ? "+left,+common,-right" : "-left,+right,+common"); }}')
+        shim = self.work/'features.so'
+        subprocess.run(['cc','-fPIC','-shared',source,'-o',shim], check=True)
+        output = self.work/'features'
+        preload = str(self.build/'distcc-rust-native.so') + ':' + str(shim)
+        for mask, union, expected in [(cpus, False, 'common'), (cpus, True, 'common,left,right'),
+                                      (cpus[:1], True, 'common,left')]:
+            with self.subTest(mask=mask, union=union):
+                env = dict(self.env, LD_PRELOAD=preload, DISTCC_RUST_HOST_PROFILE=str(output),
+                           DISTCC_RUST_HOST_UNION=str(int(union)))
+                result = self.rust('-Ctarget-cpu=native', '--print=cfg', remote=False, env=env,
+                                   prefix=['taskset', '-c', ','.join(map(str,mask))])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(output.read_text(), expected)
+                output.unlink()
+
+    def test_proc_macro_requires_host_features_only_for_whole_crates(self):
+        self.cgu_toolchain()
+        # Only the first worker's advertisement changes. All compiler, broker,
+        # macro expansion and backend jobs still run through the real daemons.
+        actual = self.get_stats(self.stats_ports[0])
+        record = re.search(r'^dcc_rust_host_features (.+)$', actual, re.M)
+        assert record is not None, 'worker did not advertise Rust host features'
+        groups = []
+        for group in record[1].split(';'):
+            names, *keys = group.split()
+            self.assertTrue(keys)
+            groups.append(' '.join([','.join(names.split(',')[1:]) or '-', *keys]))
+        narrow = self.peer(actual.replace(record[0], 'dcc_rust_host_features '+';'.join(groups)).encode())
+        a = self.host(0, f',tcp,stats={narrow.port},speed=100', slots=1)
+        b = self.host(1, f',tcp,stats={self.stats_ports[1]},speed=0.1', slots=1)
+        macro = self.work/'maker.rs'
+        macro.write_text('extern crate proc_macro; #[proc_macro] '
+                         'pub fn number(_: proc_macro::TokenStream) -> proc_macro::TokenStream '
+                         '{ "42".parse().unwrap() }')
+        plugin = self.work/'libmaker.so'
+        built = self.rust(macro, '--crate-type=proc-macro', '-Ctarget-cpu=native', '-o', plugin, remote=False)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        main = self.work/'main.rs'
+        program = self.work/'program'
+        args = ['-Copt-level=2','-Ccodegen-units=1',main,'-o',program]
+        self.start_broker(a+' '+b, name='host-features')
+        main.write_text('fn main() { assert_eq!(std::hint::black_box(42), 42); }')
+        before = self.completed_jobs()
+        plain = self.rust(*args)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertIn('distcc-rust: compiled on', plain.stderr)
+        self.assertEqual(self.completed_jobs(), [before[0]+1,before[1]])
+        subprocess.run([program],check=True)
+        # Keep enough IR for the normal 128-instruction CGU admission threshold.
+        main.write_text('extern crate maker; fn main() { let mut x: u32 = maker::number!();' +
+                        'x = std::hint::black_box(x).wrapping_add(1);' * 160 +
+                        'assert_eq!(x, 202); }')
+        args.extend(['--extern', 'maker='+str(plugin)])
+        before = self.completed_jobs()
+        log = self.work/'sandbox.log'
+        prefix = ['sandbox', 'env', 'SANDBOX_WRITE='+str(self.work)] if shutil.which('sandbox') else []
+        loaded = self.rust(*args, prefix=prefix, env=dict(self.env, SANDBOX_LOG=str(log),
+                                                         SANDBOX_DEBUG_LOG=str(self.work/'sandbox.debug')))
+        self.assertEqual(loaded.returncode, 0, loaded.stderr)
+        self.assertFalse(log.exists(), loaded.stderr)
+        self.assertIn('distcc-rust: compiled on', loaded.stderr)
+        self.assertEqual(self.completed_jobs(), [before[0],before[1]+1])
+        subprocess.run([program],check=True)
+        self.start_broker(a, name='insufficient-host')
+        before = self.completed_jobs()
+        fallback = self.rust(*args)
+        self.assertEqual(fallback.returncode, 0, fallback.stderr)
+        self.assertIn('no worker with the required Rust host ABI', fallback.stderr)
+        self.assertIn('distcc-rust-cgu: completed ', fallback.stderr)
+        self.assertNotIn('distcc-rust: compiled on', fallback.stderr)
+        self.assertGreater(self.completed_jobs()[0], before[0])
+        self.assertEqual(self.completed_jobs()[1], before[1])
+        subprocess.run([program],check=True)
+
     def test_same_triple_mixed_compilers_route_whole_crates_and_cgus(self):
         deploy = runpy.run_path(str(self.build/'packaging/gentoo/deploy.py'))
         abi, backend = self.cgu_toolchain()

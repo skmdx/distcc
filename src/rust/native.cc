@@ -18,6 +18,9 @@
 #include <iterator>
 #include <string>
 #include <set>
+#include <algorithm>
+#include <sstream>
+#include "affinity.hh"
 
 namespace {
 [[noreturn]] void fail(const char *message)
@@ -74,6 +77,56 @@ const Profile &profile()
     static const Profile value;
     return value;
 }
+
+// rustc's own native query selects this slot's LLVM and runs after startup.
+void capture_host_features(const char *path)
+{
+    auto get = original<char *(*)()>("LLVMGetHostCPUFeatures");
+    auto dispose = original<void (*)(char *)>("LLVMDisposeMessage");
+    auto mask = rust::affinity();
+    if (mask.empty()) fail("cannot determine CPU affinity");
+    auto size = mask.size() * sizeof(mask[0]);
+    auto allowed = reinterpret_cast<cpu_set_t *>(mask.data());
+    rust::CpuMask one(mask.size());
+    auto pin = reinterpret_cast<cpu_set_t *>(one.data());
+    const char *mode = std::getenv("DISTCC_RUST_HOST_UNION");
+    bool first = true, intersection = !mode || std::strcmp(mode, "1") != 0;
+    std::set<std::string> result;
+    for (size_t cpu = 0; cpu < size * 8; ++cpu) {
+        if (!CPU_ISSET_S(cpu, size, allowed))
+            continue;
+        CPU_ZERO_S(size, pin);
+        CPU_SET_S(cpu, size, pin);
+        if (sched_setaffinity(0, size, pin))
+            fail("cannot pin host feature probe");
+        char *raw = get();
+        if (!raw || !*raw)
+            fail("LLVM host feature list unavailable");
+        std::istringstream stream(raw);
+        dispose(raw);
+        std::set<std::string> current;
+        for (std::string token; std::getline(stream, token, ',');)
+            if (token.size() > 1 && token.front() == '+')
+                current.insert(token.substr(1));
+        if (first || !intersection)
+            result.insert(current.begin(), current.end());
+        else {
+            std::set<std::string> common;
+            std::set_intersection(result.begin(), result.end(), current.begin(), current.end(),
+                                  std::inserter(common, common.end()));
+            result.swap(common);
+        }
+        first = false;
+    }
+    if (first || sched_setaffinity(0, size, allowed))
+        fail("cannot restore host feature probe affinity");
+    std::ofstream file(path);
+    if (result.empty()) file << '-';
+    for (auto it = result.begin(); it != result.end(); ++it)
+        file << (it == result.begin() ? "" : ",") << *it;
+    file.close();
+    if (!file) fail("cannot write host features");
+}
 }
 
 namespace llvm::sys {
@@ -98,6 +151,10 @@ StringRef getHostCPUName()
 
 extern "C" char *LLVMGetHostCPUFeatures()
 {
+    if (const char *path = std::getenv("DISTCC_RUST_HOST_PROFILE")) {
+        static const bool captured = (capture_host_features(path), true);
+        (void)captured;
+    }
     if (!std::getenv("DISTCC_RUST_NATIVE"))
         return original<char *(*)()>("LLVMGetHostCPUFeatures")();
     static const std::string features = [] {

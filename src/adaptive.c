@@ -118,9 +118,32 @@ int dcc_capacity_update(struct dcc_capacity *cap, const struct dcc_load_report *
 }
 #endif
 
+static int parse_rust_features(char *records, struct dcc_capacity *cap)
+{
+    size_t used = 1;
+    char *group;
+    while ((group = strsep(&records, ";"))) {
+        char *names = strsep(&group, " ");
+        size_t size = strlen(names) + 1;
+        if (!group || size < 2 || size > sizeof(cap->rust_host_features) - used) return -1;
+        memcpy(cap->rust_host_features + used, names, size);
+        char *hex;
+        while ((hex = strsep(&group, " "))) {
+            if (strlen(hex) != 16 || strspn(hex, "0123456789abcdef") != 16) return -1;
+            uint64_t key = strtoull(hex, NULL, 16);
+            unsigned k = 0;
+            while (k < cap->rust_compiler_count && cap->rust_compilers[k] != key) ++k;
+            if (k == cap->rust_compiler_count || cap->rust_feature_offset[k]) return -1;
+            cap->rust_feature_offset[k] = used;
+        }
+        used += size;
+    }
+    return 0;
+}
+
 int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
 {
-    char *line, extra;
+    char *line, *rust_features = NULL, extra;
     const unsigned long long cgu_capacity_field = 1ULL << 37, cgu_memory_field = 1ULL << 38;
     unsigned long long fields = 0;
     double value;
@@ -150,6 +173,9 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
                 if (!*p) break;
                 if (*p++ != ' ') return -1;
             }
+        } else if (!strncmp(line, "dcc_rust_host_features ", 23)) {
+            if (rust_features) return -1;
+            rust_features = line + 23;
         } else if (!strncmp(line, "dcc_llvm_cgu ", 13)) {
             if (strlen(line + 13) >= sizeof(cap->llvm_cgu)) return -1;
             strcpy(cap->llvm_cgu, line + 13);
@@ -288,6 +314,7 @@ int dcc_parse_capacity(char *buf, struct dcc_capacity *cap)
         524288 | 1048576 | 2097152 | 536870912 | (127 * 4194304) | (1ULL << 32) | (1ULL << 33) |
         (1ULL << 34) | (1ULL << 35);
     const unsigned long long cgu_fields = cgu_capacity_field | cgu_memory_field;
+    if (rust_features && strcmp(rust_features, "-") && parse_rust_features(rust_features, cap)) return -1;
     if (*cap->llvm_cgu && strcmp(cap->llvm_cgu, "-") && (fields & cgu_fields) != cgu_fields) return -1;
     return (fields & required) == required && cap->cores <= cap->cpus &&
            ((cap->cpu_scale == -1 && cap->cpu_age == -1 && !cap->cpu_probe) ||

@@ -2,6 +2,7 @@
 #ifndef DCC_WORKLOAD_H
 #define DCC_WORKLOAD_H
 #include <stdint.h>
+#include <stddef.h>
 
 #define DCC_WORK_RUST 7
 #define DCC_WORK_THINLTO 8
@@ -11,6 +12,8 @@
 #define DCC_WORK_CLASSES DCC_WORK_RUST_CGU
 #define DCC_WORK_HISTORY 4096
 #define DCC_WORK_WAYS 4
+#define DCC_RUST_FEATURE_BYTES 2048
+#define DCC_RUST_FEATURE_POOL_BYTES 8192
 struct dcc_work_hint {
     uint64_t key, bytes;
     uint32_t kind, work_units; /* Language-specific estimate of computation independent of bytes. */
@@ -19,7 +22,14 @@ struct dcc_work_hint {
     uint64_t memory_class; /* Same resource class as the serialized worker job. */
     uint64_t rust_compiler; /* rustc identity and host triple for a whole crate. */
     char cgu_backend[96]; /* LLVM version and registered target for a CGU. */
+    char rust_host_features[DCC_RUST_FEATURE_BYTES]; /* Required only for host code in a whole crate. */
 };
+/* Ordinary jobs send only the fixed prefix on the local broker socket. */
+#define DCC_WORK_HINT_BASE_SIZE offsetof(struct dcc_work_hint, rust_host_features)
+static inline size_t dcc_work_hint_size(const struct dcc_work_hint *hint)
+{
+    return hint->rust_host_features[0] ? sizeof(*hint) : DCC_WORK_HINT_BASE_SIZE;
+}
 struct dcc_work_class {
     double weight, x, y, z;
     double xx, xy, yy, xz, yz;

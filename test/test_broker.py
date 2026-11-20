@@ -67,7 +67,7 @@ class MemoReconnectTest(unittest.TestCase):
 
 
 class BrokerTestCase(DistccTestCase):
-    protocol_version = 6
+    protocol_version = 7
 
     def start_memory_refusal(self):
         # The first snapshot fits; before execution the real daemon's memory

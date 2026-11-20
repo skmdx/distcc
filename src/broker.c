@@ -327,7 +327,11 @@ static int broker_request_once(uint32_t command, struct reply *reply, int *net,
     struct local_cpp_request local = {{BROKER_VERSION, command}, local_limit};
     const void *message = &request;
     size_t request_size = sizeof(request.header);
-    if (hint) { request.hint = *hint; request_size = sizeof(request); }
+    if (hint) {
+        size_t n = dcc_work_hint_size(hint);
+        memcpy(&request.hint, hint, n);
+        request_size += n;
+    }
     if (command == LOCAL_CPP || command == LOCAL_ANALYSIS) {
         message = &local; request_size = sizeof(local);
     }
@@ -1266,6 +1270,24 @@ static int pipeline_slots(const struct dcc_hostdef *host, int lanes)
     return staging < DCC_TCP_PIPELINE ? staging : DCC_TCP_PIPELINE;
 }
 
+/* Both lists use sorted LLVM names. Match complete tokens, including x86
+ * families whose names are prefixes of other features. An absent offer
+ * cannot authorize loading client code. */
+static int compatible_rust_host(const char *required, const char *offered)
+{
+    if (!*required) return 1;
+    if (!*offered) return 0;
+    if (!strcmp(required, "-")) return 1;
+    while (*required && *offered) {
+        size_t need = strcspn(required, ","), have = strcspn(offered, ",");
+        int cmp = strncmp(required, offered, need < have ? need : have);
+        if (cmp < 0 || (!cmp && need < have)) return 0;
+        if (!cmp && need == have) required += need + (required[need] == ',');
+        offered += have + (offered[have] == ',');
+    }
+    return !*required;
+}
+
 static int compatible_cgu(const char *required, const char *offered)
 {
     size_t version = strcspn(required, " ");
@@ -1384,8 +1406,12 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 continue;
             }
             int native = 0;
-            for (unsigned k = 0; k < cap->rust_compiler_count; ++k)
-                if (cap->rust_compilers[k] == client->hint.rust_compiler) { native = 1; break; }
+            for (unsigned k = 0; k < cap->rust_compiler_count; ++k) {
+                if (cap->rust_compilers[k] != client->hint.rust_compiler) continue;
+                native = compatible_rust_host(client->hint.rust_host_features,
+                    cap->rust_host_features + cap->rust_feature_offset[k]);
+                break;
+            }
             int cgu = client->hint.kind == DCC_WORK_RUST_CGU &&
                       compatible_cgu(client->hint.cgu_backend, cap->llvm_cgu);
             if (client->command == CGU_CAPACITY) {
@@ -2355,8 +2381,10 @@ int dcc_broker_serve(const char *path)
                               request.command == ACQUIRE_READY || request.command == TRY_LOCAL ||
                               request.command == CGU_CAPACITY;
                 int local_cpp = request.command == LOCAL_CPP || request.command == LOCAL_ANALYSIS;
-                if (c->state != REQUEST || length != (ssize_t)(sizeof(request) +
-                        (compile ? sizeof(struct dcc_work_hint) : local_cpp ? sizeof(uint32_t) : 0)) ||
+                size_t payload_size = length - sizeof(request);
+                int valid_size = compile ? (payload_size == DCC_WORK_HINT_BASE_SIZE || payload_size == sizeof(c->hint))
+                                         : payload_size == (local_cpp ? sizeof(uint32_t) : 0);
+                if (c->state != REQUEST || !valid_size ||
                     request.version != BROKER_VERSION ||
                     (request.command != ACQUIRE && request.command != ACQUIRE_POOL &&
                      request.command != ACQUIRE_LINK && request.command != ACQUIRE_CPP &&
@@ -2366,8 +2394,9 @@ int dcc_broker_serve(const char *path)
                     continue;
                 }
                 if (compile) {
-                    memcpy(&c->hint, packet.payload, sizeof(c->hint));
-                    if (!dcc_work_valid(&c->hint) ||
+                    c->hint.rust_host_features[0] = 0;
+                    memcpy(&c->hint, packet.payload, payload_size);
+                    if (payload_size != dcc_work_hint_size(&c->hint) || !dcc_work_valid(&c->hint) ||
                         (request.command == CGU_CAPACITY && c->hint.kind != DCC_WORK_RUST_CGU)) {
                         release_client(broker, c); continue;
                     }

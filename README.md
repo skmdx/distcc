@@ -187,7 +187,12 @@ rustc host triple and link the shared library on the client. To distribute a
 consumer, the client runs the dependency pass in a read-only bubblewrap mount
 namespace with a seccomp filter. The preload library journals paths after a
 procedural macro loads, including library dependencies and attempted writes.
-A worker with the matching compiler receives the macro and its inputs.
+A whole-crate job that produces or loads a procedural macro also requires the
+worker's compiler to advertise every LLVM host CPU feature available on any
+allowed client core. Each compiler advertises the intersection across its
+allowed worker cores. If no worker qualifies, the client expands the macro and
+uses compatible CGU workers when available. Ordinary crates require only the
+matching compiler.
 The journal also discovers regular files in the Cargo package directory, Cargo's
 registry source cache and the Portage work directory. A symlink in the path to
 one of these directories preserves access to the same source tree.

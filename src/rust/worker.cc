@@ -18,6 +18,7 @@
 extern "C" {
 #include "exec.h"
 #include "exitcode.h"
+#include "workload.h"
 }
 using namespace rust;
 namespace {
@@ -26,6 +27,7 @@ struct Catalog {
     struct Entry {
         XXH128_hash_t key;
         char identity[2048];
+        char features[DCC_RUST_FEATURE_BYTES];
     } entries[32];
     struct Route {
         XXH128_hash_t request, generation;
@@ -52,7 +54,7 @@ XXH128_hash_t fingerprint(const string &text) {
 }
 std::optional<XXH128_hash_t> compiler_generation(const fs::path &path, bool validate) {
     auto root = path.parent_path().parent_path();
-    string state = path.string() + stamp(metadata(path)), name = root.filename();
+    string state = path.string() + stamp(metadata(path)) + affinity_key(), name = root.filename();
     if (name.compare(0, 12, "rust-distcc-") == 0) {
         auto digest = name.substr(12);
         auto marker = root / ".distcc-complete";
@@ -65,10 +67,12 @@ std::optional<XXH128_hash_t> compiler_generation(const fs::path &path, bool vali
     }
     return fingerprint(state);
 }
-string cached_identity(const fs::path &path, XXH128_hash_t key) {
+string cached_identity(const fs::path &path, XXH128_hash_t key, string &features) {
     for (auto &e : catalog->entries)
-        if (XXH128_isEqual(e.key, key))
+        if (XXH128_isEqual(e.key, key)) {
+            features = e.features;
             return e.identity;
+        }
     string id;
     try {
         auto report = query(path, "-vV");
@@ -86,8 +90,11 @@ string cached_identity(const fs::path &path, XXH128_hash_t key) {
         if (run(command, {}, 2, 2) || !fs::is_regular_file(output) || !fs::file_size(output))
             throw Local("worker compiler failed codegen probe");
         id = report;
+        features = capture_cpu_profile(path, probe, CpuProfile::HostIntersection);
+        if (features.size() >= DCC_RUST_FEATURE_BYTES)
+            features.clear();
     } catch (const Local &e) {
-        fprintf(stderr, "distccd: cannot run %s: %s\n", path.c_str(), e.what());
+        fprintf(stderr, "distccd: %s probe: %s\n", path.c_str(), e.what());
     }
     auto state = compiler_generation(path, false);
     if (!state || !XXH128_isEqual(key, *state))
@@ -96,12 +103,13 @@ string cached_identity(const fs::path &path, XXH128_hash_t key) {
     if (id.size() < sizeof(e.identity)) {
         e.key = key;
         strcpy(e.identity, id.c_str());
+        strcpy(e.features, features.c_str());
     }
     return id;
 }
 struct CompilerOffer {
     string host = "-";
-    std::set<uint64_t> keys;
+    std::map<uint64_t, string> keys;
 };
 fs::path select_compiler(const string &requested, const string &host, CompilerOffer *offer = nullptr) {
     if (dcc_rust_catalog_attach(-1))
@@ -135,13 +143,24 @@ fs::path select_compiler(const string &requested, const string &host, CompilerOf
         auto current = compiler_generation(path, true);
         if (!current)
             continue;
-        auto report = cached_identity(path, *current);
+        string features;
+        auto report = cached_identity(path, *current, features);
         if (report.empty())
             continue;
         auto triple = field(report, "host: ");
         if (offer) {
             if (offer->keys.empty()) offer->host = triple;
-            offer->keys.insert(compiler_key(report));
+            auto [slot, inserted] = offer->keys.emplace(compiler_key(report), features);
+            if (!inserted && (slot->second.empty() || features.empty())) {
+                slot->second.clear(); // Unknown for one candidate with this key.
+            } else if (!inserted && slot->second != features) {
+                auto a = split(slot->second, ','), b = split(features, ',');
+                Words common;
+                std::set_intersection(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(common));
+                slot->second.clear();
+                for (const auto &f : common) slot->second += (slot->second.empty() ? "" : ",") + f;
+                if (common.empty()) slot->second = "-"; // Verified empty intersection.
+            }
             continue;
         }
         if (identity(report) != requested || (!host.empty() && triple != host))
@@ -300,11 +319,12 @@ extern "C" const char *dcc_rust_cgu_capabilities(void) {
         return nullptr;
     }
 }
-extern "C" const char *dcc_rust_compilers(const char **first_host) {
+extern "C" const char *dcc_rust_compilers(const char **first_host, const char **features) {
     static std::mutex lock;
     static std::chrono::steady_clock::time_point expires;
-    static std::pair<string, string> cached;
-    thread_local std::pair<string, string> snapshot;
+    struct Advertisement { string host, keys, features; };
+    static Advertisement cached;
+    thread_local Advertisement snapshot;
     std::lock_guard<std::mutex> guard(lock);
     auto now = std::chrono::steady_clock::now();
     if (now >= expires) {
@@ -312,13 +332,23 @@ extern "C" const char *dcc_rust_compilers(const char **first_host) {
             CompilerOffer offer;
             select_compiler("", "", &offer);
             string keys;
-            for (auto key : offer.keys) {
+            std::map<string,string> by_features;
+            for (auto &[key, features] : offer.keys) {
                 char hex[17];
                 snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)key);
                 if (!keys.empty()) keys += ' ';
                 keys += hex;
+                if (!features.empty()) by_features[features] += string(" ") + hex;
             }
-            cached = {offer.host, keys.empty() ? "-" : keys};
+            string records;
+            size_t used = 1; // Offset zero is the absent profile in dcc_capacity.
+            for (const auto &[list, slots] : by_features) {
+                if (list.size()+1 > DCC_RUST_FEATURE_POOL_BYTES-used) continue;
+                used += list.size()+1;
+                if (!records.empty()) records += ';';
+                records += list + slots;
+            }
+            cached = {offer.host, keys.empty() ? "-" : keys, records.empty() ? "-" : records};
         } catch (const std::exception &e) {
             fprintf(stderr, "distccd: Rust host query: %s\n", e.what());
             return nullptr;
@@ -326,8 +356,9 @@ extern "C" const char *dcc_rust_compilers(const char **first_host) {
         expires = now + std::chrono::seconds(5);
     }
     snapshot = cached;
-    *first_host = snapshot.first.c_str();
-    return snapshot.second.c_str();
+    *first_host = snapshot.host.c_str();
+    *features = snapshot.features.c_str();
+    return snapshot.keys.c_str();
 }
 struct dcc_rust_artifacts {
     fs::path output;

@@ -1,4 +1,5 @@
 #include "rust/sandbox.hh"
+#include "rust/probe.h"
 #include "rust/runtime.hh"
 #include "rust/api.h"
 #include <seccomp.h>
@@ -69,5 +70,43 @@ Sandbox::Sandbox(Root policy, const fs::path &tree)
 void Sandbox::command(const Words &argv) {
     args.insert(args.end(), {"--remount-ro", "/", "--"});
     args.insert(args.end(), argv.begin(), argv.end());
+}
+int run_probe(const Words &cmd, Env envs, const fs::path &outputs, bool isolate, int diagnostics,
+              std::vector<int> inherited) {
+    envs["LD_PRELOAD"] = native_library().string() + " " + env("LD_PRELOAD");
+    // Portage can trace rustc without forwarding LD_PRELOAD. Install the
+    // instrumentation and caller's preload together at the confined exec.
+    if (!isolate && env("SANDBOX_ON") != "1")
+        return run(cmd, envs, diagnostics, diagnostics, &inherited);
+    Sandbox box(Root::Host);
+    box.mount(outputs, outputs, true);
+    for (auto &[k,v] : envs) box.args.insert(box.args.end(), {"--setenv", k, v});
+    box.command(cmd);
+    inherited.push_back(box.filter.fd);
+    return run(box.args, {}, diagnostics, diagnostics, &inherited);
+}
+string capture_cpu_profile(const fs::path &compiler, const Work &work, CpuProfile mode) {
+    auto path = work.dir / "host-features";
+    Env settings;
+    if (mode == CpuProfile::Target)
+        settings = {{"DISTCC_RUST_NATIVE", work.dir}, {"DISTCC_RUST_NATIVE_CAPTURE", "1"}};
+    else
+        settings = {{"DISTCC_RUST_HOST_PROFILE", path},
+                    {"DISTCC_RUST_HOST_UNION", mode == CpuProfile::HostUnion ? "1" : "0"}};
+    auto cmd = compiler_command(compiler);
+    cmd.insert(cmd.end(), {"-Ctarget-cpu=native", "--print=cfg"});
+    Fd quiet(dcc_job_memfd("rust-native-diagnostics"));
+    int status = run_probe(cmd, settings, work.dir, false, quiet.fd);
+    if (mode != CpuProfile::Target) {
+        if (status || !fs::is_regular_file(path))
+            throw Local("cannot determine rustc host instruction set: " + contents(quiet.fd));
+        return read(path);
+    }
+    if (status)
+        throw std::runtime_error("native CPU discovery failed (" + std::to_string(status) + "): " +
+                                 contents(quiet.fd));
+    if (!fs::is_regular_file(work.dir / "cpu") || !fs::is_regular_file(work.dir / "features"))
+        throw std::runtime_error("rustc did not report its native CPU and features");
+    return read(work.dir / "cpu") + '\0' + read(work.dir / "features");
 }
 } // namespace rust

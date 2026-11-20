@@ -21,7 +21,7 @@ extern "C" {
 int dcc_rust_client(char **argv);
 int dcc_rust_catalog_fd(void);
 int dcc_rust_catalog_attach(int fd);
-const char *dcc_rust_compilers(const char **first_host);
+const char *dcc_rust_compilers(const char **first_host, const char **features);
 const char *dcc_rust_cgu_capabilities(void);
 int dcc_spawn_rust_cgu(pid_t *, const char *abi, const char *tree, const char *output,
                        const char *stdout_path, const char *stderr_path);

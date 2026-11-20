@@ -648,28 +648,16 @@ class Inputs {
 string profile_context(const string &compiler) {
     return compiler + '\0' + env("LD_LIBRARY_PATH") + '\0' + env("LD_PRELOAD");
 }
-string profile(const fs::path &compiler, const Work &work, const States &tool) {
+string profile(const fs::path &compiler, const Work &work, const States &tool,
+               CpuProfile mode = CpuProfile::Target) {
     auto library = native_library();
     auto watched = tool;
     watched.emplace(library, metadata(library));
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    check(!sched_getaffinity(0, sizeof(mask), &mask), "native CPU affinity");
-    auto context = "native:" + profile_context(compiler) + '\0' + library.string() + '\0' +
-                   read("/proc/sys/kernel/random/boot_id") +
-                   string(reinterpret_cast<char *>(&mask), sizeof(mask));
+    auto prefix = mode == CpuProfile::HostUnion ? "host-union:" : "native:";
+    auto context = prefix + profile_context(compiler) + '\0' + library.string() + '\0' +
+                   read("/proc/sys/kernel/random/boot_id") + affinity_key();
     return memo(context, watched, [&] {
-        Env envs = {{"DISTCC_RUST_NATIVE", work.dir},
-                    {"DISTCC_RUST_NATIVE_CAPTURE", "1"}};
-        Fd quiet(dcc_job_memfd("rust-native-diagnostics"));
-        auto cmd = compiler_command(compiler);
-        cmd.insert(cmd.end(), {"-Ctarget-cpu=native", "--print=cfg"});
-        if (int status = run_probe(cmd, envs, work.dir, false, quiet.fd))
-            throw std::runtime_error("native CPU discovery failed (" + std::to_string(status) + "): " +
-                                     contents(quiet.fd));
-        if (!fs::is_regular_file(work.dir / "cpu") || !fs::is_regular_file(work.dir / "features"))
-            throw std::runtime_error("rustc did not report its native CPU and features");
-        return read(work.dir / "cpu") + '\0' + read(work.dir / "features");
+        return capture_cpu_profile(compiler, work, mode);
     });
 }
 string relocated(string data, const Invocation &inv) {
@@ -1170,6 +1158,12 @@ int distributed(char **original, const Words &args, const States &responses) {
     clock_gettime(CLOCK_REALTIME, &start);
     try {
         inv.discover(exe, root, work);
+        if (inv.needs_host) {
+            auto required = profile(exe, work, tool, CpuProfile::HostUnion);
+            if (required.empty() || required.size() >= sizeof(hint.rust_host_features))
+                throw Local("cannot represent required Rust host instruction set");
+            strcpy(hint.rust_host_features, required.c_str());
+        }
     } catch (const Local &reason) {
         return refused(reason);
     }

@@ -239,7 +239,7 @@ dist_extra =							\
 	distcc_job.py \
 	distcc_python.py \
 	src/rust/native.cc src/rust/audit.cc src/rust/cgu.h src/rust/cgu_hook.cc src/rust/check_cgu_hooks.py src/rust/cgu_worker.cc \
-	src/rust/sandbox.cc src/rust/sandbox.hh src/rust/runtime.hh src/rust/client.cc src/rust/worker.cc src/rust/link.cc src/rust/response.hh src/rust/probe.cc src/rust/probe.h src/rust/common.hh src/rust/api.h \
+	src/rust/sandbox.cc src/rust/sandbox.hh src/rust/runtime.hh src/rust/client.cc src/rust/worker.cc src/rust/link.cc src/rust/response.hh src/rust/probe.cc src/rust/probe.h src/rust/common.hh src/rust/affinity.hh src/rust/api.h \
 	src/clang_driver.cc \
 	src/argv_file.h \
 	src/clang_inputs.h \

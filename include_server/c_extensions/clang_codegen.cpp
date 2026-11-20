@@ -144,9 +144,10 @@ int try_lane() {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     struct { request header; dcc_work_hint hint; } message{};
     message.header = {BROKER_VERSION, TRY_LOCAL};
+    size_t size = sizeof(message.header) + dcc_work_hint_size(&message.hint);
     reply response{};
     if (!connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) &&
-        send(fd, &message, sizeof(message), MSG_NOSIGNAL) == sizeof(message) &&
+        send(fd, &message, size, MSG_NOSIGNAL) == static_cast<ssize_t>(size) &&
         recv(fd, &response, sizeof(response), MSG_TRUNC) == sizeof(response) &&
         !response.status && response.slots == 1) return fd;
     close(fd);

@@ -2,22 +2,7 @@
 #include "rust/probe.h"
 #include "rust/api.h"
 #include "rust/runtime.hh"
-#include "rust/sandbox.hh"
 namespace rust {
-int run_probe(const Words &cmd, Env envs, const fs::path &outputs, bool isolate, int diagnostics,
-              std::vector<int> inherited) {
-    envs["LD_PRELOAD"] = native_library().string() + " " + env("LD_PRELOAD");
-    // Portage can trace rustc without forwarding LD_PRELOAD. Install the
-    // instrumentation and caller's preload together at the confined exec.
-    if (!isolate && env("SANDBOX_ON") != "1")
-        return run(cmd, envs, diagnostics, diagnostics, &inherited);
-    Sandbox box(Root::Host);
-    box.mount(outputs, outputs, true);
-    for (auto &[k,v] : envs) box.args.insert(box.args.end(), {"--setenv", k, v});
-    box.command(cmd);
-    inherited.push_back(box.filter.fd);
-    return run(box.args, {}, diagnostics, diagnostics, &inherited);
-}
 bool runtime_path(const fs::path &p, const fs::path &sysroot) {
     return below(p, sysroot) ||
            std::any_of(std::begin(runtime), std::end(runtime), [&](auto &r) { return below(p, r); });
