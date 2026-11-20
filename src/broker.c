@@ -1349,7 +1349,6 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         struct prediction forecast;
     } best = {.peer = -1}, ready = {.peer = -1}, affinity = {.peer = -1},
       completion = {.peer = -1};
-    int backlogged = batch->count != 0;
     int direct = client->command == TRY_LOCAL;
     if (direct) {
         for (i = 0; i < broker->count; ++i)
@@ -1491,8 +1490,6 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
         int pipeline = link_backend ? 0 : pipeline_slots(p->host, capacity);
         int inflight = slots + pipeline;
         int work = p->busy;
-        if (!cap || cap->busy < 0 || cap->queued < 0 || cap->preparing < 0)
-            backlogged = 1;
         if (staged && cap && cap->busy >= 0 && cap->queued >= 0 && cap->preparing >= 0) {
             int limit = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
             if (cap->capacity >= 0 && cap->capacity < limit) limit = cap->capacity;
@@ -1533,7 +1530,6 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * beyond the bounded pipeline adds CPU queueing delay. */
             if (preparing > shared_pipeline) work += preparing - shared_pipeline;
             if (leased > work) work = leased;
-            if (work > limit) backlogged = 1;
             if (returning > 0)
                 inflight += returning < slots ? returning : slots;
             inflight += suspended;
@@ -1582,7 +1578,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * worker, including existing compiles on a remote SMT core.
              * Minimizing this job's latency alone packs the fastest worker's
              * SMT lanes while independent physical cores remain unused. */
-            double critical = score, marginal_factor = forecast.factor;
+            double marginal_factor = forecast.factor;
             if (staged && cap && !link && !link_backend && (predicted ||
                 (!blocked && work < dcc_capacity_jobs(p->host, cap)))) {
                 struct dcc_capacity live = observed_capacity(p, broker->cpp_busy);
@@ -1611,34 +1607,38 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                 if (gain > 0 && gain * penalty > 1) penalty = 1 / gain;
                 if (penalty > marginal_factor) marginal_factor = penalty;
                 double throughput = forecast.start + (cost > 0 ? cost : 1) * penalty;
-                if (!predicted || throughput > score) score = throughput;
-                critical = score;
                 if (predicted && completion_model) {
-                    // During drain, displacement ends when the competing
-                    // work finishes. A long TU does not pay a short job's
-                    // SMT penalty for its entire execution. External tasks
-                    // have no lease; use the observed typical service time.
+                    /* All times are relative to this dispatch. Convert the
+                     * overlap to units of work before pricing the remainder
+                     * on an empty host. Unleased tasks use typical service. */
                     double end = lane_ready(&p->schedule.cpu, 1);
                     if (external > 0) {
                         const struct dcc_work_class *learned = &broker->model.classes[client->hint.kind - 1];
                         double competing = (p->mean_cost > 0 ? p->mean_cost : learned->z / learned->weight) * prior_factor;
                         if (competing > end) end = competing;
                     }
-                    double overlap = end - forecast.start;
-                    double duration = forecast.finish - forecast.start;
-                    if (overlap < duration && duration > 0)
-                        critical = forecast.finish + (score - forecast.finish) *
-                                   (overlap > 0 ? overlap / duration : 0);
+                    if (end < forecast.finish) {
+                        double contended = end > forecast.start ? (end - forecast.start) / forecast.factor : 0;
+                        /* Preserve clock and memory observations after the CPU
+                         * work drains, including the external tasks above. */
+                        live.running = live.busy = live.queued = 0;
+                        live.capacity = cap->capacity;
+                        if (probe) live.cpu_scale = 1;
+                        double tail = (cost - contended) * dcc_capacity_score(p->host, &live, 0);
+                        forecast.finish = forecast.start + contended * forecast.factor + tail;
+                        throughput = forecast.start + contended * penalty + tail;
+                    }
                 }
+                score = predicted && forecast.finish > throughput ? forecast.finish : throughput;
             }
             double fill = (work + 1.0) / slots;
             if (link && cap && cap->links > 0) score *= 1 + cap->links;
             rs_trace("candidate host=%s work=%d capacity=%d cost=%.3f factor=%.3f prepare=%.3f start=%.3f score=%.3f wait=%d "
-                     "finish=%.6f critical=%.6f blocked=%d busy=%d preparing=%d queued=%d leases=%d direct=%d cpp=%d planned=%u "
+                     "finish=%.6f blocked=%d busy=%d preparing=%d queued=%d leases=%d direct=%d cpp=%d planned=%u "
                      "now=%.6f client=%td request=%.6f key=%llx",
                      p->host->hostname, work, cap ? cap->capacity : -1, cost,
                      forecast.factor, forecast.prepare, forecast.start, score, wait,
-                     forecast.finish, critical, blocked, cap ? cap->busy : -1, cap ? cap->preparing : -1,
+                     forecast.finish, blocked, cap ? cap->busy : -1, cap ? cap->preparing : -1,
                      cap ? cap->queued : -1, p->busy, p->direct, p->local ? broker->cpp_busy : 0, batch->count,
                      now, client - broker->clients, client->waiting_since,
                      (unsigned long long)client->hint.key);
@@ -1646,11 +1646,10 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
              * with which to justify waiting instead of using an idle CPU. */
             int idle = !cost && staged && cap && !blocked && work < dcc_capacity_jobs(p->host, cap);
             struct selection candidate = {i, probe, wait, idle, enqueue, score, fill, marginal_factor, forecast};
-            if (source && !link && completion_model && predicted && (!wait || (!direct && enqueue)) &&
-                (completion.peer < 0 || critical < completion.score)) {
+            if (locality && completion_model && predicted &&
+                (completion.peer < 0 || forecast.finish < completion.forecast.finish ||
+                 (forecast.finish == completion.forecast.finish && (!wait || enqueue))))
                 completion = candidate;
-                completion.score = critical;
-            }
             int warm = (locality && (i == previous || batch->owners[owner_slot(batch, i, &client->hint)])) ||
                        (!direct && !link && warm_scope(batch, p, i, client->hint.scope_key));
             if (warm && staged && predicted && (!wait || enqueue) &&
@@ -1679,23 +1678,20 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
      * shorter latency cannot justify choosing a slower ready alternative. */
     /* A cold prior cannot justify leaving a worker idle. ThinLTO modules
      * with measured costs can wait for a faster lane at the link barrier. */
-    if (best.wait && ready.peer >= 0 &&
+    /* Only a trained, waitable source request can prefer a full pipeline to
+     * every admissible peer on elapsed time. On ties keep capacity busy. */
+    if (completion.peer >= 0 && completion.wait && !completion.enqueue)
+        best = completion;
+    else if (best.wait && ready.peer >= 0 &&
         ((link_backend && !thinlto) || (compare_finish && !completion_model) ||
+         (completion.peer >= 0 && !best.enqueue) ||
          best.forecast.finish >= ready.forecast.finish))
         best = ready;
-    if (!backlogged && completion.peer >= 0) {
-        if (completion.peer != best.peer)
-            rs_trace("source completion: key=%llx host=%s finish=%.6f critical=%.6f",
-                     (unsigned long long)client->hint.key,
-                     broker->peers[completion.peer].host->hostname,
-                     completion.forecast.finish, completion.score);
-        best = completion;
-    }
     /* Prefer an already populated, no-slower worker only inside its existing
      * immediate admission/pipeline bounds. Never wait for locality, increase
      * the pipeline, or pin a repeat to a slower owner. No speculative cache
      * speedup is subtracted from the normal execution-cost model. */
-    if (affinity.peer >= 0 && best.peer >= 0 && affinity.peer != best.peer &&
+    if (affinity.peer >= 0 && best.peer >= 0 && (!best.wait || best.enqueue) && affinity.peer != best.peer &&
         affinity.forecast.factor <= best.forecast.factor &&
         affinity.marginal_factor <= best.marginal_factor) {
         rs_trace("source affinity: key=%llx host=%s instead=%s",

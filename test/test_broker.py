@@ -1359,6 +1359,35 @@ class BrokerTest(BrokerTestCase):
                 _, net = self.acquire_reserved(10, (2100, size * 1048576, 5))
                 self.assertEqual(net.getpeername()[1], self.ports[expected])
 
+    def test_trained_source_waits_for_full_fast_pipeline_only_for_long_job(self):
+        def fast(busy, queued):
+            return stats_response(cpus=4, cores=2, jobs=4, capacity=4, running=busy,
+                                  busy=busy, queued=queued, preparing=0, returning=0)
+
+        fast_peer = self.peer(fast(4, 1))
+        slow_peer = self.peer(stats_response(cpus=2, cores=2, jobs=2, capacity=2, running=0,
+                              busy=0, queued=0, preparing=0, returning=0))
+        self.start_broker(self.host(0, f',tcp,stats={fast_peer.port}', slots=4) + ' ' +
+                          self.host(1, f',tcp,stats={slow_peer.port},speed=.6', slots=2))
+        seed, net = self.acquire_reserved(10, (2101, 1048576, 5))
+        self.assertEqual(net.getpeername()[1], self.ports[1])
+        seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 1_000_000_000, 0)],
+                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+        self.assertEqual(seed.recv(1), b'')
+        short, net = self.acquire_reserved(10, (2102, 1048576, 5))
+        self.assertEqual(net.getpeername()[1], self.ports[1])
+        short.close()
+        long_job = self.request(10, (2103, 128 * 1048576, 5))
+        long_job.settimeout(.1)
+        with self.assertRaises(socket.timeout):
+            long_job.recv(1032)
+        fast_peer.response = fast(0, 0)
+        long_job.settimeout(5)
+        status, _, fds = self.receive(long_job)
+        self.assertEqual(status, 0)
+        with socket.socket(fileno=fds[0]) as selected:
+            self.assertEqual(selected.getpeername()[1], self.ports[0])
+
     def test_job_cost_learns_execution_cost(self):
         peers = [self.peer(stats_response(cpus=1, jobs=1, running=0, busy=0,
                     queued=0, preparing=0, returning=0, capacity=1)) for _ in range(2)]

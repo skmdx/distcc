@@ -658,6 +658,30 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         subprocess.run([compiler, caller, library, '-o', binary], check=True)
         self.assertEqual(self.run_command([binary]).returncode, 0)
 
+    @unittest.skipUnless(os.uname().machine == 'x86_64', 'requires x86-64 ELF')
+    def test_segment_overrides_preserve_operand_ownership(self):
+        tools = llvm_tools('clang')
+        if not tools:
+            self.skipTest('matching LLVM partition helpers are not installed')
+        for dialect, template, constraint, argument, expected in (
+                ('', 'mov %fs:${1:c}, $0', '=r,i', 'i64 0', 2),
+                ('', 'mov %gs:0x48, $0', '=r', '', 2),
+                ('', 'mov %fs:(%rax), $0', '=r', '', 2),
+                ('inteldialect', 'mov $0, qword ptr fs:[0x28]', '=r', '', 2),
+                ('', 'mov %fs:ext_sym, $0', '=r', '', 1)):
+            with self.subTest(assembly=template):
+                module = self.work/'segment.bc'
+                ir = ('target triple = "x86_64-unknown-linux-gnu"\n'
+                      'define i64 @load_segment() {\n'
+                      f'  %v = call i64 asm sideeffect {dialect} "{template}", "{constraint}"({argument})\n'
+                      '  ret i64 %v\n}\ndefine i64 @other() { ret i64 1 }\n')
+                subprocess.run(['llvm-as', '-o', module], input=ir, check=True, text=True)
+                parts = json.loads(subprocess.check_output(
+                    [tools['plan'], 'split', module, '2', self.work/'part']))['parts']
+                self.assertEqual(len(parts), expected)
+                for part in parts:
+                    subprocess.run(['clang', '-c', part['path'], '-o', self.work/'part.o'], check=True)
+
     def test_partitioned_shared_object_keeps_absolute_alias(self):
         tools = llvm_tools('clang')
         if not tools:

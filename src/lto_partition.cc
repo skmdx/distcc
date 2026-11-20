@@ -24,13 +24,28 @@ using namespace llvm;
 
 // Only architectural register spellings are independent of the symbol table.
 // AT&T requires '%' even for a name like eax, which alone is a memory symbol.
+static bool segmentRegister(StringRef word) {
+  return word.size() == 2 && word.ends_with_insensitive("s") &&
+         StringRef("cdefgs").contains(toLower(word.front()));
+}
+
 static bool registerOperand(StringRef word) {
   static const Regex registers(
       "^([re]?([abcd]x|[sb]p|[sd]i|ip)|[abcd][lh]|[sb]pl|[sd]il|"
-      "r([89]|[12][0-9]|3[01])([bwd])?|[cdefgs]s|"
+      "r([89]|[12][0-9]|3[01])([bwd])?|"
       "[xyz]mm([0-9]|[12][0-9]|3[01])|mm[0-7]|k[0-7]|tmm[0-7]|st)$",
       Regex::IgnoreCase);
-  return registers.match(word);
+  return segmentRegister(word) || registers.match(word);
+}
+
+static bool consumeSegment(StringRef &args, bool intel) {
+  StringRef rest = args;
+  if ((!intel && !rest.consume_front("%")) || !segmentRegister(rest.take_front(2)))
+    return false;
+  rest = rest.drop_front(2);
+  if (!rest.consume_front(":")) return false;
+  args = rest.ltrim();
+  return true;
 }
 
 // Recognize LLVM operand substitutions before scanning assembly tokens.
@@ -41,6 +56,7 @@ static bool independentOperands(StringRef args, bool intel) {
   static constexpr StringLiteral widths[] = {"byte", "word", "dword", "qword", "tbyte",
                                              "xmmword", "ymmword", "zmmword"};
   while (!(args = args.ltrim(separators)).empty()) {
+    if (consumeSegment(args, intel)) continue;
     auto word = args.take_front(args.find_first_of(separators));
     args = args.drop_front(word.size());
     if (!intel) word.consume_front("$$"); // IR-escaped immediate prefix
@@ -52,7 +68,9 @@ static bool independentOperands(StringRef args, bool intel) {
     if (!intel || !llvm::is_contained(widths, word.lower()))
       return false;
     args = args.ltrim();
-    if (!args.consume_front_insensitive("ptr") || !args.ltrim().starts_with("[")) return false;
+    if (!args.consume_front_insensitive("ptr")) return false;
+    args = args.ltrim();
+    if (!args.starts_with("[") && !consumeSegment(args, intel)) return false;
   }
   return true;
 }
