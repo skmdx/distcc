@@ -419,29 +419,29 @@ def validate_rust_cluster(targets, work, inventory, workers=None):
         builds = sum(map(len, clients.values()))
         if not builds:
             raise RuntimeError('no executable Rust compiler for cluster validation')
-        for worker in targets if workers is None else workers:
-            hosts, compilers, backends = rust_worker_capabilities(worker['server_hosts'])
-            def validate_client(client, compiler, requirement):
-                expected = ('remote' if rust_compiler_key(compiler) in compilers else
-                            'cgu' if requirement in backends else 'local')
-                name = client['name'] + '-' + compiler['digest'][:12] + '-to-' + worker['name']
-                with (work / ('rust-' + name + '.log')).open('w') as log:
-                    bounded(['env', 'TMPDIR=' + client['temporary'],
-                             'VALIDATE_DISTCC_HOSTS=' + hosts,
-                             'VALIDATE_DISTCC_RUSTC=' + compiler['root'] + '/bin/rustc',
-                             'VALIDATE_DISTCC_RUST_ROUTE=' + expected,
-                             'python3', '-B', path(client) + '/validate-installed.py', '--rust-only'],
-                            client, 'rust-' + worker['name'], log)
-                print(f'Rust {name}: {expected} compilation and execution passed', flush=True)
-            # Several slots can belong to one client; bounded() uses one unit
-            # per client/worker, so keep those slots sequential on that client.
-            def validate_slots(client):
+        offers = [(worker['name'], *rust_worker_capabilities(worker['server_hosts']))
+                  for worker in (targets if workers is None else workers)]
+
+        def validate_slots(client):
+            start = targets.index(client)
+            for step in range(len(offers)):
+                worker, hosts, compilers, backends = offers[(start + step) % len(offers)]
                 for compiler, requirement in clients[client['name']]:
-                    validate_client(client, compiler, requirement)
-            parallel(targets, validate_slots)
+                    expected = ('remote' if rust_compiler_key(compiler) in compilers else
+                                'cgu' if requirement in backends else 'local')
+                    name = client['name'] + '-' + compiler['digest'][:12] + '-to-' + worker
+                    with (work / ('rust-' + name + '.log')).open('w') as log:
+                        bounded(['env', 'TMPDIR=' + client['temporary'],
+                                 'VALIDATE_DISTCC_HOSTS=' + hosts,
+                                 'VALIDATE_DISTCC_RUSTC=' + compiler['root'] + '/bin/rustc',
+                                 'VALIDATE_DISTCC_RUST_ROUTE=' + expected,
+                                 'python3', '-B', path(client) + '/validate-installed.py', '--rust-only'],
+                                client, 'rust-' + worker, log)
+                    print(f'Rust {name}: {expected} compilation and execution passed', flush=True)
+        parallel(targets, validate_slots)
     finally:
         parallel(targets, lambda target: run(['sudo', '-n', 'rm', '-rf', '--', path(target)], target))
-    return builds * len(targets if workers is None else workers)
+    return builds * len(offers)
 
 
 def rust_slot(target, action, *arguments, privileged=False):

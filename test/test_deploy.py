@@ -129,6 +129,8 @@ class RustDistributionTest(unittest.TestCase):
              mock.patch.object(deploy, 'rust_cgu_requirement', return_value=requirement), \
              mock.patch.object(deploy, 'rust_worker_capabilities', side_effect=lambda h: (h, *offers[h])):
             self.assertEqual(deploy.validate_rust_cluster(targets, Path(work), inventory), 6)
+        self.assertEqual([w for c,w,_ in routes if c=='a'], ['a','b','c'])
+        self.assertEqual([w for c,w,_ in routes if c=='b'], ['b','c','a'])
         self.assertCountEqual(routes, [(client, worker, route) for client in ('a', 'b')
                               for worker, route in zip(('a', 'b', 'c'), ('remote', 'cgu', 'local'))])
 
