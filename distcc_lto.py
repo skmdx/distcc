@@ -86,11 +86,50 @@ def stage_output(source, destination, stack):
         return out.name
 
 
+class FileJobs:
+    """One serial distcc transport, with a separate enqueue and completion reply."""
+    def __init__(self, transport, env, pinned):
+        self.channel, child = socket.socketpair()
+        try:
+            with child:
+                self.process = subprocess.Popen([transport, '--file-jobs'], stdin=child.fileno(),
+                                                env=env, pass_fds=pinned)
+        except BaseException:
+            self.channel.close()
+            raise
+
+    def submit(self, args):
+        fields = [os.fsencode(arg) for arg in args]
+        self.channel.sendall(b'ARGC%08x' % len(fields) + b''.join(
+            b'ARGV%08x' % len(field) + field for field in fields))
+        # Only enqueueing is ordered. An invalid manifest completes before it queues.
+        return self.channel.recv(1)
+
+    def result(self, first):
+        marker = self.channel.recv(1) if first == b'Q' else first
+        if not marker:
+            return self.process.wait() or 1
+        if marker != b'D':
+            raise ValueError('invalid file job completion')
+        status = self.channel.recv(1)
+        return status[0] if status else self.process.wait() or 1
+
+    def close(self):
+        try:
+            self.channel.sendall(b'ARGC00000000')
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            self.channel.close()
+            self.process.wait()
+
+
 def distribute(request, kind, link=None):
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     import heapq
     import itertools
     import math
+    import queue
     import shlex
 
     common, jobs = request['common'], request['jobs']
@@ -153,6 +192,8 @@ def distribute(request, kind, link=None):
         helper = 'distcc-thinlto' if kind == 4 else 'distcc-offload-link'
         env = dict(os.environ)
         env.pop('INCLUDE_SERVER_PORT', None)
+        idle = queue.LifoQueue()
+        pinned = {int(path.parent.name) for path in link.outputs.values()} if link else set()
 
         def describe(index, task):
             jobdir = work / str(index)
@@ -177,37 +218,25 @@ def distribute(request, kind, link=None):
                 entries.append((name, size, digest))
             write_metadata(kind, job, entries, jobdir / 'job',
                            work_key=work_key(job, files), work_units=task['instructions'])
-            destinations = task['destinations']
-            pinned = {int(p.parent.name) for p in map(Path, destinations)
-                      if link and p.parent.parent == Path('/proc/self/fd')}
-            read_fd, write_fd = os.pipe()
-            with os.fdopen(read_fd, 'rb') as queued, os.fdopen(write_fd, 'wb') as channel:
-                process = subprocess.Popen([transport, '--file-job', str(jobdir / 'job'),
-                    str(inputs), str(write_fd), *destinations], env=env,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(write_fd, *pinned))
-                channel.close()
-                try:
-                    # Preserve ranked submission despite differing manifest
-                    # sizes and process startup times. Admission, transfer and
-                    # execution remain concurrent; only request enqueueing is
-                    # ordered. Early failures close the pipe and are collected.
-                    queued.read(1)
-                except BaseException:
-                    process.kill()
-                    process.communicate()
-                    raise
-            return process, job
+            try:
+                lane = idle.get_nowait()
+            except queue.Empty:
+                lane = FileJobs(transport, env, pinned)
+                lanes.callback(lane.close)
+                if env.get('DISTCC_VERBOSE') == '1':
+                    print(f'{helper}: transport pid={lane.process.pid}', file=sys.stderr)
+            return lane, lane.submit([jobdir / 'job', inputs, *task['destinations']]), job
 
         def collect(started):
-            process, job = started
-            stdout, stderr = process.communicate()
-            sys.stdout.buffer.write(stdout)
-            sys.stderr.buffer.write(stderr)
-            if process.returncode:
+            lane, first, job = started
+            status = lane.result(first)
+            if lane.process.returncode is None:
+                idle.put(lane)
+            if status:
                 if link is None and env.get('DISTCC_FALLBACK') != '0' and env.get('DISTCC_SKIP_LOCAL_RETRY') != '1':
                     print(helper + ': retrying backend locally', file=sys.stderr)
                     return subprocess.call(job['args'])
-                return process.returncode
+                return status
             return 0
 
         def prepare(index, task):
@@ -289,7 +318,7 @@ def distribute(request, kind, link=None):
 
         for task in jobs:
             enqueue('prepare' if task['partitions'] > 1 else 'backend', task, priority(task))
-        with ThreadPoolExecutor(max_workers=slots) as pool:
+        with ExitStack() as lanes, ThreadPoolExecutor(max_workers=slots) as pool:
             pending = {}
             while ready or pending:
                 while ready and len(pending) < slots:

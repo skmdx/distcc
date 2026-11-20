@@ -55,6 +55,7 @@
 #include "implicit.h"
 #include "compile.h"
 #include "job.h"
+#include "rpc.h"
 #include "rust/api.h"
 #include "emaillog.h"
 #include "native_worker.h"
@@ -236,14 +237,30 @@ static void dcc_gssapi_show_principal(void) {
 }
 #endif
 
-/**
- * distcc client entry point.
- *
- * This is typically called by make in place of the real compiler.
- *
- * Performs basic setup and checks for distcc arguments, and then kicks off
- * dcc_build_somewhere().
- **/
+/* A planner leases one process per concurrent exchange. The queued notification
+ * and terminal status use the same ordered, full-duplex local socket. */
+static int file_jobs(int fd)
+{
+    for (;;) {
+        unsigned argc;
+        int ret = dcc_r_token_int(fd, "ARGC", &argc);
+        if (ret || !argc) return ret;
+        if (argc < 3 || argc > DCC_JOB_INPUT_MAX + 2) return EXIT_BAD_ARGUMENTS;
+        char **args = NULL;
+        ret = dcc_r_argv_body(fd, "ARGV", argc, &args);
+        if (!ret) {
+            int queued = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+            if (queued < 0) ret = EXIT_IO_ERROR;
+            else {
+                unsigned char done[] = {'D', dcc_file_transfer(args[0], args[1], args + 2, queued)};
+                ret = dcc_writex(fd, done, sizeof(done));
+            }
+        }
+        if (args) dcc_free_argv(args);
+        if (ret) return ret;
+    }
+}
+
 int main(int argc, char **argv)
 {
     int status, sg_level, tweaked_path = 0, masquerade = 0;
@@ -279,6 +296,8 @@ int main(int argc, char **argv)
         dcc_exit(dcc_rust_submit_cgu(argv[2], argv[3], argv[4]));
 
     /* Private transport entry point used by file-based compiler planners. */
+    if (argc == 2 && !strcmp(argv[1], "--file-jobs"))
+        dcc_exit(file_jobs(STDIN_FILENO));
     if (argc >= 6 && !strcmp(argv[1], "--file-job")) {
         long queued_fd = -1;
         if (strcmp(argv[4], "-")) {

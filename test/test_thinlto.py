@@ -17,7 +17,7 @@ from test_adaptive import stats_response
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from distcc_job import fingerprint, write_metadata
-from distcc_lto import InputSnapshot, llvm_tools, work_key
+from distcc_lto import FileJobs, InputSnapshot, llvm_tools, work_key
 
 
 @unittest.skipUnless(all(shutil.which(tool) for tool in ('clang', 'bwrap', 'sandbox')),
@@ -253,8 +253,17 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
                    outputs=[output])
         metadata = self.work / 'metadata'
         write_metadata(4, job, [(name, *fingerprint(source))], metadata)
-        result = self.run_command([self.build / 'distcc', '--file-job', metadata, inputs, '-', output])
-        self.assertEqual(result.returncode, 0, result.stderr)
+        if cc1:
+            result = self.run_command([self.build / 'distcc', '--file-job', metadata, inputs, '-', output])
+            self.assertEqual(result.returncode, 0, result.stderr)
+        else:
+            lane = FileJobs(self.build/'distcc', self.env, ())
+            self.addCleanup(lane.close)
+            self.assertNotEqual(lane.result(lane.submit([self.work/'absent', inputs, output])), 0)
+            for _ in range(2):
+                marker = lane.submit([metadata, inputs, output])
+                self.assertEqual(marker, b'Q')
+                self.assertEqual(lane.result(marker), 0)
         executable = self.work / 'linked'
         result = self.run_command(['clang', output, '-o', executable])
         self.assertEqual(result.returncode, 0, result.stderr)
