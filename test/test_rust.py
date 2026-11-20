@@ -850,6 +850,34 @@ class RustTest(BrokerTestCase):
         self.assertIn('distcc-rust: compiled on '+self.worker_address, result.stderr)
         lease.close()
 
+    def test_direct_crates_bypass_masqueraded_linker(self):
+        address = '127.0.0.1'
+        self.restart_server(self.build/'distccd', address=address)
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        self.start_broker(f'{address}:{self.ports[0]}/1,tcp,stats={self.stats_ports[0]} --localslots=1',
+                          name='host-link')
+        mask = self.work/'bin'
+        mask.mkdir()
+        (mask/'clang').symlink_to(self.build/'distcc')
+        env = dict(self.env, PATH=str(mask)+os.pathsep+self.env['PATH'])
+        source = self.work/'build.rs'
+        for name, kind in [('build_script_build','bin'),('macro_plugin','proc-macro'),('tiny','bin')]:
+            source.write_text('extern crate proc_macro;' if kind=='proc-macro' else 'fn main() {}')
+            output = self.work/(name+'.so' if kind=='proc-macro' else name)
+            flags = [] if name=='tiny' else ['-Clinker-plugin-lto']
+            result = self.rust('--crate-name',name,'--crate-type',kind,'-Clinker='+str(mask/'clang'),
+                               *flags,'-Clink-arg=-fuse-ld=lld',source,'-o',output,env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('distcc-thinlto:', result.stderr)
+            self.assertNotIn('dcc_lock_pause', result.stderr)
+            if kind=='bin':
+                subprocess.run([output], check=True)
+            else:
+                self.assertTrue(output.stat().st_size)
+        stats = json.loads(subprocess.check_output([self.build/'distcc','--lto-capacity'], env=env))
+        self.assertEqual(stats['direct_completed'], 3)
+        self.assertNotIn('kind=8 ', (self.work/'host-link.log').read_text())
+
     def test_host_artifacts_link_with_local_driver(self):
         for name, kind, body in [('build_script_build', 'bin', 'fn main() {}'),
                                  ('derive_check', 'proc-macro', 'extern crate proc_macro;')]:

@@ -9,6 +9,7 @@
 
 #include <array>
 #include <chrono>
+#include <elf.h>
 #include <functional>
 #include <iconv.h>
 #include <memory>
@@ -253,7 +254,7 @@ struct Invocation {
     std::map<fs::path, fs::path> observed;
     std::set<string> libraries;
     bool trace_macro = false, needs_host = false, static_archive = false, pipeline = false;
-    bool multi_cgu = true, incremental = false, linker_plugin_lto = false;
+    bool multi_cgu = true, incremental = false, linker_plugin_lto = false, explicit_linker = false;
     Words compiler_flags;
     string metadata_name;
     std::set<string> link_arguments;
@@ -346,8 +347,10 @@ struct Invocation {
             auto eq = v.find('=');
             string key = v.substr(0, eq), val = eq == string::npos ? "" : v.substr(eq + 1);
             if (k == "-C") {
-                if (key == "linker")
+                if (key == "linker") {
                     driver = val;
+                    explicit_linker = true;
+                }
                 if (key == "linker-plugin-lto")
                     linker_plugin_lto = val != "no" && val != "off" && val != "false";
                 if (key == "codegen-units")
@@ -719,8 +722,10 @@ string link_path(const fs::path &tools, const fs::path &name) {
         };
         auto directory = fs::path(dir);
         if (!wrapper(directory) && !wrapper(directory.parent_path()) &&
-            !alias("cc") && !alias("gcc") && !alias("clang") && !alias(name.filename()))
-            path += ":" + dir;
+            !alias("cc") && !alias("gcc") && !alias("clang") && !alias(name.filename())) {
+            if (!path.empty()) path += ':';
+            path += dir;
+        }
     }
     return path;
 }
@@ -901,7 +906,8 @@ void publish(Result &result, const Invocation &inv) {
         f.temporary = nullptr;
     }
 }
-std::optional<int> try_local_frontend(char **original, const States &responses, const dcc_work_hint &hint) {
+std::optional<int> try_local_frontend(const Invocation &inv, char **original, const States &responses,
+                                      const dcc_work_hint &hint) {
     Lease lease{dcc_broker_try_local(&hint)};
     if (lease.id < 0)
         return {};
@@ -910,8 +916,24 @@ std::optional<int> try_local_frontend(char **original, const States &responses, 
     Words cmd;
     for (auto p = original; *p; ++p)
         cmd.emplace_back(*p);
+    Env environment;
+    if (!inv.linker.empty()) {
+        // The lease covers rustc and its linker. Resolve the same native driver
+        // as finish_links so a Portage masquerade cannot start a second scheduler.
+        if (inv.explicit_linker) {
+            auto driver = link_driver(inv.linker);
+            // An opaque linker script can invoke distcc by absolute path.
+            // Preserve its behavior on the ordinary captured-link path.
+            Fd file(open(driver.c_str(), O_RDONLY | O_CLOEXEC));
+            char magic[SELFMAG];
+            if (::read(file.fd, magic, sizeof(magic)) != sizeof(magic) || memcmp(magic, ELFMAG, SELFMAG))
+                return {};
+            cmd.emplace_back("-Clinker=" + driver.string());
+        }
+        environment["PATH"] = link_path({}, inv.linker);
+    }
     auto start = std::chrono::steady_clock::now();
-    int status = run(cmd, {}, 1, 2);
+    int status = run(cmd, environment, 1, 2);
     struct rusage usage{};
     getrusage(RUSAGE_CHILDREN, &usage);
     uint64_t cpu = (usage.ru_stime.tv_sec + usage.ru_utime.tv_sec) * 1000000000ULL +
@@ -1138,7 +1160,7 @@ int distributed(char **original, const Words &args, const States &responses) {
     if (!route.native_peers || (!small && inv.multi_cgu && (inv.linker_plugin_lto ? mixed : route.cgu_peers >= 2)))
         return cgu_frontend(route, inv, exe, original, responses);
     if (small && !inv.incremental && !inv.distributed_link())
-        if (auto status = try_local_frontend(original, responses, hint))
+        if (auto status = try_local_frontend(inv, original, responses, hint))
             return *status;
     auto refused = [&](const Local &reason) {
         if (!route.cgu_peers)
