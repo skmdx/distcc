@@ -827,7 +827,8 @@ class RustTest(BrokerTestCase):
         source = self.work/'tiny.rs'
         output = self.work/'libtiny.rlib'
         source.write_text('pub fn tiny() {}')
-        result = self.rust('--crate-type=rlib', source, '-o', output)
+        result = self.rust('--crate-type=rlib', '-L', 'dependency='+str(self.work),
+                           '-Clinker-plugin-lto', source, '-o', output)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertGreater(output.stat().st_size, 0)
         stats = subprocess.check_output([self.build/'distcc','--lto-capacity'], env=self.env)
@@ -839,6 +840,35 @@ class RustTest(BrokerTestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         stats=subprocess.check_output([self.build/'distcc','--lto-capacity'],env=self.env)
         self.assertEqual(json.loads(stats)['direct_completed'],2)
+        self.start_broker(f'{address}:{self.ports[0]}/1,tcp,stats={self.stats_ports[0]} ' +
+                          self.host(1, f',tcp,stats={self.stats_ports[1]}', slots=1), name='occupied')
+        lease = self.request(15, (1, 1024, 1))
+        self.assertEqual(self.receive(lease), (0, 1, []))
+        result = self.rust('--crate-type=rlib', '-L', 'dependency='+str(self.work),
+                           '-Clinker-plugin-lto', source, '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on '+self.worker_address, result.stderr)
+        lease.close()
+
+    def test_host_artifacts_link_with_local_driver(self):
+        for name, kind, body in [('build_script_build', 'bin', 'fn main() {}'),
+                                 ('derive_check', 'proc-macro', 'extern crate proc_macro;')]:
+            with self.subTest(kind=kind):
+                source = self.work/(name+'.rs')
+                source.write_text(body)
+                output = self.work/(name if kind == 'bin' else 'lib'+name+'.so')
+                result = self.rust('--crate-name', name, '--crate-type', kind, '-Clinker=clang',
+                                   '-Clinker-plugin-lto', '-Clink-arg=-fuse-ld=lld', source, '-o', output)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-rust: compiled on ', result.stderr)
+                self.assertNotIn('distcc-thinlto:', result.stderr)
+                if kind == 'bin':
+                    subprocess.run([output], check=True)
+                else:
+                    use = self.work/'consumer.rs'
+                    use.write_text('extern crate derive_check;')
+                    subprocess.run([self.rustc, '--crate-type=lib', '--emit=metadata', use,
+                                    '--extern', 'derive_check='+str(output)], cwd=self.work, check=True)
 
     def test_warm_compiler_and_rlib_reuse(self):
         dep, artifact = self.work/'leaf.rs', self.work/'libleaf.rlib'

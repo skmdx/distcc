@@ -239,6 +239,12 @@ inline std::vector<Option> options(const Words &args) {
     }
     return parsed;
 }
+bool thin_link_argument(const string &arg) {
+    auto options = split(arg, ',');
+    return std::any_of(options.begin(), options.end(), [](const string &s) {
+        return s == "-flto=thin" || s == "-plugin-opt=thinlto";
+    });
+}
 struct Invocation {
     Words base, actions, types;
     fs::path source, outdir = fs::current_path(), scope;
@@ -254,6 +260,15 @@ struct Invocation {
     std::set<string> dep_names;
     std::map<string, string> outputs;
     Env environment;
+    bool distributed_link() const {
+        return !linker.empty() && !host_artifact() &&
+            (linker_plugin_lto || std::any_of(link_arguments.begin(), link_arguments.end(), thin_link_argument));
+    }
+    bool host_artifact() const {
+        return name == "build_script_build" ||
+            (!types.empty() && std::all_of(types.begin(), types.end(),
+                [](const string &type) { return type == "proc-macro"; }));
+    }
     explicit Invocation(const Words &args) {
         auto opts = options(args);
         incremental = std::any_of(opts.begin(), opts.end(), [](const Option &o) {
@@ -313,8 +328,8 @@ struct Invocation {
             if (k == "--crate-name")
                 name = v;
             if (k == "--crate-type") {
-                types.push_back(v);
                 for (auto &type : split(v, ',')) {
+                    types.push_back(type);
                     needs_host |= type == "proc-macro";
                     native_link |= type == "bin" || type == "cdylib" || type == "dylib" || type == "proc-macro";
                     static_archive |= type == "staticlib";
@@ -783,10 +798,9 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         for (auto it = args.begin() + 1; it != args.end(); ++it) {
             auto compiler_root = compiler.parent_path().parent_path();
             string arg = *it;
-            for (const auto &option : split(arg, ',')) {
-                thin |= option == "-flto=thin" || option == "-plugin-opt=thinlto";
+            thin |= thin_link_argument(arg);
+            for (const auto &option : split(arg, ','))
                 distributed |= option.rfind("--thinlto-distributor=", 0) == 0;
-            }
             if (!inv.link_arguments.count(arg) &&
                 (arg.find("-rpath") != string::npos || (it[-1] == "-rpath" || it[-1] == "--rpath")))
                 arg = relocate_runpath(std::move(arg), fs::canonical(fs::path(f.destination).parent_path()),
@@ -808,7 +822,7 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
             throw std::runtime_error("missing linker destination");
         // Only the local driver's identity selects the remote compiler.
         fs::path binary;
-        if (thin && !distributed && !env("DISTCC_BROKER").empty())
+        if (thin && !inv.host_artifact() && !distributed && !env("DISTCC_BROKER").empty())
             binary = thinlto_compiler(driver, box);
         Words launcher;
         std::optional<Work> temporary;
@@ -1123,7 +1137,7 @@ int distributed(char **original, const Words &args, const States &responses) {
         throw Local("worker has no matching Rust toolchain");
     if (!route.native_peers || (!small && inv.multi_cgu && (inv.linker_plugin_lto ? mixed : route.cgu_peers >= 2)))
         return cgu_frontend(route, inv, exe, original, responses);
-    if (small && !mixed && !inv.linker_plugin_lto && !inv.trace_macro && !inv.incremental && inv.scope.empty())
+    if (small && !inv.incremental && !inv.distributed_link())
         if (auto status = try_local_frontend(original, responses, hint))
             return *status;
     auto refused = [&](const Local &reason) {
