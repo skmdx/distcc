@@ -8,9 +8,11 @@
 #include <llvm/Bitcode/BitcodeWriterPass.h>
 #include <llvm/Transforms/IPO/ThinLTOBitcodeWriter.h>
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/VirtualFileSystem.h>
+#include <llvm-c/TargetMachine.h>
 #include <atomic>
 #include <mutex>
 #include <map>
@@ -27,14 +29,32 @@
 using namespace llvm;
 namespace {
 [[noreturn]] void fatal(const Twine &message);
-template <typename Fn> Fn original(Fn hook) {
+// Each ELF section contains one interposed function. Its linker-provided start
+// identifies the export even for members, constructors and overloaded methods.
+// The same sections identify the hooks to the cross-build symbol check.
+#define CGU_HOOK(id)                                                                                         \
+    extern "C" [[gnu::visibility("hidden")]] const char __start_dcc_hook_##id[];                             \
+    [[gnu::used, gnu::retain, gnu::section("dcc_hook_entries")]] static const void *const id##_entry =       \
+        __start_dcc_hook_##id;                                                                               \
+    [[gnu::section("dcc_hook_" #id)]]
+extern "C" [[gnu::visibility("hidden")]] const void *const __start_dcc_hook_entries[], *const __stop_dcc_hook_entries[];
+void *original(const void *hook) {
     Dl_info info{};
-    if (!dladdr(reinterpret_cast<void *>(hook), &info) || !info.dli_sname)
+    // GNU ld may also expose a zero-size __start symbol at the first byte.
+    // Query inside the function so dladdr selects the interposed ELF symbol.
+    if (!dladdr(static_cast<const char *>(hook) + 1, &info) || !info.dli_sname)
         fatal("cannot resolve LLVM hook symbol");
-    auto fn = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, info.dli_sname));
+    auto fn = dlsym(RTLD_NEXT, info.dli_sname);
     if (!fn)
         fatal(Twine("missing LLVM entry point ") + info.dli_sname);
     return fn;
+}
+template <typename Fn> Fn next_function(const void *hook, Fn) {
+    return reinterpret_cast<Fn>(original(hook));
+}
+template <typename R, typename C, typename... A>
+auto next_method(const void *hook, R (C::*)(A...)) {
+    return reinterpret_cast<R (*)(C *, A...)>(original(hook));
 }
 bool rust_caller(void *pc) {
     Dl_info info{};
@@ -56,7 +76,7 @@ struct Builder {
 };
 thread_local Builder builder;
 struct Emission {
-    legacy::PassManager *pm = nullptr;
+    legacy::PassManagerBase *pm = nullptr;
     TargetMachine *tm = nullptr;
     raw_fd_ostream *object = nullptr;
 };
@@ -95,6 +115,8 @@ __attribute__((constructor)) void compiler_environment() {
         fprintf(stderr, "distcc-rust-cgu: incompatible linked LLVM ABI\n");
         _exit(EXIT_DISTCC_FAILED);
     }
+    for (auto entry = __start_dcc_hook_entries; entry != __stop_dcc_hook_entries; ++entry)
+        original(*entry);
     transport = strdup(client);
     object_only =
         getenv("DISTCC_RUST_CGU_OBJECT_ONLY") && !strcmp(getenv("DISTCC_RUST_CGU_OBJECT_ONLY"), "1");
@@ -316,7 +338,7 @@ void capture_tail(ModulePassManager &pm, Module &m) {
     passes.erase(std::next(marker), passes.end());
 }
 
-ModulePassManager wrap(PassBuilder *pb, ModulePassManager passes, StringRef kind, OptimizationLevel level,
+ModulePassManager wrap_pipeline(PassBuilder *pb, ModulePassManager passes, StringRef kind, OptimizationLevel level,
                        ThinOrFullLTOPhase phase) {
     if (!transport || pb != builder.pb || !builder.tm || !supported(*builder.tm))
         return passes;
@@ -334,8 +356,11 @@ ModulePassManager wrap(PassBuilder *pb, ModulePassManager passes, StringRef kind
     return result;
 }
 } // namespace
+// The header declares extern template class PassManager<Module>, precluding
+// a specialization of run() here. The exported signature has no std types.
 PreservedAnalyses module_passes(ModulePassManager *, Module &, ModuleAnalysisManager &) asm(
     "_ZN4llvm11PassManagerINS_6ModuleENS_15AnalysisManagerIS1_JEEEJEE3runERS1_RS3_");
+CGU_HOOK(module_passes)
 PreservedAnalyses module_passes(ModulePassManager *pm, Module &m, ModuleAnalysisManager &am) {
     if (transport && rust_caller(__builtin_return_address(0))) {
         // A compiler-side bitcode writer (e.g. save-temps or linker-plugin
@@ -351,33 +376,39 @@ PreservedAnalyses module_passes(ModulePassManager *pm, Module &m, ModuleAnalysis
             capture_tail(*pm, m);
         }
     }
-    static auto next = original(&module_passes);
+    static auto next = next_function(module_passes_entry, &module_passes);
     return next(pm, m, am);
 }
 // A compiler-supplied pass may own observations in the local LLVMContext.
-Error custom_pipeline(PassBuilder *, ModulePassManager &,
-                      StringRef) asm("_ZN4llvm11PassBuilder17parsePassPipelineERNS_11PassManagerINS_"
-                                     "6ModuleENS_15AnalysisManagerIS2_JEEEJEEENS_9StringRefE");
-Error custom_pipeline(PassBuilder *pb, ModulePassManager &pm, StringRef pipeline) {
-    if (pb == builder.pb && rust_caller(__builtin_return_address(0)))
+CGU_HOOK(custom_pipeline)
+Error PassBuilder::parsePassPipeline(ModulePassManager &pm, StringRef pipeline) {
+    if (this == builder.pb && rust_caller(__builtin_return_address(0)))
         builder.custom = true;
-    static auto next = original(&custom_pipeline);
-    return next(pb, pm, pipeline);
+    using Parse = Error (PassBuilder::*)(ModulePassManager &, StringRef);
+    static auto next = next_method(custom_pipeline_entry, static_cast<Parse>(&PassBuilder::parsePassPipeline));
+    return next(this, pm, pipeline);
 }
 extern "C" void destroy_module(Module *) asm("_ZN4llvm6ModuleD1Ev");
+CGU_HOOK(destroy_module)
 void destroy_module(Module *m) {
     if (transport)
         take(*m);
-    static auto next = original(&destroy_module);
+    static auto next = next_function(destroy_module_entry, &destroy_module);
     next(m);
 }
 // Use free-function ABI declarations for constructor entry points. Calling a
 // replacement C++ constructor would initialize the LLVM object's members twice.
-#define PB_CTOR                                                                                              \
-    "_ZN4llvm11PassBuilderC1EPNS_13TargetMachineENS_21PipelineTuningOptionsESt8optionalINS_"                 \
-    "10PGOOptionsEEPNS_28PassInstrumentationCallbacksENS_18IntrusiveRefCntPtrINS_3vfs10FileSystemEEE"
+#ifdef _LIBCPP_VERSION
+#include "cgu-libcpp.h"
+#define STD_TYPE(name) "NSt" DCC_LIBCPP_NAMESPACE name "E"
+#else
+#define STD_TYPE(name) "St" name
+#endif
 extern "C" void pb_ctor(PassBuilder *, TargetMachine *, PipelineTuningOptions, std::optional<PGOOptions>,
-                        PassInstrumentationCallbacks *, IntrusiveRefCntPtr<vfs::FileSystem>) asm(PB_CTOR);
+                        PassInstrumentationCallbacks *, IntrusiveRefCntPtr<vfs::FileSystem>) asm(
+    "_ZN4llvm11PassBuilderC1EPNS_13TargetMachineENS_21PipelineTuningOptionsE" STD_TYPE("8optionalINS_10PGOOptionsEE")
+    "PNS_28PassInstrumentationCallbacksENS_18IntrusiveRefCntPtrINS_3vfs10FileSystemEEE");
+CGU_HOOK(pb_ctor)
 void pb_ctor(PassBuilder *self, TargetMachine *tm, PipelineTuningOptions pto, std::optional<PGOOptions> pgo,
              PassInstrumentationCallbacks *pic, IntrusiveRefCntPtr<vfs::FileSystem> fs) {
     if (rust_caller(__builtin_return_address(0))) {
@@ -385,82 +416,77 @@ void pb_ctor(PassBuilder *self, TargetMachine *tm, PipelineTuningOptions pto, st
         builder = {self, !pgo && pic ? tm : nullptr, pto};
         no_builtins = false;
     }
-    static auto next = original(&pb_ctor);
+    static auto next = next_function(pb_ctor_entry, &pb_ctor);
     next(self, tm, pto, std::move(pgo), pic, std::move(fs));
 }
-#define PIPELINE(fn, symbol, kind)                                                                           \
-    ModulePassManager fn(PassBuilder *, OptimizationLevel, ThinOrFullLTOPhase) asm(symbol);                  \
-    ModulePassManager fn(PassBuilder *pb, OptimizationLevel level, ThinOrFullLTOPhase phase) {               \
-        static auto next = original(&fn);                                                                    \
-        auto p = next(pb, level, phase);                                                                     \
+#define PIPELINE(fn, kind)                                                                                   \
+    CGU_HOOK(fn)                                                                                             \
+    ModulePassManager PassBuilder::fn(OptimizationLevel level, ThinOrFullLTOPhase phase) {                   \
+        static auto next = next_method(fn##_entry, &PassBuilder::fn);                                        \
+        auto p = next(this, level, phase);                                                                   \
         if (!rust_caller(__builtin_return_address(0)))                                                       \
             return p;                                                                                        \
-        return wrap(pb, std::move(p), kind, level, phase);                                                   \
+        return wrap_pipeline(this, std::move(p), kind, level, phase);                                                 \
     }
-#define LEVEL_PHASE "ENS_17OptimizationLevelENS_18ThinOrFullLTOPhaseE"
-PIPELINE(per_module, "_ZN4llvm11PassBuilder29buildPerModuleDefaultPipeline" LEVEL_PHASE, "per-module")
-PIPELINE(o0, "_ZN4llvm11PassBuilder22buildO0DefaultPipeline" LEVEL_PHASE, "O0")
-PIPELINE(module_opt, "_ZN4llvm11PassBuilder31buildModuleOptimizationPipeline" LEVEL_PHASE, "module-opt")
-ModulePassManager prelink(PassBuilder *, OptimizationLevel) asm(
-    "_ZN4llvm11PassBuilder34buildThinLTOPreLinkDefaultPipelineENS_17OptimizationLevelE");
-ModulePassManager prelink(PassBuilder *pb, OptimizationLevel level) {
-    static auto next = original(&prelink);
-    auto passes = next(pb, level);
+PIPELINE(buildPerModuleDefaultPipeline, "per-module")
+PIPELINE(buildO0DefaultPipeline, "O0")
+PIPELINE(buildModuleOptimizationPipeline, "module-opt")
+CGU_HOOK(prelink)
+ModulePassManager PassBuilder::buildThinLTOPreLinkDefaultPipeline(OptimizationLevel level) {
+    static auto next = next_method(prelink_entry, &PassBuilder::buildThinLTOPreLinkDefaultPipeline);
+    auto passes = next(this, level);
     if (!plugin_lto || !rust_caller(__builtin_return_address(0)))
         return passes;
-    return wrap(pb, std::move(passes), "thin-prelink", level, ThinOrFullLTOPhase::ThinLTOPreLink);
+    return wrap_pipeline(this, std::move(passes), "thin-prelink", level, ThinOrFullLTOPhase::ThinLTOPreLink);
 }
-ModulePassManager thin(PassBuilder *, OptimizationLevel, const ModuleSummaryIndex *) asm(
-    "_ZN4llvm11PassBuilder27buildThinLTODefaultPipelineENS_17OptimizationLevelEPKNS_18ModuleSummaryIndexE");
-ModulePassManager thin(PassBuilder *pb, OptimizationLevel level, const ModuleSummaryIndex *index) {
-    static auto next = original(&thin);
-    auto p = next(pb, level, index);
+CGU_HOOK(thin)
+ModulePassManager PassBuilder::buildThinLTODefaultPipeline(OptimizationLevel level, const ModuleSummaryIndex *index) {
+    static auto next = next_method(thin_entry, &PassBuilder::buildThinLTODefaultPipeline);
+    auto p = next(this, level, index);
     if (index || !rust_caller(__builtin_return_address(0)))
         return p;
-    return wrap(pb, std::move(p), "thin-postlink", level, ThinOrFullLTOPhase::ThinLTOPostLink);
+    return wrap_pipeline(this, std::move(p), "thin-postlink", level, ThinOrFullLTOPhase::ThinLTOPostLink);
 }
-extern "C" bool
-llvm_flags(int, const char *const *, StringRef, raw_ostream *, vfs::FileSystem *, const char *, bool) asm(
-    "_ZN4llvm2cl23ParseCommandLineOptionsEiPKPKcNS_9StringRefEPNS_11raw_ostreamEPNS_3vfs10FileSystemES2_b");
-bool llvm_flags(int n, const char *const *argv, StringRef desc, raw_ostream *err, vfs::FileSystem *fs,
-                const char *env, bool dash) {
+CGU_HOOK(llvm_flags)
+bool cl::ParseCommandLineOptions(int n, const char *const *argv, StringRef desc, raw_ostream *err,
+                                 vfs::FileSystem *fs, const char *env, bool dash) {
     if (rust_caller(__builtin_return_address(0))) {
         compiler_flags.assign(argv + 1, argv + n);
     }
-    static auto next = original(&llvm_flags);
+    static auto next = next_function(llvm_flags_entry, &cl::ParseCommandLineOptions);
     return next(n, argv, desc, err, fs, env, dash);
 }
-extern "C" void
-disable_builtins(TargetLibraryInfoImpl *) asm("_ZN4llvm21TargetLibraryInfoImpl19disableAllFunctionsEv");
-void disable_builtins(TargetLibraryInfoImpl *info) {
+CGU_HOOK(disable_builtins)
+void TargetLibraryInfoImpl::disableAllFunctions() {
     if (rust_caller(__builtin_return_address(0)))
         no_builtins = true;
-    static auto next = original(&disable_builtins);
-    next(info);
+    static auto next = next_method(disable_builtins_entry, &TargetLibraryInfoImpl::disableAllFunctions);
+    next(this);
 }
-extern "C" void analysis(TargetMachine *, legacy::PassManager *) asm("LLVMAddAnalysisPasses");
-void analysis(TargetMachine *tm, legacy::PassManager *pm) {
+CGU_HOOK(analysis)
+void LLVMAddAnalysisPasses(LLVMTargetMachineRef tm, LLVMPassManagerRef pm) {
     if (rust_caller(__builtin_return_address(0))) {
         backend_started();
-        emission = {pm, tm, nullptr};
+        emission = {unwrap(pm), reinterpret_cast<TargetMachine *>(tm), nullptr};
         no_builtins = false;
     }
-    static auto next = original(&analysis);
+    static auto next = next_function(analysis_entry, &LLVMAddAnalysisPasses);
     next(tm, pm);
 }
 extern "C" void open_output(raw_fd_ostream *, StringRef, std::error_code &, sys::fs::OpenFlags) asm(
-    "_ZN4llvm14raw_fd_ostreamC1ENS_9StringRefERSt10error_codeNS_3sys2fs9OpenFlagsE");
+    "_ZN4llvm14raw_fd_ostreamC1ENS_9StringRefER" STD_TYPE("10error_code") "NS_3sys2fs9OpenFlagsE");
+CGU_HOOK(open_output)
 void open_output(raw_fd_ostream *os, StringRef path, std::error_code &ec, sys::fs::OpenFlags flags) {
-    static auto next = original(&open_output);
+    static auto next = next_function(open_output_entry, &open_output);
     next(os, path, ec, flags);
     if (emission.pm && rust_caller(__builtin_return_address(0)))
         emission.object = !ec && path.ends_with(".rcgu.o") ? os : nullptr;
 }
-extern "C" bool emit(legacy::PassManager *, Module &) asm("_ZN4llvm6legacy11PassManager3runERNS_6ModuleE");
-bool emit(legacy::PassManager *pm, Module &m) {
+CGU_HOOK(emit)
+bool legacy::PassManager::run(Module &m) {
     auto pending = emission;
     emission = {};
-    if (pm == pending.pm && pending.object) {
+    if (this == pending.pm && pending.object) {
         auto write_object = [&](const Reply &result) {
             *pending.object << result.object;
             if (getenv("DISTCC_VERBOSE") && !strcmp(getenv("DISTCC_VERBOSE"), "1"))
@@ -488,6 +514,6 @@ bool emit(legacy::PassManager *pm, Module &m) {
                 return write_object(*reply);
         }
     }
-    static auto next = original(&emit);
-    return next(pm, m);
+    static auto next = next_method(emit_entry, &legacy::PassManager::run);
+    return next(this, m);
 }
