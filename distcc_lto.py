@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LLVM-generated link jobs over distcc's shared input transport."""
 from contextlib import ExitStack
-from functools import cached_property
+from functools import cache, cached_property
 import json
 import os
 from pathlib import Path
@@ -47,6 +47,7 @@ def open_regular(path, dir_fd=None):
     return fd
 
 
+@cache
 def llvm_tools(compiler):
     """Find the helpers registered with the compiler's own LLVM installation."""
     binary = shutil.which(compiler) or compiler
@@ -300,12 +301,15 @@ def distribute(request, kind, link=None):
                             '--chdir', CONTROL, '--clearenv', '--'])
             environment = dict(os.environ, SANDBOX_ON='0')
             parts = [Path(p).name for p in group['outputs']]
-            (directory / 'localize.rsp').write_text(shlex.join(
-                ['--localize-symbol=' + name for name in group['locals']] + ['merged.o', 'localized.o']))
             subprocess.run([*sandbox, tools['linker'], '-r', '-o', 'merged.o', *parts], env=environment, check=True)
-            subprocess.run([*sandbox, tools['objcopy'], '@localize.rsp'], env=environment, check=True)
+            output = 'merged.o'
+            if group['locals']:
+                output = 'localized.o'
+                (directory / 'localize.rsp').write_text(shlex.join(
+                    ['--localize-symbol=' + name for name in group['locals']] + ['merged.o', output]))
+                subprocess.run([*sandbox, tools['objcopy'], '@localize.rsp'], env=environment, check=True)
             destination = group['destination']
-            with os.fdopen(open_regular(directory / 'localized.o'), 'rb') as source, ExitStack() as stack:
+            with os.fdopen(open_regular(directory / output), 'rb') as source, ExitStack() as stack:
                 os.replace(stage_output(source, destination, stack), destination)
 
         # Preparation and ordinary backends share one bounded scheduler. Ready

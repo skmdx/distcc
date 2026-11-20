@@ -262,13 +262,8 @@ struct Invocation {
     std::map<string, string> outputs;
     Env environment;
     bool distributed_link() const {
-        return !linker.empty() && !host_artifact() &&
+        return !linker.empty() &&
             (linker_plugin_lto || std::any_of(link_arguments.begin(), link_arguments.end(), thin_link_argument));
-    }
-    bool host_artifact() const {
-        return name == "build_script_build" ||
-            (!types.empty() && std::all_of(types.begin(), types.end(),
-                [](const string &type) { return type == "proc-macro"; }));
     }
     explicit Invocation(const Words &args) {
         auto opts = options(args);
@@ -827,7 +822,7 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
             throw std::runtime_error("missing linker destination");
         // Only the local driver's identity selects the remote compiler.
         fs::path binary;
-        if (thin && !inv.host_artifact() && !distributed && !env("DISTCC_BROKER").empty())
+        if (thin && !distributed && !env("DISTCC_BROKER").empty())
             binary = thinlto_compiler(driver, box);
         Words launcher;
         std::optional<Work> temporary;

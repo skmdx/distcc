@@ -864,9 +864,8 @@ class RustTest(BrokerTestCase):
         for name, kind in [('build_script_build','bin'),('macro_plugin','proc-macro'),('tiny','bin')]:
             source.write_text('extern crate proc_macro;' if kind=='proc-macro' else 'fn main() {}')
             output = self.work/(name+'.so' if kind=='proc-macro' else name)
-            flags = [] if name=='tiny' else ['-Clinker-plugin-lto']
             result = self.rust('--crate-name',name,'--crate-type',kind,'-Clinker='+str(mask/'clang'),
-                               *flags,'-Clink-arg=-fuse-ld=lld',source,'-o',output,env=env)
+                               '-Clink-arg=-fuse-ld=lld',source,'-o',output,env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn('distcc-thinlto:', result.stderr)
             self.assertNotIn('dcc_lock_pause', result.stderr)
@@ -878,25 +877,24 @@ class RustTest(BrokerTestCase):
         self.assertEqual(stats['direct_completed'], 3)
         self.assertNotIn('kind=8 ', (self.work/'host-link.log').read_text())
 
-    def test_host_artifacts_link_with_local_driver(self):
+    def test_small_thinlto_links_use_distributor(self):
         for name, kind, body in [('build_script_build', 'bin', 'fn main() {}'),
-                                 ('derive_check', 'proc-macro', 'extern crate proc_macro;')]:
+                                 ('derived', 'proc-macro', 'extern crate proc_macro;')]:
             with self.subTest(kind=kind):
                 source = self.work/(name+'.rs')
                 source.write_text(body)
-                output = self.work/(name if kind == 'bin' else 'lib'+name+'.so')
+                output = self.work/(name if kind=='bin' else 'lib'+name+'.so')
                 result = self.rust('--crate-name', name, '--crate-type', kind, '-Clinker=clang',
                                    '-Clinker-plugin-lto', '-Clink-arg=-fuse-ld=lld', source, '-o', output)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('distcc-rust: compiled on ', result.stderr)
-                self.assertNotIn('distcc-thinlto:', result.stderr)
-                if kind == 'bin':
+                self.assertIn('distcc-thinlto: compiled on ', result.stderr)
+                if kind=='bin':
                     subprocess.run([output], check=True)
                 else:
-                    use = self.work/'consumer.rs'
-                    use.write_text('extern crate derive_check;')
-                    subprocess.run([self.rustc, '--crate-type=lib', '--emit=metadata', use,
-                                    '--extern', 'derive_check='+str(output)], cwd=self.work, check=True)
+                    consumer = self.work/'consumer.rs'
+                    consumer.write_text('extern crate derived;')
+                    subprocess.run([self.rustc, '--crate-type=lib', '--emit=metadata', consumer,
+                                    '--extern', 'derived='+str(output)], cwd=self.work, check=True)
 
     def test_warm_compiler_and_rlib_reuse(self):
         dep, artifact = self.work/'leaf.rs', self.work/'libleaf.rlib'
