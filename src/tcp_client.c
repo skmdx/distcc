@@ -3,6 +3,7 @@
 #include <config.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <lz4.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,14 +90,15 @@ done:
 }
 static unsigned char *next_chunk(struct input_stream *stream, const struct dcc_job_input *in,
                                  unsigned char *p, unsigned char *snapshot,
-                                 size_t *size, off_t *file_offset, size_t *file_left)
+                                 size_t *size, off_t *file_offset, size_t *file_left, int local)
 {
     *file_left = 0;
     uint64_t remaining = in->plain_size - stream->plain;
     size_t amount = remaining < DCC_TCP_CHUNK ? remaining : DCC_TCP_CHUNK;
     if (in->encoding == DCC_JOB_RAW) {
         p = dcc_tcp_file_chunk(DCC_TCP_INPUT, stream->index, stream->fd,
-            stream->offset, amount, amount == remaining, stream->immutable, p, snapshot, size);
+            stream->offset, amount, amount == remaining, local ? DCC_LOCAL_RAW :
+            stream->immutable ? DCC_IMMUTABLE : DCC_MUTABLE, p, snapshot, size);
         if (!p) return NULL;
         if (*size == 16) { *file_offset = stream->offset; *file_left = amount; }
         stream->offset += amount; stream->plain += amount;
@@ -122,6 +124,15 @@ static unsigned char *next_chunk(struct input_stream *stream, const struct dcc_j
         }
         if (stream->offset != in->wire_size) return NULL;
     }
+    if (local) {
+        unsigned char *bytes = encoded ? snapshot : p + 16;
+        if (pread(stream->fd, bytes, payload, *file_offset) != (ssize_t)payload) return NULL;
+        if (encoded && LZ4_decompress_safe((char *)bytes, (char *)p + 16, encoded, plain) != (int)plain)
+            return NULL;
+        *file_left = 0;
+        *size = dcc_tcp_encode(DCC_TCP_INPUT, stream->index, p + 16, plain, final, 0, p) + plain;
+        return p;
+    }
     dcc_tcp_put32(p, DCC_TCP_INPUT | (encoded ? DCC_TCP_COMPRESSED : 0) | (final ? DCC_TCP_FINAL : 0));
     dcc_tcp_put32(p + 4, payload + 8);
     dcc_tcp_put32(p + 8, stream->index); dcc_tcp_put32(p + 12, plain);
@@ -132,7 +143,7 @@ static unsigned char *next_chunk(struct input_stream *stream, const struct dcc_j
  * the same existing chunk stream, taking a private snapshot of mutable bytes
  * before compression/send. This does not introduce an extra frame or wait. */
 static int next_fs_chunk(const struct dcc_frontend_reply *reply, uint64_t *offset,
-                         unsigned char *buffer, unsigned char *p, size_t *size)
+                         unsigned char *buffer, unsigned char *p, size_t *size, int local)
 {
     uint64_t total = reply->size + reply->file_size;
     size_t amount = total - *offset < DCC_TCP_CHUNK ? total - *offset : DCC_TCP_CHUNK;
@@ -151,7 +162,7 @@ static int next_fs_chunk(const struct dcc_frontend_reply *reply, uint64_t *offse
         }
         data = buffer;
     }
-    *size = dcc_tcp_encode(DCC_TCP_FS_REPLY, UINT_MAX, data, amount, *offset + amount == total, p);
+    *size = dcc_tcp_encode(DCC_TCP_FS_REPLY, UINT_MAX, data, amount, *offset + amount == total, !local, p);
     if (*size == 16) { memcpy(p + 16, data, amount); *size += amount; }
     *offset += amount;
     return 0;
@@ -286,7 +297,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         for (unsigned turn = 0; turn < 4; ++turn) {
             if (!length && filesystem.size) {
                 outgoing = p_buf;
-                if (next_fs_chunk(&filesystem, &fs_offset, buffer, outgoing, &length)) goto done;
+                if (next_fs_chunk(&filesystem, &fs_offset, buffer, outgoing, &length, local)) goto done;
                 sent = 0;
             }
             if (!length && (stream.fd >= 0 || read_request < count)) {
@@ -303,7 +314,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     stream.immutable = job->kind == DCC_JOB_RUST || (seals >= 0 && (seals & immutable) == immutable);
                 }
                 outgoing = next_chunk(&stream, &job->inputs[stream.index],
-                                      p_buf, snap_buf, &length, &file_offset, &file_left);
+                                      p_buf, snap_buf, &length, &file_offset, &file_left, local);
                 if (!outgoing) goto done;
                 sent = 0;
             }

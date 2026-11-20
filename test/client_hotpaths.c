@@ -43,18 +43,19 @@ static void chunk_contract(void)
             source[i] = random ? state : 'a';
         }
         assert(pwrite(fd, source, sizeof(source), 0) == sizeof(source));
-        for (int immutable = 0; immutable < 2; ++immutable) {
+        for (enum dcc_chunk_mode mode = DCC_MUTABLE; mode <= DCC_LOCAL_RAW; ++mode) {
             for (size_t offset = 0; offset < sizeof(source); offset += DCC_TCP_CHUNK) {
                 size_t length = sizeof(source) - offset, size;
                 if (length > DCC_TCP_CHUNK) length = DCC_TCP_CHUNK;
                 int final = offset + length == sizeof(source);
                 unsigned char *p = dcc_tcp_file_chunk(DCC_TCP_INPUT, 7, fd, offset,
-                    length, final, immutable, wire, snapshot, &size);
+                    length, final, mode, wire, snapshot, &size);
                 assert(p == wire || p == snapshot);
                 assert(!!(dcc_tcp_get32(p) & DCC_TCP_FINAL) == final);
-                assert(!!(dcc_tcp_get32(p) & DCC_TCP_COMPRESSED) == !random);
+                assert(!!(dcc_tcp_get32(p) & DCC_TCP_COMPRESSED) == (!random && mode != DCC_LOCAL_RAW));
+                if (mode == DCC_LOCAL_RAW) assert(p == wire && size == 16 + length);
                 if (size == 16) {
-                    assert(immutable && random && p == wire);
+                    assert(mode == DCC_IMMUTABLE && random && p == wire);
                     /* sendfile supplies the immutable extent following the header. */
                     assert(pread(fd, p + 16, length, offset) == (ssize_t)length);
                     size += length;

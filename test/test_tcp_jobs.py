@@ -2894,7 +2894,9 @@ int main(int argc, char **argv) {
     uint64_t stream_offset = 0, total = reply.size + reply.file_size;
     while (stream_offset < total) {
         size_t size = 0;
-        int failed = next_fs_chunk(&reply, &stream_offset, raw, chunk, &size);
+        int local = !strcmp(argv[3], "unlink");
+        int failed = next_fs_chunk(&reply, &stream_offset, raw, chunk, &size, local);
+        if (!failed && local && (dcc_tcp_get32(chunk) & DCC_TCP_COMPRESSED)) return 8;
         if (!strcmp(argv[3], "truncate")) {
             dcc_frontend_fs_clear(&reply);
             return failed ? 0 : 7;

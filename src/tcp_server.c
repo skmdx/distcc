@@ -993,7 +993,8 @@ static void encode_output(void *argument)
     /* RETURNING no longer decodes inputs or filesystem replies. The server's
      * existing scratch is exclusive to this encoder; queued packets own data. */
     if (!p->data || !dcc_tcp_file_chunk(DCC_TCP_OUTPUT, i, fd,
-            s->output_offset, amount, amount == left, 1, p->data, s->buffer, &p->size)) {
+            s->output_offset, amount, amount == left, s->local ? DCC_LOCAL_RAW : DCC_IMMUTABLE,
+            p->data, s->buffer, &p->size)) {
         free(p->data); free(p); return;
     }
     p->header_size = p->size;

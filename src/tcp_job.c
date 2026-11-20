@@ -163,12 +163,12 @@ int dcc_tcp_unpack(const struct dcc_tcp_frame *f, unsigned *index, void *buffer,
     return 0;
 }
 size_t dcc_tcp_encode(uint32_t type, unsigned index, const void *data,
-                       size_t length, int final, void *storage)
+                       size_t length, int final, int compress, void *storage)
 {
     unsigned char *p = storage;
     int compressed = 0;
     /* A destination shorter than raw makes incompressible blocks cheap. */
-    if (length > 16) compressed = LZ4_compress_default(data, (char *)p + 16, length, length - 1);
+    if (compress && length > 16) compressed = LZ4_compress_default(data, (char *)p + 16, length, length - 1);
     if (compressed) type |= DCC_TCP_COMPRESSED;
     if (final) type |= DCC_TCP_FINAL;
     dcc_tcp_put32(p, type);
@@ -178,20 +178,22 @@ size_t dcc_tcp_encode(uint32_t type, unsigned index, const void *data,
     return 16 + compressed;
 }
 unsigned char *dcc_tcp_file_chunk(uint32_t type, unsigned index, int fd,
-                                  off_t offset, size_t length, int final, int immutable,
+                                  off_t offset, size_t length, int final, enum dcc_chunk_mode mode,
                                   unsigned char *p, unsigned char *snapshot, size_t *size)
 {
     if (length > DCC_TCP_CHUNK || offset < 0) return NULL;
     /* Sizes come from the manifest/result. Reading the extent itself detects
      * truncation, without a stat race or per-chunk mapping and teardown. */
+    unsigned char *bytes = mode == DCC_LOCAL_RAW ? p + 16 : snapshot + 16;
     for (size_t read = 0; read < length;) {
-        ssize_t n = pread(fd, snapshot + 16 + read, length - read, offset + read);
+        ssize_t n = pread(fd, bytes + read, length - read, offset + read);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return NULL;
         read += n;
     }
-    *size = dcc_tcp_encode(type, index, snapshot + 16, length, final, p);
-    if (!immutable && *size == 16) {
+    *size = dcc_tcp_encode(type, index, bytes, length, final, mode != DCC_LOCAL_RAW, p);
+    if (mode == DCC_LOCAL_RAW) *size += length;
+    if (mode == DCC_MUTABLE && *size == 16) {
         memcpy(snapshot, p, 16);
         *size += length;
         return snapshot;
