@@ -10,11 +10,13 @@ extern "C" {
 }
 using namespace rust;
 namespace {
-fs::path installed_tool(const fs::path &requested) {
+fs::path installed_tool(const fs::path &requested, bool &linker) {
     const auto name = requested.filename().string();
-    static const std::regex pattern(R"((([[:alnum:]_.+]+-)*(clang(\+\+)?|lld|ld\.lld))(-[0-9]+(\.[0-9]+)*)?)");
-    if (name.size() > NAME_MAX || !std::regex_match(name, pattern))
+    static const std::regex pattern(R"((?:[[:alnum:]_.+]+-)*(clang(?:\+\+)?|lld|ld\.lld)(?:-[0-9]+(?:\.[0-9]+)*)?)");
+    std::smatch match;
+    if (name.size() > NAME_MAX || !std::regex_match(name, match, pattern))
         throw std::runtime_error("expected an installed LLVM compiler or linker");
+    linker = match[1] == "lld" || match[1] == "ld.lld";
     auto directory = requested.parent_path();
     if (directory.filename() == "bin" && directory.parent_path().parent_path() == "/usr/lib/llvm" &&
         requested.lexically_normal() == requested && access(requested.c_str(), X_OK) == 0)
@@ -27,12 +29,23 @@ fs::path installed_tool(const fs::path &requested) {
     }
     throw std::runtime_error("LLVM tool is unavailable: " + name);
 }
+
+fs::path installed_plugin(const fs::path &linker, const fs::path &requested) {
+    auto prefix = fs::canonical(linker).parent_path().parent_path();
+    auto name = requested.filename();
+    for (auto directory : {"lib64", "lib"}) {
+        auto library = prefix / directory / name;
+        if (fs::is_regular_file(library)) return library;
+    }
+    throw std::runtime_error("LLVM linker plugin is unavailable: " + name.string());
+}
 }
 
 extern "C" int dcc_llvm_worker(const dcc_job *job, const char *root, int cancel, const char *out,
                                const char *err, dcc_job_result *result) {
     try {
-        auto compiler = installed_tool(job->argv[0]);
+        bool linker;
+        auto compiler = installed_tool(job->argv[0], linker);
         auto tool_dir = compiler.parent_path();
         auto private_dir = fs::path(root) / fs::path(DCC_LLVM_ROOT).relative_path();
         auto results = private_dir / "results";
@@ -71,7 +84,19 @@ extern "C" int dcc_llvm_worker(const dcc_job *job, const char *root, int cancel,
         box.args.insert(box.args.end(), {"--chdir", job->cwd, "--setenv", "PATH", "/bin:/usr/bin",
                                          "--setenv", "TMPDIR", "/tmp"});
         Words command{compiler};
-        for (char **p = job->argv + 1; *p; ++p) command.emplace_back(*p);
+        for (char **p = job->argv + 1; *p; ++p) {
+            string arg = *p;
+            auto equal = arg.find('=');
+            auto option = arg.substr(0, equal);
+            if (linker && (option == "-plugin" || option == "--plugin")) {
+                if (equal == string::npos && !p[1])
+                    throw std::runtime_error("missing LLVM linker plugin");
+                command.push_back(option);
+                command.push_back(installed_plugin(compiler, equal == string::npos ? *++p : arg.substr(equal + 1)));
+            } else {
+                command.push_back(arg);
+            }
+        }
         box.command(command);
         auto argv = pointers(box.args);
         pid_t pid;

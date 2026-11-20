@@ -75,6 +75,29 @@ class OffloadTest(BrokerTestCase):
     def test_hip_new_driver_device_only(self):
         self.hip_device_only(['--offload-new-driver'])
 
+    def test_hip_linker_uses_worker_plugin(self):
+        prefix = Path(self.compiler).resolve().parent.parent
+        if not any((prefix / lib / 'LLVMgold.so').is_file() for lib in ('lib', 'lib64')):
+            self.skipTest('LLVMgold is required')
+        source = self.work / 'plugin.hip'
+        source.write_text('__attribute__((global)) void kernel() {}\n')
+        flags = ['--offload-new-driver', '--offload-device-only', '--offload-arch=gfx900',
+                 '-nogpuinc', '-nogpulib', '-O2']
+        for lib, option in [('lib', '-plugin'), ('lib64', '--plugin=')]:
+            with self.subTest(lib=lib):
+                path = str(prefix / lib / 'LLVMgold.so')
+                plugin = [option + path] if option.endswith('=') else [option, path]
+                args = [word for arg in plugin for word in ('-Xoffload-linker', arg)]
+                self.hip_device_only(['--offload-new-driver', *args])
+
+        client_plugin = self.work / 'client-only.so'
+        client_plugin.touch()
+        result = subprocess.run([self.build / 'distcc', self.compiler, *flags, '-Xoffload-linker',
+                                 '--plugin=' + str(client_plugin), '-c', source, '-o', self.work / 'missing.o'],
+                                env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('LLVM linker plugin is unavailable: client-only.so', result.stderr)
+
     def hip_device_only(self, driver_flags):
         source = self.work / 'device.hip'
         source.write_text('__attribute__((global)) void increment(int *p) { p[0] += 1; }\n')

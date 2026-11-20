@@ -133,7 +133,12 @@ def compile_images(source, output, args):
                     # operands. Ship existing file operands through the shared
                     # cache; include directories are irrelevant after -E.
                     inputs = []
-                    for arg in command[1:]:
+                    linker = Path(command[0]).name in ('lld', 'ld.lld')
+                    for i, arg in enumerate(command[1:], 1):
+                        # GNU linker plugins belong to the worker's LLVM installation.
+                        if linker and (command[i-1] in ('-plugin', '--plugin') or
+                                       arg.partition('=')[0] in ('-plugin', '--plugin')):
+                            continue
                         value = arg.partition('=')[2] if arg.startswith('-') and '=' in arg else arg
                         if value not in node['outputs'] and not value.startswith('-') and Path(value).is_file():
                             inputs.append(value)
