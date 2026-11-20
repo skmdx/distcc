@@ -1795,7 +1795,7 @@ class FrontendTest(BrokerTestCase):
         sources = self.work / 'src'
         sources.mkdir()
         part = sources / 'part.cpp'
-        part.write_text('/*' + 'x' * 70000 + '*/\nint answer() { return 42; }\n')
+        part.write_text('/*' + 'x\n' * 35000 + '*/\nint answer() { return 42; }\n')
         generated = self.work / 'generated.cpp'
         generated.write_text('int extra() { return 0; }\n')
         unity = sources / 'Unified_cpp_test.cpp'
@@ -1808,9 +1808,13 @@ class FrontendTest(BrokerTestCase):
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
         log = (self.work / 'broker.log').read_text()
-        sizes = set(map(int, re.findall(r'job cost: key=\w+ kind=5 bytes=(\d+)', log)))
-        self.assertIn(sum(p.stat().st_size for p in (unity, part, generated)), sizes)
-        self.assertIn(probe.stat().st_size, sizes)
+        units = {int(size): int(count) for size, count in re.findall(
+            r'job cost: key=\w+ kind=5 bytes=(\d+) units=(\d+)', log)}
+        files = (unity, part, generated)
+        # Prepared frontend jobs also charge their filesystem roots.
+        self.assertGreaterEqual(units[sum(p.stat().st_size for p in files)],
+                                1 + sum(p.read_bytes().count(b'\n') for p in files))
+        self.assertLess(units[probe.stat().st_size], 100)
 
     def test_remote_result_reuse_preserves_artifacts_and_revalidates_inputs(self):
         clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')

@@ -688,6 +688,16 @@ class BrokerPlacementTest(BrokerTestCase):
 
 
 class BrokerTest(BrokerTestCase):
+    def test_completed_job_trains_cost_without_live_stats(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        self.start_broker(self.host(0, ',tcp,speed=2'))
+        lease, net = self.acquire_reserved(10, (42, 1048576, 2))
+        lease.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, 1_000_000_000, 0)],
+                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
+        self.assertEqual(lease.recv(1), b'')
+        log = (self.work/'broker.log').read_text()
+        self.assertRegex(log, r'job cost: key=2a .*factor=0\.500000 ')
+
     def test_source_affinity_uses_only_existing_pipeline_capacity(self):
         peers = [self.peer(stats_response(cpus=n, cores=n, jobs=n, capacity=n,
                     running=0, busy=0, queued=0, preparing=0, returning=0)) for n in (16, 4)]

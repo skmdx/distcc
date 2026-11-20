@@ -1140,7 +1140,12 @@ static void observe(struct broker *broker, struct client *client, const struct f
     if (!timing->execute_ns || client->factor <= 0 ||
         timing->execute_ns > 86400ULL * 1000000000 ||
         timing->prepare_ns > 86400ULL * 1000000000 ||
-        timing->queue_ns > 86400ULL * 1000000000) return;
+        timing->queue_ns > 86400ULL * 1000000000) {
+        rs_trace("unmeasured return: key=%llx client=%td request=%.6f execute_ns=%llu factor=%.6f",
+                 (unsigned long long)client->hint.key, client - broker->clients, client->waiting_since,
+                 (unsigned long long)timing->execute_ns, client->factor);
+        return;
+    }
     struct peer *peer = &broker->peers[client->peer];
     if (client->hint.scope_key) {
         unsigned i = 0;
@@ -1554,8 +1559,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
             double score = probe ? execution_factor(p, work, 1, cap->capacity, broker->cpp_busy) :
                                    dcc_capacity_score(p->host, cap, work);
             struct prediction forecast = {0};
-            if ((client->hint.key || direct) && cap)
-                forecast.factor = execution_factor(p, work, probe, cap->capacity, broker->cpp_busy);
+            if (client->hint.key || direct)
+                forecast.factor = cap ? execution_factor(p, work, probe, cap->capacity, broker->cpp_busy) : score;
             int wait = 0, enqueue = 0;
             if (predicted) {
                 forecast = predict(broker, client, i, work, cost, now, probe, cap->capacity, inflight);
@@ -2336,7 +2341,8 @@ int dcc_broker_serve(const char *path)
                         else p->full_until = now + 1;
                         p->report_until = 0;
                         broker->refresh_at = 0;
-                        rs_trace("rescheduling unstarted job from host=%s", p->host->hostname);
+                        rs_trace("rescheduling unstarted job from host=%s client=%td request=%.6f",
+                                 p->host->hostname, c - broker->clients, c->waiting_since);
                         pool_store(broker, c, returned, now);
                     } else if ((length == sizeof(request) + sizeof(struct feedback) ||
                                 length == sizeof(request) + sizeof(struct feedback) + sizeof(struct dcc_load_report)) && request.version == BROKER_VERSION &&

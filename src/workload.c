@@ -18,7 +18,7 @@
 /* Unity generators put quoted implementation-file includes in a short stub.
  * Inspect its first buffer only. Headers and transitive includes belong to
  * the compiler, and preprocessed jobs already carry their expanded size. */
-static uint32_t included_sources(const char *path, const char *text, size_t size)
+static uint32_t included_sources(const char *path, const char *text, size_t size, uint32_t *lines)
 {
     const char *end = text + size, *slash = strrchr(path, '/');
     size_t prefix = slash ? (size_t)(slash - path + 1) : 0;
@@ -47,12 +47,26 @@ static uint32_t included_sources(const char *path, const char *text, size_t size
         if (!ext || (strcmp(ext, ".c") && strcmp(ext, ".cc") && strcmp(ext, ".cpp") &&
                      strcmp(ext, ".cxx") && strcmp(ext, ".C"))) continue;
         ++lookups;
+        int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
+        int fd = open(name, flags);
+        if (fd < 0 && base) fd = open(name + base, flags);
+        if (fd < 0) continue;
         struct stat st;
-        if (stat(name, &st) && (!base || stat(name + base, &st))) continue;
-        if (S_ISREG(st.st_mode) && st.st_size > 0) {
-            bytes += st.st_size;
-            if (bytes >= 512U * 1024 * 1024) return 512U * 1024 * 1024;
+        if (!fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_size > 0) {
+            const uint32_t limit = 512U * 1024 * 1024;
+            uint32_t extent = st.st_size < limit - bytes ? (uint32_t)st.st_size : limit - bytes;
+            char buffer[65536];
+            for (uint32_t left = extent; left;) {
+                ssize_t n = read(fd, buffer, left < sizeof(buffer) ? left : sizeof(buffer));
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                for (ssize_t i = 0; i < n; ++i) *lines += buffer[i] == '\n';
+                left -= n;
+            }
+            bytes += extent;
+            if (bytes == limit) { close(fd); break; }
         }
+        close(fd);
     }
     return bytes;
 }
@@ -75,7 +89,7 @@ static void describe_source(const char *path, off_t size, struct dcc_source_feat
     ssize_t length;
     while ((length = read(fd, buffer, sizeof(buffer))) != 0) {
         if (length < 0) { if (errno == EINTR) continue; break; }
-        if (!total) included = included_sources(path, buffer, length);
+        if (!total) included = included_sources(path, buffer, length, &lines);
         total += length;
         if (total > size) break;
         for (ssize_t i = 0; i < length; ++i) lines += buffer[i] == '\n';
