@@ -62,7 +62,7 @@ class RustTest(BrokerTestCase):
     def version(self, compiler):
         report = subprocess.check_output([compiler, '-vV'], text=True).splitlines()
         fields = dict(line.split(': ', 1) for line in report[1:] if ': ' in line)
-        return '\n'.join((report[0], fields['commit-hash'], fields['LLVM version']))
+        return '\n'.join((report[0], fields['commit-hash'], '.'.join(fields['LLVM version'].split('.')[:2])))
 
     def wire_plan(self, source, *, flags=(), requested=None, logical=None, extra=(), host='', crate_types='rlib'):
         """A real rustc closure for tests which hold or alter an individual TCP transaction."""
@@ -329,6 +329,24 @@ class RustTest(BrokerTestCase):
         self.assertIn('distcc-rust: compiled on', script)
         subprocess.run([self.work/'target/debug/consumer'], check=True)
 
+    def test_whole_crate_accepts_llvm_patch_update(self):
+        report = subprocess.check_output([self.rustc, '-vV'], text=True)
+        report, changes = re.subn(r'(?m)^(LLVM version: \d+\.\d+\.)(\d+)',
+                                  lambda m: m[1] + str(int(m[2]) + 1), report)
+        self.assertEqual(changes, 1)
+        compiler = self.work/'rustc'
+        compiler.write_text('#!/bin/sh\nif [ "$1" = -vV ]; then printf "%s" ' +
+                            shlex.quote(report) + '; else exec ' + shlex.quote(self.rustc) + ' "$@"; fi\n')
+        compiler.chmod(0o755)
+        self.rustc = str(compiler)
+        source = self.work/'main.rs'
+        source.write_text('fn main(){ println!("patch"); }')
+        output = self.work/'program'
+        result = self.rust(source, '-o', output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        self.assertEqual(subprocess.check_output([output], text=True), 'patch\n')
+
     def test_same_triple_mixed_compilers_route_whole_crates_and_cgus(self):
         deploy = runpy.run_path(str(self.build/'packaging/gentoo/deploy.py'))
         abi, backend = self.cgu_toolchain()
@@ -378,7 +396,13 @@ class RustTest(BrokerTestCase):
         self.assertIn('distcc-rust: compiled on', result.stderr)
         self.assertEqual(subprocess.check_output([program], text=True).strip(), 'cargo:rustc-cfg=checked')
         self.assertEqual(self.completed_jobs(), [counts[0], counts[1]+1])
-        for flags in ([], ['-Clinker-plugin-lto', '-Clinker=clang', '-Clink-arg=-fuse-ld=lld']):
+        plugin = ['-Clinker-plugin-lto', '-Clinker=clang', '-Clink-arg=-fuse-ld=lld']
+        result = self.rust(main, '-Copt-level=2', '-Ccodegen-units=1', *plugin, '-o', program)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        self.assertNotIn('distcc-rust-cgu:', result.stderr)
+        subprocess.run([program], check=True, timeout=5)
+        for flags in ([], plugin):
             with self.subTest(flags=flags):
                 counts = self.completed_jobs()
                 trace = self.work/'frontend.trace'
@@ -396,6 +420,12 @@ class RustTest(BrokerTestCase):
                 self.assertTrue(all(b > a for a, b in zip(counts, self.completed_jobs())), result.stderr)
                 subprocess.run([program], check=True, timeout=5)
         self.start_broker(hosts[0], name='same-triple-cgu-only')
+        counts = self.completed_jobs()
+        result = self.rust(main, '-Copt-level=2', '-Ccodegen-units=1', *plugin, '-o', program)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count('distcc-rust-cgu: completed thin-prelink '), 1, result.stderr)
+        self.assertEqual(self.completed_jobs(), [counts[0]+1, counts[1]])
+        subprocess.run([program], check=True, timeout=5)
         counts = self.completed_jobs()
         result = self.rust(main, '-Copt-level=2', '-Ccodegen-units=8', '-o', program)
         self.assertEqual(result.returncode, 0, result.stderr)

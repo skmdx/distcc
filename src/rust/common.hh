@@ -186,9 +186,16 @@ inline string field(const string &report, const string &name) {
             return line.substr(name.size());
     throw Local("missing rustc identity field " + name);
 }
+inline string llvm_abi(const string &version) {
+    auto minor = version.find('.');
+    if (minor == string::npos)
+        throw Local("missing LLVM ABI in " + version);
+    auto end = version.find_first_not_of("0123456789", minor + 1);
+    return version.substr(0, end);
+}
 inline string identity(const string &report) {
     return report.substr(0, report.find('\n')) + "\n" + field(report, "commit-hash: ") + "\n" +
-           field(report, "LLVM version: ");
+           llvm_abi(field(report, "LLVM version: "));
 }
 inline uint64_t compiler_key(const string &report) {
     auto key = identity(report) + '\n' + field(report, "host: ");
@@ -216,13 +223,6 @@ inline string json_field(json_object *obj, const char *name) {
     return obj && json_object_object_get_ex(obj, name, &v) && json_object_is_type(v, json_type_string)
                ? string(json_object_get_string(v), json_object_get_string_len(v))
                : "";
-}
-inline string llvm_abi(const string &version) {
-    auto minor = version.find('.');
-    if (minor == string::npos)
-        throw Local("missing LLVM ABI in " + version);
-    auto end = version.find_first_not_of("0123456789", minor + 1);
-    return version.substr(0, end);
 }
 inline std::vector<fs::path> backend_helpers(const fs::path &sysroot = {}, const string &abi = {}) {
     auto bin = fs::read_symlink("/proc/self/exe").parent_path();

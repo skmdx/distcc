@@ -63,7 +63,7 @@ class RustDistributionTest(unittest.TestCase):
         wide = cpu('processor: 0\nflags: sse sse4a\n\nprocessor: 1\nflags: sse')
         narrow = cpu('processor: 0\nflags: sse')
         targets = [dict(name=str(i)) for i in range(4)]
-        slot = dict(host='triple', identity=dict(version='rustc', commit='a', llvm='1'), digest='a'*64)
+        slot = dict(host='triple', identity=dict(version='rustc', commit='a', llvm='23.1'), digest='a'*64)
         systems = [dict(cpu=wide, slots=[slot]), dict(cpu=narrow, slots=[]),
                    dict(cpu=cpu('processor: 0\nflags: sse4a sse'), slots=[]),
                    dict(cpu=cpu('processor: 0\nflags: sse4a sse\n\nprocessor: 1'), slots=[])]
@@ -76,7 +76,7 @@ class RustDistributionTest(unittest.TestCase):
         targets = [dict(name=name, temporary='work') for name in ('source', 'compatible', 'incompatible')]
         barrier = threading.Barrier(3, timeout=5)
         digest = 'a'*64
-        slot = dict(host='triple', identity=dict(version='v', commit='h', llvm='1'),
+        slot = dict(host='triple', identity=dict(version='v', commit='h', llvm='23.1'),
                     digest=digest, root='/rust', runtime=[dict(name='ld.so', path='/lib/ld.so')])
         for ready, works in ((True, True), (False, True), (False, False)):
             calls = []
@@ -108,10 +108,16 @@ class RustDistributionTest(unittest.TestCase):
 
     def test_validation_checks_each_client_against_actual_worker_offers(self):
         targets = [dict(name=name, temporary='work', server_hosts=name) for name in ('a', 'b', 'c')]
-        slot = dict(root='/rust', digest='a'*64, host='same-triple',
-                    identity=dict(version='rustc vendor', commit='hash', llvm='23.1.5'))
+        identity = dict(version='rustc vendor', commit='hash', llvm='23.1.5')
+        slot = dict(root='/rust', digest='a'*64, host='same-triple', identity=identity)
         requirement = ('23.1', 'x86-64')
-        offers = {'a': ({deploy.rust_compiler_key(slot)}, {requirement}),
+        def key(**changes):
+            return deploy.rust_compiler_key(dict(slot, identity=identity | changes))
+        self.assertEqual(key(llvm='23.1.5'), key(llvm='23.1.6'))
+        self.assertEqual(key(llvm='23.1.5+libcxx'), key())
+        self.assertNotEqual(key(llvm='23.2.0'), key())
+        self.assertNotEqual(key(version='rustc other vendor'), key())
+        offers = {'a': ({key(llvm='23.1.6')}, {requirement}),
                   'b': ({'1234567890abcdef'}, {requirement}), 'c': (set(), set())}
         inventory = [(targets[0], [slot]), (targets[1], [slot]), (targets[2], [])]
         routes = []

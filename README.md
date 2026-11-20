@@ -142,7 +142,7 @@ Rust requires the local `DISTCC_BROKER` socket and TCP workers with a configured
 statistics port (for example `,tcp,stats=3633`), bubblewrap and unprivileged
 user namespaces. Each worker advertises its executable compilers in
 `dcc_rust_compilers`. Whole-crate jobs require the client's release string
-including vendor metadata, commit hash, LLVM version and host triple. The
+including vendor metadata, commit hash, LLVM major and minor version, and host triple. The
 client supplies the target standard library.
 
 Distribution supports libraries, executables, build scripts and test harnesses.
@@ -203,7 +203,8 @@ object generation. A local frontend can run a procedural macro even when
 the available workers have a different Rust host ABI. Rustc retains ownership
 of ThinLTO imports, embedded bitcode, Cargo metadata notifications and final
 archives. With linker-plugin LTO, a matching worker compiles the whole crate
-unless the crate is large and more workers support its CGUs than its rustc.
+unless the crate is large, uses multiple codegen units and more workers support
+its CGUs than its rustc.
 In that case a single client frontend dispatches CGUs and receives optimized
 bitcode. Small crates prefer a matching whole-crate worker. If no worker has
 the requested rustc, the client uses a local frontend with compatible CGU

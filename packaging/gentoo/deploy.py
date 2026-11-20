@@ -342,10 +342,17 @@ def validate(target, work):
     print(f"{target['name']}: C/C++ and Rust remote compilation and execution passed", flush=True)
 
 
+def llvm_abi(version):
+    match = re.match(r'^(\d+\.\d+)', version)
+    if not match:
+        raise ValueError('missing LLVM ABI in ' + version)
+    return match[1]
+
+
 def rust_cgu_requirement(client, compiler):
-    abi = '.'.join(compiler['identity']['llvm'].split('.')[:2])
+    abi = llvm_abi(compiler['identity']['llvm'])
     library = next((lib['path'] for lib in compiler['runtime']
-                    if lib['name'] == 'libLLVM.so.' + abi), None)
+                    if lib['name'].partition('+')[0] == 'libLLVM.so.' + abi), None)
     if not library:
         return None
     target = run(['sh', '-ec', '''
@@ -365,7 +372,7 @@ def with_stats(hostspec):
 
 def rust_compiler_key(slot):
     identity = slot['identity']
-    report = '\n'.join((identity['version'], identity['commit'], identity['llvm'], slot['host']))
+    report = '\n'.join((identity['version'], identity['commit'], llvm_abi(identity['llvm']), slot['host']))
     return xxhash.xxh3_64_hexdigest(report.encode())
 
 

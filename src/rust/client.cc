@@ -1133,7 +1133,7 @@ int distributed(char **original, const Words &args, const States &responses) {
     bool mixed = route.cgu_peers > route.native_peers;
     if (!route.native_peers && !route.cgu_peers)
         throw Local("worker has no matching Rust toolchain");
-    if (!route.native_peers || (!small && (inv.linker_plugin_lto ? mixed : inv.multi_cgu && route.cgu_peers >= 2)))
+    if (!route.native_peers || (!small && inv.multi_cgu && (inv.linker_plugin_lto ? mixed : route.cgu_peers >= 2)))
         return cgu_frontend(route, inv, exe, original, responses);
     if (small && !mixed && !inv.linker_plugin_lto && !inv.trace_macro && !inv.incremental && inv.scope.empty())
         if (auto status = try_local_frontend(original, responses, hint))
