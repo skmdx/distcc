@@ -252,8 +252,7 @@ dcc_split_module(Module &module, unsigned count,
         return;
       }
       split = true;
-      // SplitModule hashes the retention arrays independently of their
-      // definitions. Rebuild each list beside the definitions it protects,
+      // Rebuild each retention list beside the definitions it protects,
       // so optimization and ELF section GC retain the same input objects.
       auto retain = [&](StringRef name, ArrayRef<GlobalValue *> original,
                         bool compilerOnly) {

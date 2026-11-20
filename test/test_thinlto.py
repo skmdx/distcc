@@ -257,8 +257,9 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
             result = self.run_command([self.build / 'distcc', '--file-job', metadata, inputs, '-', output])
             self.assertEqual(result.returncode, 0, result.stderr)
         else:
-            lane = FileJobs(self.build/'distcc', self.env, ())
+            lane = FileJobs(self.build/'distcc', self.env, (), capacity=True)
             self.addCleanup(lane.close)
+            self.assertGreater(lane.read_capacity()['jobs'], 0)
             self.assertNotEqual(lane.result(lane.submit([self.work/'absent', inputs, output])), 0)
             for _ in range(2):
                 marker = lane.submit([metadata, inputs, output])
@@ -305,6 +306,18 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         self.assertFalse(identities[1] & identities[2])
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(outputs[0], outputs[2])
+
+    def test_file_jobs_capacity_reports_transport_exit(self):
+        env = self.env.copy()
+        env.pop('DISTCC_BROKER', None)
+        expected = subprocess.run([self.build/'distcc', '--lto-capacity'], env=env,
+                                  capture_output=True).returncode
+        self.assertNotEqual(expected, 0)
+        lane = FileJobs(self.build/'distcc', env, (), capacity=True)
+        self.addCleanup(lane.close)
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            lane.read_capacity()
+        self.assertEqual(failure.exception.returncode, expected)
 
     def test_capacity_uses_worker_speed_without_increasing_concurrency(self):
         metrics = stats_response(cpus=4, cores=4, jobs=4, capacity=4,
@@ -594,7 +607,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     @unittest.skipUnless(os.uname().machine == 'x86_64', 'x86 ELF assembly')
     def test_versioned_definition_and_section_comdat_survive_partitioned_link(self):
-        compiler = shutil.which('clang')
+        compiler = 'clang'
         if not llvm_tools(compiler):
             self.skipTest('matching LLVM partition helpers are not installed')
         module = self.work / 'definitions.ll'
@@ -605,31 +618,72 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
             comdat = ' comdat($tag)' if name == 'group_member' else ''
             body = '\n'.join('store volatile i32 %x, ptr @state' for _ in range(128))
             assembly = 'call void asm sideeffect "pause", ""()' if name == 'implementation' else ''
-            functions.append(f'define i32 @{name}(i32 %x) noinline{comdat} {{\n'
+            functions.append(f'define dso_local i32 @{name}(i32 %x) noinline{comdat} {{\n'
                              f'{assembly}\n{body}\nret i32 %x\n}}')
         module.write_text('target triple = "x86_64-unknown-linux-gnu"\n'
                           'module asm ".symver implementation,exported@@PART_1"\n'
+                          '!llvm.module.flags = !{!0}\n!0 = !{i32 8, !"PIC Level", i32 2}\n'
                           '$tag = comdat any\n@state = internal global i32 0\n'
                           '@tag = linkonce_odr hidden constant {ptr,i64} {ptr @group_member,i64 42},'
                           ' section "version_records", comdat, align 8\n'
                           '@llvm.compiler.used = appending global [1 x ptr] [ptr @tag],'
-                          ' section "llvm.metadata"\n' + '\n'.join(functions))
+                          ' section "llvm.metadata"\n@__start_version_records = external constant i8\n'
+                          'define ptr @records() { ret ptr @__start_version_records }\n'
+                          + '\n'.join(functions))
         main = self.work / 'caller.c'
         main.write_text('int exported(int), independent(int), another(int);\n'
-                        'extern const struct {int (*f)(int); long v;} __start_version_records[];\n'
+                        'extern const struct {int (*f)(int); long v;} *records(void);\n'
                         'int main(void){return exported(5)!=5 || independent(7)!=7 || another(9)!=9 || '
-                        '__start_version_records->v!=42 || __start_version_records->f(4)!=4;}\n')
+                        'records()->v!=42 || records()->f(4)!=4;}\n')
         versions = self.work / 'version.map'
         versions.write_text('PART_1 { global: exported; };\n')
         obj, caller, binary = self.work/'definitions.o', self.work/'caller.o', self.work/'check'
-        for args in ([compiler, '-flto=thin', '-c', module, '-o', obj],
-                     [compiler, '-c', main, '-o', caller]):
+        for args in ([compiler, '-flto=thin', '-fPIC', '-c', module, '-o', obj],
+                     [compiler, '-fPIC', '-c', main, '-o', caller]):
             subprocess.run(args, check=True)
         result = self.run_command([self.build/'distcc', compiler, '-flto=thin', '-fuse-ld=lld',
                                    '-Wl,--version-script=' + str(versions), obj, caller, '-o', binary])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stderr, r'partitioned .* into (?:[2-9]|\d{2,})\b')
         self.assertEqual(self.run_command([binary]).returncode, 0)
+
+        library = self.work/'libversions.so'
+        result = self.run_command([self.build/'distcc', compiler, '-flto=thin', '-shared',
+                                   '-fPIC', '-fuse-ld=lld', '-Wl,--version-script=' + str(versions),
+                                   obj, '-o', library])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stderr, r'partitioned .* into (?:[2-9]|\d{2,})\b')
+        symbols = subprocess.check_output(['llvm-nm', library], text=True)
+        self.assertRegex(symbols, r'(?m)\bt \w+\.distcc\.local$')
+        subprocess.run([compiler, caller, library, '-o', binary], check=True)
+        self.assertEqual(self.run_command([binary]).returncode, 0)
+
+    def test_partitioned_shared_object_keeps_absolute_alias(self):
+        tools = llvm_tools('clang')
+        if not tools:
+            self.skipTest('matching LLVM partition helpers are not installed')
+        # ThinLTO summary generation in LLVM 22/23 cannot represent this
+        # legal constant alias. Exercise the same post-import splitter on IR.
+        module = self.work/'absolute.bc'
+        ir = ('@absolute_value = alias i8, inttoptr (i64 42 to ptr)\n'
+              'define i32 @independent() { ret i32 2 }\n' +
+              ''.join(f'define i32 @f{i}() section "ordered" {{ ret i32 {i} }}\n' for i in range(5)))
+        subprocess.run(['llvm-as', '-o', module], input=ir, text=True, check=True)
+        parts = json.loads(subprocess.check_output(
+            [tools['plan'], 'split', module, '6', self.work/'part']))['parts']
+        self.assertEqual(len(parts), 2)
+        objects = []
+        for part in parts:
+            obj = Path(part['path']).with_suffix('.o')
+            subprocess.run(['clang', '-fPIC', '-c', part['path'], '-o', obj], check=True)
+            objects.append(obj)
+        merged, library = self.work/'merged.o', self.work/'libabsolute.so'
+        self.assertRegex(subprocess.check_output(['llvm-nm', objects[0]], text=True),
+                         r'(?m)^0*2a A absolute_value$')
+        subprocess.run([tools['linker'], '-r', *objects, '-o', merged], check=True)
+        subprocess.run(['clang', '-shared', merged, '-o', library], check=True)
+        symbols = subprocess.check_output(['llvm-nm', '-D', library], text=True)
+        self.assertRegex(symbols, r'(?m)^0*2a A absolute_value$')
 
     def test_rust_linker_plugin_assembly_partitioning(self):
         rustc = shutil.which('rustc')

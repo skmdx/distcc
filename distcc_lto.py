@@ -99,6 +99,24 @@ class FileJobs:
             self.channel.close()
             raise
 
+    def read_capacity(self):
+        def read_exact(size):
+            result = bytearray()
+            while len(result) < size:
+                chunk = self.channel.recv(size - len(result))
+                if not chunk:
+                    status = self.process.wait()
+                    if status:
+                        raise subprocess.CalledProcessError(status, self.process.args)
+                    raise ValueError('incomplete file-jobs capacity frame')
+                result.extend(chunk)
+            return result
+
+        header = read_exact(12)
+        if header[:4] != b'CAPA':
+            raise ValueError('invalid file-jobs capacity frame')
+        return json.loads(read_exact(int(header[4:], 16)))
+
     def submit(self, args):
         fields = [os.fsencode(arg) for arg in args]
         self.channel.sendall(b'ARGC%08x' % len(fields) + b''.join(
@@ -151,8 +169,7 @@ def distribute(request, kind, link=None):
 
         helper = 'distcc-thinlto' if kind == 4 else 'distcc-offload-link'
         first_lane = open_lane(capacity=True)
-        with first_lane.channel.makefile('rb') as stream:
-            capacity = json.loads(stream.readline())
+        capacity = first_lane.read_capacity()
         idle.put(first_lane)
         slots = max(1, capacity['jobs'])
         parallelism = capacity['work_rate'] / capacity['min_rate'] if capacity['min_rate'] else slots
@@ -544,6 +561,9 @@ def main(kind):
             return distribute(json.loads(Path(sys.argv[1]).read_text()), kind)
         print('usage: ' + Path(sys.argv[0]).name + ' LLVM-JOB.json', file=sys.stderr)
         return 1
+    except subprocess.CalledProcessError as error:
+        print(Path(sys.argv[0]).name + ': ' + str(error), file=sys.stderr)
+        return error.returncode if error.returncode > 0 else 128 - error.returncode
     except (LocalOnly, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print(Path(sys.argv[0]).name + ': ' + str(error), file=sys.stderr)
         return 1

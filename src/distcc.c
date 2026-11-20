@@ -183,27 +183,30 @@ static void dcc_show_hosts(void) {
     dcc_free_hostlist(list);
 }
 
-static void dcc_concurrency_level(int details, int fd) {
+static char *dcc_lto_capacity(void) {
+    char *capacity = NULL;
+    const char *broker = getenv("DISTCC_BROKER");
+    if (!broker || !*broker) {
+        rs_log_error("LTO capacity requires DISTCC_BROKER");
+        dcc_exit(EXIT_BAD_ARGUMENTS);
+    }
+    if (dcc_broker_jobs(&capacity) < 0)
+        dcc_exit(EXIT_CONNECT_FAILED);
+    return capacity;
+}
+
+static void dcc_concurrency_level(void) {
     struct dcc_hostdef *list, *l;
     int nhosts;
     int nslots = 0;
     const char *broker_path = getenv("DISTCC_BROKER");
 
     if (broker_path && *broker_path) {
-        char *capacity = NULL;
-        nslots = dcc_broker_jobs(details ? &capacity : NULL);
+        nslots = dcc_broker_jobs(NULL);
         if (nslots < 0)
             dcc_exit(EXIT_CONNECT_FAILED);
-        if (details) {
-            if (dprintf(fd, "%s\n", capacity) < 0)
-                dcc_exit(EXIT_IO_ERROR);
-            free(capacity);
-        } else dprintf(fd, "%i\n", nslots);
+        printf("%i\n", nslots);
         return;
-    }
-    if (details) {
-        rs_log_error("LTO capacity requires DISTCC_BROKER");
-        dcc_exit(EXIT_BAD_ARGUMENTS);
     }
 
     if (dcc_get_hostlist(&list, &nhosts) != 0) {
@@ -220,7 +223,7 @@ static void dcc_concurrency_level(int details, int fd) {
 
     dcc_free_hostlist(list);
 
-    dprintf(fd, "%i\n", nslots);
+    printf("%i\n", nslots);
 }
 
 #ifdef HAVE_GSSAPI
@@ -299,7 +302,12 @@ int main(int argc, char **argv)
     /* Private transport entry point used by file-based compiler planners. */
     if ((argc == 2 || (argc == 3 && !strcmp(argv[2], "--lto-capacity"))) &&
         !strcmp(argv[1], "--file-jobs")) {
-        if (argc == 3) dcc_concurrency_level(1, STDIN_FILENO);
+        if (argc == 3) {
+            char *capacity = dcc_lto_capacity();
+            ret = dcc_x_token_string(STDIN_FILENO, "CAPA", capacity);
+            free(capacity);
+            if (ret) dcc_exit(ret);
+        }
         dcc_exit(file_jobs(STDIN_FILENO));
     }
     if (argc >= 6 && !strcmp(argv[1], "--file-job")) {
@@ -360,7 +368,12 @@ int main(int argc, char **argv)
         }
 
         if (!strcmp(argv[1], "-j") || !strcmp(argv[1], "--lto-capacity")) {
-            dcc_concurrency_level(!strcmp(argv[1], "--lto-capacity"), STDOUT_FILENO);
+            if (!strcmp(argv[1], "-j")) dcc_concurrency_level();
+            else {
+                char *capacity = dcc_lto_capacity();
+                puts(capacity);
+                free(capacity);
+            }
             ret = 0;
             goto out;
         }

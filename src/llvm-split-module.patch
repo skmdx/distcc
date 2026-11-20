@@ -8,7 +8,15 @@
  #include "llvm/ADT/DenseMap.h"
  #include "llvm/ADT/EquivalenceClasses.h"
  #include "llvm/ADT/SmallPtrSet.h"
-@@ -54,18 +55,31 @@
+@@ -33,7 +34,6 @@
+ #include "llvm/Support/Casting.h"
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/ErrorHandling.h"
+-#include "llvm/Support/MD5.h"
+ #include "llvm/Support/raw_ostream.h"
+ #include "llvm/Transforms/Utils/Cloning.h"
+ #include "llvm/Transforms/Utils/ValueMapper.h"
+@@ -54,18 +54,31 @@
  using ComdatMembersType = DenseMap<const Comdat *, const GlobalValue *>;
  using ClusterIDMapType = DenseMap<const GlobalValue *, unsigned>;
  
@@ -45,7 +53,7 @@
  } // end anonymous namespace
  
  static void addNonConstUser(ClusterMapType &GVtoClusterMap,
-@@ -112,7 +126,7 @@
+@@ -112,7 +125,7 @@
  // Try to balance pack those partitions into N files since this roughly equals
  // thread balancing for the backend codegen step.
  static void findPartitions(Module &M, ClusterIDMapType &ClusterIDMap,
@@ -54,7 +62,7 @@
    // At this point module should have the proper mix of globals and locals.
    // As we attempt to partition this module, we must not change any
    // locals to globals.
-@@ -155,8 +169,6 @@
+@@ -155,8 +168,6 @@
        }
      }
  
@@ -63,7 +71,7 @@
    };
  
    llvm::for_each(M.functions(), recordGVSet);
-@@ -164,31 +176,68 @@
+@@ -164,31 +175,68 @@
    llvm::for_each(M.aliases(), recordGVSet);
    llvm::for_each(M.ifuncs(), recordGVSet);
  
@@ -142,7 +150,7 @@
           MI != GVtoClusterMap.member_end(); ++MI) {
        if (!Visited.insert(*MI).second)
          continue;
-@@ -196,10 +245,8 @@
+@@ -196,10 +244,8 @@
                          << ((*MI)->hasLocalLinkage() ? " l " : " e ") << "\n");
        Visited.insert(*MI);
        ClusterIDMap[*MI] = CurrentClusterID;
@@ -154,10 +162,31 @@
    }
  }
  
-@@ -236,65 +283,59 @@
-   return (R[0] | (R[1] << 8)) % N == I;
+@@ -215,96 +261,76 @@
+     GV->setName("__llvmsplit_unnamed");
  }
  
+-// Returns whether GV should be in partition (0-based) I of N.
+-static bool isInPartition(const GlobalValue *GV, unsigned I, unsigned N) {
+-  if (const GlobalObject *Root = getGVPartitioningRoot(GV))
+-    GV = Root;
+-
+-  StringRef Name;
+-  if (const Comdat *C = GV->getComdat())
+-    Name = C->getName();
+-  else
+-    Name = GV->getName();
+-
+-  // Partition by MD5 hash. We only need a few bits for evenness as the number
+-  // of partitions will generally be in the 1-2 figure range; the low 16 bits
+-  // are enough.
+-  MD5 H;
+-  MD5::MD5Result R;
+-  H.update(Name);
+-  H.final(R);
+-  return (R[0] | (R[1] << 8)) % N == I;
+-}
+-
 -void llvm::SplitModule(
 +void llvm::dccSplitModule(
      Module &M, unsigned N,
@@ -180,8 +209,7 @@
 +    const SmallPtrSetImpl<const GlobalValue *> &Pinned) {
    ClusterIDMapType ClusterIDMap;
 -  findPartitions(M, ClusterIDMap, N);
-+  findPartitions(M, ClusterIDMap, N, Pinned);
- 
+-
 -  // Find functions not mapped to modules in ClusterIDMap and count functions
 -  // per module. Map unmapped functions using round-robin so that they skip
 -  // being distributed by isInPartition() based on function name hashes below.
@@ -190,6 +218,13 @@
 -  if (RoundRobin) {
 -    DenseMap<unsigned, unsigned> ModuleFunctionCount;
 -    SmallVector<const GlobalValue *> UnmappedFunctions;
++  findPartitions(M, ClusterIDMap, N, Pinned);
++  // Aliases of constants have no IR ownership edge. Keep any unclustered
++  // data definition in the object that owns the module's data layout.
++  for (const auto &GV : M.global_values())
++    if (!isa<Function>(GV) && !GV.isDeclaration())
++      ClusterIDMap.try_emplace(&GV, 0);
++
 +  // Place remaining definitions by instruction work rather than name hashes.
 +  // Weak definitions also need balancing; their symbol clusters are already
 +  // constrained by LLVM above. Cache weights so sorting does not rescan IR.
@@ -234,11 +269,16 @@
 -  // FIXME: We should be able to reuse M as the last partition instead of
 -  // cloning it. Note that the callers at the moment expect the module to
 -  // be preserved, so will need some adjustments as well.
++  auto Owner = [&](const GlobalValue *GV) {
++    auto It = ClusterIDMap.find(GV);
++    assert(It != ClusterIDMap.end() && "every definition needs a partition");
++    return It->second;
++  };
 +  SmallVector<bool> Occupied(N, false);
 +  Occupied[0] = !M.getModuleInlineAsm().empty();
 +  for (const auto &GV : M.global_values())
 +    if (!GV.isDeclarationForLinker())
-+      Occupied[ClusterIDMap.lookup(&GV)] = true;
++      Occupied[Owner(&GV)] = true;
 +  unsigned Remaining = llvm::count(Occupied, true);
 +  if (Remaining <= 1) {
 +    ModuleCallback(M, true);
@@ -251,8 +291,11 @@
      ValueToValueMapTy VMap;
      std::unique_ptr<Module> MPart(
          CloneModule(M, VMap, [&](const GlobalValue *GV) {
-@@ -304,7 +345,7 @@
-             return isInPartition(GV, I, N);
+-          if (auto It = ClusterIDMap.find(GV); It != ClusterIDMap.end())
+-            return It->second == I;
+-          else
+-            return isInPartition(GV, I, N);
++          return GV->isDeclaration() || Owner(GV) == I;
          }));
      if (I != 0)
 -      MPart->removeModuleInlineAsm();
