@@ -279,18 +279,18 @@ static void learn_class(struct dcc_work_class *c, const struct dcc_work_hint *hi
     }
     /* Keep one sample of slope prior through a run of uninformative probes.
      * Backends with measured work (e.g. LLVM instructions) retain their fit. */
-    double anchor = structural ? step * ridge : 0;
+    double decay = 1 - w, anchor = structural ? w * ridge : 0;
     c->mass = keep * c->mass + step;
     c->mean += step / c->mass * (seconds - c->mean);
-    c->weight = keep * c->weight + w;
-    c->x = keep * c->x + w*x;
-    c->y = keep * c->y + w*y;
-    c->z = keep * c->z + w*seconds;
-    c->xx = keep * c->xx + w*x*x + anchor;
-    c->xy = keep * c->xy + w*x*y;
-    c->yy = keep * c->yy + w*y*y + anchor;
-    c->xz = keep * c->xz + w*x*seconds + anchor*input_prior;
-    c->yz = keep * c->yz + w*y*seconds + anchor*work_prior;
+    c->weight = decay * c->weight + w;
+    c->x = decay * c->x + w*x;
+    c->y = decay * c->y + w*y;
+    c->z = decay * c->z + w*seconds;
+    c->xx = decay * c->xx + w*x*x + anchor;
+    c->xy = decay * c->xy + w*x*y;
+    c->yy = decay * c->yy + w*y*y + anchor;
+    c->xz = decay * c->xz + w*x*seconds + anchor*input_prior;
+    c->yz = decay * c->yz + w*y*seconds + anchor*work_prior;
     /* Nonnegative affine fit: fixed frontend cost must not disappear when a
      * small source includes large headers. Enumerating the seven active sets
      * also handles collinear byte/work features without unstable subtraction.

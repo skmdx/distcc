@@ -711,6 +711,19 @@ int main(int argc, char **argv) {
         double after = dcc_work_predict(&model,&h);
         assert(after > .8*trained && after <= trained);
     }
+    /* Cheap inactive code provides little evidence. Repeated observations
+     * must preserve both accumulated information and the learned slope. */
+    model = saved;
+    struct dcc_work_class *c = &model.classes[h.kind-1];
+    double slope = c->work_rate;
+    assert(slope > 0);
+    for (unsigned i=0; i<50; ++i) {
+        double weight = c->weight;
+        ++h.key;
+        dcc_work_observe(&model,&h,.01,0);
+        assert(c->weight >= weight && c->weight <= 1);
+    }
+    assert(fabs(c->work_rate - slope) < .05*slope);
     return 0;
 }''')
             subprocess.run(['gcc', '-D_GNU_SOURCE', '-I.', '-Isrc', '-ffunction-sections',
