@@ -9,6 +9,10 @@ import sys
 import distcc_python
 
 
+class UnsupportedClang(Exception):
+    """The installed frontend has no package for this compiler major."""
+
+
 def load_frontend(compiler, module='clang_compile'):
     # LibTooling locates resources relative to argv[0], without PATH lookup.
     # Preserve the driver name: resolving symlinks would lose target and mode.
@@ -23,20 +27,27 @@ def load_frontend(compiler, module='clang_compile'):
         major = version.split('.')[0]
         if not major.isdecimal():
             raise ValueError('invalid Clang version: ' + version)
-    return importlib.import_module('include_server.clang' + major + '.' + module)
+    package = 'include_server.clang' + major
+    try:
+        return importlib.import_module(package + '.' + module)
+    except ModuleNotFoundError as error:
+        if error.name != package:
+            raise
+        raise UnsupportedClang(package) from error
 
 
 def compile_command(arguments, frontend=None):
     root, original, cwd, mode, *command = arguments
-    if mode == 'remote':
-        descriptor, dependencies, *command = command
     # Captured remote cc1 arguments do not use the driver executable. Native
     # ToolInvocation still needs its resource directory resolved from argv[0].
-    if mode != 'remote':
+    if mode == 'remote':
+        descriptor, dependencies, *command = command
+    else:
+        descriptor = None
         command[0] = shutil.which(command[0]) or command[0]
     if frontend is None:
         frontend = load_frontend(command[0])
-    if mode == 'remote':
+    if descriptor is not None:
         from include_server import distcc_pump_c_extensions as protocol
         request = os.memfd_create('distcc-clang-command')
         try:
@@ -50,7 +61,13 @@ def compile_command(arguments, frontend=None):
 
 def main():
     if sys.argv[1] == '--native-worker':
-        return load_frontend(sys.argv[3], 'clang_native').serve(int(sys.argv[2]))
+        fd = int(sys.argv[2])
+        try:
+            frontend = load_frontend(sys.argv[3], 'clang_native')
+        except UnsupportedClang:
+            os.write(fd, b'U')
+            return 0
+        return frontend.serve(fd)
     if sys.argv[1] == '--worker':
         return load_frontend(sys.argv[3]).serve(int(sys.argv[2]))
     return compile_command(sys.argv[1:])

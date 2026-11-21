@@ -88,7 +88,7 @@ struct dcc_hostdef;
 
 
 
-#include "state.h"
+#include "state.h"  /* IWYU pragma: export */
 
 
 
@@ -339,7 +339,6 @@ int dcc_add_cleanup(const char *filename) WARN_UNUSED;
 /* strip.c */
 int dcc_strip_local_args(char **from, char ***out_argv, const char *input_fname);
 int dcc_prepare_clang(char ***argv, char ***files);
-void *dcc_clang_driver(void);
 int dcc_strip_dasho(char **from, char ***out_argv);
 
 /* cpp.c */

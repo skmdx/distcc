@@ -74,7 +74,7 @@ class LocalClangTest(BrokerTestCase):
         # ready one. Its configured timeout must also reap the startup process.
         self.env['DISTCC_IO_TIMEOUT'] = '1'
         result = self.command(['-dumpversion'])
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
         self.assertFalse(Path('/proc', pidfile.read_text().strip()).exists())
         self.assertIn('IO timeout', (self.work/'client.log').read_text())
 
@@ -98,17 +98,96 @@ class LocalClangTest(BrokerTestCase):
                          (expected.returncode, expected.stdout, expected.stderr))
         self.assertNotIn('--native-worker', (self.work/'client.log').read_text())
 
+    def use_unpackaged_clang(self):
+        driver = self.work/'clang-99999'
+        driver.write_text('#!/bin/sh\nif [ "$1" = -dumpversion ]; then echo 99999; exit 0; fi\n'
+                          'exec ' + shlex.quote(self.compiler) + ' "$@"\n')
+        driver.chmod(0o755)
+        self.compiler = str(driver)
+
+    def saturate_frontend(self):
+        capacity = self.peer(stats_response(cpus=1, cores=1, jobs=1))
+        self.start_local(self.host(0, f',tcp,stats={capacity.port}', slots=1))
+        self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_FALLBACK='0')
+        self.assertEqual(self.receive(self.request(15)), (0, 1, []))
+        self.assertEqual(self.receive(self.request(15)), (0, 0, []))
+
+    def test_missing_frontend_is_cached_across_local_and_prepared_requests(self):
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        self.saturate_frontend()
+        self.use_unpackaged_clang()
+        helper = self.work/'distcc-clang'
+        helper.write_text('#!/bin/sh\necho "$1" >> startups\nexec ' +
+                          shlex.quote(str(self.build/'distcc-clang')) + ' "$@"\n')
+        helper.chmod(0o755)
+        self.env['PATH'] = str(self.work)+os.pathsep+self.env['PATH']
+        for i, extra in enumerate(([], [], ['-fprofile-instr-generate'])):
+            obj = self.work/f'output-{i}.o'
+            result = self.command(['-c', str(self.source), '-o', str(obj), *extra])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertGreater(obj.stat().st_size, 0)
+        self.assertEqual((self.work/'startups').read_text().splitlines(), ['--native-worker'])
+        self.assertNotIn('input preparation command=12 ', (self.work/'broker.log').read_text())
+
+    def test_broken_frontend_fails_with_fallback_disabled(self):
+        self.saturate_frontend()
+        helper = self.work/'distcc-clang'
+        helper.write_text('#!/bin/sh\nexit 1\n')
+        helper.chmod(0o755)
+        self.env['PATH'] = str(self.work)+os.pathsep+self.env['PATH']
+        result = self.command(['-c', str(self.source), '-o', 'broken.o'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.work/'broken.o').exists())
+        self.assertIn('fallbacks are disabled', (self.work/'client.log').read_text())
+
+    def test_auxiliary_input_planning_without_a_broker_uses_the_compiler_major(self):
+        self.start_local()
+        del self.env['DISTCC_BROKER']
+        for supported in (True, False):
+            with self.subTest(supported=supported):
+                if not supported:
+                    self.use_unpackaged_clang()
+                log = self.work/'client.log'
+                log.unlink(missing_ok=True)
+                obj = self.work/'profile.o'
+                result = self.command(['-fprofile-instr-generate', '-c', str(self.source), '-o', str(obj)])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual('operation=I' in log.read_text(), supported)
+                self.assertGreater(obj.stat().st_size, 0)
+                obj.unlink()
+
+    def test_missing_native_module_or_dependency_is_not_an_unsupported_major(self):
+        self.saturate_frontend()
+        version = self.command(['-dumpversion'], reused=False, check=True, text=True).stdout
+        package = self.work/'include_server'/('clang' + version.strip().split('.')[0])
+        package.mkdir(parents=True)
+        (package.parent/'__init__.py').touch()
+        (package/'__init__.py').touch()
+        self.env['PYTHONPATH'] = str(self.work)
+        for dependency in (False, True):
+            with self.subTest(dependency=dependency):
+                if dependency:
+                    (package/'clang_native.py').write_text('import missing_distcc_dependency\n')
+                result = self.command(['-c', str(self.source), '-o', 'broken.o'])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.work/'broken.o').exists())
+
+    def test_driver_config_without_remote_frontend_is_local(self):
+        self.saturate_frontend()
+        self.env['DISTCC_FRONTEND_REMOTE'] = '0'
+        config = self.work/'settings.cfg'
+        config.write_text('-DDRIVER_CONFIG=1\n')
+        self.source.write_text('#ifndef DRIVER_CONFIG\n#error config missing\n#endif\nint value;\n')
+        for args in (['--config', str(config)], [f'--config={config}']):
+            result = self.command([*args, '-c', str(self.source), '-o', 'configured.o'])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            (self.work/'configured.o').unlink()
+        self.assertNotIn('operation=P', (self.work/'client.log').read_text())
+
     def test_link_without_resident_library_uses_driver(self):
         self.start_local()
         self.env.update(DISTCC_VERBOSE='0', DISTCC_FALLBACK='0')
-        helpers = self.work/'without-libraries'
-        helpers.mkdir()
-        helper = helpers/'distcc-clang'
-        # Model an installed Clang release without its resident module: the
-        # helper exits before the ready handshake or any request is accepted.
-        helper.write_text('#!/bin/sh\nexit 1\n')
-        helper.chmod(0o755)
-        self.env['PATH'] = str(helpers)+os.pathsep+self.env['PATH']
+        self.use_unpackaged_clang()
         (self.work/'source.c').write_text('int main(void) { return 0; }\n')
         original = self.command(['-c', 'source.c', '-o', 'source.o'], reused=False)
         self.assertEqual(original.returncode, 0, original.stderr)

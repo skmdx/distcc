@@ -921,7 +921,8 @@ dcc_build_somewhere(char *argv[],
     if (rewrite_cross) dcc_rewrite_generic_compiler(argv);
 #endif
     ret = dcc_prepare_clang(&argv, &auxiliary);
-    if (ret) goto lock_local;
+    if (ret == EXIT_LOCAL_COMPILE) goto lock_local;
+    if (ret) goto fallback;
     ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 1);
     dcc_free_argv(argv);
     argv = new_argv;
@@ -942,6 +943,11 @@ dcc_build_somewhere(char *argv[],
     remote_frontend = !ret && !preprocess_only && !dcc_scan_includes &&
         dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) && broker &&
         (dcc_cpp_ir(argv, input_fname) || dcc_cpp_gcc(argv, input_fname));
+    /* Driver config files belong to the client. Only a captured Clang
+     * frontend command has already expanded them before transport. */
+    if (!ret && !(remote_frontend && dcc_cpp_ir(argv, input_fname)) &&
+        (dcc_argv_search(argv, "--config") || dcc_argv_startswith(argv, "--config=")))
+        ret = EXIT_LOCAL_COMPILE;
     /* The native GCC path retains '-' all the way to cc1 and transports its
      * input independently of pathname lookup. Other paths still inherit stdin. */
     if (!ret && !strcmp(input_fname, "-") &&
@@ -991,6 +997,7 @@ dcc_build_somewhere(char *argv[],
         if (dcc_cpp_ir(argv, input_fname))
             ret = dcc_frontend_prepare(argv, input_fname, &prepared_job);
         else ret = dcc_gcc_frontend_prepare(argv, input_fname, &prepared_job);
+        if (ret == EXIT_LOCAL_COMPILE) goto lock_local;
         if (ret) goto fallback;
         if (!strcmp(input_fname, "-") && dcc_job_capture_stdin(prepared_job)) {
             ret = EXIT_IO_ERROR; goto unlock_and_clean_up;

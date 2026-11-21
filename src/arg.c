@@ -72,9 +72,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <assert.h>
-#include <errno.h>
 #include <ctype.h>
-#include <dlfcn.h>
 
 #include <sys/stat.h>
 
@@ -82,7 +80,6 @@
 #include "trace.h"
 #include "util.h"
 #include "exitcode.h"
-#include "job.h"
 #include "snprintf.h"
 
 struct response_args {
@@ -191,16 +188,6 @@ const char *dcc_offload_language(char *const argv[])
     return language && (!strncmp(language, "c++", 3)) ? "c++-cpp-output" : "cpp-output";
 }
 
-void *dcc_clang_driver(void)
-{
-    const char *library = getenv("DISTCC_CLANG_LIBRARY");
-    void *handle = dlopen(library && *library ? library : LIBDIR "/distcc/clang_driver.so", RTLD_NOW | RTLD_LOCAL);
-    if (!handle) rs_log_warning("cannot load Clang driver: %s", dlerror());
-    return handle;
-}
-
-
-
 int dcc_argv_append(char **argv, char *toadd)
 {
     int l = dcc_argv_len(argv);
@@ -224,7 +211,7 @@ static void dcc_note_compiled(const char *input_file, const char *output_file)
  * output. They must not be mistaken for driver inputs or action options. */
 int dcc_is_literal_option(const char *arg)
 {
-    return !strcmp(arg, "-Xclang") || !strcmp(arg, "-mllvm") ||
+    return !strcmp(arg, "-Xclang") || !strcmp(arg, "-mllvm") || !strcmp(arg, "--config") ||
            !strcmp(arg, "-dumpbase") || !strcmp(arg, "-dumpbase-ext") ||
            !strcmp(arg, "-dumpdir");
 }

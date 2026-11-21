@@ -120,13 +120,17 @@ static-function profile names. Target and language defaults are inferred from
 the requested driver name. The worker library executes the requested compilation
 without requiring identical driver release metadata. Clang IR profile generation (`-fprofile-generate`) also uses this helper
 for locally preprocessed input. Prepared TCP jobs transfer Clang profile-use,
-sample-profile, memory-profile and profile-remapping inputs. The compiler driver
-in `clang_driver.so` discovers these files and removes only inputs unused by
+sample-profile, memory-profile and profile-remapping inputs. The client uses
+the selected Clang major's frontend module to discover these files and removes only inputs unused by
 every job in the driver's plan. Objects and archives needed by a later link
 remain in source-and-link commands. Profile files share verified,
 read-only cache inodes across jobs; relative paths resolve against the client
-working directory. Build the helper with the selected `LLVM_CONFIG` and install
-it on clients together with the updated worker helper.
+working directory. Install a frontend module for each Clang major used for
+distributed frontend jobs. If the version package is absent, the broker caches
+that result and the client runs the original driver locally, including with
+`DISTCC_FALLBACK=0`. That setting still reports failures loading or running an
+installed frontend. Compile commands with explicit `--config` files need
+client-side driver expansion or local execution.
 GCC profile generation and profile use remain local because their additional file contracts are not
 part of the compilation RPC.
 
