@@ -716,6 +716,20 @@ class BrokerPlacementTest(BrokerTestCase):
 
 
 class BrokerTest(BrokerTestCase):
+    def test_untagged_connection_returns_one_reply_and_eof(self):
+        broker = self.start_broker()
+        # Queue both JOBS queries before the broker can answer the first.
+        broker.send_signal(signal.SIGSTOP)
+        try:
+            os.waitpid(broker.pid, os.WUNTRACED)
+            sock = self.request(2)
+            sock.sendall(struct.pack('=HBBI', self.protocol_version, 2, 0, 0))
+        finally:
+            broker.send_signal(signal.SIGCONT)
+        status, _, descriptors = self.receive(sock)
+        self.assertEqual((status, descriptors), (0, []))
+        self.assertEqual(sock.recv(1), b'')
+
     def test_completions_on_lost_leases_preserve_reconnected_session(self):
         peer = self.peer(stats_response(cpus=4, cores=4, jobs=4, running=0, busy=0, capacity=4))
         hosts = self.host(0, f',tcp,stats={peer.port}', slots=4)

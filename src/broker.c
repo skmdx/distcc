@@ -257,14 +257,19 @@ static void release_assignment(struct broker *broker, struct client *client)
     client->net = client->peer = -1;
 }
 
+static void close_session(struct broker *broker, int id);
+
 static void release_client(struct broker *broker, struct client *client)
 {
     release_assignment(broker, client);
     struct client **p = &broker->sessions[client->session].jobs;
     while (*p != client) p = &(*p)->session_next;
     *p = client->session_next;
-    if (!client->tag) shutdown(client->fd, SHUT_RDWR);
     client->fd = client->net = client->peer = -1;
+    if (!client->tag) {
+        broker->sessions[client->session].memo.closed = 1;
+        close_session(broker, client->session);
+    }
 }
 
 static int pool_remove(struct broker *broker, int i)
@@ -532,13 +537,21 @@ static void accept_client(struct broker *broker, int listener_fd)
 static void close_session(struct broker *broker, int id)
 {
     struct session *session = &broker->sessions[id];
+    int fd = session->memo.fd;
+    if (fd < 0) return;
+    session->memo.fd = -1;
+    dcc_watch_drop(broker->ep, &broker->watches[CONTROL + id]);
     dcc_memo_disconnect(broker->memos, &session->memo);
     while (session->jobs) release_client(broker, session->jobs);
-    if (session->memo.fd >= 0) {
-        dcc_watch_drop(broker->ep, &broker->watches[CONTROL + id]);
-        close(session->memo.fd);
-        session->memo.fd = -1;
+    if (session->memo.closed) {
+        /* Closing with unread packets resets the peer before it can read
+         * its final reply. Stop new sends, then discard queued records. */
+        shutdown(fd, SHUT_RD);
+        ssize_t n;
+        do { n = recv(fd, NULL, 0, MSG_TRUNC | MSG_DONTWAIT); }
+        while (n > 0 || (n < 0 && errno == EINTR));
     }
+    close(fd);
 }
 
 static struct client *find_job(struct session *session, unsigned tag)
@@ -635,6 +648,10 @@ static int decode_request(const struct packet *packet, size_t size, int fd,
 static void handle_request(struct broker *broker, int id, double now, int backoff)
 {
     struct session *session = &broker->sessions[id];
+    if (session->memo.closed) {
+        close_session(broker, id);
+        return;
+    }
     struct packet packet;
     int returned;
     ssize_t n = dcc_recv_fd(session->memo.fd, &packet, sizeof(packet), &returned);
@@ -653,11 +670,13 @@ static void handle_request(struct broker *broker, int id, double now, int backof
     switch (op) {
     case RELEASE:
         if (c) release_client(broker, c);
-        else dcc_memo_release(broker->memos, &session->memo, tag);
+        else if (dcc_memo_release(broker->memos, &session->memo, tag) && session->memo.closed)
+            close_session(broker, id);
         return;
     case MEMO_GET: case MEMO_REFRESH: case WORKER_GET: case MEMO_PUT: case WORKER_PUT:
         if (dcc_memo_request(broker->memos, &session->memo, tag, op, request.value, request.size,
                              request.digest, returned)) goto invalid;
+        if (session->memo.closed) close_session(broker, id);
         return;
     case CPP_DONE: release_cpp(broker, c); return;
     case FAILED: {

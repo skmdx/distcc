@@ -186,7 +186,7 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int
         count != 1 || (*host)->mode != DCC_MODE_TCP) {
         free_hosts(*host);
         *host = NULL;
-        close(net);
+        if (net >= 0) close(net);
         dcc_broker_release(fd);
         return EXIT_BAD_HOSTSPEC;
     }

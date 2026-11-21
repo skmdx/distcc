@@ -7,7 +7,7 @@
 struct dcc_memo_store;
 struct memo_lease;
 struct memo_session {
-    int fd, plan_access;
+    int fd, plan_access, closed;
     struct ucred peer;
     struct memo_lease *leases;
 };

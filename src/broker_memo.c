@@ -115,7 +115,7 @@ static void finish(struct dcc_memo_store *store, struct memo_lease *lease)
     struct memo_lease **p = &lease->session->leases;
     while (*p != lease) p = &(*p)->session_next;
     *p = lease->session_next;
-    if (!lease->tag) shutdown(lease->session->fd, SHUT_RDWR);
+    if (!lease->tag) lease->session->closed = 1;
     --store->leases;
     free(lease);
 }
@@ -197,8 +197,11 @@ int dcc_memo_request(struct dcc_memo_store *store, struct memo_session *session,
         while (memo->waiters) {
             struct memo_lease *waiter = memo->waiters;
             unlink_waiter(memo, waiter);
-            memo_reply(store, waiter->session, memo);
+            struct memo_session *recipient = waiter->session;
+            memo_reply(store, recipient, memo);
             finish(store, waiter);
+            if (recipient != session && recipient->closed)
+                shutdown(recipient->fd, SHUT_RDWR);
         }
         memo_touch(store, memo);
         evict(store);
@@ -227,7 +230,7 @@ int dcc_memo_request(struct dcc_memo_store *store, struct memo_session *session,
     if (memo && memo_ready(memo)) {
         memo_touch(store, memo);
         memo_reply(store, session, memo);
-        if (!tag) shutdown(session->fd, SHUT_RDWR);
+        if (!tag) session->closed = 1;
         return 0;
     }
     if (store->leases >= DCC_BROKER_CLIENT_MAX) return -1;
