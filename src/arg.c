@@ -160,7 +160,7 @@ const char *dcc_offload_language(char *const argv[])
 {
     const char *language = NULL;
     int amdgpu = 0;
-    if (!strstr(dcc_find_basename(argv[0]), "clang")) return NULL;
+    if (!dcc_clang_driver_mode(argv[0])) return NULL;
     for (int i = 1; argv[i]; ++i) {
         if (!strcmp(argv[i], "-x") && argv[i + 1]) language = argv[++i];
         else if (!strncmp(argv[i], "-x", 2) && argv[i][2]) language = argv[i] + 2;
@@ -332,10 +332,10 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
 		       || !strcmp(a, "--coverage")
 		       || ((!strcmp(a, "-fprofile-generate") ||
                             str_startswith("-fprofile-generate=", a)) &&
-                           !strstr(dcc_find_basename(argv[0]), "clang"))
+                           !dcc_clang_driver_mode(argv[0]))
 		       || ((!strncmp(a, "-fprofile-use", 13) ||
                             !strncmp(a, "-fauto-profile", 14)) &&
-                           !strstr(dcc_find_basename(argv[0]), "clang"))
+                           !dcc_clang_driver_mode(argv[0]))
 		       || !strcmp(a, "-fprofile-correction")) {
                 rs_log_info("compiler will emit/use profile info; must be local");
                 return EXIT_DISTCC_FAILED;

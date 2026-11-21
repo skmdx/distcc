@@ -84,10 +84,9 @@ int dcc_worker_group = 0;
 static void dcc_inside_child(char **argv,
                              const char *stdin_file,
                              const char *stdout_file,
-                             const char *stderr_file) NORETURN;
+                             const char *stderr_file, int remote) NORETURN;
 
 
-static void dcc_execvp(char **argv) NORETURN;
 
 void dcc_note_execution(struct dcc_hostdef *host, char **argv)
 {
@@ -242,40 +241,6 @@ static DWORD dcc_execvp_cyg(char **argv, const char *input_file,
 #endif
 
 /**
- * Replace this program with another in the same process.
- *
- * Does not return, either execs the compiler in place, or exits with
- * a message.
- **/
-static void dcc_execvp(char **argv)
-{
-    char *slash;
-
-    execvp(argv[0], argv);
-
-    /* If we're still running, the program was not found on the path.  One
-     * thing that might have happened here is that the client sent an absolute
-     * compiler path, but the compiler's located somewhere else on the server.
-     * In the absence of anything better to do, we search the path for its
-     * basename.
-     *
-     * Actually this code is called on both the client and server, which might
-     * cause unintnded behaviour in contrived cases, like giving a full path
-     * to a file that doesn't exist.  I don't think that's a problem. */
-
-    slash = strrchr(argv[0], '/');
-    if (slash)
-        execvp(slash + 1, argv);
-
-    /* shouldn't be reached */
-    rs_log_error("failed to exec %s: %s", argv[0], strerror(errno));
-
-    dcc_exit(EXIT_COMPILER_MISSING); /* a generalization, i know */
-}
-
-
-
-/**
  * Called inside the newly-spawned child process to execute a command.
  * Either executes it, or returns an appropriate error.
  *
@@ -294,7 +259,7 @@ static void dcc_execvp(char **argv)
 static void dcc_inside_child(char **argv,
                              const char *stdin_file,
                              const char *stdout_file,
-                             const char *stderr_file)
+                             const char *stderr_file, int remote)
 {
     int ret;
 
@@ -338,9 +303,11 @@ static void dcc_inside_child(char **argv,
     if ((ret = dcc_redirect_fds(stdin_file, stdout_file, stderr_file)))
         goto fail;
 
-    dcc_execvp(argv);
-
-    ret = EXIT_DISTCC_FAILED;
+    execvp(argv[0], argv);
+    /* A worker may have the client's compiler in another directory. */
+    if (remote && strchr(argv[0], '/')) execvp(dcc_find_basename(argv[0]), argv);
+    rs_log_error("failed to exec %s: %s", argv[0], strerror(errno));
+    ret = EXIT_COMPILER_MISSING;
 
     fail:
     dcc_exit(ret);
@@ -379,10 +346,10 @@ int dcc_new_pgrp(void)
  * @warning When called on the daemon, where stdin/stdout may refer to random
  * network sockets, all of the standard file descriptors must be redirected!
  **/
-int dcc_spawn_child(char **argv, pid_t *pidptr,
+static int spawn_child(char **argv, pid_t *pidptr,
                     const char *stdin_file,
                     const char *stdout_file,
-                    const char *stderr_file)
+                    const char *stderr_file, int remote)
 {
     pid_t pid;
 
@@ -404,7 +371,7 @@ int dcc_spawn_child(char **argv, pid_t *pidptr,
             if (dcc_new_pgrp() != 0)
                 rs_trace("Unable to start a new group\n");
         }
-        dcc_inside_child(argv, stdin_file, stdout_file, stderr_file);
+        dcc_inside_child(argv, stdin_file, stdout_file, stderr_file, remote);
         /* !! NEVER RETURN FROM HERE !! */
     } else {
         *pidptr = pid;
@@ -413,6 +380,16 @@ int dcc_spawn_child(char **argv, pid_t *pidptr,
     }
 }
 
+
+int dcc_spawn_child(char **argv, pid_t *pidptr, const char *in, const char *out, const char *err)
+{
+    return spawn_child(argv, pidptr, in, out, err, 0);
+}
+
+int dcc_spawn_remote(char **argv, pid_t *pidptr, const char *in, const char *out, const char *err)
+{
+    return spawn_child(argv, pidptr, in, out, err, 1);
+}
 
 void dcc_reset_signal(int whichsig)
 {

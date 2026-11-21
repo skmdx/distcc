@@ -607,10 +607,7 @@ static int dcc_add_clang_target(char **argv)
     if (dcc_argv_search(argv, "-cc1"))
         return 0;
 
-    if (strcmp(compiler, "clang") == 0 || strncmp(compiler, "clang-", strlen("clang-")) == 0 ||
-        strcmp(compiler, "clang++") == 0 || strncmp(compiler, "clang++-", strlen("clang++-")) == 0)
-        ;
-    else
+    if (strncmp(compiler, "clang", 5) || !dcc_clang_driver_mode(compiler))
         return 0;
 
     /* -target aarch64-linux-gnu */
@@ -637,18 +634,19 @@ static int dcc_add_clang_target(char **argv)
 static char **dcc_remote_argv(char **argv)
 {
     int argc = dcc_argv_len(argv);
-    int clang = strstr(dcc_find_basename(argv[0]), "clang") != NULL;
+    enum dcc_clang_mode clang = dcc_clang_driver_mode(argv[0]);
     char *resolved = clang && strchr(argv[0], '/') ? realpath(argv[0], NULL) : NULL;
     const char *compiler = argv[0];
     if (clang) {
         /* Masquerade links resolve to distcc itself; retain their tool name. */
-        compiler = dcc_find_basename(resolved && strstr(dcc_find_basename(resolved), "clang") ? resolved : argv[0]);
+        compiler = dcc_find_basename(resolved && dcc_clang_driver_mode(resolved) ? resolved : argv[0]);
     }
     char **view = malloc((argc + 2) * sizeof(*view) + strlen(compiler) + 1);
     if (view) {
         memcpy(view, argv, argc * sizeof(*view));
         view[0] = strcpy((char *)(view + argc + 2), compiler);
-        if (clang && strstr(dcc_find_basename(argv[0]), "++")) view[argc++] = (char *)"--driver-mode=g++";
+        if (clang == DCC_CLANG_CXX) view[argc++] = (char *)"--driver-mode=g++";
+        if (clang == DCC_CLANG_CPP) view[argc++] = (char *)"--driver-mode=cpp";
         view[argc] = NULL;
     }
     free(resolved);
@@ -726,11 +724,12 @@ static int dcc_link_candidate(char **argv, const char *broker)
 {
     int i, input = 0;
     const char *profile = getenv("DISTCC_LINK_SYSROOT");
-    if (!broker || !*broker || ((!profile || !*profile) && !strstr(argv[0], "clang")))
+    enum dcc_clang_mode clang = dcc_clang_driver_mode(argv[0]);
+    if (!broker || !*broker || clang == DCC_CLANG_CPP || ((!profile || !*profile) && !clang))
         return 0;
     for (i = 1; argv[i]; i++) {
         if (!strcmp(argv[i], "-o")) { if (argv[i + 1]) i++; continue; }
-        if (!strstr(argv[0], "clang") && argv[i][0] != '-' &&
+        if (!clang && argv[i][0] != '-' &&
             (str_endswith(".os", argv[i]) || str_endswith(".so", argv[i]) || strstr(argv[i], ".so.")))
             return 0;
         if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "-S") ||

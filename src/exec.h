@@ -36,6 +36,8 @@ int dcc_redirect_fds(const char *stdin_file,
 
 int dcc_spawn_child(char **argv, pid_t *pidptr,
                     const char *, const char *, const char *);
+int dcc_spawn_remote(char **argv, pid_t *pidptr,
+                     const char *, const char *, const char *);
 
 /* if in_fd is timeout_null_fd, means this parameter is not used */
 int dcc_collect_child(const char *what, pid_t pid,

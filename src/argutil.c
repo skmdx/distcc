@@ -44,7 +44,6 @@
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
-#include <errno.h>
 
 #include <sys/stat.h>
 
@@ -53,6 +52,41 @@
 #include "util.h"
 #include "exitcode.h"
 
+/* A release suffix is a sequence of decimal components. */
+static int clang_release(const char *s)
+{
+    do {
+        size_t digits = strspn(s, "0123456789");
+        if (!digits) return 0;
+        s += digits;
+        if (!*s) return 1;
+    } while (*s++ == '.');
+    return 0;
+}
+
+enum dcc_clang_mode dcc_clang_driver_mode(const char *path)
+{
+    const char *part = dcc_find_basename(path);
+    for (unsigned fields = 0; ; ++fields) {
+        /* An optional target has multiple nonempty dash-separated fields.
+         * A tool such as hipify-clang has only a tool-name prefix. */
+        if (fields != 1 && !strncmp(part, "clang", 5)) {
+            const char *suffix = part + 5;
+            enum dcc_clang_mode mode = DCC_CLANG_C;
+            if (!strncmp(suffix, "++", 2)) {
+                mode = DCC_CLANG_CXX;
+                suffix += 2;
+            } else if (!strncmp(suffix, "-cpp", 4)) {
+                mode = DCC_CLANG_CPP;
+                suffix += 4;
+            }
+            if (!*suffix || (*suffix == '-' && clang_release(suffix + 1))) return mode;
+        }
+        const char *dash = strchr(part, '-');
+        if (!dash || dash == part) return DCC_NOT_CLANG;
+        part = dash + 1;
+    }
+}
 
 /**
  * Return true if argv contains needle as an argument.

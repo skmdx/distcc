@@ -1004,7 +1004,7 @@ static int dcc_run_helper_job(int in_fd, int out_fd,
     argv[4] = NULL;
     ret = !strcmp(helper, "distcc-rust-cgu")
         ? dcc_spawn_rust_cgu(&pid, job->argv[1], archive, output, out_fname, err_fname)
-        : dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname);
+        : dcc_spawn_remote(argv, &pid, "/dev/null", out_fname, err_fname);
     if (ret || (ret = dcc_collect_child(helper, pid, status, in_fd,
                                  result ? &result->peak_bytes : NULL,
                                  result ? &result->cpu_ns : NULL)))
@@ -1419,7 +1419,7 @@ static int dcc_run_job(int in_fd,
 
     char stdin_path[64];
     snprintf(stdin_path, sizeof(stdin_path), "/proc/self/fd/%d", gcc_stdin);
-    if ((compile_ret = dcc_spawn_child(argv, &cc_pid,
+    if ((compile_ret = dcc_spawn_remote(argv, &cc_pid,
                                        gcc_stdin >= 0 ? stdin_path : "/dev/null", out_fname, err_fname))
         || (compile_ret = dcc_collect_child("cc", cc_pid, &status, in_fd,
                                           result ? &result->peak_bytes : NULL,

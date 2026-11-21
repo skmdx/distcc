@@ -219,7 +219,7 @@ static int get_worker(const char *compiler, int planning, int *worker)
     if (dcc_local_worker_key(compiler, NULL, NULL, key, sizeof(key))) return EXIT_IO_ERROR;
     int owner = dcc_broker_worker_get(key, worker);
     if (*worker >= 0) return 0;
-    if (owner < 0) return EXIT_DISTCC_FAILED;
+    if (owner < 0) return planning ? EXIT_DISTCC_FAILED : -1;
 
     /* The worker lease serializes startup. Only a missing version package is
      * memoized; a dead worker for an installed version must be restartable. */
@@ -239,13 +239,20 @@ static int request(char **argv, char operation, int output, int errors, int jour
     int reuse = dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0);
     int planning = operation == 'P' || operation == 'I';
     const char *driver = argv[0];
-    if ((!reuse && !planning) || !strstr(dcc_find_basename(driver), "clang")) return -1;
+    if ((!reuse && !planning) || !dcc_clang_driver_mode(driver)) return -1;
     /* Internal tool entry points bypass Clang's driver in the native binary. */
     if (argv[1] && !strncmp(argv[1], "-cc1", 4)) return planning ? EXIT_LOCAL_COMPILE : -1;
     char *compiler = NULL, *cwd = NULL;
     int worker = -1, cpu = -1, input = -1, sink = -1, pair[] = {-1,-1}, ret = EXIT_IO_ERROR;
-    if (strchr(driver, '/')) compiler = strdup(driver);
-    else if (dcc_which(driver, &compiler)) goto out;
+    int lookup = 0;
+    if (strchr(driver, '/')) {
+        struct stat st;
+        if (stat(driver, &st)) lookup = -errno;
+        else compiler = strdup(driver);
+    } else {
+        lookup = dcc_which(driver, &compiler);
+    }
+    if (lookup == -ENOENT || lookup == -ENOTDIR) return planning ? EXIT_LOCAL_COMPILE : -1;
     if (!compiler) goto out;
     ret = get_worker(compiler, planning, &worker);
     if (ret) goto out;
@@ -288,7 +295,7 @@ int dcc_prepare_clang(char ***argv, char ***files)
 {
     int needed = 0;
     if (dcc_offload_language(*argv)) return 0;
-    if (!strstr(dcc_find_basename((*argv)[0]), "clang")) return 0;
+    if (!dcc_clang_driver_mode((*argv)[0])) return 0;
     for (char **p = *argv + 1; *p; ++p)
         if (str_endswith(".a", *p) ||
             (str_startswith("-fprofile", *p) && !str_startswith("-fprofile-generate", *p)) ||
@@ -418,12 +425,12 @@ int dcc_clang_link_prepare(char **argv, int *plan, int *errors, int *remote)
     *plan = *errors = -1;
     *remote = 0;
     if (!dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0) ||
-        !strstr(dcc_find_basename(argv[0]), "clang")) return -1;
+        !dcc_clang_driver_mode(argv[0])) return -1;
     *plan = dcc_job_memfd("distcc-link-plan");
     *errors = dcc_job_memfd("distcc-link-diagnostics");
     if (*plan < 0 || *errors < 0) return EXIT_IO_ERROR;
     int status, ret = request(argv, 'L', *plan, *errors, -1, 0, &status, NULL);
-    if (ret == EXIT_LOCAL_COMPILE) return 0; /* remote is false: use the local driver. */
+    if (ret == -1 || ret == EXIT_LOCAL_COMPILE) return 0; /* Use the local driver. */
     if (ret) return ret;
     if (status) {
         off_t size = lseek(*errors, 0, SEEK_END);

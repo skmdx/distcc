@@ -342,6 +342,8 @@ int dcc_prepare_clang(char ***argv, char ***files);
 int dcc_strip_dasho(char **from, char ***out_argv);
 
 /* cpp.c */
+enum dcc_clang_mode { DCC_NOT_CLANG, DCC_CLANG_C, DCC_CLANG_CXX, DCC_CLANG_CPP };
+enum dcc_clang_mode dcc_clang_driver_mode(const char *path);
 int dcc_cpp_ir(char **argv, const char *input_fname);
 int dcc_cpp_gcc(char **argv, const char *input_fname);
 int dcc_cpp_assembly(char **argv, const char *input_fname);

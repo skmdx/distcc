@@ -105,10 +105,9 @@ static int frontend_language(char **argv, const char *input_fname, int cxx)
 
 int dcc_cpp_ir(char **argv, const char *input_fname)
 {
-    const char *name = dcc_find_basename(argv[0]), *clang = strstr(name, "clang");
-    return clang && (clang == name || clang[-1] == '-') &&
-        (!clang[5] || clang[5] == '-' || !strcmp(clang+5, "++") || !strncmp(clang+5, "++-", 3)) &&
-        frontend_language(argv, input_fname, !strncmp(clang+5, "++", 2)) == FRONTEND_C;
+    enum dcc_clang_mode mode = dcc_clang_driver_mode(argv[0]);
+    return (mode == DCC_CLANG_C || mode == DCC_CLANG_CXX) &&
+        frontend_language(argv, input_fname, mode == DCC_CLANG_CXX) == FRONTEND_C;
 }
 
 int dcc_cpp_gcc(char **argv, const char *input_fname)

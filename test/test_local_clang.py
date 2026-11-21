@@ -105,6 +105,59 @@ class LocalClangTest(BrokerTestCase):
         driver.chmod(0o755)
         self.compiler = str(driver)
 
+    def test_clang_tools_run_with_their_original_arguments(self):
+        self.start_local()
+        self.env.update(DISTCC_FALLBACK='0', DISTCC_FRONTEND_REMOTE='1')
+        for name in ('hipify-clang', 'distcc-clang', 'clang-linker-wrapper', 'clang-offload-bundler',
+                     'clang-scan-deps', 'clang-tidy', 'clang-format', 'clang-cl', 'clang-23.'):
+            with self.subTest(tool=name):
+                tool = self.work/name
+                tool.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+                tool.chmod(0o755)
+                self.compiler = str(tool)
+                args = ['input.a', '-o', 'out']
+                result = self.command(args, text=True)
+                self.assertEqual((result.returncode, result.stdout.splitlines()), (0, args))
+        self.assertNotIn('--native-worker', (self.work/'client.log').read_text())
+
+    def test_missing_driver_uses_native_exec_diagnostic(self):
+        self.saturate_frontend()
+        # clang is present in PATH. An explicit bad path must still fail.
+        for driver in ('clang-99998', self.work/'absent/clang', self.source/'clang'):
+            for args in (['-dumpversion'], ['-c', str(self.source), '-o', 'absent.o']):
+                with self.subTest(driver=driver, args=args):
+                    self.compiler = str(driver)
+                    result = self.command(args)
+                    self.assertEqual(result.returncode, 110, result.stderr)
+        log = (self.work/'client.log').read_text()
+        self.assertIn('failed to exec', log)
+        self.assertNotIn('--native-worker', log)
+
+    def test_versioned_clang_cpp_preserves_preprocessor_mode(self):
+        self.start_local()
+        alias = self.work/'x86_64-pc-linux-gnu-clang-cpp-23.1'
+        alias.symlink_to(self.compiler)
+        self.compiler = str(alias)
+        args = ['-P', str(self.source)]
+        expected = self.command(args, False, check=True)
+        result = self.command(args, check=True)
+        self.assertIn(b'int main', result.stdout)
+        self.assertEqual(result.stdout, expected.stdout)
+        self.assertIn('operation=C', (self.work/'client.log').read_text())
+
+    def test_unreachable_broker_runs_local_driver_but_fails_planning(self):
+        self.start_local()
+        self.env.update(DISTCC_BROKER=str(self.work/'missing.sock'), DISTCC_RECONNECT_TIMEOUT='0',
+                        DISTCC_FALLBACK='0', DISTCC_FRONTEND_REMOTE='1')
+        result = self.command(['-dumpversion'])
+        self.assertEqual((result.returncode, result.stdout), (0, self.command(['-dumpversion'], False).stdout))
+        self.command(['-c', str(self.source), '-o', 'in.o'], False, check=True)
+        result = self.command(['in.o', '-o', 'linked'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.command(['-fprofile-instr-generate', '-c', str(self.source), '-o', 'profile.o'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.work/'profile.o').exists())
+
     def saturate_frontend(self):
         capacity = self.peer(stats_response(cpus=1, cores=1, jobs=1))
         self.start_local(self.host(0, f',tcp,stats={capacity.port}', slots=1))
