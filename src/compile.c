@@ -31,7 +31,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <errno.h>
+#include <errno.h> // IWYU pragma: keep
 #include <sys/stat.h>
 
 #include <ctype.h>
@@ -859,7 +859,8 @@ dcc_build_somewhere(char *argv[],
         int argc = dcc_argv_len(argv);
         char **command = calloc(argc + 2, sizeof(*command));
         if (!command) { ret = EXIT_OUT_OF_MEMORY; goto clean_up; }
-        command[0] = "distcc-multi";
+        char coordinator[] = "distcc-multi";
+        command[0] = coordinator;
         memcpy(command + 1, argv, (argc + 1) * sizeof(*argv));
         /* The coordinator must not hold a local slot while waiting for its
          * children, which acquire capacity through the normal broker path. */
@@ -886,7 +887,8 @@ dcc_build_somewhere(char *argv[],
             if (!command || fcntl(plan, F_SETFD, 0) || fcntl(errors, F_SETFD, 0)) {
                 ret = EXIT_IO_ERROR;
             } else {
-                command[0] = "distcc-link"; command[1] = "--clang-plan";
+                char linker[] = "distcc-link", option[] = "--clang-plan";
+                command[0] = linker; command[1] = option;
                 command[2] = plan_fd; command[3] = errors_fd;
                 memcpy(command + 4, argv, (argc + 1) * sizeof(*argv));
                 ret = dcc_compile_local(command, NULL, NULL, NULL);
@@ -1065,11 +1067,8 @@ dcc_build_somewhere(char *argv[],
         work.bytes = dcc_resource_input_bytes(prepared_job);
     else if (!cpp_ready && (!prepared_job || !dcc_job_frontend(prepared_job)))
         work = (struct dcc_work_hint){0};
-    if (prepared_job && work.key) {
+    if (prepared_job && work.key)
         work.memory_class = dcc_resource_class(prepared_job);
-        if (dcc_job_frontend(prepared_job) && prepared_job->fs_roots)
-            work.work_units += dcc_argv_len(prepared_job->fs_roots);
-    }
 
     /* Lock ordering invariant: always acquire the lock for the
      * remote host (if any) first. */

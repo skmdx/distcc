@@ -683,6 +683,34 @@ int main(int argc, char **argv) {
     }
     h.key=40000; h.bytes=1; h.work_units=1;
     assert(isfinite(dcc_work_predict(&model,&h)) && dcc_work_predict(&model,&h)>0);
+    /* Model the first unseen Unity job after configure. All keys are fresh,
+     * so neither a repeated key nor a source-family time can mask the fit. */
+    model = (struct dcc_work_model){0};
+    h = (struct dcc_work_hint){.kind=5, .bytes=50, .work_units=3};
+    for (unsigned i=0; i<100; ++i) {
+        h.key = i+1;
+        dcc_work_observe(&model,&h,.01,0);
+    }
+    h.key++; h.bytes=750000; h.work_units=6500;
+    double cold = dcc_work_predict(&model,&h);
+    assert(cold > 1 && cold < 11);
+    dcc_work_observe(&model,&h,11,0);
+    ++h.key;
+    assert(dcc_work_predict(&model,&h) > cold + .25*(11-cold));
+    h.bytes=1900000; h.work_units=17000;
+    for (unsigned i=0; i<20; ++i, ++h.key) dcc_work_observe(&model,&h,22,0);
+    double trained = dcc_work_predict(&model,&h);
+    assert(trained > 18 && trained < 25);
+    struct dcc_work_model saved = model;
+    for (unsigned i=0; i<2; ++i) {
+        model = saved;
+        struct dcc_work_hint cheap = h;
+        ++cheap.key;
+        cheap.work_units = i ? h.work_units : 5; /* inactive code or literal data */
+        dcc_work_observe(&model,&cheap,.35,0);
+        double after = dcc_work_predict(&model,&h);
+        assert(after > .8*trained && after <= trained);
+    }
     return 0;
 }''')
             subprocess.run(['gcc', '-D_GNU_SOURCE', '-I.', '-Isrc', '-ffunction-sections',

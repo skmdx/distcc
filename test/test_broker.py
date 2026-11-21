@@ -67,7 +67,7 @@ class MemoReconnectTest(unittest.TestCase):
 
 
 class BrokerTestCase(DistccTestCase):
-    protocol_version = 7
+    protocol_version = 8
 
     def start_memory_refusal(self):
         # The first snapshot fits; before execution the real daemon's memory
@@ -1655,17 +1655,20 @@ class BrokerTest(BrokerTestCase):
         hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={2 if i == 0 else 1}')
                          for i, p in enumerate(peers))
         self.start_broker(hosts)
-        for key, size, duration in ((61, 16384, 50_000_000), (62, 1048576, 2_000_000_000)):
-            seed, net = self.acquire_reserved(10, (key, 4 * 1024 * 1024, 1), size)
+        # Equal preprocessed bytes, different numbers of statements in the
+        # original sources. RETURN reports execution on the speed=2 worker.
+        light_units, heavy_units = 16, 4096
+        for key, units, duration in ((61, light_units, 50_000_000), (62, heavy_units, 2_000_000_000)):
+            seed, net = self.acquire_reserved(10, (key, 4 * 1024 * 1024, 1), units)
             seed.sendmsg([struct.pack('=II4Q', self.protocol_version, 7, 0, 0, duration, 0)],
                          [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
         first, _ = self.acquire_reserved(10, (63, 1024 * 1024, 2))
-        short, _ = self.acquire_reserved(10, (66, 4 * 1024 * 1024, 1), 16384)
-        heavy = self.request(10, (64, 4 * 1024 * 1024, 1), 1048576)
+        short, _ = self.acquire_reserved(10, (66, 4 * 1024 * 1024, 1), light_units)
+        heavy = self.request(10, (64, 4 * 1024 * 1024, 1), heavy_units)
         heavy.settimeout(.05)
         with self.assertRaises(socket.timeout):
             heavy.recv(1032)
-        small = self.request(10, (65, 4 * 1024 * 1024, 1), 16384)
+        small = self.request(10, (65, 4 * 1024 * 1024, 1), light_units)
         small.settimeout(.05)
         with self.assertRaises(socket.timeout):
             small.recv(1032)

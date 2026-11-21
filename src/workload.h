@@ -34,13 +34,14 @@ struct dcc_work_class {
     double weight, x, y, z;
     double xx, xy, yy, xz, yz;
     double fixed, input_rate, work_rate;
+    double mass, mean; /* Unweighted execution-time EWMA for competing work. */
 };
 struct dcc_work_model {
     struct { uint64_t key, family, bytes; double seconds; int peer; } history[DCC_WORK_HISTORY];
     unsigned char next[DCC_WORK_HISTORY / DCC_WORK_WAYS];
     struct dcc_work_class classes[DCC_WORK_CLASSES];
 };
-struct dcc_source_features { uint64_t hash; uint32_t lines, included_bytes; };
+struct dcc_source_features { uint64_t hash; uint32_t units, included_bytes; };
 void dcc_work_describe(struct dcc_work_hint *, char **, const char *, const char *, int, int, struct dcc_source_features *);
 int dcc_work_valid(const struct dcc_work_hint *);
 double dcc_work_predict(const struct dcc_work_model *, const struct dcc_work_hint *);

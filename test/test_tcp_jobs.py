@@ -1795,14 +1795,28 @@ class FrontendTest(BrokerTestCase):
         sources = self.work / 'src'
         sources.mkdir()
         part = sources / 'part.cpp'
-        part.write_text('/*' + 'x\n' * 35000 + '*/\nint answer() { return 42; }\n')
+        declarations = ('static_assert(true, ""); /*' + ' ;#' * 64 + ' */\n') * 10000
+        part.write_text(declarations)
         generated = self.work / 'generated.cpp'
         generated.write_text('int extra() { return 0; }\n')
         unity = sources / 'Unified_cpp_test.cpp'
         unity.write_text('#include "part.cpp"\n# include "generated.cpp"\n')
         probe = self.work / 'configure.cpp'
         probe.write_text('int probe() { return 0; }\n')
-        for source in (unity, probe):
+        # The opener, escape and raw-string terminator straddle separate
+        # 64 KiB reads. An include inside a comment must not charge part.cpp.
+        literal = sources / 'literal.cpp'
+        text = '/*\n#include "part.cpp"\n*/\n'
+        text = text.ljust(65535) + '/*;#' + ' ;#' * 200 + '*/\n'
+        text += 'const char *s = "'
+        text = text.ljust(2 * 65536 - 1) + '\\";#";\n'
+        text += 'const char *raw = R"tag("; #\n;#'
+        text = text.ljust(3 * 65536 - 2) + ')tag";\n'
+        text += "int ch = ';'; // ;#\\\n;#\n#define STRINGIFY(x) #x\n"
+        literal.write_text(text + 'unsigned char data[] = {\n' + '0xff,0x0a,\n' * 200000 + '};\n')
+        inactive = sources / 'inactive.cpp'
+        inactive.write_text('#if 0\n' + declarations + '#endif\n')
+        for source in (unity, probe, literal, inactive):
             result = subprocess.run([self.build/'distcc', clang, '-I.', '-c', source, '-o',
                                      source.with_suffix('.o')], env=self.env, cwd=self.work,
                                     capture_output=True, text=True, timeout=30)
@@ -1811,10 +1825,10 @@ class FrontendTest(BrokerTestCase):
         units = {int(size): int(count) for size, count in re.findall(
             r'job cost: key=\w+ kind=5 bytes=(\d+) units=(\d+)', log)}
         files = (unity, part, generated)
-        # Prepared frontend jobs also charge their filesystem roots.
-        self.assertGreaterEqual(units[sum(p.stat().st_size for p in files)],
-                                1 + sum(p.read_bytes().count(b'\n') for p in files))
-        self.assertLess(units[probe.stat().st_size], 100)
+        self.assertEqual(units[sum(p.stat().st_size for p in files)], 10003)
+        self.assertEqual(units[probe.stat().st_size], 1)
+        self.assertEqual(units[literal.stat().st_size], 5)
+        self.assertEqual(units[inactive.stat().st_size], 10002)
 
     def test_remote_result_reuse_preserves_artifacts_and_revalidates_inputs(self):
         clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')

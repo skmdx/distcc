@@ -463,7 +463,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c src/broker_session.c src/workload.
 
 
 HEADERS = src/stats.h src/adaptive.h src/broker.h src/broker_protocol.h src/broker_session.h src/epoll_set.h src/lane_schedule.h src/cpuperf.h src/workload.h src/file_cache.h	\
-	src/access.h							\
+	src/access.h src/source_scan.h					\
 	src/auth.h							\
 	src/bulk.h							\
 	src/clinet.h src/compile.h					\

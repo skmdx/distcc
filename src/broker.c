@@ -1619,7 +1619,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
                     double end = lane_ready(&p->schedule.cpu, cores);
                     if (external > 0) {
                         const struct dcc_work_class *learned = &broker->model.classes[client->hint.kind - 1];
-                        double competing = (p->mean_cost > 0 ? p->mean_cost : learned->z / learned->weight) * prior_factor;
+                        double competing = (p->mean_cost > 0 ? p->mean_cost : learned->mean) * prior_factor;
                         if (competing > end) end = competing;
                     }
                     if (end < forecast.finish) {
