@@ -18,9 +18,6 @@ void dcc_broker_local_done(int lease, double elapsed, uint64_t cpu_ns, int statu
 void dcc_broker_failed(const struct dcc_hostdef *host);
 void dcc_broker_defer(const struct dcc_hostdef *host);
 void dcc_broker_return(const struct dcc_hostdef *host, int fd, const struct dcc_job_result *);
-#define DCC_BROKER_POOLED (1 << 30)
-#define DCC_BROKER_DIRECT (1 << 29)
-#define DCC_BROKER_COLD_FAMILY (1 << 28)
 #define DCC_TCP_PIPELINE 4
 int dcc_broker_jobs(char **capacity);
 /* Number of distinct peers with a free compatible LLVM backend. */

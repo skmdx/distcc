@@ -13,7 +13,7 @@ struct lane_schedule {
     unsigned root, count;
 };
 
-static unsigned lane_update(struct lane_schedule *s, unsigned i)
+static inline unsigned lane_update(struct lane_schedule *s, unsigned i)
 {
     struct lane_node *n = &s->nodes[i], *l = &s->nodes[n->left], *r = &s->nodes[n->right];
     n->size = 1 + l->size + r->size;
@@ -21,7 +21,7 @@ static unsigned lane_update(struct lane_schedule *s, unsigned i)
     return i;
 }
 
-static unsigned lane_rotate(struct lane_schedule *s, unsigned i, int left)
+static inline unsigned lane_rotate(struct lane_schedule *s, unsigned i, int left)
 {
     struct lane_node *n = &s->nodes[i];
     unsigned j = left ? n->right : n->left;
@@ -32,7 +32,7 @@ static unsigned lane_rotate(struct lane_schedule *s, unsigned i, int left)
     return lane_update(s, j);
 }
 
-static unsigned lane_balance(struct lane_schedule *s, unsigned i)
+static inline unsigned lane_balance(struct lane_schedule *s, unsigned i)
 {
     struct lane_node *n = &s->nodes[i], *l = &s->nodes[n->left], *r = &s->nodes[n->right];
     if (l->height > r->height + 1) {
@@ -48,7 +48,7 @@ static unsigned lane_balance(struct lane_schedule *s, unsigned i)
     return lane_update(s, i);
 }
 
-static unsigned lane_insert(struct lane_schedule *s, unsigned root, unsigned i)
+static inline unsigned lane_insert(struct lane_schedule *s, unsigned root, unsigned i)
 {
     if (!root) return i;
     struct lane_node *n = &s->nodes[root];
@@ -57,7 +57,7 @@ static unsigned lane_insert(struct lane_schedule *s, unsigned root, unsigned i)
     return lane_balance(s, root);
 }
 
-static unsigned lane_pop(struct lane_schedule *s, unsigned root, unsigned *first)
+static inline unsigned lane_pop(struct lane_schedule *s, unsigned root, unsigned *first)
 {
     struct lane_node *n = &s->nodes[root];
     if (!n->left) { *first = root; return n->right; }
@@ -65,20 +65,20 @@ static unsigned lane_pop(struct lane_schedule *s, unsigned root, unsigned *first
     return lane_balance(s, root);
 }
 
-static void lane_add(struct lane_schedule *s, unsigned i, double finish)
+static inline void lane_add(struct lane_schedule *s, unsigned i, double finish)
 {
     s->nodes[i] = (struct lane_node){.time = finish, .size = 1, .height = 1};
     s->root = lane_insert(s, s->root, i);
 }
 
-static void lane_finish(struct lane_schedule *s, double finish)
+static inline void lane_finish(struct lane_schedule *s, double finish)
 {
     unsigned first;
     s->root = lane_pop(s, s->root, &first);
     lane_add(s, first, finish);
 }
 
-static double lane_ready(const struct lane_schedule *s, unsigned limit)
+static inline double lane_ready(const struct lane_schedule *s, unsigned limit)
 {
     unsigned rank = limit < s->count ? s->count - limit : 0;
     unsigned i = s->root;

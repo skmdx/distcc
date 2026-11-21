@@ -211,7 +211,7 @@ class PlanMemoTest(BrokerTestCase):
         value = b'\0\xff\nplan\0'
         with self.request_memo(b'binary') as owner:
             self.assertEqual(owner.recv(1), b'\0')
-            owner.sendall(struct.pack('=II', self.protocol_version, 5) + value + b'\0')
+            owner.sendall(struct.pack('=HBBI', self.protocol_version, 5, 0, 0) + value + b'\0')
             self.assertEqual(owner.recv(1), b'')
         with self.request_memo(b'binary') as reader:
             self.assertEqual(reader.recv(64), value+b'\0')
@@ -229,12 +229,12 @@ class PlanMemoTest(BrokerTestCase):
             return subprocess.check_output([self.build/'h_compile', 'plan_journal', raw], cwd=self.work)
         journals = [journal(first), journal(other)]
         fdroot = Path(f'/proc/{broker.pid}/fd')
-        tag = 1 << 17
+        tag = 1
         with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as session:
             session.settimeout(5)
             session.connect(self.env['DISTCC_BROKER'])
             def send(command, data):
-                session.sendall(struct.pack('=II', self.protocol_version, command | tag) + data + b'\0')
+                session.sendall(struct.pack('=HBBI', self.protocol_version, command, 0, tag) + data + b'\0')
             def get(key):
                 send(4, key)
                 return session.recv(65536)
@@ -260,7 +260,7 @@ class PlanMemoTest(BrokerTestCase):
         peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         peer.settimeout(5)
         peer.connect(self.env['DISTCC_BROKER'])
-        peer.sendall(struct.pack('=II', self.protocol_version, command) + key + b'\0')
+        peer.sendall(struct.pack('=HBBI', self.protocol_version, command, 0, 0) + key + b'\0')
         self.addCleanup(peer.close)
         return peer
 
@@ -269,7 +269,7 @@ class PlanMemoTest(BrokerTestCase):
         memo = self.request_memo
         def publish(key,value):
             owner=memo(key);self.assertEqual(owner.recv(1),b'\0')
-            owner.sendall(struct.pack('=II',self.protocol_version,5)+value+b'\0')
+            owner.sendall(struct.pack('=HBBI',self.protocol_version,5, 0, 0)+value+b'\0')
             self.assertEqual(owner.recv(1),b'');owner.close()
         # 1,400 realistic-size payloads and worker handles share one byte-bounded
         # broker tree. This must not regress to the former 256-entry ceiling.
@@ -284,13 +284,13 @@ class PlanMemoTest(BrokerTestCase):
         owner=memo(payload,18);self.assertEqual(owner.recv(1),b'\0')
         waiter=memo(payload,18);owner.close()
         self.assertEqual(waiter.recv(1),b'\0')
-        waiter.sendall(struct.pack('=II',self.protocol_version,5)+b'new\0');self.assertEqual(waiter.recv(1),b'')
+        waiter.sendall(struct.pack('=HBBI',self.protocol_version,5, 0, 0)+b'new\0');self.assertEqual(waiter.recv(1),b'')
         # A late invalidator must not discard the already replaced value.
         self.assertEqual(memo(payload,18).recv(100),b'new\0')
         for i in range(257):
             left,right=socket.socketpair();self.addCleanup(right.close)
             owner=memo(('worker-'+str(i)).encode(),16);self.assertEqual(owner.recv(1),b'\0')
-            owner.sendmsg([struct.pack('=II',self.protocol_version,17)],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,
+            owner.sendmsg([struct.pack('=HBBI',self.protocol_version,17, 0, 0)],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,
                           array.array('i',[left.fileno()]))])
             left.close();self.assertEqual(owner.recv(1),b'');owner.close()
         self.assertEqual(memo(b'worker-0',16).recv(1),b'\0')

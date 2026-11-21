@@ -142,8 +142,8 @@ int try_lane() {
     if (fd < 0) return -1;
     timeval timeout{5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    struct { request header; dcc_work_hint hint; } message{};
-    message.header = {BROKER_VERSION, TRY_LOCAL};
+    struct { broker_request_hdr header; dcc_work_hint hint; } message{};
+    message.header = {BROKER_VERSION, TRY_LOCAL, 0, 0};
     size_t size = sizeof(message.header) + dcc_work_hint_size(&message.hint);
     reply response{};
     if (!connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) &&
@@ -333,7 +333,10 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler,
     if (!ok) return false;
     ok = false;
     auto remove_failed_output = llvm::scope_exit([&] {
-        if (!ok) llvm::sys::fs::remove(frontend.OutputFile);
+        if (!ok) {
+            if (auto error = llvm::sys::fs::remove(frontend.OutputFile))
+                llvm::errs() << "removing " << frontend.OutputFile << ": " << error.message() << '\n';
+        }
     });
     auto merge_start = clock_ns();
     // Internal linking owns the same CPU budget as the parts it merges. LLD's

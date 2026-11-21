@@ -133,6 +133,35 @@ int main(int argc, char **argv)
         } else { perror("memo_get"); return 1; }
         return 0;
     }
+    if (!strcmp(argv[1], "--stale-leases")) {
+        struct dcc_work_hint hint = {0};
+        struct dcc_hostdef *host;
+        char *value = NULL;
+        int worker, cpu, queued = -1;
+        int memo = dcc_broker_memo_get("old-plan", &value, NULL, NULL);
+        int helper = dcc_broker_worker_get("old-helper", &worker);
+        int local = dcc_broker_try_local(&hint);
+        assert(memo >= 0 && helper >= 0 && local >= 0);
+        assert(!dcc_broker_acquire(&host, &cpu, 0, 0, &hint, &queued));
+        assert(write(1, "A", 1) == 1 && getchar() != EOF);
+
+        /* The controller has replaced the broker. Publication of this new
+         * lease must survive every completion on the disconnected session. */
+        int current = dcc_broker_memo_get("current", &value, NULL, NULL);
+        assert(current >= 0);
+        dcc_broker_cpp_done(host);
+        dcc_broker_local_done(local, 1, 0, 0);
+        dcc_broker_memo_put(memo, "old", 3);
+        dcc_broker_worker_put(helper, host->broker_fd);
+        dcc_broker_release(cpu);
+        close(host->broker_fd);
+        dcc_free_hostdef(host);
+        dcc_broker_memo_put(current, "value", 5);
+        assert(dcc_broker_memo_get("current", &value, NULL, NULL) < 0);
+        assert(value && !strcmp(value, "value"));
+        free(value);
+        return 0;
+    }
     if (!strcmp(argv[1], "--cpp-done")) {
         struct dcc_hostdef *host;
         int lease, queued = -1;

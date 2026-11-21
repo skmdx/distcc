@@ -37,9 +37,9 @@ class PoolTest(BrokerTestCase):
 
     def pooled_lease(self):
         lease = self.request(6)
-        status, capabilities, fds = self.receive(lease)
+        status, capabilities, fds = self.receive(lease, capabilities=True)
         self.assertEqual(status, 0)
-        self.assertTrue(capabilities & (1 << 30))
+        self.assertTrue(capabilities & 1)
         self.assertEqual(len(fds), 1)
         net = socket.socket(fileno=fds[0])
         self.addCleanup(net.close)
@@ -76,7 +76,7 @@ class PoolTest(BrokerTestCase):
         lease, net = self.pooled_lease()
         before = self.accepts()
         net.shutdown(socket.SHUT_RDWR)
-        lease.sendmsg([struct.pack('=II', self.protocol_version, 7)],
+        lease.sendmsg([struct.pack('=HBBI4Q', self.protocol_version, 7, 0, 0, 0, 0, 0, 0)],
                       [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
         net.close()
         lease.close()
