@@ -2,6 +2,14 @@ TODO list for distcc
 
 --> See also TODO and FIXME comments in source files and doc/todo/
 
+Classify fat LTO inputs when the ELF linker enables them
+
+    Clang with -flto=thin -ffat-lto-objects emits ELF objects with a
+    .llvm.lto section and passes --fat-lto-objects to LLD. The small-link
+    scan counts these objects as zero bitcode bytes, including when the
+    section is present in several positional objects. Cover archive members
+    and the linker's selected fat-LTO mode when deciding to distribute.
+
 Preserve parent traversals in distributed ThinLTO module paths
 
     An input script in libs/ can name ../member.o. LLD then records
