@@ -49,18 +49,28 @@ static int compare_environment(const void *a, const void *b)
     return (x->position > y->position) - (x->position < y->position);
 }
 
-static int omitted_environment(const char *binding, size_t length, const char *const *names)
+static int context_binding(const char *binding, size_t length, enum dcc_compiler_context context)
 {
-    if (binding[length] != '=') return 0;
-    for (; names && *names; ++names) {
-        if ((*names)[0] == binding[0] && strlen(*names) == length &&
-            !memcmp(binding, *names, length)) return 1;
-    }
-    return 0;
+    static const char *const startup[] = {
+        "GCONV_PATH", "LOCPATH", "NLSPATH", "TZ", "LANG", "LANGUAGE",
+        "LLVM_PROFILE_FILE", "DISTCC_GCC_SCAN_LIBRARY", NULL
+    };
+    static const char *const prefixes[] = {"LD_", "SANDBOX_", "GLIBC_", "MALLOC_",
+        "ASAN_", "UBSAN_", "LSAN_", "TSAN_", "MSAN_", "LC_", NULL};
+    static const char *const metadata[] = {"PWD", "OLDPWD", "SHLVL", "_", "DISTCC_LOG",
+        "DISTCC_VERBOSE", "DISTCC_IO_TIMEOUT", "MAKEFLAGS", "MAKELEVEL", "MFLAGS",
+        "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "subdir", NULL};
+    int image = context == DCC_WORKER_IMAGE;
+    if (image)
+        for (const char *const *p = prefixes; *p; ++p)
+            if (!strncmp(binding, *p, strlen(*p))) return 1;
+    for (const char *const *p = image ? startup : metadata; *p; ++p)
+        if (strlen(*p) == length && !memcmp(binding, *p, length)) return image;
+    return !image;
 }
 
 int dcc_local_worker_key(const char *compiler, const char *library,
-                         const char *const *omit_environment, char *key, size_t size)
+                         enum dcc_compiler_context context, char *key, size_t size)
 {
     /* Clients keep their credentials and namespaces for the invocation. Forked
      * clients start a fresh context; driver and cc1 lookups share this one. */
@@ -69,7 +79,7 @@ int dcc_local_worker_key(const char *compiler, const char *library,
         int context_ready, environment_ready;
         XXH128_hash_t context, environment;
         XXH64_hash_t environment_stamp;
-        const char *const *omitted;
+        enum dcc_compiler_context kind;
         unsigned next_file;
         struct { char *path; struct stat info; } files[8];
     } cached;
@@ -107,6 +117,7 @@ int dcc_local_worker_key(const char *compiler, const char *library,
     }
     XXH3_128bits_update(hash, &cached.context, sizeof(cached.context));
     const char *paths[] = {compiler, library};
+    if (library) XXH3_128bits_update(hash, library, strlen(library)+1);
     for (unsigned i = 0; i < 2; ++i) {
         if (!paths[i]) continue;
         unsigned slot = 0;
@@ -131,22 +142,20 @@ int dcc_local_worker_key(const char *compiler, const char *library,
     size_t capacity = 0, count_environment = 0;
     XXH3_64bits_reset(&environment_state);
     while (environ[capacity]) {
-        if (!omitted_environment(environ[capacity], strcspn(environ[capacity], "="), omit_environment))
+        if (context_binding(environ[capacity], strcspn(environ[capacity], "="), context))
             XXH3_64bits_update(&environment_state, environ[capacity], strlen(environ[capacity]) + 1);
         ++capacity;
     }
-    for (const char *const *name = omit_environment; name && *name; ++name)
-        XXH3_64bits_update(&environment_state, *name, strlen(*name) + 1);
     XXH64_hash_t stamp = XXH3_64bits_digest(&environment_state);
     /* Relay arrays and invocation-only variables change without changing
      * startup context. Hash retained bindings, including in-place mutations. */
     if (cached.environment_ready &&
-        cached.omitted == omit_environment && cached.environment_stamp == stamp) goto environment_ready;
+        cached.kind == context && cached.environment_stamp == stamp) goto environment_ready;
     struct dcc_environment_entry *environment = calloc(capacity, sizeof(*environment));
     if (capacity && !environment) return -1;
     for (char **p = environ; *p; ++p) {
         size_t length = strcspn(*p, "=");
-        if (!omitted_environment(*p, length, omit_environment)) {
+        if (context_binding(*p, length, context)) {
             environment[count_environment] = (struct dcc_environment_entry){
                 *p, length, count_environment};
             ++count_environment;
@@ -161,7 +170,7 @@ int dcc_local_worker_key(const char *compiler, const char *library,
         XXH3_128bits_update(&environment_state, environment[i].text, strlen(environment[i].text)+1);
     free(environment);
     cached.environment = XXH3_128bits_digest(&environment_state);
-    cached.omitted = omit_environment;
+    cached.kind = context;
     cached.environment_stamp = stamp;
     cached.environment_ready = 1;
 environment_ready:
@@ -218,8 +227,9 @@ static int get_worker(const char *compiler, int planning, int *worker)
     if (!broker || !*broker)
         return planning ? start_worker(compiler, worker) : -1;
 
-    char key[80];
-    if (dcc_local_worker_key(compiler, NULL, NULL, key, sizeof(key))) return EXIT_IO_ERROR;
+    char key[80], path[PATH_MAX];
+    if (dcc_local_worker_key(compiler, dcc_helper_path("distcc-clang", path),
+                             DCC_WORKER_IMAGE, key, sizeof(key))) return EXIT_IO_ERROR;
     int owner = dcc_broker_worker_get(key, worker);
     if (*worker >= 0) return 0;
     if (owner < 0) return planning ? EXIT_DISTCC_FAILED : -1;
@@ -266,7 +276,8 @@ static int request(char **argv, char operation, int output, int errors, int jour
         (input = output >= 0 ? dup(output) : dcc_job_memfd("distcc-local-command")) < 0) goto out;
     char *directory[] = {cwd, compiler, templated ? (char *)"template" : NULL, NULL};
     if (dcc_x_argv(input, "ARGC", "ARGV", directory) ||
-        dcc_x_argv(input, "ARGC", "ARGV", argv) || lseek(input, 0, SEEK_SET) < 0) goto out;
+        dcc_x_argv(input, "ARGC", "ARGV", argv) ||
+        dcc_x_argv(input, "ARGC", "ARGV", environ) || lseek(input, 0, SEEK_SET) < 0) goto out;
     /* Driver inspection may print bindings/phases. As with -### discovery,
      * inspection stdout must not escape before the actual command executes. */
     if (operation == 'L' && (sink = open("/dev/null", O_WRONLY | O_CLOEXEC)) < 0) goto out;
@@ -346,11 +357,12 @@ static int dcc_clang_local_prepare(char **argv, const char *input, char ***comma
     unsigned dependencies = 0;
     size_t length = 0;
     char *memo = NULL, *compiler = NULL, *cwd = getcwd(NULL, 0);
-    char key[96], context[80];
+    char key[96], context[80], path[PATH_MAX];
     if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
     else dcc_which(argv[0], &compiler);
     if (compiler && cwd && getenv("DISTCC_BROKER") &&
-        !dcc_local_worker_key(compiler, NULL, NULL, context, sizeof(context))) {
+        !dcc_local_worker_key(compiler, dcc_helper_path("distcc-clang", path),
+                              DCC_PLAN_ENVIRONMENT, context, sizeof(context))) {
         dcc_clang_plan_template(&plan, argv, input);
         XXH3_state_t hash;
         XXH3_128bits_reset(&hash);
@@ -423,10 +435,18 @@ done:
     return ret;
 }
 
-int dcc_clang_link_prepare(char **argv, int *plan, int *errors, int *remote)
+int dcc_clang_run_link(char **argv, uint64_t *cpu_ns)
+{
+    int status;
+    int ret = request(argv, 'B', -1, 2, -1, 0, &status, cpu_ns);
+    return ret ? (ret < 0 ? EXIT_DISTCC_FAILED : ret) :
+        WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+int dcc_clang_link_prepare(char **argv, int *plan, int *errors, char ***invocation, int32_t *bytes)
 {
     *plan = *errors = -1;
-    *remote = 0;
+    *invocation = NULL;
     if (!dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0) ||
         !dcc_clang_driver_mode(argv[0])) return -1;
     *plan = dcc_job_memfd("distcc-link-plan");
@@ -441,12 +461,10 @@ int dcc_clang_link_prepare(char **argv, int *plan, int *errors, int *remote)
         ret = dcc_pump_readwrite(2, *errors, size);
         return ret ? ret : WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
     }
-    char **groups[1];
     if (lseek(*plan, 0, SEEK_SET) < 0 ||
-        (ret = dcc_r_argv_file(*plan, 1, groups))) return EXIT_IO_ERROR;
-    *remote = groups[0][0] != NULL;
-    dcc_free_argv(groups[0]);
-    if (lseek(*plan, 0, SEEK_SET) < 0 || lseek(*errors, 0, SEEK_SET) < 0)
+        dcc_readx(*plan, bytes, sizeof(*bytes)) ||
+        dcc_r_argv_file(*plan, 1, invocation)) return EXIT_IO_ERROR;
+    if (lseek(*plan, sizeof(*bytes), SEEK_SET) < 0 || lseek(*errors, 0, SEEK_SET) < 0)
         return EXIT_IO_ERROR;
     return 0;
 }

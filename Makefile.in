@@ -378,9 +378,9 @@ h_getline_obj = src/h_getline.o $(common_obj)
 
 common_obj += src/job.o
 common_obj += src/tcp_job.o
-distcc_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o src/plan_memo.o
+distcc_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o src/plan_memo.o src/link.o
 distccd_obj += src/tcp_server.o src/tcp_worker.o src/tcp_async.o src/clang_worker.o src/gcc_files.o src/plan_memo.o
-h_compile_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o src/plan_memo.o
+h_compile_obj += src/tcp_client.o src/frontend_fs.o src/local_clang.o src/gcc_frontend.o src/plan_memo.o src/link.o
 distcc_obj += src/remote_job.o src/file_cache.o
 distcc_obj += src/rust/sandbox.o src/rust/client.o src/rust/probe.o
 distccd_obj += src/rust/sandbox.o src/rust/worker.o src/rust/link.o src/lto_worker.o
@@ -542,10 +542,15 @@ distcc-linker-wrapper: $(LTO_BUILD)/ClangLinkerWrapper.o
 distcc-clang: src/clang/launcher.o $(common_obj)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-CLANG_OBJECTS = $(addprefix $(LTO_BUILD)/,clang_compile.o clang_codegen.o clang_native.o clang_driver.o)
+CLANG_OBJECTS = $(addprefix $(LTO_BUILD)/,clang_compile.o clang_codegen.o clang_native.o clang_driver.o link_inputs.o)
+$(LTO_BUILD)/ElfOptions.inc: $(LLVM_WRAPPER_SOURCE)/../../../lld/ELF/Options.td
+	@mkdir -p $(@D)
+	`$(LLVM_CONFIG) --bindir`/llvm-tblgen -gen-opt-parser-defs -I `$(LLVM_CONFIG) --includedir` $< -o $@
+
+$(LTO_BUILD)/link_inputs.o: $(LTO_BUILD)/ElfOptions.inc
 $(CLANG_OBJECTS): $(LTO_BUILD)/%.o: $(srcdir)/src/clang/%.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -DDCC_LLD_PATH='"$(LTO_BINDIR)/ld.lld"' -MMD -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -I$(LTO_BUILD) -DDCC_LLD_PATH='"$(LTO_BINDIR)/ld.lld"' -MMD -c $< -o $@
 
 $(LTO_BUILD)/clang_worker_loop.o: $(srcdir)/src/native_worker.cc
 	@mkdir -p $(@D)
@@ -1318,7 +1323,7 @@ TAGS: $(SRC) $(HEADERS)
 
 SRC += src/job.c src/remote_job.c
 SRC += src/tcp_job.c src/tcp_client.c src/tcp_server.c src/tcp_worker.c src/tcp_async.c
-SRC += src/frontend_fs.c src/gcc_frontend.c src/gcc_files.cc
+SRC += src/frontend_fs.c src/gcc_frontend.c src/gcc_files.cc src/link.c
 SRC += src/argv_file.c src/gcc_plan.cc src/native_worker.cc src/native_worker.h
 SRC += src/plan_memo.c src/plan_memo.h src/gcc_dependencies.cc
 src/rpc.o src/argv_file.o: src/argv_file.h

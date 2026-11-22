@@ -393,7 +393,16 @@ char *dcc_helper_path(const char *name, char path[PATH_MAX])
 {
     if (!strcmp(name, "distcc-clang")) {
         char *override = getenv("DISTCC_CLANG_DRIVER");
-        if (override && *override) return override;
+        if (override && *override) {
+            char *found;
+            if (!strchr(override, '/') && !dcc_which(override, &found)) {
+                size_t length = strlen(found);
+                if (length < PATH_MAX) memcpy(path, found, length + 1);
+                free(found);
+                if (length < PATH_MAX) return path;
+            }
+            return override;
+        }
     }
     ssize_t len = readlink("/proc/self/exe", path, PATH_MAX);
     if (len > 0 && len < PATH_MAX) {

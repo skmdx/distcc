@@ -115,6 +115,8 @@ const int dcc_default_port = DISTCC_DEFAULT_PORT;
 
 /* Configuration is shared by broker client code linked into both binaries.
  * Keep it with host parsing, not the client-only scheduling object. */
+static int tcp_jobs_only;
+
 int dcc_read_localslots_configuration(void)
 {
     static const char *const names[] = {"DISTCC_HOSTS", "DISTCC_DIR", "HOME"};
@@ -139,14 +141,22 @@ int dcc_read_localslots_configuration(void)
     dcc_hostdef_local->n_slots = 4;
     dcc_hostdef_local_cpp->n_slots = 0;
     result = dcc_get_hostlist(&hostlist, &n_hosts);
+    tcp_jobs_only = 1; /* A broker-only client has an empty local list. */
     while (hostlist) {
         struct dcc_hostdef *next = hostlist->next;
+        if (!hostlist->tcp_jobs) tcp_jobs_only = 0;
         dcc_free_hostdef(hostlist);
         hostlist = next;
     }
     for (unsigned i = 0; i < 3; ++i) { free(saved[i]); saved[i] = copies[i]; }
     initialized = 1;
     return result;
+}
+
+int dcc_tcp_job_pool(void)
+{
+    dcc_read_localslots_configuration();
+    return tcp_jobs_only;
 }
 
 /***

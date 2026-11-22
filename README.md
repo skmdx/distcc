@@ -70,6 +70,10 @@ embedded import paths. It streams each declared output to a temporary file
 beside its client destination. The final native link
 runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache
 remains in use, so warm cache entries do not start backend jobs.
+For a resolved ELF link the resident Clang helper runs LLD directly. Native
+inputs use a local slot. One or two standalone bitcode objects totaling at most
+64 KiB can use an idle local broker lane. Bitcode archives and inputs whose
+contents depend on linker scripts or response files use the distributor.
 Heavy modules are prepared through LLVM's post-import hook, partitioned with
 LLVM's module splitter, and optimized/generated on multiple workers. The number
 of partitions comes from the module's instruction share and the broker's total
@@ -77,11 +81,10 @@ compute rate divided by its slowest worker's per-job rate. These rates use the
 CPU, SMT and throttling model evaluated at full capacity. Transient runnable
 load does not reshuffle the partitions between links; placement still accounts
 for live load. This gives slower workers smaller pieces without increasing
-concurrent jobs. The split is bounded by the
-available slots, function count, and total instructions divided by the largest
-function; a module dominated by one indivisible function avoids an unproductive
-import-and-split pass. Preparation overlaps ordinary backends; ready partitions
-join the same work queue. A module that stays in one piece returns its object
+concurrent jobs. The split is bounded by the available slots, function count,
+and total instructions divided by the largest function. Each partition also
+requires at least 32 instructions on average when splitting. Preparation overlaps
+ordinary backends, and ready partitions join the same work queue. A module that stays in one piece returns its object
 directly. For multiple partitions, a relocatable merge restores private symbol bindings
 before LLD consumes the result. Constructors, TLS and exception handling retain
 their original link semantics. File assembly shares the first partition with
@@ -98,8 +101,9 @@ Individual functions and the final native layout are not subdivided.
 `make lto install-lto` builds and installs the helpers for `LLVM_CONFIG` under
 its library directory's `distcc` subdirectory and registers `distcc-lto` beside
 that installation's compiler. Set `LLVM_WRAPPER_SOURCE` as
-described below; the same source tree supplies LLVM's `SplitModule.cpp`, built
-privately with instruction-weighted placement. Use a distinct `LTO_BUILD` when
+described below. The source tree supplies LLVM's `SplitModule.cpp` for
+instruction-weighted placement and `lld/ELF/Options.td` for parsing linker inputs.
+Use a distinct `LTO_BUILD` when
 building for multiple installed LLVM ABIs. A compiler without its matching
 helpers still distributes whole-module backends.
 Clang 22 and 23 are exercised by the integration tests. Compiler acceptance and

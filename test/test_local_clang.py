@@ -91,6 +91,72 @@ class LocalClangTest(BrokerTestCase):
         finally:
             os.close(reader)
 
+    def test_request_environment_is_independent_of_worker_image(self):
+        hosts = self.host(0, ',tcp')
+        self.start_local(hosts)
+        self.env.pop('LD_BIND_NOW', None)
+        self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_HOSTS=hosts,
+                        DISTCC_FRONTEND_ROOTS=str(self.work))
+        # Observe libc lookups inside the real helper. Snapshot each request
+        # once, including variables the current driver might never consult.
+        library = self.work/'inspect.so'
+        subprocess.run([self.compiler, '-shared', '-fPIC', '-x', 'c', '-', '-o', library],
+                       input=b'''
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+char *getenv(const char *key) {
+    const char *path = secure_getenv("CUSTOM_REQUEST");
+    int fd = path ? open(path, O_CREAT|O_EXCL|O_WRONLY, 0600) : -1;
+    if (fd >= 0) {
+        dprintf(fd, "%s\\n%s\\n%s\\n%s\\n", secure_getenv("CPATH"),
+                secure_getenv("SOURCE_DATE_EPOCH"), secure_getenv("TMPDIR"), secure_getenv("PWD"));
+        close(fd);
+    }
+    return secure_getenv(key);
+}
+''', check=True)
+        helper = self.work/'inspect-clang'
+        helper.write_text('#!/bin/sh\nexport LD_PRELOAD=' + shlex.quote(str(library)) +
+                          '\nexec ' + shlex.quote(str(self.build/'distcc-clang')) + ' "$@"\n')
+        helper.chmod(0o755)
+        self.env['DISTCC_CLANG_DRIVER'] = helper.name
+        self.env['PATH'] = str(self.work) + os.pathsep + self.env['PATH']
+        self.source.write_text('#include <value.h>\nconst char stamp[] = __DATE__;\n'
+                               'int main(void) { return VALUE; }\n')
+        for i in (1, 2):
+            directory = self.work/f'env-{i}'
+            directory.mkdir()
+            (directory/'value.h').write_text(f'#define VALUE {i}\n')
+            (directory/'cwd').symlink_to(self.work)
+            self.env.update(PWD=str(directory/'cwd'), SHLVL=str(i), CFLAGS=f'-O{i}',
+                            CPATH=str(directory), SOURCE_DATE_EPOCH=str(86400*i),
+                            TMPDIR=str(directory), LIBRARY_PATH=str(directory))
+            # C runs the native preprocessor. P plans a remote frontend with
+            # the driver's current header search; L prints its current -L path.
+            args = ['-E', '-P', str(self.source)]
+            self.env['CUSTOM_REQUEST'] = str(directory/'C')
+            self.assertEqual(self.command(args, check=True).stdout,
+                             self.command(args, False, check=True).stdout)
+            self.env['CUSTOM_REQUEST'] = str(directory/'P')
+            self.command(['-c', str(self.source), '-o', str(self.work/'env.o')], check=True)
+            self.env['CUSTOM_REQUEST'] = str(directory/'L')
+            link = self.command(['env.o', '-v', '-fuse-ld=lld', '-o', 'env'])
+            self.assertEqual(link.returncode, 0, link.stderr)
+            self.assertIn(('-L'+str(directory)).encode(), link.stderr)
+            self.assertEqual(subprocess.run([self.work/'env']).returncode, i)
+            for operation in 'CPL':
+                self.assertEqual((directory/operation).read_text().splitlines(),
+                                 [self.env[k] for k in ('CPATH', 'SOURCE_DATE_EPOCH', 'TMPDIR', 'PWD')])
+        log = self.work/'client.log'
+        self.assertEqual(log.read_text().count('started local compiler libraries'), 1)
+        for op in 'CPL': self.assertIn('operation='+op, log.read_text())
+        self.env['LD_BIND_NOW'] = '1'
+        self.command(['-dumpversion'], check=True)
+        self.assertEqual(log.read_text().count('started local compiler libraries'), 2)
+
     def test_worker_startup_uses_transport_deadline_and_reaps_timeout(self):
         self.start_local()
         helpers = self.work/'slow-start'
@@ -108,8 +174,11 @@ class LocalClangTest(BrokerTestCase):
                          (original.returncode, original.stdout, original.stderr))
         self.assertIn('started local compiler libraries', (self.work/'client.log').read_text())
 
-        # A different environment requests a different helper, not the cached
-        # ready one. Its configured timeout must also reap the startup process.
+        # Force a cold start with a different helper. The timeout itself
+        # belongs to the requesting client.
+        second = helpers/'second-clang'
+        second.symlink_to(helper)
+        self.env['DISTCC_CLANG_DRIVER'] = str(second)
         self.env['DISTCC_IO_TIMEOUT'] = '1'
         result = self.command(['-dumpversion'])
         self.assertNotEqual(result.returncode, 0)

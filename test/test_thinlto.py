@@ -190,6 +190,76 @@ class ThinLTOTest(BrokerTestCase):
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
 
+    def test_prepared_link_admission_and_archive_inputs(self):
+        compiler = shutil.which('clang')
+        peer = self.peer(stats_response(cpus=4, cores=4, jobs=4, busy=0, running=0))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name='tiny')
+        self.env.update(DISTCC_CLANG_LOCAL='1', DISTCC_VERBOSE='1',
+                        DISTCC_LOG=str(self.work/'client.log'), PATH=str(self.build)+':'+os.environ['PATH'])
+        def obj(name, code, thin=True):
+            path = self.work/(name+'.c')
+            path.write_text(code)
+            self.run_command([compiler, '-O2', '-fPIC', *(['-flto=thin'] if thin else []),
+                              '-c', path, '-o', name+'.o'], check=True)
+        obj('native', 'int native(void){return 0;}', False)
+        for i in range(3): obj('part'+str(i), f'int part{i}(void){{return {i};}}')
+        obj('large', 'const char blob[]="'+('abcdefgh'*20000)+'";')
+        self.assertGreater((self.work/'large.o').stat().st_size, 65536)
+        for name, member, mode in [('elf', 'native', 'rcs'), ('bits', 'part0', 'rcs'),
+                                   ('thinbits', 'part0', 'rcsT'), ('thinelf', 'native', 'rcsT')]:
+            self.run_command(['llvm-ar', mode, f'lib{name}.a', member+'.o'], check=True)
+        def link(inputs, distributed):
+            result = self.run_command([self.build/'distcc', compiler, '-shared', '-nostdlib',
+                                       '-fuse-ld=lld', '-flto=thin', *inputs, '-o', 'libout.so'])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual('distcc-thinlto: submitting' in result.stderr, distributed, result.stderr)
+            self.assertNotIn('distcc-thinlto: partitioned', result.stderr)
+            self.assertTrue((self.work/'libout.so').read_bytes().startswith(b'\x7fELF'))
+        for inputs, distributed in [
+                (['native.o'], False), (['part0.o'], False), (['part0.o','part1.o'], False),
+                (['part0.o','part1.o','part2.o'], True), (['large.o'], True),
+                (['part1.o','-L.', '-Wl,-Bstatic','-lelf','-l:libthinelf.a'], False),
+                (['-Wl,--whole-archive', 'libbits.a'], True),
+                (['-Wl,--whole-archive', '-L.', '-lbits'], True),
+                (['-Wl,--whole-archive', '-L.', '-l:libthinbits.a'], True)]:
+            with self.subTest(inputs=inputs): link(inputs, distributed)
+        log = (self.work/'client.log').read_text()
+        self.assertIn('operation=B', log)
+        self.assertNotRegex(log, r'forking to execute: \S*distcc-link\b')
+        self.assertNotIn('--show-hosts', log)
+        self.assertNotIn('--local-command', log)
+        # Two definitions exercise LLD's own error, with local retries enabled.
+        self.env['DISTCC_FALLBACK'] = '1'
+        failed = self.run_command([self.build/'distcc', compiler, '-shared', '-nostdlib', '-fuse-ld=lld',
+                                   'native.o', 'native.o', '-o', 'bad.so'])
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(failed.stderr.count('duplicate symbol:'), 1, failed.stderr)
+
+    def test_remote_only_tiny_module_runs_one_unsplit_backend(self):
+        self.restart_server(self.build/'distccd', address='127.0.0.2')
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        self.start_broker(f'127.0.0.2:{self.ports[0]}/4,tcp,stats={self.stats_ports[0]}', name='remote')
+        self.env.update(DISTCC_CLANG_LOCAL='1', DISTCC_VERBOSE='1', PATH=str(self.build)+':'+os.environ['PATH'])
+        source = self.work/'tiny.c'
+        source.write_text('int f(void){return 2;} int g(void){return 3;}')
+        self.run_command(['clang','-O2','-flto=thin','-c',source,'-o','tiny.o'], check=True)
+        result = self.run_command([self.build/'distcc','clang','-flto=thin','-fuse-ld=lld','-shared',
+                                   '-nostdlib','tiny.o','-o','tiny.so'], check=True)
+        self.assertEqual(result.stderr.count('distcc-thinlto: compiled on'), 1, result.stderr)
+        self.assertNotIn('distcc-thinlto: partitioned', result.stderr)
+
+        # The same backend must also distribute when the pool includes a
+        # fast local peer whose only lane is already leased.
+        local = self.peer(stats_response(cpus=1, cores=1, jobs=1, busy=0, running=0))
+        remote = self.env['DISTCC_HOSTS']
+        self.start_broker(self.host(1, f',tcp,stats={local.port},speed=100', slots=1)+' '+remote,
+                          name='occupied')
+        self.env.update(DISTCC_CLANG_LOCAL='1', DISTCC_VERBOSE='1', PATH=str(self.build)+':'+os.environ['PATH'])
+        self.assertEqual(self.receive(self.request(15)), (0, 1, []))
+        result = self.run_command([self.build/'distcc','clang','-flto=thin','-fuse-ld=lld','-shared',
+                                   '-nostdlib','tiny.o','-o','occupied.so'], check=True)
+        self.assertEqual(result.stderr.count('distcc-thinlto: compiled on'), 1, result.stderr)
+
     @unittest.skipUnless(shutil.which('meson'), 'Meson required')
     def test_meson_install_preserves_origin_rpath(self):
         import ctypes
@@ -865,6 +935,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         self.assertFalse(output.exists())
 
     def test_hip_wrapper_distributes_host_thinlto(self):
+        self.env['DISTCC_CLANG_LOCAL'] = '1'
         self.link(shutil.which('clang'), hip=True)
 
     def test_hip_device_links_and_host_backends(self):

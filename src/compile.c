@@ -34,7 +34,6 @@
 #include <errno.h> // IWYU pragma: keep
 #include <sys/stat.h>
 
-#include <ctype.h>
 
 #ifdef HAVE_FNMATCH_H
   #include <fnmatch.h>
@@ -54,7 +53,6 @@
 #include "exitcode.h"
 #include "util.h"
 #include "hosts.h"
-#include "bulk.h"
 #include "implicit.h"
 #include "exec.h"
 #include "where.h"
@@ -106,8 +104,8 @@ static void release_host(struct dcc_hostdef *host, int *cpu_lock_fd,
  * Callers reserve local capacity for compiler work; coordinators acquire
  * capacity for their children instead of occupying a local compiler lane.
  **/
-static int dcc_compile_local(char *argv[],
-                             char *input_name, const char *prepared, uint64_t *cpu_ns)
+int dcc_compile_local(char *argv[],
+                      char *input_name, const char *prepared, uint64_t *cpu_ns)
 {
     pid_t pid;
     int ret;
@@ -382,7 +380,8 @@ static int dcc_link_candidate(char **argv, const char *broker)
         if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "-S") ||
             !strcmp(argv[i], "-E") || dcc_is_source(argv[i]))
             return 0;
-        if (str_endswith(".o", argv[i]) || str_endswith(".a", argv[i]) || argv[i][0] == '@')
+        if (str_endswith(".o", argv[i]) || str_endswith(".a", argv[i]) || argv[i][0] == '@' ||
+            (clang && !strncmp(argv[i], "-l", 2)))
             input = 1;
     }
     return input;
@@ -504,46 +503,8 @@ dcc_build_somewhere(char *argv[],
 
     /* Links belong to the link driver, not the compile-only Clang scanner. */
     if (dcc_link_candidate(argv, broker)) {
-        char path[PATH_MAX];
-        char *linker = dcc_helper_path("distcc-link", path);
-        int plan, errors, remote;
-        ret = dcc_clang_link_prepare(argv, &plan, &errors, &remote);
-        if (ret >= 0 && (ret || !remote)) {
-            dcc_close(plan); dcc_close(errors);
-            if (ret) goto clean_up;
-            goto lock_local;
-        }
-        if (!ret) {
-            int argc = dcc_argv_len(argv);
-            char plan_fd[32], errors_fd[32];
-            snprintf(plan_fd, sizeof(plan_fd), "%d", plan);
-            snprintf(errors_fd, sizeof(errors_fd), "%d", errors);
-            char **command = calloc(argc + 5, sizeof(*command));
-            if (!command || fcntl(plan, F_SETFD, 0) || fcntl(errors, F_SETFD, 0)) {
-                ret = EXIT_IO_ERROR;
-            } else {
-                char option[] = "--clang-plan";
-                command[0] = linker; command[1] = option;
-                command[2] = plan_fd; command[3] = errors_fd;
-                memcpy(command + 4, argv, (argc + 1) * sizeof(*argv));
-                ret = dcc_compile_local(command, NULL, NULL, NULL);
-            }
-            free(command);
-            dcc_close(plan); dcc_close(errors);
-            goto clean_up;
-        }
-        dcc_close(plan); dcc_close(errors);
-        int argc = dcc_argv_len(argv);
-        char **link_argv = calloc(argc + 2, sizeof(*link_argv));
-        if (!link_argv || !(link_argv[0] = strdup(linker))) {
-            free(link_argv);
-            ret = EXIT_OUT_OF_MEMORY;
-            goto clean_up;
-        }
-        memcpy(link_argv + 1, argv, (argc + 1) * sizeof(*argv));
-        free(argv);
-        argv = link_argv;
-        goto run_local;
+        ret = dcc_link_dispatch(argv);
+        goto clean_up;
     }
 
     /* TODO: Perhaps tidy up these gotos. */

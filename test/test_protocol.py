@@ -95,6 +95,7 @@ class ArgumentFileTest(unittest.TestCase):
                 os.ftruncate(self.fd, 0); os.lseek(self.fd, 0, os.SEEK_SET)
                 write_argv(self.fd, [str(build), compiler])
                 write_argv(self.fd, [compiler, '-E', '-x', 'c', '-'])
+                write_argv(self.fd, [f'{k}={v}' for k, v in env.items()])
                 null = os.open(os.devnull, os.O_RDWR)
                 cleanup.callback(os.close, null)
                 for _ in range(2):
@@ -249,6 +250,7 @@ class ArgumentFileTest(unittest.TestCase):
                     if isinstance(payload, bytes): os.write(self.fd, payload)
                     else:
                         for group in payload: write_argv(self.fd, group)
+                        if native: write_argv(self.fd, [f'{k}={v}' for k, v in env.items()])
                     os.lseek(self.fd, 0, os.SEEK_SET)
                     for fd in outputs: os.ftruncate(fd, 0); os.lseek(fd, 0, os.SEEK_SET)
                     reply, peer = socket.socketpair()

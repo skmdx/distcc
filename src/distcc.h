@@ -362,7 +362,8 @@ int dcc_send_fd(int sock, const void *data, size_t size, int fd);
 ssize_t dcc_recv_fd(int sock, void *data, size_t size, int *fd);
 #define DCC_IPC_FDS_MAX 7
 int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns);
-int dcc_clang_link_prepare(char **argv, int *plan, int *errors, int *remote);
+int dcc_clang_link_prepare(char **argv, int *plan, int *errors, char ***invocation, int32_t *bytes);
+int dcc_clang_run_link(char **argv, uint64_t *cpu_ns);
 int dcc_prefork_shutdown(int signal_number);
 int dcc_send_fds(int sock, const void *data, size_t size, const int *fds, unsigned count);
 ssize_t dcc_recv_fds(int sock, void *data, size_t size, int *fds, unsigned *count);

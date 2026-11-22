@@ -806,7 +806,7 @@ class GccFrontendTest(BrokerTestCase):
         source = self.work/'startup-context.c'
         source.write_text('#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n'
                           '__attribute__((constructor)) static void startup(void) {\n'
-                          ' const char *value = getenv("DISTCC_TEST_STARTUP");\n'
+                          ' const char *value = getenv("SANDBOX_TEST_STARTUP");\n'
                           ' if (getenv("DISTCC_GCC_PLAN_CONTROL") && value && !strcmp(value, "reject"))\n'
                           '  _exit(17);\n}\n')
         library = self.work/'startup-context.so'
@@ -817,7 +817,7 @@ class GccFrontendTest(BrokerTestCase):
         subprocess.run(command, cwd=self.work, check=True, capture_output=True)
         expected = (self.work/'out.o').read_bytes()
         log = self.work/'startup-context.log'
-        self.env.update(LD_PRELOAD=str(library), DISTCC_TEST_STARTUP='allow', DISTCC_LOG=str(log))
+        self.env.update(LD_PRELOAD=str(library), SANDBOX_TEST_STARTUP='allow', DISTCC_LOG=str(log))
         self.compile_frontend(command)
         self.env = dict(reversed(list(self.env.items())))
         self.compile_frontend(command)
@@ -827,13 +827,13 @@ class GccFrontendTest(BrokerTestCase):
         self.assertEqual(trace.count('started reusable GCC planner pid='), 1, trace)
         # A library constructor still receives a distinct startup environment.
         # Reusing the allow-context here would incorrectly compile successfully.
-        self.env['DISTCC_TEST_STARTUP'] = 'reject'
+        self.env['SANDBOX_TEST_STARTUP'] = 'reject'
         (self.work/'out.o').unlink()
         failed = subprocess.run([str(self.build/'distcc'), *command], cwd=self.work,
                                 env=self.env, capture_output=True, text=True, timeout=30)
         self.assertNotEqual(failed.returncode, 0, failed.stderr)
         self.assertFalse((self.work/'out.o').exists())
-        self.env['DISTCC_TEST_STARTUP'] = 'allow'
+        self.env['SANDBOX_TEST_STARTUP'] = 'allow'
         self.compile_frontend(command)
         self.assertEqual((self.work/'out.o').read_bytes(), expected)
 

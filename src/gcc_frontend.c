@@ -32,7 +32,6 @@
 char *dcc_plan_key(char **argv, const char *input)
 {
     const char *library = getenv("DISTCC_GCC_PLAN_LIBRARY");
-    static const char *const omitted[] = {"DISTCC_LOG", "DISTCC_VERBOSE", NULL};
     char context[80], *compiler = NULL, cwd[PATH_MAX];
     const char *extension = dcc_find_extension_const(input), *parent = strrchr(input, '/');
     if (!getenv("DISTCC_BROKER") || !extension || !strcmp(input, "-") ||
@@ -41,7 +40,7 @@ char *dcc_plan_key(char **argv, const char *input)
     if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
     else if (dcc_which(argv[0], &compiler)) return NULL;
     if (!compiler) return NULL;
-    int failed = dcc_local_worker_key(compiler, library, omitted, context, sizeof(context));
+    int failed = dcc_local_worker_key(compiler, library, DCC_PLAN_ENVIRONMENT, context, sizeof(context));
     free(compiler);
     if (failed) return NULL;
     XXH3_state_t hash;
@@ -128,22 +127,11 @@ static int request_planner(const char *compiler, char **argv, int input,
 {
     const char *library = getenv("DISTCC_GCC_PLAN_LIBRARY");
     if (!library) library = GCC_PLAN_LIBRARY;
-    /* This key shares a loaded image, not an argument or preprocessing
-     * result. Build flags and make's invocation/subdirectory metadata arrive
-     * with each request; its complete environment is restored before GCC main.
-     * These exported copies and distcc logging do not change the loaded image.
-     * Loader, allocator and sandbox configuration still belong to the key. */
-    static const char *const invocation_environment[] = {
-        "COLLECT_GCC_OPTIONS", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
-        "COLLECT_AS_OPTIONS", "MAKEFLAGS", "MAKELEVEL", "MFLAGS", "subdir",
-        "COLLECT_GCC", "COLLECT_LTO_WRAPPER", "COMPILER_PATH", "LIBRARY_PATH", "GCC_EXEC_PREFIX",
-        "DISTCC_LOG", "DISTCC_VERBOSE", NULL
-    };
     char key[80];
     int worker = -1, lease = -1, pair[2] = {-1, -1}, relay[2] = {-1, -1};
     int ret = EXIT_IO_ERROR;
     const char *stage = "worker identity";
-    if (dcc_local_worker_key(compiler, library, invocation_environment, key, sizeof(key))) goto out;
+    if (dcc_local_worker_key(compiler, library, DCC_WORKER_IMAGE, key, sizeof(key))) goto out;
     stage = "worker lookup";
     lease = dcc_broker_worker_get(key, &worker);
     if (worker < 0 && lease >= 0) {

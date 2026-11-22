@@ -209,7 +209,9 @@ def distribute(request, kind, link=None):
                 task['index'] = index
                 if total_instructions and len(task['outputs']) == 1:
                     useful = row['instructions'] // row['largest_function'] if row['largest_function'] else 1
-                    task['partitions'] = max(1, min(slots, row['functions'], useful,
+                    # Charge each additional backend for at least 32 IR instructions.
+                    # Tiny modules otherwise dominate an equally tiny link by ratio alone.
+                    task['partitions'] = max(1, min(slots, row['functions'], useful, row['instructions'] // 32,
                         math.ceil(row['instructions'] * parallelism / total_instructions)))
 
         def priority(task):

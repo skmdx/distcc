@@ -268,27 +268,26 @@ int main(int argc, char **argv)
     close(command); free(encoded);
     int bench = !strcmp(argv[1], "--bench");
     char key[80], previous[80];
-    static const char *const omitted[] = {"VOLATILE", NULL};
-    assert(!setenv("STABLE", "first", 1) && !setenv("VOLATILE", "first", 1));
-    assert(!dcc_local_worker_key("/proc/self/exe", NULL, omitted, key, sizeof(key)));
+    assert(!setenv("STABLE", "first", 1) && !setenv("CFLAGS", "first", 1));
+    assert(!dcc_local_worker_key("/proc/self/exe", NULL, DCC_PLAN_ENVIRONMENT, key, sizeof(key)));
     strcpy(previous, key);
-    assert(!setenv("VOLATILE", "next", 1));
-    assert(!dcc_local_worker_key("/proc/self/exe", NULL, omitted, key, sizeof(key)));
+    assert(!setenv("CFLAGS", "next", 1));
+    assert(!dcc_local_worker_key("/proc/self/exe", NULL, DCC_PLAN_ENVIRONMENT, key, sizeof(key)));
     assert(!strcmp(key, previous));
     assert(!setenv("STABLE", "next", 1));
-    assert(!dcc_local_worker_key("/proc/self/exe", NULL, omitted, key, sizeof(key)));
+    assert(!dcc_local_worker_key("/proc/self/exe", NULL, DCC_PLAN_ENVIRONMENT, key, sizeof(key)));
     assert(strcmp(key, previous));
     char **saved = environ;
-    char stable[] = "STABLE=next", variable[] = "VOLATILE=different";
+    char stable[] = "STABLE=next", variable[] = "CFLAGS=different";
     char *alternate[] = {stable, variable, NULL};
     environ = alternate;
-    assert(!dcc_local_worker_key("/proc/self/exe", NULL, omitted, previous, sizeof(previous)));
+    assert(!dcc_local_worker_key("/proc/self/exe", NULL, DCC_PLAN_ENVIRONMENT, previous, sizeof(previous)));
     char *reordered[] = {alternate[1], alternate[0], NULL};
     environ = reordered;
-    assert(!dcc_local_worker_key("/proc/self/exe", NULL, omitted, key, sizeof(key)));
+    assert(!dcc_local_worker_key("/proc/self/exe", NULL, DCC_PLAN_ENVIRONMENT, key, sizeof(key)));
     assert(!strcmp(key, previous));
     stable[7] = 'b';
-    assert(!dcc_local_worker_key("/proc/self/exe", NULL, omitted, key, sizeof(key)));
+    assert(!dcc_local_worker_key("/proc/self/exe", NULL, DCC_PLAN_ENVIRONMENT, key, sizeof(key)));
     assert(strcmp(key, previous)); /* putenv-style mutation in the same array. */
     environ = saved;
     char *authority = dcc_frontend_identity(), *same_authority = dcc_frontend_identity();
@@ -332,7 +331,7 @@ int main(int argc, char **argv)
     struct rusage before;
     assert(!getrusage(RUSAGE_SELF, &before));
     for (int i = 0; i < (bench ? 2000 : 1); ++i)
-        assert(!dcc_local_worker_key("/proc/self/exe", NULL, omitted, key, sizeof(key)));
+        assert(!dcc_local_worker_key("/proc/self/exe", NULL, DCC_PLAN_ENVIRONMENT, key, sizeof(key)));
     sample("identity", &before);
     size_t count = 0;
     while (saved[count]) ++count;
@@ -343,10 +342,10 @@ int main(int argc, char **argv)
     relay[count] = volatile_binding;
     relay[count + 1] = NULL;
     for (int i = 0; i < (bench ? 2000 : 1); ++i) {
-        snprintf(volatile_binding, sizeof(volatile_binding), "VOLATILE=%d", i);
+        snprintf(volatile_binding, sizeof(volatile_binding), "CFLAGS=%d", i);
         environ = i % 2 ? relay : saved;
         assert(!dcc_local_worker_key(i % 2 ? "/bin/sh" : "/proc/self/exe",
-                                    "/proc/self/exe", omitted, key, sizeof(key)));
+                                    "/proc/self/exe", DCC_PLAN_ENVIRONMENT, key, sizeof(key)));
     }
     environ = saved;
     free(relay);

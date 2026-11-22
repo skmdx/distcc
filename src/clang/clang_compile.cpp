@@ -102,7 +102,7 @@ public:
 
 // Import-time initialization is shared by the worker's forked jobs. Repeating
 // target registration in every child also dirties otherwise shared pages.
-void dcc_clang_compile_init() {
+static void dcc_clang_compile_init() {
     llvm::InitializeAllTargetInfos(); llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs(); llvm::InitializeAllAsmParsers(); llvm::InitializeAllAsmPrinters();
 }
@@ -163,8 +163,6 @@ static int remote(llvm::ArrayRef<const char *> argv, int fd) {
     llvm::outs().flush(); llvm::errs().flush();
     return ok ? 0 : 1;
 }
-
-int dcc_clang_native_worker(int fd);
 
 int main(int argc, char **argv) {
     dcc_clang_compile_init();

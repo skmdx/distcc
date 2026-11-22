@@ -24,7 +24,7 @@
 /* remote.c */
 
 #include <sys/types.h>
-#include <time.h>
+#include <stdint.h>
 struct dcc_hostdef;
 int dcc_wait_for_cpp(pid_t cpp_pid, int *status, const char *input_fname);
 
@@ -50,6 +50,8 @@ int dcc_compile_remote(char **argv,
 
 
 int dcc_run_local_command(char **argv);
+int dcc_link_dispatch(char **argv);
+int dcc_compile_local(char **argv, char *input, const char *prepared, uint64_t *cpu_ns);
 
 int dcc_build_somewhere_timed(char *argv[],
                               int sg_level,

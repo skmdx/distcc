@@ -21,6 +21,7 @@
 #include "clang_codegen.h"
 #include "clang_compiler.h"
 #include "compiler_command.h"
+#include "link_inputs.h"
 #include "../native_worker.h"
 
 LLD_HAS_DRIVER(elf)
@@ -137,12 +138,16 @@ int prepare(int fd, char **args, unsigned operation, int journal, bool templated
     if (error) return 1;
     // The complete input is now owned in memory. Reuse its file for the reply.
     if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) return 1;
+    if (operation == 'L') {
+        int32_t bytes = dcc_small_link_bytes(command);
+        if (write(fd, &bytes, sizeof(bytes)) != sizeof(bytes)) return 1;
+    }
     return dcc_argv_file_write(fd, "ARGC", "ARGV", command) ||
            (roots && dcc_argv_file_write(fd, "ARGC", "ARGV", roots));
 }
 int execute(int fd, unsigned operation, int journal) {
     CompilerCommand command;
-    if (!command.read(fd, 2)) {
+    if (!command.read(fd, 3)) {
         llvm::errs() << "distcc: invalid complete compiler command file\n";
         return 1;
     }
@@ -156,8 +161,21 @@ int execute(int fd, unsigned operation, int journal) {
         llvm::errs() << "distcc: " << directory[0] << ": " << strerror(errno) << '\n';
         return 1;
     }
+    char **previous = environ;
+    auto restore = llvm::scope_exit([&] { environ = previous; });
+    environ = command[2];
     argv[0] = directory[1];
     llvm::SmallVector<const char *> args;
+    if (operation == 'B') {
+        if (!argv[1]) return 1;
+        if (!llvm::sys::fs::equivalent(argv[1], DCC_LLD_PATH)) {
+            execv(argv[1], argv+1);
+            llvm::errs() << argv[1] << ": " << strerror(errno) << '\n';
+            return 1;
+        }
+        for (char **p = argv+1; *p; ++p) args.push_back(*p);
+        return lld::lldMain(args, llvm::outs(), llvm::errs(), {{lld::Gnu, &lld::elf::link}}).retCode;
+    }
     if (operation == 'C') {
         for (char **p = argv; *p; ++p) args.push_back(*p);
         return run(args);
