@@ -47,10 +47,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#ifdef HAVE_SYS_SELECT_H
-#  include <sys/select.h>
-#endif
-#include <sys/time.h>
+#include <limits.h>
+#include <poll.h>
+#include <time.h>
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -157,101 +156,51 @@ int dcc_get_io_timeout(void)
     return current_timeout;
 }
 
-/**
- * @todo Perhaps only apply the timeout for initial connections, not when
- * doing regular IO.
- **/
-int dcc_select_for_read(int fd,
-                        int timeout)
+/* Return poll's ready/timeout/error result. Signals do not renew the budget. */
+int dcc_poll_fd(int fd, short events, int timeout)
 {
-    fd_set fds;
-    int rs;
-    struct timeval tv;
-
-    tv.tv_sec = timeout;
-    tv.tv_usec = 0;
-
-    while (1) {
-        FD_ZERO(&fds);
-        FD_SET(fd, &fds);
-
-        /* Linux updates the timeval to reflect the remaining time, but other
-         * OSs may not.  So on other systems, we may wait a bit too long if
-         * the client is interrupted -- but that won't happen very often so
-         * it's no big deal.
-         */
-
-        rs_trace("select for read on fd%d for %ds", fd, (int) tv.tv_sec);
-        rs = select(fd+1, &fds, NULL, NULL, &tv);
-        if (rs == -1 && errno == EINTR) {
-            rs_trace("select was interrupted");
-            continue;
-        } else if (rs == -1) {
-            rs_log_error("select() failed: %s", strerror(errno));
-            return EXIT_IO_ERROR;
-        } else if (rs == 0) {
-            rs_log_error("IO timeout");
-            return EXIT_IO_ERROR;
-        } else if (!FD_ISSET(fd, &fds)) {
-            rs_log_error("how did fd not get set?");
-            continue;
-        } else {
-            break;              /* woot */
-        }
+    if (fd < 0 || timeout < 0) {
+        errno = EINVAL;
+        return -1;
     }
-    return 0;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
+    int64_t remaining = (int64_t)timeout * 1000000000;
+    const int64_t end = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec + remaining;
+    struct pollfd p = { .fd = fd, .events = events };
+    for (;;) {
+        int64_t ms = (remaining + 999999) / 1000000;
+        int ready = poll(&p, 1, ms > INT_MAX ? INT_MAX : (int)ms);
+        if (ready > 0 && (p.revents & POLLNVAL)) {
+            errno = EBADF;
+            return -1;
+        }
+        if (ready > 0 || (ready < 0 && errno != EINTR))
+            return ready;
+        if (!ready && ms <= INT_MAX) return 0;
+        if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
+        remaining = end - ((int64_t)now.tv_sec * 1000000000 + now.tv_nsec);
+        if (remaining <= 0) return 0;
+    }
 }
 
+static int wait_io(int fd, short events, int timeout)
+{
+    int ready = dcc_poll_fd(fd, events, timeout);
+    if (ready > 0) return 0;  /* read/write reports EOF or a socket error. */
+    if (ready < 0) rs_log_error("poll failed: %s", strerror(errno));
+    else rs_log_error("IO timeout");
+    return EXIT_IO_ERROR;
+}
 
-/*
- * Calls select() to block until the specified fd becomes writeable
- * or has an error condition, or the timeout expires.
- */
+int dcc_select_for_read(int fd, int timeout)
+{
+    return wait_io(fd, POLLIN, timeout);
+}
+
 int dcc_select_for_write(int fd, int timeout)
 {
-    fd_set write_fds;
-    fd_set except_fds;
-    int rs;
-
-    struct timeval tv;
-
-    tv.tv_sec = timeout;
-    tv.tv_usec = 0;
-
-    while (1) {
-        FD_ZERO(&write_fds);
-        FD_ZERO(&except_fds);
-        FD_SET(fd, &write_fds);
-        FD_SET(fd, &except_fds);
-        rs_trace("select for write on fd%d", fd);
-
-        rs = select(fd + 1, NULL, &write_fds, &except_fds, &tv);
-
-        if (rs == -1 && errno == EINTR) {
-            rs_trace("select was interrupted");
-            continue;
-        } else if (rs == -1) {
-            rs_log_error("select failed: %s", strerror(errno));
-            return EXIT_IO_ERROR;
-        } else if (rs == 0) {
-            rs_log_error("IO timeout");
-            return EXIT_IO_ERROR;
-        } else {
-            if (FD_ISSET(fd, &except_fds)) {
-              rs_trace("error condition on fd%d", fd);
-              /*
-               * Don't fail here; we couldn't give a good error
-               * message, because we don't know what the error
-               * condition is.  Instead just return 0 (success),
-               * indicating that the select has successfully finished.
-               * The next call to write() for that fd will fail but
-               * will also set errno properly so that we can give a
-               * good error message at that point.
-               */
-            }
-            return 0;
-        }
-    }
+    return wait_io(fd, POLLOUT, timeout);
 }
 
 

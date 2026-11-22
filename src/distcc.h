@@ -386,12 +386,15 @@ int dcc_r_str_alloc(int fd, unsigned len, char **buf);
 
 int tcp_cork_sock(int fd, int corked);
 int dcc_close(int fd);
+void dcc_raise_fd_limit(void);
+void dcc_restore_fd_limit(void);
 int dcc_get_io_timeout(void);
 /* One active RPC per client/worker process; reset at every job boundary. */
 void dcc_buffer_input(int fd);
 int dcc_want_mmap(void);
 
 
+int dcc_poll_fd(int fd, short events, int timeout);
 int dcc_select_for_write(int fd, int timeout);
 int dcc_select_for_read(int fd, int timeout);
 

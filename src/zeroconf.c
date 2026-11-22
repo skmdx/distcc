@@ -22,7 +22,6 @@
 
 #include <assert.h>
 #include <stdio.h>
-#include <sys/select.h>
 #include <signal.h>
 #include <sys/file.h>
 #include <fcntl.h>
@@ -30,7 +29,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <string.h>
-#include <errno.h>
+#include <errno.h> // IWYU pragma: keep
 #include <unistd.h>
 #include <stdlib.h>
 #include <limits.h>
@@ -47,7 +46,6 @@
 #include "hosts.h"
 #include "zeroconf.h"
 #include "trace.h"
-#include "exitcode.h"
 
 /* How long shall the background daemon be idle before i terminates itself? */
 #define MAX_IDLE_TIME 20

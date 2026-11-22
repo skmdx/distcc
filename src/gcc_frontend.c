@@ -101,6 +101,7 @@ static int start_planner(const char *compiler, char **argv, const char *library,
             fcntl(pair[1], F_SETFD, 0) ||
             setenv("LD_PRELOAD", preload, 1) || setenv("DISTCC_GCC_PLAN_CONTROL", descriptor, 1) ||
             setenv("DISTCC_GCC_PLAN_ROLE", role, 1)) _exit(1);
+        dcc_restore_fd_limit();
         execv(compiler, argv);
         _exit(1);
     }

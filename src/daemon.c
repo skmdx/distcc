@@ -221,6 +221,7 @@ int main(int argc, char *argv[])
         return dcc_rust_capture(argv + 1);
 
     dcc_setup_startup_log();
+    dcc_raise_fd_limit();
 
     if (argc == 3 && !strcmp(argv[1], "--broker"))
         return dcc_broker_serve(argv[2]);

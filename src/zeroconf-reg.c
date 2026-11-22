@@ -22,17 +22,13 @@
 
 #include <assert.h>
 #include <stdio.h>
-#include <sys/select.h>
-#include <signal.h>
 #include <sys/file.h>
 #include <sys/time.h>
-#include <time.h>
 #include <sys/stat.h>
 #include <sys/poll.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <errno.h>
 
 #include <avahi-common/thread-watch.h>
 #include <avahi-common/error.h>
@@ -43,7 +39,6 @@
 #include "distcc.h"
 #include "zeroconf.h"
 #include "trace.h"
-#include "exitcode.h"
 
 struct context {
     char *name;

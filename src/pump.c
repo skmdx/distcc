@@ -36,9 +36,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#ifdef HAVE_SYS_SELECT_H
-#  include <sys/select.h>
-#endif
 #include <sys/time.h>
 #ifdef HAVE_SYS_MMAN_H
 #  include <sys/mman.h>

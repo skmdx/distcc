@@ -687,8 +687,8 @@ gcc_plan.so: $(GCC_PLAN_OBJECTS) src/argv_file.pic.o
 CLIENT_CONTRACT_SOURCES = src/hosts.c src/hostfile.c src/loadfile.c src/lock.c src/io.c src/tempfile.c \
 	src/trace.c src/util.c src/argutil.c src/rpc.c src/filename.c src/snprintf.c src/cleanup.c @ZEROCONF_COMMON_OBJS@
 # Host configuration must link without the client-only scheduler, as in distccd.
-h_client_hotpaths: test/client_hotpaths.c src/tcp_client.c src/tcp_job.c src/tcp_job.h src/local_clang.c src/broker_client.o src/broker_session.o src/broker_protocol.h src/broker_session.h src/workload.h src/argv_file.c src/frontend_fs.c src/frontend_identity.h $(CLIENT_CONTRACT_SOURCES)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/tcp_job.c src/local_clang.c src/broker_client.o src/broker_session.o src/argv_file.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
+h_client_hotpaths: test/client_hotpaths.c src/tcp_client.c src/tcp_job.c src/tcp_job.h src/local_clang.c src/exec.c src/broker_client.o src/broker_session.o src/broker_protocol.h src/broker_session.h src/workload.h src/argv_file.c src/frontend_fs.c src/frontend_identity.h $(CLIENT_CONTRACT_SOURCES)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/tcp_job.c src/local_clang.c src/exec.c src/broker_client.o src/broker_session.o src/argv_file.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
 h_resource: test/resource.c src/resource.c src/resource.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 h_file_cache: test/file_cache.c src/file_cache.c src/file_cache.h src/remote_job.c src/job.h $(CLIENT_CONTRACT_SOURCES)

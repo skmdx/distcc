@@ -25,7 +25,8 @@
 #include <netdb.h>
 #endif
 
-#include <errno.h>
+#include <errno.h> // IWYU pragma: keep
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -272,9 +273,7 @@ static int dcc_gssapi_establish_secure_context(const struct dcc_hostdef *host,
  */
 static int dcc_gssapi_send_handshake(int to_net_sd, int from_net_sd) {
     char auth = HANDSHAKE;
-    fd_set sockets;
     int ret;
-    struct timeval timeout;
 
     rs_log_info("Sending handshake.");
 
@@ -284,15 +283,10 @@ static int dcc_gssapi_send_handshake(int to_net_sd, int from_net_sd) {
 
     rs_log_info("Sent %c.", auth);
 
-    FD_ZERO(&sockets);
-    FD_SET(from_net_sd, &sockets);
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-
-    ret = select(from_net_sd + 1, &sockets, NULL, NULL, &timeout);
+    ret = dcc_poll_fd(from_net_sd, POLLIN, 1);
 
     if (ret < 0) {
-        rs_log_error("select failed: %s.", strerror(errno));
+        rs_log_error("poll failed: %s.", strerror(errno));
         return EXIT_IO_ERROR;
     }
 
@@ -327,19 +321,12 @@ static int dcc_gssapi_send_handshake(int to_net_sd, int from_net_sd) {
  */
 static int dcc_gssapi_recv_notification(int sd) {
     char notification;
-    fd_set sockets;
     int ret;
-    struct timeval timeout;
 
-    FD_ZERO(&sockets);
-    FD_SET(sd, &sockets);
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-
-    ret = select(sd + 1, &sockets, NULL, NULL, &timeout);
+    ret = dcc_poll_fd(sd, POLLIN, 1);
 
     if (ret < 0) {
-        rs_log_error("select failed: %s.", strerror(errno));
+        rs_log_error("poll failed: %s.", strerror(errno));
         return EXIT_IO_ERROR;
     }
 

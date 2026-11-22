@@ -5,6 +5,7 @@
 #include "frontend_identity.h"
 #include "argv_file.h"
 #include "broker.h"
+#include "exec.h"
 #include "workload.h"
 #include <assert.h>
 #include <sys/mman.h>
@@ -27,6 +28,56 @@ static void sample(const char *name, struct rusage *before)
            cpu(&after) - cpu(before), after.ru_minflt - before->ru_minflt,
            after.ru_majflt - before->ru_majflt);
     *before = after;
+}
+
+static volatile sig_atomic_t ticks;
+static void interrupt_poll(int sig)
+{
+    (void)sig;
+    if (++ticks > 100) _exit(1); /* A restarted one-second timeout would never expire. */
+}
+
+static void fd_contract(void)
+{
+    struct rlimit before, after;
+    assert(!getrlimit(RLIMIT_NOFILE, &before));
+    dcc_raise_fd_limit();
+    assert(!getrlimit(RLIMIT_NOFILE, &after));
+    rlim_t budget = DCC_JOB_INPUT_MAX + 1024;
+    if (budget > before.rlim_max) budget = before.rlim_max;
+    assert(after.rlim_cur == (budget > before.rlim_cur ? budget : before.rlim_cur));
+    assert(after.rlim_max == before.rlim_max);
+    int pair[2];
+    assert(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
+    int fd = fcntl(pair[0], F_DUPFD_CLOEXEC, after.rlim_cur > 1024 ? 1024 : 0);
+    assert(fd >= 0);
+    assert(!dcc_select_for_write(fd, 0));
+    assert(write(pair[1], "x", 1) == 1);
+    assert(!dcc_select_for_read(fd, 0));
+    char byte;
+    assert(read(fd, &byte, 1) == 1);
+
+    struct sigaction handler = { .sa_handler = interrupt_poll }, previous;
+    sigemptyset(&handler.sa_mask);
+    assert(!sigaction(SIGALRM, &handler, &previous));
+    struct itimerval timer = {{0, 50000}, {0, 50000}};
+    assert(!setitimer(ITIMER_REAL, &timer, NULL));
+    assert(dcc_poll_fd(fd, POLLIN, 1) == 0 && ticks);
+    assert(!setitimer(ITIMER_REAL, &(struct itimerval){0}, NULL));
+    assert(!sigaction(SIGALRM, &previous, NULL));
+
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (!pid) _exit(37);
+    int status;
+    assert(!dcc_collect_child("FD test", pid, &status, fd, NULL, NULL));
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 37);
+    close(fd);
+    close(pair[0]);
+    close(pair[1]);
+    dcc_restore_fd_limit();
+    assert(!getrlimit(RLIMIT_NOFILE, &after));
+    assert(after.rlim_cur == before.rlim_cur && after.rlim_max == before.rlim_max);
 }
 
 static void chunk_contract(void)
@@ -176,6 +227,7 @@ int main(int argc, char **argv)
         dcc_free_hostdef(host);
         return 0;
     }
+    if (!strcmp(argv[1], "--test")) fd_contract();
     chunk_contract();
     id_contract();
     char token[4] = {'A', 'R', 'G', 'C'};

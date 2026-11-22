@@ -143,6 +143,7 @@ void dcc_maybe_send_email(void) {
 
   child_pid = fork();
   if (child_pid == 0) {
+    dcc_restore_fd_limit();
     if (dup2(email_fileno, 0) == -1 ||
         lseek(email_fileno, 0, SEEK_SET) == -1 ||
         execl(logmailer,

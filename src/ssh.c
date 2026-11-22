@@ -43,12 +43,11 @@
 
 #include <config.h>
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
-#include <errno.h>
+#include <errno.h> // IWYU pragma: keep
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -151,6 +150,7 @@ static int dcc_run_piped_cmd(char **argv,
             close(from_child_pipe[1]);
         dcc_set_blocking(STDIN_FILENO);
 
+        dcc_restore_fd_limit();
         execvp(argv[0], (char **) argv);
         rs_log_error("failed to exec %s: %s", argv[0], strerror(errno));
         return EXIT_IO_ERROR;

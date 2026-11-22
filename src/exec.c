@@ -207,6 +207,7 @@ static DWORD dcc_execvp_cyg(char **argv, const char *input_file,
     }
 
     /* Create the child process.  */
+    dcc_restore_fd_limit();
     bRet = CreateProcess(NULL,
         cmdline,        /* application name */
         NULL,           /* process security attributes */
@@ -303,6 +304,7 @@ static void dcc_inside_child(char **argv,
     if ((ret = dcc_redirect_fds(stdin_file, stdout_file, stderr_file)))
         goto fail;
 
+    dcc_restore_fd_limit();
     execvp(argv[0], argv);
     /* A worker may have the client's compiler in another directory. */
     if (remote && strchr(argv[0], '/')) execvp(dcc_find_basename(argv[0]), argv);
@@ -447,7 +449,7 @@ int dcc_collect_child(const char *what, pid_t pid,
     if (cpu_ns) *cpu_ns = 0;
 
     /* Block before wait4, atomically unblock while sleeping. Otherwise a
-     * child exiting between wait4 and select loses its wakeup and adds the
+     * child exiting between wait4 and ppoll loses its wakeup and adds the
      * old one-second polling delay to an already completed compile. These
      * client/worker processes are single threaded and own their children. */
     sigemptyset(&blocked);
@@ -464,7 +466,7 @@ int dcc_collect_child(const char *what, pid_t pid,
     clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec += dcc_job_lifetime;
     for (;;) {
-        fd_set fds;
+        struct pollfd input = { .fd = in_fd, .events = POLLIN };
         struct timespec timeout, now, *wait_time = NULL;
         pid_t ret_pid = sys_wait4(pid, wait_status, WNOHANG, &ru);
         if (ret_pid == -1) {
@@ -502,10 +504,7 @@ int dcc_collect_child(const char *what, pid_t pid,
             }
             wait_time = &timeout;
         }
-        FD_ZERO(&fds);
-        if (in_fd != timeout_null_fd) FD_SET(in_fd, &fds);
-        int ready = pselect(in_fd == timeout_null_fd ? 0 : in_fd + 1,
-                             &fds, NULL, NULL, wait_time, &wait_mask);
+        int ready = ppoll(&input, 1, wait_time, &wait_mask);
         if (ready < 0 && errno != EINTR) { ret = EXIT_IO_ERROR; break; }
         if (ready > 0) {
             char byte;

@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <xxhash.h>
 extern "C" {
+#include "distcc.h"
 #include "job.h"
 }
 namespace rust {
@@ -154,6 +155,7 @@ inline pid_t spawn(const Words &cmd, const Env &environment, int out, int err,
                 if (fcntl(fd, F_SETFD, 0) < 0)
                     _exit(100);
         }
+        dcc_restore_fd_limit();
         execvp(args[0], args.data());
         _exit(110);
     }

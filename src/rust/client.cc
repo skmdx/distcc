@@ -1395,6 +1395,7 @@ extern "C" int dcc_rust_client(char **argv) {
         fprintf(stderr, "distcc-rust: %s\n", e.what());
         return EXIT_DISTCC_FAILED;
     }
+    dcc_restore_fd_limit();
     execvp(*argv, argv);
     return EXIT_COMPILER_MISSING;
 }

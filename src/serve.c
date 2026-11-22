@@ -37,17 +37,6 @@
  * @todo The server should catch signals, and terminate the compiler process
  * group before handling them.
  *
- * @todo It might be nice to detect that the client has dropped the
- * connection, and then kill the compiler immediately.  However, we probably
- * won't notice that until we try to do IO.  SIGPIPE won't help because it's
- * not triggered until we try to do IO.  I don't think it matters a lot,
- * though, because the client's not very likely to do that.  The main case is
- * probably somebody getting bored and interrupting compilation.
- *
- * What might help is to select() on the network socket while we're waiting
- * for the child to complete, allowing SIGCHLD to interrupt the select() when
- * the child completes.  However I'm not sure if it's really worth the trouble
- * of doing that just to handle a fairly marginal case.
  **/
 
 

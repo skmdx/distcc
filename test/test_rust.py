@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 import runpy
 import re
+import resource
 import shlex
 import shutil
 import subprocess
@@ -161,7 +162,7 @@ class RustTest(BrokerTestCase):
     def setUp(self):
         super().setUp()
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
-        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
+        self.broker_process = self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
         self.env.update(DISTCC_VERBOSE='1', PATH=str(self.build) + os.pathsep + os.environ['PATH'])
 
     def rust(self, *args, remote=True, env=None, prefix=()):
@@ -195,6 +196,40 @@ class RustTest(BrokerTestCase):
     def completed_jobs(self):
         return [int(next(line.split()[1] for line in self.get_stats(port).splitlines()
                          if line.startswith('dcc_compile_ok '))) for port in self.stats_ports]
+
+    def test_whole_crate_pins_over_1024_inputs(self):
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        budget = 65536 + 1024
+        if hard != resource.RLIM_INFINITY and hard < budget:
+            self.skipTest('hard descriptor limit below the full job budget')
+        for process in (self.daemons[0], self.broker_process):
+            soft, _ = resource.prlimit(process.pid, resource.RLIMIT_NOFILE)
+            self.assertTrue(soft == resource.RLIM_INFINITY or soft >= budget)
+        limited = ['prlimit', '--nofile=1024:', '--']
+        compiler = self.work/'rustc'
+        compiler.write_text('#!/bin/sh\n[ "$(ulimit -Sn)" = 1024 ] || exit 1\nexec ' +
+                            shlex.quote(self.rustc) + ' "$@"\n')
+        compiler.chmod(0o755)
+        self.rustc = str(compiler)
+        self.rust('--version', prefix=limited).check_returncode()
+
+        count = 1100
+        for i in range(count):
+            (self.work/f'input-{i}').write_bytes(bytes([i % 251]))
+        source = self.work/'many.rs'
+        inputs = ','.join(f'include_bytes!("input-{i}")[0]' for i in range(count))
+        source.write_text(f'static DATA: [u8; {count}] = [{inputs}];\n'
+                          'fn main() { println!("{}", DATA.iter().map(|&x| u32::from(x)).sum::<u32>()); }')
+        output = self.work/'many'
+        before = self.completed_jobs()
+        result = self.rust(source, '-Ccodegen-units=1', '-o', output, prefix=limited)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        self.assertEqual(sum(self.completed_jobs()) - sum(before), 1)
+        self.assertEqual(int(subprocess.check_output([output])), sum(i % 251 for i in range(count)))
+        local = subprocess.check_output([*limited, self.build/'distcc', '--local-command',
+                                         '/bin/sh', '-c', 'ulimit -Sn'], env=self.env)
+        self.assertEqual(int(local), 1024)
 
     def assert_one_job_per_cgu(self, messages, counts):
         modules = re.findall(r'^distcc-rust-cgu: completed \S+ (\S+)$', messages, re.M)

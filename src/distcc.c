@@ -279,6 +279,7 @@ int main(int argc, char **argv)
     atexit(dcc_remove_state_file);
 
     dcc_set_trace_from_env();
+    dcc_raise_fd_limit();
     dcc_setup_log_email();
 
     dcc_trace_version();

@@ -46,7 +46,6 @@
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
-#include <sys/select.h>
 
 #include "exitcode.h"
 #include "distcc.h"
@@ -603,8 +602,7 @@ int dcc_preforking_parent(int listen_fd)
 
 
 static void dcc_sigchld_handler(int UNUSED(sig)) {
-    /* Do nothing.  Only here to break out of select() in dcc_stats_server()
-     * and select() in dcc_collect_child(). */
+    /* Interrupt the daemon's wait so that it can reap children. */
 }
 
 

@@ -53,6 +53,7 @@
 #include "distcc.h"
 #include "trace.h"
 #include "util.h"
+#include "job.h"
 #include "helpers.h"
 #include "exitcode.h"
 #include "snprintf.h"
@@ -62,6 +63,41 @@
              * Ophir.
              *        -- Isaiah 13:12 */
 
+
+static struct rlimit inherited_nofile;
+static int raised_nofile;
+
+static void set_nofile(const struct rlimit *limit)
+{
+    if (setrlimit(RLIMIT_NOFILE, limit)) {
+        rs_log_error("setrlimit(RLIMIT_NOFILE): %s", strerror(errno));
+        _exit(EXIT_IO_ERROR);
+    }
+}
+
+void dcc_raise_fd_limit(void)
+{
+    if (getrlimit(RLIMIT_NOFILE, &inherited_nofile)) {
+        rs_log_error("getrlimit(RLIMIT_NOFILE): %s", strerror(errno));
+        _exit(EXIT_IO_ERROR);
+    }
+    /* Pin a complete input set and retain room for transport and control FDs. */
+    struct rlimit limit = inherited_nofile;
+    rlim_t target = DCC_JOB_INPUT_MAX + 1024;
+    if (limit.rlim_max != RLIM_INFINITY && target > limit.rlim_max)
+        target = limit.rlim_max;
+    if (limit.rlim_cur < target) {
+        limit.rlim_cur = target;
+        set_nofile(&limit);
+        raised_nofile = 1;
+    }
+}
+
+void dcc_restore_fd_limit(void)
+{
+    if (raised_nofile)
+        set_nofile(&inherited_nofile);
+}
 
 void dcc_exit(int exitcode)
 {
