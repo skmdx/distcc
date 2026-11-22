@@ -202,6 +202,10 @@ static void finish_probe(struct broker *broker, struct peer *peer, double now, i
         if (metrics.running >= 0)
             metrics.running = metrics.running > owned ? metrics.running - owned : 0;
         commit_peer_capacity(peer, &metrics, peer->probe_serial, metrics.report_stamp, now);
+    } else if (peer->valid_until <= now && peer->deadline < broker->refresh_at) {
+        /* Share a failed sample until the next regular probe. Concurrent
+         * capacity queries must not serialize timeouts on the same peer. */
+        peer->deadline = broker->refresh_at;
     }
     stop_probe(broker, peer);
 }
@@ -776,7 +780,8 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     return 0;
 }
 
-static int step_pool_and_probes(struct broker *broker, int clients, double now, double *next)
+static int step_pool_and_probes(struct broker *broker, int clients, double capacity_request,
+                                double now, double *next)
 {
     double wake_at = *next;
     int i, probes = 0;
@@ -786,27 +791,26 @@ static int step_pool_and_probes(struct broker *broker, int clients, double now, 
         if (now >= entry->expires) close(pool_remove(broker, i));
         else if (entry->expires < wake_at) wake_at = entry->expires;
     }
-    if (clients && now >= broker->refresh_at) {
+    int periodic = clients && now >= broker->refresh_at;
+    if (periodic) {
         int fresh = 0;
         for (i = 0; i < broker->schedule.count; i++)
             fresh |= broker->schedule.peers[i].valid_until > now;
         if (!fresh)
             broker->first_probe_until = now + .25;
         broker->refresh_at = now + 1;
-        for (i = 0; i < broker->schedule.count; i++) {
-            struct peer *p = &broker->schedule.peers[i];
-            if (p->host->stats_port && p->stats_fd < 0 && now >= p->report_until) {
-                p->probe_serial = p->serial;
-                p->stats_fd = connect_peer(p, p->host->stats_port);
-                p->deadline = now + .25;
-                p->used = p->stats_reading = 0;
-            }
-        }
     }
     if (clients && broker->refresh_at < wake_at)
         wake_at = broker->refresh_at;
     for (i = 0; i < broker->schedule.count; i++) {
         struct peer *p = &broker->schedule.peers[i];
+        if ((periodic || (p->valid_until <= now && p->deadline < capacity_request)) &&
+            p->address_len && p->host->stats_port && p->stats_fd < 0 && now >= p->report_until) {
+            p->probe_serial = p->serial;
+            p->stats_fd = connect_peer(p, p->host->stats_port);
+            p->deadline = now + .25;
+            p->used = p->stats_reading = 0;
+        }
         if (clients && p->full_until > now && p->full_until < wake_at) wake_at = p->full_until;
         if (clients && p->link_until > now && p->link_until < wake_at) wake_at = p->link_until;
         if (dcc_watch_set(broker->ep, &broker->watches[STATS+i], p->stats_fd,
@@ -961,10 +965,16 @@ int dcc_broker_serve(const char *path)
     ret = 0;
     while (!stopping) {
         int i, clients = 0;
+        double capacity_request = 0;
         double now = now_seconds();
         double wake_at = now + 60;
-        for (i = 0; i < MAX_CLIENTS; i++)
+        for (i = 0; i < MAX_CLIENTS; i++) {
             clients += broker->sessions[i].memo.fd >= 0;
+            const struct client *c = &broker->schedule.clients[i];
+            if (c->fd >= 0 && c->state == WAITING && (c->command == JOBS || c->command == CGU_CAPACITY) &&
+                c->waiting_since > capacity_request)
+                capacity_request = c->waiting_since;
+        }
         /* A full broker leaves connections in the kernel backlog. Do not
          * spin on listener readiness until a live client releases capacity. */
         if (dcc_watch_set(broker->ep, &broker->watches[LISTENER], clients == MAX_CLIENTS ? -1 : fd,
@@ -978,7 +988,7 @@ int dcc_broker_serve(const char *path)
             if (now >= idle_deadline) break;
             if (idle_deadline < wake_at) wake_at = idle_deadline;
         }
-        int probes = step_pool_and_probes(broker, clients, now, &wake_at);
+        int probes = step_pool_and_probes(broker, clients, capacity_request, now, &wake_at);
         if (probes < 0) { ret = EXIT_IO_ERROR; break; }
         dispatch_waiting_batch(broker, now, probes && now < broker->first_probe_until, &wake_at);
         if (arm_watches(broker, now, &wake_at)) { ret = EXIT_IO_ERROR; break; }

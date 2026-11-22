@@ -353,12 +353,18 @@ static enum decision dispatch_local_throttle(struct broker_schedule *broker, str
 }
 
 struct rust_routes { int native, cgu, pending; };
+static int capacity_pending(const struct peer *p, const struct client *client, double now)
+{
+    return p->address_len && p->host->stats_port && p->valid_until <= now &&
+           (p->stats_fd >= 0 || p->deadline < client->waiting_since);
+}
+
 static struct rust_routes rust_routes(const struct peer *p, const struct client *client, double now)
 {
     struct rust_routes routes = {0};
     if (!p->host->tcp_jobs || !p->host->stats_port) return routes;
     if (p->valid_until <= now) {
-        routes.pending = p->address_len && (p->stats_fd >= 0 || p->deadline < client->waiting_since);
+        routes.pending = capacity_pending(p, client, now);
         return routes;
     }
     const struct dcc_capacity *cap = &p->metrics;
@@ -389,7 +395,8 @@ static enum decision answer_cgu_capacity(const struct broker_schedule *broker, c
     return ANSWER;
 }
 
-static enum decision answer_cluster_jobs(const struct broker_schedule *broker, double now, struct reply *reply)
+static enum decision answer_cluster_jobs(const struct broker_schedule *broker, const struct client *client,
+                                         double now, struct reply *reply)
 {
     double work_rate = 0, min_rate = 0;
     int available = 0;
@@ -398,6 +405,7 @@ static enum decision answer_cluster_jobs(const struct broker_schedule *broker, d
         struct dcc_capacity observed = observed_capacity(p, broker->cpp_busy);
         const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
         if (!p->address_len || p->retry_at > now || dcc_capacity_slots(p->host, cap) <= 0) continue;
+        if (capacity_pending(p, client, now)) return HOLD_JOB;
         ++available;
         int jobs = dcc_capacity_parallelism(p->host, cap);
         reply->slots += jobs + pipeline_slots(p->host, jobs);
@@ -813,7 +821,7 @@ enum decision schedule_request(struct broker_schedule *broker, struct client *cl
     switch (client->command) {
     case LOCAL_CPP: return dispatch_local_throttle(broker, client, reply, now);
     case CGU_CAPACITY: return answer_cgu_capacity(broker, client, now, reply);
-    case JOBS: return answer_cluster_jobs(broker, now, reply);
+    case JOBS: return answer_cluster_jobs(broker, client, now, reply);
     default: return place_job(broker, client, now, batch, reply, choice);
     }
 }

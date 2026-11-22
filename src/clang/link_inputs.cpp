@@ -3,6 +3,7 @@
 #include <llvm/BinaryFormat/Magic.h>
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/Object/Archive.h>
+#include <llvm/Object/ObjectFile.h>
 #include <llvm/Option/ArgList.h>
 #include <llvm/Option/OptTable.h>
 #include <llvm/Support/MemoryBuffer.h>
@@ -75,6 +76,7 @@ struct Inputs {
     std::vector<std::string> dirs;
     SmallVector<std::pair<dev_t, ino_t>, 8> scripts;
     bool onlyStatic = false;
+    bool fatLto = false;
     unsigned modules = 0;
     int bytes = 0;
 
@@ -144,23 +146,45 @@ struct Inputs {
         return depth == 0;
     }
 
+    bool bitcode(uint64_t size, bool member) {
+        if (member || !scripts.empty() || ++modules > 2 || !size || size > 64 * 1024u - bytes)
+            return false;
+        bytes += size;
+        return true;
+    }
+
+    bool scanSections(MemoryBufferRef buffer, bool member) {
+        auto object = object::ObjectFile::createELFObjectFile(buffer);
+        if (!object) { consumeError(object.takeError()); return false; }
+        for (auto section : (*object)->sections()) {
+            auto name = section.getName();
+            if (!name) { consumeError(name.takeError()); return false; }
+            if (*name == ".llvm.lto") return bitcode(section.getSize(), member);
+        }
+        return true;
+    }
+
+    bool needsSections(StringRef data) const {
+        return fatLto && identify_magic(data) == file_magic::elf_relocatable;
+    }
+
     bool inspect(StringRef path, bool member = false) {
         int fd = open(path.str().c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (fd < 0) return false;
         auto closeFile = scope_exit([&] { close(fd); });
         struct stat st;
-        char header[8];
+        char header[64];
         if (fstat(fd, &st) || !S_ISREG(st.st_mode)) return false;
         ssize_t n = pread(fd, header, sizeof(header), 0);
         if (n < 4) return false;
         StringRef data(header, n);
-        if (native(data)) return true;
-        if (member) return false;
-        if (identify_magic(data) == file_magic::bitcode) {
-            if (!scripts.empty() || ++modules > 2 || st.st_size > 64 * 1024 - bytes) return false;
-            bytes += st.st_size;
-            return true;
+        if (native(data)) {
+            if (!needsSections(data)) return true;
+            auto buffer = MemoryBuffer::getOpenFile(fd, path, st.st_size, false);
+            return buffer && scanSections((*buffer)->getMemBufferRef(), member);
         }
+        if (identify_magic(data) == file_magic::bitcode) return bitcode(st.st_size, member);
+        if (member) return false;
         bool archiveFile = identify_magic(data) == file_magic::archive;
         if (!archiveFile && (st.st_size > 64 * 1024 || scripts.size() >= 8)) return false;
         auto buffer = MemoryBuffer::getOpenFile(fd, path, st.st_size, false);
@@ -184,7 +208,8 @@ struct Inputs {
             } else {
                 auto content = child.getBuffer();
                 if (!content) { consumeError(content.takeError()); allNative = false; }
-                else allNative = native(*content);
+                else allNative = native(*content) && (!needsSections(*content) ||
+                    scanSections(MemoryBufferRef(*content, path), true));
             }
             if (!allNative) break;
         }
@@ -229,6 +254,7 @@ int dcc_small_link_bytes(char **command) {
     const auto root = args.getLastArgValue(OPT_sysroot);
     Inputs inputs;
     inputs.root = root;
+    inputs.fatLto = args.hasFlag(OPT_fat_lto_objects, OPT_no_fat_lto_objects, false);
     for (auto *arg : args.filtered(OPT_library_path)) {
         StringRef path = arg->getValue();
         if (path.consume_front("=") || path.consume_front("$SYSROOT"))

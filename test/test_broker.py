@@ -1263,6 +1263,31 @@ class BrokerTest(BrokerTestCase):
         time.sleep(1.05)
         self.assertEqual(jobs(), 8)
 
+    def test_jobs_wait_for_one_expired_capacity(self):
+        local = self.peer(stats_response(cpus=16, cores=8, jobs=12))
+        peers = [local] + [self.peer(stats_response(cpus=4, jobs=4)) for _ in range(3)]
+        self.start_broker(' '.join(f'127.0.0.1:{p.port},tcp,stats={p.port}' for p in peers))
+        def jobs():
+            return self.receive(self.request(2))
+        self.assertEqual(jobs(), (0, 30, []))
+        local.response = b'invalid stats'
+        time.sleep(4.6)
+        self.assertEqual(jobs(), (0, 30, []))
+        # The remote peers just refreshed. Only the local snapshot expires
+        # before the next periodic refresh is due.
+        time.sleep(.55)
+        local.response = stats_response(cpus=16, cores=8, jobs=16)
+        local.delay = .08
+        self.assertEqual(jobs(), (0, 35, []))
+
+    def test_jobs_return_configured_slots_after_probe_timeout(self):
+        peer = self.peer(stats_response(cpus=16, jobs=16), delay=.6)
+        self.start_broker(f'127.0.0.1:{peer.port},tcp,stats={peer.port}')
+        request = self.request(2)
+        request.settimeout(2)
+        self.assertEqual(self.receive(request), (0, 5, []))
+        self.assertEqual(peer.requests, 1)
+
     def test_jobs_survive_cold_memory_estimate(self):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2, busy=2, available=0))
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))

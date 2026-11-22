@@ -260,6 +260,32 @@ class ThinLTOTest(BrokerTestCase):
         result = self.run_command(command, check=True)
         self.assertEqual(result.stderr.count('distcc-thinlto: compiled on'), 1, result.stderr)
 
+    def test_fat_lto_executable_inputs_follow_linker_mode(self):
+        peer = self.peer(stats_response(cpus=4, cores=4, jobs=4, busy=0, running=0))
+        self.start_broker(self.host(0, f',tcp,stats={peer.port}'))
+        log = self.work/'client.log'
+        self.env.update(DISTCC_CLANG_LOCAL='1', DISTCC_LOG=str(log), DISTCC_VERBOSE='1',
+                        PATH=str(self.build)+':'+os.environ['PATH'])
+        for name, source in [('main', 'int main(void){return 0;}'), ('one', 'int one;'),
+                             ('two', 'int two;'), ('large', 'const char data[]="'+'abcdefgh'*20000+'";')]:
+            (self.work/(name+'.c')).write_text(source)
+            self.run_command(['clang', '-flto=thin', '-ffat-lto-objects', '-c', name+'.c',
+                              '-o', name+'.o'], check=True)
+        for mode, name in [('rcs', 'regular'), ('rcsT', 'thin')]:
+            self.run_command(['llvm-ar', mode, 'lib'+name+'.a', 'one.o'], check=True)
+        for inputs, distributed in [
+                ([], False), (['one.o'], False), (['one.o', 'two.o'], True), (['large.o'], True),
+                *[(['-Wl,--whole-archive', *args, '-Wl,--no-whole-archive'], True) for args in
+                  (['libregular.a'], ['libthin.a'], ['-L.', '-lregular'], ['-L.', '-lthin'])],
+                (['one.o', 'two.o', '-Wl,--no-fat-lto-objects'], False)]:
+            with self.subTest(inputs=inputs):
+                result = self.run_command([self.build/'distcc', 'clang', '-fuse-ld=lld', '-flto=thin',
+                                           '-ffat-lto-objects', 'main.o', *inputs, '-o', 'app'])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual('distcc-thinlto: submitting' in result.stderr, distributed, result.stderr)
+                self.run_command(['./app'], check=True)
+        self.assertIn('operation=B', log.read_text())
+
     def test_executable_input_scripts_and_local_admission(self):
         peer = self.peer(stats_response(cpus=4, cores=4, jobs=4, busy=0, running=0))
         log = self.work/'client.log'
