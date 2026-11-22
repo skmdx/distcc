@@ -158,8 +158,8 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         assert result.returncode == 0, (compiler, result.returncode,
             (result.stdout+result.stderr).decode(errors='replace'),
             (root/'client.log').read_text()[-5000:] if (root/'client.log').exists() else '')
+        trace = (root/'client.log').read_text()[before:]
         if ',tcp' in env['DISTCC_HOSTS']:
-            trace = (root/'client.log').read_text()[before:]
             assert 'frontend filesystem:' in trace and 'pooled TCP job completed' in trace, trace[-6000:]
         # Compatible compilers/assemblers may produce different object bytes.
         # Exercise the client ABI with a local object, then check the behavior.
@@ -184,10 +184,11 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                     stat = os.fstat(executable.fileno())
                     identity = (stat.st_dev, stat.st_ino, suffix)
                     if identity not in seen_gcc_plans:
-                        assert 'reused GCC driver status=0' in log, log[-6000:]
+                        assert 'reused GCC driver status=0' in trace, trace[-6000:]
                         seen_gcc_plans.add(identity)
                     else:
-                        assert 'GCC plan memo hit' in log or 'reused GCC driver status=0' in log, log[-6000:]
+                        assert 'GCC plan memo hit' in trace or 'reused GCC driver status=0' in trace, trace[-6000:]
+                    assert 'GCC plan memo hit' in log, log[-6000:]
             subprocess.run([compiler_path, str(obj), str(support_obj), '-o', str(exe)],
                            check=True, timeout=30)
             subprocess.run([str(exe)], check=True, timeout=5)
@@ -268,7 +269,6 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             assert 'distcc-link: linked on ' in linked.stderr, linked.stderr
             subprocess.run([output], check=True, timeout=10)
             results['sysroot_link'] = {'distributed': True, 'executed': True}
-    env, broker = fleet_env, fleet_broker
     if ',tcp' in env['DISTCC_HOSTS']:
         clang = next((p for p in compilers if 'clang' in Path(p).name), None)
         if clang:
@@ -303,6 +303,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             header = subprocess.check_output(['readelf', '-h', str(obj)], text=True, env=dict(env, LC_ALL='C'))
             assert 'AMD GPU' in header, header
             results['amdgpu'] = {'distributed': True, 'object_machine': 'AMDGPU'}
+    env, broker = fleet_env, fleet_broker
     if ',tcp' in env['DISTCC_HOSTS'] and '--rust-only' not in sys.argv:
         clang = shutil.which('clang')
         assert clang and not Path(clang).samefile('/usr/bin/distcc'), 'real Clang is required'
@@ -401,7 +402,11 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         # step contributes to the value checked by the linked executable.
         steps = ''.join(f'    x = std::hint::black_box(x).wrapping_add({i});\n'
                         for i in range(1, 65))
-        source.write_text('include!(concat!(env!("OUT_DIR"), "/rust_value.rs"));\n'
+        # Exercise whole-crate placement even when the selected daemon is on
+        # this host, where small sources can take a direct compiler lease.
+        payload = '0123456789abcdef' * 4096
+        source.write_text(f'pub const PAYLOAD: &str = "{payload}";\n'
+                          'include!(concat!(env!("OUT_DIR"), "/rust_value.rs"));\n'
                           'pub fn value() -> u32 {\n    let mut x = VALUE;\n' +
                           steps + f'    x.wrapping_sub({sum(range(1, 65))})\n}}\n')
         rust_env = dict(env, OUT_DIR=str(root))
@@ -427,7 +432,8 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             return re.findall(r'"target-(?:cpu|features)"="[^"]*"', path.read_text())
         assert cpu_attributes(local_ir), 'local Rust native CPU attributes missing'
         assert cpu_attributes(remote_ir) == cpu_attributes(local_ir), 'remote Rust CPU attributes differ'
-        source.write_text('fn main() { assert_eq!(rust_test::value(), 42); }')
+        source.write_text('fn main() { assert_eq!(rust_test::value(), 42); '
+                          f'assert_eq!(rust_test::PAYLOAD.len(), {len(payload)}); }}')
         executable = root / 'rust-run'
         subprocess.run([rustc, str(source), '--extern', 'rust_test=' + str(library),
                         '-o', str(executable)], env=rust_env, check=True, capture_output=True, timeout=90)
