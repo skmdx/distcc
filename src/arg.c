@@ -77,6 +77,7 @@
 #include <sys/stat.h>
 
 #include "distcc.h"
+#include "helpers.h"
 #include "trace.h"
 #include "util.h"
 #include "exitcode.h"
@@ -577,15 +578,16 @@ int dcc_set_input(char **a, char *ifname)
 /* Own the rewritten vector and preserve the original source identity when
  * Clang needs a rooted frontend or uses the module name for PGO. */
 int dcc_clang_command(char ***argv, const char *root, const char *original,
-                      const char *cwd, int pump, int inputs)
+                      const char *cwd, int pump, int inputs, int *using_helper)
 {
     int argc = dcc_argv_len(*argv), frontend = pump || inputs > 1;
     for (int i = 1; i < argc; ++i)
         if (!strcmp((*argv)[i], "-fprofile-generate") ||
             !strncmp((*argv)[i], "-fprofile-generate=", 19)) frontend = 1;
+    if (using_helper) *using_helper = frontend;
     if (!frontend) return 0;
-    const char *helper = getenv("DISTCC_CLANG_DRIVER");
-    const char *prefix[] = {helper && *helper ? helper : "distcc-clang",
+    char path[PATH_MAX];
+    const char *prefix[] = {dcc_helper_path("distcc-clang", path),
                            root, original, cwd, pump ? "pump" : "preprocessed"};
     char **wrapped = calloc(argc + 6, sizeof(char *));
     if (!wrapped) return EXIT_OUT_OF_MEMORY;

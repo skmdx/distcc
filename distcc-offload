@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import distcc_python
 
 
 def option(args, name):
@@ -105,7 +106,7 @@ def compile_images(source, output, args):
                 dependency = option(cpp, '-dependency-file')
                 # Use the existing local preprocessing admission, releasing
                 # it before asking the broker for a remote compilation slot.
-                add([str(helper.with_name('distcc')), *cpp, '-E', '-o', prepared], False,
+                add([distcc_python.client_executable(), *cpp, '-E', '-o', prepared], False,
                     [dependency] if dependency else [])
                 command = without(command, {'-dependency-file': 1, '-MT': 1,
                                             '-MQ': 1, '-sys-header-deps': 0,

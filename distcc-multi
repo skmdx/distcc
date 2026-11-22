@@ -78,7 +78,7 @@ def plan(command, directory):
 
 
 def execute(command):
-    distcc = str(Path(__file__).resolve().with_name('distcc'))
+    distcc = distcc_python.client_executable()
     env = dict(os.environ)
     env.pop('_DISTCC_SAFEGUARD', None)
     with tempfile.TemporaryDirectory(prefix='distcc-multi-') as name:

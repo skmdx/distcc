@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "distcc.h"
+#include "helpers.h"
 #include "exec.h"
 #include "exitcode.h"
 #include "job.h"
@@ -56,8 +57,8 @@ void dcc_clang_pool_shutdown(void)
 
 int dcc_clang_pool_get(const char *compiler)
 {
-    const char *helper = getenv("DISTCC_CLANG_DRIVER");
-    if (!helper || !*helper) helper = "distcc-clang";
+    char path[PATH_MAX];
+    const char *helper = dcc_helper_path("distcc-clang", path);
     char *selected = strdup(compiler);
     if (!selected) return -1;
     /* cc1 already owns language/target options. C and C++ driver spellings

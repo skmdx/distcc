@@ -73,6 +73,7 @@
 #include <alloca.h>
 
 #include "distcc.h"
+#include "helpers.h"
 #include "trace.h"
 #include "util.h"
 #include "stats.h"
@@ -981,7 +982,6 @@ static int dcc_run_helper_job(int in_fd, int out_fd,
                             struct dcc_job_result *result, const char *helper, const struct dcc_job *job)
 {
     char *archive = NULL, *output = NULL;
-    char *argv[5];
     struct stat st;
     pid_t pid;
     int ret;
@@ -997,14 +997,13 @@ static int dcc_run_helper_job(int in_fd, int out_fd,
         goto done;
     if ((ret = dcc_make_tmpnam("distcc-link", ".out", &output)))
         goto done;
-    argv[0] = (char *)helper;
-    argv[1] = (char *)"--worker";
-    argv[2] = archive;
-    argv[3] = output;
-    argv[4] = NULL;
-    ret = !strcmp(helper, "distcc-rust-cgu")
-        ? dcc_spawn_rust_cgu(&pid, job->argv[1], archive, output, out_fname, err_fname)
-        : dcc_spawn_remote(argv, &pid, "/dev/null", out_fname, err_fname);
+    if (!strcmp(helper, "distcc-rust-cgu")) {
+        ret = dcc_spawn_rust_cgu(&pid, job->argv[1], archive, output, out_fname, err_fname);
+    } else {
+        char path[PATH_MAX];
+        char *argv[] = {dcc_helper_path(helper, path), (char *)"--worker", archive, output, NULL};
+        ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname);
+    }
     if (ret || (ret = dcc_collect_child(helper, pid, status, in_fd,
                                  result ? &result->peak_bytes : NULL,
                                  result ? &result->cpu_ns : NULL)))
@@ -1172,10 +1171,10 @@ static int dcc_run_job(int in_fd,
         if ((ret = dcc_make_tmpnam("distccd", ".o", &temp_o))) goto out_cleanup;
         unsigned argc = dcc_argv_len(job->argv);
         argv = calloc(argc + 8, sizeof(*argv));
-        const char *helper = getenv("DISTCC_CLANG_DRIVER");
+        char helper[PATH_MAX];
         char descriptor[32];
         snprintf(descriptor, sizeof(descriptor), "%d", job->fs_channel - 1);
-        const char *prefix[] = {helper && *helper ? helper : "distcc-clang", root, temp_o,
+        const char *prefix[] = {dcc_helper_path("distcc-clang", helper), root, temp_o,
                                job->cwd, "remote", descriptor, deps_fname};
         if (!argv) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
         for (unsigned i = 0; i < argc + 7; ++i) {
@@ -1385,6 +1384,7 @@ static int dcc_run_job(int in_fd,
         goto report_result;
     }
 
+    int using_helper = 0;
     /* Pump inputs need Clang's rooted filesystem for absolute includes and
      * __has_include probes. The frontend also preserves source identity for
      * LLVM IR PGO names, which prefix-map options do not affect. */
@@ -1413,13 +1413,13 @@ static int dcc_run_job(int in_fd,
         ret = dcc_clang_command(&argv,
             job ? root : cpp_where == DCC_CPP_ON_SERVER ? temp_dir : "",
             orig_input, job ? job->cwd : client_cwd ? client_cwd : "",
-            cpp_where == DCC_CPP_ON_SERVER, job ? job->count : 1);
+            cpp_where == DCC_CPP_ON_SERVER, job ? job->count : 1, &using_helper);
         if (ret) goto out_cleanup;
     }
 
     char stdin_path[64];
     snprintf(stdin_path, sizeof(stdin_path), "/proc/self/fd/%d", gcc_stdin);
-    if ((compile_ret = dcc_spawn_remote(argv, &cc_pid,
+    if ((compile_ret = (using_helper ? dcc_spawn_child : dcc_spawn_remote)(argv, &cc_pid,
                                        gcc_stdin >= 0 ? stdin_path : "/dev/null", out_fname, err_fname))
         || (compile_ret = dcc_collect_child("cc", cc_pid, &status, in_fd,
                                           result ? &result->peak_bytes : NULL,

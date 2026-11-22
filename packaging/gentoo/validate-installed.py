@@ -255,6 +255,24 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
     if ',tcp' in env['DISTCC_HOSTS']:
         clang = next((p for p in compilers if 'clang' in Path(p).name), None)
         if clang:
+            wrappers = root/'masquerade'
+            wrappers.mkdir()
+            for name in ('clang', 'clang++', 'distcc-clang'):
+                (wrappers/name).symlink_to('/usr/bin/distcc')
+            launcher_env = dict(env, PATH=str(wrappers) + os.pathsep + env['PATH'],
+                                DISTCC_CLANG_LOCAL='1', DISTCC_FRONTEND_REMOTE='1')
+            launcher_env.pop('DISTCC_CLANG_DRIVER', None)
+            driver = Path(clang).with_name('clang++')
+            source = root/'compiler-probe.hip'
+            source.write_text('int main() { return 0; }\n')
+            obj = source.with_suffix('.o')
+            remote(['/usr/bin/distcc', driver, '--cuda-host-only', '-nogpuinc', '-nogpulib',
+                    '--offload-arch=gfx1032', '-x', 'hip', '-c', source, '-o', obj],
+                   env=launcher_env, check=True, timeout=REMOTE_TIMEOUT)
+            program = root/'compiler-probe'
+            subprocess.run([driver, obj, '-o', program], check=True, timeout=30)
+            subprocess.run([program], check=True, timeout=5)
+            results['explicit_hip_launcher'] = {'compiled': True, 'executed': True}
             source = root / 'device.c'
             source.write_text('int device_add(int a, int b) { return a + b; }\n')
             obj = root / 'device.o'
@@ -326,7 +344,8 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             'args': [clang, '--target=amdgcn-amd-amdhsa', '-nogpulib', '-Wl,--no-undefined'],
             'inputs': []}, 'jobs': jobs}))
         started = time.monotonic()
-        result = remote(['distcc-offload-link', description], env=env,
+        helpers = Path(subprocess.check_output(['/usr/bin/distcc', '--show-helpers'], text=True).strip())
+        result = remote([helpers/'distcc-offload-link', description], env=env,
                                 text=True, timeout=REMOTE_TIMEOUT)
         assert result.returncode == 0, result.stderr
         workers = re.findall(r'^distcc-offload-link: compiled on (.+)$', result.stderr, re.M)

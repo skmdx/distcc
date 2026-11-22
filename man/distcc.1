@@ -707,7 +707,7 @@ ignore that host for about one minute.
 .SH "REMOTE OBJECT LINKING"
 On Linux, GCC and Clang/LLD object/archive links can use the local broker and a synchronized
 client sysroot. This is opt-in: set DISTCC_LINK_SYSROOT to a profile produced
-by distcc-link --sync, and DISTCC_BROKER to the broker socket. The distcc-link
+by the private distcc-link helper with --sync, and DISTCC_BROKER to the broker socket. The distcc-link
 helper requires Python 3.11 or later. Each worker must have a compatible
 toolchain and DISTCCD_LINK_ROOT pointing at its sysroot cache. GCC links apply
 the cached client GCC specs, preserving its default linker flags.
@@ -719,7 +719,7 @@ cached startup objects and libraries. Full LLVM LTO and ThinLTO are supported.
 .PP
 Synchronize a stable, preferably read-only snapshot of the client's root:
 .nf
-  distcc-link --sync /srv/sysroot-snapshot gcc profile.json \\
+  "$(distcc --show-helpers)/distcc-link" --sync /srv/sysroot-snapshot gcc profile.json \\
       /var/cache/distcc-link worker:/var/cache/distcc-link
 .fi
 The cache directories must be writable by the synchronization account and

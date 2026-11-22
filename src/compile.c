@@ -46,6 +46,7 @@
 #include <assert.h>
 
 #include "distcc.h"
+#include "helpers.h"
 #include "job.h"
 #include "frontend_fs.h"
 #include "resource.h"
@@ -449,7 +450,7 @@ static int dcc_compile_local_ir(char **argv, char *input, const char *prepared, 
     free(stripped);
     if (!ret) ret = dcc_set_input(command, (char *)(fd >= 0 ? "/proc/self/fd/0" : prepared));
     if (!ret && !(cwd = getcwd(NULL, 0))) ret = EXIT_IO_ERROR;
-    if (!ret) ret = dcc_clang_command(&command, "", input, cwd, 0, 1);
+    if (!ret) ret = dcc_clang_command(&command, "", input, cwd, 0, 1, NULL);
     if (!ret) ret = dcc_compile_local(command, input, fd >= 0 ? prepared : NULL, cpu_ns);
     free(cwd);
     dcc_free_argv(command);
@@ -858,8 +859,8 @@ dcc_build_somewhere(char *argv[],
         int argc = dcc_argv_len(argv);
         char **command = calloc(argc + 2, sizeof(*command));
         if (!command) { ret = EXIT_OUT_OF_MEMORY; goto clean_up; }
-        char coordinator[] = "distcc-multi";
-        command[0] = coordinator;
+        char path[PATH_MAX];
+        command[0] = dcc_helper_path("distcc-multi", path);
         memcpy(command + 1, argv, (argc + 1) * sizeof(*argv));
         /* The coordinator must not hold a local slot while waiting for its
          * children, which acquire capacity through the normal broker path. */
@@ -870,6 +871,8 @@ dcc_build_somewhere(char *argv[],
 
     /* Links belong to the link driver, not the compile-only Clang scanner. */
     if (dcc_link_candidate(argv, broker)) {
+        char path[PATH_MAX];
+        char *linker = dcc_helper_path("distcc-link", path);
         int plan, errors, remote;
         ret = dcc_clang_link_prepare(argv, &plan, &errors, &remote);
         if (ret >= 0 && (ret || !remote)) {
@@ -886,7 +889,7 @@ dcc_build_somewhere(char *argv[],
             if (!command || fcntl(plan, F_SETFD, 0) || fcntl(errors, F_SETFD, 0)) {
                 ret = EXIT_IO_ERROR;
             } else {
-                char linker[] = "distcc-link", option[] = "--clang-plan";
+                char option[] = "--clang-plan";
                 command[0] = linker; command[1] = option;
                 command[2] = plan_fd; command[3] = errors_fd;
                 memcpy(command + 4, argv, (argc + 1) * sizeof(*argv));
@@ -899,7 +902,7 @@ dcc_build_somewhere(char *argv[],
         dcc_close(plan); dcc_close(errors);
         int argc = dcc_argv_len(argv);
         char **link_argv = calloc(argc + 2, sizeof(*link_argv));
-        if (!link_argv || !(link_argv[0] = strdup("distcc-link"))) {
+        if (!link_argv || !(link_argv[0] = strdup(linker))) {
             free(link_argv);
             ret = EXIT_OUT_OF_MEMORY;
             goto clean_up;

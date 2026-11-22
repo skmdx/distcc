@@ -246,7 +246,7 @@ def lld_for(compiler):
 
 
 def thinlto_pool():
-    transport = str(Path(__file__).resolve().with_name('distcc'))
+    transport = distcc_python.client_executable()
     result = subprocess.run([transport, '--show-hosts'], capture_output=True, text=True)
     hosts = result.stdout.splitlines()
     # A broker-only client may not have a local host list. Its reservations
@@ -1113,6 +1113,13 @@ def remote_command(host, args):
     return args
 
 
+def profile_command(host, *args):
+    if host:
+        return ['ssh', '-oBatchMode=yes', host,
+                'helpers=$(distcc --show-helpers) && exec "$helpers/distcc-link" ' + shlex.join(args)]
+    return [str(Path(__file__).resolve()), *args]
+
+
 def publish(stage, key):
     import uuid
 
@@ -1167,7 +1174,7 @@ def transfer_generation(source, listing, metadata, key, host, base):
             source.rstrip('/') + '/', remote_stage + '/'], check=True, stdout=sys.stderr)
         subprocess.run(['rsync', '-az', '--secluded-args', str(metadata),
             remote_stage + '/'], check=True, stdout=sys.stderr)
-        subprocess.run(remote_command(host, ['distcc-link', '--publish', stage, key]), check=True)
+        subprocess.run(profile_command(host, '--publish', stage, key), check=True)
     except BaseException:
         # Only this invocation's unique staging directory is removed.
         subprocess.run(remote_command(host, ['rm', '-rf', '--', stage]), check=False)
@@ -1195,9 +1202,7 @@ def sync_sysroot(root, compiler, profile_path, destinations, *, refresh=False):
         key = profile['key']
         if not KEY.fullmatch(key):
             raise ValueError('invalid cached sysroot key')
-        helper = 'distcc-link' if source_host else str(Path(__file__).resolve())
-        check = subprocess.run(remote_command(source_host,
-            [helper, '--check', source_path, compiler]),
+        check = subprocess.run(profile_command(source_host, '--check', source_path, compiler),
             input=json.dumps(profile), text=True)
         if check.returncode == 0 and all(subprocess.run(remote_command(host,
                 ['test', '-f', base + '/' + key + '/.distcc-link.json'])).returncode == 0
@@ -1208,8 +1213,8 @@ def sync_sysroot(root, compiler, profile_path, destinations, *, refresh=False):
     if source_host:
         if local is None:
             raise ValueError('a remote source requires a local cache destination for rsync staging')
-        description = json.loads(subprocess.check_output(remote_command(source_host,
-            ['distcc-link', '--describe', source_path, compiler]), text=True))
+        description = json.loads(subprocess.check_output(profile_command(source_host,
+            '--describe', source_path, compiler), text=True))
     else:
         description = describe_sysroot(source_path, compiler)
     profile, files = description['profile'], description['files']
@@ -1297,7 +1302,7 @@ def main():
         return 1
     if '-###' in command[1:]:
         os.execvp(command[0], command)
-    local = [str(Path(__file__).resolve().with_name('distcc')), '--local-command']
+    local = [distcc_python.client_executable(), '--local-command']
     try:
         if os.environ.get('DISTCC_BROKER') and compiler_family(command[0]) == 'clang':
             invocation, diagnostics = clang_link_command(command, offload=True, plan=link_plan)

@@ -21,7 +21,7 @@
  * USA.
  */
 
-#include <setjmp.h>
+#include "distcc.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdint.h>
@@ -39,7 +39,6 @@ int dcc_getenv_bool(const char *name, int def_value);
 int set_cloexec_flag (int desc, int value);
 int dcc_ignore_sigpipe(int val);
 int dcc_remove_if_exists(const char *fname);
-int dcc_trim_path(const char *compiler_name);
 int dcc_set_path(const char *newpath);
 char *dcc_abspath(const char *path, int path_len);
 int dcc_get_dns_domain(const char **domain_name);

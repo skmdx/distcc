@@ -30,6 +30,8 @@ root, helper, compiler, obj, output = sys.argv[1:]
 sys.path.insert(0, root)
 environment = dict(os.environ)
 entry = runpy.run_path(root + '/' + helper)
+import distcc_python
+assert os.path.samefile(distcc_python.client_executable(), os.path.join(root, 'distcc'))
 if helper == 'distcc-link':
     command, diagnostics = entry['clang_link_command']([compiler, '-shared', '-fuse-ld=lld', obj, '-o', output])
     subprocess.run(command, check=True)

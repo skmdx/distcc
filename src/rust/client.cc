@@ -1,6 +1,7 @@
 /* Plan the Rust dependency closure using rustc itself, and lend original
  * file descriptors to the pooled transport until the result is verified. */
 #include "rust/api.h"
+#include "helpers.h"
 #include "rust/common.hh"
 #include "rust/probe.h"
 #include "rust/response.hh"
@@ -828,7 +829,8 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
         std::optional<Work> temporary;
         if (!binary.empty()) {
             temporary.emplace(work.parent_path());
-            auto helper = fs::read_symlink("/proc/self/exe").parent_path() / "distcc-thinlto";
+            char path[PATH_MAX];
+            fs::path helper = dcc_helper_path("distcc-thinlto", path);
             const string shim = DCC_RUST_ROOT "/dtlto-distributor";
             box.mount(helper, shim);
             box.mount(temporary->dir, temporary->dir, true);

@@ -311,7 +311,7 @@ int dcc_argv_search(char **a, const char *);
 int dcc_argv_startswith(char **a, const char *);
 int dcc_copy_argv(char **argv, char ***out_argv, int extra_args);
 int dcc_clang_command(char ***argv, const char *root, const char *original,
-                      const char *cwd, int pump, int inputs);
+                      const char *cwd, int pump, int inputs, int *using_helper);
 int dcc_argv_append(char **argv, char *toadd);
 char *dcc_argv_tostr(char **a);
 void dcc_free_argv(char **argv);

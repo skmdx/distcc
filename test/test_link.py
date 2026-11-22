@@ -310,6 +310,9 @@ class LinkTestCase(BrokerTestCase):
     def test_input_suffixes_bypass_helper_only_for_gcc(self):
         probe = self.work/'link-probe'
         probe.mkdir()
+        shutil.copy2(self.build/'distcc', probe/'distcc')
+        self.env['DISTCC_CLANG_DRIVER'] = str(self.build/'distcc-clang')
+        self.build = probe
         helper = probe/'distcc-link'
         helper.write_text('#!/bin/sh\n: > "$DISTCC_LINK_PROBE"\nexit 77\n')
         helper.chmod(0o755)

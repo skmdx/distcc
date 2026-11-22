@@ -154,7 +154,7 @@ def distribute(request, kind, link=None):
     common, jobs = request['common'], request['jobs']
     if not jobs:
         return 0
-    transport = str(Path(__file__).resolve().with_name('distcc'))
+    transport = distcc_python.client_executable()
     env = dict(os.environ)
     env.pop('INCLUDE_SERVER_PORT', None)
     pinned = {int(path.parent.name) for path in link.outputs.values()} if link else set()

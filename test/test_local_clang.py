@@ -17,6 +17,44 @@ from test_broker import BrokerTestCase
 from test_adaptive import stats_response
 
 
+class ExplicitClangLauncherTest(BrokerTestCase):
+    worker_address = '127.0.0.2'
+
+    def test_private_helper_with_masquerade_first_on_path(self):
+        compiler = shutil.which('clang++')
+        if compiler is None:
+            self.skipTest('Clang++ unavailable')
+        client = self.build/'distcc'
+        wrappers = self.work/'wrappers'
+        wrappers.mkdir()
+        for name in ('clang', 'clang++', 'distcc-clang'):
+            (wrappers/name).symlink_to(client)
+        search = str(wrappers) + os.pathsep + self.base_env['PATH']
+        self.restart_server(self.build/'distccd', PATH=search)
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'))
+        env = dict(self.env, PATH=search, DISTCC_CLANG_LOCAL='1', DISTCC_FRONTEND_REMOTE='1',
+                   DISTCC_FALLBACK='0', DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_VERBOSE='1')
+        probe = subprocess.run([client, compiler, '-dumpversion'], env=env, capture_output=True,
+                               check=True, timeout=30)
+        self.assertIn(b'started local compiler libraries', probe.stderr)
+        cases = [('cpp', [], b'operation=P'),
+                 ('hip', ['--cuda-host-only', '-nogpuinc', '-nogpulib', '-x', 'hip',
+                          '--offload-arch=gfx1032', '--offload-arch=gfx90c'], b'prepared AMDGPU offload')]
+        for suffix, flags, preparation in cases:
+            with self.subTest(language=suffix):
+                source = self.work/f'input.{suffix}'
+                source.write_text('int main() { return 0; }\n')
+                obj = self.work/f'{suffix}.o'
+                compiled = subprocess.run([client, compiler, *flags, '-c', source, '-o', obj],
+                                          env=env, capture_output=True, check=True, timeout=30)
+                self.assertIn(preparation, compiled.stderr)
+                self.assertIn(b'pooled TCP job completed', compiled.stderr)
+                program = self.work/suffix
+                subprocess.run([client, compiler, '-fuse-ld=lld', obj, '-o', program], env=env,
+                               check=True, capture_output=True, timeout=30)
+                subprocess.run([program], check=True, timeout=5)
+
+
 class LocalClangTest(BrokerTestCase):
     def start_local(self, hosts=None):
         compiler = shutil.which('clang')
@@ -63,7 +101,7 @@ class LocalClangTest(BrokerTestCase):
                           '\nsleep 6\nexec ' + shlex.quote(str(self.build/'distcc-clang')) +
                           ' "$@"\n')
         helper.chmod(0o755)
-        self.env['PATH'] = str(helpers)+os.pathsep+self.env['PATH']
+        self.env['DISTCC_CLANG_DRIVER'] = str(helper)
         original = self.command(['-dumpversion'], reused=False)
         result = self.command(['-dumpversion'])
         self.assertEqual((result.returncode, result.stdout, result.stderr),
@@ -97,6 +135,32 @@ class LocalClangTest(BrokerTestCase):
         self.assertEqual((result.returncode, result.stdout, result.stderr),
                          (expected.returncode, expected.stdout, expected.stderr))
         self.assertNotIn('--native-worker', (self.work/'client.log').read_text())
+
+    def test_wrapper_name_containing_distcc_is_a_compiler(self):
+        self.start_local()
+        wrappers = self.work/'wrappers'
+        drivers = self.work/'distcc-toolchain'
+        wrappers.mkdir()
+        drivers.mkdir()
+        name = 'distcc-test-driver'
+        (wrappers/name).symlink_to(self.build/'distcc')
+        driver = drivers/name
+        driver.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        driver.chmod(0o755)
+        env = dict(self.env, PATH=os.pathsep.join((str(wrappers), str(drivers), self.env['PATH'])))
+        result = subprocess.run([wrappers/name, '--version'], env=env, check=True,
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.stdout, '--version\n')
+
+        # Compiler discovery must skip the masquerade but accept a real
+        # compiler in a directory whose name happens to contain "distcc".
+        name = 'clang-99997'
+        (wrappers/name).symlink_to(self.build/'distcc')
+        (drivers/name).symlink_to(self.compiler)
+        result = subprocess.run([self.build/'distcc', name, '-dumpversion'], env=env,
+                                capture_output=True, check=True, timeout=10)
+        self.assertEqual(result.stdout, subprocess.check_output([self.compiler, '-dumpversion']))
+        self.assertIn('started local compiler libraries', (self.work/'client.log').read_text())
 
     def use_unpackaged_clang(self):
         driver = self.work/'clang-99999'
@@ -173,7 +237,7 @@ class LocalClangTest(BrokerTestCase):
         helper.write_text('#!/bin/sh\necho "$1" >> startups\nexec ' +
                           shlex.quote(str(self.build/'distcc-clang')) + ' "$@"\n')
         helper.chmod(0o755)
-        self.env['PATH'] = str(self.work)+os.pathsep+self.env['PATH']
+        self.env['DISTCC_CLANG_DRIVER'] = str(helper)
         for i, extra in enumerate(([], [], ['-fprofile-instr-generate'])):
             obj = self.work/f'output-{i}.o'
             result = self.command(['-c', str(self.source), '-o', str(obj), *extra])
@@ -187,7 +251,7 @@ class LocalClangTest(BrokerTestCase):
         helper = self.work/'distcc-clang'
         helper.write_text('#!/bin/sh\nexit 1\n')
         helper.chmod(0o755)
-        self.env['PATH'] = str(self.work)+os.pathsep+self.env['PATH']
+        self.env['DISTCC_CLANG_DRIVER'] = str(helper)
         result = self.command(['-c', str(self.source), '-o', 'broken.o'])
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.work/'broken.o').exists())
@@ -275,7 +339,7 @@ class LocalClangTest(BrokerTestCase):
                 self.assertEqual((self.work/'linked').read_bytes(), output)
         log = (self.work/'client.log').read_text()
         self.assertIn('operation=L', log)
-        self.assertNotIn('forking to execute: distcc-link', log)
+        self.assertNotRegex(log, r'forking to execute: (?:\S*/)?distcc-link\b')
 
     def test_link_plan_driver_error_is_not_success_or_local_retry(self):
         self.start_local()

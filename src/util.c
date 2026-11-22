@@ -53,6 +53,7 @@
 #include "distcc.h"
 #include "trace.h"
 #include "util.h"
+#include "helpers.h"
 #include "exitcode.h"
 #include "snprintf.h"
 
@@ -335,70 +336,46 @@ int dcc_ignore_sigpipe(int val)
     return 0;
 }
 
-/**
- * Search through the $PATH looking for a directory containing a file called
- * @p compiler_name, which is a symbolic link containing the string "distcc".
- *
- * Trim the path to just after the *last* such directory.
- *
- * If we find a distcc masquerade dir on the PATH, remove all the dirs up
- * to that point.
- **/
-int dcc_trim_path(const char *compiler_name)
+int dcc_is_launcher(const char *name)
 {
-    const char *envpath, *newpath, *p, *n;
-    char linkbuf[MAXPATHLEN], *buf;
-    struct stat sb;
-    size_t len;
+    return !strcmp(name, "distcc") || !strcmp(name, "distcc.exe");
+}
 
-    if (!(envpath = getenv("PATH"))) {
-        rs_trace("PATH seems not to be defined");
-        return 0;
+static int same_file(const char *a, const char *b)
+{
+    struct stat x, y;
+    return !stat(a, &x) && !stat(b, &y) && x.st_dev == y.st_dev && x.st_ino == y.st_ino;
+}
+
+int dcc_is_distcc_path(const char *path)
+{
+    char client[PATH_MAX];
+    return same_file(path, BINDIR "/distcc") || same_file(path, dcc_helper_path("distcc", client));
+}
+
+char *dcc_helper_path(const char *name, char path[PATH_MAX])
+{
+    if (!strcmp(name, "distcc-clang")) {
+        char *override = getenv("DISTCC_CLANG_DRIVER");
+        if (override && *override) return override;
     }
-
-    rs_trace("original PATH %s", envpath);
-    rs_trace("looking for \"%s\"", compiler_name);
-
-    /* Allocate a buffer that will let us append "/cc" onto any PATH
-     * element, even if there is only one item in the PATH. */
-    if (!(buf = malloc(strlen(envpath)+1+strlen(compiler_name)+1))) {
-        rs_log_error("failed to allocate buffer for PATH munging");
-        return EXIT_OUT_OF_MEMORY;
-    }
-
-    for (n = p = envpath, newpath = NULL; *n; p = n) {
-        n = strchr(p, ':');
-        if (n)
-            len = n++ - p;
-        else {
-            len = strlen(p);
-            n = p + len;
-        }
-        strncpy(buf, p, len);
-
-        sprintf(buf + len, "/%s", compiler_name);
-        if (lstat(buf, &sb) == -1)
-            continue;           /* ENOENT, EACCESS, etc */
-        if (!S_ISLNK(sb.st_mode))
-            break;
-        if ((len = readlink(buf, linkbuf, sizeof linkbuf)) <= 0)
-            continue;
-        linkbuf[len] = '\0';
-        if (strstr(linkbuf, "distcc")) {
-            /* Set newpath to the part of the PATH past our match. */
-            newpath = n;
+    ssize_t len = readlink("/proc/self/exe", path, PATH_MAX);
+    if (len > 0 && len < PATH_MAX) {
+        path[len] = '\0';
+        char *slash = strrchr(path, '/');
+        if (slash && (size_t)(slash + 1 - path) + strlen(name) < PATH_MAX) {
+            *slash = '\0';
+            if (strcmp(path, BINDIR) && strcmp(path, SBINDIR)) {
+                *slash = '/';
+                strcpy(slash + 1, name);
+                if (!access(path, X_OK)) return path;
+            }
         }
     }
-
-    if (newpath) {
-        int ret = dcc_set_path(newpath);
-        if (ret)
-            return ret;
-    } else
-        rs_trace("not modifying PATH");
-
-    free(buf);
-    return 0;
+    /* Callers supply a single internal filename. */
+    _Static_assert(sizeof(PKGLIBEXECDIR) + NAME_MAX + 1 <= PATH_MAX, "helper directory too long");
+    snprintf(path, PATH_MAX, "%s/%s", PKGLIBEXECDIR, name);
+    return path;
 }
 
 /* Set the PATH environment variable to the indicated value. */
@@ -581,15 +558,8 @@ int dcc_remove_if_exists(const char *fname)
     return 0;
 }
 
-/*
- * Returns the absolute path of *command by searching each subpath of PATH.
- *
- * Input *command is either "c++" or "cc".
- * **out points to a newly allocated buffer holding the absolute path,
- * such as "/usr/bin/cc".
- *
- * Skip any path compenents that include the substring "distcc" to avoid loops.
- */
+/* Return the first executable for command on PATH, skipping aliases of
+ * distcc itself. The caller owns the resulting path. */
 int dcc_which(const char *command, char **out)
 {
     char *loc = NULL, *_loc = NULL, *path, *next_colon;
@@ -609,19 +579,17 @@ int dcc_which(const char *command, char **out)
             next_path = next_colon + 1;
             dir_len = next_colon - path;
         }
-        _loc = realloc(loc, dir_len + strlen(command) + 2);
+        _loc = realloc(loc, dir_len + strlen(command) + 3);
         if (!_loc) {
             free(loc);
             return -ENOMEM;
         }
         loc = _loc;
-        strncpy(loc, path, dir_len);
-        loc[dir_len] = '\0';
-        if (strstr(loc, "distcc"))
-            continue;
-        strcat(loc, "/");
-        strcat(loc, command);
-        if (access(loc, X_OK) == 0) {
+        memcpy(loc, path, dir_len);
+        if (!dir_len) loc[dir_len++] = '.';
+        loc[dir_len++] = '/';
+        strcpy(loc + dir_len, command);
+        if (access(loc, X_OK) == 0 && !dcc_is_distcc_path(loc)) {
             *out = loc;
             return 0;
         }

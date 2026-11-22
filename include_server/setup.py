@@ -133,7 +133,7 @@ else:
     sys.exit("""Could not cd to SRCDIR '%s'.""" % srcdir)
   srcdir_include_server = os.path.join(srcdir, 'include_server')
 
-libdir = next(flag.partition('=')[2] for flag in shlex.split(cpp_flags_env)
+libdir = next(flag.partition('=')[2].strip('"') for flag in shlex.split(cpp_flags_env)
               if flag.startswith('-DLIBDIR='))
 
 # Specify extension.

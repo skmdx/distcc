@@ -62,7 +62,7 @@ and dependency files are published in the original source order. Commands
 with additional driver-owned outputs, such as saved intermediates or split
 DWARF, retain normal local execution.
 
-GCC and Clang/LLD object links can also run on a broker-selected worker. `distcc-link --sync`
+GCC and Clang/LLD object links can also run on a broker-selected worker. `"$(distcc --show-helpers)/distcc-link" --sync`
 populates immutable sysroot caches using compressed rsync transfers; set
 DISTCC_LINK_SYSROOT to the resulting client profile and DISTCCD_LINK_ROOT on
 workers to enable this optional path. A profile directory containing gcc.json

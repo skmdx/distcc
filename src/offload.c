@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "distcc.h"
+#include "helpers.h"
 #include "exitcode.h"
 #include "trace.h"
 
@@ -218,7 +219,8 @@ int dcc_offload_command(char **argv, const char *input, const char *output,
 {
     char **helper = NULL;
     int ret = EXIT_OUT_OF_MEMORY;
-    if (append(&helper, "distcc-offload") ||
+    char path[PATH_MAX];
+    if (append(&helper, dcc_helper_path("distcc-offload", path)) ||
         append(&helper, input) || append(&helper, output)) {
         ret = EXIT_OUT_OF_MEMORY;
         goto out;

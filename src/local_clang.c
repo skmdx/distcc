@@ -15,6 +15,7 @@
 #define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 #include "distcc.h"
+#include "helpers.h"
 #include "native_worker.h"
 #include "plan_memo.h"
 #include "broker.h"
@@ -177,7 +178,9 @@ static int start_worker(const char *compiler, int *worker)
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair)) return EXIT_IO_ERROR;
     char descriptor[32];
     snprintf(descriptor, sizeof(descriptor), "%d", pair[1]);
-    char *command[] = {"distcc-clang", "--native-worker", descriptor, (char *)compiler, NULL};
+    char path[PATH_MAX];
+    char *command[] = {dcc_helper_path("distcc-clang", path), (char *)"--native-worker",
+                       descriptor, (char *)compiler, NULL};
     pid_t pid = -1;
     int ret = fcntl(pair[1], F_SETFD, 0) ? EXIT_IO_ERROR :
         dcc_spawn_child(command, &pid, "/dev/null", "/dev/null", "/dev/null");

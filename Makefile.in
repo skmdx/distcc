@@ -56,6 +56,9 @@ exec_prefix = @exec_prefix@
 bindir = @bindir@
 sbindir = @sbindir@
 libexecdir = @libexecdir@
+pkglibexecdir = $(libexecdir)/distcc
+private_scripts = distcc-clang distcc-link distcc-multi distcc-thinlto distcc-offload distcc-offload-link
+private_modules = distcc_lto.py distcc_job.py distcc_python.py
 datarootdir = @datarootdir@
 datadir = @datadir@
 sysconfdir = @sysconfdir@
@@ -77,6 +80,9 @@ DIR_DEFS = -DLIBDIR="\"${prefix}/lib\"" -DSYSCONFDIR="\"${sysconfdir}\"" -DICOND
 DIR_DEFS += -DCPP_LOOKUP_LIBRARY='"$(libdir)/distcc/cpp_lookup.so"'
 DIR_DEFS += -DGCC_PLAN_LIBRARY='"$(libdir)/distcc/gcc_plan.so"'
 DIR_DEFS += -DRUST_NATIVE_LIBRARY='"$(libdir)/distcc/distcc-rust-native.so"'
+DIR_DEFS += -DPKGLIBEXECDIR='"$(pkglibexecdir)"' -DBINDIR='"$(bindir)"' -DSBINDIR='"$(sbindir)"'
+# setup.py passes these compiler arguments through a second shell parser.
+setup_cppflags = '$(subst ','"'"',$(CPPFLAGS))'
 CPP_LOOKUP_TARGET = @CPP_LOOKUP_TARGET@
 
 # arguments to pkgconfig
@@ -478,6 +484,7 @@ HEADERS = src/stats.h src/adaptive.h src/broker.h src/broker_memo.h src/broker_s
 	src/stringmap.h							\
 	src/timefile.h src/timeval.h src/trace.h			\
 	src/types.h							\
+	src/helpers.h							\
 	src/util.h							\
 	src/exec.h src/lock.h src/where.h src/srvnet.h			\
 	src/rslave.h							\
@@ -825,7 +832,7 @@ include-server: $(LTO_BUILD)/SplitModule.cpp
 	  CFLAGS="$(CFLAGS) $(PYTHON_CFLAGS)"           \
 	  CC="$(CC)" CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" \
 	  LDFLAGS="$(LDFLAGS)"                          \
-	  CPPFLAGS="$(CPPFLAGS)"                        \
+	  CPPFLAGS=$(setup_cppflags)                    \
 	  $(PYTHON) "$(srcdir)/include_server/setup.py" \
 	      build 					\
 	        --build-base="$(include_server_builddir)"  \
@@ -1226,7 +1233,7 @@ clean-include-server:
 	  CFLAGS="$(CFLAGS) $(PYTHON_CFLAGS)"           \
 	  CC="$(CC)" CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" \
 	  LDFLAGS="$(LDFLAGS)"                          \
-	  CPPFLAGS="$(CPPFLAGS)"                        \
+	  CPPFLAGS=$(setup_cppflags)                    \
 	  $(PYTHON) "$(srcdir)/include_server/setup.py" \
 	      clean	\
 	         --build-base="$(include_server_builddir)"  \
@@ -1308,6 +1315,7 @@ showpaths:
 	@echo "  man pages            $(DESTDIR)$(man1dir)"
 	@echo "  documents            $(DESTDIR)$(docdir)"
 	@echo "  programs             $(DESTDIR)$(bindir)"
+	@echo "  private helpers      $(DESTDIR)$(pkglibexecdir)"
 	@echo "  sbin programs        $(DESTDIR)$(sbindir)"
 	@echo "  system configuration $(DESTDIR)$(sysconfdir)"
 	@echo "  icon file            $(DESTDIR)$(icondir)"
@@ -1329,18 +1337,14 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	fi
 	$(mkinstalldirs) "$(DESTDIR)$(bindir)"
 	$(mkinstalldirs) "$(DESTDIR)$(sbindir)"
-	$(INSTALL_SCRIPT) "$(srcdir)/distcc-link" "$(DESTDIR)$(bindir)/distcc-link"
-	$(INSTALL_SCRIPT) "$(srcdir)/distcc-multi" "$(DESTDIR)$(bindir)/distcc-multi"
+	$(mkinstalldirs) "$(DESTDIR)$(pkglibexecdir)"
+	for p in $(private_scripts); do $(INSTALL_SCRIPT) "$(srcdir)/$$p" "$(DESTDIR)$(pkglibexecdir)/$$p" || exit 1; done
+	for p in $(private_modules); do $(INSTALL_DATA) "$(srcdir)/$$p" "$(DESTDIR)$(pkglibexecdir)/$$p" || exit 1; done
+	ln -srf "$(DESTDIR)$(bindir)/distcc" "$(DESTDIR)$(pkglibexecdir)/distcc"
 	ln -sf distcc "$(DESTDIR)$(bindir)/distcc-rust"
-	$(INSTALL_SCRIPT) "$(srcdir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc-thinlto"
-	$(INSTALL_SCRIPT) "$(srcdir)/distcc-offload-link" "$(DESTDIR)$(bindir)/distcc-offload-link"
-	$(INSTALL_DATA) "$(srcdir)/distcc_lto.py" "$(DESTDIR)$(bindir)/distcc_lto.py"
 	if test -n "$(LINKER_WRAPPER_TARGET)"; then \
-	  $(INSTALL_PROGRAM) distcc-linker-wrapper "$(DESTDIR)$(bindir)/distcc-linker-wrapper"; \
+	  $(INSTALL_PROGRAM) distcc-linker-wrapper "$(DESTDIR)$(pkglibexecdir)/distcc-linker-wrapper"; \
 	fi
-	$(INSTALL_SCRIPT) "$(srcdir)/distcc-offload" "$(DESTDIR)$(bindir)/distcc-offload"
-	$(INSTALL_DATA) "$(srcdir)/distcc_job.py" "$(DESTDIR)$(bindir)/distcc_job.py"
-	$(INSTALL_DATA) "$(srcdir)/distcc_python.py" "$(DESTDIR)$(bindir)/distcc_python.py"
 	if test -n "$(RUST_NATIVE_TARGET)"; then \
 	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
 	  $(INSTALL_PROGRAM) distcc-rust-native.so "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"; \
@@ -1349,7 +1353,6 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
 	  $(INSTALL_PROGRAM) clang_driver.so "$(DESTDIR)$(libdir)/distcc/clang_driver.so"; \
 	fi
-	$(INSTALL_SCRIPT) "$(srcdir)/distcc-clang" "$(DESTDIR)$(bindir)/distcc-clang"
 	for p in $(bin_PROGRAMS); do \
 	  $(INSTALL_PROGRAM) "$$p" "$(DESTDIR)$(bindir)" || exit 1; \
 	done
@@ -1385,7 +1388,7 @@ install-include-server: include-server pump
 	  CFLAGS="$(CFLAGS) $(PYTHON_CFLAGS)"           \
 	  CC="$(CC)" CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" \
 	  LDFLAGS="$(LDFLAGS)"                          \
-	  CPPFLAGS="$(CPPFLAGS)"                        \
+	  CPPFLAGS=$(setup_cppflags)                    \
 	  $(PYTHON) "$(srcdir)/include_server/setup.py" \
 	      build 					\
 	        --build-base="$(include_server_builddir)" \
@@ -1484,14 +1487,8 @@ uninstall-programs:
 	rm -f "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/clang_driver.so"
 	rm -f "$(DESTDIR)$(LTO_BINDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/lto-prepare.so" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu.so"
-	rm -f "$(DESTDIR)$(bindir)/distcc-link"
-	rm -f "$(DESTDIR)$(bindir)/distcc-multi"
+	for p in $(private_scripts) $(private_modules) distcc-linker-wrapper distcc; do rm -f "$(DESTDIR)$(pkglibexecdir)/$$p"; done
 	rm -f "$(DESTDIR)$(bindir)/distcc-rust"
-	rm -f "$(DESTDIR)$(bindir)/distcc-thinlto" "$(DESTDIR)$(bindir)/distcc_job.py"
-	rm -f "$(DESTDIR)$(bindir)/distcc_python.py"
-	rm -f "$(DESTDIR)$(bindir)/distcc-offload-link" "$(DESTDIR)$(bindir)/distcc_lto.py" "$(DESTDIR)$(bindir)/distcc-linker-wrapper"
-	rm -f "$(DESTDIR)$(bindir)/distcc-offload"
-	rm -f "$(DESTDIR)$(bindir)/distcc-clang"
 	for p in $(bin_PROGRAMS) pump; do			\
 	  file="$(DESTDIR)$(bindir)/`basename $$p`";            \
 	  if [ -e "$$file" ]; then rm -fv "$$file"; fi          \

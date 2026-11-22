@@ -43,6 +43,7 @@
 #include <limits.h>
 
 #include "distcc.h"
+#include "helpers.h"
 #include "trace.h"
 #include "exitcode.h"
 #include "util.h"
@@ -94,6 +95,7 @@ static void dcc_show_usage(void)
 "   --help                     Explain usage, and exit.\n"
 "   --version                  Show version, and exit.\n"
 "   --show-hosts               Show host list, and exit.\n"
+"   --show-helpers             Show private helper directory, and exit.\n"
 "   --lto-capacity             Show broker compute capacity as JSON.\n"
 "   --show-analyzer-slots      Show available CPU capacity for analysis, and exit.\n"
 "   -j                         Show the concurrency level, as calculated from\n"
@@ -332,7 +334,7 @@ int main(int argc, char **argv)
 
     rs_trace("compiler name is \"%s\"", compiler_name);
 
-    if (strstr(compiler_name, "distcc") != NULL) {
+    if (dcc_is_launcher(compiler_name)) {
         /* Either "distcc -c hello.c" or "distcc gcc -c hello.c" */
         if (argc <= 1) {
             fprintf (stderr,
@@ -353,6 +355,14 @@ int main(int argc, char **argv)
             dcc_show_version("distcc");
             ret = 0;
             goto out;
+        }
+
+        if (!strcmp(argv[1], "--show-helpers")) {
+            char path[PATH_MAX];
+            dcc_helper_path("distcc-link", path);
+            *strrchr(path, '/') = '\0';
+            puts(path);
+            return 0;
         }
 
         if (!strcmp(argv[1], "--show-hosts")) {
@@ -408,9 +418,7 @@ int main(int argc, char **argv)
         /* Build-system launchers may wrap an absolute masquerade link.
          * Unwrap it before compiler discovery, pump analysis and RPC, just
          * as when the same link is invoked directly. */
-        char *resolved = strchr(compiler_args[0], '/') ? realpath(compiler_args[0], NULL) : NULL;
-        masquerade = resolved && !strcmp(dcc_find_basename(resolved), "distcc");
-        free(resolved);
+        masquerade = strchr(compiler_args[0], '/') && dcc_is_distcc_path(compiler_args[0]);
     } else {
         /* Invoked as "cc -c hello.c", with masqueraded path */
         if ((ret = dcc_copy_argv(argv, &compiler_args, 0)) != 0) {
