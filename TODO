@@ -2,6 +2,13 @@ TODO list for distcc
 
 --> See also TODO and FIXME comments in source files and doc/todo/
 
+Rust proc-macro library lookup through a symlinked build root
+
+    With a symlink to the entire temporary build root, the worker cannot load
+    a proc-macro's private $ORIGIN/libhelper.so in
+    test_macro_private_shared_library_and_observed_data. The same fixture passes
+    with a physical build root and a symlinked Cargo home.
+
 Clang result reuse and source scheduling (experimental)
 
     Keep isolated host speed/slot options identical to the installed config.

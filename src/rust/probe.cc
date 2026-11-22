@@ -8,7 +8,8 @@ bool runtime_path(const fs::path &p, const fs::path &sysroot) {
            std::any_of(std::begin(runtime), std::end(runtime), [&](auto &r) { return below(p, r); });
 }
 bool audit(const fs::path &depfile, int loads, const fs::path &sysroot, const std::set<fs::path> &search,
-           std::set<fs::path> &inputs, std::set<fs::path> &dirs, std::map<fs::path, fs::path> &observed) {
+           std::set<fs::path> &inputs, std::set<fs::path> &dirs, std::map<fs::path, fs::path> &observed,
+           std::set<string> &env_keys) {
     auto records = split(contents(loads), '\0');
     if (records.size() % 3)
         throw Local("incomplete Rust dependency journal");
@@ -62,6 +63,10 @@ bool audit(const fs::path &depfile, int loads, const fs::path &sysroot, const st
     for (size_t i = 0; i < records.size(); i += 3) {
         if (records[i] == "L" || records[i] == "D")
             continue;
+        if (records[i] == "E") {
+            env_keys.insert(records[i + 1]);
+            continue;
+        }
         fs::path spelling(records[i + 1]);
         auto p = spelling.lexically_normal();
         if (p == depfile)

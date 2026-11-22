@@ -486,7 +486,7 @@ class RustTest(BrokerTestCase):
         self.assertTrue(all((abi, backend) in backends for _, _, backends in offers))
         capacity = self.request(20, work=(1, 65536, 11), memory_class=1+8*64+16,
                                 cgu_backend=f'{abi} {backend}'.encode(), rust_compiler=int(key(identity), 16))
-        self.assertEqual(struct.unpack_from('=iii', capacity.recv(1032)), (0, 2, 1))
+        self.assertEqual(struct.unpack_from('=iiIi', capacity.recv(1036)), (0, 2, 0, 1))
         (self.work/'Cargo.toml').touch()
         source = self.work/'src'
         source.mkdir()
@@ -713,7 +713,7 @@ class RustTest(BrokerTestCase):
                 for incompatible in ('0.0.0 '+backend, llvm+' absent-backend'):
                     request = self.request(10, work=(1, 65536, 11), memory_class=1+8*64+16,
                                            cgu_backend=incompatible.encode())
-                    self.assertEqual(struct.unpack_from('=i', request.recv(1032))[0], 121)
+                    self.assertEqual(self.receive(request)[0], 121)
                 counts = self.completed_jobs()
                 result = subprocess.run(['strace', '-f', '-s', '256', '-e', 'execve', '-o', trace,
                                          self.build/'distcc', self.rustc, *args], cwd=self.work, env=self.env,
@@ -1183,10 +1183,11 @@ class RustTest(BrokerTestCase):
         payload.write_bytes(b'abc')
         source.write_text('mod module;\ninclude!(' + repr(str(included)).replace("'", '"') + ');\n'
                           'pub fn value() -> u32 { assert!(file!().ends_with("library space.rs")); '
-                          'assert_eq!(env!("DISTCC_RUST_TEST_VALUE"), "value with space"); '
-                          'assert!(option_env!("DISTCC_RUST_ABSENT").is_none()); '
+                          'assert_eq!(env!("CRATE_TEST_VALUE"), "value with space"); '
+                          'assert!(option_env!("CRATE_TEST_ABSENT").is_none()); '
                           'module::value() + INCLUDED + include_bytes!("payload.bin").len() as u32 }')
-        env = dict(self.env, DISTCC_RUST_TEST_VALUE='value with space')
+        env = dict(self.env, CRATE_TEST_VALUE='value with space')
+        env.pop('CRATE_TEST_ABSENT', None)
         output = self.work / 'libsample.rlib'
         result = self.rust('--crate-name', 'sample', '--crate-type=rlib', '--emit=link,dep-info',
                            source, '-o', output, env=env)
@@ -1691,6 +1692,59 @@ class RustTest(BrokerTestCase):
         self.assertIn('proc-macro host ABI', result.stderr)
         self.assertIn('compiled on', result.stderr)
 
+    def test_tracked_worker_owned_environment_uses_client(self):
+        source = self.work/'owned.rs'
+        source.write_text('fn main() { assert_eq!(env!("DISTCC_TEST_SETTING"), "client"); }')
+        output = self.work/'owned'
+        result = self.rust(source, '-o', output, env=dict(self.env, DISTCC_TEST_SETTING='client'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('crate depends on worker-owned environment: DISTCC_TEST_SETTING', result.stderr)
+        self.assertNotIn('distcc-rust: compiled on', result.stderr)
+        subprocess.run([output], check=True)
+
+    def test_proc_macro_environment_on_whole_crate_worker(self):
+        source = self.work/'context.rs'
+        library = self.work/'libcontext.so'
+        source.write_text('''extern crate proc_macro;
+use std::{env, ffi::{CStr, c_char}};
+extern "C" { fn secure_getenv(name: *const c_char) -> *const c_char; }
+#[proc_macro]
+pub fn context(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    assert_eq!(env::var("CARGO_CRATE_NAME").unwrap(), "consumer");
+    assert_eq!(env::var("MACRO_OPTION").unwrap(), "value=42");
+    assert_eq!(env::var_os("MACRO_EMPTY").unwrap(), "");
+    assert_eq!(env::var("MACRO_MISSING"), Err(env::VarError::NotPresent));
+    let ptr = unsafe { secure_getenv(c"MACRO_SECURE".as_ptr()) };
+    assert!(!ptr.is_null());
+    assert_eq!(unsafe { CStr::from_ptr(ptr) }.to_bytes(), b"secure");
+    let all: std::collections::HashMap<_, _> = env::vars_os().collect();
+    let key = std::ffi::OsStr::new;
+    assert_eq!(all.get(key("CARGO_FEATURE_JOURNAL")).unwrap(), "1");
+    assert_eq!(all.get(key("OUT_DIR")).unwrap(), "crate-output");
+    let makeflags = env::var_os("CARGO_MAKEFLAGS");
+    let libs = env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    let tmp = env::var("TMPDIR").unwrap_or_default();
+    let clean = !all.contains_key(key("MACRO_UNREAD")) && makeflags.is_none()
+        && !libs.contains("client-only") && !tmp.contains("client-only");
+    clean.to_string().parse().unwrap()
+}''')
+        self.rust('--edition=2021', '--crate-type=proc-macro', source, '-o', library,
+                  remote=False).check_returncode()
+        consumer = self.work/'consumer.rs'
+        consumer.write_text('extern crate context; fn main() { assert!(context::context!()); }')
+        tmp = self.work/'client-only'
+        tmp.mkdir()
+        env = dict(self.env, CARGO_CRATE_NAME='consumer', MACRO_OPTION='value=42', MACRO_EMPTY='',
+                   MACRO_SECURE='secure', CARGO_FEATURE_JOURNAL='1', OUT_DIR='crate-output',
+                   MACRO_UNREAD='private', CARGO_MAKEFLAGS='-j2', LD_LIBRARY_PATH=str(tmp), TMPDIR=str(tmp))
+        env.pop('MACRO_MISSING', None)
+        output = self.work/'consumer'
+        result = self.rust('-Ccodegen-units=1', consumer, '--extern', 'context='+str(library),
+                           '-o', output, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: compiled on', result.stderr)
+        subprocess.run([output], check=True)
+
     @unittest.skipUnless(shutil.which('sandbox'), 'Portage sandbox required')
     def test_pure_macro_with_portage_and_jobserver_pipe(self):
         library = self.build_pure_macro()
@@ -1720,7 +1774,7 @@ class RustTest(BrokerTestCase):
         self.assertEqual(self.rust('--crate-type=rlib',source).returncode,0)
         foreign='incompatible-test-host'
         request=self.request(10,work=(1,1024,7),work_units=1,rust_compiler=1)
-        status,=struct.unpack_from('=i',request.recv(1032))
+        status,_,_=self.receive(request)
         self.assertEqual(status,121)
         status,err,outputs=self.raw_compile(source,host=foreign)
         self.assertEqual(status,121,err)
@@ -1865,7 +1919,7 @@ class RustTest(BrokerTestCase):
     def test_portage_cargo_native_probe_in_build_tree(self):
         source = self.work / 'caller.rs'
         source.write_text('pub fn answer() -> u32 { '
-                          'include!(concat!("answer-", env!("SANDBOX_ON"), ".rs")) }')
+                          'include!(concat!("answer-", env!("CRATE_BUILD_CONTEXT"), ".rs")) }')
         (self.work / 'answer-1.rs').write_text('42')
         log = self.work / 'sandbox.log'
         env = dict(self.env, SANDBOX_LOG=str(log), SANDBOX_DEBUG_LOG=str(self.work/'sandbox.debug'))
@@ -1873,6 +1927,7 @@ class RustTest(BrokerTestCase):
         # write list for the build command, as Portage does in the ebuild phase.
         check_sandbox = ('test "$SANDBOX_ON" = 1\n'
                          'case "$LD_PRELOAD" in *libsandbox.so*) ;; *) exit 1;; esac\n'
+                         'export CRATE_BUILD_CONTEXT="$SANDBOX_ON"\n'
                          'exec "$@"')
         build = ['sandbox', 'sh', '-ec', check_sandbox, 'sh', 'env', '-u', 'TMPDIR', '-u', 'T',
                  'SANDBOX_WRITE=' + str(self.work), self.build/'distcc']

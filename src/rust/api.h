@@ -1,5 +1,6 @@
 /* Native Rust planner and isolated worker. */
 #pragma once
+#include <stddef.h>
 #include <sys/types.h>
 #define DCC_RUST_ROOT "/__distcc_rust"
 #define DCC_RUST_DIGEST_TABLE "rust-input-digests-v1"
@@ -19,6 +20,7 @@ struct dcc_rust_artifacts;
 extern "C" {
 #endif
 int dcc_rust_client(char **argv);
+int dcc_rust_env_allowed(const char *name, size_t length);
 int dcc_rust_catalog_fd(void);
 int dcc_rust_catalog_attach(int fd);
 const char *dcc_rust_compilers(const char **first_host, const char **features);

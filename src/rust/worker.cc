@@ -203,6 +203,13 @@ int execute(const dcc_job *job, const fs::path &root, int cancel, const char *ou
         for (auto &child : fs::directory_iterator(root / "tmp"))
             cmd.insert(cmd.end(), {"--ro-bind", child.path(), "/tmp/" + child.path().filename().string()});
     cmd.insert(cmd.end(), {"--bind", output, DCC_RUST_OUT, "--chdir", job->cwd});
+    // The wire decoder admits only crate-owned keys. Install the worker's
+    // loader, scratch and CPU capture settings after the crate environment.
+    for (auto p = job->rust.environment; p && *p; ++p) {
+        string entry = *p;
+        auto eq = entry.find('=');
+        cmd.insert(cmd.end(), {"--setenv", entry.substr(0, eq), entry.substr(eq + 1)});
+    }
     if (job->rust.host && *job->rust.host) {
         std::set<fs::path> libraries;
         for (unsigned i = 0; i < job->count; ++i) {
@@ -224,12 +231,6 @@ int execute(const dcc_job *job, const fs::path &root, int cancel, const char *ou
     }
     for (auto p = job->rust.directories; p && *p; ++p)
         fs::create_directories(rooted(root, *p));
-    for (auto p = job->rust.environment; p && *p; ++p) {
-        string entry = *p;
-        auto eq = entry.find('=');
-        string key = entry.substr(0, eq);
-        cmd.insert(cmd.end(), {"--setenv", key, entry.substr(eq + 1)});
-    }
     fs::path profile = rooted(root, DCC_RUST_PROFILE);
     if (*job->rust.cpu) {
         fs::create_directory(profile);

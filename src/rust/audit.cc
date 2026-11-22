@@ -1,5 +1,5 @@
 #include "rust/runtime.hh"
-/* Path journal for the isolated dependency pass. Loader bookkeeping and
+/* Journal file and environment reads in the isolated Rust dependency pass. Loader bookkeeping and
  * journal IO use raw filesystem syscalls so they cannot reenter these hooks. */
 #include <atomic>
 #include <cerrno>
@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <spawn.h>
+#include <sys/auxv.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -83,7 +84,52 @@ void Observation::operation(const char *name) const {
         errno = saved;
     }
 }
+
+thread_local bool resolving_env;
+template<bool Secure>
+char *lookup_env(const char *name) noexcept {
+    using Lookup = char *(*)(const char *);
+    static std::atomic<Lookup> original{nullptr};
+    Observation observe;
+    auto fn = original.load(std::memory_order_relaxed);
+    if (!fn) {
+        // dlsym can itself consult the environment before libc or another
+        // preload has finished initializing. Never wait on our own lookup.
+        if (resolving_env) {
+            if (!*name || strchr(name, '=') || (Secure && getauxval(AT_SECURE))) return nullptr;
+            size_t len = strlen(name);
+            for (char **p = environ; p && *p; ++p)
+                if (!strncmp(*p, name, len) && (*p)[len] == '=') return *p + len + 1;
+            return nullptr;
+        }
+        int saved = errno;
+        resolving_env = true;
+        fn = reinterpret_cast<Lookup>(dlsym(RTLD_NEXT, Secure ? "secure_getenv" : "getenv"));
+        if (!fn) _exit(100);
+        original.store(fn, std::memory_order_relaxed);
+        resolving_env = false;
+        errno = saved;
+    }
+    char *value = fn(name);
+    int fd = journal.load(std::memory_order_relaxed);
+    if (!observe.previous && fd >= 0 && *name && !strchr(name, '=')) {
+        // Only consecutive duplicates are elided. Longer names are recorded
+        // in full without allocating inside a loader hook.
+        static thread_local char last[128];
+        if (strcmp(name, last)) {
+            int saved = errno;
+            record(fd, "E", name, "");
+            size_t len = strlen(name);
+            if (len < sizeof(last)) memcpy(last, name, len + 1);
+            else last[0] = 0;
+            errno = saved;
+        }
+    }
+    return value;
+}
 } // namespace
+extern "C" char *getenv(const char *name) noexcept { return lookup_env<false>(name); }
+extern "C" char *secure_getenv(const char *name) noexcept { return lookup_env<true>(name); }
 extern "C" void dcc_rust_watch_library(int fd, const char *name) {
     if (!name || !*name)
         return;

@@ -190,6 +190,11 @@ rustc host triple and link the shared library on the client. To distribute a
 consumer, the client runs the dependency pass in a read-only bubblewrap mount
 namespace with a seccomp filter. The preload library journals paths after a
 procedural macro loads, including library dependencies and attempted writes.
+The worker receives defined environment variables read through `getenv` or
+`secure_getenv`, including empty values. Macro jobs also receive Cargo's
+`CARGO_*` crate context and `OUT_DIR` for environment enumeration. The worker
+owns loader, sandbox, jobserver and compiler-wrapper settings. Crates with an
+explicit rustc environment dependency on one of these settings compile on the client.
 A whole-crate job that produces or loads a procedural macro also requires the
 worker's compiler to advertise every LLVM host CPU feature available on any
 allowed client core. Each compiler advertises the intersection across its

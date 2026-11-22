@@ -261,7 +261,7 @@ struct Invocation {
     std::set<string> link_arguments;
     std::set<string> dep_names;
     std::map<string, string> outputs;
-    Env environment;
+    Words environment;
     bool distributed_link() const {
         return !linker.empty() &&
             (linker_plugin_lto || std::any_of(link_arguments.begin(), link_arguments.end(), thin_link_argument));
@@ -490,13 +490,15 @@ struct Invocation {
         if (first == string::npos)
             throw Local("missing dependency records");
         bool any = false;
+        std::set<string> env_keys{"RUSTC_BOOTSTRAP"};
         for (auto &line : split(data.substr(first + 2), '\n')) {
             if (line.empty())
                 continue;
             if (line.compare(0, 10, "# env-dep:") == 0) {
-                string key = line.substr(10, line.find('=', 10) - 10);
-                if (getenv(key.c_str()))
-                    environment[key] = env(key.c_str());
+                auto key = line.substr(10, line.find('=', 10) - 10);
+                if (!dcc_rust_env_allowed(key.data(), key.size()))
+                    throw Local("crate depends on worker-owned environment: " + key);
+                env_keys.insert(key);
                 continue;
             }
             if (line.back() != ':')
@@ -524,14 +526,18 @@ struct Invocation {
         }
         if (!any)
             throw Local("empty dependency records");
-        needs_host |= audit(depfile, loads.fd, root, search, inputs, dirs, observed);
+        needs_host |= audit(depfile, loads.fd, root, search, inputs, dirs, observed, env_keys);
         if (needs_host) {
-            for (auto key : {"CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "OUT_DIR"})
-                if (getenv(key))
-                    environment[key] = env(key);
+            // Cargo's crate context may also be enumerated directly, without getenv.
+            env_keys.insert("OUT_DIR");
+            for (char **p = environ; *p; ++p)
+                if (!strncmp(*p, "CARGO_", 6))
+                    env_keys.emplace(*p, strcspn(*p, "="));
         }
-        if (getenv("RUSTC_BOOTSTRAP"))
-            environment["RUSTC_BOOTSTRAP"] = env("RUSTC_BOOTSTRAP");
+        for (const auto &key : env_keys)
+            if (dcc_rust_env_allowed(key.data(), key.size()))
+                if (const char *value = getenv(key.c_str()))
+                    environment.push_back(key + "=" + value);
     }
 };
 
@@ -1206,10 +1212,8 @@ int distributed(char **original, const Words &args, const States &responses) {
     job.rust.host = host.data();
     job.rust.cpu = cpu.data();
     job.rust.features = features.data();
-    Words directories(inv.dirs.begin(), inv.dirs.end()), environment;
-    for (auto &[k, v] : inv.environment)
-        environment.push_back(k + "=" + v);
-    auto dirs = pointers(directories), envs = pointers(environment), compiler_args = pointers(cmd);
+    Words directories(inv.dirs.begin(), inv.dirs.end());
+    auto dirs = pointers(directories), envs = pointers(inv.environment), compiler_args = pointers(cmd);
     job.rust.directories = dirs.data();
     job.rust.environment = envs.data();
     job.argv = compiler_args.data();

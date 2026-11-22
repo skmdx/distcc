@@ -207,15 +207,30 @@ static void strings(struct metadata *m, char **words)
     string(m, "");
 }
 
-/* Each list contains nonempty path or NAME=value records, followed by the
- * empty string. The metadata parser owns all storage even on a short read. */
+/* The worker owns its loader, sandbox, jobserver and compiler wrappers. */
+int dcc_rust_env_allowed(const char *name, size_t length)
+{
+    static const char *const prefixes[] = {"LD_", "DYLD_", "SANDBOX_", "DISTCC_", "_DISTCC_",
+                                           "DISTCCD_", "CCACHE_", "SCCACHE_", "MALLOC_"};
+    static const char *const owned[] = {"TMPDIR", "TMP", "TEMP", "PATH", "GLIBC_TUNABLES", "GCONV_PATH",
+                                        "CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS",
+                                        "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"};
+    for (size_t i = 0; i < sizeof(prefixes)/sizeof(*prefixes); ++i) {
+        size_t n = strlen(prefixes[i]);
+        if (length >= n && !memcmp(name, prefixes[i], n)) return 0;
+    }
+    for (size_t i = 0; i < sizeof(owned)/sizeof(*owned); ++i)
+        if (length == strlen(owned[i]) && !memcmp(name, owned[i], length)) return 0;
+    return length != 0;
+}
+
 static int rust_environment(const char *entry)
 {
     const char *eq = strchr(entry, '=');
-    return eq && eq != entry && strncmp(entry, "LD_", 3) && strncmp(entry, "DYLD_", 5) &&
-        strncmp(entry, "RUSTC_WRAPPER=", sizeof("RUSTC_WRAPPER=") - 1) &&
-        strncmp(entry, "RUSTC_WORKSPACE_WRAPPER=", sizeof("RUSTC_WORKSPACE_WRAPPER=") - 1);
+    return eq && dcc_rust_env_allowed(entry, (size_t)(eq - entry));
 }
+/* Each list contains nonempty path or NAME=value records, followed by the
+ * empty string. The metadata parser owns all storage even on a short read. */
 static int get_strings(struct metadata *m, char ***words, int (*accept)(const char *))
 {
     unsigned count = 0, capacity = 0;
