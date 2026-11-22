@@ -384,10 +384,10 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         # step contributes to the value checked by the linked executable.
         steps = ''.join(f'    x = std::hint::black_box(x).wrapping_add({i});\n'
                         for i in range(1, 65))
-        source.write_text('include!(concat!(env!("DISTCC_RUST_INPUT"), "/rust_value.rs"));\n'
+        source.write_text('include!(concat!(env!("OUT_DIR"), "/rust_value.rs"));\n'
                           'pub fn value() -> u32 {\n    let mut x = VALUE;\n' +
                           steps + f'    x.wrapping_sub({sum(range(1, 65))})\n}}\n')
-        rust_env = dict(env, DISTCC_RUST_INPUT=str(root))
+        rust_env = dict(env, OUT_DIR=str(root))
         library = root / 'librust_test.rlib'
         remote_ir, local_ir = root / 'rust-remote.ll', root / 'rust-local.ll'
         rust = remote(['distcc', rustc, '--crate-name=rust_test', '--crate-type=rlib',
