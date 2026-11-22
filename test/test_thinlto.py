@@ -241,10 +241,11 @@ class ThinLTOTest(BrokerTestCase):
         self.start_broker(f'127.0.0.2:{self.ports[0]}/4,tcp,stats={self.stats_ports[0]}', name='remote')
         self.env.update(DISTCC_CLANG_LOCAL='1', DISTCC_VERBOSE='1', PATH=str(self.build)+':'+os.environ['PATH'])
         source = self.work/'tiny.c'
-        source.write_text('int f(void){return 2;} int g(void){return 3;}')
+        source.write_text('int main(void){return 0;}')
         self.run_command(['clang','-O2','-flto=thin','-c',source,'-o','tiny.o'], check=True)
-        result = self.run_command([self.build/'distcc','clang','-flto=thin','-fuse-ld=lld','-shared',
-                                   '-nostdlib','tiny.o','-o','tiny.so'], check=True)
+        command = [self.build/'distcc','clang','-flto=thin','-fuse-ld=lld','tiny.o','-o','tiny']
+        result = self.run_command(command, check=True)
+        self.run_command(['./tiny'], check=True)
         self.assertEqual(result.stderr.count('distcc-thinlto: compiled on'), 1, result.stderr)
         self.assertNotIn('distcc-thinlto: partitioned', result.stderr)
 
@@ -256,9 +257,40 @@ class ThinLTOTest(BrokerTestCase):
                           name='occupied')
         self.env.update(DISTCC_CLANG_LOCAL='1', DISTCC_VERBOSE='1', PATH=str(self.build)+':'+os.environ['PATH'])
         self.assertEqual(self.receive(self.request(15)), (0, 1, []))
-        result = self.run_command([self.build/'distcc','clang','-flto=thin','-fuse-ld=lld','-shared',
-                                   '-nostdlib','tiny.o','-o','occupied.so'], check=True)
+        result = self.run_command(command, check=True)
         self.assertEqual(result.stderr.count('distcc-thinlto: compiled on'), 1, result.stderr)
+
+    def test_executable_input_scripts_and_local_admission(self):
+        peer = self.peer(stats_response(cpus=4, cores=4, jobs=4, busy=0, running=0))
+        log = self.work/'client.log'
+        (self.work/'main.c').write_text('int main(void){ return 0; }')
+        (self.work/'member.c').write_text('int member(void){ return 1; }')
+        libs = self.work/'libs'
+        libs.mkdir()
+        self.run_command(['clang','-flto=thin','-c','member.c','-o','member.o'], check=True)
+        self.run_command(['llvm-ar','rcs',libs/'libbits.a','member.o'], check=True)
+        (libs/'libvia.so').write_text('/* script */ GROUP ( AS_NEEDED ( "libbits.a" ) )')
+        (libs/'member.o').hardlink_to(self.work/'member.o')
+        (libs/'libobject.so').write_text('INPUT ( "member.o" )')
+        (libs/'libunknown.so').write_text('EXTERN(main)')
+        for compiler in ('clang', 'clang++'):
+            # A distributed backend returns live capacity. Start both idle
+            # admission checks with the same idle worker statistics.
+            self.start_broker(self.host(0, f',tcp,stats={peer.port}'), name=compiler)
+            self.env.update(DISTCC_CLANG_LOCAL='1', DISTCC_LOG=str(log), DISTCC_VERBOSE='1',
+                            PATH=str(self.build)+':'+os.environ['PATH'])
+            self.run_command([compiler,'-x','c++' if compiler == 'clang++' else 'c',
+                              '-flto=thin','-c','main.c','-o','main.o'], check=True)
+            for library in (None, 'via', 'object', 'unknown'):
+                with self.subTest(compiler=compiler, library=library):
+                    flags = ['-Llibs', '-l'+library] if library else []
+                    result = self.run_command([self.build/'distcc',compiler,'-flto=thin','-fuse-ld=lld',
+                                               'main.o','-lm','-lgcc_s',*flags,'-o','app'])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual('distcc-thinlto: submitting' in result.stderr, bool(library), result.stderr)
+                    self.run_command(['./app'], check=True)
+        self.assertIn('operation=B', log.read_text())
+        self.assertNotRegex(log.read_text(), r'forking to execute: \S*distcc-link\b')
 
     @unittest.skipUnless(shutil.which('meson'), 'Meson required')
     def test_meson_install_preserves_origin_rpath(self):

@@ -2,6 +2,13 @@ TODO list for distcc
 
 --> See also TODO and FIXME comments in source files and doc/todo/
 
+Preserve parent traversals in distributed ThinLTO module paths
+
+    An input script in libs/ can name ../member.o. LLD then records
+    libs/../member.o in the backend command and the import index. The staged
+    filesystem contains member.o but can lack libs/. Normalizing the command
+    alone still fails when LLVM opens the original module ID from the index.
+
 Rust proc-macro library lookup through a symlinked build root
 
     With a symlink to the entire temporary build root, the worker cannot load

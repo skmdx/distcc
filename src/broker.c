@@ -633,7 +633,7 @@ static int decode_request(const struct packet *packet, size_t size, int fd,
     case ACQUIRE_POOL: case ACQUIRE_READY: case ACQUIRE_CPP: case TRY_LOCAL: case CGU_CAPACITY:
         if (size != DCC_WORK_HINT_BASE_SIZE && size != sizeof(out->hint)) return 0;
         memcpy(&out->hint, data, size);
-        return size == dcc_work_hint_size(&out->hint) && dcc_work_valid(&out->hint) &&
+        return size == dcc_work_hint_size(&out->hint) && dcc_work_valid(&out->hint, op == TRY_LOCAL) &&
                (op != CGU_CAPACITY || out->hint.kind == DCC_WORK_RUST_CGU);
     default: return 0;
     }

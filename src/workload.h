@@ -43,7 +43,7 @@ struct dcc_work_model {
 };
 struct dcc_source_features { uint64_t hash; uint32_t units, included_bytes; };
 void dcc_work_describe(struct dcc_work_hint *, char **, const char *, const char *, int, int, struct dcc_source_features *);
-int dcc_work_valid(const struct dcc_work_hint *);
+int dcc_work_valid(const struct dcc_work_hint *, int local_preflight);
 double dcc_work_predict(const struct dcc_work_model *, const struct dcc_work_hint *);
 int dcc_work_peer(const struct dcc_work_model *, const struct dcc_work_hint *);
 void dcc_work_observe(struct dcc_work_model *, const struct dcc_work_hint *, double, int);

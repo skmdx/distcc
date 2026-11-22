@@ -73,7 +73,8 @@ remains in use, so warm cache entries do not start backend jobs.
 For a resolved ELF link the resident Clang helper runs LLD directly. Native
 inputs use a local slot. One or two standalone bitcode objects totaling at most
 64 KiB can use an idle local broker lane. Bitcode archives and inputs whose
-contents depend on linker scripts or response files use the distributor.
+contents cannot be resolved use the distributor. Standard GNU input scripts
+are inspected recursively, including libraries named by GROUP and AS_NEEDED.
 Heavy modules are prepared through LLVM's post-import hook, partitioned with
 LLVM's module splitter, and optimized/generated on multiple workers. The number
 of partitions comes from the module's instruction share and the broker's total
@@ -83,7 +84,7 @@ load does not reshuffle the partitions between links; placement still accounts
 for live load. This gives slower workers smaller pieces without increasing
 concurrent jobs. The split is bounded by the available slots, function count,
 and total instructions divided by the largest function. Each partition also
-requires at least 32 instructions on average when splitting. Preparation overlaps
+requires at least 64 instructions on average when splitting. Preparation overlaps
 ordinary backends, and ready partitions join the same work queue. A module that stays in one piece returns its object
 directly. For multiple partitions, a relocatable merge restores private symbol bindings
 before LLD consumes the result. Constructors, TLS and exception handling retain

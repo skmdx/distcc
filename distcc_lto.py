@@ -209,9 +209,10 @@ def distribute(request, kind, link=None):
                 task['index'] = index
                 if total_instructions and len(task['outputs']) == 1:
                     useful = row['instructions'] // row['largest_function'] if row['largest_function'] else 1
-                    # Charge each additional backend for at least 32 IR instructions.
+                    # Keep a 223-instruction size-optimized CGU splittable,
+                    # while amortizing preparation across each backend.
                     # Tiny modules otherwise dominate an equally tiny link by ratio alone.
-                    task['partitions'] = max(1, min(slots, row['functions'], useful, row['instructions'] // 32,
+                    task['partitions'] = max(1, min(slots, row['functions'], useful, row['instructions'] // 64,
                         math.ceil(row['instructions'] * parallelism / total_instructions)))
 
         def priority(task):

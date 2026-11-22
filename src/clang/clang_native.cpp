@@ -169,7 +169,7 @@ int execute(int fd, unsigned operation, int journal) {
     if (operation == 'B') {
         if (!argv[1]) return 1;
         if (!llvm::sys::fs::equivalent(argv[1], DCC_LLD_PATH)) {
-            execv(argv[1], argv+1);
+            execvp(argv[1], argv+1);
             llvm::errs() << argv[1] << ": " << strerror(errno) << '\n';
             return 1;
         }

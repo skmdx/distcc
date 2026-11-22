@@ -199,12 +199,15 @@ class BrokerTestCase(DistccTestCase):
 
 class BrokerDirectTest(BrokerTestCase):
     def test_thinlto_preflight_obeys_local_lane_capacity(self):
-        local = self.peer(stats_response(cpus=1, cores=1, jobs=1, busy=0, running=0))
-        self.start_broker(self.host(0, f',tcp,stats={local.port}', slots=1))
-        hint = (7, 4096, 8)
-        owner = self.request(15, hint)
+        local = self.peer(stats_response(cpus=2, cores=1, jobs=2, busy=0, running=0))
+        remote = self.peer(stats_response(cpus=4, cores=4, jobs=4, busy=0, running=0))
+        self.start_broker(self.host(0, f',tcp,stats={local.port},speed=0.49', slots=2) +
+                          f' 127.0.0.2:{self.ports[1]}/4,tcp,stats={remote.port},speed=1')
+        def acquire():
+            return self.request(15, (0, 4096, 8), memory_class=1 + JOB_THINLTO * 64 + 12)
+        owner = acquire()
         self.assertEqual(self.receive(owner), (0, 1, []))
-        self.assertEqual(self.receive(self.request(15, hint)), (0, 0, []))
+        self.assertEqual(self.receive(acquire()), (0, 0, []))
 
     def test_without_local_tcp_worker_declines_and_releases_client(self):
         # A local legacy worker is not eligible for TRY_LOCAL reservations.

@@ -665,12 +665,18 @@ class ClangLinkTest(LinkTestCase):
         self.assertEqual(local.read_bytes(), output.read_bytes())
         self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
 
+    def archive_lto_main(self, flag):
+        # Exercise the distributed linker even when a local CPU is idle.
+        obj = self.work / 'main.o'
+        subprocess.run([self.compiler, flag, '-c', self.cpp, '-o', obj], check=True, capture_output=True)
+        self.obj = self.work / 'libmain.a'
+        subprocess.run(['llvm-ar', 'rcs', self.obj, obj], check=True, capture_output=True)
+
     def test_lto(self):
         for mode in ('thin', 'full'):
             with self.subTest(mode=mode):
                 flag = '-flto=' + mode
-                subprocess.run([self.compiler, flag, '-c', str(self.cpp), '-o', str(self.obj)],
-                               check=True, capture_output=True)
+                self.archive_lto_main(flag)
                 output, result = self.link([flag])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('distcc-thinlto: compiled on ' if mode == 'thin' and self.transport else
@@ -697,8 +703,7 @@ class ClangLinkTest(LinkTestCase):
         self.assertEqual(subprocess.check_output([str(output)], text=True), 'linked\n')
 
     def test_lld_optimization_options(self):
-        subprocess.run([self.compiler, '-flto=thin', '-c', str(self.cpp), '-o', str(self.obj)],
-                       check=True, capture_output=True)
+        self.archive_lto_main('-flto=thin')
         for dash in ('-', '--'):
             flags = ['-flto=thin', '-Wl,--threads=2,--lto-O3,' + ','.join(
                      dash + option for option in ('icf=all', 'undefined-version'))]

@@ -9,7 +9,6 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#include <xxhash.h>
 #include "distcc.h"
 #include "compile.h"
 #include "broker.h"
@@ -53,13 +52,10 @@ static int lld(const char *path)
         name[7] && name[7+strspn(name+7, "0123456789")] == '\0');
 }
 
-static int local_lease(char **invocation, int bytes)
+static int local_lease(int bytes)
 {
-    uint64_t key = bytes;
-    for (char **p = invocation; *p; ++p) key = XXH64(*p, strlen(*p)+1, key);
     struct dcc_work_hint hint = {.kind = DCC_WORK_THINLTO, .bytes = bytes,
-        .key = key ? key : 1, .memory_class = 1 + DCC_JOB_THINLTO * DCC_MEMORY_BUCKETS +
-                                               dcc_resource_bucket(bytes)};
+        .memory_class = 1 + DCC_JOB_THINLTO * DCC_MEMORY_BUCKETS + dcc_resource_bucket(bytes)};
     return dcc_broker_try_local(&hint);
 }
 
@@ -68,7 +64,7 @@ static int run_link(char **argv, char **args, int errors, int bytes, int offload
     int n = dcc_argv_len(args);
     char **cmd = calloc(n+6, sizeof(*cmd));
     if (!cmd) return EXIT_OUT_OF_MEMORY;
-    int lease = bytes > 0 ? local_lease(args, bytes) : -1;
+    int lease = bytes > 0 ? local_lease(bytes) : -1;
     int distributed = bytes < 0 || (bytes > 0 && lease < 0);
     int i = 0, lock = -1, ret = EXIT_OUT_OF_MEMORY;
     char *resolved = NULL, *device = NULL, *driver = NULL, *transport = NULL, *compiler = NULL;

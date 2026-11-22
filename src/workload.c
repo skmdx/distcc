@@ -174,13 +174,18 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
     }
 }
 
-int dcc_work_valid(const struct dcc_work_hint *hint)
+int dcc_work_valid(const struct dcc_work_hint *hint, int local_preflight)
 {
     if (!memchr(hint->rust_host_features, 0, sizeof(hint->rust_host_features)) ||
         (*hint->rust_host_features && hint->kind != DCC_WORK_RUST)) return 0;
     if (!memchr(hint->cgu_backend, 0, sizeof(hint->cgu_backend)) ||
         (*hint->cgu_backend && hint->kind != DCC_WORK_RUST_CGU) ||
         (hint->rust_compiler && hint->kind != DCC_WORK_RUST && hint->kind != DCC_WORK_RUST_CGU)) return 0;
+    /* A capacity-only link lease reserves memory, but has no backend work
+     * sample. Keyed reservations continue to identify actual backend jobs. */
+    if (local_preflight && !hint->key && hint->kind == DCC_WORK_THINLTO)
+        return hint->bytes && !hint->work_units && !hint->family && !hint->scope_key &&
+               hint->memory_class == 1 + DCC_JOB_THINLTO * DCC_MEMORY_BUCKETS + dcc_resource_bucket(hint->bytes);
     if (hint->memory_class > DCC_JOB_KIND_COUNT * DCC_MEMORY_BUCKETS ||
         (!!hint->key != !!hint->memory_class)) return 0;
     /* Backend snapshots include dependency artifacts and compiler data;
