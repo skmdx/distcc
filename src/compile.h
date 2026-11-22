@@ -34,7 +34,6 @@ int dcc_compile_remote(char **argv,
                        char *input_fname,
                        char *cpp_fname,
                        int cpp_fd,
-                       char **file_names,
                        char **auxiliary,
                        struct dcc_job *prepared_job,
                        char *output_fname,
@@ -49,18 +48,9 @@ int dcc_compile_remote(char **argv,
 
 /* compile.c */
 
-extern int dcc_scan_includes;
 
 int dcc_run_local_command(char **argv);
 
 int dcc_build_somewhere_timed(char *argv[],
                               int sg_level,
                               int *status);
-
-/* Declared here for testing purposes. */
-int dcc_fresh_dependency_exists(const char *dotd_fname,
-                                const char *exlude_pat,
-                                time_t reference_time,
-                                char **fresh_dependency);
-
-int dcc_discrepancy_filename(char **filename);

@@ -1,10 +1,12 @@
 /* Compiler-owned remote lookups. SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
-#include "../../src/tcp_job.h"
-#include "../../src/job.h"
-#include "../../src/file_cache.h"
-#include "../../src/frontend_fs.h"
-#include "../../src/remote_files.h"
+#include "../tcp_job.h"
+#include "../job.h"
+extern "C" {
+#include "../file_cache.h"
+}
+#include "../frontend_fs.h"
+#include "../remote_files.h"
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/FrontendTool/Utils.h>
 #include <clang/Lex/HeaderSearchOptions.h>

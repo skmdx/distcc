@@ -21,7 +21,7 @@ class PythonBuildEnvironmentTest(unittest.TestCase):
             subprocess.run([clang, '-x', 'c', '-fPIC', '-c', '-', '-o', str(obj)],
                            input='int answer(void) { return 42; }\n', text=True,
                            check=True, capture_output=True)
-            for helper in ('distcc-link', 'distcc-clang',
+            for helper in ('distcc-link',
                            'distcc-thinlto', 'distcc-offload-link'):
                 with self.subTest(helper=helper):
                     result = subprocess.run([sys.executable, '-S', '-c', '''
@@ -36,8 +36,6 @@ if helper == 'distcc-link':
     command, diagnostics = entry['clang_link_command']([compiler, '-shared', '-fuse-ld=lld', obj, '-o', output])
     subprocess.run(command, check=True)
     assert ctypes.CDLL(output).answer() == 42
-elif helper == 'distcc-clang':
-    assert callable(entry['load_frontend'](compiler).compile)
 else:
     import xxhash
     assert xxhash.xxh3_64(b'input').digest()

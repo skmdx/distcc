@@ -110,67 +110,25 @@ static int dcc_run_job(int in_fd, int out_fd, enum dcc_protover protover,
 #include "gcc_files.h"
 static int add_system_includes(char ***argv, const char *root, char **defaults)
 {
-    char *directory = NULL, **args = NULL;
-    DIR *dir = NULL;
-    FILE *manifest = NULL;
-    unsigned char header[8];
+    char **args = NULL;
     char path[PATH_MAX];
-    struct stat st;
     int ret = EXIT_PROTOCOL_ERROR;
-    unsigned count;
-    if (defaults) {
-        count = 0;
-        while (defaults[count] && *defaults[count]) ++count;
-        if (!defaults[count]) goto done;
-    } else {
-    if (asprintf(&directory, "%s/" DCC_SYSTEM_HEADERS, root) < 0)
-        return EXIT_OUT_OF_MEMORY;
-    dir = opendir(directory);
-    if (!dir) goto done;
-    struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-        if (manifest) goto done;
-        /* Same-host inputs may be links to sealed descriptors. */
-        int fd = openat(dirfd(dir), entry->d_name, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) goto done;
-        if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size > 16 * 1024 * 1024) {
-            close(fd);
-            goto done;
-        }
-        manifest = fdopen(fd, "rb");
-        if (!manifest) { close(fd); goto done; }
-        if (unlinkat(dirfd(dir), entry->d_name, 0)) goto done;
-    }
-    if (!manifest || fread(header, 1, 8, manifest) != 8 || memcmp(header, "DCSI", 4)) goto done;
-    count = dcc_tcp_get32(header + 4);
-    }
+    unsigned count = 0;
+    while (defaults[count] && *defaults[count]) ++count;
+    if (!defaults[count]) return EXIT_PROTOCOL_ERROR;
     if (count > 4096) goto done;
     ret = dcc_copy_argv(*argv, &args, 4 * count + 1);
     if (ret) goto done;
     ret = EXIT_PROTOCOL_ERROR;
     char *option;
-    if (!defaults) {
-        option = strdup("-nostdinc");
-        if (!option) { ret = EXIT_OUT_OF_MEMORY; goto done; }
-        dcc_argv_append(args, option);
-    }
     unsigned preinclude_end = 1;
     for (unsigned i = 0; i < count; ++i) {
         unsigned kind, length;
-        if (defaults) {
-            kind = (unsigned char)defaults[i][0] - '0';
-            length = strlen(defaults[i]+1);
-            if (!length || length >= sizeof(path)) goto done;
-            memcpy(path, defaults[i]+1, length);
-        } else {
-            if (fread(header, 1, 8, manifest) != 8) goto done;
-            kind = dcc_tcp_get32(header); length = dcc_tcp_get32(header + 4);
-            if (!length || length >= sizeof(path) || fread(path, 1, length, manifest) != length) goto done;
-        }
-        if ((kind > 5 && !(defaults && kind == 7)) ||
-            (kind != 3 && kind != 4 && path[0] != '/' && !defaults) ||
-            memchr(path, 0, length)) goto done;
+        kind = (unsigned char)defaults[i][0] - '0';
+        length = strlen(defaults[i]+1);
+        if (!length || length >= sizeof(path) ||
+            (kind != 0 && kind != 3 && kind != 4 && kind != 5 && kind != 7)) goto done;
+        memcpy(path, defaults[i]+1, length);
         path[length] = 0;
         if (kind == 3) {
             // GCC's target preinclude precedes user -include operands. In
@@ -200,23 +158,15 @@ static int add_system_includes(char ***argv, const char *root, char **defaults)
                 goto done;
             }
             dcc_argv_append(args, option);
-            if (defaults) {
-                option = strdup("-fplugin-arg-distcc_gcc_scan-client-search=1");
-                if (!option) { ret = EXIT_OUT_OF_MEMORY; goto done; }
-                dcc_argv_append(args, option);
-            }
+            option = strdup("-fplugin-arg-distcc_gcc_scan-client-search=1");
+            if (!option) { ret = EXIT_OUT_OF_MEMORY; goto done; }
+            dcc_argv_append(args, option);
             continue;
         }
         if (asprintf(&option, "%s%s%s", kind == 0 || kind == 5 ? "-isystem" : kind == 7 ? "-I" : "",
-                     defaults && path[0] != '/' ? "" : root, path) < 0) {
+                     path[0] != '/' ? "" : root, path) < 0) {
             ret = EXIT_OUT_OF_MEMORY;
             goto done;
-        }
-        const char *prefix[] = {"-Xclang", kind == 1 ? "-internal-isystem" : "-internal-externc-isystem", "-Xclang"};
-        for (unsigned j = 0; j < (kind == 1 || kind == 2 ? 3 : 0); ++j) {
-            char *arg = strdup(prefix[j]);
-            if (!arg) { free(option); ret = EXIT_OUT_OF_MEMORY; goto done; }
-            dcc_argv_append(args, arg);
         }
         dcc_argv_append(args, option);
         if (kind == 5) {
@@ -228,16 +178,12 @@ static int add_system_includes(char ***argv, const char *root, char **defaults)
             dcc_argv_append(args, option);
         }
     }
-    if (manifest && (fgetc(manifest) != EOF || ferror(manifest) || rmdir(directory))) goto done;
     dcc_free_argv(*argv);
     *argv = args;
     args = NULL;
     ret = 0;
 done:
     if (args) dcc_free_argv(args);
-    if (manifest) fclose(manifest);
-    if (dir) closedir(dir);
-    free(directory);
     return ret;
 }
 
@@ -248,9 +194,7 @@ int dcc_execute_job(struct dcc_job *job, const char *root, int cancel_fd,
     int ret;
     dcc_job_result_init(result);
     if (job->kind == DCC_JOB_LINK || dcc_job_tree(job)) version = DCC_VER_LINK;
-    else dcc_get_protover_from_features(DCC_COMPRESS_LZ4_STREAM,
-            job->kind == DCC_JOB_PUMP || job->kind == DCC_JOB_GCC_FRONTEND
-            ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT, &version);
+    else version = DCC_VER_STREAM;
     dcc_job_summary_clear();
     ret = dcc_run_job(cancel_fd, -1, version, job, root, result);
     dcc_job_summary_append(job->kind == DCC_JOB_GCC_FRONTEND
@@ -680,20 +624,19 @@ static int tweak_input_argument_for_server(char **argv,
 }
 
 
-static int pack_include_arguments(char **argv, const unsigned *indices, unsigned count)
+static int pack_include_arguments(char **argv, const unsigned *indices, unsigned count, int *include_fd)
 {
-    char path[] = ".distcc-includes-XXXXXX", *option = NULL;
+    char *option = NULL;
     FILE *file;
     unsigned i, read, write, next;
     int fd, error;
     if (!count) return 0;
-    /* The current directory is inside this job's private input tree. Its
-     * removal owns this file too. A relative name also avoids commas in
-     * TMPDIR being interpreted as -Wp argument separators. */
-    fd = mkstemp(path);
+    /* The GCC input tree is read-only. Let cc1 open the packed arguments
+     * through an inherited descriptor, independently of the worker's cwd. */
+    fd = dcc_job_memfd("distcc-includes");
     if (fd < 0) return EXIT_IO_ERROR;
     file = fdopen(fd, "w");
-    if (!file) { close(fd); unlink(path); return EXIT_IO_ERROR; }
+    if (!file) { close(fd); return EXIT_IO_ERROR; }
     for (i = 0; i < count; ++i) {
         fputc('"', file);
         for (const char *p = argv[indices[i]]; *p; ++p) {
@@ -702,14 +645,14 @@ static int pack_include_arguments(char **argv, const unsigned *indices, unsigned
         }
         fputs("\"\n", file);
     }
-    error = ferror(file);
+    error = ferror(file) || fflush(file);
+    if (!error && (*include_fd = dup(fd)) < 0) error = 1;
     if (fclose(file)) error = 1;
-    if (error) { unlink(path); return EXIT_IO_ERROR; }
+    if (error) return EXIT_IO_ERROR;
     /* A driver @file is expanded before GCC builds COLLECT_GCC_OPTIONS,
      * which still exceeds Linux's per-string limit. Let cc1 expand only
      * the ordered -I options, leaving driver actions and other flags intact. */
-    if (asprintf(&option, "-Wp,@%s", path) < 0) {
-        unlink(path);
+    if (asprintf(&option, "-Wp,@/proc/self/fd/%d", *include_fd) < 0) {
         return EXIT_OUT_OF_MEMORY;
     }
     for (read = write = next = 0; argv[read]; ++read) {
@@ -725,7 +668,7 @@ static int pack_include_arguments(char **argv, const unsigned *indices, unsigned
 
 /** Relocate include paths and pack bulky GCC search lists for cc1. */
 static int tweak_include_arguments_for_server(char **argv,
-                                              const char *root_dir)
+                                              const char *root_dir, int *include_fd)
 {
     int index_of_first_filename_char = 0;
     const char *include_option;
@@ -733,7 +676,7 @@ static int tweak_include_arguments_for_server(char **argv,
     int ret = 0;
     size_t bytes = 0, prefix = strlen(root_dir);
     for (i = 0; argv[i]; ++i) bytes += strlen(argv[i]) + prefix + 3;
-    if (bytes >= 64 * 1024 && !strstr(dcc_find_basename(argv[0]), "clang")) {
+    if (bytes >= 64 * 1024) {
         indices = malloc(i * sizeof(*indices));
         if (!indices) return EXIT_OUT_OF_MEMORY;
     }
@@ -773,7 +716,7 @@ static int tweak_include_arguments_for_server(char **argv,
         }
         if (!argv[i]) break;
     }
-    ret = pack_include_arguments(argv, indices, count);
+    ret = pack_include_arguments(argv, indices, count, include_fd);
 done:
     free(indices);
     return ret;
@@ -831,25 +774,17 @@ static int tweak_arguments_for_server(char **argv,
                                       const char *root_dir,
                                       const char *deps_fname,
                                       char **dotd_target,
-                                      char ***tweaked_argv)
+                                      char ***tweaked_argv, int *include_fd)
 {
     int ret;
     char *debug_map, *macro_map;
     int argc = dcc_argv_len(argv), i, client_maps = 0;
-    int preserve_spelling = strstr(dcc_find_basename(argv[0]), "clang") != NULL;
     for (i = 1; argv[i]; i++)
         if (str_startswith("-fdebug-prefix-map=/", argv[i]) ||
             str_startswith("-fmacro-prefix-map=/", argv[i]) ||
             str_startswith("-ffile-prefix-map=/", argv[i]))
             client_maps++;
-    for (i = 1; preserve_spelling && argv[i]; i++)
-        if (str_startswith("-ffile-prefix-map=", argv[i]) ||
-            str_startswith("-fmacro-prefix-map=", argv[i]) ||
-            !strcmp(argv[i], "-ffile-reproducible") ||
-            !strcmp(argv[i], "-fno-file-reproducible"))
-            preserve_spelling = 0;
-    *dotd_target = 0;
-    if ((ret = dcc_copy_argv(argv, tweaked_argv, 5 + preserve_spelling + client_maps)))
+    if ((ret = dcc_copy_argv(argv, tweaked_argv, 5 + client_maps)))
       return 1;
 
     /* Remap absolute input names and DWARF in the compiler, preserving relative
@@ -861,18 +796,12 @@ static int tweak_arguments_for_server(char **argv,
     if (!debug_map) return EXIT_OUT_OF_MEMORY;
     checked_asprintf(&macro_map, "-fmacro-prefix-map=%s=", root_dir);
     if (!macro_map) { free(debug_map); return EXIT_OUT_OF_MEMORY; }
-    memmove(*tweaked_argv + 3 + preserve_spelling, *tweaked_argv + 1, argc * sizeof(char *));
+    memmove(*tweaked_argv + 3, *tweaked_argv + 1, argc * sizeof(char *));
     (*tweaked_argv)[1] = debug_map;
     (*tweaked_argv)[2] = macro_map;
-    /* Clang's prefix map implicitly normalizes './' even for unmatched paths.
-     * Restore its default only when the user did not request that behavior. */
-    if (preserve_spelling &&
-        !((*tweaked_argv)[3] = strdup("-fno-file-reproducible")))
-        return EXIT_OUT_OF_MEMORY;
-
     /* Preserve user mappings after relocating absolute input paths. Keep the
      * user's order and let their mappings take precedence over our default. */
-    for (i = 3 + preserve_spelling; i < argc + 2 + preserve_spelling; ++i) {
+    for (i = 3; i < argc + 2; ++i) {
         char *arg = (*tweaked_argv)[i];
         if (str_startswith("-fdebug-prefix-map=/", arg) ||
             str_startswith("-fmacro-prefix-map=/", arg) ||
@@ -900,52 +829,9 @@ static int tweak_arguments_for_server(char **argv,
     dcc_argv_append(*tweaked_argv, strdup("-MF"));
     dcc_argv_append(*tweaked_argv, strdup(deps_fname));
 
-    if ((ret = tweak_include_arguments_for_server(*tweaked_argv, root_dir)))
+    if ((ret = tweak_include_arguments_for_server(*tweaked_argv, root_dir, include_fd)))
         return ret;
     return tweak_input_argument_for_server(*tweaked_argv, root_dir);
-}
-
-
-/**
- * Read the client working directory from in_fd socket,
- * and set up the server side directory corresponding to that.
- * Inputs:
- *   @p in_fd: the file descriptor for the socket.
- * Outputs:
- *   @p temp_dir: a temporary directory on the server,
- *                corresponding to the client's root directory (/),
- *   @p client_side_cwd: the current directory on the client
- *   @p server_side_cwd: the corresponding directory on the server;
- *                server_side_cwd = temp_dir + client_side_cwd
- **/
-static int make_temp_dir_and_chdir_for_cpp(int in_fd,
-        char **temp_dir, char **client_side_cwd, char **server_side_cwd)
-{
-
-        int ret = 0;
-
-        if ((ret = dcc_get_new_tmpdir(temp_dir)))
-            return ret;
-        /* Compilers canonicalize their working directory in DWARF. Keep the
-         * remapping prefix in the same form when TMPDIR contains symlinks. */
-        char *canonical = realpath(*temp_dir, NULL);
-        if (!canonical) return EXIT_IO_ERROR;
-        free(*temp_dir);
-        *temp_dir = canonical;
-        if ((ret = dcc_r_cwd(in_fd, client_side_cwd)))
-            return ret;
-
-        checked_asprintf(server_side_cwd, "%s%s", *temp_dir, *client_side_cwd);
-        if (*server_side_cwd == NULL) {
-            ret = EXIT_OUT_OF_MEMORY;
-        } else if ((ret = dcc_mk_tmp_ancestor_dirs(*server_side_cwd))) {
-            ; /* leave ret the way it is */
-        } else if ((ret = dcc_mk_tmpdir(*server_side_cwd))) {
-            ; /* leave ret the way it is */
-        } else if (chdir(*server_side_cwd) == -1) {
-            ret = EXIT_IO_ERROR;
-        }
-        return ret;
 }
 
 
@@ -1025,38 +911,6 @@ done:
     return ret;
 }
 
-/* Preprocessor line markers and expanded __FILE__ strings must name client
- * paths, not the private directory used to assemble the remote input tree. */
-static int remap_preprocessed(const char *file, const char *root)
-{
-    char *replacement = NULL, *line = NULL;
-    size_t capacity = 0, root_len = strlen(root);
-    FILE *input = NULL, *output = NULL;
-    int ret = EXIT_IO_ERROR;
-    if (dcc_make_tmpnam("distccd", ".i", &replacement))
-        goto done;
-    if (!(input = fopen(file, "r")) || !(output = fopen(replacement, "w")))
-        goto done;
-    while (getline(&line, &capacity, input) >= 0) {
-        char *from = line, *match;
-        while ((match = strstr(from, root))) {
-            if (fwrite(from, 1, match - from, output) != (size_t)(match - from))
-                goto done;
-            from = match + root_len;
-        }
-        if (fputs(from, output) == EOF) goto done;
-    }
-    if (ferror(input) || fflush(output)) goto done;
-    if (rename(replacement, file)) goto done;
-    ret = 0;
-done:
-    if (input) fclose(input);
-    if (output && fclose(output)) ret = EXIT_IO_ERROR;
-    free(line);
-    free(replacement);
-    return ret;
-}
-
 /** Read a request, run the compiler, and send a response. */
 static int dcc_run_job(int in_fd,
                        int out_fd, enum dcc_protover protover,
@@ -1079,14 +933,14 @@ static int dcc_run_job(int in_fd,
     int time_ms;
     char *time_str;
     int job_result = -1;
-    enum dcc_cpp_where cpp_where;
+    const int gcc_frontend = job && job->kind == DCC_JOB_GCC_FRONTEND;
     char *server_cwd = NULL;
     char *client_cwd = NULL;
     int changed_directory = 0;
     int preprocess_only = 0;
     int stdout_output = 0;
     void *filesystem = NULL;
-    int gcc_stdin = -1;
+    int gcc_stdin = -1, include_fd = -1;
     char **gcc_defaults = NULL, **job_argv = job ? job->argv : NULL;
 
     gettimeofday(&start, NULL);
@@ -1182,7 +1036,7 @@ static int dcc_run_job(int in_fd,
         goto out_cleanup;
     }
 
-    dcc_get_features_from_protover(protover, &compr, &cpp_where);
+    if (dcc_get_features_from_protover(protover, &compr) && protover != DCC_VER_LINK) return EXIT_PROTOCOL_ERROR;
 
     if (job && job->kind == DCC_JOB_GCC_FRONTEND) {
         if (dcc_argv_len(job->argv) < 6 || !job->fs_channel) {
@@ -1222,8 +1076,7 @@ static int dcc_run_job(int in_fd,
         }
     }
 
-    if (cpp_where == DCC_CPP_ON_SERVER) {
-        if (job) {
+    if (gcc_frontend) {
             if (!temp_dir) temp_dir = strdup(root);
             client_cwd = strdup(job->cwd);
             if (!temp_dir || !client_cwd ||
@@ -1234,9 +1087,6 @@ static int dcc_run_job(int in_fd,
             if ((ret = dcc_mk_tmp_ancestor_dirs(server_cwd)) ||
                 (ret = dcc_mk_tmpdir(server_cwd))) goto out_cleanup;
             if (chdir(server_cwd)) { ret = EXIT_IO_ERROR; goto out_cleanup; }
-        } else if ((ret = make_temp_dir_and_chdir_for_cpp(in_fd,
-                          &temp_dir, &client_cwd, &server_cwd)))
-            goto out_cleanup;
         changed_directory = 1;
     }
 
@@ -1251,9 +1101,7 @@ static int dcc_run_job(int in_fd,
         /* The argv arrived intact. Consume its input and return a completed
          * rejection, rather than an EOF that quarantines a healthy worker.
          * Staged TCP jobs already own their complete input snapshot. */
-        if (!job && (ret = cpp_where == DCC_CPP_ON_SERVER
-                ? dcc_r_many_files(in_fd, temp_dir, compr)
-                : dcc_r_token_file(in_fd, "DOTI", "/dev/null", compr)))
+        if (!job && (ret = dcc_r_token_file(in_fd, "DOTI", "/dev/null", compr)))
             goto out_cleanup;
         rs_log_error("compiler arguments cannot be distributed");
         job_result = STATS_REJ_BAD_REQ;
@@ -1284,14 +1132,10 @@ static int dcc_run_job(int in_fd,
     if ((ret = dcc_make_tmpnam("distccd", ".o", &temp_o)))
         goto out_cleanup;
 
-    /* if the protocol is multi-file, then we need to do the following
-     * in a loop.
-     */
-    if (cpp_where == DCC_CPP_ON_SERVER) {
-        if ((!job && (ret = dcc_r_many_files(in_fd, temp_dir, compr)))
-            || (!stdout_output && (ret = dcc_set_output(argv, temp_o)))
+    if (gcc_frontend) {
+        if ((!stdout_output && (ret = dcc_set_output(argv, temp_o)))
             || (ret = tweak_arguments_for_server(argv, temp_dir, deps_fname,
-                                                &dotd_target, &tweaked_argv)))
+                                                &dotd_target, &tweaked_argv, &include_fd)))
             goto out_cleanup;
         /* Repeat the switcharoo trick a few lines above. */
         dcc_free_argv(argv);
@@ -1361,7 +1205,7 @@ static int dcc_run_job(int in_fd,
        }
     }
 
-    if (cpp_where == DCC_CPP_ON_SERVER &&
+    if (gcc_frontend &&
         (ret = add_system_includes(&argv, temp_dir, gcc_defaults))) {
         if (ret != EXIT_PROTOCOL_ERROR) goto out_cleanup;
         /* The request arrived intact but its metadata is invalid. Return a
@@ -1374,9 +1218,7 @@ static int dcc_run_job(int in_fd,
     }
 
     int using_helper = 0;
-    /* Pump inputs need Clang's rooted filesystem for absolute includes and
-     * __has_include probes. The frontend also preserves source identity for
-     * LLVM IR PGO names, which prefix-map options do not affect. */
+    /* The Clang frontend preserves source identity for LLVM IR PGO names. */
     if (dcc_offload_language(argv)) {
         for (i = 1; argv[i]; ++i) {
             if (root && (!strncmp(argv[i], "--rocm-device-lib-path=", 23) ||
@@ -1400,9 +1242,7 @@ static int dcc_run_job(int in_fd,
         }
     } else if (strstr(dcc_find_basename(argv[0]), "clang")) {
         ret = dcc_clang_command(&argv,
-            job ? root : cpp_where == DCC_CPP_ON_SERVER ? temp_dir : "",
-            orig_input, job ? job->cwd : client_cwd ? client_cwd : "",
-            cpp_where == DCC_CPP_ON_SERVER, job ? job->count : 1, &using_helper);
+            job ? root : "", orig_input, job ? job->cwd : "", job ? job->count : 1, &using_helper);
         if (ret) goto out_cleanup;
     }
 
@@ -1419,22 +1259,15 @@ static int dcc_run_job(int in_fd,
     }
 
 report_result:
-    if (preprocess_only && cpp_where == DCC_CPP_ON_SERVER) {
-        if (((stdout_output || !status) &&
-             (ret = remap_preprocessed(stdout_output ? out_fname : temp_o, temp_dir))) ||
-            (ret = remap_preprocessed(err_fname, temp_dir)))
-            goto out_cleanup;
-    }
-
     if (result) {
         result->status = status;
         if ((ret = retain_artifact(result, DCC_JOB_STDERR, err_fname)) ||
             (ret = retain_artifact(result, DCC_JOB_STDOUT, out_fname))) goto out_cleanup;
         if (!status) {
-            if (cpp_where == DCC_CPP_ON_SERVER && !preprocess_only &&
+            if (gcc_frontend && !preprocess_only &&
                 (ret = dcc_fix_debug_info(temp_o, "/", temp_dir))) goto out_cleanup;
             if ((ret = retain_artifact(result, DCC_JOB_OBJECT, temp_o))) goto out_cleanup;
-            if (cpp_where == DCC_CPP_ON_SERVER) {
+            if (gcc_frontend) {
                 char *cleaned = NULL;
                 ret = dcc_cleanup_dotd(deps_fname, &cleaned, temp_dir,
                                       dotd_target ? dotd_target : orig_output, temp_o);
@@ -1460,35 +1293,8 @@ report_result:
         if (job_result == -1)
             job_result = STATS_COMPILE_ERROR;
     } else {
-        if (cpp_where == DCC_CPP_ON_SERVER && !preprocess_only) {
-          rs_trace("fixing up debug info");
-          /*
-           * We update the debugging information, replacing all occurrences
-           * of temp_dir (the server temp directory that corresponds to the
-           * client's root directory) with "/", to convert server path
-           * names to client path names.  This is safe to do only because
-           * temp_dir is of the form "/var/tmp/distccd-XXXXXX" where XXXXXX
-           * is randomly chosen by mkdtemp(), which makes it inconceivably
-           * unlikely that this pattern could occur in the debug info by
-           * chance.
-           */
-          if ((ret = dcc_fix_debug_info(temp_o, "/", temp_dir)))
-            goto out_cleanup;
-        }
         if ((ret = dcc_x_file(out_fd, temp_o, "DOTO", compr, NULL)))
             goto out_cleanup;
-
-        if (cpp_where == DCC_CPP_ON_SERVER) {
-            char *cleaned_dotd;
-            ret = dcc_cleanup_dotd(deps_fname,
-                                   &cleaned_dotd,
-                                   temp_dir,
-                                   dotd_target ? dotd_target : orig_output,
-                                   temp_o);
-            if (ret) goto out_cleanup;
-            ret = dcc_x_file(out_fd, cleaned_dotd, "DOTD", compr, NULL);
-            free(cleaned_dotd);
-        }
 
         job_result = STATS_COMPILE_OK;
     }
@@ -1506,6 +1312,7 @@ report_result:
 
 out_cleanup:
 
+    if (include_fd >= 0) close(include_fd);
     if (gcc_stdin >= 0) close(gcc_stdin);
     /* Restore the working directory, if needed. */
     if (changed_directory) {

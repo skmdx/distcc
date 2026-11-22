@@ -49,6 +49,23 @@ int dcc_argv_encode(const char *argc_token, const char *argv_token, char **argv,
     return 0;
 }
 
+int dcc_argv_file_write(int fd, const char *argc_token, const char *argv_token, char **argv)
+{
+    char *bytes;
+    size_t size;
+    int ret = dcc_argv_encode(argc_token, argv_token, argv, &bytes, &size);
+    if (ret) return ret;
+    size_t offset = 0;
+    while (offset < size) {
+        ssize_t n = write(fd, bytes + offset, size - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ret = EXIT_IO_ERROR; break; }
+        offset += (size_t)n;
+    }
+    free(bytes);
+    return ret;
+}
+
 int dcc_parse_token_int(const char *bytes, const char *expected, unsigned *value)
 {
     if (memcmp(bytes, expected, 4)) return EXIT_PROTOCOL_ERROR;

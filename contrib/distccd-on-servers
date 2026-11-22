@@ -14,7 +14,7 @@ function Usage {
 Obligatory environment variables:\n\
   DISTCC_LOC         Location of distcc, a path of the form ../distcc.\n\
   DISTCCD_MACHINES   Hostnames of compiler servers.\n\
-  DISTCCD_REMOTE_LOC Path where distcc_pump/distcc resides on servers.\n\
+  DISTCCD_REMOTE_LOC Path where distccd resides on servers.\n\
   DISTCCD_ARGS       Arguments and options for distccd command on server.\n\
   DISTCCD_TMPDIR     Exported to server as TMPDIR before start.\n\
 See script for details.\n\

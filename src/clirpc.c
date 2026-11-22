@@ -47,8 +47,6 @@
 #include "file_cache.h"
 #include "hosts.h"
 #include "state.h"
-#include "include_server_if.h"
-#include "emaillog.h"
 
 /**
  * @file
@@ -63,24 +61,6 @@ int dcc_x_req_header(int fd,
                      enum dcc_protover protover)
 {
      return dcc_x_token_int(fd, "DIST", protover);
-}
-
-
-
-/**
- * Transmit the current working directory
- */
-int dcc_x_cwd(int fd)
-{
-    int ret;
-    char cwd[MAXPATHLEN + 1];
-    char * cwd_ret;
-    cwd_ret = getcwd(cwd, MAXPATHLEN);
-    if (cwd_ret == NULL) {
-        return 0;
-    }
-    ret = dcc_x_token_string(fd, "CDIR", cwd);
-    return ret;
 }
 
 /**
@@ -131,7 +111,6 @@ int dcc_r_cc_status(int ifd, int *status)
 int dcc_retrieve_results(int net_fd,
                          int *status,
                          const char *output_fname,
-                         const char *deps_fname,
                          struct dcc_buffer *server_stderr,
                          struct dcc_buffer *server_stdout,
                          int preprocess_only,
@@ -166,8 +145,6 @@ int dcc_retrieve_results(int net_fd,
     if ((ret = dcc_r_buffer(server_stderr, net_fd, len, host->compr)))
         return ret;
 
-    if ((ret = dcc_add_buffer_to_log_email("server-side stderr", server_stderr)))
-        return ret;
 
     if ((ret = dcc_r_token_int(net_fd, "SOUT", &len))
         || (ret = dcc_r_buffer(server_stdout, net_fd, len, host->compr))
@@ -182,12 +159,6 @@ int dcc_retrieve_results(int net_fd,
                     !strcmp(output_fname, "-") ? "/dev/null" : output_fname,
                     o_len, host->compr)))
             return ret;
-        if (host->cpp_where == DCC_CPP_ON_SERVER) {
-            if ((ret = dcc_r_token_int(net_fd, "DOTD", &len)))
-                return ret;
-            return dcc_r_file_timed(net_fd, deps_fname ? deps_fname : "/dev/null",
-                                    len, host->compr);
-        }
     } else if (preprocess_only && strcmp(output_fname, "-")) {
         struct stat st;
         if (!stat(output_fname, &st) && S_ISREG(st.st_mode))
@@ -222,83 +193,5 @@ int dcc_is_link(const char *fname, int *is_link)
     }
 
     *is_link = S_ISLNK(buf.st_mode);
-    return 0;
-}
-
-struct manifest_writer { int fd; size_t used; char data[65537]; };
-
-static int flush_manifest(struct manifest_writer *writer)
-{
-    int ret = writer->used ? dcc_writex(writer->fd, writer->data, writer->used) : 0;
-    writer->used = 0;
-    return ret;
-}
-
-static int manifest_token(struct manifest_writer *writer, const char *token,
-                          unsigned value, const void *data)
-{
-    size_t size = 12 + (data ? value : 0);
-    int ret;
-    if (size >= sizeof(writer->data)) return EXIT_PROTOCOL_ERROR;
-    if (writer->used + size >= sizeof(writer->data) && (ret = flush_manifest(writer))) return ret;
-    ret = dcc_format_token_int(writer->data + writer->used, token, value);
-    if (ret) return ret;
-    if (data) memcpy(writer->data + writer->used + 12, data, value);
-    writer->used += size;
-    return 0;
-}
-
-int dcc_x_many_files(int ofd,
-                     unsigned int n_files,
-                     char **fnames, enum dcc_compress compr)
-{
-    int ret;
-    char link_points_to[MAXPATHLEN + 1];
-    int is_link;
-    const char *fname;
-    char *original_fname;
-    struct manifest_writer writer;
-    writer.fd = ofd;
-    writer.used = 0;
-
-    if ((ret = manifest_token(&writer, "NFIL", n_files, NULL))) return ret;
-
-    for (; *fnames != NULL; ++fnames) {
-        fname = *fnames;
-        ret = dcc_get_original_fname(fname, &original_fname);
-        if (ret) return ret;
-
-        ret = manifest_token(&writer, "NAME", strlen(original_fname), original_fname);
-        int placeholder = str_endswith("/forcing_technique_271828", original_fname);
-        free(original_fname);
-        if (ret) return ret;
-
-        if (placeholder) {
-            /* Directory placeholder files don't exist on disk.  Send
-               an empty file to ensure the directory is created */
-            ret = manifest_token(&writer, "FILE", 0, NULL);
-            if (ret) return ret;
-        } else {
-            if ((ret = dcc_is_link(fname, &is_link))) {
-                return ret;
-            }
-
-            if (is_link) {
-                if ((ret = dcc_read_link(fname, link_points_to)) ||
-                    (ret = manifest_token(&writer, "LINK", strlen(link_points_to), link_points_to))) {
-                    return ret;
-                }
-            } else {
-                /* Cache bytes carry the selected codec, without an RPC token. */
-                if ((ret = flush_manifest(&writer))) return ret;
-                if (compr == DCC_COMPRESS_LZ4_STREAM) {
-                    ret = dcc_x_token_int(ofd, "FILE", 0xffffffffU);
-                    if (!ret) ret = dcc_copy_file_to_fd(fname, ofd);
-                } else ret = dcc_x_file(ofd, fname, "FILE", DCC_COMPRESS_NONE, NULL);
-                if (ret) return ret;
-            }
-        }
-    }
-    if ((ret = flush_manifest(&writer))) return ret;
     return 0;
 }

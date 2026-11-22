@@ -331,9 +331,9 @@ EXPORT int openat64(int directory,const char *path,int flags,...) {
     if (journal>=0 && !observing) opened(at_path(directory,path).c_str(),flags,fd,e);
     errno=e; return fd;
 }
-EXPORT ssize_t readlinkat(int fd,const char *path,char *buffer,size_t size) {
-    static auto call=next<decltype(&readlinkat)>("readlinkat");
-    ssize_t r=forward(call,fd,path,buffer,size); int e=r<0 ? errno : 0;
+static ssize_t observed_readlinkat(int fd, const char *path, const char *buffer,
+                                   size_t size, ssize_t r) {
+    int e = r < 0 ? errno : 0;
     if (journal>=0 && !observing) {
         std::string name=at_path(fd,path),target;
         struct stat st{};
@@ -347,6 +347,16 @@ EXPORT ssize_t readlinkat(int fd,const char *path,char *buffer,size_t size) {
     }
     errno=e; return r;
 }
+EXPORT ssize_t readlinkat(int fd,const char *path,char *buffer,size_t size) {
+    static auto call=next<decltype(&readlinkat)>("readlinkat");
+    return observed_readlinkat(fd,path,buffer,size,forward(call,fd,path,buffer,size));
+}
+EXPORT ssize_t __readlinkat_chk(int fd,const char *path,char *buffer,size_t size,size_t capacity) {
+    using Read = ssize_t (*)(int,const char *,char *,size_t,size_t);
+    static auto call=next<Read>("__readlinkat_chk");
+    return observed_readlinkat(fd,path,buffer,size,forward(call,fd,path,buffer,size,capacity));
+}
+
 namespace {
 // Copy public fields, never assume that the large-file ABI has stat's layout.
 void metadata64(struct stat *out,const struct stat64 *in) {

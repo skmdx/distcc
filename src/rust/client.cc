@@ -652,7 +652,7 @@ class Inputs {
             dcc_job_input in{};
             in.path = const_cast<char *>(entry.first->first.c_str());
             in.fd = fd;
-            in.plain_size = in.wire_size = st.st_size;
+            in.plain_size = st.st_size;
             verify(p, st, fd);
             digests.get(p, fd, st, in.digest);
             in.cached = st.st_size <= DCC_FILE_CACHE_MAX ? DCC_CACHE_LOOKUP : DCC_UNCACHED;
@@ -1333,7 +1333,7 @@ extern "C" int dcc_rust_submit_cgu(const char *version, const char *target, cons
         dcc_job_input in{};
         in.path = const_cast<char *>("/cgu");
         in.fd = STDIN_FILENO;
-        in.wire_size = in.plain_size = st.st_size;
+        in.plain_size = st.st_size;
         if (dcc_file_digest(in.fd, st.st_size, in.digest))
             return EXIT_IO_ERROR;
         dcc_job job{};

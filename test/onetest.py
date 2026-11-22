@@ -17,7 +17,7 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
 # USA.
 
-"""Usage: onetest.py [--valgrind[=command]] [--lzo] [--pump] TESTNAME
+"""Usage: onetest.py [--valgrind[=command]] [--lzo] TESTNAME
 
 This command runs a single test case.
 TESTNAME should be the name of one of the test cases from testdistcc.py.
@@ -39,9 +39,6 @@ if __name__ == '__main__':
       del sys.argv[1]
     elif sys.argv[1] == "--lzo":
       testdistcc._server_options = ",lzo"
-      del sys.argv[1]
-    elif sys.argv[1] == "--pump":
-      testdistcc._server_options = ",lzo,cpp"
       del sys.argv[1]
 
   if len(sys.argv) > 1:

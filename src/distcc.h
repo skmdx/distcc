@@ -101,22 +101,14 @@ enum dcc_compress {
     DCC_COMPRESS_LZ4_STREAM
 };
 
-enum dcc_cpp_where {
-    /* weird values to catch errors */
-    DCC_CPP_ON_CLIENT     = 42,
-    DCC_CPP_ON_SERVER
-};
 
 enum dcc_protover {
     DCC_VER_1   = 1,            /**< vanilla */
     DCC_VER_2   = 2,            /**< LZO sprinkles */
-    DCC_VER_3   = 3,            /**< server-side cpp */
     DCC_VER_LINK = 4,           /**< cached-sysroot link job */
     DCC_VER_SESSION = 5,        /**< negotiate sequential connection reuse */
     DCC_VER_LZ4 = 6,            /**< LZ4, client-side cpp */
-    DCC_VER_LZ4_CPP = 7,        /**< LZ4, server-side cpp */
     DCC_VER_STREAM = 8,         /**< chunked LZ4, client-side cpp */
-    DCC_VER_STREAM_CPP = 9,     /**< chunked LZ4, server-side cpp */
     DCC_VER_STREAM_LINK = 10    /**< chunked LZ4, cached-sysroot link */
 };
 
@@ -176,12 +168,10 @@ int dcc_x_argv(int fd,
                const char *argc_token,
                const char *argv_token,
                char **argv);
-int dcc_x_cwd(int fd);
 int dcc_is_link(const char *fname, int *is_link);
 int dcc_read_link(const char* fname, char *points_to);
 
 /* srvrpc.c */
-int dcc_r_cwd(int ifd, char **cwd);
 
 /* remote.c */
 int dcc_send_job_corked(int net_fd,
@@ -201,7 +191,6 @@ struct dcc_buffer {
 int dcc_retrieve_results(int net_fd,
                          int *status,
                          const char *output_fname,
-                         const char *deps_fname,
                          struct dcc_buffer *server_stderr,
                          struct dcc_buffer *server_stdout,
                          int preprocess_only,
@@ -289,7 +278,7 @@ void dcc_calc_rate(off_t size_out,
 /* arg.c */
 int dcc_is_literal_option(const char *);
 int dcc_set_action_opt(char **, const char *);
-int dcc_set_output(char **, char *);
+int dcc_set_output(char **, const char *);
 int dcc_set_input(char **, char *);
 int dcc_expand_native(char ***argv, const char *input, const char *output);
 int dcc_native_requested(char *argv[]);
@@ -311,7 +300,7 @@ int dcc_argv_search(char **a, const char *);
 int dcc_argv_startswith(char **a, const char *);
 int dcc_copy_argv(char **argv, char ***out_argv, int extra_args);
 int dcc_clang_command(char ***argv, const char *root, const char *original,
-                      const char *cwd, int pump, int inputs, int *using_helper);
+                      const char *cwd, int inputs, int *using_helper);
 int dcc_argv_append(char **argv, char *toadd);
 char *dcc_argv_tostr(char **a);
 void dcc_free_argv(char **argv);

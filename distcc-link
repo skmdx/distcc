@@ -215,17 +215,17 @@ def clang_link_command(command, *, offload=False, plan=None):
     linker arguments can use DTLTO without bypassing those device stages.
     """
     if plan is None:
-        from include_server import clang_scan
+        from distcc_job import tokenize_driver_line, format_driver_command
         result = subprocess.run([command[0], '-###', *command[1:]], capture_output=True, text=True)
         # Clang escapes $, backticks and quotes for display. shlex preserves \$
         # inside double quotes, corrupting literal linker operands such as $ORIGIN.
-        commands = [clang_scan.tokenize_command(line) for line in result.stderr.splitlines()
+        commands = [tokenize_driver_line(line) for line in result.stderr.splitlines()
                     if line.lstrip().startswith('"')]
         if result.returncode or len(commands) != 1 or not commands[0]:
             raise LocalOnly('Clang remote links require a single LLD invocation')
         invocation = commands[0]
         # Libtool needs LLVM's unquoted -v printer, not -### quoting.
-        verbose = ''.join(clang_scan.format_command(invocation) + '\n'
+        verbose = ''.join(format_driver_command(invocation) + '\n'
                           if line.lstrip().startswith('"') else line
                           for line in result.stderr.splitlines(keepends=True)) if '-v' in command[1:] else ''
     else:
@@ -630,14 +630,14 @@ class LinkArchive:
 
 def tcp_link(net, archive, output):
     """Stream a link archive and receive one bounded pooled TCP transaction."""
-    from include_server.distcc_pump_c_extensions import TCP_BEGIN, TCP_RESULT_FD, TCP_PROGRESS, TCP_COMPLETE_SIZE
+    from distcc_job import TCP_BEGIN, TCP_RESULT_FD, TCP_PROGRESS, TCP_COMPLETE_SIZE
 
     begin, need, incoming, result_type, outgoing, complete = range(TCP_BEGIN, TCP_BEGIN + 6)
     compressed, final = 0x10000, 0x20000
     codec = Lz4Chunks()
     identity = int.from_bytes(os.urandom(8), 'big') or 1
 
-    from distcc_job import manifest
+    from distcc_job import JOB_LINK, manifest
 
     def send(kind, body):
         net.sendall(struct.pack('!II', kind, len(body)) + body)
@@ -676,7 +676,7 @@ def tcp_link(net, archive, output):
                 for descriptor in descriptors:
                     os.close(descriptor)
 
-    metadata = manifest(2, os.getcwd(), ['distcc-link'], [('/input.tar', archive.size, bytes(8), 0)])
+    metadata = manifest(JOB_LINK, os.getcwd(), ['distcc-link'], [('/input.tar', archive.size, bytes(8), 0)])
     send(begin, struct.pack('!Q', identity) + metadata)
 
     class Writer:
@@ -798,7 +798,7 @@ def tcp_link(net, archive, output):
 
 
 def remote_link(job, inputs, output):
-    from include_server.distcc_pump_c_extensions import BROKER_VERSION, BROKER_POOLED
+    from distcc_job import BROKER_VERSION, BROKER_POOLED
 
     archive = LinkArchive(job, inputs)
     with ExitStack() as stack:
@@ -1286,10 +1286,10 @@ def main():
     command = sys.argv[1:]
     link_plan = None
     if command[:1] == ['--clang-plan']:
-        from include_server import distcc_pump_c_extensions as protocol
+        from distcc_job import read_argv
         plan_fd, errors_fd = map(int, command[1:3])
         try:
-            invocation = protocol.RArgv(plan_fd)
+            invocation = read_argv(plan_fd)
         finally:
             os.close(plan_fd)
         with os.fdopen(errors_fd, errors='replace') as stream:

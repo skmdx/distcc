@@ -18,31 +18,70 @@ import time
 import unittest
 
 from test_adaptive import DistccTestCase
+sys.path.insert(0, str(Path.cwd()))
+import distcc_job
+from distcc_job import write_argv, read_argv, format_driver_command, tokenize_driver_line
 
 
 class ArgumentFileTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        extension = next(Path.cwd().glob('_include_server/lib*/include_server/distcc_pump_c_extensions*.so'))
-        spec = importlib.util.spec_from_file_location('distcc_pump_c_extensions', extension)
-        assert spec and spec.loader
-        cls.protocol = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.protocol)
+        import ctypes
+        cls.lib = ctypes.CDLL(str(Path.cwd()/'h_codec.so'))
+
+    def read_groups(self, fd, groups):
+        import ctypes as ct
+        class Arguments(ct.Structure):
+            _fields_ = [('bytes', ct.c_void_p), ('groups', ct.POINTER(ct.POINTER(ct.c_char_p))),
+                        ('count', ct.c_uint)]
+        args = Arguments()
+        if self.lib.dcc_argv_file_read(fd, groups, ct.byref(args)):
+            raise ValueError('invalid argument file')
+        try:
+            result = []
+            for i in range(groups):
+                words = []
+                while args.groups[i][len(words)] is not None:
+                    words.append(os.fsdecode(args.groups[i][len(words)]))
+                result.append(words)
+            return tuple(result)
+        finally:
+            self.lib.dcc_argv_file_close(ct.byref(args))
 
     def setUp(self):
         self.fd = os.memfd_create('distcc-argv-test')
         self.addCleanup(os.close, self.fd)
 
+    def test_version_probe_has_no_worker_control_socket(self):
+        compiler = shutil.which('clang')
+        if not compiler:
+            self.skipTest('Clang unavailable')
+        with tempfile.TemporaryDirectory() as directory:
+            wrapper = Path(directory) / 'clang'
+            for mode in ('--native-worker', '--worker'):
+                parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                with self.subTest(mode=mode), parent, child:
+                    wrapper.write_text(f'#!/bin/sh\ntest ! -S /proc/self/fd/{child.fileno()} || exit 1\n'
+                                       f'exec {shlex.quote(compiler)} "$@"\n')
+                    wrapper.chmod(0o755)
+                    with subprocess.Popen([Path.cwd()/'distcc-clang', mode, str(child.fileno()), wrapper],
+                                          pass_fds=(child.fileno(),)) as process:
+                        child.close()
+                        parent.settimeout(15)
+                        self.assertEqual(parent.recv(1), b'R')
+                        parent.close()
+                        self.assertEqual(process.wait(timeout=15), 0)
+
     def test_native_worker_shutdown_reaps_active_compilers(self):
         compiler = shutil.which('clang')
         if not compiler: self.skipTest('Clang unavailable')
         build = Path.cwd()
-        env = dict(os.environ, PYTHONPATH=str(next(build.glob('_include_server/lib.*'))))
+        env = os.environ.copy()
         for shutdown in ('disconnect', 'terminate', 'malformed'):
             with self.subTest(shutdown=shutdown), contextlib.ExitStack() as cleanup:
                 control, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
                 cleanup.callback(control.close); cleanup.callback(child.close)
-                process = subprocess.Popen([sys.executable, str(build/'distcc-clang'),
+                process = subprocess.Popen([str(build/'distcc-clang'),
                     '--native-worker', str(child.fileno()), compiler], pass_fds=(child.fileno(),),
                     env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 def finish():
@@ -54,8 +93,8 @@ class ArgumentFileTest(unittest.TestCase):
                 child.close(); control.settimeout(15)
                 self.assertEqual(control.recv(1), b'R')
                 os.ftruncate(self.fd, 0); os.lseek(self.fd, 0, os.SEEK_SET)
-                self.protocol.XArgv(self.fd, [str(build), compiler])
-                self.protocol.XArgv(self.fd, [compiler, '-E', '-x', 'c', '-'])
+                write_argv(self.fd, [str(build), compiler])
+                write_argv(self.fd, [compiler, '-E', '-x', 'c', '-'])
                 null = os.open(os.devnull, os.O_RDWR)
                 cleanup.callback(os.close, null)
                 for _ in range(2):
@@ -98,10 +137,10 @@ class ArgumentFileTest(unittest.TestCase):
                 os.ftruncate(self.fd, 0)
                 os.lseek(self.fd, 0, os.SEEK_SET)
                 os.write(self.fd, b'prefix')
-                for group in values: self.protocol.XArgv(self.fd, group)
+                for group in values: write_argv(self.fd, group)
                 end = os.lseek(self.fd, 0, os.SEEK_CUR)
                 os.lseek(self.fd, len(b'prefix'), os.SEEK_SET)
-                self.assertEqual(self.protocol.RArgvFile(self.fd, len(values)), values)
+                self.assertEqual(self.read_groups(self.fd, len(values)), values)
                 self.assertEqual(os.lseek(self.fd, 0, os.SEEK_CUR), end)
 
     def test_partial_or_invalid_file_never_publishes_arguments(self):
@@ -116,33 +155,59 @@ class ArgumentFileTest(unittest.TestCase):
                 os.lseek(self.fd, 0, os.SEEK_SET)
                 os.write(self.fd, data)
                 os.lseek(self.fd, 0, os.SEEK_SET)
-                with self.assertRaises(self.protocol.Error): self.protocol.RArgvFile(self.fd, groups)
+                with self.assertRaises(ValueError): self.read_groups(self.fd, groups)
         # Preserve the existing stream decoder's padded hexadecimal syntax.
         os.ftruncate(self.fd, 0)
         os.lseek(self.fd, 0, os.SEEK_SET)
         os.write(self.fd, b'ARGC       1ARGV       3one')
         os.lseek(self.fd, 0, os.SEEK_SET)
-        self.assertEqual(self.protocol.RArgvFile(self.fd, 1), (['one'],))
+        self.assertEqual(self.read_groups(self.fd, 1), (['one'],))
+
+    def test_wire_constants_match_c(self):
+        jobs = ('COMPILE', 'LINK', 'RUST', 'THINLTO', 'OFFLOAD_LINK', 'FRONTEND',
+                'GCC_FRONTEND', 'RUST_CGU')
+        names = ['JOB_' + job for job in jobs] + [
+            'BROKER_POOLED', 'TCP_BEGIN', 'TCP_RESULT_FD', 'TCP_PROGRESS']
+        expressions = ['DCC_' + name for name in names] + [
+            'BROKER_VERSION', 'sizeof(struct dcc_tcp_complete)']
+        expected = [getattr(distcc_job, name) for name in names] + [
+            distcc_job.BROKER_VERSION, distcc_job.TCP_COMPLETE_SIZE]
+        source = ('#include <stdio.h>\n#include "tcp_job.h"\n#include "broker_protocol.h"\n'
+                  'int main(void) {' + ''.join('printf("%zu\\n", (size_t)(' + e + '));'
+                                              for e in expressions) + '}')
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp)/'wire'
+            subprocess.run(['cc', '-I', str(Path(__file__).resolve().parents[1]/'src'),
+                            '-x', 'c', '-', '-o', str(exe)], input=source, text=True, check=True)
+            values = subprocess.check_output([exe], text=True).splitlines()
+        self.assertEqual(list(map(int, values)), expected)
+
+    def test_driver_display_and_python_argv(self):
+        args = ['clang', '', "can't", 'white space', '$ORIGIN', 'a"b', 'a\\b']
+        self.assertEqual(tokenize_driver_line(format_driver_command(args)), args)
+        write_argv(self.fd, args)
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        self.assertEqual(read_argv(self.fd), args)
 
     def test_encoding_error_does_not_publish_a_partial_command(self):
         for values in (['valid', object()], ['valid', '\ud800']):
             with self.subTest(values=values):
                 with self.assertRaises((TypeError, UnicodeEncodeError)):
-                    self.protocol.XArgv(self.fd, values)
+                    write_argv(self.fd, values)
                 self.assertEqual(os.fstat(self.fd).st_size, 0)
 
     def test_helpers_contain_bad_commands_and_accept_the_next_request(self):
         compiler = shutil.which('clang')
         if not compiler: self.skipTest('Clang unavailable')
         build = Path.cwd()
-        env = dict(os.environ, PYTHONPATH=str(next(build.glob('_include_server/lib.*'))))
+        env = os.environ.copy()
         for native in (False, True):
             with self.subTest(native=native), contextlib.ExitStack() as cleanup:
                 work = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='distcc-worker-')))
                 control, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
                 cleanup.callback(control.close); cleanup.callback(child.close)
                 control.settimeout(15)
-                process = subprocess.Popen([sys.executable, str(build/'distcc-clang'),
+                process = subprocess.Popen([str(build/'distcc-clang'),
                     '--native-worker' if native else '--worker', str(child.fileno()), compiler],
                     pass_fds=(child.fileno(),), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 def finish():
@@ -183,7 +248,7 @@ class ArgumentFileTest(unittest.TestCase):
                     os.ftruncate(self.fd, 0); os.lseek(self.fd, 0, os.SEEK_SET)
                     if isinstance(payload, bytes): os.write(self.fd, payload)
                     else:
-                        for group in payload: self.protocol.XArgv(self.fd, group)
+                        for group in payload: write_argv(self.fd, group)
                     os.lseek(self.fd, 0, os.SEEK_SET)
                     for fd in outputs: os.ftruncate(fd, 0); os.lseek(fd, 0, os.SEEK_SET)
                     reply, peer = socket.socketpair()
@@ -200,7 +265,7 @@ class ArgumentFileTest(unittest.TestCase):
                     self.assertIsNone(process.poll())
                     if success and operation == b'P':
                         os.lseek(self.fd, 0, os.SEEK_SET)
-                        prepared, roots = self.protocol.RArgvFile(self.fd, 2)
+                        prepared, roots = self.read_groups(self.fd, 2)
                         self.assertEqual(prepared[1], str(source))
                         self.assertIn(str(work), roots)
                         assert not isinstance(payload, bytes)

@@ -45,8 +45,7 @@ class Project:
                  build_subdir=None,
                  configure_cmd=None,
                  pre_build_cmd = None,
-                 build_cmd=None,
-                 include_server_args=""):
+                 build_cmd=None):
         """Specification of a project to build.
 
         url: the url to download the file.
@@ -73,8 +72,6 @@ class Project:
            We add VAR=val arguments, so build_cmd must be a single command
            that is either a form of 'make', or takes the same style
            arguments.  Defaults to 'make'.
-        include_server_args: include server tweaks such as stat reset triggers
-           for builds that modify source files.
         """
 
         self.url = url
@@ -83,7 +80,10 @@ class Project:
         self.package_file = package_file
 
         if not name:
-            name = re.match(r"(.*)\.tar(\.gz|\.bz2|)$", package_file).group(1)
+            match = re.fullmatch(r"(.*)\.tar(?:\.gz|\.bz2)?", package_file)
+            if not match:
+                raise ValueError(f"Cannot infer project name from {package_file}")
+            name = match[1]
         self.name = name
 
         self.md5 = md5
@@ -102,14 +102,13 @@ class Project:
         # TODO(csilvers): figure out automatically if only one TLD.
         self.unpacked_subdir = unpacked_subdir or self.name
         self.build_subdir = build_subdir
-        self.include_server_args = include_server_args
 
     def register(self):
         trees[self.name] = self
 
 
     def __repr__(self):
-        return "Project(name=%s)" % `self.name`
+        return "Project(name=%s)" % repr(self.name)
 
 
     def download(self):
@@ -122,7 +121,7 @@ class Project:
             # XXX: snarf gets upset if the HTTP server returns "416
             # Requested Range Not Satisfiable" because the file is already
             # totally downloaded.  This is kind of a snarf bug.
-            print "** Downloading"
+            print("** Downloading")
             run_cmd("cd %s && wget --continue %s" %
                     (self.download_dir, self.url))
             run_cmd("mv %s %s" %
@@ -134,7 +133,7 @@ class Project:
 
     def md5check(self):
         if self.md5:
-            print "** Checking source package integrity"
+            print("** Checking source package integrity")
             run_cmd("cd %s && echo '%s' | md5sum -c /dev/stdin" %
                     (self.package_dir, self.md5))
 

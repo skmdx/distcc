@@ -19,8 +19,8 @@
       "check_limits": [],
       "auto_memory": true,
       "compiler_paths": ["clang", "clang++"],
-      "validation_hosts": "worker-ssh-alias,cpp,lz4",
-      "server_hosts": "worker-ssh-alias,cpp,lz4,tcp",
+      "validation_hosts": "worker-ssh-alias,lz4",
+      "server_hosts": "worker-ssh-alias,lz4,tcp",
       "quiesce_units": ["distcc-build.service"],
       "mounts": []
     }

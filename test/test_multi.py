@@ -8,10 +8,10 @@ from test_broker import BrokerTestCase
 
 
 class MultiSourceTest(BrokerTestCase):
+    worker_address = "127.0.0.2"
     def setUp(self):
         super().setUp()
-        options = ',tcp,cpp,lz4' if self._testMethodName.startswith('test_pump') else ',tcp'
-        self.start_broker(hosts=' '.join(self.host(i, options) for i in range(len(self.ports))))
+        self.start_broker(hosts=' '.join(self.host(i, ',tcp') for i in range(len(self.ports))))
         library = os.environ.get('DISTCC_GCC_SCAN_LIBRARY')
         if not library:
             directory = subprocess.check_output(['gcc', '-print-file-name=plugin'], text=True).strip()
@@ -19,7 +19,8 @@ class MultiSourceTest(BrokerTestCase):
         if not Path(library).is_file():
             self.skipTest('The selected GCC dependency module must be built first')
         self.env = dict(self.env,
-                        DISTCC_GCC_SCAN_LIBRARY=library,
+                        DISTCC_GCC_SCAN_LIBRARY=library, DISTCC_FRONTEND_REMOTE="1",
+                        DISTCC_FRONTEND_ROOTS=str(self.root),
                         PATH=str(self.build) + os.pathsep + os.environ['PATH'])
         self.first = self.root / 'first.cpp'
         self.last = self.root / 'last.cpp'
@@ -27,11 +28,9 @@ class MultiSourceTest(BrokerTestCase):
         self.last.write_text('int value(); int main() {return value() != 42;}\n')
         self.output = self.root / 'compound'
 
-    def run_compound(self, *options, pump=False):
+    def run_compound(self, *options):
         command = [str(self.build / 'distcc'), 'g++', '-pipe', *options,
                    self.first.name, self.last.name, '-o', str(self.output)]
-        if pump:
-            command.insert(0, str(self.build / 'pump'))
         return subprocess.run(command, env=self.env, cwd=self.root,
                               text=True, capture_output=True, timeout=90)
 
@@ -59,39 +58,38 @@ class MultiSourceTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(dependency.read_bytes(), expected)
 
-    def test_pump_compound_command(self):
+    def test_frontend_compound_command(self):
         self.env['TMPDIR'] = str(self.root)
-        self.env['DISTCC_TESTING_INCLUDE_SERVER'] = '1'
         before = self.completed()
-        result = self.run_compound('-O2', pump=True)
+        result = self.run_compound('-O2')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('gave up analyzing', result.stderr)
         self.assertEqual(subprocess.call([self.output]), 0)
         self.assertEqual(self.completed() - before, 2)
 
-    def test_pump_system_header_aliases(self):
+    def test_frontend_system_header_aliases(self):
         system = self.root / 'system'
         system.mkdir()
         (system / 'x.h').write_text('#define ANSWER 42\n')
         (system / 'longer-header-name.h').symlink_to('x.h')
         self.first.write_text('#include <longer-header-name.h>\nint value(){return ANSWER;}\n')
-        self.env.update(TMPDIR=str(self.root), DISTCC_TESTING_INCLUDE_SERVER='1')
+        self.env.update(TMPDIR=str(self.root))
         before = self.completed()
-        result = self.run_compound('-isystem', str(system), pump=True)
+        result = self.run_compound('-isystem', str(system))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(subprocess.call([self.output]), 0)
         self.assertEqual(self.completed() - before, 2)
 
-    def test_pump_absolute_source_parent_components(self):
+    def test_frontend_absolute_source_parent_components(self):
         child = self.root / 'child'
         child.mkdir(exist_ok=True)
         source = str(child / '..' / self.first.name)
         self.first.write_text('const char *source_name = __FILE__;\n')
         self.last.write_text('#include <cstring>\nextern const char *source_name;\n'
                              'int main(){return std::strcmp(source_name, "' + source + '");}\n')
-        self.env.update(TMPDIR=str(self.root), DISTCC_TESTING_INCLUDE_SERVER='1')
+        self.env.update(TMPDIR=str(self.root))
         obj = self.root / 'parent.o'
-        result = subprocess.run([self.build / 'pump', self.build / 'distcc', 'g++',
+        result = subprocess.run([self.build / 'distcc', 'g++',
                                  '-c', source, '-o', obj], cwd=self.root, env=self.env,
                                 text=True, capture_output=True, timeout=90)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -99,7 +97,7 @@ class MultiSourceTest(BrokerTestCase):
         subprocess.run(['g++', str(self.last), str(obj), '-o', self.output], check=True)
         self.assertEqual(subprocess.call([self.output]), 0)
 
-    def test_pump_implicit_header_is_injected_once(self):
+    def test_frontend_implicit_header_is_injected_once(self):
         system = self.root / 'implicit-system'
         system.mkdir()
         (system / 'stdc-predef.h').write_text('#include "child.h"\n#define ANSWER 42\n')
@@ -107,9 +105,9 @@ class MultiSourceTest(BrokerTestCase):
         # the program, whereas replaying the root preinclude is correct.
         (system / 'child.h').write_text('struct implicit_type {};\n')
         self.first.write_text('int value(){return ANSWER;}\n')
-        self.env.update(TMPDIR=str(self.root), DISTCC_TESTING_INCLUDE_SERVER='1')
+        self.env.update(TMPDIR=str(self.root))
         before = self.completed()
-        result = self.run_compound('-isystem', str(system), pump=True)
+        result = self.run_compound('-isystem', str(system))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('gave up analyzing', result.stderr)
         self.assertEqual(subprocess.call([self.output]), 0)

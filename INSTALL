@@ -31,15 +31,15 @@ QUICK SUMMARY
 2. Run distccd on each server machine,
    with --allow options to limit access.
 
-3. On your client machine, set DISTCC_POTENTIAL_HOSTS to the list
+3. On your client machine, set DISTCC_HOSTS to the list
    of distcc server machines:
 
-      export DISTCC_POTENTIAL_HOSTS='localhost red green blue'
+      export DISTCC_HOSTS='localhost red green blue'
 
 4. Build your software using distcc:
 
       cd ~/my_sources/my_project
-      pump make -j40 CC="distcc gcc" <your target>
+      make -j40 CC="distcc gcc" <your target>
 
 5. If you run into problems it is highly recommended to use DISTCC_VERBOSE=1
    on the client and "--log-level debug" on the server.
@@ -60,11 +60,7 @@ It is also highly desirable to have
 
    Python >=3.1
 
-     To use "pump" mode, or to run the full test suite with "make check",
-     or to run the benchmarks.
-
-If you have any version of Python installed, then you need to have
-the corresponding Python.h file installed (e.g. sudo apt-get install python-dev).
+     To run tests, benchmarks, and the private link and offload tools.
 
 You can optionally have
 
@@ -259,14 +255,7 @@ should normally be first, unless it is significantly slower than
 another machine.  If you have many hosts (say ten or more), it's probably
 better to leave localhost out of the list.
 
-The host list also needs ",cpp,lzo" after each host if you're using
-pump mode - see README.pump for details.  Another alternative if you're
-using pump mode is to set the DISTCC_POTENTIAL_HOSTS environment
-variable; in that case, the pump script will use "lsdistcc" to
-set DISTCC_HOSTS, automatically eliminating hosts that are down
-or inaccessible or that don't have distccd running.
-
-See the distcc(1) manual and the pump(1) manual for more information.
+See the distcc(1) manual for supported host options.
 
 
 Using distcc
@@ -281,24 +270,6 @@ e.g. if your Makefile contains
             for subdir in $(SUBDIRS); do make -C $$subdir all; done
 
 then you may need to rewrite your Makefile to get better parallelism.
-This is especially important if you're using pump mode.
-
-
-Using pump mode
----------------
-
-To use pump mode, invoke your build command via the "pump" script, e.g.
-
-      export DISTCC_POTENTIAL_HOSTS="localhost red blue green"
-      cd ~/my_sources/my_project
-      pump make -j40 CC="distcc gcc" my_target
-
-Pump mode assumes that source files are not modified during the build.
-If this assumption does not hold, you should not use pump mode.
-You can disable pump mode by not using the pump script.
-In that case, you need to set DISTCC_HOSTS rather than
-DISTCC_POTENTIAL_HOSTS.
-
       export DISTCC_HOSTS="localhost red blue green"
       cd ~/my_sources/my_project
       make -j40 CC="distcc gcc" my_target
@@ -336,8 +307,3 @@ Use with ccache
 
 The best way to use is to set up a similar masquerade directory for
 ccache and put it on the PATH before distcc.
-
-NOTE: This use of ccache is incompatible with use of distcc's "pump" mode.
-
-(If you're using "pump" mode, it might be possible to use ccache on
-the distcc server machines. But we haven't tried that setup.)

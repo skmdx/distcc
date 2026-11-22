@@ -41,6 +41,10 @@ distcc_compiler_is_distributed() {
 }
 
 distcc_configure_jobs() {
+    if has distcc ${FEATURES} && ! has distcc ${RESTRICT} &&
+       [[ -n ${WORKDIR:-} && :${DISTCC_FRONTEND_ROOTS-}: != *:"${WORKDIR}":* ]]; then
+        export DISTCC_FRONTEND_ROOTS="${DISTCC_FRONTEND_ROOTS:+${DISTCC_FRONTEND_ROOTS}:}${WORKDIR}"
+    fi
     local jobs variable marker compiler distributed
     # Cargo and CMake can bypass the masquerade PATH with absolute compilers.
     # Preserve user/package wrappers and clear only our saved-phase value when

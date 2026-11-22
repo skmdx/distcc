@@ -6,9 +6,6 @@ Current Documents: <https://distcc.github.io/>
 
 Formerly <http://distcc.org/>
 
-"pump" functionality added by
-Fergus Henderson, Nils Klarlund, Manos Renieris, and Craig Silverstein (Google Inc.)
-
 distcc is a program to distribute compilation of C or C++ code across
 several machines on a network. distcc should always generate the same
 results as a local compile, is simple to install and use, and is often
@@ -24,8 +21,6 @@ By default, distcc sends source code with its headers expanded across
 the network for each job, so all it requires of the volunteer machines
 is that they be running the distccd daemon, and that they have an
 appropriate compiler installed.
-Clang retains macros until remote compilation to preserve diagnostics;
-see README.pump for preprocessing behavior and toolchain requirements.
 
 HIP compilation uses the client's Clang driver and the existing TCP input cache.
 `distcc-offload` executes the driver's action graph: each target is preprocessed
@@ -238,25 +233,13 @@ Gentoo's Rust eclass selects its compiler independently of `eselect` and prefers
 source-built Rust. A fleet using `rust-bin` can select that package type with
 `ERUST_TYPE_OVERRIDE=binary` in `package.env`, without pinning a Rust version.
 
-The distcc "pump" functionality, added in distcc 3.0, improves on
-distcc by distributing not only compilation but also preprocessing to
-distcc servers. The client transmits snapshots of application and system headers
-through the shared input cache, together with the compiler's default include
-search paths. Workers preprocess against these inputs even when their installed
-headers differ. For analyzer behavior and toolchain requirements, see README.pump.
-
 distcc is not itself a compiler, but rather a front-end to the GNU
 C/C++ compiler (gcc), or another compiler of your choice. All the
 regular gcc options and features work as normal.
 
 distcc is designed to be used with GNU make's parallel-build feature
 (-j). Shipping files across the network takes time, but few cycles on
-the client machine. Any files that can be built remotely are
-essentially "for free" in terms of client CPU.  This is even more true
-in "pump" mode, where the client does not even have to take time to
-preprocess the source files.  distcc has been successfully used in
-environments with hundreds of distcc servers, supporting dozens of
-simultaneous compiles.
+the client machine. Prepared TCP jobs can also execute the frontend on the worker.
 
 distcc is now reasonably stable and can successfully compile the Linux
 kernel, rsync, KDE, GNOME (via GARNOME), Samba and Ethereal.  distcc
@@ -660,13 +643,12 @@ in force. RSS and input size are estimates: different compiler options or source
 complexity within a class can demand more memory. Keep the service memory limit
 configured. Statistics expose `dcc_job_memory_bytes`, `dcc_job_memory_samples`,
 `dcc_job_peak_bytes`, `dcc_memory_spare_bytes`, `dcc_compile_capacity`,
-`dcc_pump_capacity` and `dcc_rust_capacity`. The last three are separate lists of
-64 capacities indexed by the binary input-size bucket. Pump and Rust construct
-input metadata before selection and reuse it for transfer. Existing jobs retain
+and per-class capacity lists such as `dcc_rust_capacity`. Each list contains
+64 capacities indexed by the binary input-size bucket. Existing jobs retain
 their own class reservations; each capacity adds the incoming class's available
 slots to the current occupancy, subject to memory and CPU limits. Statistics also
 report `dcc_memory_headroom_bytes`, `dcc_memory_reserved_bytes` and per-class byte estimates in
-`dcc_compile_memory`, `dcc_pump_memory` and `dcc_rust_memory`. The broker subtracts
+`dcc_compile_memory` and `dcc_rust_memory`. The broker subtracts
 the memory cost of leases not yet represented by the worker's reservations before
 placing more work, including input preparation across snapshot refreshes. A large
 in-flight job can consume several small-job memory slots. Selection and queue bounds
@@ -700,7 +682,7 @@ descriptors instead of compressed payloads. The client copies objects and
 dependencies into its own unpublished files after receiving COMPLETE and
 returning the connection to the broker, then publishes by atomic rename. Diagnostics
 use the received descriptors directly. Update both endpoints together.
-Pump and link inputs still use framed payloads.
+Link inputs still use framed payloads.
 `dcc_local_input_jobs` and `dcc_local_input_bytes` count accepted input
 descriptors and their uncompressed sizes, independently of TCP accept counts.
 
@@ -732,25 +714,20 @@ or other statistics clients. `stats` requires a TCP host.
 In mixed lists, entries without metrics use their configured slots and speed 1.
 Final ties follow list order (`--randomize` can change that order). Repeated entries for
 the same lock endpoint use the first entry. Lists without either new option
-retain the original selection algorithm. Compression and pump options can be
-combined with adaptive options. Use `builder-a,lz4` for LZ4 compression, or
-`builder-a,cpp,lz4` under `pump` for remote preprocessing. Both ends must run
-this fork with LZ4 support. `,lzo` retains upstream-compatible LZO compression;
-the two codecs can coexist in a host list, including with the broker and pump.
-Upgrade servers before changing client host entries to `,lz4`. Restart brokers
-and active pump sessions after upgrading the client.
+retain the original selection algorithm. Use `,lz4` or `,lzo` to select
+compression independently for each host. Upgrade both endpoints before enabling LZ4.
 
 ## Prepared TCP jobs
 
-Use `,tcp` to select the prepared-job protocol and `,cpp,tcp` under `pump`:
+Use `,tcp` to select the prepared-job protocol:
 
 ```sh
 export DISTCC_HOSTS='builder-a/8,tcp,stats=3633'
 make -j"$(distcc -j)" CC='distcc gcc' CXX='distcc g++'
 ```
 
-Both endpoints must run this version. Restart the client broker and active
-pump sessions after upgrading. This path requires the Linux broker and the
+Both endpoints must run this version. Restart the client broker after upgrading.
+This path requires the Linux broker and the
 daemon's prefork mode. It uses the existing TCP listener and IP access rules;
 SSH and GSSAPI are unsupported with `,tcp`.
 
@@ -758,7 +735,7 @@ For evaluation, `DISTCC_FRONTEND_REMOTE=1` moves ordinary GCC and Clang C/C++
 frontend execution to the selected worker. The selected compiler supplies its
 search paths and native CPU options; the worker reads source files and headers
 on demand through the existing job connection and shared snapshot cache. This
-skips include-server analysis and local preprocessing/IR generation. Clang uses
+avoids local preprocessing and IR generation. Clang uses
 its VFS interface and matching frontend libraries. GCC uses its native plugin
 to obtain search paths before preprocessing, then a read-only FUSE filesystem
 for the actual remote compiler. GCC assembly with preprocessing (`.S` or
@@ -790,8 +767,7 @@ of additional source/build trees. Relative roots use the compiler's working
 directory. These extend the job's read-only filesystem access without changing
 the compiler's include search order or exposing unrelated directories.
 The Portage phase hook adds the package's `WORKDIR` automatically, retaining
-explicit roots. This covers sibling headers and generated sources even when
-the pump analyzer is disabled.
+explicit roots. This covers sibling headers and generated sources.
 
 Live client driver planning shares the automatic local input-preparation budget.
 Only a memo owner takes that lease, after coalescing simultaneous requests;
@@ -925,7 +901,7 @@ before returning results. LZ4 chunks, verified shared-input caching, remote
 preprocessing and GCC/Clang distributed linking are supported. Link execution
 retains the one-link-per-server limit. Preparing and returning jobs can exceed
 the compiler-slot count. RPC buffers share a 512 MiB budget; file-backed inputs
-are admitted against available filesystem space. Pump snapshots and Rust inputs, including large standard and
+are admitted against available filesystem space. Rust inputs, including large standard and
 dependency libraries, share verified whole-file inodes between jobs. The compiler sees a read-only input tree and private writable outputs;
 job links keep inputs alive through cache eviction and cancellation. Large
 entries are reclaimed when their last job releases them, while small idle
@@ -969,7 +945,7 @@ admission. Wire details and limits are in [the protocol specification](doc/proto
 
 Build using the usual `./autogen.sh`, `./configure`, and `make` steps, with the
 LZ4 and xxHash (with XXH3 support) libraries and
-development headers installed. Pump also requires Python `xxhash>=3.0.0`.
+development headers installed.
 To build native helpers for several installed LLVM releases, pass their
 colon-separated `llvm-config` paths as `DISTCC_CLANG_CONFIGS` to `./configure`.
 The selected SDKs are retained for incremental `make` invocations; environment

@@ -16,7 +16,7 @@ from test_broker import BrokerTestCase
 from test_adaptive import stats_response
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from distcc_job import fingerprint, write_metadata
+from distcc_job import JOB_THINLTO, fingerprint, write_metadata
 from distcc_lto import FileJobs, InputSnapshot, llvm_tools, work_key
 
 
@@ -252,7 +252,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         job = dict(cwd=cwd, args=[shutil.which('clang'), *options, '-x', 'ir', name, '-o', output],
                    outputs=[output])
         metadata = self.work / 'metadata'
-        write_metadata(4, job, [(name, *fingerprint(source))], metadata)
+        write_metadata(JOB_THINLTO, job, [(name, *fingerprint(source))], metadata)
         if cc1:
             result = self.run_command([self.build / 'distcc', '--file-job', metadata, inputs, '-', output])
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -852,7 +852,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         source.write_bytes(b'')
         metadata, output = self.work / 'job', self.work / 'result.o'
         job = dict(cwd=self.work, args=['clang', '-c', 'empty.bc'], outputs=[output])
-        write_metadata(4, job, [(str(self.work / 'empty.bc'), *fingerprint(source))], metadata)
+        write_metadata(JOB_THINLTO, job, [(str(self.work / 'empty.bc'), *fingerprint(source))], metadata)
         read_fd, write_fd = os.pipe()
         os.close(read_fd)
         try:

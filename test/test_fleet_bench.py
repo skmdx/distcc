@@ -1,5 +1,6 @@
 """Do not promote incomplete or incomparable measurements to speedup evidence."""
 import copy
+import importlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,8 +11,8 @@ import sys
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bench'))
-import fleet
-import measure
+fleet = importlib.import_module('fleet')
+measure = importlib.import_module('measure')
 sys.path.pop(0)
 
 
@@ -149,7 +150,7 @@ class StatisticsTest(unittest.TestCase):
                             'waiting for hosts\n'
                             'waiting for host=worker cost=2.000 score=4.000\n'
                             'distcc[1] (dcc_lock_pause) nothing available, sleeping 250ms...\n'
-                            'include server gave up analyzing\nninja -v -j8\n')
+                            'ninja -v -j8\n')
             result = measure.log_summary([path])
             self.assertEqual(result['phases']['prepare']['total_seconds'], .25)
             self.assertEqual(result['phases']['broker_wait']['total_seconds'], .375)
@@ -157,7 +158,6 @@ class StatisticsTest(unittest.TestCase):
             self.assertEqual(result['broker_waits'], 2)
             self.assertEqual(result['local_slot_waits'], 1)
             self.assertEqual(result['local_slot_wait_seconds'], .25)
-            self.assertEqual(result['analysis_warnings'], 1)
             self.assertEqual(result['ninja_jobs'], [8])
 
     def test_link_backends_are_distinct_from_compilations(self):

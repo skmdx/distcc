@@ -277,7 +277,6 @@ static int dcc_parse_options(const char **psrc,
     const char *started = *psrc, *p = *psrc;
 
     host->compr = DCC_COMPRESS_NONE;
-    host->cpp_where = DCC_CPP_ON_CLIENT;
 #ifdef HAVE_GSSAPI
     host->authenticate = 0;
     host->auth_name = NULL;
@@ -303,10 +302,6 @@ static int dcc_parse_options(const char **psrc,
             /* if "hostid,down", mark it down, and strip down from hostname */
             host->is_up = 0;
             p += 4;
-        } else if (str_startswith("cpp", p)) {
-            rs_trace("got CPP option");
-            host->cpp_where = DCC_CPP_ON_SERVER;
-            p += 3;
         } else if (str_startswith("stats=", p)) {
             char *end;
             long port;
@@ -360,7 +355,7 @@ static int dcc_parse_options(const char **psrc,
 #endif
         host->compr = DCC_COMPRESS_LZ4_STREAM;
     }
-    if (dcc_get_protover_from_features(host->compr, host->cpp_where,
+    if (dcc_get_protover_from_features(host->compr,
                                        &host->protover) == -1) {
         rs_log_error("invalid host options: %s", started);
         return EXIT_BAD_HOSTSPEC;
@@ -503,31 +498,24 @@ static int dcc_parse_localhost(struct dcc_hostdef *hostdef,
  *  is known, non-zero otherwise.
  */
 int dcc_get_features_from_protover(enum dcc_protover protover,
-                                   enum dcc_compress *compr,
-                                   enum dcc_cpp_where *cpp_where)
+                                   enum dcc_compress *compr)
 {
     switch (protover) {
     case DCC_VER_1:
         *compr = DCC_COMPRESS_NONE;
         break;
     case DCC_VER_2:
-    case DCC_VER_3:
         *compr = DCC_COMPRESS_LZO1X;
         break;
     case DCC_VER_LZ4:
-    case DCC_VER_LZ4_CPP:
         *compr = DCC_COMPRESS_LZ4;
         break;
     case DCC_VER_STREAM:
-    case DCC_VER_STREAM_CPP:
         *compr = DCC_COMPRESS_LZ4_STREAM;
         break;
     default:
         return 1;
     }
-    *cpp_where = (protover == DCC_VER_3 || protover == DCC_VER_LZ4_CPP ||
-                  protover == DCC_VER_STREAM_CPP)
-                ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT;
     return 0;
 }
 
@@ -536,36 +524,23 @@ int dcc_get_features_from_protover(enum dcc_protover protover,
  *  or -1 on error.
  */
 int dcc_get_protover_from_features(enum dcc_compress compr,
-                                   enum dcc_cpp_where cpp_where,
                                    enum dcc_protover *protover)
 {
     *protover = -1;
 
-    if (compr == DCC_COMPRESS_NONE && cpp_where == DCC_CPP_ON_CLIENT) {
+    if (compr == DCC_COMPRESS_NONE) {
         *protover = DCC_VER_1;
     }
 
-    if (compr == DCC_COMPRESS_LZO1X && cpp_where == DCC_CPP_ON_SERVER) {
-        *protover = DCC_VER_3;
-    }
-
-    if (compr == DCC_COMPRESS_LZO1X && cpp_where == DCC_CPP_ON_CLIENT) {
+    if (compr == DCC_COMPRESS_LZO1X) {
         *protover = DCC_VER_2;
     }
 
-    if (compr == DCC_COMPRESS_LZ4 && cpp_where == DCC_CPP_ON_SERVER) {
-        *protover = DCC_VER_LZ4_CPP;
-    }
-
-    if (compr == DCC_COMPRESS_LZ4 && cpp_where == DCC_CPP_ON_CLIENT) {
+    if (compr == DCC_COMPRESS_LZ4) {
         *protover = DCC_VER_LZ4;
     }
     if (compr == DCC_COMPRESS_LZ4_STREAM)
-        *protover = cpp_where == DCC_CPP_ON_SERVER ? DCC_VER_STREAM_CPP : DCC_VER_STREAM;
-
-    if (compr == DCC_COMPRESS_NONE && cpp_where == DCC_CPP_ON_SERVER) {
-        rs_log_error("pump mode (',cpp') requires compression (',lz4', ',lz4s', ',tcp' or ',lzo')");
-    }
+        *protover = DCC_VER_STREAM;
 
     return *protover;
 }

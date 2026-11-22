@@ -10,6 +10,7 @@ if __name__ == '__main__' and sys.argv[0] == '/__distcc_rust/dtlto-distributor':
     sys.exit((os.read(fd, 1) or b'\x01')[0])
 
 from distcc_lto import main
+from distcc_job import JOB_THINLTO
 
 if __name__ == '__main__':
-    sys.exit(main(4))
+    sys.exit(main(JOB_THINLTO))

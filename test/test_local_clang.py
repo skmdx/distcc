@@ -116,25 +116,6 @@ class LocalClangTest(BrokerTestCase):
         self.assertFalse(Path('/proc', pidfile.read_text().strip()).exists())
         self.assertIn('IO timeout', (self.work/'client.log').read_text())
 
-    def test_admitted_compiler_probe_does_not_start_resident_worker(self):
-        self.start_local()
-        wrappers = self.work/'probe-bin'
-        wrappers.mkdir()
-        compiler = wrappers/Path(self.compiler).name
-        compiler.symlink_to(self.build/'distcc')
-        module = next((self.build/'_include_server').glob('lib*/include_server'))
-        env = dict(self.env, PATH=str(wrappers)+os.pathsep+self.env['PATH'],
-                   PYTHONPATH=str(module))
-        script = ('from compiler_analyzer import run; import sys; '
-                  'r = run(sys.argv[1:]); sys.stdout.buffer.write(r.stdout); '
-                  'sys.stderr.buffer.write(r.stderr)')
-        arguments = ['-x', 'c', '-E', '-v', '/dev/null']
-        expected = self.command(arguments, reused=False)
-        result = subprocess.run([sys.executable, '-c', script, str(compiler), *arguments],
-                                env=env, cwd=self.work, capture_output=True, timeout=5)
-        self.assertEqual((result.returncode, result.stdout, result.stderr),
-                         (expected.returncode, expected.stdout, expected.stderr))
-        self.assertNotIn('--native-worker', (self.work/'client.log').read_text())
 
     def test_wrapper_name_containing_distcc_is_a_compiler(self):
         self.start_local()
@@ -276,18 +257,15 @@ class LocalClangTest(BrokerTestCase):
     def test_missing_native_module_or_dependency_is_not_an_unsupported_major(self):
         self.saturate_frontend()
         version = self.command(['-dumpversion'], reused=False, check=True, text=True).stdout
-        package = self.work/'include_server'/('clang' + version.strip().split('.')[0])
-        package.mkdir(parents=True)
-        (package.parent/'__init__.py').touch()
-        (package/'__init__.py').touch()
-        self.env['PYTHONPATH'] = str(self.work)
-        for dependency in (False, True):
-            with self.subTest(dependency=dependency):
-                if dependency:
-                    (package/'clang_native.py').write_text('import missing_distcc_dependency\n')
-                result = self.command(['-c', str(self.source), '-o', 'broken.o'])
-                self.assertNotEqual(result.returncode, 0)
-                self.assertFalse((self.work/'broken.o').exists())
+        launcher = self.work/'distcc-clang'
+        shutil.copy2(self.build/'distcc-clang', launcher)
+        slot = self.work/('distcc-clang-' + version.split('.')[0])
+        slot.write_text('invalid executable')
+        slot.chmod(0o755)
+        self.env['DISTCC_CLANG_DRIVER'] = str(launcher)
+        result = self.command(['-c', str(self.source), '-o', 'broken.o'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.work/'broken.o').exists())
 
     def test_driver_config_without_remote_frontend_is_local(self):
         self.saturate_frontend()
@@ -780,7 +758,7 @@ class LocalClangTest(BrokerTestCase):
 
     def test_codegen_selects_the_fastest_predicted_partition_count(self):
         self.start_local()
-        header = self.build/'include_server/c_extensions/clang_codegen.h'
+        header = self.build/'src/clang/clang_codegen.h'
         (self.work/'plan.cc').write_text(f'#include "{header}"\n' + '''
 int main() {
     // Both 4 and 5 parts cost .45s; prefer the smaller resource footprint.
@@ -1003,8 +981,8 @@ int main() {
         self.start_local()
         (self.work/'source.c').write_text('int value;\n')
         (self.work/'source.S').write_text('.text\n')
-        for directory in self.build.glob('_include_server/lib.*/include_server/clang[0-9]*'):
-            compiler = shutil.which(directory.name.replace('clang','clang-'))
+        for directory in self.build.glob('distcc-clang-[0-9]*'):
+            compiler = shutil.which(directory.name.removeprefix('distcc-'))
             if not compiler: continue
             self.compiler = compiler
             for args in (['-E','-dM','source.c'], ['-c','source.S','-o','out'],

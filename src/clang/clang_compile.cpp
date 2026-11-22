@@ -1,6 +1,7 @@
 /* Preserve the client's source identity during code generation.
  * SPDX-License-Identifier: GPL-2.0-or-later */
-#include <Python.h>
+#include "../native_worker.h"
+#include <cstdlib>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/FrontendTool/Utils.h>
 #include <clang/Tooling/Tooling.h>
@@ -9,27 +10,22 @@
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/ADT/ScopeExit.h>
-#include "../../src/clang_inputs.h"
+#include "clang_inputs.h"
 #include "remote_files.h"
 #include "clang_compiler.h"
 #include "compiler_command.h"
-#ifdef DCC_CLANG_COMPILE_MODULE
 #include "clang_codegen.h"
 #include "clang_result.h"
-#endif
 
 namespace {
-const dcc_file_cache_api *file_cache;
-const dcc_argv_file_api *command_api;
 // The driver sees the existing worker paths. Only the frontend uses the
 // client's main-file identity, including quoted-include lookup from its parent.
 // File contents and metadata remain owned by the physical filesystem.
 class ClientFiles : public llvm::vfs::ProxyFileSystem {
     std::string root, cwd, original, physical;
-    bool pump;
 public:
-    ClientFiles(const char *root, const char *cwd, bool pump)
-        : ProxyFileSystem(llvm::vfs::createPhysicalFileSystem()), root(root), cwd(cwd), pump(pump) {}
+    ClientFiles(const char *root, const char *cwd)
+        : ProxyFileSystem(llvm::vfs::createPhysicalFileSystem()), root(root), cwd(cwd) {}
     void activate(llvm::StringRef name, llvm::StringRef input) {
         original = name.str();
         physical = input.str();
@@ -39,7 +35,7 @@ public:
         if (!original.empty() && name == original) return physical;
         // FileManager resolves the main file's directory before opening it.
         // A preprocessed job carries only the source image, not that tree.
-        if (!pump && !original.empty() &&
+        if (!original.empty() &&
             name == llvm::sys::path::parent_path(original))
             return llvm::sys::path::parent_path(physical).str();
         if (!root.empty() && name != root && !llvm::StringRef(name).starts_with(root + "/")) {
@@ -48,8 +44,7 @@ public:
             llvm::sys::path::remove_dots(normalized, true);
             auto mapped = root + normalized.str().str();
             // The driver also reads its installed toolchain configuration.
-            // Pump frontend lookup is restricted to the client's input tree.
-            if ((pump && !original.empty()) || getUnderlyingFS().exists(mapped)) return mapped;
+            if (getUnderlyingFS().exists(mapped)) return mapped;
         }
         return name;
     }
@@ -112,29 +107,13 @@ void dcc_clang_compile_init() {
     llvm::InitializeAllTargetMCs(); llvm::InitializeAllAsmParsers(); llvm::InitializeAllAsmPrinters();
 }
 
-// Called in a dedicated compiler child, never in the long-lived include server.
-PyObject *dcc_clang_compile(PyObject *, PyObject *arguments) {
-    PyObject *argv;
-    const char *original, *root, *cwd;
-    int pump;
-    if (!PyArg_ParseTuple(arguments, "Osssp", &argv, &original, &root, &cwd, &pump)) return nullptr;
-    PyObject *sequence = PySequence_Fast(argv, "argv must be a sequence");
-    if (!sequence) return nullptr;
-    std::vector<std::string> command;
-    for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE(sequence); ++i) {
-        const char *value = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(sequence, i));
-        if (!value) { Py_DECREF(sequence); return nullptr; }
-        command.emplace_back(value);
-    }
-    Py_DECREF(sequence);
-    if (command.empty() || !*original)
-        return PyErr_Format(PyExc_ValueError, "missing compiler command or source identity");
+static int preprocessed(std::vector<std::string> command, const char *original,
+                        const char *root, const char *cwd) {
     const std::string invoked_as = command.front();
     bool ok;
-    Py_BEGIN_ALLOW_THREADS
     clang::tooling::addTargetAndModeForProgramName(command, invoked_as);
     {
-        llvm::IntrusiveRefCntPtr<ClientFiles> files(new ClientFiles(root, cwd, pump));
+        llvm::IntrusiveRefCntPtr<ClientFiles> files(new ClientFiles(root, cwd));
         llvm::IntrusiveRefCntPtr<clang::FileManager> manager(
             new clang::FileManager(clang::FileSystemOptions(), files));
         Compile action(*files, original, cwd);
@@ -143,19 +122,10 @@ PyObject *dcc_clang_compile(PyObject *, PyObject *arguments) {
         ok = invocation.run();
     }
     llvm::outs().flush(); llvm::errs().flush();
-    Py_END_ALLOW_THREADS
-    if (PyErr_CheckSignals() < 0) return nullptr;
-    return PyLong_FromLong(ok ? 0 : 1);
+    return ok ? 0 : 1;
 }
 
-static int compile_file(int request, int fd) {
-    CompilerCommand command(*command_api);
-    if (!command.read(request, 1)) {
-        llvm::errs() << "distcc: invalid complete compiler command file\n";
-        return 1;
-    }
-    llvm::SmallVector<const char *> argv;
-    for (char **p = command[0]; *p; ++p) argv.push_back(*p);
+static int remote(llvm::ArrayRef<const char *> argv, int fd) {
     if (argv.size() < 11 || llvm::StringRef(argv[4]) != "remote") {
         llvm::errs() << "distcc: invalid remote compiler command\n";
         return 1;
@@ -179,76 +149,39 @@ static int compile_file(int request, int fd) {
             llvm::sys::path::remove_dots(normalized, true);
             path = std::string(root) + normalized.str().str();
         });
-        llvm::IntrusiveRefCntPtr<RemoteFiles> files(new RemoteFiles(dup(fd), cwd, *file_cache, client_identity,
+        llvm::IntrusiveRefCntPtr<RemoteFiles> files(new RemoteFiles(dup(fd), cwd, dcc_file_cache_records, client_identity,
             llvm::sys::path::parent_path(root).str()));
         files->prepare(*invocation);
         auto finish = llvm::scope_exit([&] { files->finish(); });
         compiler->setFileManager(new clang::FileManager(invocation->getFileSystemOpts(), files));
         compiler->createSourceManager();
-#ifdef DCC_CLANG_COMPILE_MODULE
         dcc_result::Result result(*files, *compiler, cwd);
         auto generated = dcc_clang_codegen(*compiler, [&](unsigned count) { return files->codegen_cpus(count); },
                                            &result);
         ok = generated ? *generated : clang::ExecuteCompilerInvocation(compiler.get());
-#else
-        ok = clang::ExecuteCompilerInvocation(compiler.get());
-#endif
     }
     llvm::outs().flush(); llvm::errs().flush();
     return ok ? 0 : 1;
 }
 
-#ifdef DCC_CLANG_COMPILE_MODULE
-#include "../../src/native_worker.h"
-namespace {
-PyObject *compile_request(PyObject *, PyObject *arguments) {
-    int request, fd;
-    if (!PyArg_ParseTuple(arguments, "ii", &request, &fd)) return nullptr;
-    int status;
-    Py_BEGIN_ALLOW_THREADS
-    status = compile_file(request, fd);
-    Py_END_ALLOW_THREADS
-    if (PyErr_CheckSignals() < 0) return nullptr;
-    return PyLong_FromLong(status);
-}
-PyObject *serve(PyObject *, PyObject *arguments) {
-    int descriptor;
-    if (!PyArg_ParseTuple(arguments, "i", &descriptor)) return nullptr;
-    int status;
-    Py_BEGIN_ALLOW_THREADS
-    llvm::outs().flush(); llvm::errs().flush();
-    status = dcc_native_worker(descriptor, [](int request, unsigned operation) {
-        int result = operation != 'C' ? 1 : compile_file(request, STDIN_FILENO);
-        llvm::outs().flush(); llvm::errs().flush();
-        return result;
-    });
-    Py_END_ALLOW_THREADS
-    if (PyErr_CheckSignals() < 0) return nullptr;
-    return PyLong_FromLong(status);
-}
-PyMethodDef methods[] = {
-    {"compile", dcc_clang_compile, METH_VARARGS, "Compile with the client's source identity."},
-    {"compile_file", compile_request, METH_VARARGS, "Consume a remote command file and filesystem channel."},
-    {"serve", serve, METH_VARARGS, "Own descriptor dispatch and isolated compiler children."},
-    {nullptr, nullptr, 0, nullptr}};
-PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_compile", nullptr, -1,
-                      methods, nullptr, nullptr, nullptr, nullptr};
-}
-PyMODINIT_FUNC PyInit_clang_compile() {
-    command_api = CompilerCommand::load();
-    if (!command_api) return nullptr;
-    PyObject *cache_module = PyImport_ImportModule("include_server.distcc_pump_c_extensions");
-    if (!cache_module) return nullptr;
-    PyObject *capsule = PyObject_GetAttrString(cache_module, "file_cache");
-    Py_DECREF(cache_module);
-    if (!capsule) return nullptr;
-    // This capsule exposes a static C function table, independent of Python
-    // object lifetime. Resolve it once in the resident worker before forking.
-    file_cache = static_cast<const dcc_file_cache_api *>(PyCapsule_GetPointer(capsule, "distcc.file_cache"));
-    Py_DECREF(capsule);
-    if (!file_cache) return nullptr;
+int dcc_clang_native_worker(int fd);
+
+int main(int argc, char **argv) {
     dcc_clang_compile_init();
     dcc_clang_codegen_init();
-    return PyModule_Create(&module);
+    if (argc == 4 && !strcmp(argv[1], "--native-worker"))
+        return dcc_clang_native_worker(atoi(argv[2]));
+    if (argc == 4 && !strcmp(argv[1], "--worker"))
+        return dcc_native_worker(atoi(argv[2]), [](int request, unsigned operation) {
+            CompilerCommand command;
+            if (operation != 'C' || !command.read(request, 1)) return 1;
+            llvm::SmallVector<const char *> args;
+            for (char **p = command[0]; *p; ++p) args.push_back(*p);
+            return remote(args, STDIN_FILENO);
+        });
+    if (argc >= 6 && !strcmp(argv[4], "preprocessed"))
+        return preprocessed({argv + 5, argv + argc}, argv[2], argv[1], argv[3]);
+    if (argc >= 11 && !strcmp(argv[4], "remote"))
+        return remote({argv, static_cast<size_t>(argc)}, atoi(argv[5]));
+    return 1;
 }
-#endif

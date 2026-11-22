@@ -51,53 +51,51 @@ class Summary:
     @staticmethod
     def print_mean_and_sd(times, unit='s', no_sd=False):
         assert len(unit) == 1, unit
-        mean = statistics.mean(times)
-        sd = statistics.std(times)
+        mean = statistics.mean(times) if times else None
+        sd = statistics.stdev(times) if len(times) > 1 else None
         if mean is None:
-            print "%s%s  " % ("n/a", sd_space),
+            print("%9s " % "n/a", end=' ')
         else:
-            print "%8.1f%s " % (mean, unit),
+            print("%8.1f%s " % (mean, unit), end=' ')
         if not no_sd:
             if sd is None:
-                print "%9s " % "n/a",
+                print("%9s " % "n/a", end=' ')
             else:
-                print "%8.1f%s " % (sd, unit),
+                print("%8.1f%s " % (sd, unit), end=' ')
 
     def print_table(self):
         import time, os, sys
-        import statistics
 
         # if nothing was run, skip it
         if not len(self._table):
             return        
 
         """Print out in a nice tabular form"""
-        print """
+        print("""
                        ========================
                        distcc benchmark results
                        ========================
 
-"""
-        print "Date: ", time.ctime()
+""")
+        print("Date: ", time.ctime())
         hosts = os.getenv('DISTCC_HOSTS')
-        print "DISTCC_HOSTS: %s" % `hosts`
-        print "Total hosts: %d" % buildutil.count_hosts(hosts)
+        print("DISTCC_HOSTS: %s" % repr(hosts))
+        print("Total hosts: %d" % buildutil.count_hosts(hosts))
         number_CPUs = os.sysconf('SC_NPROCESSORS_ONLN')
-        print "Local number of CPUs: %s" % number_CPUs
+        print("Local number of CPUs: %s" % number_CPUs)
         sys.stdout.flush()
         os.system("uname -a")
 
-        print ("%-20s  %-30s  %9s  %9s  %9s  %9s  %9s" 
+        print(("%-20s  %-30s  %9s  %9s  %9s  %9s"
         % ('project', 'compiler', 'time', 's.d.', 
            'CPU time',
-           'CPU util', 
-           'incl serv'))
+           'CPU util')))
 
         for row in self._table:
-            print "%-20s  %-30s " % row[:2],
+            print("%-20s  %-30s " % row[:2], end=' ')
             time_info_accumulator = row[2]
             if isinstance(time_info_accumulator, str):
-                print ' ' * 4, time_info_accumulator
+                print(' ' * 4, time_info_accumulator)
             else:
                 real_times = [time_info.real for time_info in time_info_accumulator]
                 Summary.print_mean_and_sd(real_times)
@@ -110,10 +108,4 @@ class Summary:
                     [100 * cpu_times[i]/(number_CPUs * time_info_accumulator[i].real)
                      for i in range(len(time_info_accumulator))])
                 self.print_mean_and_sd(cpu_util_ratios, unit='%', no_sd=True)
-                include_server_times = [time_info.include_server
-                                        for time_info in time_info_accumulator]
-
-                if None not in include_server_times:
-                    self.print_mean_and_sd(include_server_times, no_sd=True)
-
-                print
+                print()

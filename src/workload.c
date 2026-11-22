@@ -152,7 +152,7 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
         st.st_size <= SOURCE_LIMIT)
         hint->work_units = st.st_size;
     hint->kind = gpu && !host_only ? DCC_WORK_OFFLOAD : kind + (ready ? 0 : 3);
-    hint->memory_class = 1 + (ready ? DCC_JOB_COMPILE : DCC_JOB_PUMP) * DCC_MEMORY_BUCKETS +
+    hint->memory_class = 1 + DCC_JOB_COMPILE * DCC_MEMORY_BUCKETS +
                          dcc_resource_bucket(hint->bytes);
     key = XXH3_64bits_withSeed(&hint->kind, sizeof(hint->kind), key);
     hint->key = key ? key : 1;
@@ -208,8 +208,6 @@ static unsigned history_slot(const struct dcc_work_model *model, const struct dc
 
 static double initial_rate(unsigned kind)
 {
-    /* Pump now measures the whole uncompressed tree, so a source-only
-     * expansion multiplier would count the headers twice. */
     static const double rate[] = {.0625, .25, 1}; /* assembly, C, C++ */
     return kind < DCC_WORK_RUST ? rate[kind % 3] : 0;
 }

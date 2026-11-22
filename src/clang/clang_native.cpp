@@ -1,6 +1,5 @@
 /* Execute local driver jobs with resident libraries and isolated compiler state.
  * SPDX-License-Identifier: GPL-2.0-or-later */
-#include <Python.h>
 #include <clang/Driver/Compilation.h>
 #include <clang/Driver/Driver.h>
 #include <clang/Driver/Job.h>
@@ -22,7 +21,7 @@
 #include "clang_codegen.h"
 #include "clang_compiler.h"
 #include "compiler_command.h"
-#include "../../src/native_worker.h"
+#include "../native_worker.h"
 
 LLD_HAS_DRIVER(elf)
 
@@ -31,7 +30,6 @@ extern "C" int dcc_clang_link_plan(char **, char ***);
 extern "C" int dcc_clang_inputs(char **, char ***, char ***);
 
 namespace {
-const dcc_argv_file_api *command_api;
 int isolated(const std::function<int()> &run) {
     llvm::outs().flush(); llvm::errs().flush();
     pid_t child = fork();
@@ -139,11 +137,11 @@ int prepare(int fd, char **args, unsigned operation, int journal, bool templated
     if (error) return 1;
     // The complete input is now owned in memory. Reuse its file for the reply.
     if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET) < 0) return 1;
-    return command_api->write(fd, "ARGC", "ARGV", command) ||
-           (roots && command_api->write(fd, "ARGC", "ARGV", roots));
+    return dcc_argv_file_write(fd, "ARGC", "ARGV", command) ||
+           (roots && dcc_argv_file_write(fd, "ARGC", "ARGV", roots));
 }
 int execute(int fd, unsigned operation, int journal) {
-    CompilerCommand command(*command_api);
+    CompilerCommand command;
     if (!command.read(fd, 2)) {
         llvm::errs() << "distcc: invalid complete compiler command file\n";
         return 1;
@@ -166,13 +164,10 @@ int execute(int fd, unsigned operation, int journal) {
     }
     return prepare(fd, argv, operation, journal, directory[2] != nullptr);
 }
-PyObject *serve(PyObject *, PyObject *input) {
-    int fd;
-    if (!PyArg_ParseTuple(input, "i", &fd)) return nullptr;
-    int status;
-    Py_BEGIN_ALLOW_THREADS
-    llvm::outs().flush(); llvm::errs().flush();
-    status = dcc_native_worker(fd, [](int request, unsigned operation) {
+}
+
+int dcc_clang_native_worker(int fd) {
+    return dcc_native_worker(fd, [](int request, unsigned operation) {
         int result = execute(request, operation, -1);
         llvm::outs().flush(); llvm::errs().flush();
         return result;
@@ -181,20 +176,4 @@ PyObject *serve(PyObject *, PyObject *input) {
         llvm::outs().flush(); llvm::errs().flush();
         return result;
     });
-    Py_END_ALLOW_THREADS
-    if (PyErr_CheckSignals() < 0) return nullptr;
-    return PyLong_FromLong(status);
-}
-PyMethodDef methods[] = {
-    {"serve", serve, METH_VARARGS, "Own descriptor dispatch and isolated compiler children."},
-    {nullptr, nullptr, 0, nullptr}};
-PyModuleDef module = {PyModuleDef_HEAD_INIT, "clang_native", nullptr, -1, methods, nullptr, nullptr, nullptr, nullptr};
-}
-PyMODINIT_FUNC PyInit_clang_native() {
-    command_api = CompilerCommand::load();
-    if (!command_api) return nullptr;
-    dcc_clang_codegen_init();
-    llvm::InitializeAllTargetInfos(); llvm::InitializeAllTargets();
-    llvm::InitializeAllTargetMCs(); llvm::InitializeAllAsmParsers(); llvm::InitializeAllAsmPrinters();
-    return PyModule_Create(&module);
 }

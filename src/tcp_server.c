@@ -712,7 +712,7 @@ static int begin(struct dcc_tcp_server *s, struct dcc_tcp_frame *f)
         int required_seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
         if (s->job->kind != DCC_JOB_COMPILE || s->job->count != 1 ||
             s->job->inputs[0].kind != DCC_JOB_FILE || s->job->inputs[0].cached ||
-            s->job->inputs[0].encoding != DCC_JOB_RAW || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+            fstat(fd, &st) || !S_ISREG(st.st_mode) ||
             (uint64_t)st.st_size != s->job->inputs[0].plain_size ||
             (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY || seals < 0 ||
             (seals & required_seals) != required_seals) return -1;

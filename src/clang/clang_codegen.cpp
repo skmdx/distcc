@@ -1,9 +1,9 @@
 /* Optimize the whole translation unit, then use idle local CPU leases for
  * independent machine-code generation. SPDX-License-Identifier: GPL-2.0-or-later */
 #include "clang_codegen.h"
-#include "../../src/broker_protocol.h"
-#include "../../src/workload.h"
-#include "../../src/lto_partition.h"
+#include "../broker_protocol.h"
+#include "../workload.h"
+#include "../lto_partition.h"
 #include <clang/Basic/TargetInfo.h>
 #include <clang/CodeGen/BackendUtil.h>
 #include <clang/CodeGen/CodeGenAction.h>

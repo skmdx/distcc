@@ -15,7 +15,7 @@
 static inline size_t dcc_tcp_bitmap_size(unsigned count) { return (count + 7U) / 8U; }
 
 enum dcc_tcp_type {
-    DCC_TCP_BEGIN = 0x54000300, DCC_TCP_NEED, DCC_TCP_INPUT,
+    DCC_TCP_BEGIN = 0x54000400, DCC_TCP_NEED, DCC_TCP_INPUT,
     DCC_TCP_RESULT, DCC_TCP_OUTPUT, DCC_TCP_COMPLETE, DCC_TCP_RESULT_FD, DCC_TCP_RETRY,
     DCC_TCP_PROGRESS, DCC_TCP_FS_QUERY, DCC_TCP_FS_REPLY, DCC_TCP_OUTPUT_NAMES,
     DCC_TCP_METADATA_BEGIN, DCC_TCP_METADATA_DATA
@@ -48,7 +48,7 @@ void dcc_tcp_frame_next(struct dcc_tcp_frame *);
 int dcc_tcp_frame_header(struct dcc_tcp_frame *, size_t);
 /* 1 complete, 0 would block, -1 malformed/closed. Caller consumes after use. */
 int dcc_tcp_frame_read(int, struct dcc_tcp_frame *, size_t);
-/* Encode at most one chunk; raw input and precompressed pump blocks share
+/* Encode at most one chunk; raw input and precompressed blocks share
  * this framing. Returned allocation includes the complete 8-byte header. */
 unsigned char *dcc_tcp_frame_make(uint32_t, const void *, size_t, size_t *);
 int dcc_tcp_unpack(const struct dcc_tcp_frame *, unsigned *, void *, const void **, size_t *);

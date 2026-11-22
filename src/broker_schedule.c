@@ -12,23 +12,6 @@
 #include "trace.h"
 #include "exitcode.h"
 
-static uint64_t *family_word(struct peer *peer, uint64_t family)
-{
-    return &peer->dispatched[(family >> 6) % (sizeof(peer->dispatched) / sizeof(peer->dispatched[0]))];
-}
-
-static uint64_t family_bit(uint64_t family) { return UINT64_C(1) << (family & 63); }
-
-int cold_family(struct peer *peer, uint64_t family)
-{
-    return family && !(*family_word(peer, family) & family_bit(family));
-}
-
-void record_dispatched(struct peer *peer, uint64_t family)
-{
-    if (family) *family_word(peer, family) |= family_bit(family);
-}
-
 static int effective_lanes(const struct dcc_capacity *cap)
 {
     int lanes = cap->cpus < cap->jobs ? cap->cpus : cap->jobs;
@@ -87,8 +70,8 @@ static int oldest_first(const void *a, const void *b)
 }
 static int bulk_input(const struct peer *peer, const struct dcc_work_hint *hint)
 {
-    /* Local inputs normally pass a sealed FD. Pump's logical tree includes
-     * cached headers, so its size does not predict uploaded byte volume. */
+    /* Local inputs normally pass a sealed FD. Only prepared sources and offload
+     * inputs describe the payload before a remote transfer. */
     return !peer->local && (hint->kind <= 3 || hint->kind == DCC_WORK_OFFLOAD);
 }
 
@@ -225,13 +208,12 @@ static unsigned long long memory_forecast(const struct dcc_capacity *cap,
     unsigned row;
     const int *capacities;
     switch (kind) {
-    case DCC_JOB_FRONTEND: row = 5; capacities = cap->frontend_capacity; break;
-    case DCC_JOB_RUST_CGU: row = 6; capacities = cap->cgu_capacity; break;
+    case DCC_JOB_FRONTEND: row = 4; capacities = cap->frontend_capacity; break;
+    case DCC_JOB_RUST_CGU: row = 5; capacities = cap->cgu_capacity; break;
     case DCC_JOB_COMPILE: row = 0; capacities = cap->compile_capacity; break;
-    case DCC_JOB_PUMP: row = 1; capacities = cap->pump_capacity; break;
-    case DCC_JOB_RUST: row = 2; capacities = cap->rust_capacity; break;
-    case DCC_JOB_THINLTO: row = 3; capacities = cap->thinlto_capacity; break;
-    case DCC_JOB_OFFLOAD_LINK: row = 4; capacities = cap->offload_capacity; break;
+    case DCC_JOB_RUST: row = 1; capacities = cap->rust_capacity; break;
+    case DCC_JOB_THINLTO: row = 2; capacities = cap->thinlto_capacity; break;
+    case DCC_JOB_OFFLOAD_LINK: row = 3; capacities = cap->offload_capacity; break;
     default: return cap->job_memory;
     }
     uint64_t bytes = cap->memory_estimates[row][bucket];
@@ -354,16 +336,14 @@ static int compatible_cgu(const char *required, const char *offered)
 
 static enum decision dispatch_local_throttle(struct broker_schedule *broker, struct client *client, struct reply *reply, double now)
 {
-    int limit = client->command == LOCAL_ANALYSIS ? dcc_resource_cpus() : cpp_limit(broker);
+    int limit = cpp_limit(broker);
     /* Queue against the client's budget before granting a lease. Otherwise
      * a smaller client rejects the broker's grant and sleeps for a second
      * even when the next compiler releases its slot immediately. */
-    unsigned occupied = client->command == LOCAL_ANALYSIS ?
-                        broker->analysis_busy : broker->cpp_busy;
+    unsigned occupied = broker->cpp_busy;
     if (broker->cpp_busy < limit && occupied < client->local_limit) {
         reply->slots = occupied + 1;
         ++broker->cpp_busy;
-        broker->analysis_busy += client->command == LOCAL_ANALYSIS;
         client->cpp_reserved = 1;
         client->state = ACTIVE;
         client->run_at = now;
@@ -831,7 +811,7 @@ enum decision schedule_request(struct broker_schedule *broker, struct client *cl
                                struct reply *reply, struct placement *choice)
 {
     switch (client->command) {
-    case LOCAL_CPP: case LOCAL_ANALYSIS: return dispatch_local_throttle(broker, client, reply, now);
+    case LOCAL_CPP: return dispatch_local_throttle(broker, client, reply, now);
     case CGU_CAPACITY: return answer_cgu_capacity(broker, client, now, reply);
     case JOBS: return answer_cluster_jobs(broker, now, reply);
     default: return place_job(broker, client, now, batch, reply, choice);
@@ -841,8 +821,8 @@ enum decision schedule_request(struct broker_schedule *broker, struct client *cl
 static int waiting_order(const void *a, const void *b)
 {
     const struct waiting_job *left = a, *right = b;
-    int lc = left->client->command == LOCAL_CPP || left->client->command == LOCAL_ANALYSIS || left->client->command == JOBS;
-    int rc = right->client->command == LOCAL_CPP || right->client->command == LOCAL_ANALYSIS || right->client->command == JOBS;
+    int lc = left->client->command == LOCAL_CPP || left->client->command == JOBS;
+    int rc = right->client->command == LOCAL_CPP || right->client->command == JOBS;
     if (lc != rc) return rc - lc;
     /* Large jobs have the greatest execution penalty on a slower worker.
      * Aging gives sustained arrivals a bounded opportunity to overtake. */
@@ -864,7 +844,7 @@ int schedule_batch(struct broker_schedule *broker, struct dispatch_batch *batch,
     for (i = 0; i < MAX_CLIENTS; ++i) {
         struct client *c = &broker->clients[i];
         if (c->fd >= 0 && c->state == WAITING &&
-            (c->command == LOCAL_CPP || c->command == LOCAL_ANALYSIS || !probes_pending))
+            (c->command == LOCAL_CPP || !probes_pending))
             waiting[count_waiting++] = (struct waiting_job){c,
                 dcc_work_predict(&broker->model, &c->hint), now - c->waiting_since};
     }

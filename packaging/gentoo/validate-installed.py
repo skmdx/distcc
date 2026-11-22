@@ -17,17 +17,16 @@ REMOTE_TIMEOUT = 180
 # Deployment runs as root; compiler helpers must also load as Portage's build
 # user. An executable shared object without group/other read permission passes
 # root-only compilation tests but fails every unprivileged dlopen.
-import include_server
 account = pwd.getpwnam('portage') if os.geteuid() == 0 else None
-package = Path(next(iter(include_server.__path__)))
-for module in package.rglob('*.so'):
-    name = '.'.join(('include_server', *module.relative_to(package).parts[:-1],
-                     module.name.split('.')[0]))
-    subprocess.run([sys.executable, '-I', '-c',
-                    'import importlib,sys; importlib.import_module(sys.argv[1])', name],
-                   check=True, user=account.pw_uid if account else None,
-                   group=account.pw_gid if account else None,
-                   extra_groups=[] if account else None)
+for pattern in ('libexec/distcc/distcc-clang*', 'lib/distcc/*.so',
+                'lib/distcc/gcc-scan/*/*/distcc_gcc_scan.so'):
+    files = list(Path('/usr').glob(pattern))
+    assert files, pattern
+    for path in files:
+        subprocess.run(['test', '-r', path, '-a', '-x', path], check=True,
+                       user=account.pw_uid if account else None,
+                       group=account.pw_gid if account else None,
+                       extra_groups=[] if account else None)
 
 wrapper = Path('/usr/lib/distcc/gcc')
 assert wrapper.samefile('/usr/bin/distcc'), 'GCC masquerade wrapper is missing'
@@ -44,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
     env = dict(os.environ, PATH='/usr/lib/distcc:/usr/bin:/bin', TMPDIR=str(root),
                DISTCC_DIR=str(root/'state'),
                DISTCC_HOSTS=os.environ['VALIDATE_DISTCC_HOSTS'], DISTCC_FALLBACK='0',
-               DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_TESTING_INCLUDE_SERVER='1',
+               DISTCC_SKIP_LOCAL_RETRY='1',
                DISTCC_VERBOSE='1', DISTCC_LOG=str(root/'client.log'), CCACHE_DISABLE='1')
     # This validator owns the broker. Input discovery must not outlive its
     # listener while the remote command itself is still within its deadline.
@@ -67,19 +66,26 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                               file=sys.stderr)
     resources.push(report_failure)
     broker_log = resources.enter_context((root/'broker.log').open('w'))
-    broker = subprocess.Popen(['/usr/bin/distccd', '--broker', env['DISTCC_BROKER']],
-                              env=env, stdout=broker_log, stderr=broker_log)
-    def stop_broker():
-        broker.terminate()
-        broker.wait(timeout=10)
-    resources.callback(stop_broker)
+    def launch_broker(settings):
+        path = settings['DISTCC_BROKER']
+        proc = subprocess.Popen(['/usr/bin/distccd', '--broker', path],
+                                env=settings, stdout=broker_log, stderr=broker_log)
+        def stop():
+            proc.terminate()
+            proc.wait(timeout=10)
+        resources.callback(stop)
+        deadline = time.monotonic() + 5
+        while not Path(path).exists():
+            assert proc.poll() is None and time.monotonic() < deadline, 'Validation broker failed to start'
+            time.sleep(0.01)
+        return proc
+
+    broker = launch_broker(env)
     def remote(args, **kwargs):
         return run_observed(args, observe=(broker.pid,), **kwargs)
-    deadline = time.monotonic() + 5
-    while not Path(env['DISTCC_BROKER']).exists():
-        assert broker.poll() is None and time.monotonic() < deadline, 'Validation broker failed to start'
-        time.sleep(0.01)
     env.pop('DISTCC_GCC_SCAN_LIBRARY', None)
+    if ',tcp' in env['DISTCC_HOSTS']:
+        env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_FRONTEND_ROOTS=str(root))
     results = {}
     compilers = ['/usr/bin/gcc', '/usr/bin/g++'] + json.loads(os.environ.get('VALIDATE_DISTCC_COMPILERS', '[]'))
     # Test the names Portage actually invokes, not only target-prefixed aliases
@@ -107,6 +113,14 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
     if '--rust-only' in sys.argv or '--thinlto-only' in sys.argv:
         assert ',tcp' in env['DISTCC_HOSTS'], 'Validation requires the TCP job protocol'
         compilers = []
+    fleet_env, fleet_broker = env, broker
+    if compilers and ',tcp' in env['DISTCC_HOSTS']:
+        # Fixed transport slots exercise the daemon even on the client host.
+        # The subsequent Rust and ThinLTO checks need its advertised capacity.
+        hosts = ' '.join(','.join(x for x in host.split(',') if not x.startswith('stats='))
+                         for host in env['DISTCC_HOSTS'].split())
+        env = dict(env, DISTCC_HOSTS=hosts, DISTCC_BROKER=str(root/'compile.sock'))
+        broker = launch_broker(env)
     seen_gcc_plans = set()
     for compiler_path in dict.fromkeys(compilers):
         compiler = Path(compiler_path).name
@@ -137,13 +151,16 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                           'int main(void) { return sum(&a,&b,&c,&d,&e,&f,&g,&h) != 36 || '
                           'sizeof(uint64_t) != 8 || COUNTER_HEADER_SEEN != 1 || ABSOLUTE_HEADER_SEEN != 1; }\n')
         obj = root/(compiler+'-remote.o')
-        result = remote(['pump', 'distcc', compiler, '-I'+str(root), '-O2', '-fPIC',
+        before = (root/'client.log').stat().st_size if (root/'client.log').exists() else 0
+        result = remote(['distcc', compiler, '-I'+str(root), '-O2', '-fPIC',
                                  '-c', str(source), '-o', str(obj)],
                                 env=env, timeout=90)
         assert result.returncode == 0, (compiler, result.returncode,
             (result.stdout+result.stderr).decode(errors='replace'),
             (root/'client.log').read_text()[-5000:] if (root/'client.log').exists() else '')
-        assert b'gave up' not in result.stderr + result.stdout
+        if ',tcp' in env['DISTCC_HOSTS']:
+            trace = (root/'client.log').read_text()[before:]
+            assert 'frontend filesystem:' in trace and 'pooled TCP job completed' in trace, trace[-6000:]
         # Compatible compilers/assemblers may produce different object bytes.
         # Exercise the client ABI with a local object, then check the behavior.
         exe = root/('run-'+suffix)
@@ -155,7 +172,6 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             # validator and the selected daemon run on the same machine.
             before = (root/'client.log').stat().st_size
             frontend_env = dict(env, DISTCC_FRONTEND_REMOTE='1')
-            frontend_env.pop('INCLUDE_SERVER_PORT', None)
             obj.unlink()
             result = remote(['distcc', compiler, '-I'+str(root), '-O2', '-fPIC',
                                      '-c', str(source), '-o', str(obj)],
@@ -217,7 +233,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             before = (root/'client.log').stat().st_size
             compound = root/(compiler+'-compound')
             parent_source = str(root/'stdint.h'/'..'/support.name)
-            result = remote(['pump', 'distcc', compiler, '-I'+str(root),
+            result = remote(['distcc', compiler, '-I'+str(root),
                                      '-isystem', str(system_headers), '-O2', '-fPIC',
                                      source.name, parent_source,
                                      '-o', str(compound)], cwd=root, env=env,
@@ -252,6 +268,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             assert 'distcc-link: linked on ' in linked.stderr, linked.stderr
             subprocess.run([output], check=True, timeout=10)
             results['sysroot_link'] = {'distributed': True, 'executed': True}
+    env, broker = fleet_env, fleet_broker
     if ',tcp' in env['DISTCC_HOSTS']:
         clang = next((p for p in compilers if 'clang' in Path(p).name), None)
         if clang:

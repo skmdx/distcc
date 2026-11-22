@@ -49,14 +49,7 @@
 #include <inttypes.h>
 
 
-#define USAGE \
-"usage: h_compile COMMAND ARGS...\n" \
-"where\n" \
-"  COMMAND is dcc_fresh_dependency_exists,\n" \
-"    with ARGS being DOTD_FNAME EXCL_PAT REF_TIME\n" \
-"or\n" \
-"  COMMAND is dcc_discrepancy_filename\n" \
-"or dcc_wait_for_cpp [CHILD_EXIT_CODE]\n"
+#define USAGE "usage: h_compile COMMAND ARGS...\n"
 
 const char *rs_program_name = __FILE__;
 
@@ -134,42 +127,6 @@ int main(int argc, char *argv[])
             fwrite(data+at,1,d.length+d.target_length,stdout); putchar('\n');
             at+=d.length+d.target_length;
         }
-    } else if (strcmp(argv[1], "dcc_fresh_dependency_exists") == 0) {
-        if (argc != 5) {
-            rs_log_error("dcc_fresh_dependency_exists expects DOTD_FNAME "
-                         "EXCL_PAT REF_TIME");
-            return 1;
-        }
-        errno = 0;
-        char *ptr;
-        time_t ref_time = (time_t)strtol(argv[4], &ptr, 0);
-        if (errno || (*ptr != '\0')) {
-            rs_log_error("strtol failed");
-            return 1;
-        } else {
-            char *result;
-            int ret;
-            ret = dcc_fresh_dependency_exists((const char *)argv[2],
-                                              (const char *)argv[3],
-                                              ref_time,
-                                              &result);
-            if (ret)
-                printf("h_compile.c: UNEXPECTED RETURN VALUE\n");
-            else
-                printf("result %s\n", result ? result : "(NULL)");
-            if (result) free(result);
-        }
-    } else if (strcmp(argv[1], "dcc_discrepancy_filename") == 0) {
-        if (argc != 2) {
-            rs_log_error("dcc_discrepancy_filename expects no arguments");
-            return 1;
-        }
-        char *result;
-        int ret = dcc_discrepancy_filename(&result);
-        if (ret)
-            printf("h_compile.c: UNEXPECTED RETURN VALUE\n");
-        else
-            printf("%s", result ? result : "(NULL)");
     } else if (strcmp(argv[1], "dcc_wait_for_cpp") == 0) {
         pid_t pid = 0;
         int status = 0x1234;

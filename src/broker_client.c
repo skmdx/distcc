@@ -128,7 +128,7 @@ static int broker_request(uint8_t command, uint8_t flags, struct reply *reply, i
     struct broker_request_hdr header = {BROKER_VERSION, command, flags, 0};
     struct iovec parts[] = {{&header, sizeof(header)}, {0}};
     if (hint) parts[1] = (struct iovec){(void *)hint, dcc_work_hint_size(hint)};
-    else if (command == LOCAL_CPP || command == LOCAL_ANALYSIS)
+    else if (command == LOCAL_CPP)
         parts[1] = (struct iovec){&local_limit, sizeof(local_limit)};
     int fd = dcc_session_call(&header, parts, 2, (struct iovec){reply, sizeof(*reply)},
                               net, NULL, queued_fd, 0, decode_schedule);
@@ -137,18 +137,17 @@ static int broker_request(uint8_t command, uint8_t flags, struct reply *reply, i
     return fd;
 }
 
-int dcc_broker_local_cpp(int *lease, int *occupied, int analysis, unsigned limit)
+int dcc_broker_local_cpp(int *lease, int *occupied, unsigned limit)
 {
     struct reply reply;
     int net;
-    *lease = broker_request(analysis ? LOCAL_ANALYSIS : LOCAL_CPP, 0, &reply, &net, NULL, NULL, limit);
+    *lease = broker_request(LOCAL_CPP, 0, &reply, &net, NULL, NULL, limit);
     if (*lease >= 0) *occupied = reply.slots;
     return *lease < 0 ? EXIT_CONNECT_FAILED : 0;
 }
 
 int dcc_broker_try_local(const struct dcc_work_hint *hint)
 {
-    if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) return -1;
     struct reply reply;
     int net, lease = broker_request(TRY_LOCAL, 0, &reply, &net, hint, NULL, 0);
     if (lease >= 0 && !reply.slots) { dcc_session_finish(lease); lease = -1; }
@@ -174,9 +173,8 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int
     /* Preserve the client's --localslots and --localslots_cpp settings. */
     if (dcc_read_localslots_configuration())
         return EXIT_BAD_HOSTSPEC;
-    int remote_cpp = can_compile_locally && getenv("INCLUDE_SERVER_PORT") != NULL;
-    fd = broker_request(remote_cpp ? ACQUIRE_CPP : cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL,
-                        can_compile_locally && !dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0) ? CLIENT_COMPILE : 0,
+    fd = broker_request(cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL,
+                        can_compile_locally ? CLIENT_COMPILE : 0,
                         &reply, &net, hint, queued_fd, 0);
     if (fd < 0)
         return errno == EXDEV ? EXIT_LOCAL_COMPILE : EXIT_CONNECT_FAILED;
@@ -191,16 +189,8 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int
         return EXIT_BAD_HOSTSPEC;
     }
     (*host)->broker_managed = 1;
-    (*host)->broker_cpp_reserved = !remote_cpp && !cpp_ready;
-    (*host)->cold_family = !!(reply.flags & DCC_BROKER_COLD_FAMILY);
+    (*host)->broker_cpp_reserved = !cpp_ready;
     if (reply.flags & DCC_BROKER_DIRECT) (*host)->mode = DCC_MODE_LOCAL;
-    if (remote_cpp || cpp_ready) {
-        (*host)->cpp_where = remote_cpp ? DCC_CPP_ON_SERVER : DCC_CPP_ON_CLIENT;
-        if ((*host)->compr == DCC_COMPRESS_NONE)
-            (*host)->compr = DCC_COMPRESS_LZO1X;
-        dcc_get_protover_from_features((*host)->compr, (*host)->cpp_where,
-                                       &(*host)->protover);
-    }
     (*host)->broker_fd = net;
     (*host)->broker_lease = fd;
     (*host)->broker_pooled = !!(reply.flags & DCC_BROKER_POOLED);
@@ -272,9 +262,8 @@ void dcc_broker_worker_put(int lease, int worker)
     (void)lease;
     (void)worker;
 }
-int dcc_broker_local_cpp(int *lease, int *occupied, int analysis, unsigned limit)
+int dcc_broker_local_cpp(int *lease, int *occupied, unsigned limit)
 {
-    (void)analysis;
     (void)limit;
     (void)occupied;
     *lease = -1;

@@ -103,8 +103,8 @@ def release(overlay):
     match = re.search(r'^DISTCC_COMMIT="([0-9a-f]{40})"$', ebuild.read_text(), re.M)
     if not match:
         raise RuntimeError('release must pin a full source commit')
-    inputs = ['src', 'include_server', 'configure.ac', 'Makefile.in', 'pump.in',
-              'distcc-link', 'distcc-multi', 'distcc-clang',
+    inputs = ['src', 'configure.ac', 'Makefile.in',
+              'distcc-link', 'distcc-multi',
               'distcc-thinlto', 'distcc-offload', 'distcc-offload-link',
               'distcc_lto.py', 'distcc_job.py', 'distcc_python.py',
               'packaging/systemd', 'packaging/gentoo/*.bashrc']

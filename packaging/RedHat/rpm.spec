@@ -76,13 +76,10 @@ rm -rf $RPM_BUILD_ROOT
 %{_bindir}/distccmon-text
 %{_bindir}/lsdistcc
 %{_libdir}/distcc
-%{_bindir}/pump
 %dir %{_sysconfdir}/distcc
 %config %{_sysconfdir}/distcc/hosts
 %doc %{_mandir}/man1/distcc.1.gz
 %doc %{_mandir}/man1/distccmon-text.1.gz
-%doc %{_mandir}/man1/pump.1.gz
-%doc %{_mandir}/man1/include_server.1.gz
 %doc %{_mandir}/man1/lsdistcc.1.gz
 %doc %{_docdir}
 

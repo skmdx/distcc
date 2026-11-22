@@ -30,7 +30,6 @@ Options:
                           with the valgrind command, which defaults to
                           "valgrind --quiet".
   --lzo                   Run the server tests with lzo compression enabled.
-  --pump                  Run the server tests with remote preprocessing
                           enabled.
 Example:
   PATH="`pwd`:$PATH"
@@ -175,7 +174,7 @@ _valgrind_command            = "" # Command to invoke valgrind (or other
                                   # similar debugging tool).
                                   # e.g. "valgrind --quiet --num-callsers=20 "
 _server_options              = "" # Distcc host options to use for the server.
-                                  # Should be "", ",lzo", or ",lzo,cpp".
+                                  # Should be "", ",lzo".
 
 def _ShellSafe(s):
     '''Returns a version of s that will be interpreted literally by the shell.'''
@@ -246,10 +245,6 @@ class SimpleDistCC_Case(comfychair.TestCase):
         the test is not affected by the development environment."""
         for key in list(os.environ.keys()):
             if key[:7] == 'DISTCC_':
-                # The include server was started by the outer pump process.
-                # Its temporary-root layout is part of that shared session.
-                if key == 'DISTCC_CLIENT_TMP' and ',cpp' in _server_options:
-                    continue
                 # NOTE: This only works properly on Python 2.2: on
                 # earlier versions, it does not call unsetenv() and so
                 # subprocesses may get confused.
@@ -263,10 +258,7 @@ class SimpleDistCC_Case(comfychair.TestCase):
         return _valgrind_command;
 
     def distcc(self):
-        if "cpp" not in _server_options:
-            return self.valgrind() + "distcc "
-        else:
-            return "DISTCC_TESTING_INCLUDE_SERVER=1 " + self.valgrind() + "distcc "
+        return self.valgrind() + "distcc "
 
 
     def distccd(self):
@@ -280,11 +272,14 @@ class SimpleDistCC_Case(comfychair.TestCase):
 
     def _get_compiler(self):
         cc = self._find_compiler("cc")
-        if self.is_clang(cc):
-            return self._find_compiler("clang")
-        elif self.is_gcc(cc):
-            return self._find_compiler("gcc")
-        raise AssertionError("Unknown compiler")
+        if cc and self.is_clang(cc):
+            driver = self._find_compiler("clang")
+        elif cc and self.is_gcc(cc):
+            driver = self._find_compiler("gcc")
+        else:
+            raise AssertionError("Unknown compiler")
+        assert driver is not None, "Compiler driver missing from PATH"
+        return driver
 
     def _find_compiler(self, compiler):
         for path in os.environ['PATH'].split (':'):
@@ -363,7 +358,7 @@ as soon as that happens we can go ahead and start the client."""
                    self.server_port,
                    _ShellSafe(self.daemon_sysroot)))
 
-    def daemon_lifetime(self):
+    def daemon_lifetime(self) -> int:
         # Enough for most tests, even on a fairly loaded machine.
         # Might need more for long-running tests.
         return 60
@@ -434,10 +429,6 @@ class BogusOption_Case(SimpleDistCC_Case):
     Now that we support implicit compilers, this is passed to gcc,
     which returns a non-zero status."""
     def runtest(self):
-        # Disable the test in pump mode since the pump wrapper fails
-        # before we can run distcc.
-        if "cpp" in _server_options:
-            raise comfychair.NotRunError('pump wrapper expects DISTCC_HOSTS')
 
         error_rc, _, _ = self.runcmd_unchecked(self._cc + " --bogus-option")
         assert error_rc != 0
@@ -651,11 +642,11 @@ class DotD_Case(SimpleDistCC_Case):
             # Determine what gcc says.
             dotd_result = []  # prepare for some imperative style value passing
             class TempCompile_Case(Compilation_Case):
-                def source(self):
+                def source(self) -> str:
                       return """
 int main(void) { return 0; }
 """
-                def sourceFilename(self):
+                def sourceFilename(self) -> str:
                     return args.split()[0]
                 def compileCmd(self):
                     return self._cc + " -c " + args
@@ -670,8 +661,6 @@ int main(void) { return 0; }
                     "Case (args:%s, dep_glob:%s, how_many:%s, target:%s)"
                     %  (args, dep_glob, how_many, target))
             self.assert_equal(len(dotd_result), how_many)
-            if how_many == 1:
-                expected_dep_file = dotd_result[0]
 
             # Determine what dcc_get_dotd_info says.
             out, _err = self.runcmd("h_dotd dcc_get_dotd_info gcc -c %s" % args)
@@ -683,7 +672,7 @@ int main(void) { return 0; }
             # Assert that "needs_dotd == 1" implies names by gcc and our routine
             # are the same.
             if needs_dotd:
-                self.assert_equal(expected_dep_file, dotd_fname)
+                self.assert_equal(dotd_result[0], dotd_fname)
 
             self.assert_equal(sets_dotd_target == 1, target != None)
             if target:
@@ -715,95 +704,6 @@ int main(void) { return 0; }
             del os.environ["DEPENDENCIES_OUTPUT"]
 
 
-class Compile_c_Case(SimpleDistCC_Case):
-  """Unit tests for source file 'compile.c.'
-
-  Currently, only the functions dcc_fresh_dependency_exists() and
-  dcc_discrepancy_filename() are tested.
-  """
-
-  def getDep(self, line):
-      """Parse line to yield dependency name. From say:
-          "src/h_compile.c[21010] (dcc_fresh_dependency_exists) Checking dependency: bar_bar"
-         return "bar_bar".
-      """
-      m_obj = re.search(r"Checking dependency: ((\w|[.])*)", line)
-      assert m_obj, line
-      return m_obj.group(1)
-
-  def runtest(self):
-
-      # Test dcc_discrepancy_filename
-      # ********************************
-      os.environ['INCLUDE_SERVER_PORT'] = "abc/socket"
-      out, err = self.runcmd(
-              "h_compile dcc_discrepancy_filename")
-      self.assert_equal(out, "abc/discrepancy_counter")
-
-      os.environ['INCLUDE_SERVER_PORT'] = "socket"
-      out, err = self.runcmd(
-              "h_compile dcc_discrepancy_filename")
-      self.assert_equal(out, "(NULL)")
-
-      # os.environ will be cleaned out at start of next test.
-
-      # Test dcc_fresh_dependency_exists
-      # ********************************
-      dotd_cases = [("""
-foo.o: foo\
-bar.h bar.h notthisone.h bar.h\
-""",
-                     ["foobar.h", "bar.h"]),
-                    (
-                      """foo_foo  :\
-bar_bar \
-foo_bar""",
-                      ["bar_bar", "foo_bar"]),
-                    (":", []),
-                    ("\n", []),
-                    ("", []),
-                    ("foo.o:", []),
-                    ]
-
-      for dotd_contents, deps in dotd_cases:
-          for dep in deps:
-              _Touch(dep)
-          # Now postulate the time that is the beginning of build. This time
-          # is after that of all the dependencies.
-          time_ref = time.time() + 1
-          # Let real-time advance to time_ref.
-          while time.time() < time_ref:
-              time.sleep(1)
-          # Create .d file now, so that it appears to be no older than
-          # time_ref.
-          dotd_fd = open("dotd", "w")
-          dotd_fd.write(dotd_contents)
-          dotd_fd.close()
-          # Check: no fresh files here!
-          out, err = self.runcmd(
-              "h_compile dcc_fresh_dependency_exists dotd '%s' %i" %
-              ("*notthis*", time_ref))
-          self.assert_equal(out.split()[1], "(NULL)");
-          checked_deps = {}
-          for line in err.split("\n"):
-              if re.search("[^ ]", line):
-                  # Line is non-blank
-                  checked_deps[self.getDep(line)] = 1
-          deps_list = deps[:]
-          checked_deps_list = list(checked_deps.keys())
-          deps_list.sort()
-          checked_deps_list.sort()
-          self.assert_equal(checked_deps_list, deps_list)
-
-          # Let's try to touch, say the last dep file. Then, we should expect
-          # the name of that very file as the output because there's a fresh
-          # file.
-          if deps:
-              _Touch(deps[-1])
-              out, err = self.runcmd(
-                  "h_compile dcc_fresh_dependency_exists dotd '' %i" %
-                  time_ref)
-              self.assert_equal(out.split()[1], deps[-1])
 
 
 class ImplicitCompilerScan_Case(ScanArgs_Case):
@@ -917,13 +817,16 @@ class Compilation_Case(WithDaemon_Case):
         f.write(self.headerSource())
         f.close()
 
-    def sourceFilename(self):
+    def sourceFilename(self) -> str:
         return "testtmp.c"              # default
 
-    def headerFilename(self):
+    def headerFilename(self) -> str:
         return "testhdr.h"              # default
 
-    def headerSource(self):
+    def source(self) -> str:
+        raise NotImplementedError
+
+    def headerSource(self) -> str:
         return ""                       # default
 
     def compile(self):
@@ -948,7 +851,7 @@ class Compilation_Case(WithDaemon_Case):
                self._cc + " -o testtmp.o " + self.compileOpts() + \
                " -c %s" % (self.sourceFilename())
 
-    def compileOpts(self):
+    def compileOpts(self) -> str:
         """Returns any extra options to pass when compiling"""
         return ""
 
@@ -957,7 +860,7 @@ class Compilation_Case(WithDaemon_Case):
         return self.distcc() + \
                self._cc + " -o testtmp testtmp.o " + self.libraries()
 
-    def libraries(self):
+    def libraries(self) -> str:
         """Returns any '-l' options needed to link the program."""
         return ""
 
@@ -978,12 +881,12 @@ class Compilation_Case(WithDaemon_Case):
 class CompileHello_Case(Compilation_Case):
     """Test the simple case of building a program that works properly"""
 
-    def headerSource(self):
+    def headerSource(self) -> str:
         return """
 #define HELLO_WORLD "hello world"
 """
 
-    def source(self):
+    def source(self) -> str:
         return """
 #include <stdio.h>
 #include "%s"
@@ -999,13 +902,13 @@ int main(void) {
 
 class CommaInFilename_Case(CompileHello_Case):
 
-    def headerFilename(self):
+    def headerFilename(self) -> str:
       return 'foo1,2.h'
 
 
 class ComputedInclude_Case(CompileHello_Case):
 
-    def source(self):
+    def source(self) -> str:
         return """
 #include <stdio.h>
 #define MAKE_HEADER(header_name) STRINGIZE(header_name.h)
@@ -1020,7 +923,7 @@ int main(void) {
 """
 
 class BackslashInMacro_Case(ComputedInclude_Case):
-    def source(self):
+    def source(self) -> str:
         return """
 #include <stdio.h>
 #if FALSE
@@ -1040,7 +943,7 @@ int main(void) {
 
 class BackslashInFilename_Case(ComputedInclude_Case):
 
-    def headerFilename(self):
+    def headerFilename(self) -> str:
       # On Windows, this filename will be in a subdirectory.
       # On Unix, it will be a filename with an embedded backslash.
       try:
@@ -1049,7 +952,7 @@ class BackslashInFilename_Case(ComputedInclude_Case):
         pass
       return 'subdir\\testhdr.h'
 
-    def source(self):
+    def source(self) -> str:
         return """
 #include <stdio.h>
 #define HEADER MAKE_HEADER(testhdr)
@@ -1081,7 +984,7 @@ class LanguageSpecific_Case(Compilation_Case):
         else:
             Compilation_Case.runtest (self)
 
-    def sourceFilename(self):
+    def sourceFilename(self) -> str:
       return "testtmp" + self.extension()
 
     def languageGccName(self):
@@ -1109,15 +1012,15 @@ class CPlusPlus_Case(LanguageSpecific_Case):
     def extension(self):
       return ".cpp"  # Could also use ".cc", ".cxx", etc.
 
-    def libraries(self):
+    def libraries(self) -> str:
       return "-lstdc++"
 
-    def headerSource(self):
+    def headerSource(self) -> str:
         return """
 #define MESSAGE "hello c++"
 """
 
-    def source(self):
+    def source(self) -> str:
         return """
 #include <iostream>
 #include "testhdr.h"
@@ -1144,12 +1047,12 @@ class ObjectiveC_Case(LanguageSpecific_Case):
     def extension(self):
       return ".m"
 
-    def headerSource(self):
+    def headerSource(self) -> str:
         return """
 #define MESSAGE "hello objective-c"
 """
 
-    def source(self):
+    def source(self) -> str:
         return """
 #import <stdio.h>
 #import "testhdr.h"
@@ -1174,15 +1077,15 @@ class ObjectiveCPlusPlus_Case(LanguageSpecific_Case):
     def extension(self):
       return ".mm"
 
-    def libraries(self):
+    def libraries(self) -> str:
       return "-lstdc++"
 
-    def headerSource(self):
+    def headerSource(self) -> str:
         return """
 #define MESSAGE "hello objective-c++"
 """
 
-    def source(self):
+    def source(self) -> str:
         return """
 #import <iostream>
 #import "testhdr.h"
@@ -1202,19 +1105,19 @@ int main(void) {
 class SystemIncludeDirectories_Case(Compilation_Case):
     """Test -I/usr/include/sys"""
 
-    def compileOpts(self):
+    def compileOpts(self) -> str:
         if os.path.exists("/usr/include/sys/types.h"):
           return "-I/usr/include/"
         else:
           raise comfychair.NotRunError (
               "This test requires /usr/include/sys/types.h")
 
-    def headerSource(self):
+    def headerSource(self) -> str:
         return """
 #define HELLO_WORLD "hello world"
 """
 
-    def source(self):
+    def source(self) -> str:
         return """
 #include "sys/types.h"    /* Should resolve to /usr/include/sys/types.h. */
 #include <stdio.h>
@@ -1233,19 +1136,19 @@ int main(void) {
 class CPlusPlus_SystemIncludeDirectories_Case(CPlusPlus_Case):
     """Test -I/usr/include/sys for a C++ program"""
 
-    def compileOpts(self):
+    def compileOpts(self) -> str:
         if os.path.exists("/usr/include/sys/types.h"):
           return "-I/usr/include/sys"
         else:
           raise comfychair.NotRunError (
               "This test requires /usr/include/sys/types.h")
 
-    def headerSource(self):
+    def headerSource(self) -> str:
         return """
 #define MESSAGE "hello world"
 """
 
-    def source(self):
+    def source(self) -> str:
         return """
 #include "types.h"    /* Should resolve to /usr/include/sys/types.h. */
 #include "testhdr.h"
@@ -1262,7 +1165,7 @@ int main(void) {
 class Gdb_Case(CompileHello_Case):
     """Test that distcc generates correct debugging information."""
 
-    def sourceFilename(self):
+    def sourceFilename(self) -> str:
         try:
           os.mkdir("src")
         except:
@@ -1352,15 +1255,9 @@ class Gdb_Case(CompileHello_Case):
         # Now do the same, but in a subdirectory.  This tests that the
         # "compilation directory" field of the object file is set
         # correctly.
-        # If we're in pump mode, this test should only be run on ELF
-        # binaries, which are the only ones we rewrite at this time.
-        # If we're not in pump mode, this test should only be run
-        # if gcc's preprocessing output stores the pwd (this is true
-        # for gcc 4.0, but false for gcc 3.3).
         os.mkdir('run')
         os.chdir('run')
         self.runcmd("cp ../link/%s ./%s" % (testtmp_exe, testtmp_exe))
-        pump_mode = _server_options.find('cpp') != -1
         error_rc, _, _ = self.runcmd_unchecked(self.compiler() +
             " -g -E -I.. -c ../%s | grep `pwd` >/dev/null" %
             self.sourceFilename())
@@ -1428,7 +1325,7 @@ class CompressedCompile_Case(CompileHello_Case):
     The source needs to be moderately large to make sure compression and mmap
     is turned on."""
 
-    def source(self):
+    def source(self) -> str:
         return """
 #include <stdio.h>
 #include <stdlib.h>
@@ -1492,7 +1389,7 @@ int main(void) {
 
 class CppError_Case(CompileHello_Case):
     """Test failure of cpp"""
-    def source(self):
+    def source(self) -> str:
         return '#error "not tonight dear"\n'
 
     def runtest(self):
@@ -1504,28 +1401,13 @@ class CppError_Case(CompileHello_Case):
 
 class BadInclude_Case(Compilation_Case):
     """Handling of error running cpp"""
-    def source(self):
+    def source(self) -> str:
         return """#include <nosuchfilehere.h>
 """
 
     def runtest(self):
-        if _server_options.find('cpp') != -1:
-            # Annoyingly, different versions of gcc are inconsistent
-            # in how they treat a non-existent #include file when
-            # invoked with "-MMD": some versions treat it as an error
-            # (rc 1), some as a warning (rc 0).  When distcc is
-            # responsible for preprocessing (_server_options includes
-            # 'cpp'), we need to figure out which our gcc does, in
-            # order to verify distcc is doing the same thing.
-            # FIXME(klarlund): this is arguably a bug in gcc, and it
-            # is exacerbated by distcc's pump mode because we always
-            # pass -MMD, even when the user didn't.  TODO(klarlund):
-            # change error_rc back to 1 once that FIXME is fixed.
-            error_rc, _, _ = self.runcmd_unchecked(self._cc + " -MMD -E testtmp.c")
-        else:
-            error_rc = 1
         self.runcmd(self.distcc() + self._cc + " -o testtmp.o -c testtmp.c",
-                    error_rc)
+                    1)
 
 
 class PreprocessPlainText_Case(Compilation_Case):
@@ -1535,7 +1417,7 @@ class PreprocessPlainText_Case(Compilation_Case):
         self.createSource()
         self.initCompiler()
 
-    def source(self):
+    def source(self) -> str:
         return """#define FOO 3
 #if FOO < 10
 small foo!
@@ -1546,10 +1428,6 @@ large foo!
 """
 
     def runtest(self):
-        # Disable the test in pump mode since the pump wrapper fails
-        # before we can run distcc.
-        if "cpp" in _server_options:
-            raise comfychair.NotRunError('pump wrapper expects DISTCC_HOSTS')
 
         # -P means not to emit linemarkers
         self.runcmd(self.distcc()
@@ -1618,8 +1496,8 @@ class ImplicitCompiler_Case(CompileHello_Case):
 
 
 class Unicode_Case(Compilation_Case):
-    """Check unicode compression works OK in include_server"""
-    def source(self):
+    """Compile a source with Unicode paths"""
+    def source(self) -> str:
         return """
 #include <stdio.h>
 
@@ -1635,7 +1513,7 @@ int main(void) {
 
 class DashD_Case(Compilation_Case):
     """Test preprocessor arguments"""
-    def source(self):
+    def source(self) -> str:
         return """
 #include <stdio.h>
 
@@ -1645,7 +1523,7 @@ int main(void) {
 }
 """
 
-    def compileOpts(self):
+    def compileOpts(self) -> str:
         # quoting is hairy because this goes through the shell
         return "'-DMESSAGE=\"hello DashD\"'"
 
@@ -1655,10 +1533,10 @@ int main(void) {
 
 class EmptyDefine_Case(Compilation_Case):
     """
-    This test validates that empty definitions don't break the include_server
+    This test validates that empty definitions reach the compiler unchanged
     even when they share the same name as a real header.
     """
-    def source(self):
+    def source(self) -> str:
         return """
 #include <stdio.h>
 
@@ -1681,7 +1559,7 @@ int main(void) {
 class DashMD_DashMF_DashMT_Case(CompileHello_Case):
     """Test -MD -MFfoo -MTbar"""
 
-    def compileOpts(self):
+    def compileOpts(self) -> str:
         return "-MD -MFdotd_filename -MTtarget_name_42"
 
     def runtest(self):
@@ -1697,7 +1575,7 @@ class DashMD_DashMF_DashMT_Case(CompileHello_Case):
 class DashWpMD_Case(CompileHello_Case):
     """Test -Wp,-MD,depfile"""
 
-    def compileOpts(self):
+    def compileOpts(self) -> str:
         return "-Wp,-MD,depsfile"
 
     def runtest(self):
@@ -1710,65 +1588,11 @@ class DashWpMD_Case(CompileHello_Case):
         self.assert_re_search(r"testhdr\.h", deps)
         self.assert_re_search(r"stdio\.h", deps)
 
-class ScanIncludes_Case(CompileHello_Case):
-    """Test --scan-includes"""
-
-    def createSource(self):
-      CompileHello_Case.createSource(self)
-      self.runcmd("mv testhdr.h test_header.h")
-      self.runcmd("ln -s test_header.h testhdr.h")
-      self.runcmd("mkdir test_subdir")
-      self.runcmd("touch test_another_header.h")
-
-    def headerSource(self):
-        return """
-#define HELLO_WORLD "hello world"
-#include "test_subdir/../test_another_header.h"
-"""
-
-    def compileCmd(self):
-        return self.distcc_without_fallback() + "--scan-includes " + \
-               self._cc + " -o testtmp.o " + self.compileOpts() + \
-               " -c %s" % (self.sourceFilename())
-
-    def runtest(self):
-        cmd = self.compileCmd()
-        rc, out, err = self.runcmd_unchecked(cmd)
-        log = open('distcc.log').read()
-        pump_mode = _server_options.find('cpp') != -1
-        if pump_mode:
-          if err != '':
-              self.fail("distcc command %s produced stderr:\n%s" % (repr(cmd), err))
-          if rc != 0:
-              self.fail("distcc command %s failed:\n%s" % (repr(cmd), rc))
-          self.assert_re_search(
-              r"FILE      /.*/ScanIncludes_Case/testtmp.c", out);
-          self.assert_re_search(
-              r"FILE      /.*/ScanIncludes_Case/test_header\.h", out);
-          self.assert_re_search(
-              r"FILE      /.*/ScanIncludes_Case/test_another_header\.h", out);
-          self.assert_re_search(
-              r"SYMLINK   /.*/ScanIncludes_Case/testhdr\.h", out);
-          self.assert_re_search(
-              r"DIRECTORY /.*/ScanIncludes_Case/test_subdir", out);
-          self.assert_re_search(
-              r"FILE      /.*/stdio\.h", out);
-        else:
-          self.assert_re_search(r"ERROR: '--scan_includes' specified, but "
-                                "distcc wouldn't have used include server "
-                                ".make sure hosts list includes ',cpp' option",
-                                log)
-          self.assert_equal(rc, 100)
-          self.assert_equal(out, '')
-          self.assert_equal(err, '')
 
 class ForceDirectory_Case(CompileHello_Case):
     """
     Test that the forcing_technique properly creates directories even if
     no headers are used in them (i.e. #include foo/../bar.h creates foo)
-
-    Note that its sufficient to assert that the compile succeeds under
-    pump-mode; if the technique wasn't working, it would be a compilation error
     """
 
     def createSource(self):
@@ -1778,7 +1602,7 @@ class ForceDirectory_Case(CompileHello_Case):
       self.runcmd("mkdir test_subdir")
       self.runcmd("touch test_another_header.h")
 
-    def headerSource(self):
+    def headerSource(self) -> str:
         return """
 #define HELLO_WORLD "hello world"
 #include "test_subdir/../test_another_header.h"
@@ -1802,7 +1626,7 @@ class HundredFold_Case(CompileHello_Case):
     doing it a 100 times.
     """
 
-    def daemon_lifetime(self):
+    def daemon_lifetime(self) -> int:
         return 120
 
     def runtest(self):
@@ -1813,7 +1637,7 @@ class HundredFold_Case(CompileHello_Case):
 
 class Concurrent_Case(CompileHello_Case):
     """Try many compilations at the same time"""
-    def daemon_lifetime(self):
+    def daemon_lifetime(self) -> int:
         return 120
 
     def runtest(self):
@@ -1853,7 +1677,7 @@ class BigAssFile_Case(Compilation_Case):
         self.runcmd(self.distcc() + self._cc + " -o testtmp testtmp.o")
 
 
-    def daemon_lifetime(self):
+    def daemon_lifetime(self) -> int:
         return 300
 
 
@@ -1937,28 +1761,6 @@ class NoServer_Case(CompileHello_Case):
                               msgs)
 
 
-class MixedServerPumpFallback_Case(CompileHello_Case):
-    """
-    Invalid server name with pump attributes with a fallback to a good server without
-
-    This covers the codepath in compile.c where the first host is a remote cpp
-    but fails and goto choose_host falls back to local cpp (which had a double free
-    on exit up to and including v3.4)
-    """
-    def setup(self):
-        CompileHello_Case.setup(self)
-        os.environ['DISTCC_HOSTS'] = f"no.such.host.here,lzo,cpp 127.0.0.1:{self.server_port}"
-        self.distcc_log = 'distcc.log'
-        os.environ['DISTCC_LOG'] = self.distcc_log
-        self.createSource()
-        self.initCompiler()
-
-    def runtest(self):
-        self.runcmd(self.distcc()
-                    + self._cc + " -c -o testtmp.o testtmp.c")
-        msgs = open(self.distcc_log, 'r').read()
-        self.assert_re_search(r'compile testtmp.c on 127.0.0.1:[0-9]* completed ok',
-                              msgs)
 
 
 class ImpliedOutput_Case(CompileHello_Case):
@@ -1970,7 +1772,7 @@ class ImpliedOutput_Case(CompileHello_Case):
 class SyntaxError_Case(Compilation_Case):
     """Test building a program containing syntax errors, so it won't build
     properly."""
-    def source(self):
+    def source(self) -> str:
         return """not C source at all
 """
 
@@ -1993,10 +1795,6 @@ class NoHosts_Case(CompileHello_Case):
     We expect compilation to succeed, but with a warning that it was
     run locally."""
     def runtest(self):
-        # Disable the test in pump mode since the pump wrapper fails
-        # before we can run distcc.
-        if "cpp" in _server_options:
-            raise comfychair.NotRunError('pump wrapper expects DISTCC_HOSTS')
 
         # WithDaemon_Case sets this to point to the local host, but we
         # don't want that.  Note that you cannot delete environment
@@ -2021,12 +1819,12 @@ class NoHosts_Case(CompileHello_Case):
 class MissingCompiler_Case(CompileHello_Case):
     """Test compiler missing from server."""
     # Another way to test this would be to break the server's PATH
-    def sourceFilename(self):
+    def sourceFilename(self) -> str:
         # must be preprocessed, so that we don't need to run the compiler
         # on the client
         return "testtmp.i"
 
-    def source(self):
+    def source(self) -> str:
         return """int foo;"""
 
     def runtest(self):
@@ -2129,7 +1927,7 @@ class EmptySource_Case(Compilation_Case):
     But that's gcc's problem, not ours, so we make this test pass
     if gcc gets an ICE."""
 
-    def source(self):
+    def source(self) -> str:
         return ''
 
     def runtest(self):
@@ -2141,7 +1939,7 @@ class EmptySource_Case(Compilation_Case):
         if not re.search("internal compiler error", errs):
           self.assert_equal(rc, 0)
 
-    def sourceFilename(self):
+    def sourceFilename(self) -> str:
         return "testtmp.i"
 
 class BadLogFile_Case(CompileHello_Case):
@@ -2336,7 +2134,6 @@ tests = [
          ParseMask_Case,
          DotD_Case,
          DashMD_DashMF_DashMT_Case,
-         Compile_c_Case,
          ImplicitCompilerScan_Case,
          StripArgs_Case,
          StartStopDaemon_Case,
@@ -2351,7 +2148,6 @@ tests = [
          DashD_Case,
          EmptyDefine_Case,
          DashWpMD_Case,
-         ScanIncludes_Case,
          ForceDirectory_Case,
          BinFalse_Case,
          BinTrue_Case,
@@ -2366,7 +2162,6 @@ tests = [
          DaemonBadPort_Case,
          AccessDenied_Case,
          NoServer_Case,
-         MixedServerPumpFallback_Case,
          InvalidHostSpec_Case,
          ParseHostSpec_Case,
          ImpliedOutput_Case,
@@ -2386,10 +2181,6 @@ tests = [
          HundredFold_Case,
          BigAssFile_Case]
 
-# On macOS, certain python installations set CPATH. distcc refuses to pump if
-# it is set (src/compile.c), so unset it here so that pump tests run as expected
-if "CPATH" in os.environ:
-  del os.environ["CPATH"]
 
 if __name__ == '__main__':
   while len(sys.argv) > 1 and sys.argv[1].startswith("--"):
@@ -2401,9 +2192,6 @@ if __name__ == '__main__':
       del sys.argv[1]
     elif sys.argv[1] == "--lzo":
       _server_options = ",lzo"
-      del sys.argv[1]
-    elif sys.argv[1] == "--pump":
-      _server_options = ",lzo,cpp"
       del sys.argv[1]
     else:
       break

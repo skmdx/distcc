@@ -18,6 +18,8 @@ import time
 import unittest
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from distcc_job import BROKER_VERSION, JOB_COMPILE, JOB_RUST, JOB_THINLTO, JOB_OFFLOAD_LINK
 from test_adaptive import DistccTestCase, free_port, stats_response
 
 
@@ -66,7 +68,7 @@ class MemoReconnectTest(unittest.TestCase):
 
 
 class BrokerTestCase(DistccTestCase):
-    protocol_version = 9
+    protocol_version = BROKER_VERSION
 
     def start_memory_refusal(self):
         # The first snapshot fits; before execution the real daemon's memory
@@ -143,11 +145,11 @@ class BrokerTestCase(DistccTestCase):
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
         payload = struct.pack("=HBBI", self.protocol_version, command, client_compile, 0)
-        if command in (12, 13):
+        if command == 12:
             payload += struct.pack('=I', cpp_limit)
         if command in (6, 9, 10, 15, 20):
             if memory_class is None:
-                kind = {7: 3, 8: 4, 10: 5}.get(work[2], 1 if 4 <= work[2] <= 6 else 0)
+                kind = {7: JOB_RUST, 8: JOB_THINLTO, 10: JOB_OFFLOAD_LINK}.get(work[2], JOB_COMPILE)
                 memory_class = 1 + kind * 64 + max(0, work[1].bit_length() - 1) if work[0] else 0
             payload += struct.pack('=QQIIQQQQ96s', *work, work_units, family, scope_key,
                                    memory_class, rust_compiler, cgu_backend)
@@ -267,13 +269,13 @@ class BrokerDirectTest(BrokerTestCase):
         self.assertEqual(self.receive(self.request(15)), (0, 0, []))
         self.assertEqual(self.receive(self.request(12)), (0, 1, []))
 
-    def test_serial_analysis_queues_in_request_order(self):
+    def test_serial_preprocessing_queues_in_request_order(self):
         self.start_broker(self.host(0) + ' --localslots_cpp=4')
-        held = self.request(13, cpp_limit=1)
+        held = self.request(12, cpp_limit=1)
         self.assertEqual(self.receive(held), (0, 1, []))
         waiting = []
         for _ in range(3):
-            waiting.append(self.request(13, cpp_limit=1))
+            waiting.append(self.request(12, cpp_limit=1))
             time.sleep(.02)
         try:
             self.assertFalse(select.select(waiting, [], [], .05)[0])
@@ -338,19 +340,6 @@ class BrokerDirectTest(BrokerTestCase):
         full = self.request(15, (3, 1024, 1))
         self.assertEqual(self.receive(full), (0, 0, []))
 
-    def test_analysis_lease_charges_local_preflight(self):
-        metrics = stats_response(cpus=2, cores=1, jobs=2, capacity=2,
-                                 busy=0, queued=0, preparing=0, returning=0, running=0)
-        local = self.peer(metrics)
-        remote = self.peer(metrics, address='127.0.0.2')
-        self.start_broker(self.host(0, f',tcp,stats={local.port}') +
-                          f' 127.0.0.2:{self.ports[1]}/2,tcp,stats={remote.port},speed=0.8')
-        frontend = self.request(13)
-        self.assertEqual(self.receive(frontend), (0, 1, []))
-        hint = (1, 4 * 1024**2, 5)
-        self.assertEqual(self.receive(self.request(15, hint)), (0, 0, []))
-        frontend.close()
-        self.assertEqual(self.receive(self.request(15, hint)), (0, 1, []))
 
     def test_preflight_and_prepared_jobs_share_contention_policy(self):
         metrics = stats_response(cpus=2, cores=1, jobs=2, capacity=2,
@@ -472,11 +461,10 @@ class BrokerDirectTest(BrokerTestCase):
         self.assertEqual(rows[0][1], rows[1][1])
         self.assertNotEqual(rows[0][1], rows[2][1])
 
-    def test_client_compiles_original_files_without_include_server(self):
+    def test_client_compiles_original_files(self):
         self.local_broker()
         # A direct compile must preserve native options and the client's files,
         # even when the header-analysis endpoint is unusable.
-        self.env['INCLUDE_SERVER_PORT'] = str(self.work / 'missing-include.sock')
         source = self.work / 'direct.c'
         header = self.work / 'direct.h'
         source.write_text('#include "direct.h"\nint main(void) { return VALUE - 7; }\n')
@@ -823,7 +811,7 @@ class BrokerTest(BrokerTestCase):
                  for busy, headroom in ((1, size-1), (0, 4*size))]
         self.start_broker(' '.join(self.host(i, f',tcp,stats={p.port},speed={8 if i==0 else 1}')
                                    for i, p in enumerate(peers)))
-        _, net = self.acquire_reserved(10, (77, 4096, 5), memory_class=1+6*64)
+        _, net = self.acquire_reserved(10, (77, 4096, 5), memory_class=1+5*64)
         self.assertEqual(net.getpeername()[1], self.ports[1])
 
     def test_source_affinity_does_not_follow_a_slower_owner(self):
@@ -1051,31 +1039,6 @@ class BrokerTest(BrokerTestCase):
         import select
         self.assertFalse(select.select([lease], [], [], .2)[0])
 
-    def test_analysis_shares_occupancy_without_cpp_head_of_line_blocking(self):
-        self.start_broker(self.host(0) + ' --localslots_cpp=1')
-        capacity = int(subprocess.check_output([str(self.build / 'distcc'), '--show-analyzer-slots'],
-                                               env=self.env, text=True))
-        if capacity < 2:
-            self.skipTest('requires at least two eligible CPUs')
-        held = self.request(12)
-        self.assertEqual(self.receive(held), (0, 1, []))
-        queued_cpp = self.request(12)
-        active = []
-        for index in range(1, capacity):
-            lease = self.request(13)
-            active.append(lease)
-            self.assertEqual(self.receive(lease), (0, index, []))
-        queued_scan = self.request(13)
-        import select
-        self.assertFalse(select.select([queued_cpp, queued_scan], [], [], .1)[0])
-        active.pop().close()
-        self.assertEqual(self.receive(queued_scan), (0, capacity - 1, []))
-        queued_scan.close()
-        for lease in active:
-            lease.close()
-        held.close()
-        self.assertEqual(self.receive(queued_cpp), (0, 1, []))
-        queued_cpp.close()
 
     def test_client_waits_for_broker_start(self):
         self.env = dict(self.base_env, DISTCC_HOSTS=self.host(0),
@@ -1320,7 +1283,7 @@ class BrokerTest(BrokerTestCase):
     def test_jobs_expose_small_class_capacity_without_overadmitting_large_jobs(self):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2,
             busy=0, running=0, queued=0, preparing=0, returning=0, memory_headroom_bytes=512 * 1024**2,
-            compile_capacity=[2] * 64, pump_capacity=[2] * 64))
+            compile_capacity=[2] * 64))
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=8))
         self.assertEqual(self.receive(self.request(2)), (0, 10, []))
         first, first_net = self.acquire_reserved(9, (201, 1024, 4), 1024)
@@ -1551,7 +1514,7 @@ class BrokerTest(BrokerTestCase):
         self.start_broker(hosts)
         # Four preprocessors already occupy the faster host's physical cores.
         # Adding a compiler there gains only SMT throughput and slows them.
-        self.receive(self.request(13))  # This broker owns an active input producer.
+        self.receive(self.request(12))  # This broker owns an active input producer.
         _, selected = self.acquire_reserved(10, (1100, 4 * 1024 * 1024, 1))
         self.assertEqual(selected.getpeername()[1], self.ports[1])
 
@@ -1565,7 +1528,7 @@ class BrokerTest(BrokerTestCase):
                          for i, p in enumerate(peers))
         self.start_broker(hosts)
         # No local preprocessing lease: contention belongs to remote workers.
-        # Pump hints and preprocessed hints must obey the same CPU contract.
+        # Both source and preprocessed hints obey the same CPU contract.
         for index, kind in enumerate((4, 1)):
             _, selected = self.acquire_reserved(10, (1200 + index, 4 * 1024 * 1024, kind))
             self.assertEqual(selected.getpeername()[1], self.ports[1])
@@ -1774,7 +1737,7 @@ class BrokerTest(BrokerTestCase):
             with self.subTest(capacity=capacity):
                 first = self.peer(stats_response(cpus=4, jobs=4, capacity=4,
                     busy=0, queued=0, preparing=0, returning=0, running=0,
-                    pump_capacity=[1] * 64, frontend_capacity=capacity,
+                    frontend_capacity=capacity,
                     memory_headroom_bytes=1024**3, job_memory_bytes=1536 * 1024**2,
                     frontend_memory=256 * 1024**2))
                 second = self.peer(stats_response(cpus=4, jobs=4, capacity=4,
@@ -1783,7 +1746,7 @@ class BrokerTest(BrokerTestCase):
                                   self.host(1, f',tcp,stats={second.port}'), name=f'frontend-{capacity}')
                 for index in range(2):
                     _, net = self.acquire_reserved(10, (940 + index, 1024**2, 5),
-                                                   memory_class=1 + 6 * 64)
+                                                   memory_class=1 + 5 * 64)
                     expected = self.ports[1] if index and capacity == 1 else self.ports[0]
                     self.assertEqual(net.getpeername()[1], expected)
 
@@ -1809,23 +1772,6 @@ class BrokerTest(BrokerTestCase):
         _, next_net = self.acquire_reserved(10, (91, 4 * 1024 * 1024, kind))
         self.assertEqual(next_net.getpeername()[1], self.ports[1])
 
-    def test_pump_uses_header_tree_capacity_instead_of_small_compile_capacity(self):
-        for capacity in (-1, 1):
-            with self.subTest(capacity=capacity):
-                capacities = [4] * 64
-                capacities[22] = capacity
-                peers = [self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
-                             queued=0, preparing=0, returning=0, running=0,
-                             pump_capacity=capacities)),
-                         self.peer(stats_response(cpus=4, jobs=4, capacity=4, busy=0,
-                             queued=0, preparing=0, returning=0, running=0))]
-                hosts = ' '.join(self.host(i, f',tcp,stats={p.port},speed={1.5 if i == 0 else 1}')
-                                 for i, p in enumerate(peers))
-                self.start_broker(hosts, name=f'pump-class-{capacity}')
-                _, first = self.acquire_reserved(10, (990, 4 * 1024 * 1024, 5))
-                _, second = self.acquire_reserved(10, (991, 4 * 1024 * 1024, 5))
-                self.assertEqual(first.getpeername()[1], self.ports[0])
-                self.assertEqual(second.getpeername()[1], self.ports[0 if capacity < 0 else 1])
 
     def test_missing_class_capacity_uses_aggregate_memory_capacity(self):
         for busy in (0, 2):

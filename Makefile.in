@@ -18,7 +18,6 @@ SHELL = @SHELL@
 CFLAGS = @CFLAGS@ @POPT_CFLAGS@
 CXXFLAGS = @CXXFLAGS@
 WERROR_CFLAGS = @WERROR_CFLAGS@
-PYTHON_CFLAGS = @PYTHON_CFLAGS@
 
 LDFLAGS = @LDFLAGS@
 CC = @CC@
@@ -28,11 +27,13 @@ DISTCC_CLANG_CONFIGS ?= @DISTCC_CLANG_CONFIGS@
 export DISTCC_CLANG_CONFIGS
 # Rust native CPU discovery uses LLVM's public headers, with no LLVM linkage.
 RUST_NATIVE_TARGET = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),distcc-rust-native.so)
-CLANG_DRIVER_TARGET = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),clang_driver.so)
 LTO_BUILD ?= llvm-lto
-LTO_LIBDIR ?= $(shell $(LLVM_CONFIG) --libdir)/distcc
-LTO_BINDIR ?= $(shell $(LLVM_CONFIG) --bindir)
-LTO_TARGETS = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),$(LTO_BUILD)/distcc-lto $(LTO_BUILD)/lto-prepare.so $(LTO_BUILD)/distcc-rust-cgu $(LTO_BUILD)/distcc-rust-cgu.so)
+LLVM_SYSROOT = $(patsubst %/,%,$(or $(ESYSROOT),$(SYSROOT)))
+LLVM_TARGET_LIBDIR = $(patsubst $(LLVM_SYSROOT)/%,/%,$(shell $(LLVM_CONFIG) --libdir))
+LLVM_TARGET_BINDIR = $(patsubst $(LLVM_SYSROOT)/%,/%,$(shell $(LLVM_CONFIG) --bindir))
+LTO_LIBDIR ?= $(LLVM_TARGET_LIBDIR)/distcc
+LTO_BINDIR ?= $(LLVM_TARGET_BINDIR)
+LTO_TARGETS = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),$(LTO_BUILD)/distcc-lto $(LTO_BUILD)/lto-prepare.so $(LTO_BUILD)/distcc-rust-cgu $(LTO_BUILD)/distcc-rust-cgu.so $(LTO_BUILD)/distcc-clang)
 # Upstream Clang owns extraction, device grouping and image registration.
 # Point at its clang/tools/clang-linker-wrapper source directory to build it.
 LLVM_WRAPPER_SOURCE ?=
@@ -57,7 +58,7 @@ bindir = @bindir@
 sbindir = @sbindir@
 libexecdir = @libexecdir@
 pkglibexecdir = $(libexecdir)/distcc
-private_scripts = distcc-clang distcc-link distcc-multi distcc-thinlto distcc-offload distcc-offload-link
+private_scripts = distcc-link distcc-multi distcc-thinlto distcc-offload distcc-offload-link
 private_modules = distcc_lto.py distcc_job.py distcc_python.py
 datarootdir = @datarootdir@
 datadir = @datadir@
@@ -72,7 +73,6 @@ docdir = @docdir@
 icondir = $(datarootdir)/pixmaps
 desktopdir = $(datarootdir)/applications
 
-include_server_builddir = $(builddir)/_include_server
 
 # These must be done from here, not from autoconf, because they can
 # contain variable expansions written in Make syntax.  Ew.
@@ -81,8 +81,6 @@ DIR_DEFS += -DCPP_LOOKUP_LIBRARY='"$(libdir)/distcc/cpp_lookup.so"'
 DIR_DEFS += -DGCC_PLAN_LIBRARY='"$(libdir)/distcc/gcc_plan.so"'
 DIR_DEFS += -DRUST_NATIVE_LIBRARY='"$(libdir)/distcc/distcc-rust-native.so"'
 DIR_DEFS += -DPKGLIBEXECDIR='"$(pkglibexecdir)"' -DBINDIR='"$(bindir)"' -DSBINDIR='"$(sbindir)"'
-# setup.py passes these compiler arguments through a second shell parser.
-setup_cppflags = '$(subst ','"'"',$(CPPFLAGS))'
 CPP_LOOKUP_TARGET = @CPP_LOOKUP_TARGET@
 
 # arguments to pkgconfig
@@ -125,17 +123,12 @@ dist_files =							\
 	$(update_distcc_symlinks_PY)				\
 	$(test_SOURCE)						\
 	$(bench_PY)						\
-	$(include_server_PY)                                    \
-	$(dist_include_server_SH)                               \
-	$(include_server_SRC)                                   \
-	$(check_include_server_DATA)                            \
-	$(check_include_server_PY)                              \
 	$(conf_files)                                           \
 	$(default_files)                                        \
 	$(dist_extra)						\
 	$(gnome_data)
 
-dist_dirs = m4 include_server/test_data
+dist_dirs = m4
 
 dist_lzo = lzo/minilzo.c \
 	lzo/minilzo.h \
@@ -156,8 +149,6 @@ dist_contrib = contrib/distcc-absolutify	\
 	contrib/redhat/sysconfig		\
 	contrib/redhat/xinetd
 
-dist_include_server_SH = \
-	pump.in
 
 bench_PY = bench/Build.py \
 	bench/Project.py \
@@ -171,16 +162,14 @@ bench_PY = bench/Build.py \
 	benchmark \
 	bench/fleet.py \
 	bench/measure.py \
-	bench/fleet.example.json \
-	bench/statistics.py
+	bench/fleet.example.json
 
 pkgdoc_DOCS = AUTHORS COPYING NEWS \
-	README README.pump \
+	README \
 	INSTALL \
 	TODO \
 	doc/protocol-1.txt doc/status-1.txt \
 	doc/protocol-2.txt \
-	doc/protocol-3.txt doc/protocol-3-impl.txt \
 	doc/protocol-4.txt \
 	doc/protocol-5.txt \
 	doc/protocol-6.txt \
@@ -196,35 +185,6 @@ example_DOCS = \
 	doc/example/logrotate				\
 	doc/example/xinetd				\
 
-include_server_PY = \
-	include_server/basics.py \
-	include_server/cache_basics.py \
-	include_server/compiler_defaults.py \
-	include_server/compiler_analyzer.py \
-	include_server/gcc_scan.py \
-	include_server/clang_scan.pyi \
-	include_server/compress_files.py \
-	include_server/include_analyzer.py \
-	include_server/include_server.py \
-	include_server/mirror_path.py \
-	include_server/parse_command.py \
-	include_server/run.py \
-	include_server/setup.py \
-	include_server/scan_statistics.py
-
-include_server_SRC = \
-	include_server/c_extensions/distcc_pump_c_extensions_module.c \
-	include_server/c_extensions/input_metadata.c \
-	include_server/c_extensions/clang_scan.cpp \
-	include_server/c_extensions/clang_compile.cpp \
-	include_server/c_extensions/clang_compiler.h \
-	include_server/c_extensions/clang_result.h \
-	include_server/c_extensions/compiler_command.h \
-	include_server/c_extensions/clang_native.cpp \
-	include_server/c_extensions/clang_codegen.cpp \
-	include_server/c_extensions/clang_codegen.h \
-	src/native_worker.cc \
-	src/native_worker.h
 
 update_distcc_symlinks_PY = update-distcc-symlinks.py
 
@@ -247,10 +207,8 @@ dist_extra =							\
 	distcc_python.py \
 	src/rust/native.cc src/rust/audit.cc src/rust/cgu.h src/rust/cgu_hook.cc src/rust/check_cgu_hooks.py src/rust/cgu_worker.cc \
 	src/rust/sandbox.cc src/rust/sandbox.hh src/rust/runtime.hh src/rust/client.cc src/rust/worker.cc src/rust/link.cc src/rust/response.hh src/rust/probe.cc src/rust/probe.h src/rust/common.hh src/rust/affinity.hh src/rust/api.h \
-	src/clang_driver.cc \
+	$(wildcard src/clang/*.cpp src/clang/*.h) src/clang/launcher.c \
 	src/argv_file.h \
-	src/clang_inputs.h \
-	distcc-clang \
 	README.packaging ChangeLog \
 	packaging/RedHat/rpm.spec \
 	packaging/RedHat/logrotate.d/distcc \
@@ -309,8 +267,7 @@ test_SOURCE = test/comfychair.py \
 	test/test_deploy.py \
 	test/test_fleet_bench.py \
 	test/test_preprocess.py \
-	test/test_cpp_lookup.py \
-	find_c_extension.sh
+	test/test_cpp_lookup.py
 
 dist_common = Makefile.in install-sh configure configure.ac \
 	config.guess config.sub mkinstalldirs autogen.sh
@@ -364,11 +321,9 @@ distcc_obj = src/backoff.o						\
 	src/remote.o							\
 	src/ssh.o src/state.o src/strip.o				\
 	src/timefile.o src/traceenv.o					\
-	src/include_server_if.o						\
 	src/where.o src/adaptive.o src/broker_client.o src/workload.o	\
 	@ZEROCONF_DISTCC_OBJS@						\
 	@AUTH_DISTCC_OBJS@						\
-	src/emaillog.o							\
 	$(common_obj)
 
 distccd_obj = src/access.o						\
@@ -416,8 +371,8 @@ h_ccvers_obj = src/h_ccvers.o $(common_obj)
 h_dotd_obj = src/h_dotd.o $(common_obj)
 h_fix_debug_info = src/h_fix_debug_info.o $(common_obj)
 h_compile_obj = src/h_compile.o $(common_obj) src/compile.o src/native.o src/native_cache.o src/offload.o src/timefile.o \
-                src/backoff.o src/emaillog.o src/remote.o src/clinet.o \
-	        src/clirpc.o src/include_server_if.o src/state.o src/where.o src/adaptive.o src/broker_client.o src/workload.o \
+                src/backoff.o src/remote.o src/clinet.o \
+	        src/clirpc.o src/state.o src/where.o src/adaptive.o src/broker_client.o src/workload.o \
 		src/ssh.o src/strip.o src/cpp.o @AUTH_DISTCC_OBJS@
 h_getline_obj = src/h_getline.o $(common_obj)
 
@@ -461,11 +416,10 @@ SRC =	src/stats.c src/adaptive.c src/broker.c src/broker_client.c src/broker_sch
 	src/timeval.c src/traceenv.c					\
 	src/trace.c src/util.c src/where.c				\
 	src/lsdistcc.c src/rslave.c					\
-	src/dotd.c src/include_server_if.c				\
-	src/emaillog.c							\
+	src/dotd.c				\
 	src/fix_debug_info.c						\
 	src/zeroconf.c src/zeroconf-reg.c src/gcc-id.c \
-	src/gcc_scan.cc src/gcc_scan_inputs.cc include_server/build_gcc_scan.py
+	src/gcc_scan.cc src/gcc_scan_inputs.cc src/build_gcc_scan.py
 
 
 HEADERS = src/stats.h src/adaptive.h src/broker.h src/broker_memo.h src/broker_schedule.h src/broker_protocol.h src/broker_session.h src/epoll_set.h src/lane_schedule.h src/cpuperf.h src/workload.h src/file_cache.h	\
@@ -488,8 +442,7 @@ HEADERS = src/stats.h src/adaptive.h src/broker.h src/broker_memo.h src/broker_s
 	src/util.h							\
 	src/exec.h src/lock.h src/where.h src/srvnet.h			\
 	src/rslave.h							\
-	src/dotd.h src/include_server_if.h				\
-	src/emaillog.h 							\
+	src/dotd.h				\
 	src/va_copy.h 							\
 	src/zeroconf.h
 
@@ -501,9 +454,9 @@ default_dir = packaging/RedHat/default
 default_files = $(default_dir)/distcc
 
 man1_MEN = man/distcc.1 man/distccd.1 man/distccmon-text.1 \
-           man/lsdistcc.1 man/pump.1 man/include_server.1
+           man/lsdistcc.1
 man_HTML = man/distcc_1.html man/distccd_1.html man/distccmon_text_1.html \
-           man/lsdistcc_1.html man/pump_1.html man/include_server_1.html
+           man/lsdistcc_1.html
 MEN = $(man1_MEN)
 
 gnome_data = gnome/distccmon-gnome.png	\
@@ -547,14 +500,6 @@ check_PROGRAMS = \
 	h_state@EXEEXT@ \
 	h_getline@EXEEXT@
 
-check_include_server_PY = \
-	include_server/c_extensions_test.py \
-	include_server/clang_scan_test.py \
-	include_server/include_server_test.py \
-	include_server/gcc_scan_test.py \
-	include_server/mirror_path_test.py \
-	include_server/parse_command_test.py \
-	include_server/basics_test.py
 
 
 ######################################################################
@@ -569,11 +514,11 @@ check_include_server_PY = \
 ######################################################################
 ## OVERALL targets
 
-.PHONY: all include-server
+.PHONY: all
 
 ## NOTE: "all" must be the first (default) rule, aside from patterns.
 
-all: $(bin_PROGRAMS) $(sbin_PROGRAMS) distcc-rust $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) $(LINKER_WRAPPER_TARGET) $(LTO_TARGETS) gcc_plan.so pump include-server
+all: $(bin_PROGRAMS) $(sbin_PROGRAMS) distcc-rust $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) distcc-clang $(LINKER_WRAPPER_TARGET) $(LTO_TARGETS) gcc_plan.so clang-slots
 
 distcc-rust: distcc@EXEEXT@
 	ln -sf distcc@EXEEXT@ $@
@@ -594,12 +539,33 @@ $(LTO_BUILD)/ClangLinkerWrapper.o: llvm-linker-wrapper/LinkerWrapperOpts.inc
 distcc-linker-wrapper: $(LTO_BUILD)/ClangLinkerWrapper.o
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $< `$(LLVM_CONFIG) --ldflags` -lclang-cpp -lLLVM
 
-$(LTO_BUILD)/clang_driver.o: $(srcdir)/src/clang_driver.cc $(srcdir)/src/clang_inputs.h $(srcdir)/src/frontend_identity.h $(srcdir)/src/plan_memo.h
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -MMD -c $< -o $@
+distcc-clang: src/clang/launcher.o $(common_obj)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-clang_driver.so: $(LTO_BUILD)/clang_driver.o
-	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -shared $(LDFLAGS) -o $@ $< `$(LLVM_CONFIG) --ldflags` -lclang-cpp -lLLVM
+CLANG_OBJECTS = $(addprefix $(LTO_BUILD)/,clang_compile.o clang_codegen.o clang_native.o clang_driver.o)
+$(CLANG_OBJECTS): $(LTO_BUILD)/%.o: $(srcdir)/src/clang/%.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -DDCC_LLD_PATH='"$(LTO_BINDIR)/ld.lld"' -MMD -c $< -o $@
+
+$(LTO_BUILD)/clang_worker_loop.o: $(srcdir)/src/native_worker.cc
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -MMD -c $< -o $@
+
+$(LTO_BUILD)/distcc-clang: $(CLANG_OBJECTS) $(LTO_BUILD)/clang_worker_loop.o $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o src/argv_file.o src/file_cache.o
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $^ `$(LLVM_CONFIG) --ldflags` -Wl,-rpath,$(LLVM_TARGET_LIBDIR) -lclang-cpp -llldELF -llldCommon -lLLVM -lxxhash -llz4
+
+CLANG_MAJOR = $(firstword $(subst ., ,$(shell $(LLVM_CONFIG) --version)))
+.PHONY: clang-slots clang-slot
+clang-slot: $(LTO_BUILD)/distcc-clang
+	ln -srf $< distcc-clang-$(CLANG_MAJOR)
+
+clang-slots: $(if $(LTO_TARGETS),clang-slot)
+	+@for config in $(subst :, ,$(DISTCC_CLANG_CONFIGS)); do \
+	  major=$$("$$config" --version | cut -d. -f1) || exit 1; \
+	  if test "$$major" != "$(CLANG_MAJOR)"; then \
+	    $(MAKE) clang-slot LLVM_CONFIG="$$config" LTO_BUILD="llvm-lto-$$major" || exit 1; \
+	  fi; \
+	done
 
 $(LTO_BUILD)/SplitModule.cpp: $(srcdir)/src/llvm-split-module.patch
 	$(mkinstalldirs) "$(LTO_BUILD)"
@@ -626,12 +592,13 @@ $(LTO_BUILD)/lto-prepare.so: $(LTO_BUILD)/lto_prepare.o $(LTO_BUILD)/lto_partiti
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -shared $(LDFLAGS) -o $@ $^ `$(LLVM_CONFIG) --ldflags` -lLLVM -ldl
 
 .PHONY: lto install-lto
-lto: $(LTO_TARGETS)
+lto: $(LTO_TARGETS) $(if $(LTO_TARGETS),clang-slot)
 
 install-lto: $(LTO_TARGETS)
 	if test -n "$(LTO_TARGETS)"; then \
-	  $(mkinstalldirs) "$(DESTDIR)$(LTO_LIBDIR)" "$(DESTDIR)$(LTO_BINDIR)" && \
+	  $(mkinstalldirs) "$(DESTDIR)$(LTO_LIBDIR)" "$(DESTDIR)$(LTO_BINDIR)" "$(DESTDIR)$(pkglibexecdir)" && \
 	  $(INSTALL_PROGRAM) $(LTO_TARGETS) "$(DESTDIR)$(LTO_LIBDIR)/" && \
+	  ln -srf "$(DESTDIR)$(LTO_LIBDIR)/distcc-clang" "$(DESTDIR)$(pkglibexecdir)/distcc-clang-$(CLANG_MAJOR)" && \
 	  ln -srf "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_BINDIR)/distcc-lto"; \
 	fi
 
@@ -719,11 +686,9 @@ src/config.h.stamp: src/config.h.in
 	./config.status
 	touch src/config.h.stamp
 
-pump: pump.in config.status
-	./config.status
 
 # Grab the dependency files generated by gcc's -MD option.
--include */*.d src/rust/*.d
+-include */*.d src/rust/*.d src/clang/*.d
 
 src/job.o src/remote_job.o src/remote.o src/serve.o: src/job.h
 src/clang_worker.o src/serve.o: src/clang_worker.h
@@ -818,30 +783,6 @@ distccmon-gnome@EXEEXT@: $(mon_obj) $(gnome_obj)
 		$(mon_obj) $(gnome_obj) \
 		$(LIBS) $(GNOME_CFLAGS) $(GNOME_LIBS)
 
-# The include-server is a python app, so we use Python's build system.  We pass
-# the distcc version, the source location, the CPP flags (for location of the
-# includes), and the build location.
-include-server: $(LTO_BUILD)/SplitModule.cpp
-	+if test -z "$(PYTHON)"; then	\
-	  echo "Not building $@: No suitable python found"; \
-	else						\
-	  mkdir -p "$(include_server_builddir)" &&      \
-	  DISTCC_VERSION="$(VERSION)"			\
-	  SRCDIR="$(srcdir)"                            \
-	  LTO_BUILD="$(LTO_BUILD)"                     \
-	  CFLAGS="$(CFLAGS) $(PYTHON_CFLAGS)"           \
-	  CC="$(CC)" CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" \
-	  LDFLAGS="$(LDFLAGS)"                          \
-	  CPPFLAGS=$(setup_cppflags)                    \
-	  $(PYTHON) "$(srcdir)/include_server/setup.py" \
-	      build 					\
-	        --build-base="$(include_server_builddir)"  \
-	        --build-temp="$(include_server_builddir)" || exit 1; \
-	  if test "@cross_compiling@" != yes; then \
-	    PYTHONPATH="`"$(srcdir)/find_c_extension.sh" "$(builddir)"`" \
-	      $(PYTHON) -c 'import distcc_pump_c_extensions, clang_scan' || exit 1; \
-	  fi; \
-	fi
 
 
 ######################################################################
@@ -930,21 +871,14 @@ man/distccmon_text_1.html: man/distccmon-text.1
 man/lsdistcc_1.html: man/lsdistcc.1
 	troff2html -man "$(srcdir)"/man/lsdistcc.1 > $@
 
-man/pump_1.html: man/pump.1
-	troff2html -man "$(srcdir)"/man/pump.1 > $@
-
-man/include_server_1.html: man/include_server.1
-	troff2html -man "$(srcdir)"/man/include_server.1 > $@
-
 ######################################################################
 ## CHECK targets for code that has been build.
 
 .PHONY: check_programs
 .PHONY: maintainer-check-no-set-path distcc-maintainer-check
-.PHONY: include-server-maintainer-check pump-maintainer-check
 .PHONY: maintainer-check
 .PHONY: check
-.PHONY: lzo-check valgrind-check single-test pump-single-test
+.PHONY: lzo-check valgrind-check single-test
 
 check_programs: $(check_PROGRAMS) $(bin_PROGRAMS)
 
@@ -958,9 +892,6 @@ TESTDISTCC_OPTS =
 #
 # The more prominent of these conditions are checked explicitly checked below.
 #
-# TODO(klarlund): the outermost if assumes that the include-server target may be
-# satisfied w/o actually building an include server (or rather the C extension);
-# this logic needs to be verified or amended.
 maintainer-check-no-set-path:
 	@if ! $(PYTHON) -c 'import sys; print(sys.version)'; then \
 	  echo "WARNING: python not found; tests skipped"; \
@@ -979,54 +910,12 @@ distcc-maintainer-check: check_programs
 	 $(MAKE) PATH="`pwd`:$(RESTRICTED_PATH)" \
 	   TESTDISTCC_OPTS="$(TESTDISTCC_OPTS)" maintainer-check-no-set-path
 
-# If the include server extension module was built, then run the tests include
-# server.  TODO(klarlund): the outermost if assumes that the include-server
-# target may be satisfied w/o actually building an include server (or rather the
-# C extension); this logic needs to be verified or amended.
-# TODO(csilvers): keep track of failures instead of exiting on the first one.
-include-server-maintainer-check: include-server
-	@if ! test -d "$(include_server_builddir)"; then \
-	  echo "Skipped include-server check"; \
-	else \
-	  CURDIR=`pwd`; \
-	  include_server_loc=`"$(srcdir)/find_c_extension.sh" "$(builddir)"`; \
-	  test $$? = 0 || (echo 'Could not locate extension.' 1>&2 && exit 1); \
-	  cd "$(srcdir)/include_server"; \
-	  for p in $(check_include_server_PY); do \
-	    p_base=`basename "$$p"`; \
-	    echo "Running:" \
-              "PYTHONPATH=$$CURDIR/$$include_server_loc:$$PYTHONPATH $(PYTHON) $$p_base"; \
-	    if PYTHONPATH="$$CURDIR/$$include_server_loc:$$PYTHONPATH" $(PYTHON) "$$p_base" \
-		 > "$$CURDIR/$(tempdir)/$$p_base.out" 2>&1; then \
-	      echo "PASS"; \
-	      rm "$$CURDIR/$(tempdir)/$$p_base.out"; \
-            else \
-              echo "FAIL"; cat "$$CURDIR/$(tempdir)/$$p_base.out"; exit 1; \
-	    fi; \
-	  done; \
-	fi
+maintainer-check: distcc-maintainer-check preprocess-check
 
-# Do distcc-maintainer-check in pump-mode, if possible.
-pump-maintainer-check: pump include-server check_programs
-	@if [ -d "$(include_server_builddir)" ]; then \
-	  DISTCC_HOSTS='<invalid>,cpp,lzo' \
-	    "$(builddir)/pump" \
-	        $(MAKE) \
-	        PYTHONOPTIMIZE=0 \
-	        RESTRICTED_PATH="$(RESTRICTED_PATH)" \
-	        TESTDISTCC_OPTS="--pump $(TESTDISTCC_OPTS)" \
-	        distcc-maintainer-check; \
-	fi
+h_codec.so: $(srcdir)/src/file_cache.c $(srcdir)/src/argv_file.c src/config.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -shared -fPIC $(LDFLAGS) -o $@ $(filter %.c,$^) -lxxhash
 
-# Do distcc-maintainer-check, for non-pumped distcc, and try the include_server
-# check to check the include server's behavior, if applicable.  If the include
-# server exists, then carry out distcc-maintainer-check in pump-mode.
-# These suites share daemon ports and _testtmp; do not overlap them under -j.
-.NOTPARALLEL: maintainer-check
-maintainer-check: distcc-maintainer-check include-server-maintainer-check preprocess-check \
-	pump-maintainer-check
-
-adaptive-check: all check_programs h_client_hotpaths h_resource h_file_cache
+adaptive-check: all check_programs h_client_hotpaths h_resource h_file_cache h_codec.so
 	$(PYTHON) "$(srcdir)/test/test_state.py" -v
 	$(PYTHON) "$(srcdir)/test/test_portage_jobs.py" -v
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v
@@ -1051,17 +940,11 @@ adaptive-check: all check_programs h_client_hotpaths h_resource h_file_cache
 	$(PYTHON) "$(srcdir)/test/test_deploy.py" -v
 	$(PYTHON) "$(srcdir)/test/test_fleet_bench.py" -v
 
-preprocess-check: distcc distccd pump include-server $(CPP_LOOKUP_TARGET)
+preprocess-check: distcc distccd $(CPP_LOOKUP_TARGET)
 	$(PYTHON) "$(srcdir)/test/test_preprocess.py" -v
 	if test -n "$(CPP_LOOKUP_TARGET)"; then $(PYTHON) "$(srcdir)/test/test_cpp_lookup.py" -v; fi
 
-check: adaptive-check
-	@if test -n "$(PYTHON)"; then \
-	   $(MAKE) maintainer-check; \
-	else \
-	   echo "WARNING: pump-mode not being tested"; \
-	   $(MAKE) distcc-maintainer-check; \
-	fi
+check: adaptive-check maintainer-check
 
 # Runs the tests in lzo-mode.
 lzo-check:
@@ -1080,19 +963,10 @@ single-test: check_programs
 	PATH="`pwd`:$(RESTRICTED_PATH)" \
 	    $(PYTHON) "$(srcdir)/test/onetest.py" $(TESTDISTCC_OPTS) $(TESTNAME)
 
-# Run a single test in pump-mode.
-pump-single-test: pump include-server check_programs
-	DISTCC_HOSTS='<invalid>,cpp,lzo' \
-	    "$(builddir)/pump" \
-	        $(MAKE) \
-	        RESTRICTED_PATH="$(RESTRICTED_PATH)" \
-	        TESTDISTCC_OPTS="--pump $(TESTDISTCC_OPTS)" \
-	        single-test
-
 ######################################################################
 ## CHECK targets for code that has been installed.
 
-.PHONY: pump-installcheck distcc-installcheck maintainer-installcheck
+.PHONY: distcc-installcheck maintainer-installcheck
 .PHONY: installcheck verify-binaries-installcheck daemon-installcheck
 
 # Verify that DISTCC_INSTALLATION contains the expected set of binaries.
@@ -1119,41 +993,8 @@ distcc-installcheck: $(check_PROGRAMS)
 	  TESTDISTCC_OPTS="$(TESTDISTCC_OPTS)" \
 	  $(MAKE) maintainer-check-no-set-path
 
-# Check the installation to see whether pump-mode works.
-pump-installcheck:
-	which_loc=`which which`; \
-	pump_loc=`PATH="$(DISTCC_INSTALLATION)" "$$which_loc" pump`; \
-	DISTCC_HOSTS='<invalid>,cpp,lzo' \
-	  "$$pump_loc" \
-            $(MAKE) DISTCC_INSTALLATION="$(DISTCC_INSTALLATION)" \
-	      RESTRICTED_PATH="$(RESTRICTED_PATH)" \
-              TESTDISTCC_OPTS=--pump distcc-installcheck; \
-
-# "make maintainer-installcheck" verifies the currently installed version in
-# RESTRICTED_PATH.  It does not have the "install" target as a dependency so
-# that you can can check an installation that is installed via some different
-# method (e.g. rpm or debian package).  You must specify the location of such an
-# installation by overriding the value of DISTCC_INSTALLATION.
-#
-# The maintainer-installcheck does not run the include server unit tests;
-# but the integration tests in 'test' are run in pump mode.
-maintainer-installcheck: verify-binaries-installcheck distcc-installcheck \
-	pump-installcheck
-
-installcheck:
-	@if test -n "$(PYTHON)"; then \
-	   $(MAKE) maintainer-installcheck; \
-	elif test -n "$(PYTHON)"; then \
-	   echo "WARNING: pump-mode not being tested"; \
-	   $(MAKE) distcc-maintainer-installcheck; \
-	else \
-	   echo "Cannot run install-tests: python binary not found"; \
-	   false; \
-	fi
-
-# This tests that the distcc daemon is running, and that it and distcc
-# and the pump script have been installed correctly, by compiling a simple
-# hello world program with distcc and distcc-pump.
+maintainer-installcheck: verify-binaries-installcheck distcc-installcheck
+installcheck: maintainer-installcheck
 # This can be used after "make install-deb".
 #
 # This uses distcc from your PATH and (for the first test)
@@ -1169,10 +1010,6 @@ daemon-installcheck:
 	    echo 'int main(void) { puts("hello world"); return 0; }' >> hello.c && \
 	    rm -f hello.o && \
 	    DISTCC_FALLBACK=0 distcc $(CC) $(CFLAGS) -c hello.c -o hello.o && \
-	    test -f hello.o && \
-	    rm -f hello.o && \
-	    DISTCC_POTENTIAL_HOSTS=127.0.0.1 DISTCC_FALLBACK=0 \
-	        pump distcc $(CC) $(CFLAGS) -c hello.c -o hello.o && \
 	    test -f hello.o
 
 ######################################################################
@@ -1199,17 +1036,17 @@ benchmark:
 ######################################################################
 ## CLEAN targets
 
-.PHONY: clean clean-autoconf clean-lzo clean-include-server
+.PHONY: clean clean-autoconf clean-lzo
 .PHONY: maintainer-clean maintainer-clean-autoconf distclean distclean-autoconf
 
 # Also clean binaries which are optionally built. Also remove .d files; old ones
 # may confuse 'make'.
-clean: clean-autoconf clean-lzo clean-include-server
-	rm -f src/*.[od] src/rust/*.[od]
-	rm -f test/*.pyc
+clean: clean-autoconf clean-lzo
+	rm -f src/*.[od] src/rust/*.[od] src/clang/*.[od]
+	rm -f test/*.pyc h_codec.so
 	rm -f $(check_PROGRAMS) $(bin_PROGRAMS) $(sbin_PROGRAMS) distcc-rust
-	rm -f cpp_lookup.so distcc-rust-native.so clang_driver.so gcc_plan.so src/argv_file.pic.o
-	rm -rf "$(LTO_BUILD)"
+	rm -f cpp_lookup.so distcc-rust-native.so distcc-clang distcc-clang-[0-9]* gcc_plan.so src/argv_file.pic.o
+	rm -rf "$(LTO_BUILD)" llvm-lto-[0-9]*
 	rm -f distcc-linker-wrapper
 	rm -rf llvm-linker-wrapper
 	rm -f `echo $(man1_MEN) | sed -e 's/ /.gz /g' -e 's/$$/.gz/'`
@@ -1217,7 +1054,6 @@ clean: clean-autoconf clean-lzo clean-include-server
 	rm -f distccmon-gnome
 	rm -rf _testtmp  # produced by test/testdistcc.py and daemon-installcheck
 	rm -rf +distcheck
-	rm -rf "$(include_server_builddir)"
 
 clean-autoconf:
 	rm -f config.cache config.log
@@ -1225,20 +1061,6 @@ clean-autoconf:
 clean-lzo:
 	rm -f lzo/*.[od] lzo/testmini
 
-
-clean-include-server:
-	if test -n "$(PYTHON)"; then	\
-	  DISTCC_VERSION="$(VERSION)"			\
-	  SRCDIR="$(srcdir)"                            \
-	  CFLAGS="$(CFLAGS) $(PYTHON_CFLAGS)"           \
-	  CC="$(CC)" CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" \
-	  LDFLAGS="$(LDFLAGS)"                          \
-	  CPPFLAGS=$(setup_cppflags)                    \
-	  $(PYTHON) "$(srcdir)/include_server/setup.py" \
-	      clean	\
-	         --build-base="$(include_server_builddir)"  \
-	         --build-temp="$(include_server_builddir)"; \
-	fi
 
 maintainer-clean: distclean \
 	maintainer-clean-autoconf clean
@@ -1248,7 +1070,7 @@ maintainer-clean-autoconf:
 	rm -f configure src/config.h.in
 
 distclean-autoconf:
-	rm -f Makefile src/config.h src/config.h.stamp pump
+	rm -f Makefile src/config.h src/config.h.stamp
 	rm -f lzo/.stamp-conf
 	rm -f config.status config.cache config.log aclocal.m4
 	rm -rf autom4te.cache
@@ -1303,7 +1125,7 @@ alldist: deb
 
 ### INSTALL (and UNINSTALL) targets
 
-.PHONY: showpaths install install-programs install-include-server
+.PHONY: showpaths install install-programs
 .PHONY: install-man install-doc install-example install-gnome-data
 .PHONY: install-conf
 
@@ -1326,9 +1148,9 @@ showpaths:
 # tricky features so mkinstalldirs and cp will do
 
 install: showpaths install-doc install-man install-programs \
-	install-include-server install-example @INSTALL_GNOME@ install-conf
+	install-example @INSTALL_GNOME@ install-conf
 
-install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) $(CLANG_DRIVER_TARGET) $(LINKER_WRAPPER_TARGET) gcc_plan.so install-lto
+install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_NATIVE_TARGET) distcc-clang $(LINKER_WRAPPER_TARGET) gcc_plan.so install-lto
 	$(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc"
 	$(INSTALL_PROGRAM) gcc_plan.so "$(DESTDIR)$(libdir)/distcc/gcc_plan.so"
 	if test -n "$(CPP_LOOKUP_TARGET)"; then \
@@ -1338,6 +1160,7 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	$(mkinstalldirs) "$(DESTDIR)$(bindir)"
 	$(mkinstalldirs) "$(DESTDIR)$(sbindir)"
 	$(mkinstalldirs) "$(DESTDIR)$(pkglibexecdir)"
+	$(INSTALL_PROGRAM) distcc-clang "$(DESTDIR)$(pkglibexecdir)/distcc-clang"
 	for p in $(private_scripts); do $(INSTALL_SCRIPT) "$(srcdir)/$$p" "$(DESTDIR)$(pkglibexecdir)/$$p" || exit 1; done
 	for p in $(private_modules); do $(INSTALL_DATA) "$(srcdir)/$$p" "$(DESTDIR)$(pkglibexecdir)/$$p" || exit 1; done
 	ln -srf "$(DESTDIR)$(bindir)/distcc" "$(DESTDIR)$(pkglibexecdir)/distcc"
@@ -1349,68 +1172,12 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(CPP_LOOKUP_TARGET) $(RUST_N
 	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
 	  $(INSTALL_PROGRAM) distcc-rust-native.so "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"; \
 	fi
-	if test -n "$(CLANG_DRIVER_TARGET)"; then \
-	  $(mkinstalldirs) "$(DESTDIR)$(libdir)/distcc" && \
-	  $(INSTALL_PROGRAM) clang_driver.so "$(DESTDIR)$(libdir)/distcc/clang_driver.so"; \
-	fi
 	for p in $(bin_PROGRAMS); do \
 	  $(INSTALL_PROGRAM) "$$p" "$(DESTDIR)$(bindir)" || exit 1; \
 	done
 	for p in $(sbin_PROGRAMS); do \
 	  $(INSTALL_PROGRAM) "$$p" "$(DESTDIR)$(sbindir)" || exit 1; \
 	done
-
-# See comments for the include-server target.  Also, we work around an issue in
-# the change_root function of distutils/utils.py that turns the absolute prefix
-# into a relative reference if the root is the empty string: we absolutize the
-# destination directory in order to substitute '/' for the empty prefix (the
-# default) when defining the '--root' parameter.
-# The final complex issue involves installing pump.  pump wants to
-# know the installed-location of include_server.py.  The only way to
-# tell is to have setup.py install it, and then look what it says (via
-# the --record output).  So when installing pump, we look at the
-# --record output and modify the installed pump to have that location.
-# Note: --record output is inconsistent (buggy?) and sometimes leaves out
-# the leading slash in $prefix, even though we require prefix start with
-# a slash.  We use sed to add it back in at cp time.
-# Also, on Cygwin the --record output is in DOS text file format (CR LF
-# line endings), so we need to convert it from DOS text file format to
-# Unix text file format (LF line endings); we use sed for that too.
-install-include-server: include-server pump
-	+if test -z "$(PYTHON)"; then	\
-	  echo "Not building $@: No suitable python found"; \
-	else						\
-	  mkdir -p "$(include_server_builddir)" &&      \
-	  DESTDIR=`cd "$(DESTDIR)/" && pwd` &&            \
-	  DISTCC_VERSION="$(VERSION)"			\
-	  SRCDIR="$(srcdir)"                            \
-	  LTO_BUILD="$(LTO_BUILD)"                       \
-	  CFLAGS="$(CFLAGS) $(PYTHON_CFLAGS)"           \
-	  CC="$(CC)" CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" \
-	  LDFLAGS="$(LDFLAGS)"                          \
-	  CPPFLAGS=$(setup_cppflags)                    \
-	  $(PYTHON) "$(srcdir)/include_server/setup.py" \
-	      build 					\
-	        --build-base="$(include_server_builddir)" \
-	        --build-temp="$(include_server_builddir)" \
-	      install 					\
-	         --prefix="$(prefix)" 			\
-	         --record="$(include_server_builddir)/install.log.pre" \
-	         --root="$$DESTDIR"                     \
-	    || exit 1; \
-	  sed -e '/^[^\/]/ s,^,/,' \
-	      -e 's/\r$$//' \
-	      "$(include_server_builddir)/install.log.pre" \
-	      > "$(include_server_builddir)/install.log"; \
-	  if test -n "$(PYTHON_INSTALL_RECORD)"; then \
-	    cp -f "$(include_server_builddir)/install.log" "$(PYTHON_INSTALL_RECORD)"; \
-	  fi; \
-	  $(mkinstalldirs) "$(DESTDIR)$(bindir)" && \
-	  INCLUDE_SERVER=`grep '/include_server.py$$' "$(include_server_builddir)/install.log"` && \
-	  sed "s,^include_server='',include_server='$$INCLUDE_SERVER'," \
-	    pump > "$(include_server_builddir)/pump" && \
-	  $(INSTALL_SCRIPT) "$(include_server_builddir)/pump" "$(DESTDIR)$(bindir)"; \
-	fi
 
 install-man: $(man1_MEN)
 	$(mkinstalldirs) "$(DESTDIR)$(man1dir)"
@@ -1479,17 +1246,17 @@ install-conf: $(conf_files) $(default_files)
 # so we clean up the doc subdirectory before cleaning up doc itself.
 
 uninstall: uninstall-man uninstall-programs @UNINSTALL_GNOME@ \
-	uninstall-include-server uninstall-example uninstall-doc uninstall-conf
+	uninstall-example uninstall-doc uninstall-conf
 
 uninstall-programs:
+	rm -f "$(DESTDIR)$(pkglibexecdir)/distcc-clang" "$(DESTDIR)$(pkglibexecdir)/distcc-clang-$(CLANG_MAJOR)" "$(DESTDIR)$(LTO_LIBDIR)/distcc-clang"
 	rm -f "$(DESTDIR)$(libdir)/distcc/cpp_lookup.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/gcc_plan.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"
-	rm -f "$(DESTDIR)$(libdir)/distcc/clang_driver.so"
 	rm -f "$(DESTDIR)$(LTO_BINDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/lto-prepare.so" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu.so"
 	for p in $(private_scripts) $(private_modules) distcc-linker-wrapper distcc; do rm -f "$(DESTDIR)$(pkglibexecdir)/$$p"; done
 	rm -f "$(DESTDIR)$(bindir)/distcc-rust"
-	for p in $(bin_PROGRAMS) pump; do			\
+	for p in $(bin_PROGRAMS); do			\
 	  file="$(DESTDIR)$(bindir)/`basename $$p`";            \
 	  if [ -e "$$file" ]; then rm -fv "$$file"; fi          \
 	done
@@ -1503,15 +1270,6 @@ uninstall-programs:
 # There's no setup.py --uninstall. :-( So I depend on
 # PYTHON_INSTALL_RECORD being set.  If it was used at --install time,
 # I can use it again to uninstall.
-uninstall-include-server:
-	if [ -e "$(PYTHON_INSTALL_RECORD)" ]; then              \
-	  cat "$(PYTHON_INSTALL_RECORD)" | xargs rm -fv;        \
-	  cat "$(PYTHON_INSTALL_RECORD)" | sed 's/py$/pyc/' | xargs rm -fv; \
-	  cat "$(PYTHON_INSTALL_RECORD)" | sed 's/py$/pyo/' | xargs rm -fv; \
-	else                                                    \
-	  echo "Cannot uninstall include-server: no PYTHON_INSTALL_RECORD"; \
-	fi
-
 uninstall-man:
 	for p in $(man1_MEN); do				\
 	  file="$(DESTDIR)$(man1dir)/`basename $$p`";           \
@@ -1569,4 +1327,4 @@ src/gcc_frontend.o src/plan_memo.o src/h_compile.o: src/plan_memo.h
 src/frontend_fs.o src/tcp_client.o src/local_clang.o: src/frontend_fs.h
 HEADERS += src/tcp_job.h src/tcp_async.h src/clang_worker.h
 HEADERS += src/job.h
-HEADERS += src/frontend_fs.h src/frontend_identity.h src/gcc_files.h src/remote_files.h include_server/c_extensions/remote_files.h
+HEADERS += src/frontend_fs.h src/frontend_identity.h src/gcc_files.h src/remote_files.h src/clang/remote_files.h

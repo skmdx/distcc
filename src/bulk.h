@@ -21,6 +21,9 @@
  * USA.
  */
 
+#pragma once
+#include "distcc.h"
+
 int dcc_r_file(int ifd, const char *filename, unsigned,
                enum dcc_compress);
 int dcc_r_fifo(int ifd, const char *fifo_name, size_t len);
@@ -39,13 +42,3 @@ int dcc_r_token_file(int ifd,
 
 int dcc_open_read(const char *fname, int *ifd, off_t *fsize);
 int dcc_copy_file_to_fd(const char *in_fname, int out_fd);
-
-/* clirpc.c */
-int dcc_x_many_files(int ofd,
-                     unsigned int n_files,
-                     char **fnames, enum dcc_compress compr);
-
-/* srvrpc.c */
-int dcc_r_many_files(int in_fd,
-                     const char *dirname,
-                     enum dcc_compress compr);

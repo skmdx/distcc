@@ -165,8 +165,7 @@ const char *opt_compiler = NULL;
 
 const char *protocol_suffix[] = { NULL, /* to make the rest 1-based */
                                   "",
-                                  ",lzo",
-                                  ",lzo,cpp" };
+                                  ",lzo" };
 
 #define MAXHOSTS 500
 #define MAXTRIES 5       /* this constant can't be changed without
@@ -216,7 +215,7 @@ Options:\n\
 -oOVERLAP  Set number of extra DNS requests to send [%d]\n\
 -gDNSGAP   Set number of missing DNS entries to tolerate [%d]\n\
 -rPORT     Port to connect to [%d]\n\
--PPROTOCOL Protocol version to use (1-3) [%d]\n\
+-PPROTOCOL Protocol version to use (1-2) [%d]\n\
 -pCOMPILER Name of compiler to use [%s]\n\
 -d       Append DNS domain name to format\n\
 -v       Verbose\n\
@@ -342,31 +341,7 @@ static void generate_query(void)
         break;
       }
 
-     case 3: {
-        static const char canned_query_fmt_protocol_3[]=
-                                      "DIST00000003"
-                                      "CDIR00000001/"
-                                      "ARGC00000005"
-                                      "ARGV%08x%s"
-                                      "ARGV00000002-c"
-                                      "ARGV00000007hello.c"
-                                      "ARGV00000002-o"
-                                      "ARGV00000007hello.o"
-                                      "NFIL00000001"
-                                      "NAME00000008/hello.c"
-                                      "FILE%08x";
 
-        sprintf(canned_query,
-                canned_query_fmt_protocol_3,
-                 (unsigned)strlen(opt_compiler),
-                 opt_compiler,
-                 (unsigned)lzod_program_len);
-
-        canned_query_len = strlen(canned_query) + lzod_program_len;
-        memcpy(canned_query + strlen(canned_query),
-               lzod_program, lzod_program_len);
-        break;
-      }
     }
 }
 
@@ -1060,7 +1035,7 @@ int main(int argc, char **argv)
             break;
         case 'P':
             opt_protocol = atoi(argv[opti]+2);
-            if (opt_protocol <= 0 || opt_protocol > 3) {
+            if (opt_protocol <= 0 || opt_protocol > 2) {
                 usage();
             }
             break;

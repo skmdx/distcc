@@ -75,6 +75,19 @@ static int cache_root(const char *tmp)
     return root;
 }
 
+static int write_all(int fd, const void *data, size_t size)
+{
+    const char *p = data;
+    while (size) {
+        ssize_t n = write(fd, p, size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n;
+        size -= (size_t)n;
+    }
+    return 0;
+}
+
 struct dcc_record_cache { int root, shards[2 * CACHE_SHARDS]; };
 
 struct dcc_record_cache *dcc_file_cache_open(const char *tmp)
@@ -154,7 +167,7 @@ static int copy_snapshot(int from, int to)
         ssize_t n = read(from, buffer, sizeof(buffer));
         if (n == 0) return 0;
         if (n < 0 && errno == EINTR) continue;
-        if (n < 0 || dcc_writex(to, buffer, n)) return -1;
+        if (n < 0 || write_all(to, buffer, n)) return -1;
     }
 }
 
@@ -313,7 +326,7 @@ static int quota_write(int root, off_t bytes)
 {
     int fd = openat(root, ".", O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
-    int ret = dcc_writex(fd, &bytes, sizeof(bytes));
+    int ret = write_all(fd, &bytes, sizeof(bytes));
     if (!ret) ret = publish_file(root, ".quota", fd);
     close(fd);
     return ret;

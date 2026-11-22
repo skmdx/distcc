@@ -10,6 +10,90 @@ import distcc_python
 import xxhash
 
 
+(JOB_COMPILE, JOB_LINK, JOB_RUST, JOB_THINLTO, JOB_OFFLOAD_LINK,
+ JOB_FRONTEND, JOB_GCC_FRONTEND, JOB_RUST_CGU) = range(8)
+BROKER_VERSION = 10
+BROKER_POOLED = 1
+TCP_BEGIN = 0x54000400
+TCP_RESULT_FD = TCP_BEGIN + 6
+TCP_PROGRESS = TCP_BEGIN + 8
+TCP_COMPLETE_SIZE = 8 + 5 * 8 + 12 * 4
+
+
+def read_argv(fd):
+    def read(size):
+        data = bytearray()
+        while len(data) < size:
+            part = os.read(fd, min(size - len(data), 65536))
+            if not part:
+                raise ValueError('truncated argument file')
+            data.extend(part)
+        return data
+
+    def number(token):
+        header = read(12)
+        digits = header[4:].lstrip(b' ')
+        if header[:4] != token or not digits or any(c not in b'0123456789abcdefABCDEF' for c in digits):
+            raise ValueError('invalid argument header')
+        return int(digits, 16)
+
+    return [os.fsdecode(bytes(read(number(b'ARGV')))) for _ in range(number(b'ARGC'))]
+
+
+def write_argv(fd, argv):
+    def header(tag, count):
+        return f'{tag}{count:08x}'.encode('ascii')
+    data = bytearray(header('ARGC', len(argv)))
+    for arg in argv:
+        word = os.fsencode(arg)
+        if b'\0' in word:
+            raise ValueError('NUL in argument')
+        data.extend(header('ARGV', len(word)))
+        data.extend(word)
+    pending = memoryview(data)
+    while pending:
+        pending = pending[os.write(fd, pending):]
+
+
+def tokenize_driver_line(line):
+    words, word = [], []
+    quote = None
+    started = False
+    chars = iter(line)
+    for c in chars:
+        if c == '\\':
+            word.append(next(chars, c))
+        elif quote:
+            if c == quote:
+                quote = None
+            else:
+                word.append(c)
+        elif c in ('"', "'"):
+            quote = c
+        elif c.isspace():
+            if started:
+                words.append(''.join(word))
+                word.clear()
+            started = False
+            continue
+        else:
+            word.append(c)
+        started = True
+    if started:
+        words.append(''.join(word))
+    return words
+
+
+def format_driver_command(argv):
+    def display(text, force):
+        special = '\\"$' + chr(96)
+        quoted = force or not text or any(c.isspace() or c in special or c == "'" for c in text)
+        if quoted:
+            return '"' + ''.join(('\\' if c in special else '') + c for c in text) + '"'
+        return text
+    return ''.join(' ' + display(arg, i == 0) for i, arg in enumerate(argv))
+
+
 class LocalOnly(Exception):
     pass
 
@@ -54,7 +138,7 @@ class RustCommand(NamedTuple):
     environment: tuple[str, ...] = ()
 
 
-def manifest(kind, cwd, argv, inputs, *, rust=None, outputs=()):
+def manifest(kind, cwd, argv, inputs, *, rust=None, outputs=(), input_kind=0):
     """Encode the bounded BEGIN manifest, including its first-use parent table."""
     data = bytearray()
     parents = {}
@@ -79,13 +163,13 @@ def manifest(kind, cwd, argv, inputs, *, rust=None, outputs=()):
     string(cwd)
     for arg in argv:
         string(arg)
-    if kind in (4, 5):
+    if kind in (JOB_THINLTO, JOB_OFFLOAD_LINK):
         if not outputs:
             raise ValueError('LLVM job requires declared outputs')
         for name in outputs:
             string(name)
         string('')
-    if kind == 3:
+    if kind == JOB_RUST:
         if rust is None:
             raise ValueError('Rust command metadata is required')
         number(rust.phase)
@@ -94,7 +178,7 @@ def manifest(kind, cwd, argv, inputs, *, rust=None, outputs=()):
                       *rust.directories, '', *rust.environment, ''):
             string(field)
     for name, size, digest, cached in inputs:
-        for value in (0, 0, cached, size, size):
+        for value in (input_kind, cached, size):
             number(value)
         data.extend(digest)
         parent, slash, base = os.fsencode(name).rpartition(b'/')

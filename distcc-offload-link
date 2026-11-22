@@ -2,6 +2,7 @@
 """Distribute LLVM's per-target offload link jobs."""
 import sys
 from distcc_lto import main
+from distcc_job import JOB_OFFLOAD_LINK
 
 if __name__ == '__main__':
-    sys.exit(main(5))
+    sys.exit(main(JOB_OFFLOAD_LINK))

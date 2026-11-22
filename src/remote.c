@@ -150,10 +150,6 @@ dcc_send_header(int net_fd,
 
     if ((ret = dcc_x_req_header(net_fd, host->protover)))
         return ret;
-    if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        if ((ret = dcc_x_cwd(net_fd)))
-            return ret;
-    }
     if ((ret = dcc_x_argv(net_fd, "ARGC", "ARGV", argv)))
         return ret;
 
@@ -222,8 +218,6 @@ out:
  * @param cpp_fname Filename of preprocessed source.  May not be complete yet,
  * depending on @p cpp_pid.
  *
- * @param files If we are doing preprocessing on the server, the names of
- * all the files needed; otherwise, NULL.
  *
  * @param output_fname File that the object code should be delivered to.
  *
@@ -231,7 +225,6 @@ out:
  * allowed to complete before we send the input file.
  *
  * @param local_cpu_lock_fd If != -1, file descriptor for the lock file.
- * Should be != -1 iff (host->cpp_where != DCC_CPP_ON_SERVER).
  * If != -1, the lock must be held on entry to this function,
  * and THIS FUNCTION WILL RELEASE THE LOCK.
  *
@@ -251,7 +244,6 @@ int dcc_compile_remote(char **argv,
                        char *input_fname,
                        char *cpp_fname,
                        int cpp_fd,
-                       char **files,
                        char **auxiliary,
                        struct dcc_job *prepared_job,
                        char *output_fname,
@@ -270,7 +262,6 @@ int dcc_compile_remote(char **argv,
     int ssh_status;
     off_t doti_size = -1;
     struct timeval before, after;
-    unsigned int n_files;
 
     if (gettimeofday(&before, NULL))
         rs_log_warning("gettimeofday failed");
@@ -284,7 +275,6 @@ int dcc_compile_remote(char **argv,
 
     *status = 0;
     if (host->tcp_jobs) {
-        if (host->cpp_where == DCC_CPP_ON_CLIENT) {
             ret = dcc_wait_for_cpp(cpp_pid, status, input_fname);
             if (local_cpu_lock_fd != -1) {
                 dcc_unlock(local_cpu_lock_fd);
@@ -292,8 +282,7 @@ int dcc_compile_remote(char **argv,
             }
             dcc_broker_cpp_done(host);
             if (ret || *status) goto out;
-        } else dcc_broker_cpp_done(host);
-        ret = dcc_compile_direct(host, prepared_job, argv, cpp_fname, cpp_fd, files, auxiliary, output_fname, deps_fname,
+        ret = dcc_compile_direct(host, prepared_job, argv, cpp_fname, cpp_fd, auxiliary, output_fname, deps_fname,
                                  server_stderr, server_stdout, status);
         goto out;
     }
@@ -321,19 +310,6 @@ int dcc_compile_remote(char **argv,
 
     dcc_note_state(DCC_PHASE_SEND, NULL, NULL, DCC_REMOTE);
 
-    if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        n_files = dcc_argv_len(files);
-        if ((ret = dcc_send_header(to_net_fd, argv, host))) {
-          goto out;
-        }
-
-        if ((ret = dcc_x_many_files(to_net_fd, n_files, files, host->compr))) {
-            goto out;
-        }
-    } else {
-        /* This waits for cpp and puts its status in *status.  If cpp failed,
-         * then the connection will have been dropped and we need not bother
-         * trying to get any response from the server. */
 
         if ((ret = dcc_send_header(to_net_fd, argv, host)))
             goto out;
@@ -355,11 +331,8 @@ int dcc_compile_remote(char **argv,
         if ((ret = dcc_x_file(to_net_fd, cpp_fname, "DOTI", host->compr,
                               &doti_size)))
             goto out;
-    }
 
     rs_trace("client finished sending request to server");
-    if (host->cpp_where == DCC_CPP_ON_SERVER)
-        dcc_broker_cpp_done(host);
     tcp_cork_sock(to_net_fd, 0);
     /* but it might not have been read in by the server yet; there's
      * 100kB or more of buffers in the two kernels. */
@@ -373,7 +346,7 @@ int dcc_compile_remote(char **argv,
      * receive results. */
     if (ret == 0 && *status == 0) {
         ret = dcc_retrieve_results(from_net_fd, status, output_fname,
-                                   deps_fname, server_stderr,
+                                   server_stderr,
                                    server_stdout, dcc_argv_search(argv, "-E"), host);
         if (!ret && host->broker_pooled) {
             unsigned end;

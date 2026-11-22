@@ -95,9 +95,7 @@ int main(void)
                 pressure = 12;
                 assert(dcc_resource_local_slots(4) == 1);
                 assert(!dcc_resource_slots(4)); /* Worker admission stays strict. */
-                assert(dcc_resource_analysis_slots(4) == 1);
                 assert(dcc_resource_local_slots(0) == 0);
-                assert(dcc_resource_analysis_slots(0) == 0);
                 pressure = 7;
                 assert(dcc_resource_local_slots(4) == 1); /* PSI hysteresis. */
                 pressure = 0;

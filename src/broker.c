@@ -232,14 +232,12 @@ static void probe_event(struct broker *broker, struct peer *peer, double now, in
 
 static void release_cpp(struct broker *broker, struct client *client)
 {
-    if (client->cpp_reserved && (client->command == LOCAL_CPP || client->command == LOCAL_ANALYSIS))
+    if (client->cpp_reserved && client->command == LOCAL_CPP)
         rs_trace("input preparation command=%u wait=%.6f execute=%.6f client=%td request=%.6f",
                  client->command, client->run_at - client->waiting_since,
                  now_seconds() - client->run_at, client - broker->schedule.clients, client->waiting_since);
     if (client->cpp_reserved) broker->dirty = 1;
     broker->schedule.cpp_busy -= client->cpp_reserved;
-    if (client->command == LOCAL_ANALYSIS)
-        broker->schedule.analysis_busy -= client->cpp_reserved;
     client->cpp_reserved = 0;
 }
 
@@ -327,11 +325,7 @@ static void deliver_connection(struct broker *broker, struct client *client)
                           .flags = client->direct && client->command != TRY_LOCAL ? DCC_BROKER_DIRECT :
                                    client->pooled ? DCC_BROKER_POOLED : 0};
     struct peer *peer = &broker->schedule.peers[client->peer];
-    uint64_t family = client->hint.family;
     strcpy(reply.host, peer->host->hostdef_string);
-    if (!client->direct && client->command == ACQUIRE_CPP && family &&
-        cold_family(peer, family))
-        reply.flags |= DCC_BROKER_COLD_FAMILY;
     dcc_watch_drop(broker->ep, &broker->watches[NETWORK + (client - broker->schedule.clients)]);
     if (send_reply(client->fd, &reply, client->net)) {
         release_client(broker, client);
@@ -632,7 +626,7 @@ static int decode_request(const struct packet *packet, size_t size, int fd,
     if (fd >= 0) return 0;
     switch (op) {
     case ACQUIRE: case ACQUIRE_LINK: case JOBS: return !size;
-    case LOCAL_CPP: case LOCAL_ANALYSIS:
+    case LOCAL_CPP:
         if (size != sizeof(out->limit)) return 0;
         memcpy(&out->limit, data, sizeof(out->limit));
         return out->limit && out->limit <= INT_MAX;
@@ -707,7 +701,6 @@ static void handle_request(struct broker *broker, int id, double now, int backof
             }
         } else {
             struct peer *p = &broker->schedule.peers[c->peer];
-            if (c->command == ACQUIRE_CPP) record_dispatched(p, c->hint.family);
             const struct dcc_load_report *report = request.report;
             if (report && p->metrics.jobs && dcc_tcp_get64(report->stamp) > p->report_stamp &&
                 !dcc_capacity_update(&p->metrics, report, p->direct + (p->local ? broker->schedule.cpp_busy : 0))) {

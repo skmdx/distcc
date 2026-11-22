@@ -83,8 +83,8 @@
 
 static int dcc_lock_one(struct dcc_hostdef *hostlist,
                         struct dcc_hostdef **buildhost,
-                        int *cpu_lock_fd, int analysis);
-static void dcc_lock_pause(int analysis_occupied);
+                        int *cpu_lock_fd);
+static void dcc_lock_pause(void);
 
 
 int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
@@ -114,21 +114,21 @@ int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
         if (h->stats_port || h->speed) {
             while ((ret = dcc_lock_adaptive(hostlist, buildhost, cpu_lock_fd))
                    == EXIT_BUSY)
-                dcc_lock_pause(0);
+                dcc_lock_pause();
             return ret;
         }
     }
-    return dcc_lock_one(hostlist, buildhost, cpu_lock_fd, 0);
+    return dcc_lock_one(hostlist, buildhost, cpu_lock_fd);
 
     /* FIXME: Host list is leaked? */
 }
 
 
-static void dcc_lock_pause(int analysis_occupied)
+static void dcc_lock_pause(void)
 {
     /* File locks have no release notification; revisit short local links
      * promptly. Analyzer admission wakes through inotify instead. */
-    unsigned pause_time_ms = analysis_occupied ? 1000 : 20;
+    unsigned pause_time_ms = 20;
 
     char *pt = getenv("DISTCC_PAUSE_TIME_MSEC");
     if (pt)
@@ -137,17 +137,6 @@ static void dcc_lock_pause(int analysis_occupied)
 	/*	This call to dcc_note_state() is made before the host is known, so it
 		does not make sense and does nothing useful as far as I can tell.	*/
     /*	dcc_note_state(DCC_PHASE_BLOCKED, NULL, NULL, DCC_UNKNOWN);	*/
-
-    if (analysis_occupied) {
-        struct timespec begin, end;
-        clock_gettime(CLOCK_MONOTONIC, &begin);
-        rs_trace("waiting for analyzer memory admission (up to %ums)...", pause_time_ms);
-        dcc_resource_analysis_wait(analysis_occupied, pause_time_ms);
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        rs_trace("analyzer memory admission waited %.6fs", end.tv_sec - begin.tv_sec +
-                 (end.tv_nsec - begin.tv_nsec) / 1000000000.0);
-        return;
-    }
 
     rs_trace("nothing available, sleeping %ums...", pause_time_ms);
 
@@ -167,7 +156,7 @@ static void dcc_lock_pause(int analysis_occupied)
  **/
 static int dcc_lock_one(struct dcc_hostdef *hostlist,
                         struct dcc_hostdef **buildhost,
-                        int *cpu_lock_fd, int analysis)
+                        int *cpu_lock_fd)
 {
     struct dcc_hostdef *h;
     int i_cpu;
@@ -178,14 +167,14 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
             char i_cpu_is_usable = 0;
 
             for (h = hostlist; h; h = h->next) {
-                int limit = analysis || (h == dcc_hostdef_local_cpp && !h->slots_specified) ?
+                int limit = (h == dcc_hostdef_local_cpp && !h->slots_specified) ?
                             dcc_resource_cpus() : h->n_slots;
                 if (i_cpu >= limit)
                     continue;
 
                 i_cpu_is_usable = 1;
                 if (h->mode == DCC_MODE_LOCAL && i_cpu >=
-                    (analysis ? dcc_resource_analysis_slots(limit) : dcc_resource_local_slots(limit)))
+                    dcc_resource_local_slots(limit))
                     continue;
 
                 ret = dcc_lock_host("cpu", h, i_cpu, 0, cpu_lock_fd);
@@ -206,7 +195,7 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
                 break;
         }
 
-        dcc_lock_pause(0);
+        dcc_lock_pause();
     }
 }
 
@@ -219,10 +208,10 @@ static int dcc_lock_one(struct dcc_hostdef *hostlist,
 int dcc_lock_local(int *cpu_lock_fd)
 {
     struct dcc_hostdef *chosen;
-    return dcc_lock_one(dcc_hostdef_local, &chosen, cpu_lock_fd, 0);
+    return dcc_lock_one(dcc_hostdef_local, &chosen, cpu_lock_fd);
 }
 
-static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
+int dcc_lock_local_cpp(int *cpu_lock_fd)
 {
     int ret = dcc_read_localslots_configuration();
     if (ret) return ret;
@@ -234,35 +223,23 @@ static int lock_local_preprocessing(int *cpu_lock_fd, int analysis)
         int occupied;
         for (;;) {
             int maximum = chosen->slots_specified ? chosen->n_slots : dcc_resource_cpus();
-            int limit = analysis ? dcc_resource_analysis_slots(dcc_resource_cpus()) :
-                                   dcc_resource_local_slots(maximum);
+            int limit = dcc_resource_local_slots(maximum);
             if (!limit) {
-                dcc_lock_pause(analysis ? 1 : 0);
+                dcc_lock_pause();
                 continue;
             }
-            ret = dcc_broker_local_cpp(cpu_lock_fd, &occupied, analysis, limit);
+            ret = dcc_broker_local_cpp(cpu_lock_fd, &occupied, limit);
             /* The broker can live in a different cgroup. Keep admission
              * against this client's budget, not the small broker service. */
-            if (ret || occupied <= (analysis ? dcc_resource_analysis_slots(dcc_resource_cpus()) :
-                                               dcc_resource_local_slots(maximum))) break;
+            if (ret || occupied <= (            dcc_resource_local_slots(maximum))) break;
             dcc_unlock(*cpu_lock_fd);
             *cpu_lock_fd = -1;
-            dcc_lock_pause(analysis ? occupied : 0);
+            dcc_lock_pause();
         }
     } else
-        ret = dcc_lock_one(dcc_hostdef_local_cpp, &chosen, cpu_lock_fd, analysis);
+        ret = dcc_lock_one(dcc_hostdef_local_cpp, &chosen, cpu_lock_fd);
     if (ret == 0) {
         dcc_note_state(DCC_PHASE_CPP, NULL, chosen->hostname, DCC_LOCAL);
     }
     return ret;
-}
-
-int dcc_lock_local_cpp(int *cpu_lock_fd)
-{
-    return lock_local_preprocessing(cpu_lock_fd, 0);
-}
-
-int dcc_lock_local_analysis(int *cpu_lock_fd)
-{
-    return lock_local_preprocessing(cpu_lock_fd, 1);
 }

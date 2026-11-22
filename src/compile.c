@@ -63,20 +63,7 @@
 #include "compile.h"
 #include "broker.h"
 #include "workload.h"
-#include "include_server_if.h"
-#include "emaillog.h"
 #include "dotd.h"
-
-/**
- * This boolean is true iff --scan-includes option is enabled.
- * If so, distcc will just run the source file through the include server,
- * and print out the list of header files that might be #included,
- * rather than actually compiling the sources.
- */
-int dcc_scan_includes = 0;
-
-static const char *const include_server_port_suffix = "/socket";
-static const char *const discrepancy_suffix = "/discrepancy_counter";
 
 static void release_host(struct dcc_hostdef *host, int *cpu_lock_fd,
                          int *local_cpu_lock_fd, int failed)
@@ -100,290 +87,6 @@ static void release_host(struct dcc_hostdef *host, int *cpu_lock_fd,
    }
 }
 
-static int dcc_get_max_discrepancies_before_demotion(void)
-{
-    /* Warning: the default setting here should have the same value as in the
-     * pump.in script! */
-    static const int default_setting = 1;
-    static int current_setting = 0;
-
-    if (current_setting > 0)
-        return current_setting;
-
-    const char *user_setting = getenv("DISTCC_MAX_DISCREPANCY");
-    if (user_setting) {
-        int parsed_user_setting = atoi(user_setting);
-        if (parsed_user_setting <= 0) {
-            rs_log_error("Bad DISTCC_MAX_DISCREPANCY value: %s", user_setting);
-            exit(EXIT_BAD_ARGUMENTS);
-        }
-        current_setting = parsed_user_setting;
-    } else {
-        current_setting = default_setting;
-    }
-    return current_setting;
-}
-
-/**
- * Return in @param filename the name of the file we use as unary counter of
- * discrepancies (a compilation failing on the server, but succeeding
- * locally. This function may return NULL in @param filename if the name cannot
- * be determined.
- **/
-int dcc_discrepancy_filename(char **filename)
-{
-    const char *include_server_port = getenv("INCLUDE_SERVER_PORT");
-    *filename = NULL;
-    if (include_server_port == NULL) {
-        return 0;
-    } else if (str_endswith(include_server_port_suffix,
-                            include_server_port)) {
-        /* We're going to make a longer string from include_server_port: one
-         * that replaces include_server_port_suffix with discrepancy_suffix. */
-        int delta = strlen(discrepancy_suffix) -
-            strlen(include_server_port_suffix);
-        assert (delta > 0);
-        *filename = malloc(strlen(include_server_port) + 1 + delta);
-        if (!*filename) {
-            rs_log_error("failed to allocate space for filename");
-            return EXIT_OUT_OF_MEMORY;
-        }
-        strcpy(*filename, include_server_port);
-        int slash_pos = strlen(include_server_port)
-                        - strlen(include_server_port_suffix);
-        /* Because include_server_port_suffix is a suffix of include_server_port
-         * we expect to find a '/' at slash_pos in filename. */
-        assert((*filename)[slash_pos] == '/');
-        (void) strcpy(*filename + slash_pos, discrepancy_suffix);
-        return 0;
-    } else
-        return 0;
-}
-
-
-/**
- * Return the length of the @param discrepancy_filename in newly allocated
- * memory; return 0 if it's not possible to determine the length (if
- * e.g. @param discrepancy_filename is NULL).
- **/
-static int dcc_read_number_discrepancies(const char *discrepancy_filename)
-{
-    if (!discrepancy_filename) return 0;
-    struct stat stat_record;
-    if (stat(discrepancy_filename, &stat_record) == 0) {
-        size_t size = stat_record.st_size;
-        /* Does size fit in an 'int'? */
-        if ((((size_t) (int) size) == size) &&
-            ((int) size) > 0)
-            return ((int) size);
-        else
-            return INT_MAX;
-    } else
-        return 0;
-}
-
-
-/**
- *  Lengthen the file whose name is @param discrepancy_filename by one byte. Or,
- *  do nothing, if @param discrepancy_filename is NULL.
- **/
-static int dcc_note_discrepancy(const char *discrepancy_filename)
-{
-    FILE *discrepancy_file;
-    if (!discrepancy_filename) return 0;
-    if (!(discrepancy_file = fopen(discrepancy_filename, "a"))) {
-        rs_log_error("failed to open discrepancy_filename file: %s: %s",
-                     discrepancy_filename,
-                     strerror(errno));
-        return EXIT_IO_ERROR;
-    }
-    if (fputc('@', discrepancy_file) == EOF) {
-        rs_log_error("failed to write to discrepancy_filename file: %s",
-                     discrepancy_filename);
-        fclose(discrepancy_file);
-        return EXIT_IO_ERROR;
-    }
-    /* The file position is a property of the stream, so we are
-    assured that exactly one process will take the 'if' branch when
-    max_discrepancies_before_demotion failures is reached. */
-    if (ftell(discrepancy_file) == 
-        (long int)dcc_get_max_discrepancies_before_demotion()) {
-        rs_log_warning("now using plain distcc, possibly due to "
-                       "inconsistent file system changes during build");
-    }
-    fclose(discrepancy_file);
-    return 0;
-}
-
-
-/**
- * In some cases, it is ill-advised to preprocess on the server. Check for such
- * situations. If they occur, then change protocol version.
- **/
-static void dcc_perhaps_adjust_cpp_where_and_protover(
-    char *input_fname,
-    struct dcc_hostdef *host,
-    char *discrepancy_filename, const char *include_server)
-{
-    /* It's unfortunate that the variable that controls preprocessing is in the
-       "host" datastructure. See elaborate complaint in dcc_build_somewhere. */
-
-    if (!include_server || !*include_server) {
-        host->cpp_where = DCC_CPP_ON_CLIENT;
-        dcc_get_protover_from_features(host->compr, host->cpp_where, &host->protover);
-        return;
-    }
-
-    /* Check whether there has been too much trouble running distcc-pump during
-       this build. */
-    if (dcc_read_number_discrepancies(discrepancy_filename) >=
-        dcc_get_max_discrepancies_before_demotion()) {
-        /* Give up on using distcc-pump */
-        host->cpp_where = DCC_CPP_ON_CLIENT;
-        dcc_get_protover_from_features(host->compr,
-                                       host->cpp_where,
-                                       &host->protover);
-    }
-
-    /* Don't do anything silly for already preprocessed files. */
-    if (dcc_is_preprocessed(input_fname)) {
-        /* Don't subject input file to include analysis. */
-        rs_log_warning("cannot use distcc_pump on already preprocessed file"
-                       " (such as emitted by ccache)");
-        host->cpp_where = DCC_CPP_ON_CLIENT;
-        dcc_get_protover_from_features(host->compr,
-                                       host->cpp_where,
-                                       &host->protover);
-    }
-    /* Environment variables CPATH and two friends are hidden ways of passing
-     * -I's. Beware! */
-    if (getenv("CPATH") || getenv("C_INCLUDE_PATH")
-        || getenv("CPLUS_INCLUDE_PATH")) {
-        rs_log_warning("cannot use distcc_pump with any of environment"
-                       " variables CPATH, C_INCLUDE_PATH or CPLUS_INCLUDE_PATH"
-                       " set, preprocessing locally");
-        host->cpp_where = DCC_CPP_ON_CLIENT;
-        dcc_get_protover_from_features(host->compr,
-                                       host->cpp_where,
-                                       &host->protover);
-    }
-}
-
-
-
-/**
- * Do a time analysis of dependencies in dotd file.  First, if @param dotd_fname
- * is created before @param reference_time, then return NULL in result.  Second,
- * if one of the files mentioned in the @param dotd_fname is modified after time
- * @param reference_time, then return non-NULL in result. Otherwise return NULL
- * in result.  A non-NULL value in result is a pointer to a newly allocated
- * string describing the offending dependency.
-
- * If @param exclude_pattern is not NULL, then files matching the glob @param
- * exclude_pattern are not considered in the above comparison.
- *
- *  This function is not declared static --- for purposes of testing.
- **/
-int dcc_fresh_dependency_exists(const char *dotd_fname,
-                                const char *exclude_pattern,
-                                time_t reference_time,
-                                char **result)
-{
-    struct stat stat_dotd;
-    off_t dotd_fname_size = 0;
-    FILE *fp;
-    int c;
-    int res;
-    char *dep_name;
-
-    *result = NULL;
-    /* Allocate buffer for dotd contents and open it. */
-    res = stat(dotd_fname, &stat_dotd);
-    if (res) {
-        rs_trace("could not stat \"%s\": %s", dotd_fname, strerror(errno));
-        return 0;
-    }
-    if (stat_dotd.st_mtime < reference_time) {
-        /* That .d file appears to be too old; don't trust it for this
-         * analysis. */
-        rs_trace("old dotd file \"%s\"", dotd_fname);
-        return 0;
-    }
-    dotd_fname_size = stat_dotd.st_size;
-    /* Is dotd_fname_size representable as a size_t value ? */
-    if ((off_t) (size_t) dotd_fname_size == dotd_fname_size) {
-        dep_name = malloc((size_t) dotd_fname_size);
-        if (!dep_name) {
-            rs_log_error("failed to allocate space for dotd file");
-            return EXIT_OUT_OF_MEMORY;
-        }
-    } else { /* This is exceedingly unlikely. */
-        rs_trace("file \"%s\" is too big", dotd_fname);
-        return 0;
-    }
-    if ((fp = fopen(dotd_fname, "r")) == NULL) {
-        rs_trace("could not open \"%s\": %s", dotd_fname, strerror(errno));
-        free(dep_name);
-        return 0;
-    }
-
-    /* Find ':'. */
-    while ((c = getc(fp)) != EOF && c != ':');
-    if (c != ':') goto return_0;
-
-    /* Process dependencies. */
-    while (c != EOF) {
-        struct stat stat_dep;
-        int i = 0;
-        /* Skip whitespaces and backslashes. */
-        while ((c = getc(fp)) != EOF && (isspace(c) || c == '\\'));
-        /* Now, we're at start of file name. */
-        ungetc(c, fp);
-        while ((c = getc(fp)) != EOF &&
-               (!isspace(c) || c == '\\')) {
-            if (i >= dotd_fname_size) {
-                /* Impossible */
-                rs_log_error("not enough room for dependency name");
-                goto return_0;
-            }
-            if (c == '\\') {
-                /* Skip the newline. */
-                if ((c = getc(fp)) != EOF)
-                    if (c != '\n') ungetc(c, fp);
-            }
-            else dep_name[i++] = c;
-        }
-        if (i != 0) {
-            dep_name[i] = '\0';
-#ifdef HAVE_FNMATCH_H
-            if (exclude_pattern == NULL ||
-                fnmatch(exclude_pattern, dep_name, 0) == FNM_NOMATCH) {
-#else
-            /* Tautology avoids compiler warning about unused variable. */
-            if (exclude_pattern == exclude_pattern) {
-#endif
-                /* The dep_name is not excluded; now verify that it is not too
-                 * young. */
-                rs_log_info("Checking dependency: %s", dep_name);
-                res = stat(dep_name, &stat_dep);
-                if (res) goto return_0;
-                if (stat_dep.st_ctime >= reference_time) {
-                    fclose(fp);
-                    *result = realloc(dep_name, strlen(dep_name) + 1);
-                    if (*result == NULL) {
-                        rs_log_error("realloc failed");
-                        return EXIT_OUT_OF_MEMORY;
-                    }
-                    return 0;
-                }
-            }
-        }
-    }
-  return_0:
-    fclose(fp);
-    free(dep_name);
-    return 0;
-}
 
 
 /**
@@ -450,69 +153,12 @@ static int dcc_compile_local_ir(char **argv, char *input, const char *prepared, 
     free(stripped);
     if (!ret) ret = dcc_set_input(command, (char *)(fd >= 0 ? "/proc/self/fd/0" : prepared));
     if (!ret && !(cwd = getcwd(NULL, 0))) ret = EXIT_IO_ERROR;
-    if (!ret) ret = dcc_clang_command(&command, "", input, cwd, 0, 1, NULL);
+    if (!ret) ret = dcc_clang_command(&command, "", input, cwd, 1, NULL);
     if (!ret) ret = dcc_compile_local(command, input, fd >= 0 ? prepared : NULL, cpu_ns);
     free(cwd);
     dcc_free_argv(command);
     return ret;
 }
-
-
- /* Make the decision to send email about @param input_name, but only after a
-  * little further investgation.
-  *
-  * We avoid sending email if there's a fresh dependency. To find out, we need
-  * @param deps_fname, a .d file, created during the build.  We check each
-  * dependency described there. If just one changed after the build started,
-  * then we really don't want to hear about distcc-pump errors, because
-  * dependencies shouldn't change. The files generated during the build are
-  * exceptions. To disregard these, the distcc user may specify a glob pattern
-  * in environment variable DISTCC_EXCLUDE_FRESH_FILES.
-  *
-  * Also, if there has been too many discrepancies (where the build has
-  * succeeded remotely but failed locally), then we need to stop using
-  * distcc-pump for the remainder of the build.  The present function
-  * contributes to this logic: if it is determined that email must be sent, then
-  * the count of such situations is incremented using the file @param
-  * discrepancy_filename.
- */
-static int dcc_please_send_email_after_investigation(
-    const char *input_fname,
-    const char *deps_fname,
-    const char *discrepancy_filename) {
-
-    int ret;
-    char *fresh_dependency;
-    const char *include_server_port = getenv("INCLUDE_SERVER_PORT");
-    struct stat stat_port;
-    rs_log_warning("remote compilation of '%s' failed, retried locally "
-                   "and got a different result.", input_fname);
-    if ((include_server_port != NULL) &&
-        (stat(include_server_port, &stat_port)) == 0) {
-        time_t build_start = stat_port.st_ctime;
-        if (deps_fname) {
-            const char *exclude_pattern =
-                getenv("DISTCC_EXCLUDE_FRESH_FILES");
-
-            if ((ret = dcc_fresh_dependency_exists(deps_fname,
-                                                   exclude_pattern,
-                                                   build_start,
-                                                   &fresh_dependency))) {
-                return ret;
-            }
-            if (fresh_dependency) {
-                rs_log_warning("file '%s', a dependency of %s, "
-                               "changed during the build", fresh_dependency,
-                               input_fname);
-                free(fresh_dependency);
-                return dcc_note_discrepancy(discrepancy_filename);
-            }
-        }
-    }
-    dcc_please_send_email();
-    return dcc_note_discrepancy(discrepancy_filename);
-}
-
 #ifdef HAVE_FSTATAT
 /* Re-write "cc" to directly call gcc or clang
  */
@@ -631,7 +277,7 @@ static int dcc_add_clang_target(char **argv)
 */
 /* A shallow wire view owns its compiler name in the array allocation. Resolve
  * an absolute Clang to the selected executable, not the worker's default LLVM
- * slot. Both pump and locally preprocessed jobs use this same conversion. */
+ * slot. The prepared job uses this same conversion. */
 static char **dcc_remote_argv(char **argv)
 {
     int argc = dcc_argv_len(argv);
@@ -803,22 +449,13 @@ dcc_build_somewhere(char *argv[],
                     int sg_level,
                     int *status)
 {
-    /* Read job settings once. Pump can be disabled below; update its local
-     * view at the same point as the environment inherited by subprocesses.
-     * Do not cache arbitrary getenv calls across native worker invocations. */
     const char *broker = getenv("DISTCC_BROKER");
-    const char *include_server = getenv("INCLUDE_SERVER_PORT");
     int rewrite_cross = !getenv("DISTCC_NO_REWRITE_CROSS");
     char *input_fname = NULL, *output_fname, *cpp_fname = NULL, *deps_fname = NULL;
     int cpp_fd = -1;
-    int input_snapshot = -1;
-    struct dcc_snapshot_metadata *metadata = NULL;
-    char **files = NULL;
     char **auxiliary = NULL;
     struct dcc_job *prepared_job = NULL;
-    char **server_side_argv = NULL;
     char **localcpp_server_argv = NULL;
-    char **remotecpp_server_argv = NULL;
     struct dcc_buffer server_stderr = {0}, server_stdout = {0};
     int preprocess_only, offload_targets = 0, remote_frontend = 0;
     int needs_dotd = 0;
@@ -826,20 +463,16 @@ dcc_build_somewhere(char *argv[],
     pid_t cpp_pid = 0;
     int cpu_lock_fd = -1, local_cpu_lock_fd = -1;
     int direct_lease = -1;
-    int ret;
+    int ret = 0;
     int remote_ret = 0;
     int remote_completed = 0, cpp_ready = 0;
     int retry_count = 0, max_retries, remote_unsupported = 0;
     struct dcc_hostdef *host = NULL;
     struct dcc_work_hint work = {0};
     struct dcc_source_features source_features = {0};
-    char *discrepancy_filename = NULL;
     char **new_argv;
 
     max_retries = dcc_get_max_retries();
-
-    if ((ret = dcc_discrepancy_filename(&discrepancy_filename)))
-        goto clean_up;
 
     if (sg_level) /* Recursive distcc - run locally, and skip all locking. */
         goto run_local;
@@ -928,21 +561,18 @@ dcc_build_somewhere(char *argv[],
     ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 1);
     dcc_free_argv(argv);
     argv = new_argv;
-    if (dcc_offload_language(argv)) {
-        unsetenv("INCLUDE_SERVER_PORT"); include_server = NULL;
-    }
     preprocess_only = dcc_argv_search(argv, "-E");
-    if (preprocess_only && (ret || !include_server))
+    if (preprocess_only)
         ret = EXIT_LOCAL_CPP;
     /* Local execution consumes the same broker capacity as a local worker,
      * but needs neither native expansion nor a duplicate header/input tree. */
-    if (!ret && !dcc_scan_includes && !dcc_offload_language(argv) &&
+    if (!ret && !dcc_offload_language(argv) &&
         broker && *broker) {
         dcc_work_describe(&work, argv, input_fname, NULL, -1, 0, &source_features);
         direct_lease = dcc_broker_try_local(&work);
         if (direct_lease >= 0) goto run_local;
     }
-    remote_frontend = !ret && !preprocess_only && !dcc_scan_includes &&
+    remote_frontend = !ret && !preprocess_only &&
         dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) && broker &&
         (dcc_cpp_ir(argv, input_fname) || dcc_cpp_gcc(argv, input_fname));
     /* Driver config files belong to the client. Only a captured Clang
@@ -1005,50 +635,10 @@ dcc_build_somewhere(char *argv[],
             ret = EXIT_IO_ERROR; goto unlock_and_clean_up;
         }
     }
-    if (!prepared_job && !preprocess_only && !dcc_scan_includes && dcc_cpp_ir(argv, input_fname)) {
-        unsetenv("INCLUDE_SERVER_PORT"); include_server = NULL;
-    }
-
-    /* A homogeneous broker pool has a known input format before selection.
-     * Finish include analysis before reserving a worker or opening its socket:
-     * analysis must not consume worker slots or their idle timeout. */
-    if (broker && *broker && include_server && !dcc_scan_includes && !prepared_job) {
-        struct dcc_hostdef *list = NULL, *entry;
-        int count, same_format = 1;
-        enum dcc_compress compr = DCC_COMPRESS_NONE;
-        if ((ret = dcc_get_hostlist(&list, &count))) goto fallback;
-        for (entry = list; entry;) {
-            struct dcc_hostdef *next = entry->next;
-            enum dcc_compress format = entry->compr == DCC_COMPRESS_NONE ?
-                DCC_COMPRESS_LZO1X : entry->compr;
-            if (entry->mode != DCC_MODE_TCP ||
-                (compr != DCC_COMPRESS_NONE && compr != format)) same_format = 0;
-            compr = format;
-            dcc_free_hostdef(entry);
-            entry = next;
-        }
-        if (count && same_format) {
-            ret = dcc_talk_to_include_server(argv, &files, compr, &input_snapshot, &metadata);
-            if (ret == EXIT_LOCAL_COMPILE) goto lock_local;
-        }
-        if (!ret && files && compr == DCC_COMPRESS_LZ4_STREAM) {
-            prepared_job = dcc_job_describe(argv, NULL, -1, files, metadata);
-            if (!prepared_job) { ret = EXIT_IO_ERROR; goto fallback; }
-        }
-        if (count && same_format && ret) {
-            rs_log_warning("failed to get includes from include server, "
-                           "preprocessing locally before worker selection");
-            if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0)) dcc_exit(ret);
-            files = NULL;
-            unsetenv("INCLUDE_SERVER_PORT"); include_server = NULL;
-            if (preprocess_only) { ret = EXIT_LOCAL_CPP; goto fallback; }
-        }
-    }
-
     /* With a broker, finish local preprocessing before reserving a worker.
      * Release the local lock before requesting the remote lease; never wait
      * for a remote slot while holding a local slot. Reuse this input on retry. */
-    if (broker && *broker && !include_server && !dcc_scan_includes && !prepared_job) {
+    if (broker && *broker && !prepared_job) {
         dcc_read_localslots_configuration();
         if (local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
             (ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
@@ -1069,9 +659,8 @@ dcc_build_somewhere(char *argv[],
         cpp_ready = 1;
     }
 
-    if (broker)
-        if (cpp_ready || !work.key)
-            dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready, &source_features);
+    if (broker && (cpp_ready || !work.key))
+        dcc_work_describe(&work, argv, input_fname, cpp_fname, cpp_fd, cpp_ready, &source_features);
     if (prepared_job && !dcc_job_frontend(prepared_job) && work.key)
         work.bytes = dcc_resource_input_bytes(prepared_job);
     else if (!cpp_ready && (!prepared_job || !dcc_job_frontend(prepared_job)))
@@ -1110,117 +699,26 @@ dcc_build_somewhere(char *argv[],
         if ((ret = dcc_get_dotd_info(argv, &deps_fname, &needs_dotd,
                                      &sets_dotd_target, &target)))
             goto fallback;
-        ret = dcc_compile_direct(host, prepared_job, prepared_job->argv, NULL, -1, NULL, auxiliary,
+        ret = dcc_compile_direct(host, prepared_job, prepared_job->argv, NULL, -1, auxiliary,
                                 output_fname, needs_dotd ? deps_fname : NULL,
                                 &server_stderr, &server_stdout, status);
         goto remote_result;
     }
 
-    if (!cpp_ready && host->cpp_where == DCC_CPP_ON_CLIENT && !dcc_is_preprocessed(input_fname)) {
-        /* Lock the local CPU, since we're going to be doing preprocessing
-         * or include scanning. */
-        if ((ret = dcc_lock_local_cpp(&local_cpu_lock_fd)) != 0) {
-            goto fallback;
-        }
-    }
-
-    if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        /* Perhaps it is not a good idea to preprocess on the server. */
-        dcc_perhaps_adjust_cpp_where_and_protover(input_fname, host,
-                                                  discrepancy_filename, include_server);
-    }
-    if (dcc_scan_includes) {
-        ret = dcc_approximate_includes(host, argv);
-        goto unlock_and_clean_up;
-    }
-    if (host->cpp_where == DCC_CPP_ON_SERVER) {
-        if (!files && (ret = dcc_talk_to_include_server(argv, &files, host->compr, &input_snapshot, &metadata))) {
-            if (ret == EXIT_LOCAL_COMPILE) {
-                release_host(host, &cpu_lock_fd, &local_cpu_lock_fd, 0);
-                goto lock_local;
-            }
-            /* Fallback to doing cpp locally */
-            /* It's unfortunate that the variable that controls that is in the
-             * "host" datastructure, even though in this case it's the client
-             * that fails to support it,  but "host" is what gets passed
-             * around in the client code. We are, in essence, throwing away
-             * the host's capability to do cpp, so if this code was to execute
-             * again (it won't, not in the same process) we wouldn't know if
-             * the server supports it or not.
-             */
-            rs_log_warning("failed to get includes from include server, "
-                           "preprocessing locally");
-            if (dcc_getenv_bool("DISTCC_TESTING_INCLUDE_SERVER", 0))
-                dcc_exit(ret);
-            host->cpp_where = DCC_CPP_ON_CLIENT;
-            dcc_get_protover_from_features(host->compr,
-                                           host->cpp_where,
-                                           &host->protover);
-        } else if (local_cpu_lock_fd != -1) {
-            /* Include server succeeded. */
-            /* We're done with local "preprocessing" (include scanning). */
-            dcc_unlock(local_cpu_lock_fd);
-            /* Don't try to unlock again in dcc_compile_remote. */
-            local_cpu_lock_fd = -1;
-        }
-
-    }
-
-    if (host->cpp_where == DCC_CPP_ON_CLIENT) {
-        if (preprocess_only) {
-            ret = EXIT_LOCAL_CPP;
-            goto fallback;
-        }
-        files = NULL;
-        dcc_job_free(prepared_job);
-        prepared_job = NULL;
-
-        /* Include analysis may have fallen back after host selection. */
-        if (!cpp_ready && local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
-            (ret = dcc_lock_local_cpp(&local_cpu_lock_fd)))
-            goto fallback;
-
-        if (!cpp_ready && (ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid, NULL)))
-            goto fallback;
-
-        /* localcpp_server_argv may already be processed from a previous bad host */
-        if (localcpp_server_argv == NULL) {
-            if ((ret = dcc_strip_local_args(argv, &localcpp_server_argv, input_fname)))
-                goto fallback;
-        }
-        server_side_argv = localcpp_server_argv;
-    } else {
-        cpp_fname = NULL;
-        cpp_pid = 0;
-        /* remotecpp_server_argv may already be processed from a previous bad host */
-        if (remotecpp_server_argv == NULL) {
-            char *dotd_target = NULL;
-            if ((ret = dcc_get_dotd_info(argv, &deps_fname, &needs_dotd,
-                                         &sets_dotd_target, &dotd_target)))
-                goto fallback;
-            if ((ret = dcc_copy_argv(argv, &remotecpp_server_argv, 2)))
-                goto fallback;
-            if (needs_dotd && !sets_dotd_target && (!preprocess_only || dotd_target)) {
-               dcc_argv_append(remotecpp_server_argv, strdup("-MT"));
-               if (dotd_target == NULL)
-                   dcc_argv_append(remotecpp_server_argv, strdup(output_fname));
-               else
-                   dcc_argv_append(remotecpp_server_argv, strdup(dotd_target));
-            }
-        }
-        server_side_argv = remotecpp_server_argv;
-    }
-    char **wire_argv = dcc_remote_argv(server_side_argv);
+    if (!cpp_ready && !dcc_is_preprocessed(input_fname) &&
+        (ret = dcc_lock_local_cpp(&local_cpu_lock_fd)))
+        goto fallback;
+    if (!cpp_ready && (ret = dcc_cpp_maybe(argv, input_fname, &cpp_fname, &cpp_pid, NULL)))
+        goto fallback;
+    if (!localcpp_server_argv &&
+        (ret = dcc_strip_local_args(argv, &localcpp_server_argv, input_fname)))
+        goto fallback;
+    char **wire_argv = dcc_remote_argv(localcpp_server_argv);
     if (!wire_argv) { ret = EXIT_OUT_OF_MEMORY; goto unlock_and_clean_up; }
-    if (host->tcp_jobs && files && !prepared_job) {
-        prepared_job = dcc_job_describe(wire_argv, NULL, -1, files, metadata);
-        if (!prepared_job) { ret = EXIT_IO_ERROR; goto fallback; }
-    }
     ret = dcc_compile_remote(wire_argv,
                                   input_fname,
                                   cpp_fname,
                                   cpp_fd,
-                                  files,
                                   auxiliary,
                                   prepared_job,
                                   output_fname,
@@ -1403,32 +901,13 @@ dcc_build_somewhere(char *argv[],
             direct_lease = -1;
         }
     }
-    if (remote_ret != 0) {
-        if (remote_ret != ret && host->cpp_where == DCC_CPP_ON_SERVER) {
-            /* Oops! it seems what we did remotely is not the same as what we did
-              locally. We normally send email in such situations (if emailing is
-              enabled), but we attempt an a time analysis of source files in order
-              to avoid doing so in case source files we changed during the build.
-            */
-            (void) dcc_please_send_email_after_investigation(
-                input_fname,
-                deps_fname,
-                discrepancy_filename);
-        } else if (host) {
-            /* A local-CPP diagnostic difference can result from lost macro
-             * provenance; it does not implicate the include graph or worker.
-             * Matching compiler failures likewise say nothing about health.
-             */
-            dcc_enjoyed_host(host);
-        }
-    }
+    if (remote_ret && host) dcc_enjoyed_host(host);
 
   unlock_and_clean_up:
     if (cpu_lock_fd != -1) {
         dcc_unlock(cpu_lock_fd);
         cpu_lock_fd = -1; /* Not really needed, just for consistency. */
     }
-    /* For the --scan_includes case. */
     if (local_cpu_lock_fd != -1) {
         dcc_unlock(local_cpu_lock_fd);
         local_cpu_lock_fd = -1; /* Not really needed, just for consistency. */
@@ -1436,18 +915,12 @@ dcc_build_somewhere(char *argv[],
 
   clean_up:
     dcc_job_free(prepared_job);
-    free(metadata);
-    if (input_snapshot >= 0) close(input_snapshot);
     if (auxiliary) dcc_free_argv(auxiliary);
     if (cpp_fd >= 0) { close(cpp_fd); free(cpp_fname); }
     dcc_free_argv(argv);
-    if (remotecpp_server_argv != NULL) {
-        dcc_free_argv(remotecpp_server_argv);
-    }
     if (localcpp_server_argv != NULL) {
         free(localcpp_server_argv);
     }
-    free(discrepancy_filename);
     dcc_free_buffer(&server_stdout);
     dcc_free_buffer(&server_stderr);
     return ret;

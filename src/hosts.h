@@ -21,6 +21,9 @@
  * USA.
  */
 
+#pragma once
+#include "distcc.h"
+
 /**
  * @file
  *
@@ -57,7 +60,6 @@ struct dcc_hostdef {
     enum dcc_compress compr;
 
     /** Where are we doing preprocessing? */
-    enum dcc_cpp_where cpp_where;
 
 #ifdef HAVE_GSSAPI
     /* Are we authenticating with this host? */
@@ -76,7 +78,6 @@ struct dcc_hostdef {
     int broker_fd;
     int broker_lease;
     int broker_cpp_reserved;
-    int cold_family;
     int broker_pooled;
     int tcp_jobs;
 };
@@ -93,11 +94,9 @@ int dcc_get_hostlist(struct dcc_hostdef **ret_list,
 int dcc_free_hostdef(struct dcc_hostdef *host);
 
 int dcc_get_features_from_protover(enum dcc_protover protover,
-                                   enum dcc_compress *compr,
-                                   enum dcc_cpp_where *cpp_where);
+                                   enum dcc_compress *compr);
 
 int dcc_get_protover_from_features(enum dcc_compress compr,
-                                   enum dcc_cpp_where cpp_where,
                                    enum dcc_protover *protover);
 
 /* hostfile.c */

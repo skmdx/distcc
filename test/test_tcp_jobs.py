@@ -39,7 +39,7 @@ from test_adaptive import free_port
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-from distcc_job import RustCommand, manifest as job_manifest
+from distcc_job import JOB_COMPILE, JOB_RUST, RustCommand, manifest as job_manifest
 
 
 def required_match(pattern, text):
@@ -73,11 +73,6 @@ class ClientHotpathsTest(unittest.TestCase):
 class FileCacheTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        extension = next(Path.cwd().glob('_include_server/lib*/include_server/distcc_pump_c_extensions*.so'))
-        spec = importlib.util.spec_from_file_location('distcc_pump_c_extensions', extension)
-        assert spec and spec.loader
-        cls.module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.module)
         pointer = ctypes.c_void_p
         size = ctypes.c_size_t
         class Api(ctypes.Structure):
@@ -87,11 +82,8 @@ class FileCacheTest(unittest.TestCase):
                         ('contents', ctypes.CFUNCTYPE(ctypes.c_int, pointer, size, pointer, size,
                                                      ctypes.POINTER(pointer), ctypes.POINTER(size))),
                         ('write', ctypes.CFUNCTYPE(None, pointer, pointer, size, pointer, size))]
-        capsule = ctypes.pythonapi.PyCapsule_GetPointer
-        capsule.argtypes = (ctypes.py_object, ctypes.c_char_p)
-        capsule.restype = pointer
-        cls.api = Api.from_address(capsule(cls.module.file_cache, b'distcc.file_cache'))
-        cls.library = ctypes.CDLL(cls.module.__file__)
+        cls.library = ctypes.CDLL(str(Path.cwd()/'h_codec.so'))
+        cls.api = Api.in_dll(cls.library, 'dcc_file_cache_records')
         cls.library.dcc_file_cache_put.argtypes = [pointer, pointer, ctypes.c_char_p, ctypes.c_int]
         cls.library.dcc_file_cache_put.restype = None
         cls.library.dcc_file_cache_get.argtypes = [pointer, pointer, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_int]
@@ -385,9 +377,6 @@ class GccFrontendTest(BrokerTestCase):
         output = self.work/'cgo'
         output.mkdir()
         env = dict(self.env, CC=f'{self.build}/distcc {self.cc}')
-        # cgo also runs -E probes; they do not use the native frontend. There
-        # is no include server in this fixture, so use its normal local -E path.
-        env.pop('INCLUDE_SERVER_PORT')
         result = subprocess.run([go, 'tool', 'cgo', '-objdir', str(output), str(source)],
                                 env=env,
                                 capture_output=True, text=True, timeout=30)
@@ -412,7 +401,7 @@ class GccFrontendTest(BrokerTestCase):
             self.compile_frontend(command)
             self.assertEqual((self.work/'out.o').read_bytes(), expected)
 
-    worker_address = '127.0.0.1'
+    worker_address = '127.0.0.2'
 
     def test_planner_preloads_default_scan_plugin_in_parent(self):
         self.start_frontend()
@@ -436,9 +425,7 @@ class GccFrontendTest(BrokerTestCase):
         self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), backoff=backoff)
         self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
                         DISTCC_GCC_PLAN_LIBRARY=str(self.build/'gcc_plan.so'),
-                        DISTCC_TESTING_INCLUDE_SERVER='1',
-                        DISTCC_GCC_SCAN_LIBRARY=self.module, DISTCC_SKIP_LOCAL_RETRY='1',
-                        INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
+                        DISTCC_GCC_SCAN_LIBRARY=self.module, DISTCC_SKIP_LOCAL_RETRY='1')
 
     def compile_frontend(self, command, source=None):
         log = Path(self.env['DISTCC_LOG']) if self.env.get('DISTCC_LOG') else None
@@ -1766,7 +1753,7 @@ class FrontendTest(BrokerTestCase):
         self.start_tcp()
         self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
                         DISTCC_CLANG_LOCAL='1', PATH=str(self.build)+os.pathsep+self.env['PATH'],
-                        DISTCC_SKIP_LOCAL_RETRY='1', INCLUDE_SERVER_PORT='/nonexistent/analyzer.sock')
+                        DISTCC_SKIP_LOCAL_RETRY='1')
         return clang
 
     def test_header_directory_survives_failed_file_open(self):
@@ -2652,32 +2639,29 @@ class FrontendTest(BrokerTestCase):
                    '-o', str(output), '-MMD', '-MF', str(deps)]
         subprocess.run(command, check=True, capture_output=True, cwd=generated)
         expected = output.read_bytes(), deps.read_bytes()
-        hook = self.build/'packaging/gentoo/pump.bashrc'
+        hook = self.build/'packaging/gentoo/jobs.bashrc'
         script = '''
 has() { local word=$1; shift; [[ " $* " == *" $word "* ]]; }
 register_die_hook() { :; }
 die() { echo "$*" >&2; exit 1; }
 source "$1"
 shift
-trap distcc_pump_stop EXIT
-distcc_pump_start
-distcc_pump_start
+distcc_configure_jobs
+distcc_configure_jobs
 [[ $DISTCC_FRONTEND_ROOTS == "$EXPECTED_ROOTS" ]] || exit 98
 "$@"
 '''
-        for pump in ('0', '1'):
-            with self.subTest(pump=pump):
-                output.unlink(missing_ok=True); deps.unlink(missing_ok=True)
-                env = dict(self.env, WORKDIR=str(package), T=str(generated), FEATURES='distcc',
-                           DISTCC_PUMP=pump, DISTCC_FRONTEND_ROOTS=str(extra),
-                           EXPECTED_ROOTS=str(extra) + ':' + str(package),
-                           PATH=str(self.build) + os.pathsep + self.env['PATH'])
-                result = subprocess.run(['bash', '-c', script, 'portage-frontend', str(hook),
-                                         str(self.build/'distcc'), *command],
-                                        env=env, cwd=generated, capture_output=True, text=True, timeout=30)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('frontend filesystem:', result.stderr)
-                self.assertEqual((output.read_bytes(), deps.read_bytes()), expected)
+        output.unlink(missing_ok=True); deps.unlink(missing_ok=True)
+        env = dict(self.env, WORKDIR=str(package), T=str(generated), FEATURES='distcc',
+                   DISTCC_FRONTEND_ROOTS=str(extra),
+                   EXPECTED_ROOTS=str(extra) + ':' + str(package),
+                   PATH=str(self.build) + os.pathsep + self.env['PATH'])
+        result = subprocess.run(['bash', '-c', script, 'portage-frontend', str(hook),
+                                 str(self.build/'distcc'), *command],
+                                env=env, cwd=generated, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('frontend filesystem:', result.stderr)
+        self.assertEqual((output.read_bytes(), deps.read_bytes()), expected)
         source.write_text('#include "../../../private/secret.h"\n')
         output.unlink()
         result = subprocess.run(['bash', '-c', script, 'portage-frontend', str(hook),
@@ -2773,7 +2757,7 @@ distcc_pump_start
         config = Path(clang).resolve().parent/'llvm-config'
         if not config.exists(): self.skipTest('LLVM development files unavailable')
         source = self.work/'buffer.cc'
-        header = self.build/'include_server/c_extensions/remote_files.h'
+        header = self.build/'src/clang/remote_files.h'
         source.write_text(f'#include "{header}"\n' + r'''
 int main(int argc, char **argv) {
     auto loaded = llvm::MemoryBuffer::getFile(argv[1]);
@@ -3144,11 +3128,10 @@ class TcpJobsTest(TcpJobTestCase):
                 self.assertEqual(status, 0)
                 self.assertEqual(len(fds), 1)
                 with socket.socket(fileno=fds[0]) as net:
-                    self.assertTrue(capabilities & (1 << 28), 'unstarted family must remain cold')
-                    self.wire_job(body, cached=2, identity=identity, net=net)
+                    self.wire_job(body, cached=False, identity=identity, net=net)
                     self.upload(net, body)
-                    self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', identity)))
-                    lease.sendmsg([struct.pack('=II', self.protocol_version, 14)],
+                    self.assertEqual(self.frame(net), (0x54000407, struct.pack('!Q', identity)))
+                    lease.sendmsg([struct.pack('=HBBI', self.protocol_version, 14, 0, 0)],
                                   [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [net.fileno()]))])
                     self.assertEqual(lease.recv(1), b'')
         stats = self.get_stats(self.stats_ports[0])
@@ -3167,14 +3150,14 @@ class TcpJobsTest(TcpJobTestCase):
         paths = tuple(f'/src/input-{i}.c'.encode() for i in range(9))
         net = None
         for identity in (71, 72, 73):
-            net = self.wire_job(body, paths=paths, identity=identity, net=net, verification=None)
+            net = self.wire_job(body, paths=paths, identity=identity, net=net)
             uploads = 0
             while True:
                 kind, data = self.frame(net)
-                if kind == 0x54000307:
+                if kind == 0x54000407:
                     self.assertEqual(data, struct.pack('!Q', identity))
                     break
-                self.assertEqual(kind, 0x54000301)
+                self.assertEqual(kind, 0x54000401)
                 for index in bitmap_indices(data):
                     self.upload(net, body, index)
                     uploads += 1
@@ -3185,18 +3168,18 @@ class TcpJobsTest(TcpJobTestCase):
         self.restart_server(self.build/'distccd', DISTCC_JOB_MEMORY='1048576')
         self.addCleanup(self.restart_server, self.build/'distccd')
         body = b'/*' + b' '*(8*1024*1024) + b'*/ fn cached_input() {}\n'
-        net = self.wire_job(body, identity=91, verification=None, job_kind=3)
+        net = self.wire_job(body, identity=91, job_kind=JOB_RUST)
         kind, data = self.frame(net)
-        self.assertEqual(kind, 0x54000301)
+        self.assertEqual(kind, 0x54000401)
         for index in bitmap_indices(data): self.upload(net, body, index)
-        self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 91)))
+        self.assertEqual(self.frame(net), (0x54000407, struct.pack('!Q', 91)))
         deadline = time.monotonic() + 5
         while list(self.root.glob('distcc-tcp-*')):
             self.assertLess(time.monotonic(), deadline, 'input tree was not reclaimed')
             time.sleep(.01)
-        self.wire_job(body, identity=92, net=net, verification=None, job_kind=3)
+        self.wire_job(body, identity=92, net=net, job_kind=JOB_RUST)
         # The warm job must reach admission without requesting any input bytes.
-        self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 92)))
+        self.assertEqual(self.frame(net), (0x54000407, struct.pack('!Q', 92)))
 
     def test_rust_retry_progresses_while_cache_maintenance_is_locked(self):
         cache = self.work/'cache'
@@ -3205,13 +3188,13 @@ class TcpJobsTest(TcpJobTestCase):
         self.addCleanup(self.restart_server, self.build/'distccd')
         body = b'fn cached_input() {}\n'
         paths = tuple(f'/src/input-{i}.rs'.encode() for i in range(9))
-        net = self.wire_job(body, paths=paths, identity=81, verification=None, job_kind=3)
+        net = self.wire_job(body, paths=paths, identity=81, job_kind=JOB_RUST)
         while True:
             kind, data = self.frame(net)
-            if kind == 0x54000307:
+            if kind == 0x54000407:
                 self.assertEqual(data, struct.pack('!Q', 81))
                 break
-            self.assertEqual(kind, 0x54000301)
+            self.assertEqual(kind, 0x54000401)
             for index in bitmap_indices(data): self.upload(net, body, index)
         digest = xxhash.xxh3_64(body).digest()
         entry = next(cache.glob('*/'+digest.hex()))
@@ -3221,23 +3204,23 @@ class TcpJobsTest(TcpJobTestCase):
             # the third cached transaction then had no worker to serve it.
             for identity in (82, 83, 84):
                 self.wire_job(body, paths=paths, identity=identity, net=net,
-                              verification=None, job_kind=3)
-                self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', identity)))
+                              job_kind=JOB_RUST)
+                self.assertEqual(self.frame(net), (0x54000407, struct.pack('!Q', identity)))
             # A cold shared input must also finish without cache publication.
             entry.unlink()
             self.wire_job(body, paths=paths, identity=85, net=net,
-                          verification=None, job_kind=3)
+                          job_kind=JOB_RUST)
             kind, data = self.frame(net)
-            self.assertEqual(kind, 0x54000301)
+            self.assertEqual(kind, 0x54000401)
             for index in bitmap_indices(data): self.upload(net, body, index)
-            self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 85)))
+            self.assertEqual(self.frame(net), (0x54000407, struct.pack('!Q', 85)))
             self.assertFalse(entry.exists())
         self.wire_job(body, paths=paths, identity=86, net=net,
-                      verification=None, job_kind=3)
+                      job_kind=JOB_RUST)
         kind, data = self.frame(net)
-        self.assertEqual(kind, 0x54000301)
+        self.assertEqual(kind, 0x54000401)
         for index in bitmap_indices(data): self.upload(net, body, index)
-        self.assertEqual(self.frame(net), (0x54000307, struct.pack('!Q', 86)))
+        self.assertEqual(self.frame(net), (0x54000407, struct.pack('!Q', 86)))
         self.assertEqual(entry.read_bytes(), body)
 
     @unittest.skipUnless(shutil.which('strace'), 'strace is required')
@@ -3387,7 +3370,7 @@ int unlinkat(int fd, const char *path, int flags) {
                 body = f'int asynchronous_{kind};\n'.encode()
                 if kind == 'cache':
                     first = self.wire_job(body)
-                    self.assertEqual(self.frame(first), (0x54000301, b'\x01'))
+                    self.assertEqual(self.frame(first), (0x54000401, b'\x01'))
                     self.upload(first, body)
                     self.result(first)
                     first.close()
@@ -3404,7 +3387,7 @@ int unlinkat(int fd, const char *path, int flags) {
                 if kind == 'copy':
                     before = int(required_match(r'dcc_tcp_parallel_tasks (\d+)', self.get_stats(self.stats_ports[0]))[1])
                     owner = self.wire_job(body)
-                    self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
+                    self.assertEqual(self.frame(owner), (0x54000401, b'\x01'))
                 net = self.wire_job(body, cached=kind != 'cleanup')
                 if owner:
                     deadline = time.monotonic() + 5
@@ -3416,7 +3399,7 @@ int unlinkat(int fd, const char *path, int flags) {
                         time.sleep(.01)
                     self.upload(owner, body)
                 if kind == 'store':
-                    self.assertEqual(self.frame(net), (0x54000301, b'\x01'))
+                    self.assertEqual(self.frame(net), (0x54000401, b'\x01'))
                 if kind in ('store', 'cleanup'): self.upload(net, body)
                 try:
                     deadline = time.monotonic() + 5
@@ -3479,7 +3462,7 @@ int unlinkat(int fd, const char *path, int flags) {
             self.assertIn('SCM_RIGHTS', calls)
             self.assertIn('sendfile(', calls)  # Result publication, not an input snapshot.
             self.assertNotRegex(calls, r'sendfile\([^\n]*distcc-preprocessed')
-            returned = re.search(r'sendmsg\([^\n]*iov_len=128[^\n]*SCM_RIGHTS', calls)
+            returned = re.search(r'sendmsg\([^\n]*iov_len=8[^\n]*iov_len=32[^\n]*iov_len=88[^\n]*SCM_RIGHTS', calls)
             assert returned is not None, 'pooled connection was not returned'
             self.assertLess(returned.start(), calls.index('sendfile('), 'copy held the pooled connection')
             self.assertEqual(actual.read_bytes(), expected.read_bytes())
@@ -3493,7 +3476,7 @@ int unlinkat(int fd, const char *path, int flags) {
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as net, (self.work/'bad.i').open('w+b') as f:
             f.write(body); f.flush()
             net.settimeout(3); net.connect(f'{prefix}-{self.ports[0]}.sock')
-            net.sendmsg([struct.pack('!II', 0x54000300, len(manifest)) + manifest],
+            net.sendmsg([struct.pack('!II', 0x54000400, len(manifest)) + manifest],
                         [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [f.fileno()]))])
             self.assertEqual(net.recv(1), b'')
         self.job('after-invalid-local-fd')
@@ -3582,7 +3565,7 @@ time_t time(time_t *out) {
         # reports a failed RPC; only that pooled connection is known bad.
         with socket.socket(fileno=descriptors[0]) as net:
             net.shutdown(socket.SHUT_RDWR)
-        lease.sendall(struct.pack('=II', self.protocol_version, 11))
+        lease.sendall(struct.pack('=HBBI', self.protocol_version, 11, 0, 0))
         self.assertEqual(lease.recv(1), b'')
         lease.close()
         self.job('fresh-connection-after-failure')
@@ -3594,7 +3577,7 @@ time_t time(time_t *out) {
         self.assertEqual(status, 0)
         for fd in descriptors:
             os.close(fd)
-        lease.sendall(struct.pack('=II', self.protocol_version, 11))
+        lease.sendall(struct.pack('=HBBI', self.protocol_version, 11, 0, 0))
         self.assertEqual(lease.recv(1), b'')
         lease.close()
         retry = self.request(6)
@@ -3612,7 +3595,7 @@ time_t time(time_t *out) {
             reservations.append(net)
         body = b'int phase_accounting;\n'
         net = self.wire_job(body)
-        self.assertEqual(self.frame(net), (0x54000301, b'\x01'))
+        self.assertEqual(self.frame(net), (0x54000401, b'\x01'))
         stats = self.get_stats(self.stats_ports[0])
         self.assertIn('dcc_preparing 1\n', stats)
         self.assertIn('dcc_queued 0\n', stats)
@@ -3670,8 +3653,8 @@ ssize_t write(int fd, const void *data, size_t size) {
         streams = [self.wire_job(body, cached=False) for _ in range(6)]
         cancelled = self.wire_job(body, cached=False)
         first = codec.encode(body[:262144])
-        self.send(cancelled, 0x54010302, struct.pack('!II', 0, 262144) + first[8:])
-        self.send(cancelled, 0x54010302, struct.pack('!II', 0, 262144) + first[8:])
+        self.send(cancelled, 0x54010402, struct.pack('!II', 0, 262144) + first[8:])
+        self.send(cancelled, 0x54010402, struct.pack('!II', 0, 262144) + first[8:])
         deadline = time.monotonic() + 3
         while not int(required_match(r'dcc_tcp_input_prefetch_bytes (\d+)',
                                self.get_stats(self.stats_ports[0]))[1]):
@@ -3683,7 +3666,7 @@ ssize_t write(int fd, const void *data, size_t size) {
             packed = codec.encode(chunk)
             plain, size = struct.unpack('!II', packed[:8])
             self.assertGreater(size, 0)
-            kind = 0x54010302 | (0x20000 if offset + plain == len(body) else 0)
+            kind = 0x54010402 | (0x20000 if offset + plain == len(body) else 0)
             for net in streams:
                 self.send(net, kind, struct.pack('!II', 0, plain) + packed[8:])
         for net in streams:
@@ -3699,7 +3682,7 @@ ssize_t write(int fd, const void *data, size_t size) {
             for _ in range(8):
                 net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=2)
                 sockets.append(net)
-                net.sendall(struct.pack('!II', 0x54000300, 100) + b'partial')
+                net.sendall(struct.pack('!II', 0x54000400, 100) + b'partial')
             self.job('while-receiving')
         finally:
             for net in sockets:
@@ -3707,23 +3690,19 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.job('after-cancel')
 
     def wire_job(self, body, cached: int=True, paths=(b'/src/source.c',), identity=1, receive_buffer=None,
-                 verification: bytes | None = b'DCSI\0\0\0\0', net=None, job_kind=1):
+                 net=None, job_kind=JOB_COMPILE):
         args = [b'gcc', b'-c', paths[0], b'-o', b'/src/result.o']
         inputs: list[tuple[bytes, int, bytes, int]] = [
             (p, len(body), xxhash.xxh3_64(body).digest(), cached) for p in paths]
-        if verification is not None:
-            inputs.append((b'/.distcc-system/check', len(verification), xxhash.xxh3_64(verification).digest(), 0))
-        rust = RustCommand(phase=1, compiler='admission fixture') if job_kind == 3 else None
-        manifest = struct.pack('!Q', identity) + job_manifest(job_kind, '/src', args, inputs, rust=rust)
+        rust = RustCommand(phase=1, compiler='admission fixture') if job_kind == JOB_RUST else None
+        manifest = struct.pack('!Q', identity) + job_manifest(job_kind, '/src', args, inputs, rust=rust, input_kind=3 if job_kind == JOB_COMPILE else 0)
         if net is None:
             net = socket.create_connection(('127.0.0.1', self.ports[0]), timeout=5)
         net.settimeout(5)
         if receive_buffer:
             net.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
         self.addCleanup(net.close)
-        self.send(net, 0x54000300, manifest)
-        if verification is not None:
-            self.upload(net, verification, len(paths))
+        self.send(net, 0x54000400, manifest)
         return net
 
     @staticmethod
@@ -3746,15 +3725,15 @@ ssize_t write(int fd, const void *data, size_t size) {
         for offset in range(0, max(1, len(body)), 256*1024):
             chunk = body[offset:offset+256*1024]
             final = 0x20000 if offset + len(chunk) == len(body) else 0
-            self.send(net, 0x54000302 | final, struct.pack('!II', index, len(chunk)) + chunk)
+            self.send(net, 0x54000402 | final, struct.pack('!II', index, len(chunk)) + chunk)
 
     def result(self, net, identity=1, expected_status=0):
         codec = runpy.run_path(str(self.build / 'distcc-link'))['Lz4Chunks']()
         kind, description = self.frame(net)
-        while kind == 0x54000308:
+        while kind == 0x54000408:
             self.assertEqual(description, struct.pack('!Q', identity))
             kind, description = self.frame(net)
-        self.assertEqual(kind, 0x54000303)
+        self.assertEqual(kind, 0x54000403)
         self.assertEqual(len(description), 72)
         status, mode, *sizes = struct.unpack('!II4Q', description[:40])
         prepare, queued, execute, cpu = struct.unpack('!4Q', description[40:])
@@ -3765,11 +3744,11 @@ ssize_t write(int fd, const void *data, size_t size) {
         outputs = [bytearray() for _ in sizes]
         while True:
             kind, body = self.frame(net)
-            if kind == 0x54000305:
+            if kind == 0x54000405:
                 self.assertEqual(len(body), 96)
                 self.assertEqual(body[:8], struct.pack('!Q', identity))
                 break
-            self.assertEqual(kind & ~0x30000, 0x54000304)
+            self.assertEqual(kind & ~0x30000, 0x54000404)
             index, plain = struct.unpack('!II', body[:8])
             data = codec.decode(body[8:], plain) if kind & 0x10000 else body[8:]
             outputs[index].extend(data)
@@ -3779,31 +3758,18 @@ ssize_t write(int fd, const void *data, size_t size) {
             self.assertTrue(outputs[2].startswith(b'\x7fELF'))
         return outputs
 
-    def test_missing_or_invalid_system_include_manifest_is_rejected(self):
-        body = b'int unchecked_headers;\n'
-        for verification in (None, b'bad format', b'DCSI\0\0\0\1',
-                             b'DCSI' + struct.pack('!I', 4097),
-                             b'DCSI' + struct.pack('!III', 1, 0, 1) + b'x',
-                             b'DCSI' + struct.pack('!I', 0) + b'extra'):
-            with self.subTest(verification=verification):
-                net = self.wire_job(body, cached=False, verification=verification)
-                self.upload(net, body)
-                # Intact jobs with invalid metadata return a completed protocol
-                # error. EOF would incorrectly quarantine a healthy worker.
-                outputs = self.result(net, expected_status=109 << 8)
-                self.assertEqual(outputs[2], b'')
 
     def test_single_upload_and_owner_disconnect(self):
         body = b'int cache_owner_recovery(void) { return 901; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
+        self.assertEqual(self.frame(owner), (0x54000401, b'\x01'))
         waiter = self.wire_job(body)
         waiter.settimeout(.15)
         with self.assertRaises(socket.timeout):
             waiter.recv(8)
         owner.close()
         waiter.settimeout(5)
-        self.assertEqual(self.frame(waiter), (0x54000301, b'\x01'))
+        self.assertEqual(self.frame(waiter), (0x54000401, b'\x01'))
         self.upload(waiter, body)
         self.result(waiter)
         hit = self.wire_job(body)
@@ -3815,11 +3781,11 @@ ssize_t write(int fd, const void *data, size_t size) {
         self.addCleanup(self.restart_server, self.build / 'distccd')
         body = b'int recovered_from_stalled_peer(void) { return 904; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
+        self.assertEqual(self.frame(owner), (0x54000401, b'\x01'))
         waiter = self.wire_job(body, identity=2)
         # The owner stays connected but sends no input, as with a lost network
         # path. A healthy waiter must receive progress before that owner expires.
-        self.assertEqual(self.frame(waiter), (0x54000308, struct.pack('!Q', 2)))
+        self.assertEqual(self.frame(waiter), (0x54000408, struct.pack('!Q', 2)))
         # Simulate a delayed event-loop turn. The owner now expires, but the
         # queued takeover notification must reach the healthy waiting peer.
         parent = self.daemons[0].pid
@@ -3830,10 +3796,10 @@ ssize_t write(int fd, const void *data, size_t size) {
             os.kill(parent, signal.SIGCONT)
         while True:
             kind, data = self.frame(waiter)
-            if kind == 0x54000301:
+            if kind == 0x54000401:
                 self.assertEqual(data, b'\x01')
                 break
-            self.assertEqual((kind, data), (0x54000308, struct.pack('!Q', 2)))
+            self.assertEqual((kind, data), (0x54000408, struct.pack('!Q', 2)))
         self.assertEqual(owner.recv(1), b'')
         self.upload(waiter, body)
         self.result(waiter, identity=2)
@@ -3850,7 +3816,7 @@ ssize_t write(int fd, const void *data, size_t size) {
                             TEST_FILE_ARM=str(arm), TEST_FILE_ENTERED=str(marker),
                             TEST_FILE_RELEASE=str(release))
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
+        self.assertEqual(self.frame(owner), (0x54000401, b'\x01'))
         owner_root, = self.root.glob('distcc-tcp-*/src')
         arm.touch()
         waiter = self.wire_job(body, paths=[b'/waiter/source.c', b'/alias/source.c'])
@@ -3866,7 +3832,7 @@ ssize_t write(int fd, const void *data, size_t size) {
         finally:
             release.touch()
         kind, requested = self.frame(waiter)
-        self.assertEqual(kind, 0x54000301)
+        self.assertEqual(kind, 0x54000401)
         index, = bitmap_indices(requested)
         self.upload(waiter, body, index)
         self.result(waiter)  # A duplicate NEED is a protocol error here.
@@ -3874,7 +3840,7 @@ ssize_t write(int fd, const void *data, size_t size) {
     def test_parallel_cache_waiters_share_upload(self):
         body = b'int single_upload_for_all(void) { return 902; }\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
+        self.assertEqual(self.frame(owner), (0x54000401, b'\x01'))
         waiters = [self.wire_job(body) for _ in range(7)]
         self.upload(owner, body)
         self.result(owner)
@@ -3883,27 +3849,27 @@ ssize_t write(int fd, const void *data, size_t size) {
 
     def test_path_ancestor_rejected_even_with_intervening_name(self):
         # Checking only adjacent sorted names misses /a as parent of /a/b.
-        net = self.wire_job(b'int invalid;', paths=(b'/a', b'/a.b', b'/a/b'), verification=None)
+        net = self.wire_job(b'int invalid;', paths=(b'/a', b'/a.b', b'/a/b'))
         self.assertEqual(net.recv(8), b'')
 
     def test_bad_digest_discards_connection_and_releases_waiter(self):
         body = b'int verified_upload;\n'
         owner = self.wire_job(body)
-        self.assertEqual(self.frame(owner), (0x54000301, b'\x01'))
+        self.assertEqual(self.frame(owner), (0x54000401, b'\x01'))
         waiter = self.wire_job(body)
         self.upload(owner, b'x' * len(body))
         self.assertEqual(owner.recv(8), b'')
-        self.assertEqual(self.frame(waiter), (0x54000301, b'\x01'))
+        self.assertEqual(self.frame(waiter), (0x54000401, b'\x01'))
         self.upload(waiter, body)
         self.result(waiter)
 
     def test_invalid_chunks_close_connection_without_dispatch(self):
         body = b'int bounded_input;\n'
         cases = [
-            (0x54020302, struct.pack('!II', 0, 262145)),
-            (0x54020302, struct.pack('!II', 1, len(body)) + body),
-            (0x54030302, struct.pack('!II', 0, len(body)) + b'\xff'),
-            (0x54020302, struct.pack('!II', 0, len(body)) + body[:-1]),
+            (0x54020402, struct.pack('!II', 0, 262145)),
+            (0x54020402, struct.pack('!II', 1, len(body)) + body),
+            (0x54030402, struct.pack('!II', 0, len(body)) + b'\xff'),
+            (0x54020402, struct.pack('!II', 0, len(body)) + body[:-1]),
         ]
         for kind, data in cases:
             with self.subTest(kind=kind, payload=len(data)):
@@ -3985,7 +3951,7 @@ Path(args[args.index('-o') + 1]).write_bytes(random.Random(543).randbytes(4 * 10
                 stalled.append(net)
                 self.upload(net, body)
                 kind, description = self.frame(net)
-                self.assertEqual(kind, 0x54000303)
+                self.assertEqual(kind, 0x54000403)
                 self.assertEqual(struct.unpack('!II4Q', description[:40])[4], 4 * 1024 * 1024)
             wrapper.write_text(original)
             stats = self.get_stats(self.stats_ports[0])
@@ -4124,18 +4090,18 @@ with open(args[args.index('-o') + 1], 'ab') as output:
                 with listener.accept()[0] as net:
                     net.settimeout(5)
                     kind, manifest = self.frame(net)
-                    self.assertEqual(kind, 0x54000300)
+                    self.assertEqual(kind, 0x54000400)
                     while True:
                         kind, body = self.frame(net)
-                        self.assertEqual(kind & ~0x30000, 0x54000302)
+                        self.assertEqual(kind & ~0x30000, 0x54000402)
                         if kind & 0x20000:
                             break
-                    response = struct.pack('!IIII8Q', 0x54000303, 72, 0, 0,
+                    response = struct.pack('!IIII8Q', 0x54000403, 72, 0, 0,
                                            0, 0, len(payload), 0, 0, 0, 0, 0)
                     for i in range(12):
-                        kind = 0x54020304 if i == 11 else 0x54000304
+                        kind = 0x54020404 if i == 11 else 0x54000404
                         response += struct.pack('!IIII', kind, 39, 2, 31) + payload[i*31:(i+1)*31]
-                    response += struct.pack('!II', 0x54000305, 96) + manifest[:8] + bytes(88)
+                    response += struct.pack('!II', 0x54000405, 96) + manifest[:8] + bytes(88)
                     if trailing:
                         response += b'unsolicited bytes'
                     net.sendall(response)
@@ -4176,18 +4142,18 @@ with open(args[args.index('-o') + 1], 'ab') as output:
                 with listener.accept()[0] as net:
                     net.settimeout(5)
                     kind, manifest = self.frame(net)
-                    self.assertEqual(kind, 0x54000300)
+                    self.assertEqual(kind, 0x54000400)
                     while True:
                         kind, body = self.frame(net)
-                        self.assertEqual(kind & ~0x30000, 0x54000302)
+                        self.assertEqual(kind & ~0x30000, 0x54000402)
                         if kind & 0x20000:
                             break
                     # Deliberately fragment the response header.
-                    response = struct.pack('!IIII8Q', 0x54000303, 72, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0)
+                    response = struct.pack('!IIII8Q', 0x54000403, 72, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0)
                     net.sendall(response[:3])
                     time.sleep(.01)
                     net.sendall(response[3:])
-                    self.send(net, 0x54020304, struct.pack('!II', 2, 4) + b'FAKE')
+                    self.send(net, 0x54020404, struct.pack('!II', 2, 4) + b'FAKE')
                     reached.set()  # Close after a complete artifact, before COMPLETE.
             except BaseException as error:
                 errors.append(error)

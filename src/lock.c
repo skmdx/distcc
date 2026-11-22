@@ -101,14 +101,13 @@ struct dcc_hostdef _dcc_local = {
     (char *)"localhost",        /* verbatim string */
     DCC_VER_1,                  /* protocol (ignored) */
     DCC_COMPRESS_NONE,          /* compression (ignored) */
-    DCC_CPP_ON_CLIENT,          /* where to cpp (ignored) */
 #ifdef HAVE_GSSAPI
     0,                          /* Authentication? */
     NULL,                       /* Authentication name */
 #endif
     NULL,
     0, 0, 0,                    /* adaptive statistics, speed, explicit limit */
-    0, -1, -1, 0, 0             /* broker descriptors, pooled session, TCP jobs */
+    0, -1, -1, 0, 0, 0          /* broker descriptors, pooled session, TCP jobs */
 };
 
 struct dcc_hostdef *dcc_hostdef_local = &_dcc_local;
@@ -124,14 +123,13 @@ struct dcc_hostdef _dcc_local_cpp = {
     (char *)"localhost",        /* verbatim string */
     DCC_VER_1,                  /* protocol (ignored) */
     DCC_COMPRESS_NONE,          /* compression (ignored) */
-    DCC_CPP_ON_CLIENT,          /* where to cpp (ignored) */
 #ifdef HAVE_GSSAPI
     0,                          /* Authentication? */
     NULL,                       /* Authentication name */
 #endif
     NULL,
     0, 0, 0,                    /* adaptive statistics, speed, explicit limit */
-    0, -1, -1, 0, 0             /* broker descriptors, pooled session, TCP jobs */
+    0, -1, -1, 0, 0, 0          /* broker descriptors, pooled session, TCP jobs */
 };
 
 struct dcc_hostdef *dcc_hostdef_local_cpp = &_dcc_local_cpp;

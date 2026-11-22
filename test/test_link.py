@@ -29,9 +29,6 @@ class LinkArchiveTest(unittest.TestCase):
         root = str(Path.cwd())
         sys.path.insert(0, root)
         cls.addClassCleanup(sys.path.remove, root)
-        extension = str(next(Path.cwd().glob('_include_server/lib.*')))
-        sys.path.insert(0, extension)
-        cls.addClassCleanup(sys.path.remove, extension)
         cls.helper = runpy.run_path(str(Path.cwd() / 'distcc-link'))
 
     def test_prepared_link_keeps_capability_policy_without_driver_query(self):
@@ -77,7 +74,7 @@ class LinkArchiveTest(unittest.TestCase):
                 query.assert_called_once_with('clang', target)
 
     def test_tcp_progress_and_local_artifact_descriptor(self):
-        from include_server.distcc_pump_c_extensions import TCP_BEGIN, TCP_PROGRESS, TCP_RESULT_FD, TCP_COMPLETE_SIZE
+        from distcc_job import TCP_BEGIN, TCP_PROGRESS, TCP_RESULT_FD, TCP_COMPLETE_SIZE
         archive = self.helper['LinkArchive']({}, {})
         payload = b'linked artifact\n' * 4096
         load = bytes(range(TCP_COMPLETE_SIZE - 8))

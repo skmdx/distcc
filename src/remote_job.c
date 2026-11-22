@@ -19,92 +19,32 @@
 #include "job.h"
 #include "tcp_job.h"
 #include "file_cache.h"
-#include "include_server_if.h"
 #include "exitcode.h"
 #include "trace.h"
 #include "workload.h"
 #include "resource.h"
 
-struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd, char **files,
-                                 const struct dcc_snapshot_metadata *metadata)
+struct dcc_job *dcc_job_describe(char **argv, const char *cpp, int cpp_fd)
 {
-    struct dcc_job *job = calloc(1, sizeof(*job));
-    int64_t savings = -12;
     char *source, *output;
-    unsigned i;
+    struct dcc_job *job = calloc(1, sizeof(*job));
     if (!job) return NULL;
-    job->kind = files ? DCC_JOB_PUMP : DCC_JOB_COMPILE;
+    job->kind = DCC_JOB_COMPILE;
     job->cwd = getcwd(NULL, 0);
     if (!job->cwd || dcc_scan_args(argv, &source, &output, &job->argv, 0)) goto failed;
-    job->count = files ? dcc_argv_len(files) : 1;
-    if (job->count > DCC_JOB_INPUT_MAX ||
-        !(job->inputs = calloc(job->count ? job->count : 1, sizeof(*job->inputs)))) {
-        job->count = 0;
-        goto failed;
-    }
-    for (i = 0; i < job->count; ++i) job->inputs[i].fd = -1;
-    if (files && !metadata) goto failed;
-    savings -= job->count;
-    for (i = 0; i < job->count; ++i) {
-        struct dcc_job_input *in = &job->inputs[i];
-        struct stat st;
-        const char *name = files ? files[i] : cpp;
-        if (files) {
-            if (dcc_get_original_fname(name, &in->path)) goto failed;
-        } else {
-            const char *extension = cpp_fd >= 0 ?
-                dcc_preproc_exten(dcc_find_extension(source)) : strrchr(cpp, '.');
-            /* Preprocessed files can omit line markers; explicit-language
-             * input may still contain macros. Both need the source basename
-             * for compiler file symbols and diagnostics. */
-            if (dcc_is_preprocessed(source) || dcc_argv_search(argv, "-x")) {
-                if (asprintf(&in->path, "/%s", dcc_find_basename(source)) < 0) goto failed;
-            } else if (asprintf(&in->path, "/input%s", extension ? extension : ".i") < 0) goto failed;
-        }
-        if (files && str_endswith("/forcing_technique_271828", in->path)) {
-            in->kind = DCC_JOB_EMPTY;
-            continue;
-        }
-        if (files && dcc_tcp_get64(metadata[i].wire) != UINT64_MAX) {
-            in->encoding = DCC_JOB_LZ4;
-            in->wire_size = dcc_tcp_get64(metadata[i].wire);
-            in->plain_size = dcc_tcp_get64(metadata[i].plain);
-            if (in->plain_size <= DCC_FILE_CACHE_MAX) {
-                memcpy(in->digest, metadata[i].digest, sizeof(in->digest));
-                in->cached = 1;
-                savings += (int64_t)(in->wire_size > INT_MAX ? INT_MAX : in->wire_size) - DCC_FILE_HASH_SIZE;
-            }
-            continue;
-        }
-        if (files) {
-            char target[4097];
-            ssize_t n = readlink(name, target, sizeof(target) - 1);
-            if (n < 0 || n == sizeof(target) - 1) goto failed;
-            target[n] = 0;
-            in->target = strdup(target);
-            if (!in->target) goto failed;
-            in->kind = DCC_JOB_SYMLINK;
-            continue;
-        }
-        if ((cpp_fd >= 0 ? fstat(cpp_fd, &st) : stat(name, &st)) || !S_ISREG(st.st_mode)) goto failed;
-        in->wire_size = in->plain_size = st.st_size;
-        {
-            in->fd = cpp_fd >= 0 ? fcntl(cpp_fd, F_DUPFD_CLOEXEC, 0) :
-                open(name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-            if (in->fd < 0) goto failed;
-            in->encoding = DCC_JOB_RAW;
-        }
-    }
-    if (savings < 16384) for (i = 0; i < job->count; ++i) job->inputs[i].cached = 0;
-    if (files && savings >= 16384) {
-        char canonical[PATH_MAX];
-        if (realpath(source, canonical)) for (i = 0; i < job->count; ++i) {
-            const struct dcc_job_input *in = &job->inputs[i];
-            if (in->cached && in->plain_size <= DCC_SOURCE_PUSH_MAX && !strcmp(in->path, canonical)) {
-                job->main_input = i + 1;
-                break;
-            }
-        }
+    struct dcc_job_input *in = job->inputs = calloc(1, sizeof(*in));
+    if (!in) goto failed;
+    job->count = 1;
+    in->fd = cpp_fd >= 0 ? fcntl(cpp_fd, F_DUPFD_CLOEXEC, 0) :
+                           open(cpp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat st;
+    if (in->fd < 0 || fstat(in->fd, &st) || !S_ISREG(st.st_mode)) goto failed;
+    in->plain_size = st.st_size;
+    if (dcc_is_preprocessed(source) || dcc_argv_search(argv, "-x")) {
+        if (asprintf(&in->path, "/%s", dcc_find_basename(source)) < 0) goto failed;
+    } else {
+        const char *ext = cpp_fd >= 0 ? dcc_preproc_exten(dcc_find_extension(source)) : strrchr(cpp, '.');
+        if (asprintf(&in->path, "/input%s", ext ? ext : ".i") < 0) goto failed;
     }
     return job;
 failed:
@@ -181,19 +121,19 @@ static int auxiliary_inputs(struct dcc_job *job, char **paths)
         in->path = strdup(*p);
         in->fd = open(*p, O_RDONLY | O_CLOEXEC);
         if (!in->path || in->fd < 0 || fstat(in->fd, &st) || !S_ISREG(st.st_mode)) return -1;
-        in->wire_size = in->plain_size = st.st_size;
+        in->plain_size = st.st_size;
         if (dcc_file_digest(in->fd, st.st_size, in->digest)) return -1;
         in->cached = 1;
     }
     return 0;
 }
-int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char **argv, const char *cpp, int cpp_fd, char **files, char **auxiliary,
+int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char **argv, const char *cpp, int cpp_fd, char **auxiliary,
                        const char *output, const char *deps, struct dcc_buffer *err,
                        struct dcc_buffer *out, int *status)
 {
-    struct dcc_job *job = prepared ? prepared : dcc_job_describe(argv, cpp, cpp_fd, files, NULL);
+    struct dcc_job *job = prepared ? prepared : dcc_job_describe(argv, cpp, cpp_fd);
     struct dcc_job_result result;
-    int ret = EXIT_IO_ERROR, transport_complete = 0, need_cpp = 0;
+    int ret = EXIT_IO_ERROR, transport_complete = 0;
     dcc_job_result_init(&result);
     /* Input metadata survives worker selection and retries. Final driver
      * arguments can add dependency targets after selection. */
@@ -203,14 +143,9 @@ int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char 
         if (dcc_copy_argv(argv, &job->argv, 0)) goto done;
     }
     if (!job || auxiliary_inputs(job, auxiliary)) goto done;
-    if (job->main_input)
-        job->inputs[job->main_input-1].cached = host->cold_family ? DCC_CACHE_PUSH : DCC_CACHE_LOOKUP;
-    ret = dcc_tcp_exchange(host, job, files, cpp, output, deps, &result);
+    ret = dcc_tcp_exchange(host, job, NULL, cpp, output, deps, &result);
     if (ret == EXIT_BUSY) dcc_broker_defer(host);
     if (ret) goto done;
-    need_cpp = files && WIFEXITED(result.status) && WEXITSTATUS(result.status) == EXIT_LOCAL_CPP;
-    /* No compiler ran: do not train the scheduler on header verification. */
-    if (need_cpp) result.execute_ns = 0;
     /* COMPLETE ends the network transaction; publication is local work. */
     dcc_broker_return(host, host->broker_fd, &result);
     transport_complete = 1;
@@ -220,9 +155,9 @@ int dcc_compile_direct(struct dcc_hostdef *host, struct dcc_job *prepared, char 
         (ret = buffer_result(result.fd[DCC_JOB_STDOUT], &result, DCC_JOB_STDOUT, out))) goto done;
     if (!*status) {
         if ((ret = publish(&result.fd[DCC_JOB_OBJECT], &result, DCC_JOB_OBJECT, output))) goto done;
-        if (files || dcc_job_frontend(job))
+        if (dcc_job_frontend(job))
             ret = publish(&result.fd[DCC_JOB_DEPS], &result, DCC_JOB_DEPS, deps);
-    } else if (!need_cpp && dcc_argv_search(argv, "-E") && strcmp(output, "-")) {
+    } else if (dcc_argv_search(argv, "-E") && strcmp(output, "-")) {
         struct stat st;
         if (!stat(output, &st) && S_ISREG(st.st_mode)) unlink(output);
     }

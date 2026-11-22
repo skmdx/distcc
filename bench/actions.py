@@ -35,11 +35,11 @@ project_actions = ('download', 'md5check')
 
 
 def action_help():
-    print "Actions:"
+    print("Actions:")
     for action, default, descr in all_actions:
         default_ch = default and '*' or ' '
-        print " %c  %-20s %s" % (default_ch, action, descr)
-    print " (* = on by default)"
+        print(" %c  %-20s %s" % (default_ch, action, descr))
+    print(" (* = on by default)")
 
 
 # Filter out only actions where 'default' is true
@@ -51,7 +51,7 @@ def parse_opt_actions(optarg):
     action_names = [a[0] for a in all_actions]
     for oa in opt_actions:
         if oa not in action_names:
-            raise ValueError, ("no such action: %s" % `oa`)
+            raise ValueError("no such action: %s" % repr(oa))
     return opt_actions
 
 

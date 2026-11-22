@@ -156,7 +156,7 @@ int dcc_expand_response_files(char ***argv)
 }
 
 /* Offload preprocessing is a compiler-generated bundle of target-specific
- * translation units. It must not go through the single-frontend pump scanner. */
+ * translation units. It must not go through the single-frontend compiler path. */
 const char *dcc_offload_language(char *const argv[])
 {
     const char *language = NULL;
@@ -509,7 +509,7 @@ int dcc_set_action_opt(char **a, const char *new_c)
  * detected by dcc_scan_args(), it's also correctly identified here.
  * It might be better to make the code shared.
  **/
-int dcc_set_output(char **a, char *ofname)
+int dcc_set_output(char **a, const char *ofname)
 {
     int i;
 
@@ -578,9 +578,9 @@ int dcc_set_input(char **a, char *ifname)
 /* Own the rewritten vector and preserve the original source identity when
  * Clang needs a rooted frontend or uses the module name for PGO. */
 int dcc_clang_command(char ***argv, const char *root, const char *original,
-                      const char *cwd, int pump, int inputs, int *using_helper)
+                      const char *cwd, int inputs, int *using_helper)
 {
-    int argc = dcc_argv_len(*argv), frontend = pump || inputs > 1;
+    int argc = dcc_argv_len(*argv), frontend = inputs > 1;
     for (int i = 1; i < argc; ++i)
         if (!strcmp((*argv)[i], "-fprofile-generate") ||
             !strncmp((*argv)[i], "-fprofile-generate=", 19)) frontend = 1;
@@ -588,7 +588,7 @@ int dcc_clang_command(char ***argv, const char *root, const char *original,
     if (!frontend) return 0;
     char path[PATH_MAX];
     const char *prefix[] = {dcc_helper_path("distcc-clang", path),
-                           root, original, cwd, pump ? "pump" : "preprocessed"};
+                           root, original, cwd, "preprocessed"};
     char **wrapped = calloc(argc + 6, sizeof(char *));
     if (!wrapped) return EXIT_OUT_OF_MEMORY;
     for (int i = 0; i < 5; ++i) {

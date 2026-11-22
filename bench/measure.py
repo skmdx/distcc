@@ -93,7 +93,7 @@ def summarize_samples(samples, names):
 
 
 def log_summary(paths):
-    counts = dict(analysis_warnings=0, io_timeouts=0, sandbox_denials=0, broker_waits=0,
+    counts = dict(io_timeouts=0, sandbox_denials=0, broker_waits=0,
                   local_slot_waits=0, local_slot_wait_seconds=0.0,
                   analysis_memory_waits=0, analysis_memory_wait_seconds=0.0)
     timings = []
@@ -110,7 +110,6 @@ def log_summary(paths):
         pending = {}
         with path.open(errors='replace') as stream:
             for line in stream:
-                counts['analysis_warnings'] += 'include server gave up analyzing' in line
                 counts['io_timeouts'] += 'ERROR: IO timeout' in line
                 counts['sandbox_denials'] += 'ACCESS DENIED' in line
                 counts['broker_waits'] += 'waiting for host' in line
@@ -190,17 +189,13 @@ def fingerprint(tree):
 
 def implementation():
     """Record code visible inside the build's mount namespace, before timing."""
-    spec = importlib.util.find_spec('include_server')
-    if spec is None or not spec.submodule_search_locations:
-        raise RuntimeError('installed include server is missing')
-    package = Path(next(iter(spec.submodule_search_locations)))
     paths = []
-    for name in ('distcc', 'distccd', 'pump'):
+    for name in ('distcc', 'distccd'):
         binary = shutil.which(name)
         if binary is None:
             raise RuntimeError(name + ' is missing')
         paths.append(Path(binary))
-    paths += sorted(p for p in package.iterdir() if p.suffix in ('.py', '.so'))
+    paths += sorted(p for p in Path('/usr/libexec/distcc').iterdir() if p.is_file())
     return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
 
 
@@ -266,7 +261,7 @@ def prepare_runtime(runtime):
 
 def measure(config, out, buildroot):
     group = cgroup()
-    # Preserve Portage's short paths (pump uses Unix sockets under T), while all
+    # Preserve Portage's short paths, while all
     # temporary writes belong to the workspace directory mounted by fleet.py.
     assert os.path.samefile('/var/tmp', buildroot), 'private build mount is missing'
     buildtree = Path('/var/tmp/portage')
@@ -302,7 +297,7 @@ def measure(config, out, buildroot):
     socket_path = str(runtime / 'broker.sock')
     (private / 'env/distcc-bench').write_text(
         'FEATURES="${FEATURES} distcc keepwork keeptemp -ccache"\n'
-        'export DISTCC_PUMP=1 CCACHE_DISABLE=1 DISTCC_FALLBACK=0 DISTCC_SKIP_LOCAL_RETRY=1 DISTCC_VERBOSE=1\n'
+        'export CCACHE_DISABLE=1 DISTCC_FALLBACK=0 DISTCC_SKIP_LOCAL_RETRY=1 DISTCC_VERBOSE=1\n'
         'export DISTCC_HOSTS=' + shlex.quote(hosts) + '\n'
         'export DISTCC_BROKER=' + shlex.quote(socket_path) + '\n'
         'export DISTCC_LOG=' + shlex.quote(str(client_log)) + '\n'
@@ -427,7 +422,7 @@ def measure(config, out, buildroot):
     events = dict(line.split() for line in memory_events.splitlines())
     if config.get('expected_objects') is not None and len(objects) != config['expected_objects']:
         error = error or f"expected {config['expected_objects']} compiled objects, got {len(objects)}"
-    if any(summary[k] for k in ('analysis_warnings', 'io_timeouts', 'sandbox_denials')):
+    if any(summary[k] for k in ('io_timeouts', 'sandbox_denials')):
         error = error or 'build diagnostics failed validation'
     if not summary['feedback_jobs']:
         error = error or 'no measured broker feedback; distributed path not established'

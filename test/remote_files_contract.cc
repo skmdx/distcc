@@ -1,5 +1,5 @@
 /* Exercise VFS snapshot ownership and the actual local request stream. */
-#include "../include_server/c_extensions/remote_files.h"
+#include "../src/clang/remote_files.h"
 #include <thread>
 #include <future>
 #include <csignal>

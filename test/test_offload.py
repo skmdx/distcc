@@ -23,8 +23,7 @@ class OffloadTest(BrokerTestCase):
     def setUp(self):
         super().setUp()
         self.start_broker(self.host(0, ',tcp'))
-        # An offload job must bypass the single-frontend pump analyzer.
-        self.env.update(DISTCC_VERBOSE='1', INCLUDE_SERVER_PORT=str(self.work / 'absent.sock'))
+        self.env['DISTCC_VERBOSE'] = '1'
         self.env['PATH'] = str(self.build) + os.pathsep + self.env.get('PATH', os.defpath)
 
     def distributed(self, flags, source):
@@ -35,7 +34,6 @@ class OffloadTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(' on 127.0.0.1', result.stderr)
         self.assertIn('prepared AMDGPU offload:', result.stderr)
-        self.assertNotIn('include server gave up', result.stderr)
         self.assertGreater(obj.stat().st_size, 0)
         return obj
 
@@ -59,7 +57,6 @@ class OffloadTest(BrokerTestCase):
         source.write_text('int main() { return 0; }\n')
         obj = self.work / 'configure.o'
         env = dict(self.env)
-        env.pop('INCLUDE_SERVER_PORT')
         result = subprocess.run([str(self.build / 'distcc'), self.compiler, '-flto=thin',
                                  '-c', str(source), '-o', str(obj)], env=env,
                                 capture_output=True, text=True, timeout=30)

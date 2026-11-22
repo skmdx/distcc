@@ -58,7 +58,6 @@
 #include "job.h"
 #include "rpc.h"
 #include "rust/api.h"
-#include "emaillog.h"
 #include "native_worker.h"
 
 
@@ -87,7 +86,7 @@ static void dcc_show_usage(void)
     dcc_show_version("distcc");
     printf(
 "Usage:\n"
-"   distcc [--scan-includes] [COMPILER] [compile options] -o OBJECT -c SOURCE\n"
+"   distcc [COMPILER] [compile options] -o OBJECT -c SOURCE\n"
 "   distcc [--help|--version|--show-hosts|-j]\n"
 "\n"
 "Options:\n"
@@ -97,11 +96,8 @@ static void dcc_show_usage(void)
 "   --show-hosts               Show host list, and exit.\n"
 "   --show-helpers             Show private helper directory, and exit.\n"
 "   --lto-capacity             Show broker compute capacity as JSON.\n"
-"   --show-analyzer-slots      Show available CPU capacity for analysis, and exit.\n"
 "   -j                         Show the concurrency level, as calculated from\n"
 "                              the host list, and exit.\n"
-"   --scan-includes            Show the files that distcc would send to the\n"
-"                              remote machine, and exit.  (Pump mode only.)\n"
 #ifdef HAVE_GSSAPI
 "   --show-principal           Show current distccd GSS-API principal and exit.\n"
 #endif
@@ -129,7 +125,6 @@ static void dcc_show_usage(void)
 "   USER@HOST                  SSH connection to specified username at host.\n"
 "   HOSTSPEC,lz4               Enable LZ4 compression.\n"
 "   HOSTSPEC,lzo               Enable legacy LZO compression.\n"
-"   HOSTSPEC,cpp,lz4           Use pump mode (remote preprocessing).\n"
 "   HOSTSPEC,auth              Enable GSS-API based mutual authenticaton.\n"
 "   --randomize                Randomize the server list before execution.\n"
 "\n"
@@ -280,7 +275,6 @@ int main(int argc, char **argv)
 
     dcc_set_trace_from_env();
     dcc_raise_fd_limit();
-    dcc_setup_log_email();
 
     dcc_trace_version();
 
@@ -372,11 +366,6 @@ int main(int argc, char **argv)
             goto out;
         }
 
-        if (!strcmp(argv[1], "--show-analyzer-slots")) {
-            printf("%d\n", dcc_resource_cpus());
-            ret = 0;
-            goto out;
-        }
 
         if (!strcmp(argv[1], "-j") || !strcmp(argv[1], "--lto-capacity")) {
             if (!strcmp(argv[1], "-j")) dcc_concurrency_level();
@@ -389,18 +378,6 @@ int main(int argc, char **argv)
             goto out;
         }
 
-        if (!strcmp(argv[1], "--scan-includes")) {
-            if (argc <= 2) {
-                fprintf (stderr,
-                         "%s: missing operand\n"
-                         "Try `%s --help' for more information.\n",
-                         argv[0], argv[0]);
-                ret = EXIT_BAD_ARGUMENTS;
-                goto out;
-            }
-            dcc_scan_includes = 1;
-            argv++;
-        }
 
 #ifdef HAVE_GSSAPI
 	    if (!strcmp(argv[1], "--show-principal")) {
@@ -417,7 +394,7 @@ int main(int argc, char **argv)
          * "gcc -c hello.c" */
 
         /* Build-system launchers may wrap an absolute masquerade link.
-         * Unwrap it before compiler discovery, pump analysis and RPC, just
+         * Unwrap it before compiler discovery and RPC, just
          * as when the same link is invoked directly. */
         masquerade = strchr(compiler_args[0], '/') && dcc_is_distcc_path(compiler_args[0]);
     } else {
@@ -456,6 +433,5 @@ int main(int argc, char **argv)
     if (compiler_args) {
       dcc_free_argv(compiler_args);
     }
-    dcc_maybe_send_email();
     dcc_exit(ret);
 }

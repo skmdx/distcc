@@ -22,7 +22,7 @@ class PlanResult(NamedTuple):
 
 
 class PlanMemoTest(BrokerTestCase):
-    worker_address = '127.0.0.1'
+    worker_address = '127.0.0.2'
     start_frontend = GccFrontendTest.start_frontend
     compile_frontend = GccFrontendTest.compile_frontend
 
@@ -370,7 +370,7 @@ class PlanDependenciesTest(unittest.TestCase):
         for op in ('readlinkat','lstat64','fstatat-empty'):
             memo=self.journal(op,link);self.assertTrue(self.valid_journal(memo))
             link.unlink();link.symlink_to(self.sources/'a.c')
-            self.assertFalse(self.valid_journal(memo));link.unlink();link.symlink_to(path)
+            self.assertFalse(self.valid_journal(memo), op);link.unlink();link.symlink_to(path)
 
 def load_tests(loader, tests, pattern):
     # Reuse the broker fixture, not all unrelated inherited scheduling tests.

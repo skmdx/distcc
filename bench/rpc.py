@@ -118,7 +118,6 @@ def main():
     parser.add_argument('--variants', nargs='+', choices=VARIANTS, default=list(VARIANTS))
     parser.add_argument('--remove-glob', action='append', default=[])
     parser.add_argument('--verify', type=shlex.split, help='quoted argv command to verify each build')
-    parser.add_argument('--pump', action='store_true')
     parser.add_argument('--before-measure', type=shlex.split,
                         help='quoted argv hook after warmup; {variant} selects the instance')
     parser.add_argument('--server', action='append', default=[], metavar='SSH_HOST:CGROUP_PATH')
@@ -146,8 +145,7 @@ def main():
     root.mkdir()
     base_env = dict(os.environ, DISTCC_FALLBACK='0', DISTCC_MAX_RETRIES='1',
                     DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_LOG='', DISTCC_VERBOSE='0',
-                    TMPDIR=str(root), DISTCC_CLIENT_TMP=str(root),
-                    DISTCC_TESTING_INCLUDE_SERVER='1')
+                    TMPDIR=str(root), DISTCC_CLIENT_TMP=str(root))
     instances = {}
     samples = []
     try:
@@ -156,7 +154,7 @@ def main():
             directory.mkdir()
             binary = args.baseline if name == 'baseline' else args.candidate
             hosts = args.baseline_hosts if name == 'baseline' and args.baseline_hosts else args.hosts
-            binary = binaries.get(name, binary)
+            binary = binaries[name] if name in binaries else binary
             hosts = endpoints.get(name, hosts)
             address = directory / 'broker.sock'
             codec = args.baseline_codec if name == 'baseline' else VARIANTS[name]
@@ -168,23 +166,12 @@ def main():
             log = (directory / 'build.log').open('w+')
             broker = subprocess.Popen([str(binary/'distccd'), '--broker', str(address)],
                                       env=env, stdout=log, stderr=log)
-            instances[name] = dict(env=env, log=log, broker=broker, binary=binary, pump=False)
+            instances[name] = dict(env=env, log=log, broker=broker, binary=binary)
             deadline = time.monotonic() + 5
             while not address.exists():
                 if broker.poll() is not None or time.monotonic() >= deadline:
                     raise RuntimeError('broker failed to start')
                 time.sleep(.01)
-            if args.pump:
-                startup = subprocess.run([str(binary/'pump'), '--startup'], env=env,
-                                         cwd=args.work, check=True, capture_output=True, text=True)
-                for line in startup.stdout.splitlines():
-                    words = shlex.split(line)
-                    if len(words) == 2 and words[0] == 'export':
-                        key, value = words[1].split('=', 1)
-                        env[key] = value
-                if 'INCLUDE_SERVER_PORT' not in env:
-                    raise RuntimeError('pump did not start')
-                instances[name]['pump'] = True
 
         def execute(name, measured, repeat):
             instance = instances[name]
@@ -201,14 +188,11 @@ def main():
             before = servers_usage(args.server) if measured else []
             network_before = network_usage(broker.pid) if measured else {}
             broker_cpu, _ = process_usage(broker.pid)
-            include_pid = int(env.get('INCLUDE_SERVER_PID', '0'))
-            include_cpu = process_usage(include_pid)[0] if include_pid else 0
             try:
                 result = run_command(command, env, args.work, log)
             except RuntimeError as error:
                 raise RuntimeError(f'{error}; broker exit status: {broker.poll()}') from error
             after_cpu, peak = process_usage(broker.pid)
-            include_after, include_peak = process_usage(include_pid) if include_pid else (0, 0)
             if measured:
                 after = servers_usage(args.server)
                 network_after = network_usage(broker.pid)
@@ -222,8 +206,7 @@ def main():
                                           for key, stats in network_after.items())
                                           for field in TCP_COUNTERS}
                 result.update(variant=name, repeat=repeat, broker_cpu_seconds=after_cpu-broker_cpu,
-                              include_cpu_seconds=include_after-include_cpu, include_peak_bytes=include_peak,
-                              total_client_cpu_seconds=result['client_cpu_seconds'] + after_cpu-broker_cpu + include_after-include_cpu,
+                              total_client_cpu_seconds=result['client_cpu_seconds'] + after_cpu-broker_cpu,
                               broker_peak_bytes=peak, tcp_connections=len(network_after), network=network,
                               tcp_info_before=list(network_before.values()),
                               tcp_info_after=list(network_after.values()), servers=[
@@ -247,8 +230,8 @@ def main():
                 execute(name, True, repeat)
         summary = {name: {field: median(s[field] for s in samples if s['variant'] == name)
                          for field in ('wall_seconds', 'client_cpu_seconds', 'broker_cpu_seconds',
-                                       'include_cpu_seconds', 'total_client_cpu_seconds',
-                                       'client_peak_bytes', 'broker_peak_bytes', 'include_peak_bytes')}
+                                       'total_client_cpu_seconds',
+                                       'client_peak_bytes', 'broker_peak_bytes')}
                    for name in args.variants}
         for name, values in summary.items():
             rows = [s for s in samples if s['variant'] == name]
@@ -263,14 +246,11 @@ def main():
                 values[field] = (median(row['network'][field] for row in rows)
                                  if all(row['network'] is not None for row in rows) else None)
         args.output.write_text(json.dumps(dict(samples=samples, medians=summary,
-            repeats=args.repeats, pump=args.pump, baseline_codec=args.baseline_codec,
+            repeats=args.repeats, baseline_codec=args.baseline_codec,
             memory_note='broker and server peaks are lifetime upper bounds; command wait4 peaks can include the inherited launcher peak'), indent=2) + '\n')
         print(json.dumps(dict(medians=summary)), flush=True)
     finally:
         for instance in instances.values():
-            if instance['pump']:
-                subprocess.run([str(instance['binary']/'pump'), '--shutdown'], env=instance['env'],
-                               cwd=args.work, stdout=instance['log'], stderr=instance['log'])
             broker = instance['broker']
             if broker.poll() is None:
                 broker.terminate()

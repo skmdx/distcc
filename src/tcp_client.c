@@ -3,7 +3,6 @@
 #include <config.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <lz4.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,7 +18,7 @@
 #include "tcp_job.h"
 #include "frontend_fs.h"
 
-struct input_stream { int fd, immutable; unsigned index; uint64_t offset, plain; };
+struct input_stream { int fd, immutable; unsigned index; uint64_t offset; };
 /* TCP has no ancillary descriptors. Read ahead into one maximum wire chunk;
  * frames borrow its payload until consumed. Local IPC retains exact recvmsg
  * boundaries so SCM_RIGHTS stays attached to its own frame. */
@@ -93,50 +92,14 @@ static unsigned char *next_chunk(struct input_stream *stream, const struct dcc_j
                                  size_t *size, off_t *file_offset, size_t *file_left, int local)
 {
     *file_left = 0;
-    uint64_t remaining = in->plain_size - stream->plain;
+    uint64_t remaining = in->plain_size - stream->offset;
     size_t amount = remaining < DCC_TCP_CHUNK ? remaining : DCC_TCP_CHUNK;
-    if (in->encoding == DCC_JOB_RAW) {
-        p = dcc_tcp_file_chunk(DCC_TCP_INPUT, stream->index, stream->fd,
-            stream->offset, amount, amount == remaining, local ? DCC_LOCAL_RAW :
-            stream->immutable ? DCC_IMMUTABLE : DCC_MUTABLE, p, snapshot, size);
-        if (!p) return NULL;
-        if (*size == 16) { *file_offset = stream->offset; *file_left = amount; }
-        stream->offset += amount; stream->plain += amount;
-        return p;
-    }
-    /* Pump files already contain independent LZ4 blocks. Reframe, don't
-     * decompress and recompress, and require their terminal marker. */
-    unsigned char header[8];
-    if (pread(stream->fd, header, 8, stream->offset) != 8) return NULL;
-    uint32_t plain = dcc_tcp_get32(header), encoded = dcc_tcp_get32(header + 4);
-    if ((!plain && remaining) || plain > DCC_TCP_CHUNK || plain > remaining ||
-        (encoded && encoded >= plain)) return NULL;
-    size_t payload = encoded ? encoded : plain;
-    *file_offset = stream->offset + 8;
-    *file_left = payload;
-    stream->offset += 8 + payload; stream->plain += plain;
-    int final = stream->plain == in->plain_size;
-    if (final) {
-        if (plain) {
-            if (pread(stream->fd, header, 8, stream->offset) != 8 ||
-                dcc_tcp_get64(header)) return NULL;
-            stream->offset += 8;
-        }
-        if (stream->offset != in->wire_size) return NULL;
-    }
-    if (local) {
-        unsigned char *bytes = encoded ? snapshot : p + 16;
-        if (pread(stream->fd, bytes, payload, *file_offset) != (ssize_t)payload) return NULL;
-        if (encoded && LZ4_decompress_safe((char *)bytes, (char *)p + 16, encoded, plain) != (int)plain)
-            return NULL;
-        *file_left = 0;
-        *size = dcc_tcp_encode(DCC_TCP_INPUT, stream->index, p + 16, plain, final, 0, p) + plain;
-        return p;
-    }
-    dcc_tcp_put32(p, DCC_TCP_INPUT | (encoded ? DCC_TCP_COMPRESSED : 0) | (final ? DCC_TCP_FINAL : 0));
-    dcc_tcp_put32(p + 4, payload + 8);
-    dcc_tcp_put32(p + 8, stream->index); dcc_tcp_put32(p + 12, plain);
-    *size = 16; /* The immutable snapshot supplies the following file extent. */
+    p = dcc_tcp_file_chunk(DCC_TCP_INPUT, stream->index, stream->fd,
+        stream->offset, amount, amount == remaining, local ? DCC_LOCAL_RAW :
+        stream->immutable ? DCC_IMMUTABLE : DCC_MUTABLE, p, snapshot, size);
+    if (!p) return NULL;
+    if (*size == 16) { *file_offset = stream->offset; *file_left = amount; }
+    stream->offset += amount;
     return p;
 }
 /* Metadata is already in memory. A READ joins its prefix and open file into
@@ -258,7 +221,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     static unsigned char buffer[2 * DCC_TCP_CHUNK + 16U];
     struct tcp_input input = {.wire = local ? NULL : buffer + DCC_TCP_CHUNK};
     int local_input = local && job->kind == DCC_JOB_COMPILE && job->count == 1 &&
-        job->inputs[0].encoding == DCC_JOB_RAW && job->inputs[0].fd >= 0;
+        job->inputs[0].fd >= 0;
     int send_input_fd = local_input;
     int shared_input = -1;
     static struct dcc_frontend_reply filesystem = {.fd = -1};
@@ -302,7 +265,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
             }
             if (!length && (stream.fd >= 0 || read_request < count)) {
                 if (stream.fd < 0) {
-                    stream.index = requests[read_request++]; stream.offset = stream.plain = 0;
+                    stream.index = requests[read_request++]; stream.offset = 0;
                     int retained = job->inputs[stream.index].fd;
                     stream.fd = retained >= 0 ? fcntl(retained, F_DUPFD_CLOEXEC, 0) :
                         open(files ? files[stream.index] : cpp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -525,8 +488,7 @@ done:
                  read_request, count, have_result, incoming.type, incoming.used, sent, length);
     if (shared_input >= 0) close(shared_input);
     if (!ret) {
-        rs_trace("BEGIN %zu bytes, NEED %u, main pushed %d", metadata_size + 8, needs,
-                 job->main_input && job->inputs[job->main_input - 1].cached == DCC_CACHE_PUSH);
+        rs_trace("BEGIN %zu bytes, NEED %u", metadata_size + 8, needs);
         unsigned cached = 0, transferred = 0;
         for (unsigned i = 0; i < job->count; ++i) {
             cached += !!job->inputs[i].cached;

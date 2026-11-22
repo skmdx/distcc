@@ -19,7 +19,6 @@ struct dcc_capacity {
     int running, busy, queued, links, admission, available;
     int preparing, returning, capacity, suspended;
     int compile_capacity[DCC_MEMORY_BUCKETS];
-    int pump_capacity[DCC_MEMORY_BUCKETS];
     int rust_capacity[DCC_MEMORY_BUCKETS];
     int thinlto_capacity[DCC_MEMORY_BUCKETS];
     int offload_capacity[DCC_MEMORY_BUCKETS];
@@ -27,7 +26,7 @@ struct dcc_capacity {
     int frontend_capacity[DCC_MEMORY_BUCKETS];
     int cgu_capacity[DCC_MEMORY_BUCKETS];
     unsigned long long memory_headroom, memory_reserved, job_memory;
-    unsigned long long memory_estimates[7][DCC_MEMORY_BUCKETS];
+    unsigned long long memory_estimates[6][DCC_MEMORY_BUCKETS];
 };
 struct dcc_load_report;
 int dcc_capacity_update(struct dcc_capacity *, const struct dcc_load_report *, int owned);

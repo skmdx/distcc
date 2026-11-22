@@ -16,9 +16,5 @@ void dcc_argv_file_close(struct dcc_argv_file *);
  * eight hexadecimal digits. The token need not be NUL-terminated. */
 int dcc_parse_token_int(const char *, const char *, unsigned *);
 int dcc_argv_encode(const char *, const char *, char **, char **, size_t *);
-struct dcc_argv_file_api {
-    int (*read)(int, unsigned, struct dcc_argv_file *);
-    void (*close)(struct dcc_argv_file *);
-    int (*write)(int, const char *, const char *, char **);
-};
+int dcc_argv_file_write(int, const char *, const char *, char **);
 #endif

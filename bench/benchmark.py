@@ -76,10 +76,10 @@ def error(msg):
 
 
 def list_projects():
-    names = trees.keys()
+    names = list(trees.keys())
     names.sort()
     for n in names:
-        print n
+        print(n)
 
         
 def find_project(name):
@@ -87,22 +87,22 @@ def find_project(name):
     Return the nearest unique match for name.
     """
     best_match = None
-    for pn in trees.keys():
+    for pn in list(trees.keys()):
         if pn.startswith(name):
             if best_match:
-                raise ValueError, "ambiguous prefix %s" % name
+                raise ValueError("ambiguous prefix %s" % name)
             else:
                 best_match = pn
                 
     if not best_match:
-        raise ValueError, "nothing matches %s" % name
+        raise ValueError("nothing matches %s" % name)
     else:
         return trees[best_match]
 
 
 
 def show_help():
-    print """Usage: benchmark.py [OPTION]... [PROJECT]...
+    print("""Usage: benchmark.py [OPTION]... [PROJECT]...
 Test distcc relative performance building different projects.
 By default, all known projects are built.
 
@@ -113,7 +113,7 @@ Options:
   --cxx=PATH                 specify base value of CXX to pass to configure
   --output=FILE              print final summary to FILE in addition to stdout
   -c, --compiler=COMPILER    specify one compiler to use; format is
-                             {local|dist|lzo|pump},h<NUMHOSTS>,j<NUMJOBS>
+                             {local|dist|lzo},h<NUMHOSTS>,j<NUMJOBS>
   -n N                       repeat compilation N times
   -a, --actions=ACTIONS      comma-separated list of action phases
                              to perform
@@ -130,13 +130,13 @@ Use of distcc features is set with the -c/--compiler option.  The argument
 to -c/--compiler has three components, separated by commas.  The first
 component specifies which distcc features to enabled: "local" means
 run cc locally, "distcc" means use plain distcc, "lzo" means enabled
-compression, and "pump" means to enable pump mode and compression.
+compression.
 The second component specifies how many distcc hosts to use.  The third
 component specifies how many jobs to run (the -j/--jobs option to "make").
 Multiple -c/--compiler options specify different scenarios to measure.
 The default is to measure a few reasonable scenarios.
 
-"""
+""")
     actions.action_help()
 
 
@@ -203,7 +203,7 @@ def main():
     if args:
         chosen_projects = [find_project(name) for name in args]
     else:
-        chosen_projects = trees.values()
+        chosen_projects = list(trees.values())
 
     for proj in chosen_projects:
         # Ignore actions we did in a previous benchmark run, absent -f.

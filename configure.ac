@@ -89,10 +89,6 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[]], [[
 
 ### Checks for configure options
 
-AC_ARG_ENABLE(pump-mode,
-	AS_HELP_STRING([--disable-pump-mode],[include server support (pump mode), requires python]),
-		[pump_mode=${enableval}], [pump_mode=yes])
-
 AM_PATH_PYTHON([3.1],,[:])
 AC_ARG_VAR(PYTHON, [Python interpreter])
 AC_ARG_VAR(DISTCC_CLANG_CONFIGS, [Colon-separated llvm-config paths for native helper modules])
@@ -181,7 +177,6 @@ dnl Checks for programs
 AC_PROG_CC
 AC_PROG_CXX
 WERROR_CFLAGS=""
-PYTHON_CFLAGS=""
 if test x"$GCC" = xyes
 then
     CFLAGS="$CFLAGS -MD \
@@ -206,27 +201,11 @@ then
     if test x"$enable_Werror" != xno
     then
       WERROR_CFLAGS="-Werror"
-	  # -Wp,-U_FORTIFY_SOURCE is to turn off _FORTIFY_SOURCE on systems where
-	  # it's in the Python Makefile (and hence inherited by us).
-	  # -Werror -D_FORTIFY_SOURCE gives compiler errors for some distcc routines that
-	  # ignore the return value from libc functions (like getcwd).
-	  # That would cause this code to not compile, which is no good.
-	  PYTHON_CFLAGS="-Wp,-U_FORTIFY_SOURCE"
     fi
-
-    # Additional flags for compiling Python extension modules.
-    # We disable -Wmissing-prototypes and -Wmissing-declarations,
-    # which don't apply to python extensions (it exports global fns via a
-    # pointer), and -Wwrite-strings, which just had too many false
-    # positives (for Python 2.2, anyway; looks like these may be fixed
-    # in Python 2.5).
-    PYTHON_CFLAGS="$PYTHON_CFLAGS -Wno-missing-prototypes -Wno-missing-declarations \
--Wno-write-strings"
 
     AC_MSG_NOTICE([Adding gcc options: $CFLAGS])
 fi
 AC_SUBST(WERROR_CFLAGS)
-AC_SUBST(PYTHON_CFLAGS)
 AC_SEARCH_LIBS([strerror],[cposix])
 AC_SEARCH_LIBS([log1p],[m])
 AC_CHECK_HEADERS([json-c/json.h], [], [AC_MSG_ERROR([json-c headers are required])])
@@ -524,7 +503,6 @@ AC_DEFINE_UNQUOTED(GNU_HOST, ["$host"], [Your gnu-style host triple])
 # The '.stamp-conf' files force creation of the containing directories in the
 # build tree.
 AC_CONFIG_FILES([Makefile]  lzo/.stamp-conf)
-AC_CONFIG_FILES([pump], [chmod +x pump])
 AC_OUTPUT
 
 

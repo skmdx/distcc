@@ -15,7 +15,7 @@ import tempfile
 import distcc_python
 import xxhash
 
-from distcc_job import LocalOnly, fingerprint, snapshot, write_metadata
+from distcc_job import JOB_THINLTO, LocalOnly, fingerprint, snapshot, write_metadata
 
 CONTROL = '/__distcc_lto'
 RUNTIME = ('/lib', '/lib64', '/usr/lib64', '/usr/lib/gcc', '/usr/lib/llvm',
@@ -156,7 +156,6 @@ def distribute(request, kind, link=None):
         return 0
     transport = distcc_python.client_executable()
     env = dict(os.environ)
-    env.pop('INCLUDE_SERVER_PORT', None)
     pinned = {int(path.parent.name) for path in link.outputs.values()} if link else set()
     with tempfile.TemporaryDirectory(prefix='distcc-lto-') as directory, ExitStack() as lanes:
         idle = queue.LifoQueue()
@@ -167,7 +166,7 @@ def distribute(request, kind, link=None):
                 print(f'{helper}: transport pid={lane.process.pid}', file=sys.stderr)
             return lane
 
-        helper = 'distcc-thinlto' if kind == 4 else 'distcc-offload-link'
+        helper = 'distcc-thinlto' if kind == JOB_THINLTO else 'distcc-offload-link'
         first_lane = open_lane(capacity=True)
         capacity = first_lane.read_capacity()
         idle.put(first_lane)
@@ -183,7 +182,7 @@ def distribute(request, kind, link=None):
                 if name not in files:
                     path = work / ('input-' + str(len(files)))
                     files[name] = InputSnapshot(opener(name) if opener else name, path)
-            names = task['inputs'][:1] if kind == 4 else [*task['inputs'], *common['inputs']]
+            names = task['inputs'][:1] if kind == JOB_THINLTO else [*task['inputs'], *common['inputs']]
             task['bytes'] = sum(files[name].size for name in {absolute(p) for p in names})
 
         for task in jobs:
@@ -193,7 +192,7 @@ def distribute(request, kind, link=None):
             task['partitions'] = 1
         total_bytes = sum(task['bytes'] for task in jobs)
         total_instructions = 0
-        tools = llvm_tools(common['args'][0]) if kind == 4 else None
+        tools = llvm_tools(common['args'][0]) if kind == JOB_THINLTO else None
         indexes = [next((arg.split('=', 1)[1] for arg in task['args']
                          if arg.startswith('-fthinlto-index=')), None) for task in jobs]
         if tools and all(indexes):
@@ -538,7 +537,7 @@ def run_link(work, linked, temporary, compiler, filter_fd, command):
                     raise ValueError('invalid ThinLTO description name')
                 request = files.request(os.fsdecode(message), compiler)
                 try:
-                    status = distribute(request, 4, files)
+                    status = distribute(request, JOB_THINLTO, files)
                 except subprocess.CalledProcessError as error:
                     status = error.returncode
                 status = 128 - status if status < 0 else status
@@ -554,7 +553,7 @@ def run_link(work, linked, temporary, compiler, filter_fd, command):
 
 def main(kind):
     try:
-        if kind == 4 and sys.argv[1:2] == ['--rust-link']:
+        if kind == JOB_THINLTO and sys.argv[1:2] == ['--rust-link']:
             work, linked, temporary, compiler, filter_fd, *command = sys.argv[2:]
             return run_link(work, linked, temporary, compiler, filter_fd, command)
         if len(sys.argv) == 2:

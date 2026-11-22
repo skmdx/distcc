@@ -34,12 +34,12 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
                    core_scale: float | str = 1, smt_gain: float | str = .25,
                    cpu_scale: float | str = -1, cpu_age: float | str = -1,
                    cpu_probe: float | str = 0,
-                   compile_capacity=None, pump_capacity=None, rust_capacity=None, thinlto_capacity=None,
+                   compile_capacity=None, rust_capacity=None, thinlto_capacity=None,
                    offload_capacity=None, frontend_capacity=None,
                    memory_headroom_bytes: int | float | str = 16 * 1024**3,
                    memory_reserved_bytes: int | float | str = 0,
                    job_memory_bytes: int | float | str = 256 * 1024**2,
-                   compile_memory=None, pump_memory=None, rust_memory=None, thinlto_memory=None,
+                   compile_memory=None, rust_memory=None, thinlto_memory=None,
                    offload_memory=None, frontend_memory=None, **metrics):
     if frontend_capacity is None: frontend_capacity = metrics.get('capacity', jobs)
     if frontend_memory is None: frontend_memory = job_memory_bytes
@@ -48,9 +48,6 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
     if compile_capacity is None:
         compile_capacity = [metrics.get('capacity', jobs)] * 64
     capacities = compile_capacity if isinstance(compile_capacity, str) else ','.join(map(str, compile_capacity))
-    if pump_capacity is None:
-        pump_capacity = [metrics.get('capacity', jobs)] * 64
-    pump = pump_capacity if isinstance(pump_capacity, str) else ','.join(map(str, pump_capacity))
     if rust_capacity is None:
         rust_capacity = [metrics.get('capacity', jobs)] * 64
     rust = rust_capacity if isinstance(rust_capacity, str) else ','.join(map(str, rust_capacity))
@@ -61,7 +58,7 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
         offload_capacity = [metrics.get('capacity', jobs)] * 64
     offload = offload_capacity if isinstance(offload_capacity, str) else ','.join(map(str, offload_capacity))
     memory = ''
-    for kind, estimates in (('compile', compile_memory), ('pump', pump_memory), ('rust', rust_memory),
+    for kind, estimates in (('compile', compile_memory), ('rust', rust_memory),
                            ('thinlto', thinlto_memory), ('offload', offload_memory)):
         if estimates is None: estimates = [job_memory_bytes] * 64
         values = estimates if isinstance(estimates, str) else ','.join(map(str, estimates))
@@ -72,7 +69,6 @@ def stats_response(cpus: float | str = 4, jobs: float | str = 4,
             f"dcc_core_scale {core_scale}\n"
             f"dcc_cpu_scale {cpu_scale}\ndcc_cpu_age {cpu_age}\ndcc_cpu_probe {cpu_probe}\n"
             f"dcc_compile_capacity {capacities}\n"
-            f"dcc_pump_capacity {pump}\n"
             f"dcc_rust_capacity {rust}\n"
             f"dcc_thinlto_capacity {thinlto}\n"
             f"dcc_offload_capacity {offload}\n"
@@ -139,11 +135,6 @@ class DistccTestCase(unittest.TestCase):
         # C++ budget for every test worker sharing the runner's cgroup.
         cls.base_env['DISTCC_JOB_MEMORY'] = '64'
         cls.base_env['DISTCCD_RUST_TMPDIR'] = str(cls.root)
-        cls.base_env['DISTCC_CLANG_LIBRARY'] = str(cls.build / 'clang_driver.so')
-        # Build-tree checks need the matching native extension even after a
-        # child changes cwd. Installed-path checks use the installed package.
-        if (cls.build / '_include_server').is_dir():
-            cls.base_env['PYTHONPATH'] = str(next(cls.build.glob('_include_server/lib.*')))
         cls.daemons = []
         cls.ports = []
         cls.stats_ports = []
@@ -222,7 +213,7 @@ class DistccTestCase(unittest.TestCase):
                 response += chunk
 
     def setUp(self):
-        # Broker and pump sockets beneath this directory must fit sockaddr_un.
+        # Broker and other sockets beneath this directory must fit sockaddr_un.
         self.work = Path(tempfile.mkdtemp(prefix="", dir=self.root))
         self.ddir = self.work / "distcc"
         self.ddir.mkdir()
@@ -244,8 +235,6 @@ class DistccTestCase(unittest.TestCase):
                    DISTCC_FALLBACK="0", DISTCC_VERBOSE="1", DISTCC_LOG=str(log),
                    DISTCC_PAUSE_TIME_MSEC="20", TMPDIR=str(self.work))
         command = [str(self.build / "distcc"), "gcc", "-c", str(self.source), "-o", str(obj)]
-        if ",cpp" in hosts:
-            command.insert(0, str(self.build / "pump"))
         result = subprocess.run(command, env=env,
                                 capture_output=True, text=True, timeout=10)
         text = log.read_text()
@@ -446,7 +435,7 @@ int open(const char *path, int flags, ...) {
 
     def test_tcp_jobs_keep_class_capacity_in_the_cross_process_cache(self):
         peer = self.peer(stats_response(cpus=8, jobs=8, capacity=2,
-            compile_capacity=[8] * 64, pump_capacity=[2] * 64,
+            compile_capacity=[8] * 64,
             suspended=3, memory_pressure=0))
         env = dict(self.base_env,
             DISTCC_HOSTS=f'127.0.0.1:{self.ports[0]},tcp,stats={peer.port}',
@@ -500,7 +489,7 @@ int open(const char *path, int flags, ...) {
                                        '18446744073709551616,' + valid,
                                        ','.join(['268435456'] * 63), valid + ',1')):
             with self.subTest(value=value):
-                peer = self.peer(stats_response(pump_memory=value))
+                peer = self.peer(stats_response(compile_memory=value))
                 hosts = self.host(0, f',stats={peer.port},speed=4') + ' ' + self.host(1)
                 _, log = self.compile(hosts, f'memory-estimates-{index}')
                 self.assertIn('adaptive stats unavailable', log)
@@ -609,15 +598,6 @@ int open(const char *path, int flags, ...) {
         self.assertIsNone(self.compile(self.host(0))[0])
         self.assertEqual(self.compile(self.host(0, ",lzo,speed=1"), "lzo")[0], self.ports[0])
 
-    def test_pump(self):
-        if not (self.build / "pump").exists() or not list(
-                self.build.glob("_include_server/lib*/include_server/*.so")):
-            self.skipTest("pump/include server not built")
-        self.source.write_text('#include <stdio.h>\nint main(void) { return puts("ok") < 0; }\n')
-        host = self.host(0, f",lzo,cpp,stats={self.stats_ports[0]}")
-        port, log = self.compile(host)
-        self.assertEqual(port, self.ports[0])
-        self.assertNotIn("adaptive stats unavailable", log)
 
     def test_invalid_options(self):
         for option in ("stats=0", "stats=65536", "stats=", "stats=12x",
@@ -734,66 +714,6 @@ int main(int argc, char **argv) {
 
 
 class MemoryEstimateTest(unittest.TestCase):
-    @unittest.skipUnless(sys.platform.startswith('linux'), 'inotify admission notification')
-    def test_analysis_memory_publication_wakes_waiter_and_rechecks_admission(self):
-        with tempfile.TemporaryDirectory(prefix='distcc-analysis-wake-') as directory:
-            root = Path(directory)
-            source, executable = root / 'wait.c', root / 'wait'
-            source.write_text('''#include <stdio.h>
-#include "resource.h"
-int main(void) {
-    if (dcc_resource_cpus() < 2) return 77;
-    dcc_resource_analysis_wait(2, 5000);
-    printf("%d\\n", dcc_resource_analysis_slots(dcc_resource_cpus()));
-    return 0;
-}''')
-            subprocess.run(['gcc', '-D_GNU_SOURCE', '-Isrc', str(source),
-                            'src/resource.c', '-o', str(executable)], check=True,
-                           capture_output=True)
-            port = root / 'include-server'
-            memory = Path(str(port) + '.memory')
-            env = dict(os.environ, INCLUDE_SERVER_PORT=str(port))
-            # A notification alone is not admission. A zero measurement keeps
-            # calibration serialized; a measured small scan permits another.
-            for peak in (0, 1024 * 1024):
-                memory.write_bytes((0).to_bytes(8, sys.byteorder))
-                proc = subprocess.Popen([executable], env=env, text=True,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                try:
-                    deadline = time.monotonic() + 3
-                    while True:
-                        if proc.poll() == 77:
-                            self.skipTest('at least two available CPUs required')
-                        self.assertIsNone(proc.poll())
-                        watches = Path(f'/proc/{proc.pid}/fdinfo')
-                        installed = False
-                        for entry in watches.iterdir():
-                            # The child can close an unrelated descriptor
-                            # between directory enumeration and inspection.
-                            with contextlib.suppress(FileNotFoundError):
-                                installed |= 'inotify wd:' in entry.read_text()
-                        if installed:
-                            break
-                        self.assertLess(time.monotonic(), deadline, 'memory watch was not installed')
-                        time.sleep(.01)
-                    with memory.open('r+b', buffering=0) as output:
-                        fcntl.lockf(output, fcntl.LOCK_EX)
-                        output.write(peak.to_bytes(8, sys.byteorder))
-                    stdout, stderr = proc.communicate(timeout=2)
-                    self.assertEqual(proc.returncode, 0, stderr)
-                    if peak:
-                        self.assertGreaterEqual(int(stdout), 2)
-                    else:
-                        self.assertLessEqual(int(stdout), 1)
-                finally:
-                    if proc.poll() is None:
-                        proc.kill()
-                    proc.communicate()
-            # Publication preceding watch registration must also avoid the
-            # five-second timeout: there is no future write to wake it.
-            result = subprocess.run([executable], env=env, capture_output=True,
-                                    text=True, timeout=2, check=True)
-            self.assertGreaterEqual(int(result.stdout), 2)
 
     def test_workload_classes_reserve_their_own_measured_peak(self):
         with tempfile.TemporaryDirectory(prefix='distcc-memory-model-') as directory:
@@ -814,9 +734,8 @@ int main(void) {
     unsigned small = dcc_resource_class(&job);
     input.plain_size = 2048;
     unsigned large = dcc_resource_class(&job);
-    job.kind = DCC_JOB_PUMP;
-    unsigned pump = dcc_resource_class(&job);
-    assert(small != large && pump != large);
+    unsigned other = 1 + DCC_JOB_THINLTO * DCC_MEMORY_BUCKETS + dcc_resource_bucket(2048);
+    assert(small != large && other != large);
     assert(dcc_resource_bucket(0) == 0);
     assert(dcc_resource_bucket(ULLONG_MAX) == 63);
     struct dcc_job_input rust_files[] = {input, {.path="/deps/libfoo.rlib", .plain_size=128*M}};
@@ -830,16 +749,14 @@ int main(void) {
     assert(dcc_resource_class(&rust) > rust_class + 20);
     assert(!dcc_resource_known(small));
     assert(dcc_resource_class_slots(16, small, 0) >= 2);
-    assert(dcc_resource_class_slots(16, pump, 0) >= 2);
+    assert(dcc_resource_class_slots(16, other, 0) >= 2);
     assert(dcc_resource_input_bytes(&job) == 2048);
     struct dcc_job_input profiled_inputs[] = {
         {.path="/main.c", .plain_size = 2048}, {.path="/data.rlib", .kind = DCC_JOB_READONLY, .plain_size = 80*M}
     };
-    struct dcc_job profiled = {.kind = DCC_JOB_PUMP, .count = 2, .inputs = profiled_inputs};
-    assert(dcc_resource_class(&profiled) == pump);
-    assert(dcc_resource_input_bytes(&profiled) == 2048);
-    profiled.kind = DCC_JOB_COMPILE;
+    struct dcc_job profiled = {.kind = DCC_JOB_COMPILE, .count = 2, .inputs = profiled_inputs};
     assert(dcc_resource_class(&profiled) == large);
+    assert(dcc_resource_input_bytes(&profiled) == 2048);
     profiled.kind = DCC_JOB_FRONTEND;
     assert(dcc_resource_class(&profiled) == 1 + DCC_JOB_FRONTEND * DCC_MEMORY_BUCKETS);
     assert(dcc_resource_input_bytes(&profiled) == 0);
@@ -868,17 +785,17 @@ int main(void) {
     assert(dcc_resource_job_bytes() == 1184*M);
     assert(dcc_resource_estimate(small) == 256*M);
     assert(dcc_resource_estimate(large) == 1184*M);
-    assert(dcc_resource_estimate(pump) == 1184*M);
-    assert(!dcc_resource_known(pump));
+    assert(dcc_resource_estimate(other) == 1184*M);
+    assert(!dcc_resource_known(other));
     /* Both may still fit all CPU slots on a high-memory test host. */
     assert(dcc_resource_class_slots(16, large, 0) <= small_slots);
     assert(dcc_resource_class_slots(16, small, 0) == small_slots);
     /* Later smaller successes must not erase the class's observed demand. */
     dcc_resource_observe(large, 64*M, 1);
     assert(dcc_resource_estimate(large) == 1184*M);
-    dcc_resource_observe(pump, 1536*M, 0);
-    assert(!dcc_resource_known(pump));
-    assert(dcc_resource_estimate(pump) == 1984*M);
+    dcc_resource_observe(other, 1536*M, 0);
+    assert(!dcc_resource_known(other));
+    assert(dcc_resource_estimate(other) == 1984*M);
     assert(dcc_resource_samples() == 3);
     assert(dcc_resource_peak_bytes() == 1536*M);
     assert(!dcc_resource_admit(small, ULLONG_MAX));
@@ -905,7 +822,7 @@ int main(void) {
      * sample through a complete CPU-sized cohort; retire it after two.
      * This models switching from a large C++ package to small C inputs of
      * the same size without resetting a live daemon's learning. */
-    unsigned recent = 1 + DCC_JOB_PUMP * DCC_MEMORY_BUCKETS + 62;
+    unsigned recent = 1 + DCC_JOB_COMPILE * DCC_MEMORY_BUCKETS + 62;
     unsigned cohort = dcc_resource_cpus();
     dcc_resource_observe(recent, 896*M, 1);
     for (unsigned i = 0; i < 2*cohort; ++i)
@@ -921,7 +838,7 @@ int main(void) {
     assert(dcc_resource_peak_bytes() == 1536*M);
     /* Previously unseen work uses recent demand plus the configured floor,
      * while lifetime telemetry remains available for diagnosis. */
-    unsigned unseen = 1 + DCC_JOB_COMPILE * DCC_MEMORY_BUCKETS + 62;
+    unsigned unseen = 1 + DCC_JOB_RUST * DCC_MEMORY_BUCKETS + 62;
     assert(!dcc_resource_known(unseen));
     assert(dcc_resource_estimate(unseen) == 512*M);
     dcc_resource_observe(recent, 896*M, 1);
@@ -936,7 +853,7 @@ int main(void) {
     assert(dcc_resource_job_bytes() == 512*M);
     assert(dcc_resource_spare_bytes() == 128*M);
     assert(dcc_resource_estimate(large) == 512*M);
-    assert(dcc_resource_known(pump));
+    assert(dcc_resource_known(other));
     assert(dcc_resource_class_slots(16, 1 + 63, 0) > 0);
     return 0;
 }''')

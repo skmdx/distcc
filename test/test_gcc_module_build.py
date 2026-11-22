@@ -28,10 +28,10 @@ class ModuleBuildTest(unittest.TestCase):
     def build(self, root, flags, source):
         # The small sources isolate the build contract; installed frontend
         # integration tests separately exercise the real GCC module ABI.
-        for directory in ('include_server', 'src', 'gcc-source/gcc', 'gcc-source/libcpp/include', 'headers'):
+        for directory in ('src', 'gcc-source/gcc', 'gcc-source/libcpp/include', 'headers'):
             (root/directory).mkdir(parents=True, exist_ok=True)
-        script = root/'include_server/build_gcc_scan.py'
-        shutil.copyfile(Path(__file__).resolve().parents[1]/'include_server/build_gcc_scan.py', script)
+        script = root/'src/build_gcc_scan.py'
+        shutil.copyfile(Path(__file__).resolve().parents[1]/'src/build_gcc_scan.py', script)
         version = subprocess.check_output(['gcc', '-dumpfullversion'], text=True).strip()
         (root/'gcc-source/gcc/BASE-VER').write_text(version)
         (root/'gcc-source/gcc/DATESTAMP').write_text('20260101')

@@ -245,7 +245,7 @@ unsigned long long dcc_resource_input_bytes(const struct dcc_job *job)
          * describe source complexity. Including one large common profile
          * collapses tiny and expensive compilations into the same class.
          * Storage remains charged through the cgroup's actual backing pages. */
-        if ((job->kind == DCC_JOB_COMPILE || job->kind == DCC_JOB_PUMP) &&
+        if (job->kind == DCC_JOB_COMPILE &&
             job->inputs[i].kind == DCC_JOB_READONLY) continue;
         unsigned long long size = job->inputs[i].plain_size;
         bytes = size <= ULLONG_MAX - bytes ? bytes + size : ULLONG_MAX;
@@ -470,58 +470,4 @@ int dcc_resource_admit(unsigned memory_class, unsigned long long reserved)
     unsigned long long spare = reserved ? dcc_resource_spare_bytes() : 0;
     if (!resource_slots(1, job, spare, 0)) return 0;
     return reserved <= budget - job - spare;
-}
-
-static int analysis_memory_path(char path[PATH_MAX])
-{
-    const char *port = getenv("INCLUDE_SERVER_PORT");
-    return port && snprintf(path, PATH_MAX, "%s.memory", port) < PATH_MAX;
-}
-
-int dcc_resource_analysis_slots(int maximum)
-{
-    char path[PATH_MAX];
-    uint64_t peak = 0;
-    /* The build-scoped pool publishes its observed resident+frontend peak.
-     * Compilation and ordinary preprocessing continue using their own model. */
-    if (analysis_memory_path(path)) {
-        int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-        if (fd >= 0) {
-            struct flock lock = {.l_type = F_RDLCK, .l_whence = SEEK_SET};
-            if (fcntl(fd, F_SETLKW, &lock) || read(fd, &peak, sizeof(peak)) != sizeof(peak))
-                peak = 0;
-            close(fd);
-        }
-    }
-    if (!peak) {
-        /* One real request calibrates demand before enabling parallel scans.
-         * Reserve the available budget; a full-compilation estimate must not
-         * prevent smaller native analysis from ever collecting a sample. */
-        sample_resources();
-        unsigned long long initial = available < budget ? available : budget;
-        return initial && maximum > 0 ? producer_slots(1, initial, 0) : 0;
-    }
-    unsigned long long job = measured_job_bytes(peak);
-    return producer_slots(maximum, job, peak);
-}
-
-void dcc_resource_analysis_wait(int occupied, unsigned timeout_ms)
-{
-    struct pollfd ready = {.fd = -1, .events = POLLIN};
-#ifdef __linux__
-    char path[PATH_MAX];
-    if (analysis_memory_path(path)) {
-        ready.fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
-        if (ready.fd >= 0 && inotify_add_watch(ready.fd, path, IN_MODIFY | IN_DELETE_SELF) < 0) {
-            close(ready.fd);
-            ready.fd = -1;
-        }
-    }
-#endif
-    /* Install the watch before rechecking admission: calibration may finish
-     * between releasing the rejected lease and starting this wait. The
-     * timeout still covers unrelated changes in the client's memory budget. */
-    if (occupied > dcc_resource_analysis_slots(dcc_resource_cpus()))
-        poll(&ready, 1, timeout_ms > INT_MAX ? INT_MAX : (int)timeout_ms);
-    if (ready.fd >= 0) close(ready.fd);
 }

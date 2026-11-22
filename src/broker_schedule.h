@@ -32,7 +32,6 @@ struct peer {
     uint64_t scopes[16], report_stamp;
     /* A collision suppresses speculative transmission. Keep this independent
      * of timings, which are unavailable for preprocessor-only requests. */
-    uint64_t dispatched[1024];
     unsigned next_scope;
     double report_until;
 };
@@ -58,7 +57,7 @@ struct client {
 struct broker_schedule {
     struct peer peers[MAX_HOSTS];
     struct client clients[MAX_CLIENTS];
-    int count, cpp_busy, cpp_limit, analysis_busy;
+    int count, cpp_busy, cpp_limit;
     uint64_t direct_completed, direct_prepared_completed;
     double local_prepare[DCC_WORK_CLASSES];
     struct dcc_work_model model;
@@ -88,5 +87,3 @@ enum decision schedule_request(struct broker_schedule *, struct client *, double
 void schedule_assign(struct broker_schedule *, struct client *, struct dispatch_batch *, const struct placement *, double now);
 void observe_local_prepare(struct broker_schedule *, unsigned kind, double sample);
 void observe(struct broker_schedule *, struct client *, const struct feedback *, double now);
-void record_dispatched(struct peer *, uint64_t family);
-int cold_family(struct peer *, uint64_t family);

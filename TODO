@@ -19,8 +19,8 @@ Clang result reuse and source scheduling (experimental)
     still exceed the installed baseline; steady supply is not proven improved.
     A matched whole-build pair now shows a wall/CPU benefit with no fallback.
     Release qualification is currently failing: the shared token decoder
-    rejects the legacy space-padded hexadecimal fields tested by protocol and
-    pump integration; the argument-rejection retry test times out for both
+    rejects the legacy space-padded hexadecimal fields tested by protocol
+    integration; the argument-rejection retry test times out for both
     fallback policies. Fix these contracts before the reverse full-build pair.
     Raw object equality is not claimed for heterogeneous/adaptive codegen.
 
@@ -64,7 +64,7 @@ type-check TCP integration tests
 
 should rewrite non-ELF, non-DWARF2 object files
 
-    The existing include-server code will rewrite ELF files to refer
+    The remote GCC frontend rewrites ELF files to refer
     to source-file names (in the DWARF2 sections) as they would appear
     on the client machine, rather than as they appear when rewritten
     on the server machine.  We should enhance that functionality to
@@ -515,7 +515,7 @@ check that all lengths are unsigned 32-bit
     I think this is done, but it's worth checking a bit more.
 
 
-in plain (non-pump) mode, abort when cpp fails
+abort when local preprocessing fails
 
     The same SIGCHLD handling approach used to feed the compiler from
     a fifo might be used to abort early if the preprocessor fails.
@@ -1127,20 +1127,6 @@ Large-scale Distribution
 -------------------------------------------------------------------------------
 DONE TODOs
 -------------------------------------------------------------------------------
-
-preprocess remotely [Done! This is distcc 3.0's "pump" mode.]
-
-    Some people might like to assume that all the machines have the same
-    headers installed, in which case we really can preprocess remotely and
-    only ship the source.  Imagine e.g. a Clearcase environment where the same
-    filesystem view is mounted on all machines, and they're all running the
-    exact same system release.
-
-    It's probably not really a good idea, because it will be marginally faster
-    but much more risky.  It is possible, though, and perhaps people building
-    files with enormous headers would like it.
-
-    Perhaps those people should just use a different tool like dmake, etc.
 
 SSH connection hoarding
 

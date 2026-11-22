@@ -120,8 +120,7 @@ int dcc_compress_file(int in_fd,
 
 /* A raw LZ4 block prefixed by its uncompressed size in network byte order.
  * Knowing the exact size avoids speculative allocations and repeated decoding.
- * Empty bulk files use the existing zero-length token; cached pump files may
- * also contain an LZ4 block encoding empty input.
+ * Empty bulk files use the zero-length token.
  */
 int dcc_compress_lz4_alloc(const char *in_buf, size_t in_len,
                            char **out_buf, size_t *out_len)

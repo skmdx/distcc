@@ -22,6 +22,9 @@ from test_broker import BrokerTestCase
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+from distcc_job import JOB_RUST_CGU
+
+
 @unittest.skipUnless(shutil.which('rustc') and shutil.which('bwrap'), 'rustc and bubblewrap required')
 class RustTest(BrokerTestCase):
     # A separate loopback address exercises TCP worker placement. A local
@@ -67,7 +70,7 @@ class RustTest(BrokerTestCase):
 
     def wire_plan(self, source, *, flags=(), requested=None, logical=None, extra=(), host='', crate_types='rlib'):
         """A real rustc closure for tests which hold or alter an individual TCP transaction."""
-        from distcc_job import RustCommand, fingerprint, manifest
+        from distcc_job import JOB_RUST, RustCommand, fingerprint, manifest
         root = subprocess.check_output([self.rustc, '--print=sysroot'], text=True).strip()
         depfile = self.work/'wire.d'
         subprocess.run([self.rustc, '--crate-type=rlib', '-Zbinary-dep-depinfo',
@@ -79,23 +82,23 @@ class RustTest(BrokerTestCase):
                 '-o', '/__distcc_rust/out/libwire.rlib', *flags]
         entries = [(logical if logical and path==source else path, *fingerprint(path), 1) for path in paths]
         command = RustCommand(phase=1, compiler=requested or self.version(self.rustc), crate_types=crate_types, host=host)
-        return manifest(3, self.work, args, entries, rust=command), paths
+        return manifest(JOB_RUST, self.work, args, entries, rust=command), paths
 
     def wire_result(self, net, identity, first=None):
         codec = runpy.run_path(str(self.build/'distcc-link'))['Lz4Chunks']()
         kind, data = first or self.frame(net)
-        while kind == 0x54000308:
+        while kind == 0x54000408:
             kind, data = self.frame(net)
-        self.assertEqual(kind, 0x54000303)
+        self.assertEqual(kind, 0x54000403)
         status, _, *sizes = struct.unpack('!II4Q', data[:40])
         streams = [bytearray() for _ in sizes]
         names = []
         while True:
             kind, data = self.frame(net)
-            if kind == 0x54000305:
+            if kind == 0x54000405:
                 self.assertEqual(data[:8], struct.pack('!Q', identity))
                 break
-            if kind == 0x5400030b:
+            if kind == 0x5400040b:
                 while data:
                     size, mode = struct.unpack_from('!QI', data)
                     name, data = data[12:].split(b'\0', 1)
@@ -103,7 +106,7 @@ class RustTest(BrokerTestCase):
                     sizes.append(size)
                     streams.append(bytearray())
                 continue
-            self.assertEqual(kind & ~0x30000, 0x54000304)
+            self.assertEqual(kind & ~0x30000, 0x54000404)
             index, plain = struct.unpack_from('!II', data)
             streams[index].extend(codec.decode(data[8:], plain) if kind & 0x10000 else data[8:])
         self.assertEqual(names, sorted(names))
@@ -113,11 +116,11 @@ class RustTest(BrokerTestCase):
     def raw_compile(self, source, **kw):
         body, paths = self.wire_plan(source, **kw)
         with socket.create_connection((self.worker_address, self.ports[0]), timeout=15) as net:
-            self.send(net, 0x54000300, struct.pack('!Q',1)+body)
+            self.send(net, 0x54000400, struct.pack('!Q',1)+body)
             kind, needed = self.frame(net)
-            if kind != 0x54000301:
+            if kind != 0x54000401:
                 return self.wire_result(net, 1, (kind, needed))
-            self.assertEqual(kind, 0x54000301)
+            self.assertEqual(kind, 0x54000401)
             for i, path in enumerate(paths):
                 if needed[i//8] & (1 << (i%8)): self.upload(net, path.read_bytes(), i)
             return self.wire_result(net, 1)
@@ -292,7 +295,7 @@ class RustTest(BrokerTestCase):
         peer = self.peer(worker_stats)
         self.start_broker(self.host(0, f',tcp,stats={peer.port}', slots=1), name='one-lane')
         def request_cgu(command):
-            return self.request(command, work=(1, 65536, 11), memory_class=1+8*64+16,
+            return self.request(command, work=(1, 65536, 11), memory_class=1+JOB_RUST_CGU*64+16,
                                 cgu_backend=f'{version} {target}'.encode())
 
         cold = request_cgu(20)
@@ -519,7 +522,7 @@ class RustTest(BrokerTestCase):
         self.assertEqual(offers[0][1], {key(self.version(other))})
         self.assertIn(key(identity), offers[1][1])
         self.assertTrue(all((abi, backend) in backends for _, _, backends in offers))
-        capacity = self.request(20, work=(1, 65536, 11), memory_class=1+8*64+16,
+        capacity = self.request(20, work=(1, 65536, 11), memory_class=1+JOB_RUST_CGU*64+16,
                                 cgu_backend=f'{abi} {backend}'.encode(), rust_compiler=int(key(identity), 16))
         self.assertEqual(struct.unpack_from('=iiIi', capacity.recv(1036)), (0, 2, 0, 1))
         (self.work/'Cargo.toml').touch()
@@ -683,7 +686,7 @@ class RustTest(BrokerTestCase):
         folder = self.work/'patch-worker'
         folder.mkdir()
         daemon = folder/'distccd'
-        os.link(self.build/'distccd', daemon)
+        shutil.copy2(self.build/'distccd', daemon)
         shim = folder/'version.c'
         shim.write_text('#include <stdio.h>\n#include <unistd.h>\n'
                         'void __real_LLVMGetVersion(unsigned*,unsigned*,unsigned*);\n'
@@ -746,7 +749,7 @@ class RustTest(BrokerTestCase):
                 self.assertIn('dcc_rust_host '+(native if host == native else '-'), stats)
                 self.assertIn(llvm+' '+backend, next(l for l in stats.splitlines() if l.startswith('dcc_llvm_cgu ')))
                 for incompatible in ('0.0.0 '+backend, llvm+' absent-backend'):
-                    request = self.request(10, work=(1, 65536, 11), memory_class=1+8*64+16,
+                    request = self.request(10, work=(1, 65536, 11), memory_class=1+JOB_RUST_CGU*64+16,
                                            cgu_backend=incompatible.encode())
                     self.assertEqual(self.receive(request)[0], 121)
                 counts = self.completed_jobs()
@@ -1408,7 +1411,7 @@ class RustTest(BrokerTestCase):
             first, _ = listener.accept()
             with first:
                 first.settimeout(10)
-                self.assertEqual(first.recv(4, socket.MSG_WAITALL), struct.pack('!I', 0x54000300))
+                self.assertEqual(first.recv(4, socket.MSG_WAITALL), struct.pack('!I', 0x54000400))
             second, _ = listener.accept()
             with second, socket.create_connection((self.worker_address, self.ports[0]), timeout=10) as worker:
                 peers = {second: worker, worker: second}
@@ -1685,7 +1688,7 @@ class RustTest(BrokerTestCase):
             with self.subTest(flags=flags, types=types):
                 body, _ = self.wire_plan(src, flags=flags, crate_types=types)
                 with socket.create_connection((self.worker_address, self.ports[0])) as net:
-                    self.send(net, 0x54000300, struct.pack('!Q', 1) + body)
+                    self.send(net, 0x54000400, struct.pack('!Q', 1) + body)
                     self.assertEqual(net.recv(1), b'')
 
     def test_repeated_emits_preserve_remote_outputs(self):
@@ -2107,14 +2110,14 @@ pub fn context(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             # Reserve the actual Rust inputs, then stop sending as a disconnected
             # uploader would. The real file-job client has the same inputs.
             manifest = struct.pack('!Q', 999) + body
-            owner.sendall(struct.pack('!II', 0x54000300, len(manifest)) + manifest)
+            owner.sendall(struct.pack('!II', 0x54000400, len(manifest)) + manifest)
             header = bytearray()
             while len(header) < 8:
                 part = owner.recv(8 - len(header))
                 self.assertTrue(part)
                 header.extend(part)
             kind, size = struct.unpack('!II', header)
-            self.assertEqual(kind, 0x54000301)
+            self.assertEqual(kind, 0x54000401)
             while size:
                 part = owner.recv(size)
                 self.assertTrue(part)
@@ -2135,16 +2138,16 @@ pub fn context(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
         subprocess.run([self.work / 'recovery-check'], check=True, timeout=5)
 
     def reserve_input_space(self, identity):
-        from distcc_job import manifest as job_manifest
+        from distcc_job import JOB_COMPILE, manifest as job_manifest
         args = [b'gcc', b'-c', b'/src/held.c', b'-o', b'/src/held.o']
         space = os.statvfs(self.root)
         size = space.f_bavail * space.f_frsize - 8 * 1024 * 1024
         digest = struct.pack('!Q', identity)
-        manifest = digest + job_manifest(1, '/src', args, [
+        manifest = digest + job_manifest(JOB_COMPILE, '/src', args, [
             ('/src/held.c', size, digest, 0), ('/src/marker', 1, digest, 1)])
         net = socket.create_connection((self.worker_address, self.ports[0]), timeout=5)
         self.addCleanup(net.close)
-        net.sendall(struct.pack('!II', 0x54000300, len(manifest)) + manifest)
+        net.sendall(struct.pack('!II', 0x54000400, len(manifest)) + manifest)
         return net
 
     def test_shared_inputs_survive_cancel_and_eviction_and_are_read_only(self):
@@ -2180,10 +2183,10 @@ pub fn read_only() -> bool {
             sockets.append(net)
             # The planner's scheduling hint is consumed locally, before the
             # transport encodes the unchanged worker job description.
-            self.send(net, 0x54000300, struct.pack('!Q', identity) + body)
+            self.send(net, 0x54000400, struct.pack('!Q', identity) + body)
             if identity == 1:
                 kind, requested = self.frame(net)
-                self.assertEqual(kind, 0x54000301)
+                self.assertEqual(kind, 0x54000401)
                 for index in range(len(requested) * 8):
                     if not requested[index // 8] & (1 << (index % 8)): continue
                     if index != manifest_index:
@@ -2200,7 +2203,7 @@ pub fn read_only() -> bool {
                 # Leave only 8 MiB of unreserved capacity. The other jobs fit
                 # only if admission counts shared files as already stored.
                 held = self.reserve_input_space(999)
-                self.assertEqual(self.frame(held), (0x54000301, b'\x02'))
+                self.assertEqual(self.frame(held), (0x54000401, b'\x02'))
 
         deadline = time.monotonic() + 10
         relative = str(payload).lstrip('/')
@@ -2228,7 +2231,7 @@ pub fn read_only() -> bool {
         promoted = select.select(sockets[1:], [], [], 5)[0]
         self.assertEqual(len(promoted), 1)
         kind, requested = self.frame(promoted[0])
-        self.assertEqual(kind, 0x54000301)
+        self.assertEqual(kind, 0x54000401)
         self.assertEqual(int.from_bytes(requested, 'little'), 1 << manifest_index)
         self.upload(promoted[0], marker.read_bytes(), manifest_index)
         for identity, net in enumerate(sockets[1:], 2):
@@ -2274,7 +2277,7 @@ pub fn read_only() -> bool {
             payload.write(os.urandom(32))
             payload.truncate(32 * 1024 * 1024)
         held = self.reserve_input_space(101)
-        self.assertEqual(held.recv(9, socket.MSG_WAITALL), struct.pack('!IIB', 0x54000301, 1, 2))
+        self.assertEqual(held.recv(9, socket.MSG_WAITALL), struct.pack('!IIB', 0x54000401, 1, 2))
         cancelled = self.reserve_input_space(102)
         preparing(2)
         cancelled.close()

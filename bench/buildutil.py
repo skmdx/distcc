@@ -30,11 +30,11 @@ def run_cmd(cmd, expected=0):
     import time, os
     
     before = time.time()
-    print '%% %s' % cmd
+    print('%% %s' % cmd)
     result = os.system(cmd)
     after = time.time()
     elapsed = (after - before)
-    print '%16.4fs elapsed\n' % elapsed
+    print('%16.4fs elapsed\n' % elapsed)
     if expected is not None:
         if expected != result:
             raise AssertionError("command failed: expected status %d, got %d",
@@ -53,7 +53,7 @@ def count_hosts(hosts):
     num_hosts = 0
     for host in hosts.split():
       if host == '+zeroconf':
-        raise ValueError, "Can't count hosts when +zeroconf is in DISTCC_HOSTS"
+        raise ValueError("Can't count hosts when +zeroconf is in DISTCC_HOSTS")
       if host.startswith('-'):
         # Don't count options such as '--randomize', '--localslots=N',
         # or '--localslots_cpp=N' as hosts.
@@ -77,7 +77,7 @@ def tweak_hosts(hosts, max_hosts, opts):
     hosts_list = []
     for host in hosts.split():
       if host == '+zeroconf':
-        raise ValueError, "Can't limit hosts when +zeroconf in DISTCC_HOSTS"
+        raise ValueError("Can't limit hosts when +zeroconf in DISTCC_HOSTS")
       if host.startswith('-'):
         # Don't count options such as '--randomize', '--localslots=N',
         # or '--localslots_cpp=N' as hosts; but keep them in the host list.

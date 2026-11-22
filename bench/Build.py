@@ -33,11 +33,10 @@ RE_TIME = re.compile(r"""^real \s* (\d*\.\d*)\n
 
 class TimeInfo:
    """A record of real, system, and user time."""
-   def __init__(self, real=None, system=None, user=None, include_server=None):
+   def __init__(self, real=None, system=None, user=None):
       self.real = real
       self.system = system
       self.user = user
-      self.include_server = include_server
 
 
 class Build:
@@ -70,7 +69,7 @@ class Build:
         self.configure_done = os.path.join(self.log_dir, "bench-configure.done")
 
     def __repr__(self):
-        return "Build(%s, %s)" % (`self.project`, `self.compiler`)
+        return "Build(%s, %s)" % (repr(self.project), repr(self.compiler))
 
     def _run_cmd_with_redirect_farm(self, cmd):
         """Initialize shell script farm for given compiler,
@@ -83,7 +82,7 @@ class Build:
         """
         farm_dir = os.path.join(self.build_dir, 'build-cc-script-farm')
         make_dir(farm_dir)
-        print ("** Creating masquerading shell scripts in '%s'" % farm_dir)
+        print(("** Creating masquerading shell scripts in '%s'" % farm_dir))
         masquerade = os.path.join(self.build_dir, 'masquerade')
         prepare_shell_script_farm(self.compiler, farm_dir, masquerade)
         old_path = os.environ['PATH'] 
@@ -105,7 +104,7 @@ class Build:
                                          self.project.package_file)
 
         make_dir(self.base_dir)
-        print "** Unpacking..."
+        print("** Unpacking...")
         run_cmd("cd %s && %s" % (self.base_dir, tar_cmd))
 
 
@@ -119,7 +118,7 @@ class Build:
         rm_files((configure_log, distcc_log, self.configure_done))
 
         make_dir(self.build_dir)
-        print "** Configuring..."
+        print("** Configuring...")
         cmd = ("cd %s && \\\nDISTCC_LOG='%s' \\\nCC='%s' \\\nCXX='%s' \\\n%s \\\n>%s 2>&1"
                % (self.build_dir, distcc_log,
                   self.compiler.cc, self.compiler.cxx,
@@ -130,28 +129,19 @@ class Build:
 
     @staticmethod
     def _extract_time_info(log_file_name):
-	"""Open log file and look for output of 'time -p' and include server 
-	time."""
-	log_file = open(log_file_name, 'r')
-	text = log_file.read()
-	log_file.close()
+        """Read the wall, user and system times reported by time -p."""
+        log_file = open(log_file_name, 'r')
+        text = log_file.read()
+        log_file.close()
 
-	match = RE_TIME.search(text)
-	if not match:
-	    sys.exit('Could not locate time information in log %s.'
-		     % log_file_name)
-	time_info = TimeInfo(float(match.group(1)),
-			     float(match.group(2)),
-			     float(match.group(3)))
-	# Now locate include server cpu time if present.
-	lines = text.splitlines()
-	for line in lines:
-	   if line.startswith('Include server timing.  '):
-	      is_time = float(
-		 line[len('Include server timing.  '):].split()[9][:-1])
-	      time_info.include_server = is_time
-	      break
-	return time_info
+        match = RE_TIME.search(text)
+        if not match:
+            sys.exit('Could not locate time information in log %s.'
+                     % log_file_name)
+        time_info = TimeInfo(float(match.group(1)),
+                             float(match.group(2)),
+                             float(match.group(3)))
+        return time_info
 
     def did_configure(self):
         """Returns true if configure was successfully run for this
@@ -170,7 +160,7 @@ class Build:
         rm_files((build_log, distcc_log))
 
         make_dir(self.build_dir)
-        print "** Building..."
+        print("** Building...")
         if self.project.pre_build_cmd:
             cmd = ("cd %s && %s > %s 2>&1" % (self.build_dir,
                                               self.project.pre_build_cmd,
@@ -185,15 +175,12 @@ class Build:
         cmd = ("cd %s && \\\n"
                "(time -p \\\n"
                "DISTCC_HOSTS='%s' \\\n"
-               "INCLUDE_SERVER_ARGS='-t --unsafe_absolute_includes %s' \\\n"
-               "%s%s \\\nDISTCC_LOG='%s' \\\nCC='%s' \\\nCXX='%s' "
+               "%s \\\nDISTCC_LOG='%s' \\\nCC='%s' \\\nCXX='%s' "
                "\\\n%s)"
                "\\\n>%s 2>&1"
                %
                (self.build_dir,
                 distcc_hosts,
-                self.project.include_server_args,
-                self.compiler.pump_cmd,
                 self.project.build_cmd,
                 distcc_log,
                 self.compiler.cc,
@@ -206,12 +193,12 @@ class Build:
     def clean(self):
         clean_log = os.path.join(self.log_dir, "bench-clean.log")
         make_dir(self.build_dir)
-        print "** Cleaning build directory"
+        print("** Cleaning build directory")
         cmd = "cd %s && make clean >%s 2>&1" % (self.build_dir, clean_log)
         self._run_cmd_with_redirect_farm(cmd)
 
     def scrub(self):
-        print "** Removing build directory"
+        print("** Removing build directory")
         rm_files((self.configure_done, ))
         run_cmd("rm -rf %s" % self.unpacked_dir)
 
@@ -248,6 +235,6 @@ class Build:
             summary.store(self.project, self.compiler, time_info_accumulator)
         except KeyboardInterrupt:
             raise
-        except:
-            apply(sys.excepthook, sys.exc_info()) # print traceback
+        except Exception as error:
+            sys.excepthook(type(error), error, error.__traceback__)
             summary.store(self.project, self.compiler, 'FAIL WITH EXCEPTION')

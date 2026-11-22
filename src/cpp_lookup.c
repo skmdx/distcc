@@ -39,25 +39,12 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int enabled;
 static _Atomic unsigned failed_lookups;
 static int saved_output = -1;
-static int saved_stdout = -1;
-static int output_fd = STDOUT_FILENO;
-static int native_manifest_complete;
 static char *working_directory, *command;
 static char **arguments;
 static int (*next_open)(const char *, int, ...);
 static int (*next_chdir)(const char *);
 static int (*next_fchdir)(int);
 static pthread_once_t bindings = PTHREAD_ONCE_INIT;
-
-void dcc_cpp_lookup_manifest_complete(void);
-void dcc_cpp_lookup_manifest_complete(void)
-{
-    /* The native manifest records each failed candidate as well as positive
-     * inputs. The include server validates these identities before publication,
-     * including namespace changes during the scan. Rechecking whole directory
-     * timestamps here would replay scans for unrelated generated files. */
-    native_manifest_complete = 1;
-}
 
 static void bind_libc(void)
 {
@@ -245,17 +232,8 @@ __attribute__((constructor)) static void initialize(void)
     exe[size] = 0;
     const char *name = strrchr(exe, '/');
     if (!name || (strcmp(name + 1, "cc1") && strcmp(name + 1, "cc1plus"))) return;
-    /* Native dependency scans publish into their manifest descriptor instead
-     * of stdout. A replay must replace that manifest before the caller sees it. */
-    const char *descriptor = getenv("DISTCC_CPP_LOOKUP_OUTPUT_FD");
-    if (descriptor) {
-        char *end;
-        long value = strtol(descriptor, &end, 10);
-        if (!*descriptor || *end || value < 3 || value > INT_MAX) return;
-        output_fd = (int)value;
-    }
     struct stat output;
-    if (fstat(output_fd, &output) || !S_ISREG(output.st_mode) || lseek(output_fd, 0, SEEK_CUR) != 0) return;
+    if (fstat(STDOUT_FILENO, &output) || !S_ISREG(output.st_mode) || lseek(STDOUT_FILENO, 0, SEEK_CUR) != 0) return;
     FILE *stream = fopen("/proc/self/cmdline", "rb");
     if (!stream) return;
     size_t capacity = 0;
@@ -266,40 +244,25 @@ __attribute__((constructor)) static void initialize(void)
     for (ssize_t i = 0; i < used; ++i) if (!command[i]) count++;
     arguments = calloc(count + 1, sizeof(*arguments));
     if (!arguments) return;
-    int preprocess = 0, native_scan = 0;
+    int preprocess = 0;
     char *p = command;
     for (size_t i = 0; i < count; ++i) {
         arguments[i] = p;
         if (!strcmp(p, "-E")) preprocess = 1;
-        if (!strncmp(p, "-fplugin", 8)) {
-            if (!descriptor) return;
-            if (!strncmp(p, "-fplugin=", 9)) {
-                const char *base = strrchr(p + 9, '/');
-                if (strcmp(base ? base + 1 : p + 9, "distcc_gcc_scan.so")) return;
-                native_scan = 1;
-            }
-        }
+        if (!strncmp(p, "-fplugin", 8)) return;
         p += strlen(p) + 1;
     }
-    if (descriptor && !native_scan) return;
     working_directory = getcwd(NULL, 0);
     if (preprocess && working_directory) {
-        saved_output = fcntl(output_fd, F_DUPFD_CLOEXEC, 3);
-        /* GCC closes stdout before destructors run, even in dependency mode. */
-        if (output_fd != STDOUT_FILENO)
-            saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
+        saved_output = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
     }
-    enabled = saved_output >= 0 && (output_fd == STDOUT_FILENO || saved_stdout >= 0);
+    enabled = saved_output >= 0;
 }
 
 __attribute__((destructor)) static void validate(void)
 {
     pthread_mutex_lock(&lock);
     enabled = 0;
-    if (native_manifest_complete) {
-        pthread_mutex_unlock(&lock);
-        return;
-    }
     int changed = 0;
     for (unsigned i = 0; i < BUCKETS; ++i) {
         for (struct directory *d = directories[i]; d; d = d->next) {
@@ -314,8 +277,7 @@ __attribute__((destructor)) static void validate(void)
     enabled = 0;
     if (setenv("DISTCC_CPP_LOOKUP", "0", 1) || next_chdir(working_directory) ||
         fflush(NULL) || ftruncate(saved_output, 0) || lseek(saved_output, 0, SEEK_SET) != 0 ||
-        dup2(saved_output, output_fd) < 0 ||
-        (saved_stdout >= 0 && dup2(saved_stdout, STDOUT_FILENO) < 0)) _exit(75);
+        dup2(saved_output, STDOUT_FILENO) < 0) _exit(75);
     execv("/proc/self/exe", arguments);
     _exit(75);
 }
