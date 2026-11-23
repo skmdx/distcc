@@ -6,6 +6,7 @@ import concurrent.futures
 import os
 import re
 import select
+import shlex
 from pathlib import Path
 import socket
 import shutil
@@ -69,6 +70,23 @@ class MemoReconnectTest(unittest.TestCase):
 
 class BrokerTestCase(DistccTestCase):
     protocol_version = BROKER_VERSION
+
+    def clang_slot(self, compiler):
+        major = subprocess.check_output([compiler, '-dumpversion'], text=True).strip().split('.')[0]
+        resident = self.build / f'distcc-clang-{major}'
+        if not resident.is_file():
+            self.skipTest(f'Clang {major} frontend required')
+        return resident.resolve()
+
+    def trace_local_worker(self):
+        trace = self.work/'resident.trace'
+        helper = self.work/'trace-helper'
+        helper.write_text('#!/bin/sh\nexec strace -D -f -qq -e trace=process,recvmsg -o ' +
+                          shlex.quote(str(trace)) + ' ' + shlex.quote(str(self.build/'distcc-clang')) +
+                          ' "$@"\n')
+        helper.chmod(0o755)
+        self.env['DISTCC_CLANG_DRIVER'] = str(helper)
+        return trace
 
     def start_memory_refusal(self):
         # The first snapshot fits; before execution the real daemon's memory

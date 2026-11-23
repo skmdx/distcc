@@ -33,7 +33,7 @@ LLVM_TARGET_LIBDIR = $(patsubst $(LLVM_SYSROOT)/%,/%,$(shell $(LLVM_CONFIG) --li
 LLVM_TARGET_BINDIR = $(patsubst $(LLVM_SYSROOT)/%,/%,$(shell $(LLVM_CONFIG) --bindir))
 LTO_LIBDIR ?= $(LLVM_TARGET_LIBDIR)/distcc
 LTO_BINDIR ?= $(LLVM_TARGET_BINDIR)
-LTO_TARGETS = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),$(LTO_BUILD)/distcc-lto $(LTO_BUILD)/distcc-rust-cgu $(LTO_BUILD)/distcc-rust-cgu.so $(LTO_BUILD)/distcc-clang)
+LTO_TARGETS = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),$(LTO_BUILD)/distcc-rust-cgu $(LTO_BUILD)/distcc-rust-cgu.so $(LTO_BUILD)/distcc-clang)
 # Upstream Clang owns extraction, device grouping and image registration.
 # Point at its clang/tools/clang-linker-wrapper source directory to build it.
 LLVM_WRAPPER_SOURCE ?=
@@ -195,7 +195,6 @@ dist_extra =							\
 	distcc-thinlto \
 	distcc-offload-link \
 	distcc_lto.py \
-	src/lto.cc \
 	src/lto_worker.cc \
 	src/lto_partition.cc \
 	src/lto_partition.h \
@@ -242,6 +241,7 @@ test_SOURCE = test/comfychair.py \
 	test/gcc_files_contract.cc \
 	test/file_cache.c \
 	test/client_hotpaths.c \
+	test/h_lto_split.cc \
 	test/plan_dependency_calls.cc \
 	test/resource.c \
 	test/frontend_metadata_contract.c \
@@ -559,15 +559,18 @@ $(LTO_BUILD)/distcc-clang: $(CLANG_OBJECTS) $(LTO_BUILD)/clang_worker_loop.o $(L
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $^ `$(LLVM_CONFIG) --ldflags` -Wl,-rpath,$(LLVM_TARGET_LIBDIR) '-Wl,--export-dynamic-symbol=_ZN4llvm3lto11thinBackend*' -lclang-cpp -llldELF -llldCommon -lLLVM -lxxhash -llz4 -ldl -lseccomp
 
 CLANG_MAJOR = $(firstword $(subst ., ,$(shell $(LLVM_CONFIG) --version)))
-.PHONY: clang-slots clang-slot
+.PHONY: clang-slots clang-slot split-test-slots split-test-slot
 clang-slot: $(LTO_BUILD)/distcc-clang
 	ln -srf $< distcc-clang-$(CLANG_MAJOR)
 
-clang-slots: $(if $(LTO_TARGETS),clang-slot)
+split-test-slot: $(LTO_BUILD)/h_lto_split
+split-test-slots: clang-slots
+
+clang-slots split-test-slots: %s: $(if $(LTO_TARGETS),%)
 	+@for config in $(subst :, ,$(DISTCC_CLANG_CONFIGS)); do \
 	  major=$$("$$config" --version | cut -d. -f1) || exit 1; \
 	  if test "$$major" != "$(CLANG_MAJOR)"; then \
-	    $(MAKE) clang-slot LLVM_CONFIG="$$config" LTO_BUILD="llvm-lto-$$major" || exit 1; \
+	    $(MAKE) $* LLVM_CONFIG="$$config" LTO_BUILD="llvm-lto-$$major" || exit 1; \
 	  fi; \
 	done
 
@@ -585,11 +588,7 @@ $(LTO_BUILD)/lto_partition.o: $(srcdir)/src/lto_partition.cc $(srcdir)/src/lto_p
 	$(mkinstalldirs) "$(LTO_BUILD)"
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -c $< -o $@
 
-$(LTO_BUILD)/lto.o: $(srcdir)/src/lto.cc $(srcdir)/src/lto_partition.h
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -MMD -c $< -o $@
-
-$(LTO_BUILD)/distcc-lto: $(LTO_BUILD)/lto.o $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o
+$(LTO_BUILD)/h_lto_split: $(srcdir)/test/h_lto_split.cc $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $^ `$(LLVM_CONFIG) --ldflags` -lLLVM
 
 .PHONY: lto install-lto
@@ -597,10 +596,9 @@ lto: $(LTO_TARGETS) $(if $(LTO_TARGETS),clang-slot)
 
 install-lto: $(LTO_TARGETS)
 	if test -n "$(LTO_TARGETS)"; then \
-	  $(mkinstalldirs) "$(DESTDIR)$(LTO_LIBDIR)" "$(DESTDIR)$(LTO_BINDIR)" "$(DESTDIR)$(pkglibexecdir)" && \
+	  $(mkinstalldirs) "$(DESTDIR)$(LTO_LIBDIR)" "$(DESTDIR)$(pkglibexecdir)" && \
 	  $(INSTALL_PROGRAM) $(LTO_TARGETS) "$(DESTDIR)$(LTO_LIBDIR)/" && \
-	  ln -srf "$(DESTDIR)$(LTO_LIBDIR)/distcc-clang" "$(DESTDIR)$(pkglibexecdir)/distcc-clang-$(CLANG_MAJOR)" && \
-	  ln -srf "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_BINDIR)/distcc-lto"; \
+	  ln -srf "$(DESTDIR)$(LTO_LIBDIR)/distcc-clang" "$(DESTDIR)$(pkglibexecdir)/distcc-clang-$(CLANG_MAJOR)"; \
 	fi
 
 src/rust/native.o src/rust/audit.o: src/%.o: $(srcdir)/src/%.cc
@@ -916,7 +914,7 @@ maintainer-check: distcc-maintainer-check preprocess-check
 h_codec.so: $(srcdir)/src/file_cache.c $(srcdir)/src/argv_file.c src/config.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -shared -fPIC $(LDFLAGS) -o $@ $(filter %.c,$^) -lxxhash
 
-adaptive-check: all check_programs h_client_hotpaths h_resource h_file_cache h_codec.so
+adaptive-check: all check_programs split-test-slots h_client_hotpaths h_resource h_file_cache h_codec.so
 	$(PYTHON) "$(srcdir)/test/test_state.py" -v
 	$(PYTHON) "$(srcdir)/test/test_portage_jobs.py" -v
 	$(PYTHON) "$(srcdir)/test/test_adaptive.py" -v
@@ -1254,7 +1252,7 @@ uninstall-programs:
 	rm -f "$(DESTDIR)$(libdir)/distcc/cpp_lookup.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/gcc_plan.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"
-	rm -f "$(DESTDIR)$(LTO_BINDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu.so"
+	rm -f "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu.so"
 	for p in $(private_scripts) $(private_modules) distcc-linker-wrapper distcc; do rm -f "$(DESTDIR)$(pkglibexecdir)/$$p"; done
 	rm -f "$(DESTDIR)$(bindir)/distcc-rust"
 	for p in $(bin_PROGRAMS); do			\

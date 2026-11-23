@@ -17,7 +17,7 @@ from test_adaptive import stats_response
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from distcc_job import JOB_THINLTO, fingerprint, write_metadata
-from distcc_lto import FileJobs, InputSnapshot, llvm_tools, work_key
+from distcc_lto import FileJobs, InputSnapshot, work_key
 
 
 @unittest.skipUnless(all(shutil.which(tool) for tool in ('clang', 'bwrap', 'sandbox')),
@@ -114,6 +114,9 @@ class ThinLTOTest(BrokerTestCase):
         self.env.update(DISTCC_VERBOSE='1', PATH=str(self.build) + os.pathsep + os.environ['PATH'])
         self.env.pop('DISTCC_LINK_SYSROOT', None)
 
+    def partition_probe(self, compiler):
+        return self.clang_slot(compiler).with_name('h_lto_split')
+
     def run_command(self, command, **kwargs):
         try:
             return subprocess.run(list(map(str, command)), cwd=self.work, env=self.env,
@@ -142,6 +145,44 @@ class ThinLTOTest(BrokerTestCase):
             self.assertNotEqual(work_key(job, files), key)
             self.assertEqual(item.path.read_bytes(), b'original input')
             hashed.assert_called_once_with(item.path)
+
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_link_and_index_plans_share_the_serial_worker(self):
+        trace = self.trace_local_worker()
+        self.env['DISTCC_CLANG_LOCAL'] = '1'
+        compiler = shutil.which('clang')
+        assert compiler is not None
+        # Each L request produces a driver diagnostic and ends before backend execution.
+        # The next request must still see its own diagnostics, cwd and result stream.
+        plan = self.work/'plan.json'
+        plan.write_text('[]')
+        lane = FileJobs(self.build/'distcc', self.env, ())
+        self.addCleanup(lane.close)
+        for i in range(2):
+            obj = f'missing-{i}.o'
+            linked = self.run_command([self.build/'distcc', compiler, obj, '-o', 'out'])
+            self.assertNotEqual(linked.returncode, 0)
+            self.assertIn(obj, linked.stderr)
+            self.assertEqual(linked.stdout, '')
+            self.assertEqual(lane.plan(compiler, plan), [])
+        events = trace.read_text()
+        self.assertNotIn('/distcc-lto"', events)
+        resident = re.search(r'execve\("[^"]*/distcc-clang-\d+",[^\n]* = 0', events)
+        self.assertIsNotNone(resident, events)
+        assert resident is not None
+        plans = events[resident.end():]
+        for op in 'LN':
+            self.assertEqual(plans.count(f'iov_base="{op}\\0'), 2, plans)
+        self.assertNotRegex(plans, r'\b(?:clone3?|vfork|fork)\(')
+
+    def test_missing_planner_keeps_whole_module_backends(self):
+        # The launcher reports U for an absent sibling. Remote backends still
+        # use the real compiler installed on the daemon.
+        launcher = self.work/'distcc-clang'
+        shutil.copy2(self.build/'distcc-clang', launcher)
+        self.env.update(DISTCC_CLANG_LOCAL='0', DISTCC_CLANG_DRIVER=str(launcher))
+        result = self.link('clang')
+        self.assertNotIn('distcc-thinlto: partitioned ', result.stderr)
 
     def link(self, compiler, archive=False, hip=False):
         objects = []
@@ -188,6 +229,8 @@ class ThinLTOTest(BrokerTestCase):
             expected = self.run_command([reference, *arguments])
             actual = self.run_command([output, *arguments])
             self.assertEqual((actual.returncode, actual.stdout), (expected.returncode, expected.stdout))
+
+        return result
 
     def test_objects_and_imports(self):
         self.link(shutil.which('clang'))
@@ -497,7 +540,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         else:
             lane = FileJobs(self.build/'distcc', self.env, (), capacity=True)
             self.addCleanup(lane.close)
-            self.assertGreater(lane.read_capacity()['jobs'], 0)
+            self.assertGreater(lane.read_json(b'CAPA')['jobs'], 0)
             self.assertNotEqual(lane.result(lane.submit([self.work/'absent', inputs, output])), 0)
             for _ in range(2):
                 marker = lane.submit([metadata, inputs, output])
@@ -554,7 +597,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         lane = FileJobs(self.build/'distcc', env, (), capacity=True)
         self.addCleanup(lane.close)
         with self.assertRaises(subprocess.CalledProcessError) as failure:
-            lane.read_capacity()
+            lane.read_json(b'CAPA')
         self.assertEqual(failure.exception.returncode, expected)
 
     def test_capacity_uses_worker_speed_without_increasing_concurrency(self):
@@ -591,8 +634,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     def test_dominant_function_skips_unproductive_partitioning(self):
         compiler = shutil.which('clang')
-        if not llvm_tools(compiler):
-            self.skipTest('matching LLVM partition helpers are not installed')
+        self.clang_slot(compiler)
         source = self.work / 'dominant.c'
         source.write_text('__attribute__((noinline)) int heavy(int x) { volatile int v=x;\n' +
                           '\n'.join(f'v = (v * 3 + {i}) % 101;' for i in range(128)) +
@@ -622,8 +664,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
     def check_partitioned_backend(self, portage=False):
         """Execute real partitions, then compare the final link's ABI and behavior."""
         compiler = shutil.which('clang++')
-        if not llvm_tools(compiler):
-            self.skipTest('matching LLVM partition helpers are not installed')
+        self.clang_slot(compiler)
         heavy = self.work / 'heavy.cc'
         definitions = '\n'.join(
             f'__attribute__((noinline)) static int local_{i}(int x) '
@@ -695,9 +736,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
                     self.check_partition_balance(compiler)
 
     def check_partition_balance(self, compiler):
-        tools = llvm_tools(compiler)
-        if not tools:
-            self.skipTest('matching LLVM partition helpers are not installed')
+        probe = self.partition_probe(compiler)
         source = self.work / 'uneven.ll'
         definitions = []
         sizes = [60] * 9 + [3] * 18
@@ -718,7 +757,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         loads, identities = [], []
         objects = []
         for run in range(2):
-            result = self.run_command([tools['plan'], 'split', source, '3',
+            result = self.run_command([probe, source, '3',
                                        self.work / f'balanced-{run}-'])
             self.assertEqual(result.returncode, 0, result.stderr)
             parts = json.loads(result.stdout)['parts']
@@ -747,9 +786,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     def test_module_assembly_preserves_private_definitions(self):
         compiler = shutil.which('clang')
-        tools = llvm_tools(compiler)
-        if not tools:
-            self.skipTest('matching LLVM partition helpers are not installed')
+        probe = self.partition_probe(compiler)
         source = self.work / 'assembly.c'
         source.write_text('asm(".local asm_value\\n.data\\nasm_value: .long 7\\n.text\\n");\n'
                           'extern int asm_value;\n'
@@ -759,7 +796,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         bitcode = self.work / 'assembly.bc'
         result = self.run_command([compiler, '-emit-llvm', '-c', source, '-o', bitcode])
         self.assertEqual(result.returncode, 0, result.stderr)
-        result = self.run_command([tools['plan'], 'split', bitcode, '3', self.work / 'part'])
+        result = self.run_command([probe, bitcode, '3', self.work / 'part'])
         self.assertEqual(result.returncode, 0, result.stderr)
         parts = json.loads(result.stdout)['parts']
         self.assertGreater(len(parts), 1)
@@ -770,9 +807,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     def test_function_assembly_preserves_cross_function_symbols(self):
         compiler = shutil.which('clang')
-        tools = llvm_tools(compiler)
-        if not tools:
-            self.skipTest('matching LLVM partition helpers are not installed')
+        probe = self.partition_probe(compiler)
         source = self.work / 'function-assembly.c'
         source.write_text(
             '__attribute__((noinline)) void define(void) {\n'
@@ -784,7 +819,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         bitcode = source.with_suffix('.bc')
         result = self.run_command([compiler, '-emit-llvm', '-c', source, '-o', bitcode])
         self.assertEqual(result.returncode, 0, result.stderr)
-        result = self.run_command([tools['plan'], 'split', bitcode, '3', self.work / 'part'])
+        result = self.run_command([probe, bitcode, '3', self.work / 'part'])
         self.assertEqual(result.returncode, 0, result.stderr)
         parts = json.loads(result.stdout)['parts']
         self.assertEqual(len(parts), 1)
@@ -806,9 +841,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
     def test_instruction_assembly_and_plain_data_section_split(self):
         compiler = shutil.which('clang')
         assert compiler is not None
-        tools = llvm_tools(compiler)
-        if not tools:
-            self.skipTest('matching LLVM partition helpers are not installed')
+        probe = self.partition_probe(compiler)
         source = self.work / 'barrier.c'
         source.write_text('volatile int state __attribute__((section(".data"))) = 40;\n'
                           'int value(void) { asm volatile("" ::: "memory");\n'
@@ -818,7 +851,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
                           'int main(void) { return value() + 2 == 42 ? 0 : 1; }\n')
         module = source.with_suffix('.bc')
         subprocess.run([compiler, '-emit-llvm', '-c', source, '-o', module], check=True)
-        partition = subprocess.check_output([tools['plan'], 'split', module, '2', self.work/'part'])
+        partition = subprocess.check_output([probe, module, '2', self.work/'part'])
         parts = json.loads(partition)['parts']
         self.assertEqual(len(parts), 2)
         output = self.work / 'barrier'
@@ -830,15 +863,13 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     def test_versioned_import_applies_to_implicit_backend_call(self):
         compiler = 'clang'
-        tools = llvm_tools(compiler)
-        if not tools:
-            self.skipTest('matching LLVM partition helpers are not installed')
+        probe = self.partition_probe(compiler)
         src, bc, obj = (self.work / ('import.'+ext) for ext in ('c', 'bc', 'o'))
         src.write_text('asm(".symver memcpy, memcpy@IMPORT_1");\n'
                        'void copy(char*a,char*b,unsigned n){__builtin_memcpy(a,b,n);}\n'
                        'int independent(int x){return x+1;}\n')
         subprocess.run([compiler, '-emit-llvm', '-c', src, '-o', bc], check=True)
-        parts = json.loads(subprocess.check_output([tools['plan'], 'split', bc, '2', self.work/'part']))['parts']
+        parts = json.loads(subprocess.check_output([probe, bc, '2', self.work/'part']))['parts']
         self.assertEqual(len(parts), 1)
         subprocess.run([compiler, '-c', parts[0]['path'], '-o', obj], check=True)
         self.assertIn('memcpy@IMPORT_1', subprocess.check_output(['llvm-nm', '-u', obj], text=True))
@@ -846,8 +877,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
     @unittest.skipUnless(os.uname().machine == 'x86_64', 'x86 ELF assembly')
     def test_versioned_definition_and_section_comdat_survive_partitioned_link(self):
         compiler = 'clang'
-        if not llvm_tools(compiler):
-            self.skipTest('matching LLVM partition helpers are not installed')
+        self.clang_slot(compiler)
         module = self.work / 'definitions.ll'
         # A retained version tag and a function belong to the same COMDAT.
         # A versioned exported definition must share its assembler's object.
@@ -898,9 +928,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     @unittest.skipUnless(os.uname().machine == 'x86_64', 'requires x86-64 ELF')
     def test_segment_overrides_preserve_operand_ownership(self):
-        tools = llvm_tools('clang')
-        if not tools:
-            self.skipTest('matching LLVM partition helpers are not installed')
+        probe = self.partition_probe('clang')
         for dialect, template, constraint, argument, expected in (
                 ('', 'mov %fs:${1:c}, $0', '=r,i', 'i64 0', 2),
                 ('', 'mov %gs:0x48, $0', '=r', '', 2),
@@ -915,15 +943,13 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
                       '  ret i64 %v\n}\ndefine i64 @other() { ret i64 1 }\n')
                 subprocess.run(['llvm-as', '-o', module], input=ir, check=True, text=True)
                 parts = json.loads(subprocess.check_output(
-                    [tools['plan'], 'split', module, '2', self.work/'part']))['parts']
+                    [probe, module, '2', self.work/'part']))['parts']
                 self.assertEqual(len(parts), expected)
                 for part in parts:
                     subprocess.run(['clang', '-c', part['path'], '-o', self.work/'part.o'], check=True)
 
     def test_partitioned_shared_object_keeps_absolute_alias(self):
-        tools = llvm_tools('clang')
-        if not tools:
-            self.skipTest('matching LLVM partition helpers are not installed')
+        probe = self.partition_probe('clang')
         # ThinLTO summary generation in LLVM 22/23 cannot represent this
         # legal constant alias. Exercise the same post-import splitter on IR.
         module = self.work/'absolute.bc'
@@ -932,7 +958,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
               ''.join(f'define i32 @f{i}() section "ordered" {{ ret i32 {i} }}\n' for i in range(5)))
         subprocess.run(['llvm-as', '-o', module], input=ir, text=True, check=True)
         parts = json.loads(subprocess.check_output(
-            [tools['plan'], 'split', module, '6', self.work/'part']))['parts']
+            [probe, module, '6', self.work/'part']))['parts']
         self.assertEqual(len(parts), 2)
         objects = []
         for part in parts:
@@ -942,7 +968,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         merged, library = self.work/'merged.o', self.work/'libabsolute.so'
         self.assertRegex(subprocess.check_output(['llvm-nm', objects[0]], text=True),
                          r'(?m)^0*2a A absolute_value$')
-        subprocess.run([tools['linker'], '-r', *objects, '-o', merged], check=True)
+        subprocess.run(['ld.lld', '-r', *objects, '-o', merged], check=True)
         subprocess.run(['clang', '-shared', merged, '-o', library], check=True)
         symbols = subprocess.check_output(['llvm-nm', '-D', library], text=True)
         self.assertRegex(symbols, r'(?m)^0*2a A absolute_value$')
@@ -957,9 +983,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         compiler = shutil.which('clang-' + llvm)
         if not compiler:
             self.skipTest('Clang matching rustc required')
-        tools = llvm_tools(compiler)
-        if not tools:
-            self.skipTest('LLVM partition helper matching rustc required')
+        probe = self.partition_probe(compiler)
         src, module = self.work/'ops.rs', self.work/'ops.bc'
         main = self.work/'main.c'
         main.write_text('unsigned intel(unsigned), att(unsigned);\n'
@@ -983,7 +1007,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
                 subprocess.run([rustc, '--edition=2021', '--crate-type=lib', '-Cpanic=abort',
                                 '-Clinker-plugin-lto', '-Ccodegen-units=1', '--emit=obj', src, '-o', module],
                                check=True)
-                plan = subprocess.check_output([tools['plan'], 'split', module, '2', self.work/'part'])
+                plan = subprocess.check_output([probe, module, '2', self.work/'part'])
                 parts = json.loads(plan)['parts']
                 self.assertEqual(len(parts), 1 if extra else 2)
                 if not extra:
@@ -993,8 +1017,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     def check_used_section(self, retain):
         compiler = shutil.which('clang')
-        if not llvm_tools(compiler):
-            self.skipTest('matching LLVM partition helpers are not installed')
+        self.clang_slot(compiler)
         source = self.work / 'retained.c'
         body = 'volatile int v=x;\n' + '\n'.join(f'v += {i};' for i in range(128))
         attributes = 'used,retain' if retain else 'used'
@@ -1020,12 +1043,13 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         self.assertEqual(result.returncode, 0, result.stderr)
         counts = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
         self.assertTrue(counts and min(counts) > 1, result.stderr)
+        self.assertIn('status=0 operation=N', result.stderr)
         self.assertIn('status=0 operation=A', result.stderr)
         self.assertIn('status=0 operation=M', result.stderr)
         if prefix:
             executed = trace.read_text()
             self.assertNotIn('"-r", "-o", "merged.o"', executed)
-            self.assertNotRegex(executed, r'execve\("[^"]*/(bwrap|llvm-objcopy)"')
+            self.assertNotRegex(executed, r'execve\("[^"]*/(bwrap|llvm-objcopy|distcc-lto)"')
             self.assertNotRegex(executed, r'execve\("[^"]*/llvm-config')
             self.assertNotIn('"--lto-capacity"]', '\n'.join(
                 line for line in executed.splitlines() if '"--file-jobs"' not in line))

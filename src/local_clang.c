@@ -251,11 +251,12 @@ static int request(char **argv, char operation, int output, int errors, int jour
 {
     int reuse = dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0);
     int planning = operation == 'P' || operation == 'I';
-    int lto = operation == 'A' || operation == 'M';
+    int lto = operation == 'A' || operation == 'M' || operation == 'N';
     const char *driver = argv[0];
-    if ((!reuse && !planning && !lto) || !dcc_clang_driver_mode(driver)) return -1;
-    /* Internal tool entry points bypass Clang's driver in the native binary. */
-    if (argv[1] && !strncmp(argv[1], "-cc1", 4)) return planning ? EXIT_LOCAL_COMPILE : -1;
+    if ((!reuse && !planning && !lto) || !dcc_clang_driver_mode(driver))
+        return operation == 'N' ? EXIT_LOCAL_COMPILE : -1;
+    if (argv[1] && !strncmp(argv[1], "-cc1", 4) &&
+        !(operation == 'C' && !strcmp(argv[1], "-cc1"))) return planning ? EXIT_LOCAL_COMPILE : -1;
     char *compiler = NULL, *cwd = NULL;
     int worker = -1, cpu = -1, input = -1, sink = -1, pair[] = {-1,-1}, ret = EXIT_IO_ERROR;
     int lookup = 0;
@@ -266,7 +267,7 @@ static int request(char **argv, char operation, int output, int errors, int jour
     } else {
         lookup = dcc_which(driver, &compiler);
     }
-    if (lookup == -ENOENT || lookup == -ENOTDIR) return planning ? EXIT_LOCAL_COMPILE : -1;
+    if (lookup == -ENOENT || lookup == -ENOTDIR) return planning || lto ? EXIT_LOCAL_COMPILE : -1;
     if (!compiler) goto out;
     ret = get_worker(compiler, planning || lto, &worker);
     if (ret) goto out;
@@ -436,10 +437,10 @@ done:
     return ret;
 }
 
-int dcc_clang_local_tool(char **argv, char operation, uint64_t *cpu_ns)
+int dcc_clang_local_tool(char **argv, char operation, int output, uint64_t *cpu_ns)
 {
     int status;
-    int ret = request(argv, operation, -1, 2, -1, 0, &status, cpu_ns);
+    int ret = request(argv, operation, output, 2, -1, 0, &status, cpu_ns);
     return ret ? (ret < 0 ? EXIT_DISTCC_FAILED : ret) :
         WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }

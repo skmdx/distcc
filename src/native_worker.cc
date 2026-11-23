@@ -143,17 +143,22 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
                     received != 5 + int(has_extra_fd(request.operation)) + int(request.operation == 'G' || request.operation == 'S') ||
                     (request.operation != 'C' && request.operation != 'P' && request.operation != 'L' && request.operation != 'B' && request.operation != 'D' &&
                      request.operation != 'G' && request.operation != 'S' && request.operation != 'I' &&
-                     request.operation != 'A' && request.operation != 'M' && request.operation != 'T') ||
+                     request.operation != 'A' && request.operation != 'M' && request.operation != 'N' && request.operation != 'T') ||
                     request.group > INT_MAX) return 1;
-                if (plan && (request.operation == 'P' || request.operation == 'I')) {
+                if (plan && (request.operation == 'P' || request.operation == 'I' ||
+                             request.operation == 'L' || request.operation == 'N')) {
                     // Only planning runs in the serial dispatcher. Compiler children
                     // retain their own descriptor tables and working directories.
-                    int cwd = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC), saved = dup(STDERR_FILENO);
-                    if (cwd < 0 || saved < 0 || dup2(fds[4], STDERR_FILENO) < 0) return 1;
+                    int cwd = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC);
+                    int out = dup(STDOUT_FILENO), err = dup(STDERR_FILENO);
+                    fflush(nullptr);
+                    if (cwd < 0 || out < 0 || err < 0 || dup2(fds[3], STDOUT_FILENO) < 0 ||
+                        dup2(fds[4], STDERR_FILENO) < 0) return 1;
                     int status = plan(fds[0], request.operation, fds[2]);
-                    fflush(stderr);
-                    if (fchdir(cwd) || dup2(saved, STDERR_FILENO) < 0) return 1;
-                    close(cwd); close(saved);
+                    fflush(nullptr);
+                    if (fchdir(cwd) || dup2(out, STDOUT_FILENO) < 0 || dup2(err, STDERR_FILENO) < 0)
+                        return 1;
+                    close(cwd); close(out); close(err);
                     dcc_native_result reply{uint64_t(status & 255) << 8, 0, 0};
                     notify(fds[1], &reply, sizeof(reply));
                     continue;

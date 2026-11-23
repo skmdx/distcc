@@ -16,4 +16,5 @@ struct LtoInputs {
 int dcc_lto_compile(const LtoInputs &, llvm::ArrayRef<const char *>, int output);
 bool dcc_lto_init(bool client);
 int dcc_lto_local(const char *description, unsigned operation);
+int dcc_lto_plan(const char *description, int output);
 int dcc_lto_remote(int command, unsigned operation);

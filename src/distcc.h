@@ -363,7 +363,7 @@ ssize_t dcc_recv_fd(int sock, void *data, size_t size, int *fd);
 #include "fd_io.h" // IWYU pragma: export
 int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns);
 int dcc_clang_link_prepare(char **argv, int *plan, int *errors, char ***invocation, int32_t *bytes);
-int dcc_clang_local_tool(char **argv, char operation, uint64_t *cpu_ns);
+int dcc_clang_local_tool(char **argv, char operation, int output, uint64_t *cpu_ns);
 int dcc_prefork_shutdown(int signal_number);
 
 int dcc_r_token(int ifd, char *token);

@@ -67,7 +67,17 @@ public:
     }
 };
 
+int compile_cc1(llvm::ArrayRef<const char *> command) {
+    auto invocation = std::make_shared<clang::CompilerInvocation>();
+    DccChildCompiler instance(new clang::CompilerInstance(invocation));
+    if (!dcc_parse_compiler_invocation(*instance, command.drop_front(2), command.front())) return 1;
+    if (auto result = dcc_clang_codegen(*instance)) return *result ? 0 : 1;
+    return clang::ExecuteCompilerInvocation(instance.get()) ? 0 : 1;
+}
+
 int run(llvm::ArrayRef<const char *> original) {
+    if (original.size() >= 2 && llvm::StringRef(original[1]) == "-cc1")
+        return compile_cc1(original);
     // Let Clang expand driver-name defaults before explicit options override them.
     std::vector<std::string> command(original.begin(), original.end());
     clang::tooling::addTargetAndModeForProgramName(command, original.front());
@@ -86,14 +96,7 @@ int run(llvm::ArrayRef<const char *> original) {
                 llvm::SmallVector<llvm::StringRef> strings(command.begin(), command.end());
                 return llvm::sys::ExecuteAndWait(command[0], strings);
             }
-            auto compile = [&] {
-                auto invocation = std::make_shared<clang::CompilerInvocation>();
-                DccChildCompiler instance(new clang::CompilerInstance(invocation));
-                if (!dcc_parse_compiler_invocation(*instance,
-                    llvm::ArrayRef(command).drop_front(2), args[0])) return 1;
-                if (auto result = dcc_clang_codegen(*instance)) return *result ? 0 : 1;
-                return clang::ExecuteCompilerInvocation(instance.get()) ? 0 : 1;
-            };
+            auto compile = [&] { return compile_cc1(command); };
             // The enclosing driver is already a per-invocation child. A single
             // phase cannot leak compiler state into another phase or job.
             return single ? compile() : isolated(compile);
@@ -167,6 +170,8 @@ int execute(int fd, unsigned operation, int journal) {
     environ = command[2];
     argv[0] = directory[1];
     llvm::SmallVector<const char *> args;
+    if (operation == 'N')
+        return argv[1] && !argv[2] ? dcc_lto_plan(argv[1], fd) : 1;
     if (operation == 'A' || operation == 'M')
         return argv[1] && !argv[2] ? dcc_lto_local(argv[1], operation) : 1;
     if (operation == 'B') {

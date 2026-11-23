@@ -249,14 +249,27 @@ static int file_jobs(int fd)
         ret = dcc_r_argv_body(fd, "ARGV", argc, &args);
         if (!ret) {
             unsigned char done[] = {'D', 0};
-            if (argc == 3 && (!strcmp(args[0], "--prepare") || !strcmp(args[0], "--merge"))) {
-                done[1] = dcc_clang_local_tool(args + 1, args[0][2] == 'p' ? 'A' : 'M', NULL);
+            int weights = -1;
+            if (argc == 3 && !strcmp(args[0], "--plan")) {
+                weights = dcc_job_memfd("distcc-index-weights");
+                done[1] = weights < 0 ? EXIT_IO_ERROR : dcc_clang_local_tool(args + 1, 'N', weights, NULL);
+            } else if (argc == 3 && (!strcmp(args[0], "--prepare") || !strcmp(args[0], "--merge"))) {
+                done[1] = dcc_clang_local_tool(args + 1, args[0][2] == 'p' ? 'A' : 'M', -1, NULL);
             } else {
                 int queued = fcntl(fd, F_DUPFD_CLOEXEC, 3);
                 if (queued < 0) ret = EXIT_IO_ERROR;
                 else done[1] = dcc_file_transfer(args[0], args[1], args + 2, queued);
             }
             if (!ret) ret = dcc_writex(fd, done, sizeof(done));
+            if (weights >= 0) {
+                if (!ret && !done[1]) {
+                    off_t size = lseek(weights, 0, SEEK_END);
+                    if (size < 0 || size > UINT_MAX || lseek(weights, 0, SEEK_SET) < 0) ret = EXIT_IO_ERROR;
+                    else if (!(ret = dcc_x_token_int(fd, "WGHT", size)))
+                        ret = dcc_pump_readwrite(fd, weights, size);
+                }
+                close(weights);
+            }
         }
         if (args) dcc_free_argv(args);
         if (ret) return ret;

@@ -91,6 +91,49 @@ class LocalClangTest(BrokerTestCase):
         finally:
             os.close(reader)
 
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_prepared_local_cc1_reuses_frontend(self):
+        log = self.work/'client.log'
+        def capacity():
+            busy = int(not log.exists() or 'operation=P' not in log.read_text())
+            return stats_response(cpus=1, cores=1, jobs=1, capacity=1, busy=busy,
+                                  running=busy, queued=0, preparing=0, returning=0)
+        peer = self.peer(capacity)
+        self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
+        self.start_local(self.host(0, f',tcp,stats={peer.port}', slots=1))
+        self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_FRONTEND_ROOTS=str(self.work))
+        resident = self.trace_local_worker()
+        self.command(['-dumpversion'], check=True)  # Warm the compiler before tracing the client.
+        (self.work/'value.h').write_text('#define VALUE 42\n')
+        self.source.write_text('#include "value.h"\nint main(void) { return VALUE != 42; }\n')
+        trace = self.work/'client.exec'
+        def traced(*args):
+            return subprocess.run(['strace', '-f', '-qq', '-e', 'execve', '-o', trace,
+                                   self.build/'distcc', self.compiler, *args], cwd=self.work,
+                                  env=self.env, capture_output=True, timeout=20)
+        before = log.stat().st_size
+        result = traced('-O2', '-fprofile-instr-generate', '-MD', '-MF', 'object.d',
+                        '-c', self.source, '-o', 'object.o')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('prepared=1', (self.work/'broker.log').read_text())
+        for op in 'IPC':
+            self.assertIn('operation='+op, log.read_text()[before:])
+        self.assertIn(b'distcc codegen plan:', result.stderr)
+        self.assertNotIn('"-cc1"', trace.read_text())
+        self.assertNotRegex(resident.read_text(), r'execve\([^\n]*"-cc1"')
+        self.assertIn('value.h', (self.work/'object.d').read_text())
+        self.command(['-fprofile-instr-generate', 'object.o', '-o', 'check'], reused=False, check=True)
+        subprocess.run([self.work/'check'], check=True, cwd=self.work)
+
+        (self.work/'empty.s').touch()
+        before = log.stat().st_size
+        result = traced('-cc1as', '-triple', subprocess.check_output(
+            [self.compiler, '-dumpmachine'], text=True).strip(), '-filetype', 'obj',
+            '-o', 'asm.o', 'empty.s')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('operation=C', log.read_text()[before:])
+        self.assertIn(f'execve("{self.compiler}",', trace.read_text())
+
     def test_request_environment_is_independent_of_worker_image(self):
         hosts = self.host(0, ',tcp')
         self.start_local(hosts)

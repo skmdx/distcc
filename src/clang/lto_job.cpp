@@ -1,8 +1,10 @@
-/* A disposable compiler process owns one set of immutable inputs. */
+/* The client planner reads frozen indexes. Execution children own their inputs and outputs. */
 #include "lto_backend.h"
 #include "compiler_command.h"
 #include "../fd_io.h"
 #include <lld/Common/Driver.h>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/IR/ModuleSummaryIndex.h>
 #include <llvm/Object/ELFObjectFile.h>
 #include <llvm/ObjCopy/CommonConfig.h>
 #include <llvm/ObjCopy/ELF/ELFConfig.h>
@@ -174,6 +176,46 @@ int fail(StringRef message) {
     errs() << "distcc ThinLTO: " << message << '\n';
     return 1;
 }
+}
+
+int dcc_lto_plan(const char *description, int output) {
+    auto buffer = MemoryBuffer::getFile(description);
+    if (!buffer) return fail(buffer.getError().message());
+    auto request = json::parse((*buffer)->getBuffer());
+    if (!request) return fail(toString(request.takeError()));
+    auto *jobs = request->getAsArray();
+    if (!jobs) return fail("expected ThinLTO input descriptions");
+    json::Array weights;
+    for (auto &value : *jobs) {
+        auto *job = value.getAsObject();
+        if (!job || !job->getString("source") || !job->getString("index"))
+            return fail("missing ThinLTO source or index");
+        auto source = *job->getString("source");
+        auto index = getModuleSummaryIndexForFile(*job->getString("index"));
+        if (!index) return fail(toString(index.takeError()));
+        int64_t instructions = 0, functions = 0, largest = 0;
+        for (auto &entry : **index) {
+            for (auto &summary : entry.second.getSummaryList()) {
+                auto *function = dyn_cast<FunctionSummary>(summary.get());
+                if (!function || !(**index).isGlobalValueLive(function)) continue;
+                bool primary = function->modulePath() == source;
+                if (!primary && function->importType() != GlobalValueSummary::Definition) continue;
+                instructions += function->instCount();
+                largest = std::max<int64_t>(largest, function->instCount());
+                if (primary && function->linkage() != GlobalValue::AvailableExternallyLinkage)
+                    ++functions;
+            }
+        }
+        weights.push_back(json::Object{{"instructions", instructions}, {"functions", functions},
+                                       {"largest_function", largest}});
+    }
+    if (ftruncate(output, 0) || lseek(output, 0, SEEK_SET) < 0) return fail(strerror(errno));
+    raw_fd_ostream stream(output, false);
+    stream << json::Value(std::move(weights));
+    stream.flush();
+    auto error = stream.error();
+    stream.clear_error();
+    return error ? fail(error.message()) : 0;
 }
 
 int dcc_lto_local(const char *description, unsigned operation) {

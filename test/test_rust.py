@@ -1085,10 +1085,10 @@ class RustTest(BrokerTestCase):
                 self.assertEqual(subprocess.check_output([output], text=True), 'distributed Rust ThinLTO\n')
 
     def test_single_cgu_thinlto_partitions_with_size_optimization(self):
-        from distcc_lto import llvm_tools
         clang = shutil.which('clang')
-        if not clang or not llvm_tools(clang):
-            self.skipTest('matching LLVM partition helpers required')
+        if not clang:
+            self.skipTest('Clang required')
+        self.clang_slot(clang)
         hosts = [self.host(i, f',tcp,stats={self.stats_ports[i]}', slots=1) for i in range(2)]
         self.start_broker(' '.join(hosts), name='thinlto')
         source = self.work/'functions.rs'

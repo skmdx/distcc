@@ -248,8 +248,8 @@ static int dcc_add_clang_target(char **argv)
     const char *target = NATIVE_COMPILER_TRIPLE;
     const char *compiler = dcc_find_basename(argv[0]);
 
-    /* Frontend invocations already carry their driver's resolved -triple. */
-    if (dcc_argv_search(argv, "-cc1"))
+    /* Internal Clang tools take -triple, not the driver's -target option. */
+    if (argv[1] && !strncmp(argv[1], "-cc1", 4))
         return 0;
 
     if (strncmp(compiler, "clang", 5) || !dcc_clang_driver_mode(compiler))

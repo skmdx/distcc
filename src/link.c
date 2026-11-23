@@ -96,11 +96,11 @@ static int run_link(char **argv, char **args, int errors, int bytes, int offload
     if (lease < 0) {
         if ((ret = dcc_lock_local(&lock))) goto out;
     }
-    ret = dcc_clang_local_tool(cmd, 'B', &cpu);
+    ret = dcc_clang_local_tool(cmd, 'B', -1, &cpu);
     if (ret && distributed && dcc_getenv_bool("DISTCC_FALLBACK", 1)) {
         rs_log_warning("distributed link failed; retrying locally");
         memcpy(cmd+1, args, (n+1)*sizeof(*args));
-        ret = dcc_clang_local_tool(cmd, 'B', &cpu);
+        ret = dcc_clang_local_tool(cmd, 'B', -1, &cpu);
     }
 out:
     if (lease >= 0) {

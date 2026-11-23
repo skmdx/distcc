@@ -219,6 +219,10 @@ class ArgumentFileTest(unittest.TestCase):
                 cleanup.callback(finish)
                 child.close()
                 self.assertEqual(control.recv(1), b'R')
+                def process_context():
+                    base = Path('/proc')/str(process.pid)
+                    return tuple(os.readlink(base/name) for name in ('cwd', 'fd/1', 'fd/2'))
+                initial_context = process_context()
                 outputs = [os.memfd_create('distcc-worker-test') for _ in range(3)]
                 for fd in outputs: cleanup.callback(os.close, fd)
                 directory = [str(build), compiler]
@@ -239,6 +243,13 @@ class ArgumentFileTest(unittest.TestCase):
                                   b'P', True))
                     cases.append(([directory, [compiler, '-cc1', '-emit-obj', '-x', 'c',
                                                str(source), '-o', str(work/'out.o')]], b'P', True))
+                    cwd = [str(work), compiler]
+                    (work/'link.o').touch()
+                    (work/'index-plan.json').write_text('[]')
+                    cases += [([cwd, [compiler, '-c', str(source)]], b'I', True),
+                              ([cwd, [compiler, '-fuse-ld=lld', 'link.o', '-o', 'out']], b'L', True),
+                              ([cwd, [compiler, 'missing.json']], b'N', False),
+                              ([cwd, [compiler, 'index-plan.json']], b'N', True)]
                 cases.append((valid, b'C', True))
                 # The execution worker may already have been cancelled when
                 # its queued request reaches a shared helper. A missing group
@@ -265,6 +276,8 @@ class ArgumentFileTest(unittest.TestCase):
                     self.assertEqual(os.waitstatus_to_exitcode(status) == 0, success,
                                      os.pread(outputs[2], 65536, 0))
                     self.assertIsNone(process.poll())
+                    if native and operation in (b'P', b'I', b'L', b'N'):
+                        self.assertEqual(process_context(), initial_context)
                     if success and operation == b'P':
                         os.lseek(self.fd, 0, os.SEEK_SET)
                         prepared, roots = self.read_groups(self.fd, 2)
@@ -282,6 +295,16 @@ class ArgumentFileTest(unittest.TestCase):
                         # long-lived callers. Our disposable worker must retain
                         # the actual driver's lifetime choice in both directions.
                         self.assertEqual('-disable-free' in prepared, '-disable-free' in native_args)
+                    elif success and operation == b'N':
+                        self.assertEqual(os.pread(self.fd, 128, 0), b'[]')
+                    elif success and operation == b'L':
+                        os.lseek(self.fd, 4, os.SEEK_SET)
+                        linker, = self.read_groups(self.fd, 1)
+                        self.assertIn('link.o', linker)
+                    elif success and operation == b'I':
+                        os.lseek(self.fd, 0, os.SEEK_SET)
+                        command, _ = self.read_groups(self.fd, 2)
+                        self.assertIn(str(source), command)
                     elif success:
                         self.assertIn(b'version', os.pread(outputs[1], 65536, 0)+os.pread(outputs[2], 65536, 0))
 

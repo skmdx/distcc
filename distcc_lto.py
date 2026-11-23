@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LLVM-generated link jobs over distcc's shared input transport."""
 from contextlib import ExitStack
-from functools import cache, cached_property
+from functools import cached_property
 import json
 import os
 from pathlib import Path
@@ -40,15 +40,6 @@ def open_regular(path, dir_fd=None):
         os.close(fd)
         raise ValueError('expected regular ThinLTO file')
     return fd
-
-
-@cache
-def llvm_tools(compiler):
-    """Find the helpers registered with the compiler's own LLVM installation."""
-    binary = shutil.which(compiler) or compiler
-    bindir = Path(binary).resolve().parent
-    plan = (bindir / 'distcc-lto').resolve()
-    return dict(plan=plan, linker=bindir / 'ld.lld') if plan.is_file() else None
 
 
 def work_key(job, files):
@@ -92,7 +83,7 @@ class FileJobs:
             self.channel.close()
             raise
 
-    def read_capacity(self):
+    def read_json(self, token):
         def read_exact(size):
             result = bytearray()
             while len(result) < size:
@@ -101,14 +92,23 @@ class FileJobs:
                     status = self.process.wait()
                     if status:
                         raise subprocess.CalledProcessError(status, self.process.args)
-                    raise ValueError('incomplete file-jobs capacity frame')
+                    raise ValueError(f'incomplete file-jobs {token!r} frame')
                 result.extend(chunk)
             return result
 
         header = read_exact(12)
-        if header[:4] != b'CAPA':
-            raise ValueError('invalid file-jobs capacity frame')
+        if header[:4] != token:
+            raise ValueError(f'invalid file-jobs {token!r} frame')
         return json.loads(read_exact(int(header[4:], 16)))
+
+    def plan(self, compiler, description):
+        args = ['--plan', compiler, description]
+        status = self.result(self.submit(args))
+        if status == 121:  # EXIT_LOCAL_COMPILE: no frontend for this compiler.
+            return None
+        if status:
+            raise subprocess.CalledProcessError(status, args)
+        return self.read_json(b'WGHT')
 
     def submit(self, args):
         fields = [os.fsencode(arg) for arg in args]
@@ -160,8 +160,7 @@ def distribute(request, kind, link=None):
 
         helper = 'distcc-thinlto' if kind == JOB_THINLTO else 'distcc-offload-link'
         first_lane = open_lane(capacity=True)
-        capacity = first_lane.read_capacity()
-        idle.put(first_lane)
+        capacity = first_lane.read_json(b'CAPA')
         slots = max(1, capacity['jobs'])
         parallelism = capacity['work_rate'] / capacity['min_rate'] if capacity['min_rate'] else slots
         work = Path(directory)
@@ -184,15 +183,17 @@ def distribute(request, kind, link=None):
             task['partitions'] = 1
         total_bytes = sum(task['bytes'] for task in jobs)
         total_instructions = 0
-        tools = llvm_tools(common['args'][0]) if kind == JOB_THINLTO else None
+        weights = None
         indexes = [next((arg.split('=', 1)[1] for arg in task['args']
                          if arg.startswith('-fthinlto-index=')), None) for task in jobs]
-        if tools and all(indexes):
+        if kind == JOB_THINLTO and all(indexes):
             plan = work / 'plan.json'
             # source is the module ID stored in the index. The planner opens only the frozen index.
             plan.write_text(json.dumps([dict(source=task['inputs'][0], index=str(files[absolute(index)].path))
                                         for task, index in zip(jobs, indexes)]))
-            weights = json.loads(subprocess.check_output([tools['plan'], 'plan', plan], text=True))
+            weights = first_lane.plan(common['args'][0], plan)
+        idle.put(first_lane)
+        if weights is not None:
             if len(weights) != len(jobs):
                 raise ValueError('incomplete LLVM work estimates')
             total_instructions = sum(row['instructions'] for row in weights)

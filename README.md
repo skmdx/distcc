@@ -102,9 +102,9 @@ on the partition with the least instruction work, including weak definitions.
 Individual functions and the final native layout are not subdivided.
 
 `make lto install-lto` builds and installs the helpers for `LLVM_CONFIG` under
-its library directory's `distcc` subdirectory and registers `distcc-lto` beside
-that installation's compiler. Set `LLVM_WRAPPER_SOURCE` as
-described below. The source tree supplies LLVM's `SplitModule.cpp` for
+its library directory's `distcc` subdirectory. The client uses the matching
+resident Clang helper to read index weights before partitioning. Set
+`LLVM_WRAPPER_SOURCE` as described below. The source tree supplies LLVM's `SplitModule.cpp` for
 instruction-weighted placement and `lld/ELF/Options.td` for parsing linker inputs.
 Use a distinct `LTO_BUILD` when
 building for multiple installed LLVM ABIs. A compiler without its matching
@@ -860,19 +860,13 @@ fresh, batched for previously used names and fetched on demand for other names.
 Execute-only directories use individual lookups without exposing a listing.
 
 `DISTCC_CLANG_LOCAL=1` also reuses Clang and LLD libraries for local driver
-commands, including configure probes. The existing broker caches a control
-socket for each compiler, caller environment and namespace. It retains job
-scheduling; the compiler helper forks an isolated child for each invocation.
-The selected driver handles options and tool selection, and other linkers and
-specialized compiler tools retain their native execution. Client disconnection
-cancels the invocation, and closing the broker cache releases idle helpers.
-Link discovery also uses this resident driver. A positively identified BFD
-link goes directly to the existing local slot/execution path, avoiding the
-Python coordinator and a separate `clang -###` process. Other linker commands
-pass the prepared invocation to `distcc-link`, which retains its existing
-LLD/offload capability policy. Driver diagnostics are emitted once.
-This evaluation path requires the selected Clang release's `clang_native`
-extension and keeps the caller's filesystem, credentials and sandbox context.
+commands, including configure probes. The broker caches a worker for each
+compiler and startup context. The worker handles frontend, link and ThinLTO
+index planning serially, with each request's directory, environment and
+diagnostic streams. Compilation runs in an isolated child. A prepared local
+`-cc1` invocation enters the frontend directly and retains parallel code
+generation when enabled. Specialized tools such as `-cc1as` use the original
+compiler. Closing the broker cache releases idle helpers.
 
 `DISTCC_CLANG_CODEGEN=1` evaluates parallel code generation in the local and
 remote frontend paths; set it in the process that owns the compiler helper
