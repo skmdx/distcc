@@ -363,6 +363,8 @@ ssize_t dcc_recv_fd(int sock, void *data, size_t size, int *fd);
 #include "fd_io.h" // IWYU pragma: export
 int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns);
 int dcc_clang_link_prepare(char **argv, int *plan, int *errors, char ***invocation, int32_t *bytes);
+int dcc_lto_distribute(int argc, char **argv);
+int dcc_lto_capacity(char **capacity);
 int dcc_clang_local_tool(char **argv, char operation, int output, uint64_t *cpu_ns);
 int dcc_prefork_shutdown(int signal_number);
 
@@ -382,6 +384,10 @@ void dcc_buffer_input(int fd);
 int dcc_want_mmap(void);
 
 
+struct pollfd;
+/* Optional, immutable during a distributor invocation. Readability cancels all lanes. */
+extern int dcc_client_cancel_fd;
+int dcc_poll_cancelable(struct pollfd *p, int timeout_ms);
 int dcc_poll_fd(int fd, short events, int timeout);
 int dcc_select_for_write(int fd, int timeout);
 int dcc_select_for_read(int fd, int timeout);

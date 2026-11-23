@@ -105,8 +105,7 @@ def release(overlay):
         raise RuntimeError('release must pin a full source commit')
     inputs = ['src', 'configure.ac', 'Makefile.in',
               'distcc-link', 'distcc-multi',
-              'distcc-thinlto', 'distcc-offload', 'distcc-offload-link',
-              'distcc_lto.py', 'distcc_job.py', 'distcc_python.py',
+              'distcc-offload', 'distcc_job.py', 'distcc_python.py',
               'packaging/systemd', 'packaging/gentoo/*.bashrc']
     # Do not silently deploy an older implementation over pending changes.
     for tree, paths in ((ROOT, inputs), (Path(overlay), ['sys-devel/distcc'])):

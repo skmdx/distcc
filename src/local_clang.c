@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,7 +70,7 @@ static int context_binding(const char *binding, size_t length, enum dcc_compiler
     return !image;
 }
 
-int dcc_local_worker_key(const char *compiler, const char *library,
+static int worker_key_locked(const char *compiler, const char *library,
                          enum dcc_compiler_context context, char *key, size_t size)
 {
     /* Clients keep their credentials and namespaces for the invocation. Forked
@@ -107,7 +108,15 @@ int dcc_local_worker_key(const char *compiler, const char *library,
         XXH3_128bits_update(hash, groups, count*sizeof(*groups));
         uid_t uid = geteuid();
         gid_t gid = getegid();
-        mode_t mask = umask(0); umask(mask);
+        /* umask(0) would briefly change the mask of every transfer thread. */
+        FILE *status = fopen("/proc/self/status", "re");
+        if (!status) return -1;
+        unsigned mask;
+        char line[256];
+        int found = 0;
+        while (!found && fgets(line, sizeof(line), status)) found = sscanf(line, "Umask: %o", &mask) == 1;
+        fclose(status);
+        if (!found) return -1;
         XXH3_128bits_update(hash, &uid, sizeof(uid));
         XXH3_128bits_update(hash, &gid, sizeof(gid));
         XXH3_128bits_update(hash, &mask, sizeof(mask));
@@ -181,6 +190,24 @@ environment_ready:
     return 0;
 }
 
+static pthread_mutex_t key_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t fork_once = PTHREAD_ONCE_INIT;
+static int fork_error;
+static void lock_key(void) { pthread_mutex_lock(&key_lock); }
+static void unlock_key(void) { pthread_mutex_unlock(&key_lock); }
+static void init_key_lock(void) { fork_error = pthread_atfork(lock_key, unlock_key, unlock_key); }
+
+int dcc_local_worker_key(const char *compiler, const char *library,
+                         enum dcc_compiler_context context, char *key, size_t size)
+{
+    pthread_once(&fork_once, init_key_lock);
+    if (fork_error) { errno = fork_error; return -1; }
+    lock_key();
+    int ret = worker_key_locked(compiler, library, context, key, size);
+    unlock_key();
+    return ret;
+}
+
 static int start_worker(const char *compiler, int *worker)
 {
     int pair[2];
@@ -190,9 +217,23 @@ static int start_worker(const char *compiler, int *worker)
     char path[PATH_MAX];
     char *command[] = {dcc_helper_path("distcc-clang", path), (char *)"--native-worker",
                        descriptor, (char *)compiler, NULL};
-    pid_t pid = -1;
-    int ret = fcntl(pair[1], F_SETFD, 0) ? EXIT_IO_ERROR :
-        dcc_spawn_child(command, &pid, "/dev/null", "/dev/null", "/dev/null");
+    /* A resident cannot retain the invoking terminal or reopen writable paths
+     * in a package sandbox. Individual requests supply their own log FDs. */
+    int log = dcc_job_memfd("distcc-helper-startup");
+    pid_t pid = log < 0 ? -1 : fork();
+    if (pid == 0) {
+        int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (input < 0 || setpgid(0, 0) || dup2(input, 0) < 0 ||
+            dup2(log, 1) < 0 || dup2(log, 2) < 0 ||
+            close_range(3, ~0U, CLOSE_RANGE_CLOEXEC) || fcntl(pair[1], F_SETFD, 0))
+            _exit(EXIT_IO_ERROR);
+        signal(SIGPIPE, SIG_DFL);
+        dcc_restore_fd_limit();
+        execvp(command[0], command);
+        _exit(EXIT_COMPILER_MISSING);
+    }
+    if (log >= 0) close(log);
+    int ret = pid < 0 ? EXIT_IO_ERROR : 0;
     close(pair[1]);
     char byte;
     /* Loading compiler libraries may fault them in from slow storage. Use the
@@ -282,7 +323,7 @@ static int request(char **argv, char operation, int output, int errors, int jour
         dcc_x_argv(input, "ARGC", "ARGV", environ) || lseek(input, 0, SEEK_SET) < 0) goto out;
     /* Driver inspection may print bindings/phases. As with -### discovery,
      * inspection stdout must not escape before the actual command executes. */
-    if (operation == 'L' && (sink = open("/dev/null", O_WRONLY | O_CLOEXEC)) < 0) goto out;
+    if (operation == 'L' && (sink = dcc_job_memfd("distcc-plan-output")) < 0) goto out;
     int fds[] = {input, pair[1], journal >= 0 ? journal : 0, sink >= 0 ? sink : 1, errors};
     struct dcc_native_request request = {operation, 0};
     if (dcc_send_fds(worker, &request, sizeof(request), fds, 5)) goto out;

@@ -132,6 +132,7 @@ struct dcc_buffer;
  * Results own open FDs before the worker removes temporary pathnames. */
 int dcc_execute_job(struct dcc_job *, const char *root, int cancel_fd, struct dcc_job_result *);
 const char *dcc_job_tmp_top(const struct dcc_job *);
+int dcc_finish_file_job(struct dcc_job_result *, unsigned output_count);
 int dcc_file_transfer(const char *metadata, const char *snapshots, char **outputs, int queued_fd);
 int dcc_llvm_worker(const struct dcc_job *, const char *root, int cancel, const char *out,
                     const char *err, struct dcc_job_result *);

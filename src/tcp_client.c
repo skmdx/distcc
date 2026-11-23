@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -172,19 +173,9 @@ static int stage_outputs(struct dcc_job *job, struct dcc_job_result *r,
 }
 static uint64_t transaction_id(void)
 {
-    static pid_t owner;
-    static uint64_t counter;
-    pid_t pid = getpid();
-    if (owner != pid) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        counter = ((uint64_t)pid << 32) ^ ((uint64_t)now.tv_sec * 1000000000 + now.tv_nsec);
-        owner = pid;
-    }
-    /* IDs correlate frames on one leased connection; they are not secrets.
-     * Reseed after fork and retain the sequence across retries. */
-    if (!++counter) ++counter;
-    return counter;
+    static _Atomic uint32_t sequence;
+    return (uint64_t)(uint32_t)getpid() << 32 |
+           atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
 }
 int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files,
                       const char *cpp, const char *output, const char *deps, struct dcc_job_result *result)
@@ -195,12 +186,12 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     unsigned char stack_reqd[16] = {0};
     unsigned *requests = job->count <= 16 ? stack_req : calloc(job->count, sizeof(*requests));
     unsigned char *requested = job->count <= 16 ? stack_reqd : calloc(job->count, 1);
-    /* The command-line client runs exchanges sequentially, including retries.
-     * Retain only storage; all job state and descriptors are reset below. */
-    static unsigned char p_buf[DCC_TCP_CHUNK + 16U], snap_buf[DCC_TCP_CHUNK + 16U];
-    static unsigned char *large_manifest;
-    static size_t manifest_capacity;
-    unsigned char *outgoing = p_buf;
+    struct exchange_buffers {
+        unsigned char payload[DCC_TCP_CHUNK + 16], snapshot[DCC_TCP_CHUNK + 16];
+        unsigned char wire[2 * DCC_TCP_CHUNK + 16];
+    } *storage = malloc(sizeof(*storage));
+    unsigned char *large_manifest = NULL;
+    unsigned char *p_buf = storage ? storage->payload : NULL, *outgoing = p_buf;
     uint64_t received[DCC_JOB_RESULT_COUNT] = {0}, id = transaction_id();
     unsigned finals = 0, read_request = 0, count = 0;
     size_t length = 0, sent = 0;
@@ -218,31 +209,27 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     socklen_t address_size = sizeof(address);
     int local = !getsockname(host->broker_fd, (struct sockaddr *)&address, &address_size) &&
         address.ss_family == AF_UNIX;
-    static unsigned char buffer[2 * DCC_TCP_CHUNK + 16U];
-    struct tcp_input input = {.wire = local ? NULL : buffer + DCC_TCP_CHUNK};
+    unsigned char *buffer = storage ? storage->wire : NULL;
+    struct tcp_input input = {.wire = !buffer || local ? NULL : buffer + DCC_TCP_CHUNK};
     int local_input = local && job->kind == DCC_JOB_COMPILE && job->count == 1 &&
         job->inputs[0].fd >= 0;
     int send_input_fd = local_input;
     int shared_input = -1;
-    static struct dcc_frontend_reply filesystem = {.fd = -1};
+    struct dcc_frontend_reply filesystem = {.fd = -1};
     uint64_t fs_offset = 0, fs_requests = 0, fs_bytes = 0;
     unsigned needs = 0, reads = 0, read_batches = 0;
     time_t active = time(NULL);
     dcc_job_result_init(result);
-    if (!host->broker_managed || host->broker_fd < 0 || !requests || !requested) goto done;
+    if (!host->broker_managed || host->broker_fd < 0 || !storage || !requests || !requested) goto done;
     if (local_input && (shared_input = local_snapshot(job->inputs[0].fd, job->inputs[0].plain_size)) < 0)
         goto done;
     size_t metadata_size = 0;
     unsigned char *manifest = dcc_job_encode_buffer(job, &metadata_size);
     if (!manifest) goto done;
     length = metadata_size + 16;
-    if (length > sizeof(p_buf)) {
-        if (manifest_capacity < length) {
-            void *next = realloc(large_manifest, length);
-            if (!next) { free(manifest); goto done; }
-            large_manifest = next;
-            manifest_capacity = length;
-        }
+    if (length > sizeof(storage->payload)) {
+        large_manifest = malloc(length);
+        if (!large_manifest) { free(manifest); goto done; }
         outgoing = large_manifest;
     }
     dcc_tcp_put32(outgoing, DCC_TCP_BEGIN);
@@ -277,7 +264,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     stream.immutable = job->kind == DCC_JOB_RUST || (seals >= 0 && (seals & immutable) == immutable);
                 }
                 outgoing = next_chunk(&stream, &job->inputs[stream.index],
-                                      p_buf, snap_buf, &length, &file_offset, &file_left, local);
+                                      p_buf, storage->snapshot, &length, &file_offset, &file_left, local);
                 if (!outgoing) goto done;
                 sent = 0;
             }
@@ -326,7 +313,8 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         int buffered = input.end - input.begin > incoming.used;
         int ready;
         if (buffered) { p.revents = POLLIN; ready = 1; }
-        else ready = poll(&p, 1, pending ? 0 : timeout * 1000);
+        else ready = dcc_poll_cancelable(&p, pending ? 0 : timeout * 1000);
+        if (ready < 0 && errno == ECANCELED) { ret = EXIT_DISTCC_FAILED; goto done; }
         if (ready < 0 && errno == EINTR) continue;
         if (!ready && pending) continue; /* Prepare the next chunk without waiting for I/O. */
         if (ready <= 0) goto done;
@@ -497,7 +485,9 @@ done:
         if (cached) rs_trace("input cache: %u of %u entries transferred", transferred, job->count);
     }
     if (stream.fd >= 0) close(stream.fd);
-    dcc_frontend_fs_reset(&filesystem);
+    dcc_frontend_fs_clear(&filesystem);
+    free(storage);
+    free(large_manifest);
     if (requests != stack_req) free(requests);
     if (requested != stack_reqd) free(requested);
     if (local) dcc_tcp_frame_clear(&incoming);

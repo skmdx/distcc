@@ -31,6 +31,8 @@ __pycache__/
 /cpp_lookup.so
 /distcc-rust-native.so
 /distcc-rust
+/distcc-thinlto
+/distcc-offload-link
 /gcc_plan.so
 /distcc-linker-wrapper
 /llvm-linker-wrapper/

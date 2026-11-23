@@ -87,7 +87,9 @@ for live load. This gives slower workers smaller pieces without increasing
 concurrent jobs. The split is bounded by the available slots, function count,
 and total instructions divided by the largest function. Each partition also
 requires at least 64 instructions on average when splitting. Preparation overlaps
-ordinary backends, and ready partitions join the same work queue. A module that stays in one piece returns its object
+ordinary backends, and ready partitions join the same work queue. The native ThinLTO
+and offload distributors share immutable input snapshots across transfer threads and
+submit directly to the broker in priority order. A module that stays in one piece returns its object
 directly. For multiple partitions, a relocatable merge restores private symbol bindings
 before LLD consumes the result. Constructors, TLS and exception handling retain
 their original link semantics. File assembly shares the first partition with

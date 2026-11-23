@@ -17,12 +17,11 @@ from test_adaptive import stats_response
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from distcc_job import JOB_THINLTO, fingerprint, write_metadata
-from distcc_lto import FileJobs, InputSnapshot, work_key
 
 
 @unittest.skipUnless(all(shutil.which(tool) for tool in ('clang', 'bwrap', 'sandbox')),
                      'Clang, bubblewrap and Gentoo sandbox required')
-class PortageSandboxTest(unittest.TestCase):
+class PortageSandboxTest(BrokerTestCase):
     def test_local_job_creates_namespace_inside_portage_sandbox(self):
         self.compile_local_job()
 
@@ -42,55 +41,42 @@ class PortageSandboxTest(unittest.TestCase):
             if build_uid is not None:
                 os.chown(work, build_uid, -1)
                 work.chmod(0o700)
-            jobdir = work / 'partition'
-            jobdir.mkdir()
+            self.start_broker(' '.join(self.host(i, f',tcp,stats={self.stats_ports[i]}') for i in range(2)))
             compiler = shutil.which('clang')
             assert compiler is not None
             source = work / 'library.bc'
-            subprocess.run([compiler, '-O2', '-flto=thin', '-x', 'c', '-c', '-',
-                            '-o', source], input=b'int answer(void) { return 42; }',
-                           check=True)
+            definitions = ''.join(f'__attribute__((noinline)) static int part{i}(int x) '
+                                  f'{{ volatile int n=x; return n*{i+1}; }}' for i in range(32))
+            body = definitions + 'int private_definition(int x) {return ' + '+'.join(
+                f'part{i}(x)' for i in range(32)) + ';}'
+            subprocess.run([compiler, '-O2', '-flto=thin', '-x', 'c', '-c', '-', '-o', source],
+                           input=body.encode(), check=True)
             subprocess.run([Path(compiler).with_name('ld.lld'), '-shared',
                             '--thinlto-index-only', source, '-o', work/'library.so'], check=True)
             index = str(source) + '.thinlto.bc'
-            spec = jobdir / 'request.json'
-            spec.write_text(json.dumps(dict(cwd=str(work), partitions=2,
-                args=[compiler, '-x', 'ir', '-fthinlto-index=' + index, '-c', str(source),
-                      '-o', str(work/'unused.o')],
-                files={str(source): str(source), index: index,
-                       **{str(work/f'alias-{i}.bc'): str(source) for i in range(1100)}})))
-            merge = work/'merge'
-            merge.mkdir()
-            subprocess.run([compiler, '-x', 'c', '-c', '-', '-o', merge/'part.o'],
-                           input=b'int private_definition(void) { return 42; }', check=True)
-            merge_spec = merge/'request.json'
-            merge_spec.write_text(json.dumps(dict(parts=['part.o'], locals=['private_definition'])))
+            aliases = [work/f'alias-{i}.bc' for i in range(1100)]
+            for alias in aliases:
+                os.link(source, alias)
+            output = work/'result.o'
+            spec = work/'jobs.json'
+            spec.write_text(json.dumps(dict(common=dict(args=[compiler, '-c'], inputs=list(map(str, aliases))),
+                jobs=[dict(args=['-x', 'ir', str(source), '-fthinlto-index='+index, '-o', str(output)],
+                           inputs=[str(source), index], outputs=[str(output)])])))
             trace = work / 'exec.log'
             sandbox_log = work / 'sandbox.log'
-            env = dict(os.environ, SANDBOX_WRITE=str(work), SANDBOX_LOG=str(sandbox_log),
-                       PYTHONDONTWRITEBYTECODE='1', DISTCC_CLANG_LOCAL='0')
-            env.pop('DISTCC_BROKER', None)
-            build = Path.cwd()
-            env['PYTHONPATH'] = str(build)
-            script = ('import os,sys,resource; from distcc_lto import FileJobs; '
-                      'lim=resource.RLIMIT_NOFILE; resource.setrlimit(lim,(1024,resource.getrlimit(lim)[1])); '
-                      'assert os.environ["SANDBOX_ON"] == "1"; '
-                      'lane=FileJobs(sys.argv[1], os.environ, ()); '
-                      'rc=lane.result(lane.submit(["--prepare", sys.argv[2], sys.argv[3]])) or '
-                      'lane.result(lane.submit(["--merge", sys.argv[2], sys.argv[4]])); '
-                      'lane.close(); sys.exit(rc)')
-            command = ['sandbox', sys.executable, '-c', script, build/'distcc', compiler, spec, merge_spec]
+            env = dict(self.env, SANDBOX_WRITE=str(self.root)+':'+str(work), SANDBOX_LOG=str(sandbox_log),
+                       DISTCC_VERBOSE='1', DISTCC_CLANG_LOCAL='0', TMPDIR=str(work))
+            command = ['sandbox', 'sh', '-c', 'ulimit -Sn 1024 && test "$SANDBOX_ON" = 1 && exec "$@"',
+                       'sh', self.build/'distcc-thinlto', spec]
             if shutil.which('strace'):
                 command = ['strace', '-f', '-e', 'trace=execve,capset,prctl,seccomp',
                            '-o', trace, *command]
             result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
-            parts = json.loads((jobdir/'partitions.json').read_bytes())['parts']
-            self.assertTrue(parts)
-            for part in parts:
-                self.assertTrue((jobdir/part['path']).stat().st_size)
-            symbols = subprocess.check_output(['llvm-nm', merge/'localized.o'], text=True)
-            self.assertRegex(symbols, r' t private_definition\b')
+            self.assertRegex(result.stderr, r'partitioned .* into (?:[2-9]|\d{2,})')
+            self.assertIn('status=0 operation=M', result.stderr)
+            symbols = subprocess.check_output(['llvm-nm', output], text=True)
+            self.assertRegex(symbols, r' t part\d+')
             self.assertFalse(sandbox_log.exists(), result.stderr)
             if trace.exists():
                 events = trace.read_text()
@@ -126,26 +112,6 @@ class ThinLTOTest(BrokerTestCase):
             details = broker.read_text()[-8192:] if broker.exists() else ''
             self.fail(f'command timed out: {command}\n{error.stderr!r}\n{details}')
 
-    def test_snapshot_identity_is_lazy_shared_and_immutable(self):
-        source = self.work / 'input.bc'
-        source.write_bytes(b'original input')
-        expected = fingerprint(source)
-        with patch('distcc_lto.fingerprint', wraps=fingerprint) as hashed:
-            item = InputSnapshot(source, self.work / 'snapshot')
-            self.assertEqual(item.size, source.stat().st_size)
-            hashed.assert_not_called()
-            source.write_bytes(b'replaced input')
-            self.assertEqual(item.identity, expected)
-            files = {str(source): item}
-            args = ['clang', '-c', str(source)]
-            job = dict(cwd=str(self.work), args=args,
-                       inputs=[str(source)], outputs=[])
-            key = work_key(job, files)
-            args.append('-DOTHER=1')
-            self.assertNotEqual(work_key(job, files), key)
-            self.assertEqual(item.path.read_bytes(), b'original input')
-            hashed.assert_called_once_with(item.path)
-
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
     def test_link_and_index_plans_share_the_serial_worker(self):
         trace = self.trace_local_worker()
@@ -154,17 +120,25 @@ class ThinLTOTest(BrokerTestCase):
         assert compiler is not None
         # Each L request produces a driver diagnostic and ends before backend execution.
         # The next request must still see its own diagnostics, cwd and result stream.
-        plan = self.work/'plan.json'
-        plan.write_text('[]')
-        lane = FileJobs(self.build/'distcc', self.env, ())
-        self.addCleanup(lane.close)
+        src = self.work/'input.o'
+        subprocess.run([compiler, '-flto=thin', '-x', 'c', '-c', '-', '-o', src],
+                       input=b'int value(void) {return 42;}', check=True)
+        subprocess.run([Path(compiler).with_name('ld.lld'), '-shared', '--thinlto-index-only', src,
+                        '-o', self.work/'linked.so'], check=True)
+        index = str(src) + '.thinlto.bc'
+        out = str(self.work/'result.o')
+        desc = self.work/'jobs.json'
+        desc.write_text(json.dumps(dict(common=dict(args=[compiler, '-c'], inputs=[]),
+            jobs=[dict(args=[str(src), '-fthinlto-index='+index, '-o', out],
+                       inputs=[str(src), index], outputs=[out])])))
         for i in range(2):
             obj = f'missing-{i}.o'
             linked = self.run_command([self.build/'distcc', compiler, obj, '-o', 'out'])
             self.assertNotEqual(linked.returncode, 0)
             self.assertIn(obj, linked.stderr)
             self.assertEqual(linked.stdout, '')
-            self.assertEqual(lane.plan(compiler, plan), [])
+            plan = self.run_command([self.build/'distcc-thinlto', desc])
+            self.assertEqual(plan.returncode, 0, plan.stderr)
         events = trace.read_text()
         self.assertNotIn('/distcc-lto"', events)
         resident = re.search(r'execve\("[^"]*/distcc-clang-\d+",[^\n]* = 0', events)
@@ -534,18 +508,8 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
             path.write_text(str(i))
             entries.append((cwd+'/import-'+str(i)+'.bc', *fingerprint(path)))
         write_metadata(JOB_THINLTO, job, entries, metadata)
-        if cc1:
-            result = self.run_command([self.build / 'distcc', '--file-job', metadata, inputs, '-', output])
-            self.assertEqual(result.returncode, 0, result.stderr)
-        else:
-            lane = FileJobs(self.build/'distcc', self.env, (), capacity=True)
-            self.addCleanup(lane.close)
-            self.assertGreater(lane.read_json(b'CAPA')['jobs'], 0)
-            self.assertNotEqual(lane.result(lane.submit([self.work/'absent', inputs, output])), 0)
-            for _ in range(2):
-                marker = lane.submit([metadata, inputs, output])
-                self.assertEqual(marker, b'Q')
-                self.assertEqual(lane.result(marker), 0)
+        result = self.run_command([self.build/'distcc', '--file-job', metadata, inputs, '-', output])
+        self.assertEqual(result.returncode, 0, result.stderr)
         executable = self.work / 'linked'
         result = self.run_command(['clang', output, '-o', executable])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -588,17 +552,17 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(outputs[0], outputs[2])
 
-    def test_file_jobs_capacity_reports_transport_exit(self):
+    def test_distributor_reports_capacity_failure(self):
         env = self.env.copy()
         env.pop('DISTCC_BROKER', None)
         expected = subprocess.run([self.build/'distcc', '--lto-capacity'], env=env,
                                   capture_output=True).returncode
         self.assertNotEqual(expected, 0)
-        lane = FileJobs(self.build/'distcc', env, (), capacity=True)
-        self.addCleanup(lane.close)
-        with self.assertRaises(subprocess.CalledProcessError) as failure:
-            lane.read_json(b'CAPA')
-        self.assertEqual(failure.exception.returncode, expected)
+        desc = self.work/'jobs.json'
+        desc.write_text(json.dumps(dict(common=dict(args=['clang'], inputs=[]),
+            jobs=[dict(args=['-c'], inputs=['input.bc'], outputs=['out.o'])])))
+        result = subprocess.run([self.build/'distcc-thinlto', desc], env=env, capture_output=True)
+        self.assertEqual(result.returncode, expected)
 
     def test_capacity_uses_worker_speed_without_increasing_concurrency(self):
         metrics = stats_response(cpus=4, cores=4, jobs=4, capacity=4,
@@ -1017,6 +981,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     def check_used_section(self, retain):
         compiler = shutil.which('clang')
+        assert compiler is not None
         self.clang_slot(compiler)
         source = self.work / 'retained.c'
         body = 'volatile int v=x;\n' + '\n'.join(f'v += {i};' for i in range(128))
@@ -1035,11 +1000,16 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         obj, output = source.with_suffix('.o'), self.work / 'retained'
         result = self.run_command([compiler, '-O2', '-flto=thin', '-c', source, '-o', obj])
         self.assertEqual(result.returncode, 0, result.stderr)
+        second = self.work/'second.o'
+        subprocess.run([compiler, '-flto=thin', '-x', 'c', '-c', '-', '-o', second],
+                       input=b'int additional_module(void) { return 11; }', check=True)
         flags = ['-Wl,--gc-sections'] if retain else []
         trace = self.work / 'executed'
         prefix = ['strace', '-f', '-e', 'execve', '-o', trace] if shutil.which('strace') else []
-        result = self.run_command([*prefix, self.build / 'distcc', compiler, '-O2', '-flto=thin',
-                                   '-fuse-ld=lld', *flags, obj, '-o', output])
+        result = self.run_command([*prefix, compiler, '-O2', '-flto=thin', '-fuse-ld=lld',
+                                   '-Wl,--thinlto-distributor='+str(self.build/'distcc-thinlto'),
+                                   '-Wl,--thinlto-remote-compiler='+compiler, '-Wl,-u,additional_module',
+                                   *flags, obj, second, '-o', output])
         self.assertEqual(result.returncode, 0, result.stderr)
         counts = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
         self.assertTrue(counts and min(counts) > 1, result.stderr)
@@ -1051,25 +1021,134 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
             self.assertNotIn('"-r", "-o", "merged.o"', executed)
             self.assertNotRegex(executed, r'execve\("[^"]*/(bwrap|llvm-objcopy|distcc-lto)"')
             self.assertNotRegex(executed, r'execve\("[^"]*/llvm-config')
-            self.assertNotIn('"--lto-capacity"]', '\n'.join(
-                line for line in executed.splitlines() if '"--file-jobs"' not in line))
+            self.assertNotIn('"--lto-capacity"', executed)
+            self.assertNotIn('"--file-jobs"', executed)
+            self.assertNotRegex(executed, r'execve\("[^"]*/python(?:3[.\d]*)?"')
         self.assertEqual(self.run_command([output]).returncode, 0)
 
-    def test_ranked_submission_survives_slow_process_start(self):
-        """Use real workers while delaying the largest job before broker IPC."""
+    def test_parallel_inputs_survive_replacement_and_cancellation(self):
+        import signal
+        compiler = shutil.which('clang')
+        bc = self.work/'input.bc'
+        result = self.run_command([compiler, '-x', 'c', '-emit-llvm', '-c', '-', '-o', bc],
+                                  input='int value(void){return 42;}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        original = bc.read_bytes()
+        outputs = [self.work/f'out-{i}.o' for i in range(32)]
+        jobs = [dict(args=['-x', 'ir', str(bc), '-o', str(out)], inputs=[str(bc)], outputs=[str(out)])
+                for out in outputs]
+        desc = self.work/'jobs.json'
+        desc.write_text(json.dumps(dict(common=dict(args=[compiler, '-c'], inputs=[]), jobs=jobs)))
+        temp = self.work/'distributor'
+        temp.mkdir()
+        for cancel in (True, False):
+            bc.write_bytes(original)
+            with subprocess.Popen([self.build/'distcc-thinlto', desc], cwd=self.work,
+                                  env=dict(self.env, TMPDIR=str(temp)), stderr=subprocess.PIPE, text=True) as proc:
+                assert proc.stderr is not None
+                for line in proc.stderr:
+                    if line.startswith('distcc-thinlto: submitting '):
+                        bc.write_bytes(b'replaced after snapshot')
+                        if cancel:
+                            proc.send_signal(signal.SIGTERM)
+                        break
+                else:
+                    self.fail('backend never submitted')
+                _, log = proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, 128 + signal.SIGTERM if cancel else 0, log)
+            self.assertFalse(list(temp.glob('distcc-lto-*')))
+            self.assertFalse(list(self.work.glob('*.distcc-*')))
+        self.assertEqual(log.count('distcc-thinlto: compiled on '), len(outputs))
+        self.assertTrue(all(path.read_bytes()[:4] == b'\x7fELF' for path in outputs))
+
+    def test_parallel_local_retry_diagnostics_and_cancellation(self):
+        import select
+        compiler = self.work / 'clang-98765'
+        compiler.write_text("""#!/bin/sh
+if test -n "${RETRY_STARTED:-}"; then
+    echo $$ > "$RETRY_STARTED"
+    exec sleep 40
+fi
+printf 'first %s\\n' "$2" >&2
+sleep .02
+printf 'last %s\\n' "$2" >&2
+cp "$1" "$2"
+""")
+        compiler.chmod(0o755)
+        source = self.work/'input.o'
+        self.run_command(['clang', '-x', 'c', '-c', '-', '-o', source], input='int data;').check_returncode()
+        outputs = [str(self.work/f'retry-{i}.o') for i in range(8)]
+        jobs = [dict(args=[str(source), out], inputs=[str(source)], outputs=[out]) for out in outputs]
+        request = self.work/'jobs.json'
+        request.write_text(json.dumps(dict(common=dict(args=[str(compiler)], inputs=[]), jobs=jobs)))
+        self.env.update(DISTCC_FALLBACK='1', DISTCC_SKIP_LOCAL_RETRY='0')
+        command = [self.build/'distcc-thinlto', request]
+        result = self.run_command(command)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for out in outputs:
+            self.assertIn(f'first {out}\nlast {out}\n', result.stderr)
+            self.assertEqual(Path(out).read_bytes(), source.read_bytes())
+
+        fifo = self.work/'retry-started'
+        os.mkfifo(fifo)
+        with os.fdopen(os.open(fifo, os.O_RDWR), 'r') as reader, subprocess.Popen(
+                command, env=dict(self.env, RETRY_STARTED=str(fifo)), stderr=subprocess.PIPE) as proc:
+            try:
+                self.assertTrue(select.select([reader], [], [], 10)[0])
+                child = int(reader.readline())
+                proc.terminate()
+                _, log = proc.communicate(timeout=5)
+                self.assertEqual(proc.returncode, 143, log)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child, 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+    def test_parallel_batches_release_transport_descriptors(self):
+        compiler = shutil.which('clang')
+        assert compiler is not None
+        work, temporary, final = (self.work/name for name in ('inputs', 'lto', 'output'))
+        for directory in (work, temporary, final):
+            directory.mkdir()
+        source = work/'input.o'
+        linked = final/'library.so'
+        subprocess.run([compiler, '-flto=thin', '-x', 'c', '-c', '-', '-o', source],
+                       input=b'int value(void) {return 42;}', check=True)
+        subprocess.run([Path(compiler).with_name('ld.lld'), '-shared', '--thinlto-index-only',
+                        source, '-o', linked], check=True)
+        index = str(source)+'.thinlto.bc'
+        (work/'dtlto-inputs').touch()
+        jobs = []
+        for i in range(16):
+            output = str(temporary/f'part-{i}.o')
+            jobs.append(dict(inputs=[str(source), index], outputs=[output],
+                             args=[str(source), '-fthinlto-index='+index, '-o', output]))
+        description = temporary/'jobs.json'
+        description.write_text(json.dumps(dict(common=dict(linker_output=str(linked),
+            args=[compiler, '-c'], inputs=[]), jobs=jobs)))
+        # Sample at the linker's reply boundary, after every transfer thread has exited.
+        sender = """import os, socket, sys
+s = socket.socket(fileno=int(os.environ['DISTCC_RUST_DTLTO_FD']))
+for _ in range(3):
+    s.send(os.fsencode(sys.argv[1]))
+    assert s.recv(1) == bytes([0])
+    print(len(os.listdir('/proc/%d/fd' % os.getppid())))
+"""
+        with open(os.devnull, 'rb') as fd:
+            result = self.run_command([self.build/'distcc-thinlto', '--rust-link', work, linked,
+                temporary, compiler, fd.fileno(), sys.executable, '-c', sender, description],
+                pass_fds=(fd.fileno(),))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        counts = list(map(int, result.stdout.splitlines()))
+        self.assertEqual(counts, [counts[0]]*3)
+        self.assertEqual(result.stderr.count('distcc-thinlto: compiled on '), 3 * len(jobs))
+
+    def test_ranked_parallel_submission(self):
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
         self.start_broker(' '.join(self.host(i, f',tcp,stats={self.stats_ports[i]}')
                                   for i in range(2)), name='ranked')
-        planner = self.work / 'planner'
-        planner.mkdir()
-        for name in ('distcc-thinlto', 'distcc_lto.py', 'distcc_job.py', 'distcc_python.py'):
-            shutil.copy2(self.build / name, planner / name)
-        proxy = planner / 'distcc'
-        proxy.write_text('#!/usr/bin/env python3\nimport os, sys, time\n'
-                         'if len(sys.argv) > 2 and sys.argv[2].endswith("/0/job"):\n'
-                         '    time.sleep(0.2)\n'
-                         'os.execv(' + repr(str(self.build / 'distcc')) + ', sys.argv)\n')
-        proxy.chmod(0o755)
         compiler = shutil.which('clang')
         self.assertIsNotNone(compiler)
         jobs, sizes, objects = [], [], []
@@ -1087,23 +1166,22 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
                              inputs=[str(bitcode)], outputs=[str(output)]))
         description = self.work / 'jobs.json'
         description.write_text(json.dumps(dict(common=dict(args=[compiler], inputs=[]), jobs=jobs)))
-        command = [planner / 'distcc-thinlto', description]
+        command = [self.build / 'distcc-thinlto', description]
         result = self.run_command(command)
         self.assertEqual(result.returncode, 0, result.stderr)
-        files = {name: InputSnapshot(name, self.work / f'snapshot-{i}')
-                 for i, name in enumerate(name for job in jobs for name in job['inputs'])}
-        keys = [work_key(dict(cwd=str(self.work), args=[compiler, *job['args']],
-                             inputs=job['inputs'], outputs=job['outputs']), files) for job in jobs]
-        assigned = [int(key, 16) for key in re.findall(r'assigning host=.* key=(\w+) ',
-                                                      (self.work / 'ranked.log').read_text())]
-        self.assertEqual(assigned, [key for _, key in sorted(zip(sizes, keys), reverse=True)])
+        submitted = re.findall(r'submitting (\S+) instructions=\d+ bytes=(\d+)', result.stderr)
+        self.assertEqual([int(n) for _, n in submitted], sorted(sizes, reverse=True))
+        observed = {key: int(size) for key, size in re.findall(r'job cost: key=(\w+) kind=8 bytes=(\d+)',
+                                                               (self.work/'ranked.log').read_text())}
+        assigned = re.findall(r'assigning host=.* key=(\w+) ', (self.work/'ranked.log').read_text())
+        self.assertEqual([observed[k] for k in assigned], sorted(sizes, reverse=True))
         main = self.work / 'main.c'
         main.write_text('int value0(void), value1(void), value2(void);\n'
                         'int main(void) { return value0()+value1()+value2()!=6; }\n')
         result = self.run_command([compiler, main, *objects, '-o', 'check'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.run_command([self.work / 'check']).returncode, 0)
-        # A child failing before enqueueing must release the startup barrier
+        # An error before enqueueing must release the submission barrier
         # and leave previously published objects intact.
         previous = [path.read_bytes() for path in objects]
         self.env.update(DISTCC_BROKER=str(self.work / 'absent.sock'), DISTCC_RECONNECT_TIMEOUT='0')

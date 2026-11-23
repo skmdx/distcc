@@ -156,19 +156,29 @@ class DistccTestCase(unittest.TestCase):
                 (wrappers / (name + '-' + version.split('.')[0])).symlink_to(compiler_path)
         target = subprocess.check_output([cls.cc, "-dumpmachine"], text=True).strip()
         (wrappers / (target + "-gcc")).symlink_to("gcc")
+        daemon_root = cls.root
+        identity = []
+        if os.geteuid() == 0:
+            import pwd
+            account = pwd.getpwnam('nobody')
+            identity = ['--user', account.pw_name]
+            cls.root.chmod(0o711)
+            daemon_root = cls.root / 'workers'
+            daemon_root.mkdir(mode=0o700)
+            os.chown(daemon_root, account.pw_uid, account.pw_gid)
         for i in range(getattr(cls, 'worker_count', 2)):
             port, stats = free_port(), free_port()
             log = open(cls.root / f"daemon-{i}.log", "w+")
             cls.logs.append(log)
-            env = dict(cls.base_env, TMPDIR=str(cls.root),
+            env = dict(cls.base_env, TMPDIR=str(daemon_root), DISTCCD_RUST_TMPDIR=str(daemon_root),
                        DISTCCD_PATH=str(wrappers) + os.pathsep + os.defpath)
             env.update(getattr(cls, "daemon_env", {}))
             proc = subprocess.Popen([
-                str(cls.build / "distccd"), "--daemon", "--no-detach",
+                str(cls.build / "distccd"), "--daemon", "--no-detach", *identity,
                 "--log-stderr", "--verbose", "--enable-tcp-insecure",
                 "--listen", cls.worker_address, "--allow", "127.0.0.0/8",
                 "--port", str(port), "--stats", "--stats-port", str(stats),
-                "--jobs", "4", "--pid-file", str(cls.root / f"daemon-{i}.pid")],
+                "--jobs", "4", "--pid-file", str(daemon_root / f"daemon-{i}.pid")],
                 env=env, stdout=log, stderr=log, start_new_session=True)
             cls.daemons.append(proc)
             cls.ports.append(port)

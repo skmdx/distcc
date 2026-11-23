@@ -83,7 +83,7 @@ int dcc_get_io_timeout(void)
     /** Timeout for all IO other than opening connections.  Much longer,
      * because compiling files can take a long time. **/
     static const int default_dcc_io_timeout = 300; /* seconds */
-    static int current_timeout = 0;
+    static _Thread_local int current_timeout = 0;
 
     if (current_timeout > 0)
         return current_timeout;
@@ -102,6 +102,18 @@ int dcc_get_io_timeout(void)
     return current_timeout;
 }
 
+int dcc_client_cancel_fd = -1;
+
+int dcc_poll_cancelable(struct pollfd *p, int timeout_ms)
+{
+    if (dcc_client_cancel_fd < 0) return poll(p, 1, timeout_ms);
+    struct pollfd pair[] = {*p, {dcc_client_cancel_fd, POLLIN, 0}};
+    int ready = poll(pair, 2, timeout_ms);
+    if (ready > 0 && pair[1].revents) { errno = ECANCELED; return -1; }
+    p->revents = pair[0].revents;
+    return ready;
+}
+
 /* Return poll's ready/timeout/error result. Signals do not renew the budget. */
 int dcc_poll_fd(int fd, short events, int timeout)
 {
@@ -116,7 +128,7 @@ int dcc_poll_fd(int fd, short events, int timeout)
     struct pollfd p = { .fd = fd, .events = events };
     for (;;) {
         int64_t ms = (remaining + 999999) / 1000000;
-        int ready = poll(&p, 1, ms > INT_MAX ? INT_MAX : (int)ms);
+        int ready = dcc_poll_cancelable(&p, ms > INT_MAX ? INT_MAX : (int)ms);
         if (ready > 0 && (p.revents & POLLNVAL)) {
             errno = EBADF;
             return -1;
@@ -154,7 +166,7 @@ int dcc_select_for_write(int fd, int timeout)
 /**
  * Read exactly @p len bytes from a file.
  **/
-static struct {
+static _Thread_local struct {
     int fd;
     size_t head, size;
     char data[65536];

@@ -33,8 +33,8 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <sys/file.h>
+#include <pthread.h>
 #include <string.h>
-#include <errno.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <syslog.h>
@@ -194,12 +194,6 @@ rs_loglevel_from_name(const char *name)
  **/
 static void rs_lazy_default(void)
 {
-    static int called;
-
-    if (called)
-        return;
-
-    called = 1;
     if (logger_list == NULL)
         rs_add_logger(rs_logger_file, RS_LOG_WARNING, NULL, STDERR_FILENO);
 }
@@ -213,8 +207,10 @@ rs_log_va(int flags, char const *caller_fn_name, char const *fmt, va_list va)
     int level = flags & RS_LOG_PRIMASK;
     struct rs_logger_list *l;
 
-    rs_lazy_default();
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, rs_lazy_default);
 
+    flockfile(stderr);
     if (level <= rs_trace_level)
       for (l = logger_list; l; l = l->next)
           if (level <= l->max_level) {
@@ -227,6 +223,7 @@ rs_log_va(int flags, char const *caller_fn_name, char const *fmt, va_list va)
                     fmt, copied_va, l->private_ptr, l->private_int);
               VA_COPY_END(copied_va);
           }
+    funlockfile(stderr);
 }
 
 

@@ -40,9 +40,9 @@ inline void check(bool ok, const string &what) {
 }
 struct Work {
     fs::path dir;
-    explicit Work(const fs::path &parent) {
-        string tmp = (parent / "distcc-rust-XXXXXX").string();
-        check(mkdtemp(tmp.data()) != nullptr, "Rust working directory");
+    explicit Work(const fs::path &parent, const char *pattern = "distcc-rust-XXXXXX") {
+        string tmp = (parent / pattern).string();
+        check(mkdtemp(tmp.data()) != nullptr, "temporary working directory");
         dir = fs::absolute(tmp);
     }
     ~Work() {
@@ -135,11 +135,12 @@ inline Words compiler_command(const fs::path &compiler, const fs::path &mount = 
     return {mount.empty() ? compiler.string() : (mount / "bin/rustc").string()};
 }
 inline pid_t spawn(const Words &cmd, const Env &environment, int out, int err,
-                   const std::vector<int> *inherited = nullptr) {
+                   const std::vector<int> *inherited = nullptr, bool process_group = false) {
     auto args = pointers(cmd);
     pid_t pid = fork();
     check(pid >= 0, "fork rustc");
     if (!pid) {
+        if (process_group && setpgid(0, 0)) _exit(100);
         for (const auto &item : environment)
             if (setenv(item.first.c_str(), item.second.c_str(), 1))
                 _exit(100);

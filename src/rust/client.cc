@@ -838,7 +838,7 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
             char path[PATH_MAX];
             fs::path helper = dcc_helper_path("distcc-thinlto", path);
             const string shim = DCC_RUST_ROOT "/dtlto-distributor";
-            box.mount(helper, shim);
+            box.mount(fs::canonical(helper), shim);
             box.mount(temporary->dir, temporary->dir, true);
             cmd.insert(cmd.end(), {"--setenv", "TMPDIR", temporary->dir});
             command.emplace_back("-Wl,--thinlto-distributor=" + shim +

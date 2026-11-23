@@ -20,7 +20,6 @@
 #include <linux/fs.h>
 #include <sys/ioctl.h>
 #endif
-#include "distcc.h"
 #include "file_cache.h"
 
 /* Shards serialize preparation, but share the former 64 * 4 MiB budget.
@@ -157,7 +156,7 @@ int dcc_file_digest(int fd, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE])
     return 0;
 }
 
-static int copy_snapshot(int from, int to)
+int dcc_copy_snapshot(int from, int to)
 {
     char buffer[65536];
 #ifdef __linux__
@@ -175,7 +174,7 @@ static int snapshot(int from, const char *destination, int shared)
 {
     int to = open(destination, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, shared ? 0400 : 0600);
     if (to < 0) return 0;
-    int ok = !copy_snapshot(from, to);
+    int ok = !dcc_copy_snapshot(from, to);
     close(to);
     if (!ok) unlink(destination);
     return ok;
@@ -394,7 +393,7 @@ void dcc_file_cache_put(struct dcc_record_cache *cache, const unsigned char *has
     if (st.st_size > CACHE_BYTES) goto done;
     to = openat(shard, ".", O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
     if (to < 0) goto done;
-    if (!copy_snapshot(from, to) && !fchmod(to, 0400))
+    if (!dcc_copy_snapshot(from, to) && !fchmod(to, 0400))
         publish_snapshot(cache->root, shard, key, to);
 done:
     if (to >= 0) close(to);

@@ -14,7 +14,6 @@
 #include <arpa/inet.h>
 #include "distcc.h"
 #include "hosts.h"
-#include "bulk.h"
 #include "broker.h"
 #include "job.h"
 #include "tcp_job.h"
@@ -167,6 +166,32 @@ done:
     return transport_complete && ret ? DCC_REMOTE_LOCAL_ERROR : ret;
 }
 
+int dcc_finish_file_job(struct dcc_job_result *result, unsigned output_count)
+{
+    int ret = 0;
+    flockfile(stderr);
+    for (unsigned i = DCC_JOB_STDERR; i <= DCC_JOB_STDOUT; ++i) {
+        struct dcc_buffer buffer = {0};
+        if ((ret = buffer_result(result->fd[i], result, i, &buffer))) break;
+        ret = dcc_writex(i == DCC_JOB_STDERR ? STDERR_FILENO : STDOUT_FILENO,
+                         buffer.data, buffer.size);
+        dcc_free_buffer(&buffer);
+        if (ret) break;
+    }
+    funlockfile(stderr);
+    if (ret) return ret;
+    if (!result->status) {
+        if (result->named_count != output_count) return EXIT_PROTOCOL_ERROR;
+        for (unsigned i = 0; i < output_count; ++i) {
+            struct dcc_named_output *f = result->named + i;
+            if (rename(f->temporary, f->destination)) return EXIT_IO_ERROR;
+            free(f->temporary);
+            f->temporary = NULL;
+        }
+    }
+    return WIFEXITED(result->status) ? WEXITSTATUS(result->status) : 128 + WTERMSIG(result->status);
+}
+
 /* Planners own immutable numbered snapshots. Scheduling, caching, compression,
  * cancellation and connection reuse stay on the ordinary path. queued_fd is
  * consumed after enqueueing, or closed on an earlier failure. */
@@ -225,25 +250,7 @@ int dcc_file_transfer(const char *metadata, const char *snapshots, char **output
     }
     ret = dcc_transfer_prepared(job, files, NULL, &hint, queued_fd, &result);
     queued_fd = -1;
-    if (ret) goto done;
-    for (unsigned i = DCC_JOB_STDERR; i <= DCC_JOB_STDOUT; ++i) {
-        struct dcc_buffer buffer = {0};
-        if ((ret = buffer_result(result.fd[i], &result, i, &buffer))) goto done;
-        ret = dcc_writex(i == DCC_JOB_STDERR ? STDERR_FILENO : STDOUT_FILENO,
-                         buffer.data, buffer.size);
-        dcc_free_buffer(&buffer);
-        if (ret) goto done;
-    }
-    if (!result.status) {
-        if (result.named_count != output_count) { ret = EXIT_PROTOCOL_ERROR; goto done; }
-        for (unsigned i = 0; i < output_count; ++i) {
-            struct dcc_named_output *f = result.named + i;
-            if (rename(f->temporary, f->destination)) { ret = EXIT_IO_ERROR; goto done; }
-            free(f->temporary);
-            f->temporary = NULL;
-        }
-    }
-    ret = WIFEXITED(result.status) ? WEXITSTATUS(result.status) : 128 + WTERMSIG(result.status);
+    if (!ret) ret = dcc_finish_file_job(&result, output_count);
 done:
     if (queued_fd >= 0) close(queued_fd);
     dcc_job_result_free(&result);

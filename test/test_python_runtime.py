@@ -21,31 +21,25 @@ class PythonBuildEnvironmentTest(unittest.TestCase):
             subprocess.run([clang, '-x', 'c', '-fPIC', '-c', '-', '-o', str(obj)],
                            input='int answer(void) { return 42; }\n', text=True,
                            check=True, capture_output=True)
-            for helper in ('distcc-link',
-                           'distcc-thinlto', 'distcc-offload-link'):
-                with self.subTest(helper=helper):
-                    result = subprocess.run([sys.executable, '-S', '-c', '''
+            for helper in ('distcc-thinlto', 'distcc-offload-link'):
+                self.assertTrue((root/helper).samefile(root/'distcc'))
+            result = subprocess.run([sys.executable, '-S', '-c', '''
 import ctypes, os, runpy, subprocess, sys
-root, helper, compiler, obj, output = sys.argv[1:]
+root, compiler, obj, output = sys.argv[1:]
 sys.path.insert(0, root)
 environment = dict(os.environ)
-entry = runpy.run_path(root + '/' + helper)
+entry = runpy.run_path(root + '/distcc-link')
 import distcc_python
 assert os.path.samefile(distcc_python.client_executable(), os.path.join(root, 'distcc'))
-if helper == 'distcc-link':
-    command, diagnostics = entry['clang_link_command']([compiler, '-shared', '-fuse-ld=lld', obj, '-o', output])
-    subprocess.run(command, check=True)
-    assert ctypes.CDLL(output).answer() == 42
-else:
-    import xxhash
-    assert xxhash.xxh3_64(b'input').digest()
+command, diagnostics = entry['clang_link_command']([compiler, '-shared', '-fuse-ld=lld', obj, '-o', output])
+subprocess.run(command, check=True)
+assert ctypes.CDLL(output).answer() == 42
 assert dict(os.environ) == environment
 assert subprocess.check_output([sys.executable, '-c',
     'import os; print(os.environ["GENTOO_CPYTHON_BUILD"])'], text=True).strip() == '1'
-''', str(root), helper, clang, str(obj), str(library)],
-                        env=dict(os.environ, GENTOO_CPYTHON_BUILD='1'),
-                        capture_output=True, text=True, timeout=30)
-                    self.assertEqual(result.returncode, 0, result.stderr)
+''', str(root), clang, str(obj), str(library)], env=dict(os.environ, GENTOO_CPYTHON_BUILD='1'),
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':

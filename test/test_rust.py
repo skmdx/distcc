@@ -1118,8 +1118,7 @@ class RustTest(BrokerTestCase):
         self.assertEqual(subprocess.check_output([output, 'argument'], text=True), '1056\n')
 
     def test_thinlto_output_directories(self):
-        from contextlib import ExitStack
-        from distcc_lto import LinkFiles
+        import sys
         work, final, temporary = (self.work/p for p in ('inputs', 'final', 'lto'))
         for directory in (work, final, temporary):
             directory.mkdir()
@@ -1133,19 +1132,27 @@ class RustTest(BrokerTestCase):
             return dict(args=['primary', '-fthinlto-index=index', '-o', str(destination)],
                         inputs=['primary', 'index'], outputs=[str(destination)])
 
-        with ExitStack() as stack:
-            files = LinkFiles(work, linked, temporary, stack)
-            for invalid_arg in ('@more-options', 1):
-                with self.subTest(arg=invalid_arg):
-                    description.write_text(json.dumps(dict(common=dict(common, args=['clang', '-c', invalid_arg]),
-                                                           jobs=[job(final/'ok.o')])))
-                    with self.assertRaisesRegex(ValueError, 'compiler arguments'):
-                        files.request(str(description), 'clang')
-            for invalid in (work/'bad.o', temporary/'..'/'bad.o', temporary/'alias'/'bad.o'):
-                with self.subTest(path=invalid):
-                    description.write_text(json.dumps(dict(common=common, jobs=[job(final/'ok.o'), job(invalid)])))
-                    with self.assertRaises((ValueError, NotADirectoryError)):
-                        files.request(str(description), 'clang')
+        # Act as the sandboxed linker on the inherited control socket.
+        sender = ('import os,sys,socket; s=socket.socket(fileno=int(os.environ["DISTCC_RUST_DTLTO_FD"])); '
+                  's.send(os.fsencode(sys.argv[1])); sys.exit(0 if s.recv(1)==bytes([0]) else 1)')
+        def rejected(request):
+            description.write_text(json.dumps(request))
+            with open(os.devnull, 'rb') as fd:
+                result = subprocess.run([self.build/'distcc-thinlto', '--rust-link',
+                    work, linked, temporary, 'clang', str(fd.fileno()), sys.executable, '-c', sender, description],
+                    pass_fds=(fd.fileno(),), capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((final/'ok.o').exists())
+            return result.stderr
+
+        for invalid_arg in ('@more-options', 1):
+            with self.subTest(arg=invalid_arg):
+                self.assertIn('compiler arguments', rejected(dict(common=dict(common, args=['clang', '-c', invalid_arg]),
+                                                                  jobs=[job(final/'ok.o')])))
+        for invalid in (work/'bad.o', temporary/'..'/'bad.o', temporary/'alias'/'bad.o'):
+            with self.subTest(path=invalid):
+                self.assertRegex(rejected(dict(common=common, jobs=[job(final/'ok.o'), job(invalid)])),
+                                 'outside link directories|invalid ThinLTO path|unexpected ThinLTO backend job|Not a directory')
 
     @unittest.skipUnless(shutil.which('cargo') and shutil.which('clang'), 'Cargo and Clang required')
     def test_cargo_link_driver_skips_masquerade_symlinks(self):

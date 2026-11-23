@@ -54,7 +54,6 @@
 #include "implicit.h"
 #include "compile.h"
 #include "job.h"
-#include "rpc.h"
 #include "rust/api.h"
 #include "native_worker.h"
 
@@ -178,16 +177,13 @@ static void dcc_show_hosts(void) {
     dcc_free_hostlist(list);
 }
 
-static char *dcc_lto_capacity(void) {
-    char *capacity = NULL;
+int dcc_lto_capacity(char **capacity) {
     const char *broker = getenv("DISTCC_BROKER");
     if (!broker || !*broker) {
         rs_log_error("LTO capacity requires DISTCC_BROKER");
-        dcc_exit(EXIT_BAD_ARGUMENTS);
+        return EXIT_BAD_ARGUMENTS;
     }
-    if (dcc_broker_jobs(&capacity) < 0)
-        dcc_exit(EXIT_CONNECT_FAILED);
-    return capacity;
+    return dcc_broker_jobs(capacity) < 0 ? EXIT_CONNECT_FAILED : 0;
 }
 
 static void dcc_concurrency_level(void) {
@@ -236,52 +232,15 @@ static void dcc_gssapi_show_principal(void) {
 }
 #endif
 
-/* A planner leases one process per concurrent exchange. The queued notification
- * and terminal status use the same ordered, full-duplex local socket. */
-static int file_jobs(int fd)
-{
-    for (;;) {
-        unsigned argc;
-        int ret = dcc_r_token_int(fd, "ARGC", &argc);
-        if (ret || !argc) return ret;
-        if (argc < 3 || argc > DCC_JOB_INPUT_MAX + 2) return EXIT_BAD_ARGUMENTS;
-        char **args = NULL;
-        ret = dcc_r_argv_body(fd, "ARGV", argc, &args);
-        if (!ret) {
-            unsigned char done[] = {'D', 0};
-            int weights = -1;
-            if (argc == 3 && !strcmp(args[0], "--plan")) {
-                weights = dcc_job_memfd("distcc-index-weights");
-                done[1] = weights < 0 ? EXIT_IO_ERROR : dcc_clang_local_tool(args + 1, 'N', weights, NULL);
-            } else if (argc == 3 && (!strcmp(args[0], "--prepare") || !strcmp(args[0], "--merge"))) {
-                done[1] = dcc_clang_local_tool(args + 1, args[0][2] == 'p' ? 'A' : 'M', -1, NULL);
-            } else {
-                int queued = fcntl(fd, F_DUPFD_CLOEXEC, 3);
-                if (queued < 0) ret = EXIT_IO_ERROR;
-                else done[1] = dcc_file_transfer(args[0], args[1], args + 2, queued);
-            }
-            if (!ret) ret = dcc_writex(fd, done, sizeof(done));
-            if (weights >= 0) {
-                if (!ret && !done[1]) {
-                    off_t size = lseek(weights, 0, SEEK_END);
-                    if (size < 0 || size > UINT_MAX || lseek(weights, 0, SEEK_SET) < 0) ret = EXIT_IO_ERROR;
-                    else if (!(ret = dcc_x_token_int(fd, "WGHT", size)))
-                        ret = dcc_pump_readwrite(fd, weights, size);
-                }
-                close(weights);
-            }
-        }
-        if (args) dcc_free_argv(args);
-        if (ret) return ret;
-    }
-}
-
 int main(int argc, char **argv)
 {
     int status, sg_level, tweaked_path = 0, masquerade = 0;
     char **compiler_args = NULL; /* dynamically allocated */
     char *compiler_name; /* points into argv[0] */
     int ret;
+
+    if (!strcmp(argv[0], "/__distcc_rust/dtlto-distributor"))
+        return dcc_lto_distribute(argc, argv);
 
     dcc_client_catch_signals();
     atexit(dcc_cleanup_tempfiles);
@@ -310,17 +269,9 @@ int main(int argc, char **argv)
     if (argc == 5 && !strcmp(argv[1], "--rust-cgu"))
         dcc_exit(dcc_rust_submit_cgu(argv[2], argv[3], argv[4]));
 
-    /* Private transport entry point used by file-based compiler planners. */
-    if ((argc == 2 || (argc == 3 && !strcmp(argv[2], "--lto-capacity"))) &&
-        !strcmp(argv[1], "--file-jobs")) {
-        if (argc == 3) {
-            char *capacity = dcc_lto_capacity();
-            ret = dcc_x_token_string(STDIN_FILENO, "CAPA", capacity);
-            free(capacity);
-            if (ret) dcc_exit(ret);
-        }
-        dcc_exit(file_jobs(STDIN_FILENO));
-    }
+    if (!strcmp(compiler_name, "distcc-thinlto") || !strcmp(compiler_name, "distcc-offload-link"))
+        dcc_exit(dcc_lto_distribute(argc, argv));
+
     if (argc >= 6 && !strcmp(argv[1], "--file-job")) {
         long queued_fd = -1;
         if (strcmp(argv[4], "-")) {
@@ -384,7 +335,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "-j") || !strcmp(argv[1], "--lto-capacity")) {
             if (!strcmp(argv[1], "-j")) dcc_concurrency_level();
             else {
-                char *capacity = dcc_lto_capacity();
+                char *capacity = NULL;
+                if ((ret = dcc_lto_capacity(&capacity))) goto out;
                 puts(capacity);
                 free(capacity);
             }

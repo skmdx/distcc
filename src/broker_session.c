@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include "distcc.h"
 #include "broker.h"
 #include "broker_protocol.h"
 #include "broker_session.h"
@@ -13,6 +14,7 @@
 #ifdef __linux__
 #include <pthread.h>
 #include <poll.h>
+#include <limits.h>
 #include <time.h>
 static pthread_once_t cleanup_once = PTHREAD_ONCE_INIT;
 static pthread_key_t cleanup_key;
@@ -58,7 +60,9 @@ static int reconnect_wait(struct reconnect *retry, int error, int allow_unreacha
     }
     double remaining = retry->deadline - now_seconds();
     if (remaining <= 0) return 0;
-    poll(NULL, 0, remaining * 1000 < retry->delay ? (int)(remaining * 1000) : retry->delay);
+    struct pollfd delay = {-1, 0, 0};
+    if (dcc_poll_cancelable(&delay, remaining * 1000 < retry->delay ? (int)(remaining * 1000) : retry->delay) < 0 &&
+        errno == ECANCELED) return 0;
     errno = error;
     if (retry->delay < 1000) retry->delay *= 2;
     return 1;
@@ -185,6 +189,19 @@ int dcc_session_call(struct broker_request_hdr *header, struct iovec *parts, siz
         do { sent = sendmsg(fd, &msg, MSG_NOSIGNAL); } while (sent < 0 && errno == EINTR);
         /* A denied peer can close immediately after queuing its error. */
         int read_reply = sent < 0 ? errno == EPIPE || errno == ECONNRESET : mark_queued(queued_fd) == 0;
+        if (read_reply && dcc_client_cancel_fd >= 0) {
+            struct pollfd p = {fd, POLLIN, 0};
+            double end = io_timeout ? now_seconds() + io_timeout : 0;
+            if (retry.deadline && (!end || retry.deadline < end)) end = retry.deadline;
+            int ready;
+            do {
+                double ms = end ? (end - now_seconds()) * 1000 : 0;
+                int timeout = !end ? -1 : ms <= 0 ? 0 : ms >= INT_MAX ? INT_MAX : (int)ms + 1;
+                ready = dcc_poll_cancelable(&p, timeout);
+            } while (ready < 0 && errno == EINTR);
+            if (!ready) errno = ETIMEDOUT;
+            read_reply = ready > 0;
+        }
         if (read_reply) {
             ssize_t n = receive_reply(fd, reply.iov_base, reply.iov_len, descriptor);
             if (n >= 0) {
