@@ -133,34 +133,34 @@ static int compare_names(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 static int directory_entry(struct dcc_frontend_reply *reply, int fd, const char *name,
-                           unsigned type, int statuses, int inspect)
+                           unsigned type, int attributes, int inspect, int follow)
 {
     struct stat st = {0};
     int error = 0;
-    if (inspect || (!statuses && type == DT_UNKNOWN))
-        error = fstatat(fd, name, &st, statuses == 1 ? 0 : AT_SYMLINK_NOFOLLOW) ? errno : 0;
-    else if (!statuses) st.st_mode = DTTOIF(type);
+    if (inspect || (!attributes && type == DT_UNKNOWN))
+        error = fstatat(fd, name, &st, follow ? 0 : AT_SYMLINK_NOFOLLOW) ? errno : 0;
+    else if (!attributes) st.st_mode = DTTOIF(type);
     unsigned char header[8];
     size_t length = strlen(name);
     dcc_tcp_put32(header, length);
-    dcc_tcp_put32(header + 4, statuses == 2 && !inspect ? DCC_FS_NO_METADATA :
-                 statuses ? (uint32_t)error : error ? 0 : st.st_mode);
+    dcc_tcp_put32(header + 4, attributes && !inspect ? DCC_FS_NO_METADATA :
+                 attributes ? (uint32_t)error : error ? 0 : st.st_mode);
     return append(reply, header, 8) || append(reply, name, length) ||
         (inspect && !error && metadata(reply, &st));
 }
 /* Own fd. Cached names need fresh child metadata, but no DIR allocation or
  * the extra descriptor stat that opendir/fdopendir performs. */
-static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
+static int directory(struct dcc_frontend_reply *reply, int fd, int follow,
                      const char **hints, size_t hint_count, const char *previous,
                      const struct stat *initial)
 {
     size_t offset = reply->size;
     unsigned char header[8] = {0};
     uint32_t count = 0, flags = 0;
-    int result = statuses ? append(reply, header, statuses == 2 ? 8 : 4) : 0;
+    int result = initial ? append(reply, header, previous ? 8 : 4) : 0;
     unsigned char version[DCC_FS_METADATA], observed[DCC_FS_METADATA];
     struct stat snapshot;
-    if (!result && statuses == 2) {
+    if (!result && previous) {
         encode_metadata(version, initial);
         if (!memcmp(version, previous, sizeof(version))) flags |= DCC_FS_DIRECTORY_CACHED;
         else if (hint_count && S_ISDIR(dcc_tcp_get32(previous + 32)))
@@ -170,7 +170,7 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
         /* This is a lookup index, not a readdir result. The caller checked
          * current search permission; child attributes are never reused. */
         for (size_t i = 0; i < hint_count && !result; ++i) {
-            result = directory_entry(reply, fd, hints[i], DT_UNKNOWN, statuses, 1);
+            result = directory_entry(reply, fd, hints[i], DT_UNKNOWN, 1, 1, follow);
             ++count;
         }
     } else if (!result) {
@@ -188,9 +188,9 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
                 at += entry->d_reclen;
                 if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
                 const char *name = entry->d_name;
-                int inspect = statuses == 1 || (statuses == 2 && hint_count &&
+                int inspect = (initial && !previous) || (hint_count &&
                     bsearch(&name, hints, hint_count, sizeof(*hints), compare_names));
-                result = directory_entry(reply, fd, name, entry->d_type, statuses, inspect);
+                result = directory_entry(reply, fd, name, entry->d_type, initial != NULL, inspect, follow);
                 ++count;
             }
         }
@@ -198,7 +198,7 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
     /* Only freshly enumerated names need a publication stability check.
      * Cached names were matched to the fresh descriptor identity above and
      * are never republished; child attributes still come from this query. */
-    if (!result && statuses == 2 && !flags) {
+    if (!result && previous && !flags) {
         result = fstat(fd, &snapshot);
         if (!result) {
             encode_metadata(observed, &snapshot);
@@ -207,9 +207,9 @@ static int directory(struct dcc_frontend_reply *reply, int fd, int statuses,
     }
     int error = errno;
     close(fd);
-    if (!result && statuses) {
-        if (statuses == 2) dcc_tcp_put32(reply->data + offset, flags);
-        dcc_tcp_put32(reply->data + offset + (statuses == 2 ? 4 : 0), count);
+    if (!result && initial) {
+        if (previous) dcc_tcp_put32(reply->data + offset, flags);
+        dcc_tcp_put32(reply->data + offset + (previous ? 4 : 0), count);
     }
     errno = error;
     return result;
@@ -219,7 +219,8 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
                           int contents, const char **hints, size_t hint_count,
                           const char *previous)
 {
-    int flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK | (follow ? 0 : O_NOFOLLOW);
+    int traversal = O_DIRECTORY | O_CLOEXEC | (follow ? 0 : O_NOFOLLOW);
+    int flags = O_RDONLY | O_NONBLOCK | traversal;
     int fd = -1;
     struct stat st;
     /* Cached names or a known lookup footprint avoid reading a directory.
@@ -227,7 +228,7 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
      * search permissions (including ACLs). Actual readdir uses LIST and its
      * ordinary read-permission check, even when lookup names are cached. */
     if (contents && previous && S_ISDIR(dcc_tcp_get32(previous + 32))) {
-        fd = open(path, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        fd = open(path, O_PATH | traversal);
         if (fd >= 0) {
             if (fstat(fd, &st)) goto failed;
             unsigned char version[DCC_FS_METADATA];
@@ -239,7 +240,7 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
             }
             if (!memcmp(previous, version, sizeof(version)) || hint_count) {
                 if (metadata(reply, &st)) goto failed;
-                return directory(reply, fd, 2, hints, hint_count, previous, &st);
+                return directory(reply, fd, follow, hints, hint_count, previous, &st);
             }
             /* No positive hints means this directory may mainly reject
              * include candidates. Refresh its names once rather than
@@ -256,15 +257,15 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
                 return error == EACCES ? metadata(reply, &st) : -1;
             }
             if (metadata(reply, &st)) goto failed;
-            return directory(reply, fd, 2, hints, hint_count, previous, &st);
+            return directory(reply, fd, follow, hints, hint_count, previous, &st);
         }
     }
     if ((follow ? stat(path, &st) : lstat(path, &st))) return -1;
     if (!S_ISDIR(st.st_mode) || !contents) return metadata(reply, &st);
     fd = open(path, flags);
     /* Execute-only directories still permit known header lookups. */
-    if (fd < 0) return !follow && errno == EACCES ? metadata(reply, &st) : -1;
-    if (!follow) {
+    if (fd < 0) return previous && errno == EACCES ? metadata(reply, &st) : -1;
+    if (previous) {
         if (fstat(fd, &st)) goto failed;
         /* Reading names without search permission does not authorize even
          * negative child lookups. Such names belong only in a LIST reply. */
@@ -275,7 +276,7 @@ static int query_metadata(struct dcc_frontend_reply *reply, const char *path, in
         }
     }
     if (metadata(reply, &st)) goto failed;
-    return directory(reply, fd, follow ? 1 : 2, hints, hint_count, previous, &st);
+    return directory(reply, fd, follow, hints, hint_count, previous, &st);
 failed:
     {
         int error = errno;
@@ -350,7 +351,7 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
     const char *separator = memchr(names, 0, end - names), *small_hints[32];
     const char **hints = small_hints, *version = NULL;
     size_t hint_count = 0;
-    if (operation == DCC_FS_LSTAT) {
+    if (operation == DCC_FS_LSTAT || (operation == DCC_FS_STAT && separator)) {
         if (!separator || end - separator - 1 < DCC_FS_METADATA) return -1;
         version = separator + 1;
         const char *previous = NULL;

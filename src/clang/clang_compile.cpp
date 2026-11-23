@@ -152,7 +152,10 @@ static int remote(llvm::ArrayRef<const char *> argv, int fd) {
         });
         llvm::IntrusiveRefCntPtr<RemoteFiles> files(new RemoteFiles(dup(fd), cwd, dcc_file_cache_records, client_identity,
             llvm::sys::path::parent_path(root).str()));
-        files->prepare(*invocation);
+        if (auto error = files->prepare(*invocation)) {
+            llvm::errs() << "distcc: preparing frontend filesystem: " << error.message() << '\n';
+            return 1;
+        }
         auto finish = llvm::scope_exit([&] { files->finish(); });
         compiler->setFileManager(new clang::FileManager(invocation->getFileSystemOpts(), files));
         compiler->createSourceManager();

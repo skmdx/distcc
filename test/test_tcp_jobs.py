@@ -1756,6 +1756,60 @@ class FrontendTest(BrokerTestCase):
                         DISTCC_SKIP_LOCAL_RETRY='1')
         return clang
 
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_clang_hints_follow_each_source_and_only_open_used_headers(self):
+        clang = self.start_frontend()
+        real = self.work/'headers'
+        real.mkdir()
+        include = self.work/'include'
+        include.symlink_to(real, target_is_directory=True)
+        nested = real/'nested'
+        nested.mkdir()
+        (nested/'common.h').touch()
+        for name in ('a', 'b'):
+            (real/(name+'.inc')).write_text('42\n')
+            (real/(name+'_only.h')).symlink_to(name+'.inc')
+            (self.work/(name+'.c')).write_text(
+                f'#include <nested/common.h>\n#if __has_include(<absent.h>)\n#error unexpected header\n#endif\n'
+                f'int value =\n#include <{name}_only.h>\n;\n')
+
+        def compile_source(name):
+            trace, output = self.work/'trace', self.work/(name+'.o')
+            args = [clang, '-nostdinc', '-I'+str(include), '-c', str(self.work/(name+'.c')), '-o', str(output)]
+            subprocess.run(args, env=self.env, check=True, capture_output=True)
+            expected = output.read_bytes()
+            output.unlink()
+            result = subprocess.run(['strace', '-yy', '-s', '512', '-e', 'trace=newfstatat,statx,openat,getdents64',
+                                     '-o', trace, str(self.build/'distcc'), *args],
+                                    env=self.env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('frontend filesystem:', result.stderr)
+            self.assertEqual(output.read_bytes(), expected)
+            return trace.read_text()
+
+        cold = compile_source('a')
+        self.assertRegex(cold, r'getdents64\(\d+<'+re.escape(str(nested))+r'>')
+        self.assertRegex(cold, r'getdents64\(\d+<'+re.escape(str(real))+r'>')
+        self.assertNotRegex(cold, r'fstatat\([^\n]*"b_only\.h"')
+        # A different size forces a miss if the cold TU speculatively reads A.
+        (real/'a.inc').write_text('12345\n')
+        cold_b = compile_source('b')
+        self.assertNotRegex(cold_b, r'getdents64\(\d+<'+re.escape(str(nested))+r'>')
+        self.assertNotRegex(cold_b, r'openat\([^\n]*"[^"]*/a_only\.h", O_RDONLY')
+        warm_a = compile_source('a')
+        self.assertRegex(warm_a, r'(?:fstatat|statx)\([^\n]*"a_only\.h"')
+        self.assertNotRegex(warm_a, r'(?:fstatat|statx|openat)\([^\n]*"[^"]*b_only\.h"')
+        for events in (cold_b, warm_a):
+            self.assertNotRegex(events, r'getdents64\(\d+<'+re.escape(str(real))+r'>')
+            self.assertNotRegex(events, r'(?:fstatat|statx)\([^\n]*"[^"]*absent\.h"')
+        # The stale directory yields only A's hinted attributes. Looking up a
+        # newly added header must refresh the names before answering negatively.
+        (real/'late.h').write_text('73\n')
+        source = self.work/'a.c'
+        source.write_text(source.read_text().replace('a_only.h', 'late.h'))
+        changed = compile_source('a')
+        self.assertRegex(changed, r'getdents64\(\d+<'+re.escape(str(real))+r'>')
+
     def test_header_directory_survives_failed_file_open(self):
         clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1')
         directory = self.work/'format'

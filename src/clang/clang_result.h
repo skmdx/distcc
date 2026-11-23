@@ -173,7 +173,7 @@ public:
         // loaded libraries and environment. Different worker execs never share
         // an action, even when an on-disk compiler is replaced in place.
         if (!instance.second) return;
-        key = "clang-ir-v1:" LLVM_VERSION_STRING ":" + llvm::toHex(instance.first);
+        key = "clang-ir-v2:" LLVM_VERSION_STRING ":" + llvm::toHex(instance.first);
         key.append(cwd.data(), cwd.size()); key += '\0';
         canonical.generateCC1CommandLine([&](const llvm::Twine &arg) { key += arg.str(); key += '\0'; });
         lock = files.claimResult(key);
@@ -187,9 +187,9 @@ public:
         if (key.empty()) return {};
         auto cached = files.result(key);
         if (!cached.data || cached.size < 8) return {};
-        uint64_t size = dccfs::number(cached.data, 8);
+        uint64_t size = dccfs::number(cached.data+cached.size-8, 8);
         if (size > cached.size-8) return {};
-        auto parsed = llvm::json::parse({cached.data+8, size});
+        auto parsed = llvm::json::parse({cached.data+size, cached.size-size-8});
         if (!parsed) { llvm::consumeError(parsed.takeError()); return {}; }
         auto *record = parsed->getAsObject();
         if (!record) return {};
@@ -210,7 +210,7 @@ public:
                 << " valid=" << valid << " cpu_ns=" << now(CLOCK_PROCESS_CPUTIME_ID)-cpu
                 << " wall_ns=" << now(CLOCK_MONOTONIC)-wall << '\n';
         if (!valid) return {};
-        llvm::MemoryBufferRef bitcode({cached.data+8+size, cached.size-8-size}, "distcc frontend IR");
+        llvm::MemoryBufferRef bitcode({cached.data, size}, "distcc frontend IR");
         auto module = llvm::parseBitcodeFile(bitcode, context);
         if (!module) { llvm::consumeError(module.takeError()); return {}; }
         const auto &dep = compiler.getDependencyOutputOpts();
@@ -261,20 +261,18 @@ public:
             if (!llvm::json::isUTF8(name)) return;
             names.push_back(name);
         }
-        std::string metadata;
-        llvm::raw_string_ostream stream(metadata);
+        // Bitstream offsets are relative to byte zero. Append the certificate
+        // and bitcode length after LLVM finishes writing the module in place.
+        llvm::SmallVector<char> record;
+        llvm::raw_svector_ostream stream(record);
+        llvm::WriteBitcodeToFile(module, stream, true);
+        uint64_t size = record.size();
         stream << llvm::json::Value(llvm::json::Object{{"inputs", std::move(*inputs)},
             {"dependencies", std::move(names)}, {"diagnostics", diagnostics->bytes},
             {"warnings", diagnostics->getNumWarnings()}});
-        llvm::SmallVector<char> encoded;
-        llvm::raw_svector_ostream bitcode(encoded);
-        llvm::WriteBitcodeToFile(module, bitcode, true);
-        llvm::StringRef bytes(encoded.data(), encoded.size());
-        if (metadata.size()+bytes.size()+8+key.size() > DCC_FILE_CACHE_MAX-64) return;
-        std::string record(8, '\0');
-        for (unsigned n = 0; n < 8; ++n) record[7-n] = uint64_t(metadata.size()) >> (8*n);
-        record += metadata; record.append(bytes.data(), bytes.size());
-        files.saveResult(key, record);
+        for (int shift = 56; shift >= 0; shift -= 8) record.push_back(size >> shift);
+        if (record.size()+key.size() > DCC_FILE_CACHE_MAX-64) return;
+        files.saveResult(key, {record.data(), record.size()});
         if (verbose) llvm::errs() << "distcc compiler result: stored inputs=" << input_count << '\n';
     }
 };

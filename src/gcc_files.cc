@@ -26,6 +26,7 @@ extern "C" {
 
 namespace {
 using dccfs::number;
+using dccfs::valid_name;
 static int run_session(fuse_session *session) {
     // A signal can arrive after the single-thread loop's exit check but before
     // its blocking read. The MT loop wakes via a semaphore and cancels/joins
@@ -38,40 +39,31 @@ static int run_session(fuse_session *session) {
     fuse_loop_cfg_destroy(config);
     return result;
 }
-struct Entry {
+struct Entry : dccfs::DirectoryListing {
     // The map owns the spelling; entries and keys live until this job ends.
     const std::string *path = nullptr;
-    enum Listing { Deferred, Unavailable, Partial, Ready } listing = Deferred;
     int error = 0;
     std::array<char, DCC_FS_METADATA> version{};
     bool queried = false, searched = false;
     std::set<std::string> hints, observed;
-    std::vector<std::string_view> names;
-    // File contents or the immutable reply/cache record owning directory names.
-    dccfs::Buffer bytes;
     // A job owns one filesystem snapshot. Repeated FUSE readlink callbacks
     // must not round-trip to the client and reauthorize the same hop.
     dccfs::Buffer link_target;
     unsigned mode() const { return number(version.data()+32, 4); }
 };
-struct Query {
-    unsigned operation = DCC_FS_LSTAT;
-    std::string path, bytes;
-    dccfs::Buffer previous;
-};
+using Query = dccfs::DirectoryQuery;
+static dccfs::SourceHints source_hints(dccfs::Connection &connection, const char *cwd, const char *input) {
+    auto source = (std::filesystem::path(cwd)/input).lexically_normal();
+    return {connection, source.string(), source.parent_path().string()};
+}
 class Files {
     dccfs::Connection connection;
-    std::string source, scope;
-    dccfs::Buffer previous_hints;
+    dccfs::SourceHints hints;
     std::map<std::string, std::set<std::string>> predictions;
     int hints_error = 0;
     bool learned = false;
     std::map<std::string, Entry> entries;
     std::map<std::pair<uint64_t, uint64_t>, ino_t> inodes;
-    static bool valid_name(std::string_view name) {
-        return !name.empty() && name != "." && name != ".." &&
-            name.find_first_of("/\0", 0, 2) == std::string_view::npos;
-    }
     int load_hints(const dccfs::Buffer &snapshot) {
         if (!snapshot.owner) return 0;
         std::string_view bytes(snapshot.data, snapshot.size);
@@ -97,19 +89,14 @@ public:
     Files(int fd, std::string root, const char *identity, const char *cache_root,
           const char *cwd, const char *input)
         : connection(fd, dcc_file_cache_records, identity, cache_root),
-          source((std::filesystem::path(cwd)/input).lexically_normal().string()),
-          scope(std::filesystem::path(source).parent_path().string()), root(std::move(root)) {
-        previous_hints = connection.source_hints(source);
-        // A known source retains its own footprint. A new source can bootstrap
-        // from a nearby job without overwriting either source's future hints.
-        auto hints = previous_hints.owner ? previous_hints : connection.source_hints(scope);
-        learned = bool(hints.owner);
-        hints_error = load_hints(hints);
+          hints(source_hints(connection, cwd, input)), root(std::move(root)) {
+        learned = bool(hints.snapshot().owner);
+        hints_error = load_hints(hints.snapshot());
     }
     ~Files() {
         if (hints_error) return;
         std::string snapshot;
-        snapshot.reserve(previous_hints.size);
+        snapshot.reserve(hints.snapshot().size);
         for (const auto &[path, entry] : entries) {
             if (!entry.searched) continue;
             // Speculative queries do not teach the next job to repeat them.
@@ -120,12 +107,7 @@ public:
             for (const auto &name : entry.observed) { snapshot += name; snapshot += '\0'; }
             snapshot += '\0';
         }
-        if (!previous_hints.owner || snapshot.size() != previous_hints.size ||
-            memcmp(snapshot.data(), previous_hints.data, snapshot.size()))
-            connection.save_source_hints(source, snapshot);
-        // One atomic record replaces hundreds of per-directory cache accesses.
-        // Concurrent jobs may change only the next cold source's prediction.
-        connection.save_source_hints(scope, snapshot);
+        hints.save(connection, snapshot);
     }
     ino_t inode(uint64_t device, uint64_t number) {
         // One FUSE mount represents several client devices. Preserve hardlink
@@ -143,125 +125,45 @@ public:
             query.bytes = path;
             return query.bytes.size() <= DCC_FS_QUERY_MAX-12 ? 0 : (entry.error = ENAMETOOLONG);
         }
-        auto &previous = query.previous = connection.directory_names(path);
-        std::array<char, DCC_FS_METADATA> listing_version{};
-        if (previous.owner) {
-            if (previous.size < DCC_FS_METADATA) return entry.error = EPROTO;
-            // A partial reply suffices while the compiler uses known names.
-            // Once it requests an unknown child, refresh the complete index:
-            // sending its old version again would only yield another partial
-            // reply and force an individual RPC for each new include candidate.
-            if (entry.listing != Entry::Partial)
-                memcpy(listing_version.data(), previous.data, DCC_FS_METADATA);
-        }
         if (predicted != predictions.end()) {
             entry.hints = std::move(predicted->second);
             predictions.erase(predicted);
         }
-        query.bytes = path; query.bytes += '\0';
-        query.bytes.append(listing_version.data(), DCC_FS_METADATA);
-        // Reserve the outer operation and the batch entry's length/operation.
-        if (query.bytes.size() > DCC_FS_QUERY_MAX-12) return entry.error = ENAMETOOLONG;
-        std::string child = path == "/" ? path : path+'/';
-        size_t prefix = child.size();
-        for (const auto &name : entry.hints) {
-            child.resize(prefix); child += name;
-            // This child's own query will refresh its identity and permissions.
-            // Do not ask the parent to stat it again, even across batch splits.
-            if (scheduled.count(child)) continue;
-            if (name.size()+1 > DCC_FS_QUERY_MAX-12-query.bytes.size()) break;
-            query.bytes += name; query.bytes += '\0';
-        }
-        return 0;
+        // An unknown child upgrades a partial footprint to a complete name index.
+        if (entry.listing != Entry::Partial) query.previous = connection.directory_names(path);
+        return entry.error = query.encode(entry.hints, scheduled);
     }
     int accept(const Query &query, const dccfs::Buffer &response) {
-        const auto &path = query.path;
-        auto &entry = entries[path];
-        const auto &previous = query.previous;
-        entry.queried = true;
-        entry.error = 0;
+        auto &entry = entries[query.path];
+        entry.queried = true; entry.error = 0;
         entry.listing = query.operation == DCC_FS_ATTRIBUTES ? Entry::Deferred : Entry::Unavailable;
         if (response.size < DCC_FS_METADATA) return entry.error = EPROTO;
         memcpy(entry.version.data(), response.data, DCC_FS_METADATA);
         if (response.size == DCC_FS_METADATA) return 0;
-        if (!S_ISDIR(entry.mode()) || response.size < DCC_FS_METADATA+8) return entry.error = EPROTO;
-        unsigned flags = number(response.data+DCC_FS_METADATA, 4);
-        if (flags & ~(DCC_FS_DIRECTORY_CACHED | DCC_FS_DIRECTORY_STABLE | DCC_FS_DIRECTORY_PARTIAL))
-            return entry.error = EPROTO;
-        bool reused = flags & DCC_FS_DIRECTORY_CACHED;
-        bool partial = flags & DCC_FS_DIRECTORY_PARTIAL;
-        if (partial && flags != DCC_FS_DIRECTORY_PARTIAL) return entry.error = EPROTO;
-        entry.names.clear();
-        entry.bytes = reused ? previous : response;
-        if (reused) {
-            if (!previous.owner || memcmp(entry.version.data(), previous.data, DCC_FS_METADATA))
-                return entry.error = EPROTO;
-            std::string_view names(previous.data+DCC_FS_METADATA, previous.size-DCC_FS_METADATA);
-            while (!names.empty()) {
-                auto end = names.find('\0');
-                if (end == std::string_view::npos || !valid_name(names.substr(0, end)))
-                    return entry.error = EPROTO;
-                entry.names.push_back(names.substr(0, end));
-                names.remove_prefix(end+1);
-            }
-        }
-        size_t offset = DCC_FS_METADATA+8;
-        unsigned count = number(response.data+DCC_FS_METADATA+4, 4);
-        std::string names;
-        for (unsigned i = 0; i < count; ++i) {
-            if (response.size-offset < 8) return entry.error = EPROTO;
-            unsigned length = number(response.data+offset, 4), error = number(response.data+offset+4, 4);
-            offset += 8;
-            if (!length || length > response.size-offset) return entry.error = EPROTO;
-            std::string_view name(response.data+offset, length);
-            if (!valid_name(name))
-                return entry.error = EPROTO;
-            offset += length;
-            if (error != DCC_FS_NO_METADATA) {
-                auto &child = entries[(path == "/" ? path : path+'/')+std::string(name)];
-                child.error = error;
-                if (!error) {
-                    if (response.size-offset < DCC_FS_METADATA) return entry.error = EPROTO;
-                    memcpy(child.version.data(), response.data+offset, DCC_FS_METADATA);
-                    offset += DCC_FS_METADATA;
-                }
-                child.queried = true;
-            }
-            if (!reused && !partial) entry.names.push_back(name);
-            if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) { names += name; names += '\0'; }
-        }
-        if (offset != response.size) return entry.error = EPROTO;
-        // Keep names as borrowed views, not an Entry and full path for every
-        // unrelated sibling. Only compiler lookups and fresh attributes need
-        // child state; the same index still answers negative lookups locally.
-        std::sort(entry.names.begin(), entry.names.end());
-        entry.listing = partial ? Entry::Partial : Entry::Ready;
-        if (!reused && (flags & DCC_FS_DIRECTORY_STABLE)) {
-            connection.save_directory_names(path, entry.version, names);
-        }
-        return 0;
+        const std::string prefix = query.path == "/" ? query.path : query.path+'/';
+        return entry.error = entry.decode(connection, query, response,
+            [&](std::string_view name, unsigned error, const char *metadata) {
+                auto &child = entries[prefix + std::string(name)];
+                child.error = error; child.queried = true;
+                if (!error) memcpy(child.version.data(), metadata, DCC_FS_METADATA);
+            });
     }
     int fetch(std::set<std::string> paths, bool speculative = false) {
-        std::vector<Query> pending;
-        std::string payload;
-        auto flush = [&]() -> int {
-            dccfs::Buffer response;
-            if (auto error = connection.request(DCC_FS_DIRECTORIES, payload, response))
-                return error.value();
-            size_t offset = 0;
-            for (const auto &query : pending) {
-                if (response.size-offset < 8) return EPROTO;
-                unsigned error = number(response.data+offset, 4), length = number(response.data+offset+4, 4);
-                offset += 8;
-                if (length > response.size-offset || error > INT_MAX) return EPROTO;
-                if (error) {
-                    auto &entry = entries[query.path];
-                    entry.queried = true; entry.error = error;
-                } else if (int invalid = accept(query, {response.owner, response.data+offset, length}))
-                    return invalid;
-                offset += length;
+        while (!paths.empty()) {
+            std::vector<Query> pending;
+            while (!paths.empty()) {
+                auto &query = pending.emplace_back();
+                if (int error = prepare(paths, query, speculative)) return error;
+                paths.erase(query.path);
             }
-            if (offset != response.size) return EPROTO;
+            auto error = connection.batch(DCC_FS_DIRECTORIES, pending, [&](const Query &q, std::error_code ec,
+                                                                           const dccfs::Buffer &reply) {
+                if (!ec) return std::error_code(accept(q, reply), std::generic_category());
+                auto &entry = entries[q.path];
+                entry.queried = true; entry.error = ec.value();
+                return std::error_code{};
+            });
+            if (error) return error.value();
             // Every reply in this batch must be applied before scheduling
             // children: some are already queried by another batch entry.
             // Only freshly observed directories from this source's hints
@@ -278,23 +180,6 @@ public:
                         paths.insert(std::move(path));
                 }
             }
-            pending.clear(); payload.clear();
-            return 0;
-        };
-        while (!paths.empty() || !pending.empty()) {
-            if (paths.empty()) {
-                if (int error = flush()) return error;
-                continue;
-            }
-            Query query;
-            if (int error = prepare(paths, query, speculative)) return error;
-            if (payload.size()+8+query.bytes.size() > DCC_FS_QUERY_MAX-4)
-                if (int error = flush()) return error;
-            paths.erase(query.path);
-            uint32_t header[] = {htonl(query.bytes.size()+4), htonl(query.operation)};
-            payload.append(reinterpret_cast<const char *>(header), sizeof(header));
-            payload += query.bytes;
-            pending.push_back(std::move(query));
         }
         return 0;
     }
@@ -351,7 +236,7 @@ public:
             (found == entries.end() || !found->second.queried)) {
             parent->second.searched = true;
             std::string_view name(path.data()+separator+1, path.size()-separator-1);
-            if (!std::binary_search(parent->second.names.begin(), parent->second.names.end(), name)) {
+            if (parent->second.excludes(name)) {
                 // The immutable name index already owns this negative answer.
                 // Do not allocate a second full-path Entry for every failed
                 // include candidate. The kernel also retains the reply.

@@ -60,12 +60,13 @@ static struct dcc_frontend_reply query(struct dcc_job *job, const char *path,
                                       unsigned operation, const unsigned char *previous)
 {
     size_t length = strlen(path), size = 4 + length;
-    if (operation == DCC_FS_LSTAT) size += 1 + DCC_FS_METADATA + sizeof("header");
+    int versioned = operation == DCC_FS_LSTAT || (operation == DCC_FS_STAT && previous);
+    if (versioned) size += 1 + DCC_FS_METADATA + sizeof("header");
     unsigned char *bytes = calloc(1, size);
     assert(bytes);
     dcc_tcp_put32(bytes, operation);
     memcpy(bytes + 4, path, length);
-    if (operation == DCC_FS_LSTAT) {
+    if (versioned) {
         if (previous) memcpy(bytes + 5 + length, previous, DCC_FS_METADATA);
         memcpy(bytes + 5 + length + DCC_FS_METADATA, "header", sizeof("header"));
     }
@@ -131,6 +132,52 @@ static void reuse_reply(struct dcc_job *job, const char *path)
     dcc_frontend_fs_clear(&reply);
     assert(!reply.data && !reply.capacity && !reply.size && reply.fd == -1);
     free(request);
+}
+
+static void clang_directory(struct dcc_job *job, const char *root)
+{
+    char dir[PATH_MAX], alias[PATH_MAX], header[PATH_MAX], target[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/include-real", root);
+    snprintf(alias, sizeof(alias), "%s/include-alias", root);
+    snprintf(header, sizeof(header), "%s/include-real/header", root);
+    snprintf(target, sizeof(target), "%s/include-real/target", root);
+    assert(!mkdir(dir, 0700) && !symlink(dir, alias) && !symlink("target", header));
+    contents(target, "first");
+    unsigned char version[DCC_FS_METADATA] = {0};
+    batches = 0;
+    struct dcc_frontend_reply reply = query(job, alias, DCC_FS_STAT, version);
+    assert(batches && dcc_tcp_get32(reply.data+60) == DCC_FS_DIRECTORY_STABLE);
+    assert(header_size(&reply) == 5);
+    memcpy(version, reply.data+8, sizeof(version));
+    dcc_frontend_fs_clear(&reply);
+    contents(target, "replacement");
+    batches = 0;
+    reply = query(job, alias, DCC_FS_STAT, version);
+    assert(!batches && dcc_tcp_get32(reply.data+60) == DCC_FS_DIRECTORY_CACHED);
+    assert(header_size(&reply) == 11);
+    dcc_frontend_fs_clear(&reply);
+    // r285 sends a plain STAT inside DIRECTORIES. Each name must carry the
+    // followed attributes, immediately after the unversioned entry count.
+    unsigned char packet[PATH_MAX+12];
+    unsigned length = strlen(alias);
+    dcc_tcp_put32(packet, DCC_FS_DIRECTORIES);
+    dcc_tcp_put32(packet+4, 4+length);
+    dcc_tcp_put32(packet+8, DCC_FS_STAT);
+    memcpy(packet+12, alias, length);
+    assert(!dcc_frontend_fs_reply(job, packet, length+12, &reply));
+    assert(!dcc_tcp_get32(reply.data) && !dcc_tcp_get32(reply.data+8));
+    unsigned offset = 16 + DCC_FS_METADATA;
+    assert(dcc_tcp_get32(reply.data+offset) == 2);
+    offset += 4;
+    for (unsigned i = 0; i < 2; ++i) {
+        length = dcc_tcp_get32(reply.data+offset);
+        assert(!dcc_tcp_get32(reply.data+offset+4) && length == 6);
+        offset += 8+length;
+        assert(S_ISREG(dcc_tcp_get32(reply.data+offset+32)) && dcc_tcp_get64(reply.data+offset+24) == 11);
+        offset += DCC_FS_METADATA;
+    }
+    assert(offset == reply.size);
+    dcc_frontend_fs_clear(&reply);
 }
 
 static void authorization(const char *root)
@@ -244,6 +291,7 @@ int main(int argc, char **argv)
     authorization(argv[1]);
     char *roots[] = {argv[1], NULL};
     struct dcc_job job = {.fs_roots = roots};
+    clang_directory(&job, argv[1]);
     large_listing(&job, argv[1]);
     empty_footprint(&job, directory_path);
     descriptor_stats = 0;

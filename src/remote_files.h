@@ -7,10 +7,14 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <array>
+#include <algorithm>
+#include <climits>
+#include <set>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -215,24 +219,25 @@ public:
         out = {data, data.get(), size};
         return {};
     }
-    struct Query { unsigned op; std::string path; uint64_t reply_size = 0; };
-    template<typename Apply>
-    std::error_code batch(unsigned op, const std::vector<Query> &queries, Apply apply) {
+    struct Query {
+        unsigned operation;
+        std::string path;
+        const std::string &payload() const { return path; }
+    };
+    template<typename Q, typename Apply>
+    std::error_code batch(unsigned op, const std::vector<Q> &queries, Apply apply) {
         size_t first = 0;
         while (first < queries.size()) {
             std::string packet;
             size_t end = first;
-            uint64_t bodies = 0;
             while (end < queries.size()) {
                 const auto &q = queries[end];
-                size_t size = 8 + q.path.size();
+                size_t size = 8 + q.payload().size();
                 if (size + 4 > DCC_FS_QUERY_MAX) return std::make_error_code(std::errc::filename_too_long);
-                if (packet.size() + size + 4 > DCC_FS_QUERY_MAX ||
-                    (end != first && bodies + q.reply_size > DCC_TCP_CHUNK)) break;
-                bodies += q.reply_size;
-                uint32_t header[] = {htonl(size - 4), htonl(q.op)};
+                if (packet.size() + size + 4 > DCC_FS_QUERY_MAX) break;
+                uint32_t header[] = {htonl(size - 4), htonl(q.operation)};
                 packet.append(reinterpret_cast<const char *>(header), sizeof(header));
-                packet += q.path;
+                packet += q.payload();
                 ++end;
             }
             Buffer reply;
@@ -240,11 +245,13 @@ public:
             std::string_view data(reply.data, reply.size);
             while (first < end) {
                 if (data.size() < 8) return std::make_error_code(std::errc::protocol_error);
-                std::error_code ec(number(data.data(), 4), std::generic_category());
+                unsigned status = number(data.data(), 4);
+                if (status > INT_MAX) return std::make_error_code(std::errc::protocol_error);
+                std::error_code ec(status, std::generic_category());
                 size_t length = number(data.data()+4, 4);
                 data.remove_prefix(8);
                 if (length > data.size()) return std::make_error_code(std::errc::protocol_error);
-                if (auto error = apply(queries[first++], ec, data.substr(0, length))) return error;
+                if (auto error = apply(queries[first++], ec, Buffer{reply.owner, data.data(), length})) return error;
                 data.remove_prefix(length);
             }
             if (!data.empty()) return std::make_error_code(std::errc::protocol_error);
@@ -281,13 +288,10 @@ public:
     Buffer source_hints(std::string_view source) {
         return cached(cache_key("gcc-source-hints", source));
     }
-    void save_directory_names(std::string_view path, const std::array<char, DCC_FS_METADATA> &version,
-                              std::string_view names) {
+    void save_directory_names(std::string_view path, std::string_view record) {
         auto key = cache_key("directory-names", path);
-        std::string data(version.data(), version.size());
-        data.append(names);
         // One atomic record couples names to their observed directory version.
-        cache.write(records, key.data(), key.size(), data.data(), data.size());
+        cache.write(records, key.data(), key.size(), record.data(), record.size());
     }
     void save_source_hints(std::string_view source, std::string_view hints) {
         auto key = cache_key("gcc-source-hints", source);
@@ -327,6 +331,112 @@ public:
         Buffer response;
         if (auto error = request(DCC_FS_READ, path, response)) return error;
         return snapshot(path, version, response, out);
+    }
+};
+
+inline bool valid_name(std::string_view name) {
+    return !name.empty() && name != "." && name != ".." &&
+        name.find_first_of("/\0", 0, 2) == std::string_view::npos;
+}
+
+// The source owns its lookup footprint. Only a cold source consults the scope.
+class SourceHints {
+    std::string source, scope;
+    Buffer previous;
+    bool source_hit;
+public:
+    SourceHints(Connection &c, std::string source, std::string scope)
+        : source(std::move(source)), scope(std::move(scope)), previous(c.source_hints(this->source)),
+          source_hit(bool(previous.owner)) {
+        if (!source_hit) previous = c.source_hints(this->scope);
+    }
+    const Buffer &snapshot() const { return previous; }
+    bool known_source() const { return source_hit; }
+    void save(Connection &c, std::string_view actual) const {
+        bool changed = !previous.owner || actual != std::string_view(previous.data, previous.size);
+        if (!source_hit || changed) c.save_source_hints(source, actual);
+        if (changed) c.save_source_hints(scope, actual);
+    }
+};
+
+struct DirectoryQuery {
+    unsigned operation = DCC_FS_LSTAT;
+    std::string path, bytes;
+    Buffer previous;
+    const std::string &payload() const { return bytes; }
+
+    int encode(const std::set<std::string> &hints, const std::set<std::string> &scheduled) {
+        if (previous.owner && previous.size < DCC_FS_METADATA) return EPROTO;
+        bytes = path; bytes += '\0';
+        if (previous.owner) bytes.append(previous.data, DCC_FS_METADATA);
+        else bytes.append(DCC_FS_METADATA, '\0');
+        if (bytes.size() > DCC_FS_QUERY_MAX-12) return ENAMETOOLONG;
+        const std::string prefix = path == "/" ? path : path + '/';
+        for (const auto &name : hints) {
+            if (scheduled.count(prefix + name)) continue;
+            if (name.size()+1 > DCC_FS_QUERY_MAX-12-bytes.size()) break;
+            bytes += name; bytes += '\0';
+        }
+        return 0;
+    }
+};
+
+struct DirectoryListing {
+    enum Listing { Deferred, Unavailable, Partial, Ready } listing = Deferred;
+    std::vector<std::string_view> names;
+    // Owns the name views for a directory, or the file contents for a GCC inode.
+    Buffer bytes;
+    bool excludes(std::string_view name) const {
+        return listing == Ready && !std::binary_search(names.begin(), names.end(), name);
+    }
+    template<class Child>
+    int decode(Connection &connection, const DirectoryQuery &query, const Buffer &response, Child child) {
+        if (response.size < DCC_FS_METADATA+8 || !S_ISDIR(number(response.data+32, 4))) return EPROTO;
+        const auto &previous = query.previous;
+        auto flags = number(response.data+DCC_FS_METADATA, 4);
+        if (flags != 0 && flags != DCC_FS_DIRECTORY_CACHED &&
+            flags != DCC_FS_DIRECTORY_STABLE && flags != DCC_FS_DIRECTORY_PARTIAL) return EPROTO;
+        bool reused = flags == DCC_FS_DIRECTORY_CACHED;
+        bool partial = flags == DCC_FS_DIRECTORY_PARTIAL;
+        names.clear();
+        bytes = reused ? previous : response;
+        if (reused) {
+            if (!previous.owner || memcmp(response.data, previous.data, DCC_FS_METADATA)) return EPROTO;
+            std::string_view saved(previous.data+DCC_FS_METADATA, previous.size-DCC_FS_METADATA);
+            while (!saved.empty()) {
+                auto end = saved.find('\0');
+                if (end == std::string_view::npos || !valid_name(saved.substr(0, end))) return EPROTO;
+                names.push_back(saved.substr(0, end));
+                saved.remove_prefix(end+1);
+            }
+        }
+        std::string saved;
+        if (flags == DCC_FS_DIRECTORY_STABLE) saved.assign(response.data, DCC_FS_METADATA);
+        auto count = number(response.data+DCC_FS_METADATA+4, 4);
+        std::string_view rows(response.data+DCC_FS_METADATA+8, response.size-DCC_FS_METADATA-8);
+        for (unsigned i = 0; i < count; ++i) {
+            if (rows.size() < 8) return EPROTO;
+            size_t length = number(rows.data(), 4);
+            unsigned error = number(rows.data()+4, 4);
+            rows.remove_prefix(8);
+            if (length > rows.size()) return EPROTO;
+            auto name = rows.substr(0, length);
+            if (!valid_name(name)) return EPROTO;
+            rows.remove_prefix(length);
+            if (error != DCC_FS_NO_METADATA) {
+                if (error > INT_MAX || (!error && rows.size() < DCC_FS_METADATA)) return EPROTO;
+                child(name, error, rows.data());
+                if (!error) rows.remove_prefix(DCC_FS_METADATA);
+            }
+            if (!reused && !partial) names.push_back(name);
+            if (flags == DCC_FS_DIRECTORY_STABLE) { saved += name; saved += '\0'; }
+        }
+        if (!rows.empty()) return EPROTO;
+        std::sort(names.begin(), names.end());
+        listing = partial ? Partial : Ready;
+        if (flags == DCC_FS_DIRECTORY_STABLE)
+            connection.save_directory_names(query.path, saved);
+        return 0;
     }
 };
 }

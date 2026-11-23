@@ -1,6 +1,5 @@
 /* Compiler-owned remote lookups. SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
-#include "../tcp_job.h"
 #include "../job.h"
 extern "C" {
 #include "../file_cache.h"
@@ -30,6 +29,7 @@ extern "C" {
 #include <unistd.h>
 #include <cstring>
 #include <array>
+#include <map>
 #include <set>
 
 using dccfs::number;
@@ -108,7 +108,9 @@ class RemoteFiles : public llvm::vfs::FileSystem {
         std::error_code error;
         std::array<char, DCC_FS_METADATA> version{};
         std::shared_ptr<const llvm::MemoryBuffer> contents;
-        bool queried = false, listed = false, have_real = false;
+        std::unique_ptr<dccfs::DirectoryListing> directory;
+        mutable std::string content_hash;
+        bool queried = false, have_real = false;
         unsigned observed = 0;
         std::string resolved;
         explicit Entry(std::error_code error) : error(error) {}
@@ -125,14 +127,15 @@ class RemoteFiles : public llvm::vfs::FileSystem {
             if (!error && !memcmp(version.data(), bytes, version.size())) return;
             error.clear();
             memcpy(version.data(), bytes, version.size());
-            contents.reset(); resolved.clear();
-            queried = listed = have_real = false;
+            contents.reset(); content_hash.clear(); resolved.clear();
+            directory.reset();
+            queried = have_real = false;
         }
     };
     dccfs::Connection connection;
     std::string cwd;
     llvm::StringMap<Entry> entries;
-    std::string scope;
+    std::optional<dccfs::SourceHints> hints;
     std::set<std::string> reads;
     bool recording = false, stable = true;
     std::vector<std::string> observations;
@@ -165,7 +168,10 @@ class RemoteFiles : public llvm::vfs::FileSystem {
         }
         result["metadata"] = digest({version.data(), version.size()});
         if (entry.observed & 2) {
-            if (entry.contents) result["contents"] = digest(entry.contents->getBuffer());
+            if (entry.contents) {
+                if (entry.content_hash.empty()) entry.content_hash = digest(entry.contents->getBuffer());
+                result["contents"] = entry.content_hash;
+            }
             else result["error"] = EPROTO;
         }
         if (entry.observed & 4) result["resolved"] = entry.resolved;
@@ -180,12 +186,11 @@ class RemoteFiles : public llvm::vfs::FileSystem {
         }
         return found->second;
     }
-    std::error_code remember(llvm::StringRef name, std::error_code error) {
+    void remember(llvm::StringRef name, std::error_code error) {
         auto old = entries.find(name);
         if (old != entries.end() && old->second.observed && old->second.error != error) stable = false;
         if (old == entries.end()) entries.try_emplace(name, error);
         else old->second.error = error;
-        return error;
     }
     llvm::SmallString<256> absolute(const llvm::Twine &path) const {
         llvm::SmallString<256> name;
@@ -213,7 +218,8 @@ class RemoteFiles : public llvm::vfs::FileSystem {
                 auto leaf = llvm::sys::path::filename(entry);
                 auto parent = entries.find(llvm::sys::path::parent_path(entry));
                 if (!leaf.empty() && leaf != "." && leaf != ".." &&
-                    parent != entries.end() && parent->second.listed)
+                    parent != entries.end() && parent->second.directory &&
+                    parent->second.directory->excludes({leaf.data(), leaf.size()}))
                     return std::make_error_code(std::errc::no_such_file_or_directory);
             }
             if (end == name.size()) break;
@@ -232,83 +238,83 @@ public:
                 std::string identity, std::string cache_root)
         : connection(fd, cache, std::move(identity), cache_root), cwd(std::move(cwd)) { connection.async_writes(cache_root); }
     using Query = dccfs::Connection::Query;
-    std::error_code prefetch(unsigned op, const std::vector<Query> &queries) {
-        return connection.batch(op, queries, [this](const Query &query, std::error_code ec, std::string_view data) {
-            if (query.op == DCC_FS_REALPATH) {
-                if (!ec) {
-                    auto found = entries.find(query.path);
-                    if (found != entries.end()) {
-                        found->second.resolved.assign(data);
-                        found->second.have_real = true;
-                    }
+    std::error_code prefetch(const std::vector<Query> &queries) {
+        return connection.batch(DCC_FS_BATCH, queries, [this](const Query &query, std::error_code ec, const dccfs::Buffer &data) {
+            if (query.operation == DCC_FS_REALPATH) {
+                auto found = entries.find(query.path);
+                if (!ec && found != entries.end()) {
+                    found->second.resolved.assign(data.data, data.size);
+                    found->second.have_real = true;
                 }
             } else if (!ec) {
-                auto result = applyStatus(query.path, {data.data(), data.size()});
-                if (!result) return result.getError();
-            } else if (ec != std::errc::file_too_large && ec != std::errc::permission_denied) {
-                (void)remember(query.path, ec);
+                if (data.size != DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
+                remember(query.path, data.data).queried = true;
+            } else {
+                remember(query.path, ec);
             }
             return std::error_code{};
         });
     }
     void retain(llvm::StringRef name, dccfs::Snapshot snapshot) {
         auto &record = remember(name, snapshot.version.data());
+        record.content_hash.clear();
         record.contents = std::make_shared<SnapshotBuffer>(
             llvm::StringRef(snapshot.bytes.data, snapshot.bytes.size), name.str(), std::move(snapshot.bytes.owner));
     }
-    void prepare(const clang::CompilerInvocation &invocation) {
+    std::error_code prepare(const clang::CompilerInvocation &invocation) {
         std::set<std::string> directories;
         for (const auto &entry : invocation.getHeaderSearchOpts().UserEntries)
             directories.insert(absolute(entry.Path).str().str());
         const auto &inputs = invocation.getFrontendOpts().Inputs;
-        if (!inputs.empty() && inputs[0].isFile())
-            directories.insert(llvm::sys::path::parent_path(absolute(inputs[0].getFile())).str());
-        scope = "clang-scope:" + cwd;
-        std::vector<Query> queries;
+        std::map<std::string, std::set<std::string>> predicted;
+        if (!inputs.empty() && inputs[0].isFile()) {
+            auto source = absolute(inputs[0].getFile()).str().str();
+            directories.insert(llvm::sys::path::parent_path(source).str());
+            std::string scope = "clang-scope:" + cwd;
+            for (const auto &dir : directories) { scope += '\0'; scope += dir; }
+            hints.emplace(connection, "clang-source:" + source, std::move(scope));
+            const auto &saved = hints->snapshot();
+            if (saved.owner) {
+                llvm::StringRef paths(saved.data, saved.size);
+                while (!paths.empty()) {
+                    auto [path, rest] = paths.split('\0');
+                    auto leaf = llvm::sys::path::filename(path);
+                    if (path.starts_with("/") && dccfs::valid_name({leaf.data(), leaf.size()})) {
+                        auto parent = llvm::sys::path::parent_path(path).str();
+                        if (hints->known_source() || directories.count(parent)) {
+                            directories.insert(parent);
+                            predicted[parent].insert(leaf.str());
+                        }
+                    }
+                    paths = rest;
+                }
+            }
+        }
+        std::vector<dccfs::DirectoryQuery> queries;
         for (const auto &path : directories) {
-            scope += '\0'; scope += path;
-            queries.push_back({DCC_FS_STAT, path});
+            auto &q = queries.emplace_back();
+            q.operation = DCC_FS_STAT; q.path = path;
+            q.previous = connection.directory_names(path);
+            if (int error = q.encode(predicted[path], directories)) return {error, std::generic_category()};
         }
-        (void)prefetch(DCC_FS_DIRECTORIES, queries);
-        auto hints = connection.source_hints(scope);
-        if (!hints.owner) return;
-        llvm::StringRef names(hints.data, hints.size);
-        queries.clear();
-        while (!names.empty()) {
-            auto pair = names.split('\0');
-            if (pair.first.starts_with("/"))
-                queries.push_back({DCC_FS_STATUS, pair.first.str()});
-            names = pair.second;
-        }
-        if (prefetch(DCC_FS_BATCH, queries)) return;
-        std::vector<Query> missing;
-        for (const auto &q : queries) {
-            auto it = entries.find(q.path);
-            if (it == entries.end() || it->second.error || !S_ISREG(it->second.mode())) continue;
-            const char *version = it->second.version.data();
-            dccfs::Snapshot snapshot;
-            if (connection.cached_file(q.path, version, snapshot)) retain(q.path, std::move(snapshot));
-            else missing.push_back({DCC_FS_READ, q.path, 8 + DCC_FS_METADATA + number(version+24, 8)});
-        }
-        (void)connection.batch(DCC_FS_BATCH, missing, [this](const Query &q, std::error_code ec, std::string_view data) {
-            if (ec) return std::error_code{}; // Retry speculative failures on actual open.
-            // LLVM requires a NUL after every individual source image.
-            auto bytes = std::make_shared<std::string>(data);
-            dccfs::Snapshot snapshot;
-            auto error = connection.snapshot(q.path, entries.find(q.path)->second.version.data(),
-                {bytes, bytes->data(), bytes->size()}, snapshot);
-            if (!error) retain(q.path, std::move(snapshot));
-            return error;
+        return connection.batch(DCC_FS_DIRECTORIES, queries, [&](const auto &q, std::error_code error,
+                                                                   const dccfs::Buffer &reply) {
+            if (!error) return accept(q, reply);
+            // A speculative access denial is not a compiler observation.
+            if (error != std::errc::permission_denied && error != std::errc::file_too_large)
+                remember(q.path, error);
+            return std::error_code{};
         });
     }
     void finish() {
         connection.finish_writes();
-        std::string hints;
+        if (!hints) return;
+        std::string actual;
         for (const auto &path : reads) {
-            if (hints.size() + path.size() + 1 > DCC_FS_QUERY_MAX) break;
-            hints += path; hints += '\0';
+            if (actual.size() + path.size() + 1 > DCC_FS_QUERY_MAX) break;
+            actual += path; actual += '\0';
         }
-        if (!hints.empty()) connection.save_source_hints(scope, hints);
+        hints->save(connection, actual);
     }
     int claimResult(llvm::StringRef action) { return connection.claim_compilation({action.data(), action.size()}); }
     dccfs::Buffer result(llvm::StringRef action) { return connection.compilation({action.data(), action.size()}); }
@@ -317,7 +323,7 @@ public:
     }
     void beginObservations() {
         for (auto &entry : entries) entry.second.observed = 0;
-        observations.clear(); stable = recording = true;
+        observations.clear(); reads.clear(); stable = recording = true;
     }
     std::optional<llvm::json::Array> certificate() const {
         if (!stable) return std::nullopt;
@@ -337,7 +343,7 @@ public:
             queries.push_back({DCC_FS_STATUS, path->str()});
             if (*ops & 4) queries.push_back({DCC_FS_REALPATH, path->str()});
         }
-        if (prefetch(DCC_FS_BATCH, queries)) return false;
+        if (prefetch(queries)) return false;
         for (const auto &value : expected) {
             const auto *item = value.getAsObject();
             auto path = item->getString("path");
@@ -346,7 +352,7 @@ public:
             if (*ops & 2) (void)openFileForRead(*path);
             if (*ops & 4) {
                 llvm::SmallString<256> resolved;
-                (void)getRealPath(*path, resolved);
+                if (getRealPath(*path, resolved)) return false;
             }
             if (!stable || entries.find(*path) == entries.end() ||
                 llvm::json::Value(observation(*path)) != value) return false;
@@ -369,45 +375,60 @@ public:
         return result;
     }
     llvm::ErrorOr<llvm::vfs::Status> statusImpl(llvm::StringRef name) {
-        auto found = entries.find(name);
-        if (found != entries.end() && (found->second.error ||
-            !S_ISDIR(found->second.mode()) || found->second.queried)) return found->second.status(name);
-        if (found == entries.end()) {
-            if (auto error = cachedError(name)) return error;
-        }
-        auto response = request(DCC_FS_STAT, name);
-        if (!response) return remember(name, response.getError());
-        return applyStatus(name, (*response)->getBuffer());
+        Entry *entry;
+        if (auto e = lookup(name, entry)) return e;
+        if (entry && (!S_ISDIR(entry->mode()) || entry->queried)) return entry->status(name);
+        dccfs::DirectoryQuery query;
+        query.path = name.str();
+        query.previous = connection.directory_names(query.path);
+        if (auto e = fetch(query, {})) return e;
+        return entries.find(name)->second.status(name);
     }
-    llvm::ErrorOr<llvm::vfs::Status> applyStatus(llvm::StringRef name, llvm::StringRef answer) {
-        if (answer.size() < DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
-        auto &record = remember(name, answer.data());
-        if (S_ISDIR(record.mode()) && answer.size() >= DCC_FS_METADATA+4) {
-            unsigned count = number(answer.data() + DCC_FS_METADATA, 4);
-            size_t offset = DCC_FS_METADATA+4;
-            llvm::SmallString<256> entry(name);
-            entry += '/';
-            size_t prefix = entry.size();
-            for (unsigned i = 0; i < count; ++i) {
-                if (answer.size() - offset < 8) return std::make_error_code(std::errc::protocol_error);
-                unsigned length = number(answer.data() + offset, 4), error = number(answer.data() + offset + 4, 4);
-                offset += 8;
-                if (length > answer.size() - offset) return std::make_error_code(std::errc::protocol_error);
-                entry.resize(prefix);
-                entry += answer.substr(offset, length);
-                offset += length;
-                if (error) (void)remember(entry, std::error_code(error, std::generic_category()));
-                else {
-                    if (answer.size() - offset < DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
-                    remember(entry, answer.data() + offset);
-                    offset += DCC_FS_METADATA;
-                }
+    std::error_code lookup(llvm::StringRef name, Entry *&entry) {
+        auto found = entries.find(name);
+        if (found == entries.end()) {
+            auto parent = entries.find(llvm::sys::path::parent_path(name));
+            auto leaf = llvm::sys::path::filename(name);
+            if (parent != entries.end() && parent->second.directory &&
+                parent->second.directory->listing == dccfs::DirectoryListing::Partial &&
+                dccfs::valid_name({leaf.data(), leaf.size()})) {
+                // An unpredicted lookup upgrades a partial footprint once.
+                dccfs::DirectoryQuery query;
+                query.path = parent->getKey().str();
+                if (auto e = fetch(query, {leaf.str()})) return e;
+                found = entries.find(name);
             }
-            if (offset != answer.size()) return std::make_error_code(std::errc::protocol_error);
-            record.listed = true;
         }
-        record.queried = true;
-        return record.status(name);
+        entry = found == entries.end() ? nullptr : &found->second;
+        return entry ? entry->error : cachedError(name);
+    }
+    std::error_code fetch(dccfs::DirectoryQuery &query, const std::set<std::string> &children) {
+        query.operation = DCC_FS_STAT;
+        if (int e = query.encode(children, {})) return {e, std::generic_category()};
+        dccfs::Buffer response;
+        if (auto e = connection.request(query.operation, query.bytes, response)) {
+            remember(query.path, e);
+            return e;
+        }
+        return accept(query, response);
+    }
+    std::error_code accept(const dccfs::DirectoryQuery &query, const dccfs::Buffer &reply) {
+        if (reply.size < DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
+        auto &entry = remember(query.path, reply.data);
+        entry.queried = true;
+        entry.directory.reset();
+        if (reply.size == DCC_FS_METADATA) return {};
+        auto listing = std::make_unique<dccfs::DirectoryListing>();
+        std::string prefix = query.path;
+        if (prefix.back() != '/') prefix += '/';
+        int e = listing->decode(connection, query, reply, [&](std::string_view leaf, unsigned error, const char *version) {
+            auto path = prefix + std::string(leaf);
+            if (error) remember(path, {static_cast<int>(error), std::generic_category()});
+            else remember(path, version);
+        });
+        if (e) return {e, std::generic_category()};
+        entry.directory = std::move(listing);
+        return {};
     }
     llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(const llvm::Twine &path) override {
         auto name = absolute(path);
@@ -419,28 +440,20 @@ public:
         if (!result) {
             auto error = result.getError();
             if (error == std::errc::no_such_file_or_directory || error == std::errc::not_a_directory)
-                (void)remember(name, error);
+                remember(name, error);
             else { stable = false; return result; }
         }
         observe(name, 2, result ? std::error_code{} : result.getError());
         return result;
     }
     llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openImpl(llvm::StringRef name) {
-        std::array<char, DCC_FS_METADATA> version{};
-        auto found = entries.find(name);
-        if (found != entries.end()) {
-            auto &record = found->second;
-            if (record.error) return record.error;
-            if (record.contents)
-                return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));
-            if (S_ISREG(record.mode())) {
-                version = record.version;
-            }
-        } else if (auto error = cachedError(name)) return error;
+        Entry *entry;
+        if (auto error = lookup(name, entry)) return error;
+        if (entry && entry->contents)
+            return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, entry->version.data()), entry->contents));
         dccfs::Snapshot snapshot;
         if (auto error = connection.read({name.data(), name.size()},
-                found != entries.end() && S_ISREG(found->second.mode()) ? version.data() : nullptr, snapshot))
-            return error;
+                entry && S_ISREG(entry->mode()) ? entry->version.data() : nullptr, snapshot)) return error;
         retain(name, std::move(snapshot));
         auto &record = entries.find(name)->second;
         return std::unique_ptr<llvm::vfs::File>(new SnapshotFile(metadata(name, record.version.data()), record.contents));

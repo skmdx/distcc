@@ -69,7 +69,7 @@ int main() {
     auto directory = stamp(S_IFDIR | 0755, 0, 1);
     auto regular = stamp(S_IFREG | 0644, 5, 1);
     auto listing = directory;
-    integer(listing, 6, 4);
+    integer(listing, 0, 4); integer(listing, 6, 4);
     child(listing, "a", regular); child(listing, "b", regular); child(listing, "c", regular);
     child(listing, "child", directory);
     child(listing, "large", stamp(S_IFREG | 0644, 1024*1024, 1));
@@ -77,7 +77,7 @@ int main() {
     std::string types;
     integer(types, 1, 4); integer(types, S_IFREG, 4); types += 'a';
     integer(types, 5, 4); integer(types, S_IFDIR, 4); types += "child";
-    auto empty_directory = directory; integer(empty_directory, 0, 4);
+    auto empty_directory = directory; integer(empty_directory, 0, 4); integer(empty_directory, 0, 4);
     std::string long_path = '/' + std::string(65536, 'x');
     struct Reply { unsigned operation; std::string path, bytes; unsigned error = 0, extra = 0; };
     std::vector<Reply> replies{
@@ -99,6 +99,8 @@ int main() {
         {DCC_FS_STAT, "/denied", {}, EACCES},
         {DCC_FS_REALPATH, "/broken", "bad", 0, 10},
     };
+    for (auto &r : replies)
+        if (r.operation == DCC_FS_STAT) r.path.append(1 + DCC_FS_METADATA, '\0');
     int sockets[2];
     require(!socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), "socketpair");
     int small = 1024;
@@ -210,7 +212,7 @@ int main() {
         require(files.openFileForRead("/denied").getError() == std::errc::permission_denied, "lost cached error");
         require(files.getRealPath("/broken", resolved) == std::errc::io_error, "published truncated reply");
     }
-    require(cache_reads == 6 && cache_writes == 2, "cache admission count after writer drain");
+    require(cache_reads == 11 && cache_writes == 2, "cache admission count after writer drain");
     peer.join();
     require(retained->getBuffer() == "fresh", "buffer did not outlive filesystem");
     require(retained_cache->getBuffer() == "cache", "cache view did not outlive filesystem");
