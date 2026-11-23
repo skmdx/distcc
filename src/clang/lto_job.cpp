@@ -4,6 +4,7 @@
 #include "../fd_io.h"
 #include "../sandbox_child.h"
 #include <lld/Common/Driver.h>
+#include <llvm/ADT/ScopeExit.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/IR/ModuleSummaryIndex.h>
 #include <llvm/Object/ELFObjectFile.h>
@@ -15,6 +16,7 @@
 #include <llvm/Support/Path.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include "../job.h"
@@ -46,8 +48,8 @@ bool enter_output(StringRef directory) {
     return !chdir("/") && dcc_restrict_compiler_child();
 }
 
-Error merge(const json::Array &parts, const json::Array &locals) {
-    SmallVector<std::string> command{"ld.lld","-r","-o","merged.o"};
+Error merge(const json::Array &parts, const json::Array &locals, int capture) {
+    SmallVector<std::string> command{"ld.lld","-r","-o",locals.empty() ? "merged.o" : "-"};
     for (const auto &part : parts) {
         auto name = part.getAsString();
         if (!name) return createStringError("invalid merge input");
@@ -55,24 +57,18 @@ Error merge(const json::Array &parts, const json::Array &locals) {
     }
     SmallVector<const char *> args;
     for (auto &word : command) args.push_back(word.c_str());
-    if (lld::lldMain(args, outs(), errs(), {{lld::Gnu, &lld::elf::link}}).retCode)
-        return createStringError("relocatable link failed");
+    if (auto e = dcc_link_elf(args, capture)) return e;
     if (locals.empty()) return Error::success();
-    objcopy::CommonConfig config;
+    std::vector<std::string> names;
     for (const auto &local : locals) {
         auto name = local.getAsString();
         if (!name) return createStringError("invalid local symbol");
-        if (auto e = config.SymbolsToLocalize.addMatcher(objcopy::NameOrPattern::create(
-                *name, objcopy::MatchStyle::Literal, [](Error e) { return e; }))) return e;
+        names.push_back(name->str());
     }
-    auto binary = object::createBinary("merged.o");
-    if (!binary) return binary.takeError();
-    auto *elf = dyn_cast<object::ELFObjectFileBase>(binary->getBinary());
-    if (!elf) return createStringError("expected a relocatable ELF object");
     std::error_code ec;
-    raw_fd_ostream output("localized.o", ec);
+    raw_fd_ostream output("merged.o", ec);
     if (ec) return errorCodeToError(ec);
-    if (Error e = objcopy::elf::executeObjcopyOnBinary(config, {}, *elf, output)) return e;
+    if (Error e = dcc_localize_elf(capture, names, output)) return e;
     output.close();
     return errorCodeToError(output.error());
 }
@@ -81,6 +77,44 @@ int fail(StringRef message) {
     errs() << "distcc ThinLTO: " << message << '\n';
     return 1;
 }
+}
+
+Error dcc_link_elf(ArrayRef<const char *> args, int capture) {
+    // "-o -" uses LLVM's process stdout. Each caller is a single-job
+    // compiler child. Flush both boundaries, including LLD's last partial block.
+    int saved = -1;
+    if (capture >= 0) {
+        outs().flush();
+        saved = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0);
+        if (saved < 0) return errorCodeToError(errnoAsErrorCode());
+        if (dup2(capture, STDOUT_FILENO) < 0) {
+            auto ec = errnoAsErrorCode();
+            close(saved);
+            return errorCodeToError(ec);
+        }
+    }
+    int status = lld::lldMain(args, outs(), errs(), {{lld::Gnu, &lld::elf::link}}).retCode;
+    if (saved >= 0) {
+        outs().flush();
+        int restored = dup2(saved, STDOUT_FILENO);
+        close(saved);
+        if (restored < 0 || outs().has_error()) return createStringError("capturing relocatable link output failed");
+    }
+    return status ? createStringError("relocatable link failed") : Error::success();
+}
+
+Error dcc_localize_elf(int fd, ArrayRef<std::string> names, raw_ostream &output) {
+    auto buffer = MemoryBuffer::getOpenFile(fd, "relocatable", -1, false);
+    if (!buffer) return errorCodeToError(buffer.getError());
+    auto binary = object::createBinary((*buffer)->getMemBufferRef());
+    if (!binary) return binary.takeError();
+    auto *elf = dyn_cast<object::ELFObjectFileBase>(binary->get());
+    if (!elf) return createStringError("expected a relocatable ELF object");
+    objcopy::CommonConfig config;
+    for (const auto &name : names)
+        if (auto e = config.SymbolsToLocalize.addMatcher(objcopy::NameOrPattern::create(
+                name, objcopy::MatchStyle::Literal, [](Error e) { return e; }))) return e;
+    return objcopy::elf::executeObjcopyOnBinary(config, {}, *elf, output);
 }
 
 int dcc_lto_plan(const char *description, int output) {
@@ -111,8 +145,21 @@ int dcc_lto_plan(const char *description, int output) {
                     ++functions;
             }
         }
-        weights.push_back(json::Object{{"instructions", instructions}, {"functions", functions},
-                                       {"largest_function", largest}});
+        json::Object row{{"instructions", instructions}, {"functions", functions},
+                         {"largest_function", largest}};
+        if (auto *args = job->getArray("driver")) {
+            std::vector<std::string> words;
+            SmallVector<const char *> command;
+            for (auto &arg : *args) {
+                auto word = arg.getAsString();
+                if (!word) return fail("invalid template argument");
+                words.push_back(word->str());
+            }
+            if (words.empty()) return fail("missing template compiler");
+            for (auto &word : words) command.push_back(word.c_str());
+            row["cc1"] = json::Array(dcc_lto_cc1(command));
+        }
+        weights.push_back(std::move(row));
     }
     if (ftruncate(output, 0) || lseek(output, 0, SEEK_SET) < 0) return fail(strerror(errno));
     raw_fd_ostream stream(output, false);
@@ -135,18 +182,23 @@ int dcc_lto_local(const char *description, unsigned operation) {
     if (operation == 'M') {
         auto *parts = job->getArray("parts"), *names = job->getArray("locals");
         if (!parts || !names) return fail("invalid merge job");
+        int capture = names->empty() ? -1 : memfd_create("distcc-relocatable", MFD_CLOEXEC);
+        if (!names->empty() && capture < 0) return fail(strerror(errno));
+        auto release = scope_exit([&] { if (capture >= 0) close(capture); });
         if (!enter_output(dir)) return fail(strerror(errno));
-        if (auto error = merge(*parts, *names)) return fail(toString(std::move(error)));
+        if (auto error = merge(*parts, *names, capture)) return fail(toString(std::move(error)));
         return 0;
     }
     LtoInputs inputs;
     auto cwd = job->getString("cwd");
+    auto index = job->getString("index");
     auto count = job->getInteger("partitions");
     auto *files = job->getObject("files");
     auto *args = job->getArray("args");
-    if (!cwd || !count || *count < 1 || *count > UINT_MAX || !args || !files)
+    if (!cwd || !index || !count || *count < 1 || *count > UINT_MAX || !args || !files)
         return fail("invalid partition job");
     inputs.cwd = cwd->str(); inputs.partitions = *count; inputs.manifest = "partitions.json";
+    inputs.localIndex = index->str();
     if (!reserve_descriptors(files->size() + 64)) return fail(strerror(errno));
     for (auto &item : *files) {
         auto path = item.second.getAsString();

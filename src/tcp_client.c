@@ -18,8 +18,10 @@
 #include "trace.h"
 #include "tcp_job.h"
 #include "frontend_fs.h"
+#include "file_cache.h"
+#include "fd_io.h"
 
-struct input_stream { int fd, immutable; unsigned index; uint64_t offset; };
+struct input_stream { int fd, immutable, pass_fd; unsigned index; uint64_t offset; };
 /* TCP has no ancillary descriptors. Read ahead into one maximum wire chunk;
  * frames borrow its payload until consumed. Local IPC retains exact recvmsg
  * boundaries so SCM_RIGHTS stays attached to its own frame. */
@@ -68,19 +70,12 @@ static int local_snapshot(int source, uint64_t size)
         return open(path, O_RDONLY | O_CLOEXEC);
     }
     int fd = dcc_job_memfd("distcc-local-input"), readonly = -1;
-    off_t offset = 0;
     char path[64];
     if (fd < 0) return -1;
     /* Reopening /proc/self/fd in a different UID still checks inode mode.
      * An anonymous, sealed snapshot grants access only through the passed
      * descriptor without exposing or chmod'ing the client's named file. */
-    while ((uint64_t)offset < size) {
-        size_t amount = size - offset > DCC_TCP_CHUNK ? DCC_TCP_CHUNK : size - offset;
-        ssize_t n = sendfile(fd, source, &offset, amount);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) goto done;
-    }
-    if (fchmod(fd, 0444) || fcntl(fd, F_ADD_SEALS,
+    if (dcc_copy_snapshot(source, fd, size) || fchmod(fd, 0444) || fcntl(fd, F_ADD_SEALS,
             F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)) goto done;
     snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
     readonly = open(path, O_RDONLY | O_CLOEXEC);
@@ -211,9 +206,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
         address.ss_family == AF_UNIX;
     unsigned char *buffer = storage ? storage->wire : NULL;
     struct tcp_input input = {.wire = !buffer || local ? NULL : buffer + DCC_TCP_CHUNK};
-    int local_input = local && job->kind == DCC_JOB_COMPILE && job->count == 1 &&
-        job->inputs[0].fd >= 0;
-    int send_input_fd = local_input;
+    int local_input = local && dcc_job_sealed_primary(job) && job->inputs[0].fd >= 0;
     int shared_input = -1;
     struct dcc_frontend_reply filesystem = {.fd = -1};
     uint64_t fs_offset = 0, fs_requests = 0, fs_bytes = 0;
@@ -223,6 +216,7 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
     if (!host->broker_managed || host->broker_fd < 0 || !storage || !requests || !requested) goto done;
     if (local_input && (shared_input = local_snapshot(job->inputs[0].fd, job->inputs[0].plain_size)) < 0)
         goto done;
+    int send_input_fd = shared_input;
     size_t metadata_size = 0;
     unsigned char *manifest = dcc_job_encode_buffer(job, &metadata_size);
     if (!manifest) goto done;
@@ -257,14 +251,24 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     stream.fd = retained >= 0 ? fcntl(retained, F_DUPFD_CLOEXEC, 0) :
                         open(files ? files[stream.index] : cpp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
                     if (stream.fd < 0) goto done;
+                    /* Bound rights queued by one job even if the receiver stalls. */
+                    stream.pass_fd = local && job->kind == DCC_JOB_THINLTO && read_request <= DCC_IPC_FDS_MAX &&
+                        (retained < 0 || (fcntl(stream.fd, F_GETFL) & O_ACCMODE) == O_RDONLY);
                     int seals = fcntl(stream.fd, F_GET_SEALS);
                     int immutable = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
                     /* Rust holds this generation and verifies its descriptor and
                      * pathname again before publishing any output. */
                     stream.immutable = job->kind == DCC_JOB_RUST || (seals >= 0 && (seals & immutable) == immutable);
                 }
-                outgoing = next_chunk(&stream, &job->inputs[stream.index],
-                                      p_buf, storage->snapshot, &length, &file_offset, &file_left, local);
+                if (stream.pass_fd) {
+                    outgoing = p_buf;
+                    dcc_tcp_put32(outgoing, DCC_TCP_INPUT | DCC_TCP_FINAL);
+                    dcc_tcp_put32(outgoing + 4, 4);
+                    dcc_tcp_put32(outgoing + 8, stream.index);
+                    length = 12;
+                    send_input_fd = stream.fd;
+                } else outgoing = next_chunk(&stream, &job->inputs[stream.index],
+                                             p_buf, storage->snapshot, &length, &file_offset, &file_left, local);
                 if (!outgoing) goto done;
                 sent = 0;
             }
@@ -272,16 +276,16 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
             /* Prepared replies can be sent immediately. Register POLLOUT only
              * after a nonblocking write leaves bytes pending. */
             ssize_t n;
-            if (send_input_fd) {
+            if (send_input_fd >= 0) {
                 struct iovec iov = {outgoing + sent, length - sent};
                 union { struct cmsghdr align; char data[CMSG_SPACE(sizeof(int))]; } control = {0};
                 struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1,
                     .msg_control = control.data, .msg_controllen = sizeof(control)};
                 struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
                 c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
-                memcpy(CMSG_DATA(c), &shared_input, sizeof(int));
+                memcpy(CMSG_DATA(c), &send_input_fd, sizeof(int));
                 n = sendmsg(host->broker_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
-                if (n > 0) send_input_fd = 0; /* Rights accompany the first byte, even on a short write. */
+                if (n > 0) send_input_fd = -1; /* Rights accompany the first byte, even on a short write. */
             } else if (sent < length)
                 n = send(host->broker_fd, outgoing + sent, length - sent,
                          MSG_NOSIGNAL | MSG_DONTWAIT | (file_left ? MSG_MORE : 0));
@@ -399,15 +403,22 @@ int dcc_tcp_exchange(struct dcc_hostdef *host, struct dcc_job *job, char **files
                     unsigned index = dcc_tcp_get32(incoming.data);
                     int fd = incoming.fd_plus_one - 1;
                     struct stat st;
-                    if (index >= DCC_JOB_RESULT_COUNT || (finals & (1U << index)) || received[index] ||
-                        fstat(fd, &st) || !S_ISREG(st.st_mode) ||
-                        (uint64_t)st.st_size != result->size[index] ||
+                    if (fstat(fd, &st) || !S_ISREG(st.st_mode) ||
                         (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY) goto done;
-                    if (result->fd[index] >= 0) close(result->fd[index]);
-                    result->fd[index] = fd;
-                    incoming.fd_plus_one = 0;
-                    received[index] = result->size[index];
-                    finals |= 1U << index;
+                    if (index < DCC_JOB_RESULT_COUNT) {
+                        if ((finals & (1U << index)) || received[index] ||
+                            (uint64_t)st.st_size != result->size[index]) goto done;
+                        result->fd[index] = fd;
+                        incoming.fd_plus_one = 0;
+                        received[index] = result->size[index];
+                        finals |= 1U << index;
+                    } else {
+                        if (index - DCC_JOB_RESULT_COUNT != named_index || named_index >= result->named_count ||
+                            named_bytes) goto done;
+                        struct dcc_named_output *f = &result->named[named_index];
+                        if ((uint64_t)st.st_size != f->size || dcc_copy_snapshot(fd, f->fd, f->size)) goto done;
+                        do { ++named_index; } while (named_index < result->named_count && !result->named[named_index].size);
+                    }
                 } else if (type == DCC_TCP_OUTPUT_NAMES && (job->outdir || job->llvm_outputs) && have_result &&
                            !result->status && !names_received) {
                     if (stage_outputs(job, result, incoming.data, incoming.size)) goto done;

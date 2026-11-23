@@ -304,7 +304,8 @@ extern "C" int dcc_rust_cgu_worker(const dcc_job *job, const char *tree, int can
                                    const char *out, const char *err, dcc_job_result *result) {
     if (!job->compiler_channel) return EXIT_LOCAL_COMPILE << 8;
     try {
-        Fd input(open((fs::path(tree) / "cgu").c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+        Fd input(job->inputs[0].fd >= 0 ? fcntl(job->inputs[0].fd, F_DUPFD_CLOEXEC, 0) :
+                 open((fs::path(tree) / "cgu").c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
         struct stat st;
         if (fstat(input.fd, &st) || !S_ISREG(st.st_mode)) return EXIT_PROTOCOL_ERROR << 8;
         Fd object(dcc_job_memfd("rust-cgu-object"));
@@ -331,8 +332,9 @@ extern "C" int dcc_rust_cgu_worker(const dcc_job *job, const char *tree, int can
             check(!fstat(object.fd, &st) && st.st_size > 8, "missing CGU result");
             result->size[DCC_JOB_OBJECT] = st.st_size;
             result->mode = 0600;
-            result->fd[DCC_JOB_OBJECT] = object.fd;
-            object.fd = -1;
+            result->fd[DCC_JOB_OBJECT] = open(("/proc/self/fd/" + std::to_string(object.fd)).c_str(),
+                                              O_RDONLY | O_CLOEXEC);
+            check(result->fd[DCC_JOB_OBJECT] >= 0, "open completed CGU result");
         }
         return usage.status;
     } catch (const std::exception &e) {

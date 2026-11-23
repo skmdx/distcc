@@ -15,6 +15,7 @@ import struct
 import sys
 import time
 import unittest
+from unittest.mock import patch
 import test_tcp_jobs as tcp
 
 from test_broker import BrokerTestCase
@@ -297,6 +298,25 @@ class RustTest(BrokerTestCase):
                              Path(self.logs[0].name).read_bytes()[offset:])
         self.assertEqual(len(started), 1)
         self.assert_resident_sandbox(int(started[0]), [b'/backend', b'--worker'])
+
+    def test_local_cgu_uses_sealed_input(self):
+        self.cgu_toolchain()
+        prefix = str(self.root/'local-cgu')
+        self.restart_server(self.build/'distccd', address='127.0.0.1', DISTCC_LOCAL_SOCKET=prefix)
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        with patch.dict(self.base_env, DISTCC_LOCAL_SOCKET=prefix):
+            self.start_broker(f'127.0.0.1:{self.ports[0]}/1,tcp,stats={self.stats_ports[0]}', name='local-cgu')
+        source = self.work/'answer.rs'
+        steps = ''.join(f'x = std::hint::black_box(x) + {i};' for i in range(64))
+        source.write_text('fn main() { let mut x=0u64;' + steps + 'println!("{}", x); }')
+        result = self.rust(source, '-Ccodegen-units=1', '-Copt-level=2', '-o', 'answer', remote=False,
+                           env=dict(self.env, LD_PRELOAD=str(self.build/'llvm-lto/distcc-rust-cgu.so'),
+                                    DISTCC_RUST_CGU_CLIENT=str(self.build/'distcc'), DISTCC_VERBOSE='1'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        count = result.stderr.count('distcc-rust-cgu: compiled on')
+        self.assertGreater(count, 0, result.stderr)
+        self.assertIn(f'dcc_local_input_jobs {count}\n', self.get_stats(self.stats_ports[0], '127.0.0.1'))
+        self.assertEqual(int(subprocess.check_output([self.work/'answer'])), sum(range(64)))
 
     def test_started_cgu_failure_reaches_the_compiler(self):
         version, target = self.cgu_toolchain()

@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#include <sys/sendfile.h>
 #ifdef __linux__
 #include <linux/fs.h>
 #include <sys/ioctl.h>
@@ -156,25 +157,27 @@ int dcc_file_digest(int fd, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE])
     return 0;
 }
 
-int dcc_copy_snapshot(int from, int to)
+int dcc_copy_snapshot(int from, int to, uint64_t size)
 {
-    char buffer[65536];
-#ifdef __linux__
-    if (!ioctl(to, FICLONE, from)) return 0;
-#endif
-    for (;;) {
-        ssize_t n = read(from, buffer, sizeof(buffer));
-        if (n == 0) return 0;
+    if (!size) return 0;
+    struct file_clone_range range = {.src_fd = from, .src_length = size};
+    if (!ioctl(to, FICLONERANGE, &range)) return 0;
+    off_t offset = 0;
+    while ((uint64_t)offset < size) {
+        size_t amount = size - offset > (1U << 30) ? 1U << 30 : size - offset;
+        ssize_t n = sendfile(to, from, &offset, amount);
         if (n < 0 && errno == EINTR) continue;
-        if (n < 0 || write_all(to, buffer, n)) return -1;
+        if (n <= 0) { if (!n) errno = EIO; return -1; }
     }
+    return 0;
 }
 
 static int snapshot(int from, const char *destination, int shared)
 {
     int to = open(destination, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, shared ? 0400 : 0600);
     if (to < 0) return 0;
-    int ok = !dcc_copy_snapshot(from, to);
+    struct stat st;
+    int ok = !fstat(from, &st) && !dcc_copy_snapshot(from, to, st.st_size);
     close(to);
     if (!ok) unlink(destination);
     return ok;
@@ -393,7 +396,7 @@ void dcc_file_cache_put(struct dcc_record_cache *cache, const unsigned char *has
     if (st.st_size > CACHE_BYTES) goto done;
     to = openat(shard, ".", O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
     if (to < 0) goto done;
-    if (!dcc_copy_snapshot(from, to) && !fchmod(to, 0400))
+    if (!dcc_copy_snapshot(from, to, st.st_size) && !fchmod(to, 0400))
         publish_snapshot(cache->root, shard, key, to);
 done:
     if (to >= 0) close(to);

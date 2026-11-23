@@ -67,6 +67,11 @@ static inline int dcc_job_frontend(const struct dcc_job *job)
 {
     return job->kind == DCC_JOB_FRONTEND || job->kind == DCC_JOB_GCC_FRONTEND;
 }
+static inline int dcc_job_sealed_primary(const struct dcc_job *job)
+{
+    return (job->kind == DCC_JOB_COMPILE || job->kind == DCC_JOB_RUST_CGU) &&
+           job->count == 1 && job->inputs[0].kind == DCC_JOB_FILE && !job->inputs[0].cached;
+}
 #define DCC_LLVM_ROOT "/__distcc_lto"
 #define DCC_LLVM_OUT DCC_LLVM_ROOT "/results"
 static inline int dcc_job_llvm(const struct dcc_job *job)

@@ -51,16 +51,18 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
         if (input >= 0) {
             if (dcc_job_frontend(job)) {
                 job->fs_channel = input + 1;
+            } else if (job->kind == DCC_JOB_RUST_CGU) {
+                job->inputs[0].fd = input;
+                input = -1; /* dcc_job_free owns the sealed generation. */
             } else {
-            char target[64], path[PATH_MAX];
-            snprintf(target, sizeof(target), "/proc/self/fd/%d", input);
-            /* Only this job's compiler inherits the read-only input. The
-             * symlink retains the source basename and avoids materializing
-             * another tmpfs copy. The worker closes it before its next job. */
-            if (job->kind != DCC_JOB_COMPILE || job->count != 1 ||
-                snprintf(path, sizeof(path), "%s%s", run->root, job->inputs[0].path) >= (int)sizeof(path) ||
-                fcntl(input, F_SETFD, 0) || symlink(target, path))
-                finished.error = EXIT_IO_ERROR;
+                char target[64], path[PATH_MAX];
+                snprintf(target, sizeof(target), "/proc/self/fd/%d", input);
+                /* Only this job's compiler inherits the read-only input.
+                 * The symlink preserves its source basename. */
+                if (job->kind != DCC_JOB_COMPILE || job->count != 1 ||
+                    snprintf(path, sizeof(path), "%s%s", run->root, job->inputs[0].path) >= (int)sizeof(path) ||
+                    fcntl(input, F_SETFD, 0) || symlink(target, path))
+                    finished.error = EXIT_IO_ERROR;
             }
         }
         /* Includes compiler-created temporaries: parent-owned cleanup must

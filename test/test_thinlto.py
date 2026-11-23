@@ -69,7 +69,7 @@ class PortageSandboxTest(BrokerTestCase):
             command = ['sandbox', 'sh', '-c', 'ulimit -Sn 1024 && test "$SANDBOX_ON" = 1 && exec "$@"',
                        'sh', self.build/'distcc-thinlto', spec]
             if shutil.which('strace'):
-                command = ['strace', '-f', '-e', 'trace=execve,capset,prctl,seccomp',
+                command = ['strace', '-f', '-s', '256', '-e', 'trace=execve,capset,prctl,seccomp,openat',
                            '-o', trace, *command]
             result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -80,6 +80,10 @@ class PortageSandboxTest(BrokerTestCase):
             self.assertFalse(sandbox_log.exists(), result.stderr)
             if trace.exists():
                 events = trace.read_text()
+                # The module and its index each get one snapshot, including
+                # the 1100 hard-link aliases and all generated partitions.
+                copies = re.findall(r'openat\([^ \n]+, "[^"]*/distcc-lto-[^/"]+/input-\d+", O_WRONLY', events)
+                self.assertEqual(len(copies), 2)
                 self.assertNotRegex(events, r'execve\("[^"]*/(bwrap|ld\.lld|llvm-objcopy)"')
                 self.assertRegex(events, r'prctl\(PR_SET_NO_NEW_PRIVS, 1, .*\)\s+= 0')
                 self.assertRegex(events, r'capset\(.*\)\s+= 0')
@@ -157,6 +161,58 @@ class ThinLTOTest(BrokerTestCase):
         self.env.update(DISTCC_CLANG_LOCAL='0', DISTCC_CLANG_DRIVER=str(launcher))
         result = self.link('clang')
         self.assertNotIn('distcc-thinlto: partitioned ', result.stderr)
+
+    def start_local_lto(self):
+        prefix, cache = str(self.root/'local-lto'), self.root/'input-cache'
+        self.restart_server(self.build/'distccd', DISTCC_LOCAL_SOCKET=prefix, DISTCCD_FILE_CACHE=str(cache))
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        with patch.dict(self.base_env, DISTCC_LOCAL_SOCKET=prefix, DISTCC_VERBOSE='1'):
+            self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='local-lto')
+        return cache
+
+    def test_local_thinlto_input_descriptor_budget(self):
+        self.start_local_lto()
+        self.check_backend_cwd(False, extra=80)
+        sizes = sum((self.work/'inputs'/str(i)).stat().st_size for i in range(64))
+        stats = self.get_stats(self.stats_ports[0])
+        self.assertIn('dcc_local_input_jobs 1\n', stats)
+        self.assertIn(f'dcc_local_input_bytes {sizes}\n', stats)
+
+    def test_local_partitions_and_different_driver_arguments(self):
+        compiler = shutil.which('clang')
+        assert compiler is not None
+        self.clang_slot(compiler)
+        cache = self.start_local_lto()
+        jobs, shared = [], set()
+        for name, body in [('large', '\n'.join(f'int f{i}(int x) {{ volatile int n=x; return n*{i}+x; }}'
+                                               for i in range(160))), ('small', 'int small(void) {return 42;}')]:
+            src, out = self.work/(name+'.bc'), self.work/(name+'.o')
+            self.run_command([compiler, '-O2', '-flto=thin', '-x', 'c', '-c', '-', '-o', src], input=body, check=True)
+            self.run_command([Path(compiler).with_name('ld.lld'), '-shared', '--thinlto-index-only', src,
+                              '-o', self.work/(name+'.so')], check=True)
+            index = Path(str(src)+'.thinlto.bc')
+            args = [str(src), '-fthinlto-index='+str(index), '-o', str(out)]
+            if name == 'small':
+                args += ['-ffunction-sections']
+                shared.add(fingerprint(src)[1].hex())
+            shared.add(fingerprint(index)[1].hex())
+            jobs.append(dict(args=args, inputs=[str(src), str(index)], outputs=[str(out)]))
+        spec = self.work/'jobs.json'
+        spec.write_text(json.dumps(dict(common=dict(args=[compiler, '-c'], inputs=[]), jobs=jobs)))
+        trace = self.work/'transfer.trace'
+        tracer = ['strace', '-f', '-yy', '-e', 'recvmsg', '-o', trace] if shutil.which('strace') else []
+        result = self.run_command([*tracer, self.build/'distcc-thinlto', spec])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        children = re.findall(r'submitting .*\.part-\d+\.bc .* command=cc1', result.stderr)
+        self.assertGreater(len(children), 1, result.stderr)
+        self.assertRegex(result.stderr, r'submitting .*small\.bc .* command=driver')
+        sections = self.run_command(['readelf', '-SW', self.work/'small.o'], check=True)
+        self.assertIn('.text.small', sections.stdout)
+        self.assertEqual((self.work/'large.o').stat().st_mode & 0o777, 0o600)
+        self.assertEqual({p.name for p in cache.glob('*/*') if len(p.name) == 16}, shared)
+        self.assertIn(f'dcc_local_input_jobs {len(children)+1}\n', self.get_stats(self.stats_ports[0]))
+        if tracer:
+            self.assertRegex(trace.read_text(), r'SCM_RIGHTS[^\n]+/__distcc_lto/results/0')
 
     def link(self, compiler, archive=False, hip=False):
         objects = []

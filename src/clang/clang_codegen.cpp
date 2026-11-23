@@ -12,16 +12,13 @@
 #include <clang/Frontend/MultiplexConsumer.h>
 #include <llvm/IR/Module.h>
 #include "clang_result.h"
-#include <llvm/ObjCopy/ConfigManager.h>
-#include <llvm/ObjCopy/ObjCopy.h>
-#include <llvm/Object/Binary.h>
+#include "lto_backend.h"
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/BuryPointer.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/TargetParser/Triple.h>
-#include <lld/Common/Driver.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -35,8 +32,6 @@
 #include <atomic>
 #include <new>
 #include <time.h>
-
-LLD_HAS_DRIVER(elf)
 
 namespace {
 bool verbose_enabled() {
@@ -341,39 +336,33 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler,
     auto merge_start = clock_ns();
     // Internal linking owns the same CPU budget as the parts it merges. LLD's
     // hardware-thread default would otherwise oversubscribe unleased CPUs.
-    std::vector<std::string> link{DCC_LLD_PATH, "--threads=" + std::to_string(extra+1),
-                                 "-r", "-o", frontend.OutputFile};
+    int merged = -1;
+    auto close_merged = llvm::scope_exit([&] { if (merged >= 0) close(merged); });
+    std::vector<std::string> link{DCC_LLD_PATH, "--threads=" + std::to_string(extra+1), "-r"};
+    if (!names->empty() && (merged = memfd_create("distcc-relocatable", MFD_CLOEXEC)) < 0) return false;
+    link.insert(link.end(), {"-o", merged >= 0 ? "-" : frontend.OutputFile});
     for (int fd : parts) link.push_back(fd_path(fd));
     // LLD is already resident for local driver jobs. This compiler child owns
     // one merge, so its linker state cannot leak into another invocation.
     llvm::SmallVector<const char *> link_args;
     for (const auto &argument : link) link_args.push_back(argument.c_str());
-    if (lld::lldMain(link_args, llvm::outs(), llvm::errs(),
-                     {{lld::Gnu, &lld::elf::link}}).retCode) return false;
-    // LLD owns output-file creation. Read its merged object before opening
-    // Clang's temporary replacement, then restore local symbols with the
-    // resident library. No symbol-list file or external objcopy is needed.
-    auto binary = llvm::object::createBinary(frontend.OutputFile);
-    if (!binary) { llvm::logAllUnhandledErrors(binary.takeError(), llvm::errs()); return false; }
-    llvm::objcopy::ConfigManager config;
-    config.Common.OutputFilename = frontend.OutputFile;
-    for (const auto &name : *names) {
-        auto matcher = llvm::objcopy::NameOrPattern::create(name, llvm::objcopy::MatchStyle::Literal,
-            [](llvm::Error error) { return error; });
-        if (auto error = config.Common.SymbolsToLocalize.addMatcher(std::move(matcher))) {
-            llvm::logAllUnhandledErrors(std::move(error), llvm::errs()); return false;
-        }
+    if (auto e = dcc_link_elf(link_args, merged)) {
+        llvm::logAllUnhandledErrors(std::move(e), llvm::errs());
+        return false;
     }
-    auto output = compiler.createOutputFile(frontend.OutputFile, true, true, true);
-    if (!output) return false;
-    auto error = llvm::objcopy::executeObjcopyOnBinary(config, *binary->getBinary(), *output);
-    output->flush();
-    ok = !error;
-    if (error) llvm::logAllUnhandledErrors(std::move(error), llvm::errs());
-    output.reset();
-    ok &= !compiler.getDiagnostics().hasErrorOccurred();
-    compiler.clearOutputFiles(!ok);
-    if (!ok) return false;
+    if (merged >= 0) {
+        auto output = compiler.createOutputFile(frontend.OutputFile, true, true, true);
+        if (!output) return false;
+        auto error = dcc_localize_elf(merged, *names, *output);
+        output->flush();
+        ok = !error;
+        if (error) llvm::logAllUnhandledErrors(std::move(error), llvm::errs());
+        output.reset();
+        ok &= !compiler.getDiagnostics().hasErrorOccurred();
+        compiler.clearOutputFiles(!ok);
+        if (!ok) return false;
+    }
+    ok = true;
     if (measured) {
         measured->overhead_ns.fetch_add(prepared+clock_ns()-merge_start);
         measured->parts.fetch_add(parts.size());

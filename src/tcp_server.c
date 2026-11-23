@@ -68,7 +68,7 @@ struct dcc_tcp_server {
     struct dcc_tcp_run run;
     struct input *inputs;
     char *paths;
-    unsigned remaining, input_index, output_index, prepared;
+    unsigned remaining, input_index, output_index, prepared, received_local_input;
     uint64_t input_offset, output_offset, reserved, input_bytes, result_bytes;
     uint64_t input_pending; /* File bytes not yet materialized in the private tree. */
     int storage_reserved;
@@ -412,7 +412,7 @@ static void reset_job(struct dcc_tcp_server *s)
     s->early_budget = 0;
     s->early_line = NULL;
     s->reserved = 0;
-    s->remaining = s->output_index = s->prepared = 0;
+    s->remaining = s->output_index = s->prepared = s->received_local_input = 0;
     s->input_offset = s->output_offset = 0;
     s->phase = PREPARING;
 }
@@ -710,8 +710,7 @@ static int begin(struct dcc_tcp_server *s, struct dcc_tcp_frame *f)
         int fd = f->fd_plus_one - 1;
         int seals = fcntl(fd, F_GET_SEALS);
         int required_seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
-        if (s->job->kind != DCC_JOB_COMPILE || s->job->count != 1 ||
-            s->job->inputs[0].kind != DCC_JOB_FILE || s->job->inputs[0].cached ||
+        if (!s->local || !dcc_job_sealed_primary(s->job) ||
             fstat(fd, &st) || !S_ISREG(st.st_mode) ||
             (uint64_t)st.st_size != s->job->inputs[0].plain_size ||
             (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY || seals < 0 ||
@@ -741,23 +740,44 @@ static void completed_input(struct input *in)
     input_stored(in);
     in->wanted = 0; --in->server->remaining;
 }
+/* A local peer may still have a writer. Clone into the private tree or copy
+ * the declared extent and reject a concurrent change before using the file. */
+static int snapshot_local_input(int source, int destination, uint64_t size)
+{
+    struct stat before, after;
+    return (fcntl(source, F_GETFL) & O_ACCMODE) != O_RDONLY ||
+        fstat(source, &before) || !S_ISREG(before.st_mode) || (uint64_t)before.st_size != size ||
+        dcc_copy_snapshot(source, destination, size) || fstat(source, &after) ||
+        before.st_ctim.tv_sec != after.st_ctim.tv_sec || before.st_ctim.tv_nsec != after.st_ctim.tv_nsec ||
+        before.st_size != after.st_size;
+}
 static void decode_input(void *argument)
 {
     struct dcc_tcp_server *s = argument;
-    unsigned index;
-    size_t length;
-    const void *data;
-    s->input_error = dcc_tcp_unpack(&s->decoding, &index, s->buffer, &data, &length);
-    if (s->input_error) return;
-    s->input_error = dcc_writex(s->input_fd, data, length);
-    if (!s->input_error && s->job->inputs[index].cached)
-        s->input_error = XXH3_64bits_update(s->hash, data, length) != XXH_OK;
-    if (!s->input_error && s->job->inputs[index].cached && (s->decoding.type & DCC_TCP_FINAL)) {
-        XXH64_canonical_t digest;
-        XXH64_canonicalFromHash(&digest, XXH3_64bits_digest(s->hash));
-        if (s->input_offset + length != s->job->inputs[index].plain_size ||
-            memcmp(digest.digest, s->job->inputs[index].digest, 8)) s->input_error = -1;
-        else dcc_file_cache_put(job_cache(s->job), s->job->inputs[index].digest, s->inputs[index].path,
+    unsigned index = s->input_index;
+    const struct dcc_job_input *file = &s->job->inputs[index];
+    XXH64_canonical_t digest;
+    if (s->decoding.fd_plus_one) {
+        s->input_error = snapshot_local_input(s->decoding.fd_plus_one - 1, s->input_fd, file->plain_size);
+        if (!s->input_error && file->cached)
+            s->input_error = dcc_file_digest(s->input_fd, file->plain_size, digest.digest);
+    } else {
+        size_t length;
+        const void *data;
+        s->input_error = dcc_tcp_unpack(&s->decoding, &index, s->buffer, &data, &length);
+        if (s->input_error) return;
+        s->input_error = dcc_writex(s->input_fd, data, length);
+        if (!s->input_error && file->cached) {
+            s->input_error = XXH3_64bits_update(s->hash, data, length) != XXH_OK;
+            if (s->decoding.type & DCC_TCP_FINAL) {
+                if (s->input_offset + length != file->plain_size) s->input_error = -1;
+                XXH64_canonicalFromHash(&digest, XXH3_64bits_digest(s->hash));
+            }
+        }
+    }
+    if (!s->input_error && file->cached && (s->decoding.type & DCC_TCP_FINAL)) {
+        if (memcmp(digest.digest, file->digest, sizeof(digest))) s->input_error = -1;
+        else dcc_file_cache_put(job_cache(s->job), file->digest, s->inputs[index].path,
                                dcc_job_shared(s->job, index));
     }
 }
@@ -765,11 +785,14 @@ static int finish_input(struct dcc_tcp_server *s)
 {
     const struct dcc_tcp_frame *f = &s->decoding;
     unsigned index = dcc_tcp_get32(f->data);
-    size_t length = dcc_tcp_get32(f->data + 4);
     struct input *in = &s->inputs[index];
     const struct dcc_job_input *description = &s->job->inputs[index];
     if (s->input_error) return -1;
-    s->input_offset += length;
+    if (f->fd_plus_one) {
+        if (!s->received_local_input++) ++local_input_jobs;
+        local_input_bytes += description->plain_size;
+        s->input_offset = description->plain_size;
+    } else s->input_offset += dcc_tcp_get32(f->data + 4);
     if (!(f->type & DCC_TCP_FINAL)) return s->input_offset < description->plain_size ? 0 : -1;
     if (s->input_offset != description->plain_size) return -1;
     close(s->input_fd); s->input_fd = -1;
@@ -795,12 +818,17 @@ static void input_complete(void *argument)
 
 static int receive_input(struct dcc_tcp_server *s, const struct dcc_tcp_frame *f)
 {
-    if (!s->job || s->phase != PREPARING || f->size < 8) return -1;
-    unsigned index = dcc_tcp_get32(f->data), length = dcc_tcp_get32(f->data + 4);
+    if (!s->job || s->phase != PREPARING) return -1;
+    if (f->fd_plus_one) {
+        if (!s->local || s->job->kind != DCC_JOB_THINLTO || f->size != 4 ||
+            f->type != (DCC_TCP_INPUT | DCC_TCP_FINAL) || s->input_fd >= 0) return -1;
+    } else if (f->size < 8) return -1;
+    unsigned index = dcc_tcp_get32(f->data), length = f->fd_plus_one ? 0 : dcc_tcp_get32(f->data + 4);
     if (index >= s->job->count || !s->inputs[index].wanted || length > DCC_TCP_CHUNK) return -1;
     if (s->input_fd < 0) {
-        s->input_fd = open(s->inputs[index].path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-        if (s->input_fd < 0 || XXH3_64bits_reset(s->hash) != XXH_OK) return -1;
+        s->input_fd = open(s->inputs[index].path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (s->input_fd < 0 || (!f->fd_plus_one && s->job->inputs[index].cached &&
+                                 XXH3_64bits_reset(s->hash) != XXH_OK)) return -1;
         s->input_index = index; s->input_offset = 0;
     }
     if (index != s->input_index || length > s->job->inputs[index].plain_size - s->input_offset) return -1;
@@ -810,7 +838,7 @@ static int receive_input(struct dcc_tcp_server *s, const struct dcc_tcp_frame *f
     s->frame = spare;
     /* RAW already points into the receive frame: avoid a thread handoff for
      * a bounded write. Offload expansion, where independent jobs can use CPUs. */
-    if ((length >= 65536 && compressed) ||
+    if (s->decoding.fd_plus_one || (length >= 65536 && compressed) ||
         (s->job->inputs[index].cached && (s->decoding.type & DCC_TCP_FINAL)))
         return dcc_tcp_async_submit(&s->work, decode_input, input_complete, s) ? -1 : 1;
     decode_input(s);
@@ -1030,7 +1058,7 @@ static int output_available(struct dcc_tcp_server *s)
     for (unsigned i = s->output_index; i < DCC_JOB_RESULT_COUNT + s->result.named_count; ++i) {
         uint64_t left = output_size(&s->result, i) - (i == s->output_index ? s->output_offset : 0);
         if (!left) continue;
-        size_t amount = s->local && i < DCC_JOB_RESULT_COUNT ? 12 : (left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK) + 16;
+        size_t amount = s->local ? 12 : (left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK) + 16;
         return amount <= DCC_TCP_BYTES - retained;
     }
     return 1;
@@ -1044,14 +1072,15 @@ static int output(struct dcc_tcp_server *s)
         unsigned i = s->output_index;
         uint64_t left = output_size(&s->result, i) - s->output_offset;
         if (!left) { ++s->output_index; s->output_offset = 0; continue; }
-        if (s->local && i < DCC_JOB_RESULT_COUNT) {
+        if (s->local) {
             unsigned char index[4];
             dcc_tcp_put32(index, i);
             if (queue(s, DCC_TCP_RESULT_FD, index, sizeof(index))) return -1;
             struct packet *p = s->head;
             while (p->next) p = p->next;
-            p->file = s->result.fd[i]; p->rights = 1;
-            s->output_offset = s->result.size[i];
+            p->file = i < DCC_JOB_RESULT_COUNT ? s->result.fd[i] : s->result.named[i-DCC_JOB_RESULT_COUNT].fd;
+            p->rights = 1;
+            s->output_offset = output_size(&s->result, i);
             return 0;
         }
         size_t amount = left < DCC_TCP_CHUNK ? left : DCC_TCP_CHUNK;
@@ -1306,7 +1335,7 @@ int dcc_tcp_server_process(struct dcc_tcp_server *s, short events)
             break;
         }
         uint32_t type = s->frame.type & ~DCC_TCP_FLAGS;
-        if (s->frame.fd_plus_one && type != DCC_TCP_BEGIN) return -1;
+        if (s->frame.fd_plus_one && type != DCC_TCP_BEGIN && type != DCC_TCP_INPUT) return -1;
         if (type == DCC_TCP_BEGIN) {
             if (!s->job && s->head) return -1;
             ret = begin(s, &s->frame);
@@ -1413,7 +1442,7 @@ void dcc_tcp_dispatch_ready(void)
         int link = s->job->kind == DCC_JOB_LINK;
         if (!link || !link_waiting) {
             s->run.operation = DCC_TCP_RUN;
-            int input = s->job->kind == DCC_JOB_COMPILE && s->job->count == 1 ? s->job->inputs[0].fd : -1;
+            int input = dcc_job_sealed_primary(s->job) ? s->job->inputs[0].fd : -1;
             if (dcc_job_frontend(s->job)) {
                 if (!s->fs_peer) {
                     int pair[2];

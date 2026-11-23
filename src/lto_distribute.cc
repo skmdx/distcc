@@ -125,21 +125,20 @@ static auto stamp(const struct stat &s) {
                            s.st_ctim.tv_sec, s.st_ctim.tv_nsec);
 }
 struct Snapshot {
-    string name, path;
+    string path;
     uint64_t size;
     std::once_flag ready;
     std::array<unsigned char, DCC_FILE_HASH_SIZE> hash;
-    Snapshot(string n, string p, Fd input) : name(std::move(n)), path(std::move(p)) {
-        auto before = state(input.fd);
-        Fd output(open(path.c_str(), O_WRONLY | O_EXCL | O_CREAT | O_CLOEXEC, 0600));
-        check(!dcc_copy_snapshot(input.fd, output.fd), "snapshot " + name);
-        require(stamp(before) == stamp(state(input.fd)), "input changed during snapshot");
-        size = before.st_size;
+    Snapshot(string p, uint64_t bytes) : path(std::move(p)), size(bytes) {}
+    Snapshot(string p, int input, const struct stat &before) : Snapshot(std::move(p), before.st_size) {
+        Fd output(open(path.c_str(), O_WRONLY | O_EXCL | O_CREAT | O_CLOEXEC, 0400));
+        check(!dcc_copy_snapshot(input, output.fd, size), "snapshot " + path);
+        require(stamp(before) == stamp(state(input)), "input changed during snapshot");
     }
     const auto &digest() {
         std::call_once(ready, [&] {
             auto fd = regular(path);
-            check(!dcc_file_digest(fd.fd, size, hash.data()), "fingerprint " + name);
+            check(!dcc_file_digest(fd.fd, size, hash.data()), "fingerprint " + path);
         });
         return hash;
     }
@@ -152,10 +151,73 @@ struct Group {
     size_t remaining;
 };
 struct Task : Backend {
-    std::vector<Snapshot *> files;
+    struct Input { string name; Snapshot &data; };
+    std::vector<Input> files;
+    std::optional<size_t> partition;
     uint64_t bytes = 0, instructions = 0, partitions = 1;
     string index;
+    const Snapshot *index_file = nullptr;
     std::shared_ptr<Group> group;
+};
+
+// LLD supplies these four per-module arguments after the common driver
+// options. Any other shape keeps its original driver invocation.
+struct BackendTemplate {
+    static constexpr const char *marker = "__distcc_lto_arg_";
+    string input, index = string(marker) + "index.bc", output = string(marker) + "out.o";
+    Words cc1;
+    size_t source_arg, index_arg, output_arg;
+    std::optional<size_t> basename_arg;
+
+    bool matches(const Task &t) const {
+        if (t.inputs.empty() || t.outputs.size() != 1 || t.args.size() != (t.partition ? 6 : 4)) return false;
+        const auto &source = t.inputs.front();
+        return !source.empty() && source[0] != '-' && source[0] != '@' && t.args[0] == source &&
+               t.args[1] == "-fthinlto-index=" + t.index && t.args[2] == "-o" &&
+               !t.args[3].empty() && t.args[3] != "-" && absolute_name(t.args[3]) == t.outputs[0] &&
+               (t.partition || fs::path(source).extension() == fs::path(input).extension());
+    }
+
+    Words driver(const Words &common, const Task &t) {
+        if (common.size() > 1 && common[1] == "-cc1") return {};
+        if (std::any_of(common.begin(), common.end(), [](const string &s) {
+            return s.find(marker) != string::npos;
+        })) return {};
+        input = string(marker) + "dir/" + marker + "in" + fs::path(t.inputs.front()).extension().string();
+        if (!matches(t)) return {};
+        Words args = common;
+        args.insert(args.end(), {input, "-fthinlto-index=" + index, "-o", output});
+        return args;
+    }
+
+    void resolve(Words args, const string &compiler) {
+        if (args.empty() || args.front() != "-cc1") return;
+        args.insert(args.begin(), compiler);
+        const string basename = fs::path(input).filename();
+        const string index_flag = "-fthinlto-index=" + index;
+        unsigned sources = 0, indexes = 0, outputs = 0;
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (args[i] == input && i >= 2 && args[i-2] == "-x" && args[i-1] == "ir") {
+                source_arg = i; ++sources;
+            }
+            else if (args[i] == index_flag) { index_arg = i; ++indexes; }
+            else if (args[i] == output && args[i-1] == "-o") { output_arg = i; ++outputs; }
+            else if (args[i] == basename && args[i-1] == "-main-file-name" && !basename_arg) basename_arg = i;
+            else if (args[i].find(marker) != string::npos) return; // e.g. a derived side output
+        }
+        if (sources == 1 && indexes == 1 && outputs == 1) cc1 = std::move(args);
+    }
+
+    Words bind(const Task &t) const {
+        if (cc1.empty() || !matches(t)) return {};
+        Words args = cc1;
+        args[source_arg] = t.args[0];
+        args[index_arg] = t.args[1];
+        args[output_arg] = t.args[3];
+        if (basename_arg) args[*basename_arg] = fs::path(t.args[0]).filename();
+        if (t.partition) args.insert(args.end(), t.args.end()-2, t.args.end());
+        return args;
+    }
 };
 
 // The ready queue is touched only by the coordinator. A worker returns a
@@ -300,10 +362,13 @@ static int retry_backend(const Words &args) {
 
 static void publish(const fs::path &source, const fs::path &destination) {
     auto input = regular(source);
+    check(!fchmod(input.fd, 0600), "set merged object mode");
+    if (!rename(source.c_str(), destination.c_str())) return;
+    check(errno == EXDEV, "publish merged object");
     string tmp = (destination.parent_path() / ".distcc-XXXXXX").string();
     Fd output(mkostemp(tmp.data(), O_CLOEXEC));
     try {
-        check(!dcc_copy_snapshot(input.fd, output.fd), "stage merged object");
+        check(!dcc_copy_snapshot(input.fd, output.fd, state(input.fd).st_size), "stage merged object");
         check(!rename(tmp.c_str(), destination.c_str()), "publish merged object");
     } catch (...) { unlink(tmp.c_str()); throw; }
 }
@@ -316,7 +381,9 @@ struct Distribution {
     const char *helper;
     const bool verbose = rust::env("DISTCC_VERBOSE") == "1";
     rust::Work work{fs::temp_directory_path(), "distcc-lto-XXXXXX"};
-    std::map<string, Snapshot> snapshots;
+    std::map<decltype(stamp({})), Snapshot> snapshots;
+    std::map<string, Snapshot *> by_name;
+    BackendTemplate backend_template;
     uint64_t total_bytes = 0, total_instructions = 0;
     size_t sequence = 0;
     Scheduler pool;
@@ -325,28 +392,35 @@ struct Distribution {
         : request(r), kind(k), link(l),
           helper(k == DCC_JOB_THINLTO ? "distcc-thinlto" : "distcc-offload-link"), pool(slots) {}
 
-    void register_inputs(Task &t, bool generated) {
+    void register_inputs(Task &t) {
         Words names = t.inputs;
         names.insert(names.end(), request.inputs.begin(), request.inputs.end());
         std::set<string> seen;
         for (auto &name : names) {
             name = absolute_name(name);
             if (!seen.insert(name).second) continue;
-            auto it = snapshots.find(name);
-            if (it == snapshots.end()) {
+            auto [it, inserted] = by_name.try_emplace(name, nullptr);
+            if (inserted) {
+                bool generated = t.partition && t.files.empty();
                 auto file = generated ? regular(name) : link ? link->input(name) :
                     Fd(open(name.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
-                it = snapshots.try_emplace(name, name, work.dir / ("input-" + std::to_string(snapshots.size())),
-                                           std::move(file)).first;
+                auto before = state(file.fd);
+                auto generation = stamp(before);
+                auto frozen = generated ? snapshots.try_emplace(generation, name, before.st_size) :
+                    snapshots.try_emplace(generation, work.dir / ("input-" + std::to_string(snapshots.size())),
+                                          file.fd, before);
+                it->second = &frozen.first->second;
             }
-            t.files.push_back(&it->second);
-            if (kind != DCC_JOB_THINLTO || t.files.size() == 1) t.bytes += it->second.size;
+            t.files.push_back({name, *it->second});
+            if (kind != DCC_JOB_THINLTO || t.files.size() == 1) t.bytes += it->second->size;
         }
         for (auto &out : t.outputs) out = absolute_name(out);
         if (t.destinations.empty()) t.destinations = t.outputs;
     }
 
     Words command(const Task &t) const {
+        auto bound = backend_template.bind(t);
+        if (!bound.empty()) return bound;
         Words args = request.args;
         args.insert(args.end(), t.args.begin(), t.args.end());
         return args;
@@ -354,9 +428,9 @@ struct Distribution {
 
     void backend(const Task &t, int &queued) {
         auto args = command(t);
-        if (verbose) fprintf(stderr, "%s: submitting %s instructions=%llu bytes=%llu\n", helper,
-                              t.files.front()->name.c_str(), (unsigned long long)t.instructions,
-                              (unsigned long long)t.bytes);
+        if (verbose) fprintf(stderr, "%s: submitting %s instructions=%llu bytes=%llu command=%s\n", helper,
+                              t.files.front().name.c_str(), (unsigned long long)t.instructions,
+                              (unsigned long long)t.bytes, args.size() > 1 && args[1] == "-cc1" ? "cc1" : "driver");
         Words files, destinations;
         std::vector<dcc_job_input> inputs;
         dcc_work_hint hint{};
@@ -364,18 +438,25 @@ struct Distribution {
         uint64_t key = XXH3_64bits(cwd.data(), cwd.size());
         auto hash = [&](const string &s) { key = XXH3_64bits_withSeed(s.c_str(), s.size()+1, key); };
         std::map<string, string> paths;
-        for (auto *s : t.files) {
-            paths[s->name] = "input:" + std::to_string(files.size());
-            files.push_back(s->path);
+        for (auto &[name, data] : t.files) {
+            paths[name] = "input:" + std::to_string(files.size());
+            files.push_back(data.path);
             dcc_job_input in{};
             in.fd = -1;
-            in.path = const_cast<char *>(s->name.c_str());
+            in.path = const_cast<char *>(name.c_str());
             in.kind = DCC_JOB_FILE;
-            in.cached = DCC_CACHE_LOOKUP;
-            in.plain_size = s->size;
-            auto &digest = s->digest();
-            memcpy(in.digest, digest.data(), digest.size());
-            key = XXH3_64bits_withSeed(in.digest, sizeof(in.digest), key);
+            in.plain_size = data.size;
+            if (t.partition && inputs.empty()) {
+                // The shared parent index below identifies the module. Its
+                // partition ordinal is independent of the private work path.
+                hash(std::to_string(*t.partition));
+                in.cached = DCC_UNCACHED;
+            } else {
+                in.cached = DCC_CACHE_LOOKUP;
+                auto &digest = data.digest();
+                memcpy(in.digest, digest.data(), digest.size());
+                key = XXH3_64bits_withSeed(in.digest, sizeof(in.digest), key);
+            }
             key = XXH3_64bits_withSeed(&in.plain_size, sizeof(in.plain_size), key);
             inputs.push_back(in);
         }
@@ -384,14 +465,18 @@ struct Distribution {
             destinations.push_back(std::to_string(i));
             destinations.push_back(t.destinations[i]);
         }
-        for (const auto &s : args) {
+        // Use the driver vocabulary for scheduling, including when cc1 contains
+        // a derived -main-file-name for a private partition path.
+        auto hash_arg = [&](const string &s) {
             auto eq = s.find('=');
             auto found = paths.find(absolute_name(s.empty() ? "." : s));
             if (found != paths.end()) hash(found->second);
             else if (eq != string::npos && eq+1 < s.size() && (found = paths.find(absolute_name(s.substr(eq+1)))) != paths.end())
                 hash(s.substr(0, eq+1) + found->second);
             else hash(s);
-        }
+        };
+        for (const auto &s : request.args) hash_arg(s);
+        for (const auto &s : t.args) hash_arg(s);
         auto argv = rust::pointers(args), outputs = rust::pointers(t.outputs);
         auto targets = rust::pointers(destinations), snapshots = rust::pointers(files);
         dcc_job job{};
@@ -425,8 +510,12 @@ struct Distribution {
         auto spec = own(json_object_new_object());
         auto paths = json_object_new_object();
         json_object_object_add(spec.get(), "files", paths);
-        for (auto *file : t.files) json_object_object_add(paths, file->name.c_str(), json_object_new_string(file->path.c_str()));
+        for (auto &[name, data] : t.files) json_object_object_add(paths, name.c_str(), json_object_new_string(data.path.c_str()));
         json_object_object_add(spec.get(), "cwd", json_object_new_string(cwd.c_str()));
+        // The compiler has no /proc in its chroot. Expose only the frozen,
+        // read-only index there. The sandbox drops capabilities and denies chmod.
+        fs::create_hard_link(t.index_file->path, dir/"index.thinlto.bc");
+        json_object_object_add(spec.get(), "index", json_object_new_string(absolute_name(t.index).c_str()));
         json_object_object_add(spec.get(), "partitions", json_object_new_uint64(t.partitions));
         json_object_object_add(spec.get(), "args", strings(command(t)));
         local_tool(request.args[0], 'A', dir / "request.json", spec.get());
@@ -449,13 +538,15 @@ struct Distribution {
             require(word(field(part, "path")) == name, "unexpected LLVM partition path");
             string input = (dir/name).string(), output = t.outputs[0];
             Task child;
+            child.partition = i;
+            child.index = t.index;
             if (group) {
                 group->parts.push_back("part-" + std::to_string(i) + ".o");
                 output = (group->dir/group->parts.back()).string();
             }
             child.args = t.args;
             for (auto &arg : child.args)
-                if (!arg.empty() && absolute_name(arg) == t.files[0]->name) arg = input;
+                if (!arg.empty() && absolute_name(arg) == t.files[0].name) arg = input;
             auto out = std::find(child.args.begin(), child.args.end(), "-o");
             require(out != child.args.end() && ++out != child.args.end(), "missing partition output");
             *out = output;
@@ -478,7 +569,7 @@ struct Distribution {
         pool.enqueue(priority, !split, [this, split, dir, t = std::move(t)](int &fd) -> Completion {
             if (split) {
                 return [this, children = prepare(dir, t)]() mutable {
-                    for (auto &child : children) { register_inputs(child, true); enqueue(std::move(child)); }
+                    for (auto &child : children) { register_inputs(child); enqueue(std::move(child)); }
                 };
             }
             backend(t, fd);
@@ -489,7 +580,7 @@ struct Distribution {
                     json_object_object_add(spec.get(), "parts", strings(group->parts));
                     json_object_object_add(spec.get(), "locals", strings(group->locals));
                     local_tool(request.args[0], 'M', group->dir / "request.json", spec.get());
-                    publish(group->dir/(group->locals.empty() ? "merged.o" : "localized.o"), group->destination);
+                    publish(group->dir/"merged.o", group->destination);
                     return {};
                 });
             };
@@ -498,11 +589,13 @@ struct Distribution {
 
     void run(size_t slots, double parallelism) {
         std::vector<Task> tasks;
+        std::vector<size_t> planned;
+        std::optional<size_t> template_row;
         auto plan = own(json_object_new_array());
         for (const auto &job : request.jobs) {
             Task &t = tasks.emplace_back();
             static_cast<Backend &>(t) = job;
-            register_inputs(t, false);
+            register_inputs(t);
             require(t.files.size() <= DCC_JOB_INPUT_MAX, "too many backend inputs");
             total_bytes += t.bytes;
             if (kind != DCC_JOB_THINLTO || request.args.empty() || t.inputs.empty()) continue;
@@ -510,25 +603,38 @@ struct Distribution {
                 t.index = arg.substr(strlen("-fthinlto-index="));
                 auto row = json_object_new_object();
                 json_object_array_add(plan.get(), row);
+                planned.push_back(tasks.size()-1);
                 json_object_object_add(row, "source", json_object_new_string(t.inputs[0].c_str()));
-                json_object_object_add(row, "index", json_object_new_string(snapshots.at(absolute_name(t.index)).path.c_str()));
+                t.index_file = by_name.at(absolute_name(t.index));
+                json_object_object_add(row, "index", json_object_new_string(t.index_file->path.c_str()));
+                if (!template_row) {
+                    auto driver = backend_template.driver(request.args, t);
+                    if (!driver.empty()) {
+                        template_row = planned.size()-1;
+                        json_object_object_add(row, "driver", strings(driver));
+                    }
+                }
                 break;
             }
         }
-        if (kind == DCC_JOB_THINLTO && count(plan.get()) == tasks.size()) {
+        if (!planned.empty()) {
             Fd fd(dcc_job_memfd("distcc-index-weights"));
             bool supported = true;
             try { local_tool(request.args[0], 'N', work.dir/"plan.json", plan.get(), fd.fd); }
             catch (const Failure &e) { if (e.status != EXIT_LOCAL_COMPILE) throw; supported = false; }
             if (supported) {
                 auto weights = parse(rust::contents(fd.fd));
-                require(count(weights.get()) == tasks.size(), "incomplete LLVM work estimates");
-                for (size_t i = 0; i < tasks.size(); ++i) {
-                    tasks[i].instructions = number(json_object_array_get_idx(weights.get(), i), "instructions");
-                    total_instructions += tasks[i].instructions;
+                require(count(weights.get()) == planned.size(), "incomplete LLVM work estimates");
+                if (template_row)
+                    backend_template.resolve(words(field(json_object_array_get_idx(weights.get(), *template_row), "cc1")),
+                                             request.args[0]);
+                for (size_t i = 0; i < planned.size(); ++i) {
+                    auto &t = tasks[planned[i]];
+                    t.instructions = number(json_object_array_get_idx(weights.get(), i), "instructions");
+                    total_instructions += t.instructions;
                 }
-                for (size_t i = 0; total_instructions && i < tasks.size(); ++i) {
-                    auto &t = tasks[i];
+                for (size_t i = 0; total_instructions && i < planned.size(); ++i) {
+                    auto &t = tasks[planned[i]];
                     if (t.outputs.size() != 1) continue;
                     auto row = json_object_array_get_idx(weights.get(), i);
                     auto largest = number(row, "largest_function");

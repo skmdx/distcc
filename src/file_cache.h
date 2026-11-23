@@ -10,7 +10,7 @@
 #define DCC_FILE_CACHE_MAX (256 * 1024 * 1024)
 #define DCC_FILE_CACHE_SHARDS 64
 
-int dcc_copy_snapshot(int from, int to);
+int dcc_copy_snapshot(int from, int to, uint64_t size);
 /* Hash the known extent [0, size) without changing the descriptor offset.
  * The caller owns a stable input; read errors and premature EOF return -1. */
 int dcc_file_digest(int fd, off_t size, unsigned char hash[DCC_FILE_HASH_SIZE]);

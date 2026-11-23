@@ -151,6 +151,19 @@ llvm::Error llvm::lto::thinBackend(
   return invoke();
 }
 
+std::vector<std::string> dcc_lto_cc1(ArrayRef<const char *> args) {
+    clang::DiagnosticOptions opts;
+    auto diagnostics = clang::CompilerInstance::createDiagnostics(*vfs::getRealFileSystem(), opts);
+    clang::driver::Driver driver(args.front(), sys::getDefaultTargetTriple(), *diagnostics);
+    driver.setCheckInputsExist(false);
+    driver.setTargetAndMode(clang::driver::ToolChain::getTargetAndModeFromProgramName(args.front()));
+    std::unique_ptr<clang::driver::Compilation> plan(driver.BuildCompilation(args));
+    if (!plan || plan->containsError() || plan->getJobs().size() != 1) return {};
+    const auto &cc1 = plan->getJobs().begin()->getArguments();
+    if (cc1.empty() || StringRef(cc1.front()) != "-cc1") return {};
+    return {cc1.begin(), cc1.end()};
+}
+
 int dcc_lto_compile(const LtoInputs &inputs, ArrayRef<const char *> args, int output) {
     if (args.size() < 2) return 1;
     auto invocation = std::make_shared<clang::CompilerInvocation>();
@@ -161,15 +174,10 @@ int dcc_lto_compile(const LtoInputs &inputs, ArrayRef<const char *> args, int ou
     if (StringRef(args[1]) == "-cc1") {
         if (!parse(args.drop_front(2))) return 1;
     } else {
-        clang::DiagnosticOptions opts;
-        auto diagnostics = clang::CompilerInstance::createDiagnostics(*vfs::getRealFileSystem(), opts);
-        clang::driver::Driver driver(args.front(), sys::getDefaultTargetTriple(), *diagnostics);
-        driver.setCheckInputsExist(false);
-        driver.setTargetAndMode(clang::driver::ToolChain::getTargetAndModeFromProgramName(args.front()));
-        std::unique_ptr<clang::driver::Compilation> plan(driver.BuildCompilation(args));
-        if (!plan || plan->containsError() || plan->getJobs().size() != 1) return 1;
-        const auto &cc1 = plan->getJobs().begin()->getArguments();
-        if (cc1.empty() || StringRef(cc1.front()) != "-cc1" || !parse(ArrayRef(cc1).drop_front())) return 1;
+        auto words = dcc_lto_cc1(args);
+        SmallVector<const char *> cc1;
+        for (auto &word : words) cc1.push_back(word.c_str());
+        if (cc1.empty() || !parse(ArrayRef(cc1).drop_front())) return 1;
     }
     auto &frontend = invocation->getFrontendOpts();
     if (!inputs.output.empty() &&
@@ -208,7 +216,11 @@ int dcc_lto_compile(const LtoInputs &inputs, ArrayRef<const char *> args, int ou
         aux.close();
         if (aux.has_error()) resolved = false;
     };
-    if (!codegen.ThinLTOIndexFile.empty()) resolve(codegen.ThinLTOIndexFile);
+    if (!codegen.ThinLTOIndexFile.empty()) {
+        if (inputs.partitions && clientPath(inputs.cwd, codegen.ThinLTOIndexFile) == inputs.localIndex)
+            codegen.ThinLTOIndexFile = "index.thinlto.bc";
+        else resolve(codegen.ThinLTOIndexFile);
+    }
     dcc_clang_profile_inputs(codegen, resolve);
     if (!resolved) return 1;
     frontend.OutputFile = "-";
