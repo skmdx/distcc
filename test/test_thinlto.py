@@ -57,7 +57,8 @@ class PortageSandboxTest(unittest.TestCase):
             spec.write_text(json.dumps(dict(cwd=str(work), partitions=2,
                 args=[compiler, '-x', 'ir', '-fthinlto-index=' + index, '-c', str(source),
                       '-o', str(work/'unused.o')],
-                files={str(source): str(source), index: index})))
+                files={str(source): str(source), index: index,
+                       **{str(work/f'alias-{i}.bc'): str(source) for i in range(1100)}})))
             merge = work/'merge'
             merge.mkdir()
             subprocess.run([compiler, '-x', 'c', '-c', '-', '-o', merge/'part.o'],
@@ -71,7 +72,8 @@ class PortageSandboxTest(unittest.TestCase):
             env.pop('DISTCC_BROKER', None)
             build = Path.cwd()
             env['PYTHONPATH'] = str(build)
-            script = ('import os,sys; from distcc_lto import FileJobs; '
+            script = ('import os,sys,resource; from distcc_lto import FileJobs; '
+                      'lim=resource.RLIMIT_NOFILE; resource.setrlimit(lim,(1024,resource.getrlimit(lim)[1])); '
                       'assert os.environ["SANDBOX_ON"] == "1"; '
                       'lane=FileJobs(sys.argv[1], os.environ, ()); '
                       'rc=lane.result(lane.submit(["--prepare", sys.argv[2], sys.argv[3]])) or '
@@ -367,7 +369,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
     def test_cc1_backend_without_driver_compile_flag(self):
         self.check_backend_cwd(True)
 
-    def test_resident_backend_transfers_multiple_descriptor_batches(self):
+    def trace_backend(self):
         trace = self.work/'server.exec'
         traced = self.work/'server'
         binary = self.build/'distccd'
@@ -380,9 +382,13 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         else:
             self.restart_server(binary)
         self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='resident')
+        return trace
+
+    def test_resident_backend_transfers_multiple_descriptor_batches(self):
+        trace = self.trace_backend()
         log = Path(self.logs[0].name)
         offset = log.stat().st_size
-        self.check_backend_cwd(False, extra=300)
+        self.check_backend_cwd(False, extra=1100)
         started = re.findall(rb'started reusable sandboxed ThinLTO worker pid=(\d+)', log.read_bytes()[offset:])
         self.assertEqual(len(started), 1)
         if trace.exists():
@@ -403,6 +409,32 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
             pending.extend(map(int, (process/'task'/str(pid)/'children').read_text().split()))
         else:
             self.fail('resident sandbox exited between backend requests')
+
+    @unittest.skipUnless(shutil.which('strace'), 'daemon exec tracing required')
+    def test_lld_object_and_partition_jobs_share_one_sandbox(self):
+        trace = self.trace_backend()
+        self.env.update(DISTCC_VERBOSE='1', DISTCC_FALLBACK='0')
+        compiler = shutil.which('clang')
+        assert compiler is not None
+        for name, flags, source in [
+                ('plain', [], 'int plain(void) {return 1;}'),
+                ('fat', ['-ffat-lto-objects'], 'int fat(void) {return 2;}'),
+                ('split', [], '\n'.join(f'int f{i}(int x) {{return (x*{i+1}) ^ (x/7);}}' for i in range(200)))]:
+            with self.subTest(name=name):
+                obj = self.work/(name+'.o')
+                self.run_command([compiler, '-x', 'c', '-O2', '-fPIC', '-flto=thin', *flags,
+                                  '-c', '-', '-o', obj], input=source, check=True)
+                result = self.run_command([compiler, '-flto=thin', *flags, '-fuse-ld=lld', '-shared',
+                    '-Wl,--thinlto-distributor='+str(self.build/'distcc-thinlto'),
+                    '-Wl,--thinlto-remote-compiler='+compiler, obj, '-o', name+'.so'])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if name == 'split':
+                    self.assertRegex(result.stderr, r'submitting .*\.part-\d+\.bc ')
+                else:
+                    # LLD can extract the embedded FatLTO module to a sibling .o.
+                    self.assertRegex(result.stderr, 'submitting '+re.escape(str(obj))+r'(?:\.\S+\.o)? ')
+                self.assertEqual((self.work/(name+'.so')).read_bytes()[:4], b'\x7fELF')
+        self.assertEqual(len(re.findall(r'execve\("/usr/bin/bwrap"', trace.read_text())), 1)
 
     def test_index_import_requires_declared_snapshot(self):
         compiler = shutil.which('clang')

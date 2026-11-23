@@ -33,10 +33,18 @@ template<class Action> struct on_exit {
 };
 // Received descriptors can occupy a closed standard stream. Move those out of
 // the way before installing stdio, the command and an optional driver relay.
+bool has_extra_fd(unsigned operation) {
+    return operation == 'D' || operation == 'G' || operation == 'T';
+}
 bool child_descriptors(int *fds, unsigned count, unsigned operation) {
-    bool driver = operation=='D' || operation=='G';
+    bool extra = has_extra_fd(operation);
     bool journal = operation=='G' || operation=='S';
-    int first_unused = journal ? 6 : driver ? 5 : 4;
+    bool backend = operation == 'T';
+    int first_unused = journal || backend ? 6 : extra ? 5 : 4;
+    // The sandbox inherits an open, read-only /dev/null. Keep it through
+    // descriptor transfer: a user namespace may not reopen device nodes.
+    int nullfd = backend ? fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, first_unused) : -1;
+    if (backend && nullfd < 0) return false;
     for (unsigned i = 0; i < count; ++i) {
         if (i == 1) continue;
         if (fds[i] < first_unused) {
@@ -46,9 +54,10 @@ bool child_descriptors(int *fds, unsigned count, unsigned operation) {
     }
     for (unsigned i = 0; i != 3; ++i)
         if (dup2(fds[i+2], i) < 0) return false;
-    if (journal && !driver) close(4);
-    return dup2(fds[0], 3) >= 0 && (!driver || dup3(fds[5], 4, O_CLOEXEC) >= 0) &&
-        (!journal || dup3(fds[driver ? 6 : 5], 5, O_CLOEXEC) >= 0) &&
+    if (journal && !extra) close(4);
+    return dup2(fds[0], 3) >= 0 && (!extra || dup3(fds[5], 4, O_CLOEXEC) >= 0) &&
+        (!journal || dup3(fds[extra ? 6 : 5], 5, O_CLOEXEC) >= 0) &&
+        (!backend || dup3(nullfd, 5, O_CLOEXEC) >= 0) &&
         !close_range(first_unused, ~0U, 0);
 }
 }
@@ -131,7 +140,7 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
                 });
                 if (!length) return 0;
                 if (length != sizeof(request) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) ||
-                    received != (request.operation == 'G' ? 7 : request.operation == 'D' || request.operation == 'S' ? 6 : 5) ||
+                    received != 5 + int(has_extra_fd(request.operation)) + int(request.operation == 'G' || request.operation == 'S') ||
                     (request.operation != 'C' && request.operation != 'P' && request.operation != 'L' && request.operation != 'B' && request.operation != 'D' &&
                      request.operation != 'G' && request.operation != 'S' && request.operation != 'I' &&
                      request.operation != 'A' && request.operation != 'M' && request.operation != 'T') ||

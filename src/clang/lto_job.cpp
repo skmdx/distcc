@@ -20,6 +20,8 @@
 #include <sys/prctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include "../job.h"
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -27,6 +29,14 @@ LLD_HAS_DRIVER(elf)
 using namespace llvm;
 namespace {
 std::vector<sock_filter> compiler_filter;
+bool reserve_descriptors(rlim_t needed) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) < 0) return false;
+    auto target = std::min(needed, limit.rlim_max);
+    if (limit.rlim_cur >= target) return true;
+    limit.rlim_cur = target;
+    return setrlimit(RLIMIT_NOFILE, &limit) == 0;
+}
 // A client child can create files only in its disposable root. A daemon
 // child can only read its read-only runtime and write its output/stdio FDs.
 // Neither child needs process inspection, signalling, networking or exec.
@@ -45,6 +55,7 @@ bool restrict_job() {
 
 bool dcc_lto_init(bool client) {
     if (!client) {
+        if (!reserve_descriptors(DCC_JOB_INPUT_MAX)) return false;
         // Reject an accidentally writable submount even if the namespace
         // root itself is read-only. Check once, before accepting descriptors.
         FILE *mounts = setmntent("/proc/self/mounts", "r");
@@ -189,6 +200,7 @@ int dcc_lto_local(const char *description, unsigned operation) {
     if (!cwd || !count || *count < 1 || *count > UINT_MAX || !args || !files)
         return fail("invalid partition job");
     inputs.cwd = cwd->str(); inputs.partitions = *count; inputs.manifest = "partitions.json";
+    if (!reserve_descriptors(files->size() + 64)) return fail(strerror(errno));
     for (auto &item : *files) {
         auto path = item.second.getAsString();
         if (!path) return fail("invalid snapshot");
@@ -228,9 +240,13 @@ int dcc_lto_remote(int fd, unsigned operation) {
                 return fail("unexpected input descriptor");
         }
     }
-    close(0); close(fd);
+    if (dup2(5, STDIN_FILENO) < 0) return fail(strerror(errno));
+    close(5);
+    close(fd);
     SmallVector<const char *> args;
     for (char **p = command[1]; *p; ++p) args.push_back(*p);
     if (!restrict_job()) return fail("cannot confine compiler");
-    return dcc_lto_compile(inputs, args, STDOUT_FILENO);
+    int status = dcc_lto_compile(inputs, args, 4);
+    close(4);
+    return status;
 }

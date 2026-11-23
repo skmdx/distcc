@@ -23,6 +23,36 @@ using namespace llvm;
 namespace {
 thread_local const LtoInputs *active;
 
+// For IR, CodeGenAction creates a virtual output file even when the compiler
+// instance already has an output stream. Keep LLVM's stdout for diagnostics.
+class ObjectStream final : public vfs::OutputFileImpl {
+    raw_fd_ostream stream;
+public:
+    explicit ObjectStream(int fd) : stream(fd, false) {}
+    raw_pwrite_stream &getOS() override { return stream; }
+    Error keep() override {
+        stream.flush();
+        auto ec = stream.error();
+        stream.clear_error();
+        return errorCodeToError(ec);
+    }
+    Error discard() override { return keep(); }
+};
+
+class ObjectOutput final : public vfs::OutputBackend {
+    int fd;
+    IntrusiveRefCntPtr<OutputBackend> cloneImpl() const override {
+        return makeIntrusiveRefCnt<ObjectOutput>(fd);
+    }
+    Expected<std::unique_ptr<vfs::OutputFileImpl>>
+    createFileImpl(StringRef path, std::optional<vfs::OutputConfig>) override {
+        if (path != "-") return createStringError("unexpected ThinLTO output: %s", path.str().c_str());
+        return std::make_unique<ObjectStream>(fd);
+    }
+public:
+    explicit ObjectOutput(int fd) : fd(fd) {}
+};
+
 SmallString<256> clientPath(StringRef cwd, StringRef name) {
     SmallString<256> path(name);
     if (!sys::path::is_absolute(path)) {
@@ -182,7 +212,7 @@ int dcc_lto_compile(const LtoInputs &inputs, ArrayRef<const char *> args, int ou
     dcc_clang_profile_inputs(codegen, resolve);
     if (!resolved) return 1;
     frontend.OutputFile = "-";
-    compiler->setOutputStream(std::make_unique<raw_fd_ostream>(output, false));
+    compiler->setOutputManager(makeIntrusiveRefCnt<ObjectOutput>(output));
     active = &inputs;
     auto reset = scope_exit([] { active = nullptr; });
     return clang::ExecuteCompilerInvocation(compiler.get()) ? 0 : 1;

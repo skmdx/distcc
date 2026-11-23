@@ -252,7 +252,8 @@ def distribute(request, kind, link=None):
             lane = acquire_lane()
             args = [operation, common['args'][0], description]
             status = lane.result(lane.submit(args))
-            idle.put(lane)
+            if lane.process.returncode is None:
+                idle.put(lane)
             if status:
                 raise subprocess.CalledProcessError(status, args)
 

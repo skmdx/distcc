@@ -9,6 +9,7 @@
 #include <sys/syscall.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 extern "C" {
 #include "exec.h"
 #include "exitcode.h"
@@ -52,18 +53,23 @@ extern "C" int dcc_lto_helper(const dcc_job *job, char *path) {
     if (job->kind != DCC_JOB_THINLTO || !job->llvm_outputs[0] || job->llvm_outputs[1]) return 0;
     for (unsigned i = 0; i < job->count; ++i)
         if (!dcc_job_file(&job->inputs[i])) return 0;
-    bool object = false, ir = false;
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) < 0) return -1;
+    if (rlim_t(job->count) + 32 > std::min<rlim_t>(limit.rlim_max, DCC_JOB_INPUT_MAX)) return 0;
+    bool object = false, ir = false, thinlto_index = false;
     for (auto p = job->argv + 1; *p; ++p) {
         if (!strcmp(*p, "-c") || !strcmp(*p, "-emit-obj")) object = true;
-        if (!strcmp(*p, "-x")) {
-            if (!p[1] || strcmp(*++p, "ir")) return 0;
+        if (!strncmp(*p, "-x", 2)) {
+            const char *language = (*p)[2] ? *p + 2 : *++p;
+            if (!language || strcmp(language, "ir")) return 0;
             ir = true;
         }
+        if (!strncmp(*p, "-fthinlto-index=", sizeof("-fthinlto-index=") - 1)) thinlto_index = true;
         if (!strncmp(*p, "-save-temps", 11) || !strncmp(*p, "--save-temps", 12)) return 0;
     }
     if (!object || !job->count) return 0;
     auto extension = fs::path(job->inputs[0].path).extension();
-    if (!ir && extension != ".bc" && extension != ".ll") return 0;
+    if (!ir && !thinlto_index && extension != ".bc" && extension != ".ll") return 0;
     try {
         bool linker;
         auto tool = fs::canonical(installed_tool(job->argv[0], linker));
@@ -76,7 +82,7 @@ extern "C" int dcc_lto_helper(const dcc_job *job, char *path) {
         auto helper = dcc_helper_path(("distcc-clang-" + match[1].str()).c_str(), storage);
         if (access(helper, X_OK)) return errno == ENOENT ? 0 : -1;
         return realpath(helper, path) ? 1 : -1;
-    } catch (const std::exception &) { return -1; }
+    } catch (const std::exception &) { return 0; }
 }
 
 extern "C" int dcc_spawn_lto(pid_t *pid, int channel, const char *helper, const char *compiler) {
@@ -125,9 +131,9 @@ int resident(const dcc_job *job, const char *root, const fs::path &output,
     check(lseek(spec.fd, 0, SEEK_SET) == 0, "rewind backend command");
     struct timespec started;
     clock_gettime(CLOCK_MONOTONIC, &started);
-    int fds[] = {spec.fd, reply.fd[1], transfer.fd[1], object.fd, diagnostics.fd};
+    int fds[] = {spec.fd, reply.fd[1], transfer.fd[1], stdout_log.fd, diagnostics.fd, object.fd};
     dcc_native_request run{'T', 0};
-    check(!dcc_send_fds(job->compiler_channel - 1, &run, sizeof(run), fds, 5), "submit backend");
+    check(!dcc_send_fds(job->compiler_channel - 1, &run, sizeof(run), fds, std::size(fds)), "submit backend");
     reply.sent(); transfer.sent();
     Fd staged(open(root, O_PATH | O_DIRECTORY | O_CLOEXEC));
     struct open_how how{};
