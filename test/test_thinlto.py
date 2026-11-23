@@ -42,60 +42,60 @@ class PortageSandboxTest(unittest.TestCase):
             if build_uid is not None:
                 os.chown(work, build_uid, -1)
                 work.chmod(0o700)
-            root = work / 'root'
-            source, output = work / 'input.c', work / 'output.o'
-            staged_source = root / str(source).lstrip('/')
-            staged_source.parent.mkdir(parents=True)
-            staged_source.write_text('int answer(void) { return 42; }\n')
+            jobdir = work / 'partition'
+            jobdir.mkdir()
             compiler = shutil.which('clang')
             assert compiler is not None
-            inputs = [str(source)]
-            probe = []
-            if os.geteuid() == 0:
-                library = work / 'capabilities.so'
-                result = subprocess.run([compiler, '-shared', '-fPIC', '-x', 'c',
-                                         '-', '-o', str(library)], text=True, capture_output=True,
-                                        input='''\
-#include <linux/capability.h>
-#include <sys/prctl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-__attribute__((constructor)) static void check(void) {
-    struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
-    struct __user_cap_data_struct caps[2];
-    if (syscall(SYS_capget, &header, caps) ||
-        caps[0].effective || caps[0].permitted || caps[0].inheritable ||
-        caps[1].effective || caps[1].permitted || caps[1].inheritable ||
-        prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) _exit(98);
-    const char message[] = "compiler capabilities cleared\\n";
-    write(2, message, sizeof(message) - 1);
-}
-''')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                shutil.copyfile(library, root / str(library).lstrip('/'))
-                inputs.append(str(library))
-                probe.append(str(library))
-            job = dict(cwd=str(work), inputs=inputs, outputs=[str(output)], partitions=1,
-                       args=[compiler, '-c', '-x', 'c', str(source), '-o', str(output)])
-            manifest = work / 'job.json'
-            manifest.write_text(json.dumps(job))
-            env = dict(os.environ, SANDBOX_WRITE=str(work), SANDBOX_LOG=str(work / 'sandbox.log'),
-                       PYTHONDONTWRITEBYTECODE='1',
-                       PYTHONPATH=str(Path(__file__).resolve().parents[1]))
-            script = ('import json, os, sys; from distcc_lto import run_preparation; '
-                      'before = os.environ["SANDBOX_WRITE"]; '
+            source = work / 'library.bc'
+            subprocess.run([compiler, '-O2', '-flto=thin', '-x', 'c', '-c', '-',
+                            '-o', source], input=b'int answer(void) { return 42; }',
+                           check=True)
+            subprocess.run([Path(compiler).with_name('ld.lld'), '-shared',
+                            '--thinlto-index-only', source, '-o', work/'library.so'], check=True)
+            index = str(source) + '.thinlto.bc'
+            spec = jobdir / 'request.json'
+            spec.write_text(json.dumps(dict(cwd=str(work), partitions=2,
+                args=[compiler, '-x', 'ir', '-fthinlto-index=' + index, '-c', str(source),
+                      '-o', str(work/'unused.o')],
+                files={str(source): str(source), index: index})))
+            merge = work/'merge'
+            merge.mkdir()
+            subprocess.run([compiler, '-x', 'c', '-c', '-', '-o', merge/'part.o'],
+                           input=b'int private_definition(void) { return 42; }', check=True)
+            merge_spec = merge/'request.json'
+            merge_spec.write_text(json.dumps(dict(parts=['part.o'], locals=['private_definition'])))
+            trace = work / 'exec.log'
+            sandbox_log = work / 'sandbox.log'
+            env = dict(os.environ, SANDBOX_WRITE=str(work), SANDBOX_LOG=str(sandbox_log),
+                       PYTHONDONTWRITEBYTECODE='1', DISTCC_CLANG_LOCAL='0')
+            env.pop('DISTCC_BROKER', None)
+            build = Path.cwd()
+            env['PYTHONPATH'] = str(build)
+            script = ('import os,sys; from distcc_lto import FileJobs; '
                       'assert os.environ["SANDBOX_ON"] == "1"; '
-                      'result = run_preparation(sys.argv[1], json.load(open(sys.argv[2])), '
-                      'sys.argv[3] if len(sys.argv) > 3 else None); '
-                      'assert os.environ["SANDBOX_WRITE"] == before; '
-                      'assert os.environ["SANDBOX_ON"] == "1"; sys.exit(result)')
-            result = subprocess.run(['sandbox', sys.executable, '-c', script, str(root), str(manifest), *probe],
-                                    env=env, text=True, capture_output=True, timeout=30)
+                      'lane=FileJobs(sys.argv[1], os.environ, ()); '
+                      'rc=lane.result(lane.submit(["--prepare", sys.argv[2], sys.argv[3]])) or '
+                      'lane.result(lane.submit(["--merge", sys.argv[2], sys.argv[4]])); '
+                      'lane.close(); sys.exit(rc)')
+            command = ['sandbox', sys.executable, '-c', script, build/'distcc', compiler, spec, merge_spec]
+            if shutil.which('strace'):
+                command = ['strace', '-f', '-e', 'trace=execve,capset,prctl,seccomp',
+                           '-o', trace, *command]
+            result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertGreater((root / str(output).lstrip('/')).stat().st_size, 0)
-            self.assertFalse((work / 'sandbox.log').exists(), result.stderr)
-            if os.geteuid() == 0:
-                self.assertIn('compiler capabilities cleared', result.stderr)
+            parts = json.loads((jobdir/'partitions.json').read_bytes())['parts']
+            self.assertTrue(parts)
+            for part in parts:
+                self.assertTrue((jobdir/part['path']).stat().st_size)
+            symbols = subprocess.check_output(['llvm-nm', merge/'localized.o'], text=True)
+            self.assertRegex(symbols, r' t private_definition\b')
+            self.assertFalse(sandbox_log.exists(), result.stderr)
+            if trace.exists():
+                events = trace.read_text()
+                self.assertNotRegex(events, r'execve\("[^"]*/(bwrap|ld\.lld|llvm-objcopy)"')
+                self.assertRegex(events, r'prctl\(PR_SET_NO_NEW_PRIVS, 1, .*\)\s+= 0')
+                self.assertRegex(events, r'capset\(.*\)\s+= 0')
+                self.assertRegex(events, r'prctl\(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, .*\)\s+= 0')
 
 
 @unittest.skipUnless(shutil.which('clang') and shutil.which('bwrap'), 'Clang and bubblewrap required')
@@ -367,7 +367,80 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
     def test_cc1_backend_without_driver_compile_flag(self):
         self.check_backend_cwd(True)
 
-    def check_backend_cwd(self, cc1):
+    def test_resident_backend_transfers_multiple_descriptor_batches(self):
+        trace = self.work/'server.exec'
+        traced = self.work/'server'
+        binary = self.build/'distccd'
+        if shutil.which('strace'):
+            traced.write_text('#!/bin/sh\nexec ' + shlex.join(
+                ['strace', '-D', '-f', '-e', 'execve', '-o', str(trace), str(binary)]) + ' "$@"\n')
+            traced.chmod(0o755)
+            self.restart_server(traced)
+            self.addCleanup(self.restart_server, binary)
+        else:
+            self.restart_server(binary)
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='resident')
+        log = Path(self.logs[0].name)
+        offset = log.stat().st_size
+        self.check_backend_cwd(False, extra=300)
+        started = re.findall(rb'started reusable sandboxed ThinLTO worker pid=(\d+)', log.read_bytes()[offset:])
+        self.assertEqual(len(started), 1)
+        if trace.exists():
+            self.assertEqual(len(re.findall(r'execve\("/usr/bin/bwrap"', trace.read_text())), 1)
+        # Inspect the live payload. The outer bwrap supervisor and PID 1
+        # can both appear between the distccd child and the resident compiler.
+        pending = [int(started[0])]
+        while pending:
+            pid = pending.pop()
+            process = Path('/proc')/str(pid)
+            if (process/'cmdline').read_bytes().split(b'\0')[:2] == [b'/distcc-clang', b'--lto-worker']:
+                values = dict(line.split(':', 1) for line in (process/'status').read_text().splitlines())
+                for field in ('CapEff', 'CapPrm', 'CapInh', 'CapBnd', 'CapAmb'):
+                    self.assertEqual(int(values[field], 16), 0, field)
+                self.assertEqual(int(values['NoNewPrivs']), 1)
+                self.assertEqual(int(values['Seccomp']), 2)
+                break
+            pending.extend(map(int, (process/'task'/str(pid)/'children').read_text().split()))
+        else:
+            self.fail('resident sandbox exited between backend requests')
+
+    def test_index_import_requires_declared_snapshot(self):
+        compiler = shutil.which('clang')
+        assert compiler is not None
+        compilers = [Path(compiler), Path('/usr/lib/llvm/22/bin/clang')]
+        for tool in dict.fromkeys(c.resolve() for c in compilers if c.exists()):
+            with self.subTest(compiler=tool):
+                directory = self.work/tool.name
+                directory.mkdir()
+                self.check_index_import(str(tool), directory)
+
+    def check_index_import(self, compiler, directory):
+        main = directory/'main.bc'
+        other = directory/'other.bc'
+        for path, body in [(main, 'extern int leaf(void); int main(void) { return leaf(); }'),
+                           (other, 'int leaf(void) { return 0; }')]:
+            r = self.run_command([compiler, '-O2', '-flto=thin', '-c', '-x', 'c', '-', '-o', path], input=body)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.run_command([Path(compiler).with_name('ld.lld'), '--thinlto-index-only',
+                              '--thinlto-emit-imports-files', '-e', 'main', main, other])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(str(other), Path(str(main)+'.imports').read_text().splitlines())
+        index = Path(str(main)+'.thinlto.bc')
+        inputs = directory/'inputs'
+        inputs.mkdir()
+        for i, path in enumerate([main, index]):
+            os.link(path, inputs/str(i))
+        output = self.work/'backend.o'
+        job = dict(cwd=str(self.work), args=[compiler, '-c', '-x', 'ir', str(main),
+                   '-fthinlto-index=' + str(index), '-o', str(output)], outputs=[str(output)])
+        spec = self.work/'job'
+        write_metadata(JOB_THINLTO, job, [(str(p), *fingerprint(p)) for p in (main, index)], spec)
+        r = self.run_command([self.build/'distcc', '--file-job', spec, inputs, '-', output])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('undeclared ThinLTO input: ' + str(other), r.stderr)
+        self.assertFalse(output.exists())
+
+    def check_backend_cwd(self, cc1, extra=0):
         inputs = self.work / 'inputs'
         inputs.mkdir()
         source = inputs / '0'
@@ -380,7 +453,12 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         job = dict(cwd=cwd, args=[shutil.which('clang'), *options, '-x', 'ir', name, '-o', output],
                    outputs=[output])
         metadata = self.work / 'metadata'
-        write_metadata(JOB_THINLTO, job, [(name, *fingerprint(source))], metadata)
+        entries = [(name, *fingerprint(source))]
+        for i in range(1, extra+1):
+            path = inputs/str(i)
+            path.write_text(str(i))
+            entries.append((cwd+'/import-'+str(i)+'.bc', *fingerprint(path)))
+        write_metadata(JOB_THINLTO, job, entries, metadata)
         if cc1:
             result = self.run_command([self.build / 'distcc', '--file-job', metadata, inputs, '-', output])
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -910,9 +988,12 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         self.assertEqual(result.returncode, 0, result.stderr)
         counts = list(map(int, re.findall(r'partitioned .* into (\d+)', result.stderr)))
         self.assertTrue(counts and min(counts) > 1, result.stderr)
+        self.assertIn('status=0 operation=A', result.stderr)
+        self.assertIn('status=0 operation=M', result.stderr)
         if prefix:
             executed = trace.read_text()
-            self.assertIn('"-r", "-o", "merged.o"', executed)
+            self.assertNotIn('"-r", "-o", "merged.o"', executed)
+            self.assertNotRegex(executed, r'execve\("[^"]*/(bwrap|llvm-objcopy)"')
             self.assertNotRegex(executed, r'execve\("[^"]*/llvm-config')
             self.assertNotIn('"--lto-capacity"]', '\n'.join(
                 line for line in executed.splitlines() if '"--file-jobs"' not in line))

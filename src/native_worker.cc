@@ -18,6 +18,11 @@
 #include <utility>
 
 namespace {
+bool notify(int fd, const void *bytes, size_t size) {
+    ssize_t n;
+    do { n = write(fd, bytes, size); } while (n < 0 && errno == EINTR);
+    return n == static_cast<ssize_t>(size);
+}
 // C++17 has no standard scope_exit. The native worker also serves GCC and
 // must not load LLVM merely for descriptor and child-process ownership.
 template<class Action> struct on_exit {
@@ -53,6 +58,10 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
     // channel; inherited pipes and locks would keep the caller's jobs alive.
     if (dup2(control, 3) < 0 || close_range(4, ~0U, 0)) return 1;
     control = 3;
+    struct sigaction ignore_pipe{}, inherited_pipe{};
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_pipe.sa_mask);
+    if (sigaction(SIGPIPE, &ignore_pipe, &inherited_pipe)) return 1;
     int events = -1, signals = -1;
     struct job { int peer; pid_t group; };
     std::map<pid_t, job> jobs;
@@ -74,6 +83,7 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
         if (signals >= 0) close(signals);
         if (events >= 0) close(events);
         if (installed) sigaction(SIGCHLD, &previous_action, nullptr);
+        sigaction(SIGPIPE, &inherited_pipe, nullptr);
         sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
     });
     if (!installed || (events = epoll_create1(EPOLL_CLOEXEC)) < 0 ||
@@ -85,7 +95,7 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
         return !epoll_ctl(events, EPOLL_CTL_ADD, fd, &event);
     };
     if (!watch(control, 0) || !watch(signals, 1) ||
-        send(control, "R", 1, MSG_NOSIGNAL) != 1) return 1;
+        !notify(control, "R", 1)) return 1;
     for (;;) {
         epoll_event ready[32];
         int count = epoll_wait(events, ready, 32, -1);
@@ -123,7 +133,8 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
                 if (length != sizeof(request) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) ||
                     received != (request.operation == 'G' ? 7 : request.operation == 'D' || request.operation == 'S' ? 6 : 5) ||
                     (request.operation != 'C' && request.operation != 'P' && request.operation != 'L' && request.operation != 'B' && request.operation != 'D' &&
-                     request.operation != 'G' && request.operation != 'S' && request.operation != 'I') ||
+                     request.operation != 'G' && request.operation != 'S' && request.operation != 'I' &&
+                     request.operation != 'A' && request.operation != 'M' && request.operation != 'T') ||
                     request.group > INT_MAX) return 1;
                 if (plan && (request.operation == 'P' || request.operation == 'I')) {
                     // Only planning runs in the serial dispatcher. Compiler children
@@ -135,7 +146,7 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
                     if (fchdir(cwd) || dup2(saved, STDERR_FILENO) < 0) return 1;
                     close(cwd); close(saved);
                     dcc_native_result reply{uint64_t(status & 255) << 8, 0, 0};
-                    send(fds[1], &reply, sizeof(reply), MSG_NOSIGNAL);
+                    notify(fds[1], &reply, sizeof(reply));
                     continue;
                 }
                 fflush(nullptr);
@@ -147,6 +158,7 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
                     if (prctl(PR_SET_PDEATHSIG, SIGKILL) || getppid() != parent ||
                         setpgid(0, request.group) || sigprocmask(SIG_SETMASK, &previous_mask, nullptr) ||
                         sigaction(SIGINT, &action, nullptr) ||
+                        sigaction(SIGPIPE, &inherited_pipe, nullptr) ||
                         !child_descriptors(fds, received, request.operation)) _exit(1);
                     int status = execute(3, request.operation);
                     fflush(nullptr);
@@ -180,10 +192,10 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
             if (found == jobs.end()) return 1;
             uint64_t cpu = uint64_t(usage.ru_utime.tv_sec+usage.ru_stime.tv_sec)*1000000000 +
                 uint64_t(usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)*1000;
-                dcc_native_result reply{uint64_t(status), uint64_t(usage.ru_maxrss)*1024, cpu};
+            dcc_native_result reply{uint64_t(status), uint64_t(usage.ru_maxrss)*1024, cpu};
             int peer = found->second.peer;
             epoll_ctl(events, EPOLL_CTL_DEL, peer, nullptr);
-            send(peer, &reply, sizeof(reply), MSG_NOSIGNAL);
+            notify(peer, &reply, sizeof(reply));
             close(peer);
             jobs.erase(found);
         }

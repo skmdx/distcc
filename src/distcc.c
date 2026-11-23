@@ -49,10 +49,8 @@
 #include "util.h"
 #include "hosts.h"
 #include "adaptive.h"
-#include "resource.h"
 #include "where.h"
 #include "broker.h"
-#include "bulk.h"
 #include "implicit.h"
 #include "compile.h"
 #include "job.h"
@@ -250,12 +248,15 @@ static int file_jobs(int fd)
         char **args = NULL;
         ret = dcc_r_argv_body(fd, "ARGV", argc, &args);
         if (!ret) {
-            int queued = fcntl(fd, F_DUPFD_CLOEXEC, 3);
-            if (queued < 0) ret = EXIT_IO_ERROR;
-            else {
-                unsigned char done[] = {'D', dcc_file_transfer(args[0], args[1], args + 2, queued)};
-                ret = dcc_writex(fd, done, sizeof(done));
+            unsigned char done[] = {'D', 0};
+            if (argc == 3 && (!strcmp(args[0], "--prepare") || !strcmp(args[0], "--merge"))) {
+                done[1] = dcc_clang_local_tool(args + 1, args[0][2] == 'p' ? 'A' : 'M', NULL);
+            } else {
+                int queued = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+                if (queued < 0) ret = EXIT_IO_ERROR;
+                else done[1] = dcc_file_transfer(args[0], args[1], args + 2, queued);
             }
+            if (!ret) ret = dcc_writex(fd, done, sizeof(done));
         }
         if (args) dcc_free_argv(args);
         if (ret) return ret;

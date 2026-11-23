@@ -1700,7 +1700,7 @@ class GccFrontendTest(BrokerTestCase):
         def descendants(pid):
             try:
                 children = [int(p) for p in Path(f'/proc/{pid}/task/{pid}/children').read_text().split()]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 return []
             return children + [child for parent in children for child in descendants(parent)]
         with (self.work/'cancel.log').open('wb') as log:

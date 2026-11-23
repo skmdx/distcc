@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include "../native_worker.h"
 #include <cstdlib>
+#include <sys/prctl.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/FrontendTool/Utils.h>
 #include <clang/Tooling/Tooling.h>
@@ -15,6 +16,7 @@
 #include "clang_compiler.h"
 #include "compiler_command.h"
 #include "clang_codegen.h"
+#include "lto_backend.h"
 #include "clang_result.h"
 
 namespace {
@@ -167,8 +169,14 @@ static int remote(llvm::ArrayRef<const char *> argv, int fd) {
 int main(int argc, char **argv) {
     dcc_clang_compile_init();
     dcc_clang_codegen_init();
-    if (argc == 4 && !strcmp(argv[1], "--native-worker"))
+    if (argc == 3 && !strcmp(argv[1], "--lto-worker")) {
+        if (prctl(PR_SET_DUMPABLE, 0) || !dcc_lto_init(false)) return 1;
+        return dcc_native_worker(atoi(argv[2]), dcc_lto_remote);
+    }
+    if (argc == 4 && !strcmp(argv[1], "--native-worker")) {
+        if (!dcc_lto_init(true)) return 1;
         return dcc_clang_native_worker(atoi(argv[2]));
+    }
     if (argc == 4 && !strcmp(argv[1], "--worker"))
         return dcc_native_worker(atoi(argv[2]), [](int request, unsigned operation) {
             CompilerCommand command;

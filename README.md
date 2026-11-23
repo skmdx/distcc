@@ -62,11 +62,13 @@ Link backends rank workers by predicted completion time, including current CPU
 contention. Once the broker has measured ThinLTO service times, a module can
 wait for a faster occupied worker if that predicts an earlier finish. Cold
 ThinLTO jobs and offload links use the best available lane.
-Under Portage, only bubblewrap's namespace setup runs with `SANDBOX_ON=0`:
-the preload cannot track its UID maps and root switch. The isolated compiler
-still uses read-only input mounts, and the caller's sandbox environment is preserved.
-The daemon runs the installed LLVM tool in a private namespace preserving
-embedded import paths. It streams each declared output to a temporary file
+The daemon keeps one read-only bubblewrap sandbox per Clang slot. Each
+backend runs in a disposable child with its own input descriptors and output
+stream. LLVM resolves index imports by their original module identifiers
+against the declared inputs. Multi-output backends and device links retain
+per-job namespaces. On the client, disposable children of the matching Clang
+helper prepare and merge partitions in private output directories under the
+caller's Portage sandbox. The daemon streams each declared output to a temporary file
 beside its client destination. The final native link
 runs on the client; no client sysroot snapshot is needed. LLD's ThinLTO cache
 remains in use, so warm cache entries do not start backend jobs.

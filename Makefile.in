@@ -33,7 +33,7 @@ LLVM_TARGET_LIBDIR = $(patsubst $(LLVM_SYSROOT)/%,/%,$(shell $(LLVM_CONFIG) --li
 LLVM_TARGET_BINDIR = $(patsubst $(LLVM_SYSROOT)/%,/%,$(shell $(LLVM_CONFIG) --bindir))
 LTO_LIBDIR ?= $(LLVM_TARGET_LIBDIR)/distcc
 LTO_BINDIR ?= $(LLVM_TARGET_BINDIR)
-LTO_TARGETS = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),$(LTO_BUILD)/distcc-lto $(LTO_BUILD)/lto-prepare.so $(LTO_BUILD)/distcc-rust-cgu $(LTO_BUILD)/distcc-rust-cgu.so $(LTO_BUILD)/distcc-clang)
+LTO_TARGETS = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),$(LTO_BUILD)/distcc-lto $(LTO_BUILD)/distcc-rust-cgu $(LTO_BUILD)/distcc-rust-cgu.so $(LTO_BUILD)/distcc-clang)
 # Upstream Clang owns extraction, device grouping and image registration.
 # Point at its clang/tools/clang-linker-wrapper source directory to build it.
 LLVM_WRAPPER_SOURCE ?=
@@ -196,7 +196,6 @@ dist_extra =							\
 	distcc-offload-link \
 	distcc_lto.py \
 	src/lto.cc \
-	src/lto_prepare.cc \
 	src/lto_worker.cc \
 	src/lto_partition.cc \
 	src/lto_partition.h \
@@ -300,7 +299,7 @@ rpc_obj = src/rpc.o src/argv_file.o
 
 common_obj = src/arg.o src/argutil.o					\
 	src/cleanup.o src/compress.o src/compress_stream.o					\
-	src/trace.o src/util.o src/io.o src/exec.o			\
+	src/trace.o src/util.o src/io.o src/fd_io.o src/exec.o			\
 	$(rpc_obj) src/tempfile.o src/bulk.o src/help.o src/filename.o	\
 	src/lock.o src/broker_session.o src/resource.o					\
 	src/netutil.o							\
@@ -339,7 +338,7 @@ distccd_obj = src/access.o						\
 	$(common_obj)
 
 lsdistcc_obj = src/lsdistcc.o 						\
-	src/clinet.o src/io.o src/netutil.o src/trace.o src/util.o 	\
+	src/clinet.o src/io.o src/fd_io.o src/netutil.o src/trace.o src/util.o 	\
 	src/rslave.o src/snprintf.o                                     \
 	lzo/minilzo.o
 
@@ -347,7 +346,7 @@ lsdistcc_obj = src/lsdistcc.o 						\
 mon_obj =								\
 	src/cleanup.o							\
 	src/filename.o							\
-	src/io.o							\
+	src/io.o src/fd_io.o							\
 	src/mon.o							\
 	src/netutil.o							\
 	src/argutil.o							\
@@ -401,7 +400,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c src/broker_client.c src/broker_sch
 	src/h_sa2str.c src/h_scanargs.c src/h_strip.c			\
 	src/h_dotd.c src/h_compile.c src/h_getline.c			\
 	src/help.c src/history.c src/hosts.c src/hostfile.c		\
-	src/implicit.c src/io.c						\
+	src/implicit.c src/io.c src/fd_io.c						\
 	src/loadfile.c src/lock.c 					\
 	src/mon.c src/mon-notify.c src/mon-text.c			\
 	src/mon-gnome.c							\
@@ -542,7 +541,7 @@ distcc-linker-wrapper: $(LTO_BUILD)/ClangLinkerWrapper.o
 distcc-clang: src/clang/launcher.o $(common_obj)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-CLANG_OBJECTS = $(addprefix $(LTO_BUILD)/,clang_compile.o clang_codegen.o clang_native.o clang_driver.o link_inputs.o)
+CLANG_OBJECTS = $(addprefix $(LTO_BUILD)/,clang_compile.o clang_codegen.o clang_native.o clang_driver.o link_inputs.o lto_job.o lto_backend.o)
 $(LTO_BUILD)/ElfOptions.inc: $(LLVM_WRAPPER_SOURCE)/../../../lld/ELF/Options.td
 	@mkdir -p $(@D)
 	`$(LLVM_CONFIG) --bindir`/llvm-tblgen -gen-opt-parser-defs -I `$(LLVM_CONFIG) --includedir` $< -o $@
@@ -556,8 +555,8 @@ $(LTO_BUILD)/clang_worker_loop.o: $(srcdir)/src/native_worker.cc
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -MMD -c $< -o $@
 
-$(LTO_BUILD)/distcc-clang: $(CLANG_OBJECTS) $(LTO_BUILD)/clang_worker_loop.o $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o src/argv_file.o src/file_cache.o
-	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $^ `$(LLVM_CONFIG) --ldflags` -Wl,-rpath,$(LLVM_TARGET_LIBDIR) -lclang-cpp -llldELF -llldCommon -lLLVM -lxxhash -llz4
+$(LTO_BUILD)/distcc-clang: $(CLANG_OBJECTS) $(LTO_BUILD)/clang_worker_loop.o $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o src/argv_file.o src/file_cache.o src/fd_io.o
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $^ `$(LLVM_CONFIG) --ldflags` -Wl,-rpath,$(LLVM_TARGET_LIBDIR) '-Wl,--export-dynamic-symbol=_ZN4llvm3lto11thinBackend*' -lclang-cpp -llldELF -llldCommon -lLLVM -lxxhash -llz4 -ldl -lseccomp
 
 CLANG_MAJOR = $(firstword $(subst ., ,$(shell $(LLVM_CONFIG) --version)))
 .PHONY: clang-slots clang-slot
@@ -586,15 +585,12 @@ $(LTO_BUILD)/lto_partition.o: $(srcdir)/src/lto_partition.cc $(srcdir)/src/lto_p
 	$(mkinstalldirs) "$(LTO_BUILD)"
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -c $< -o $@
 
-$(LTO_BUILD)/lto.o $(LTO_BUILD)/lto_prepare.o: $(LTO_BUILD)/%.o: $(srcdir)/src/%.cc $(srcdir)/src/lto_partition.h
+$(LTO_BUILD)/lto.o: $(srcdir)/src/lto.cc $(srcdir)/src/lto_partition.h
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fPIC -MMD -c $< -o $@
 
 $(LTO_BUILD)/distcc-lto: $(LTO_BUILD)/lto.o $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $^ `$(LLVM_CONFIG) --ldflags` -lLLVM
-
-$(LTO_BUILD)/lto-prepare.so: $(LTO_BUILD)/lto_prepare.o $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o
-	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -shared $(LDFLAGS) -o $@ $^ `$(LLVM_CONFIG) --ldflags` -lLLVM -ldl
 
 .PHONY: lto install-lto
 lto: $(LTO_TARGETS) $(if $(LTO_TARGETS),clang-slot)
@@ -656,7 +652,7 @@ $(GCC_PLAN_OBJECTS): $(LTO_BUILD)/%.o: $(srcdir)/src/%.cc
 gcc_plan.so: $(GCC_PLAN_OBJECTS) src/argv_file.pic.o
 	$(CXX) $(CXXFLAGS) -shared $(LDFLAGS) -o $@ $^ -ldl
 
-CLIENT_CONTRACT_SOURCES = src/hosts.c src/hostfile.c src/loadfile.c src/lock.c src/io.c src/tempfile.c \
+CLIENT_CONTRACT_SOURCES = src/hosts.c src/hostfile.c src/loadfile.c src/lock.c src/io.c src/fd_io.c src/tempfile.c \
 	src/trace.c src/util.c src/argutil.c src/rpc.c src/filename.c src/snprintf.c src/cleanup.c @ZEROCONF_COMMON_OBJS@
 # Host configuration must link without the client-only scheduler, as in distccd.
 h_client_hotpaths: test/client_hotpaths.c src/tcp_client.c src/tcp_job.c src/tcp_job.h src/local_clang.c src/exec.c src/broker_client.o src/broker_session.o src/broker_protocol.h src/broker_session.h src/workload.h src/argv_file.c src/frontend_fs.c src/frontend_identity.h $(CLIENT_CONTRACT_SOURCES)
@@ -1258,7 +1254,7 @@ uninstall-programs:
 	rm -f "$(DESTDIR)$(libdir)/distcc/cpp_lookup.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/gcc_plan.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"
-	rm -f "$(DESTDIR)$(LTO_BINDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/lto-prepare.so" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu.so"
+	rm -f "$(DESTDIR)$(LTO_BINDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/distcc-lto" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu.so"
 	for p in $(private_scripts) $(private_modules) distcc-linker-wrapper distcc; do rm -f "$(DESTDIR)$(pkglibexecdir)/$$p"; done
 	rm -f "$(DESTDIR)$(bindir)/distcc-rust"
 	for p in $(bin_PROGRAMS); do			\
@@ -1332,4 +1328,4 @@ src/gcc_frontend.o src/plan_memo.o src/h_compile.o: src/plan_memo.h
 src/frontend_fs.o src/tcp_client.o src/local_clang.o: src/frontend_fs.h
 HEADERS += src/tcp_job.h src/tcp_async.h src/clang_worker.h
 HEADERS += src/job.h
-HEADERS += src/frontend_fs.h src/frontend_identity.h src/gcc_files.h src/remote_files.h src/clang/remote_files.h
+HEADERS += src/frontend_fs.h src/frontend_identity.h src/gcc_files.h src/remote_files.h src/clang/remote_files.h src/fd_io.h

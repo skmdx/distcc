@@ -4,9 +4,16 @@
 #include <fstream>
 #include <limits.h>
 #include <regex>
+#include <spawn.h>
+#include <linux/openat2.h>
+#include <sys/syscall.h>
+#include <poll.h>
+#include <sys/socket.h>
 extern "C" {
 #include "exec.h"
 #include "exitcode.h"
+#include "helpers.h"
+#include "clang_worker.h"
 }
 using namespace rust;
 namespace {
@@ -41,6 +48,122 @@ fs::path installed_plugin(const fs::path &linker, const fs::path &requested) {
 }
 }
 
+extern "C" int dcc_lto_helper(const dcc_job *job, char *path) {
+    if (job->kind != DCC_JOB_THINLTO || !job->llvm_outputs[0] || job->llvm_outputs[1]) return 0;
+    for (unsigned i = 0; i < job->count; ++i)
+        if (!dcc_job_file(&job->inputs[i])) return 0;
+    bool object = false, ir = false;
+    for (auto p = job->argv + 1; *p; ++p) {
+        if (!strcmp(*p, "-c") || !strcmp(*p, "-emit-obj")) object = true;
+        if (!strcmp(*p, "-x")) {
+            if (!p[1] || strcmp(*++p, "ir")) return 0;
+            ir = true;
+        }
+        if (!strncmp(*p, "-save-temps", 11) || !strncmp(*p, "--save-temps", 12)) return 0;
+    }
+    if (!object || !job->count) return 0;
+    auto extension = fs::path(job->inputs[0].path).extension();
+    if (!ir && extension != ".bc" && extension != ".ll") return 0;
+    try {
+        bool linker;
+        auto tool = fs::canonical(installed_tool(job->argv[0], linker));
+        if (linker) return 0;
+        std::smatch match;
+        static const std::regex version(R"(clang(?:\+\+)?-([0-9]+)(?:\.[0-9]+)*)");
+        auto name = tool.filename().string();
+        if (!std::regex_match(name, match, version)) return 0;
+        char storage[PATH_MAX];
+        auto helper = dcc_helper_path(("distcc-clang-" + match[1].str()).c_str(), storage);
+        if (access(helper, X_OK)) return errno == ENOENT ? 0 : -1;
+        return realpath(helper, path) ? 1 : -1;
+    } catch (const std::exception &) { return -1; }
+}
+
+extern "C" int dcc_spawn_lto(pid_t *pid, int channel, const char *helper, const char *compiler) {
+    try {
+        bool linker;
+        auto tool_dir = fs::canonical(installed_tool(compiler, linker)).parent_path();
+        Sandbox box(Root::ResidentLLVM);
+        box.mount(tool_dir, tool_dir);
+        box.mount(helper, "/distcc-clang");
+        box.command({"/distcc-clang", "--lto-worker", "3"});
+        auto argv = pointers(box.args);
+        Fd filter(fcntl(box.filter.fd, F_DUPFD_CLOEXEC, 5));
+        posix_spawn_file_actions_t actions;
+        int rc = posix_spawn_file_actions_init(&actions);
+        if (rc) return rc;
+        rc = posix_spawn_file_actions_adddup2(&actions, channel, 3);
+        if (!rc) rc = posix_spawn_file_actions_adddup2(&actions, filter.fd, 4);
+        if (!rc) rc = posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+        if (!rc) rc = posix_spawn_file_actions_addclosefrom_np(&actions, 5);
+        if (!rc) rc = posix_spawn(pid, argv[0], &actions, nullptr, argv.data(), environ);
+        posix_spawn_file_actions_destroy(&actions);
+        return rc;
+    } catch (const std::exception &) { return EIO; }
+}
+
+namespace {
+struct Channel {
+    int fd[2];
+    Channel() { check(!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, fd), "create job channel"); }
+    ~Channel() { close(fd[0]); if (fd[1] >= 0) close(fd[1]); }
+    void sent() { close(fd[1]); fd[1] = -1; }
+};
+int resident(const dcc_job *job, const char *root, const fs::path &output,
+             const char *out, const char *err, int cancel, dcc_job_result *result) {
+    Fd object(open(output.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600));
+    Fd diagnostics(open(err, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600));
+    Fd stdout_log(open(out, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0600));
+    Fd spec(dcc_job_memfd("distcc-lto-command"));
+    Channel reply, transfer;
+    char *directory[] = {job->cwd, job->llvm_outputs[0], nullptr};
+    std::vector<char *> names;
+    for (unsigned i = 0; i != job->count; ++i) names.push_back(job->inputs[i].path);
+    names.push_back(nullptr);
+    for (auto words : {directory + 0, job->argv, names.data()})
+        check(!dcc_x_argv(spec.fd, "ARGC", "ARGV", words), "write backend command");
+    check(lseek(spec.fd, 0, SEEK_SET) == 0, "rewind backend command");
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    int fds[] = {spec.fd, reply.fd[1], transfer.fd[1], object.fd, diagnostics.fd};
+    dcc_native_request run{'T', 0};
+    check(!dcc_send_fds(job->compiler_channel - 1, &run, sizeof(run), fds, 5), "submit backend");
+    reply.sent(); transfer.sent();
+    Fd staged(open(root, O_PATH | O_DIRECTORY | O_CLOEXEC));
+    struct open_how how{};
+    how.flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS;
+    check(!fcntl(transfer.fd[0], F_SETFL, O_NONBLOCK), "set input channel nonblocking");
+    for (unsigned i = 0; i < job->count;) {
+        unsigned char count = std::min<unsigned>(job->count - i, DCC_IPC_FDS_MAX);
+        std::vector<Fd> batch;
+        int descriptors[DCC_IPC_FDS_MAX];
+        for (unsigned n = 0; n < count; ++n, ++i) {
+            auto file = fs::path(job->inputs[i].path).relative_path();
+            batch.emplace_back(syscall(SYS_openat2, staged.fd, file.c_str(), &how, sizeof(how)));
+            struct stat st;
+            check(!fstat(batch.back().fd, &st) && S_ISREG(st.st_mode), "expected staged regular input");
+            descriptors[n] = batch.back().fd;
+        }
+        for (;;) {
+            int rc = dcc_wait_compiler_fd(transfer.fd[0], POLLOUT, cancel, &started);
+            if (rc) return rc << 8;
+            if (!dcc_send_fds(transfer.fd[0], &count, 1, descriptors, count)) break;
+            check(errno == EAGAIN, "send backend inputs");
+        }
+    }
+    dcc_native_result usage{};
+    int rc = dcc_compiler_result(reply.fd[0], cancel, &started, &usage);
+    if (rc) return rc << 8;
+    result->peak_bytes = usage.peak_bytes; result->cpu_ns = usage.cpu_ns;
+    if (!usage.status) {
+        struct stat st;
+        check(!fstat(object.fd, &st) && S_ISREG(st.st_mode) && st.st_size, "missing backend output");
+    }
+    return usage.status;
+}
+}
+
 extern "C" int dcc_llvm_worker(const dcc_job *job, const char *root, int cancel, const char *out,
                                const char *err, dcc_job_result *result) {
     try {
@@ -50,6 +173,8 @@ extern "C" int dcc_llvm_worker(const dcc_job *job, const char *root, int cancel,
         auto private_dir = fs::path(root) / fs::path(DCC_LLVM_ROOT).relative_path();
         auto results = private_dir / "results";
         fs::create_directories(results);
+        if (job->compiler_channel)
+            return resident(job, root, results / "0", out, err, cancel, result);
         Sandbox box(Root::LLVM);
         box.args.insert(box.args.end(), {"--cap-drop", "ALL"});
         box.mount(tool_dir, tool_dir);

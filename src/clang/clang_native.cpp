@@ -22,6 +22,7 @@
 #include "clang_compiler.h"
 #include "compiler_command.h"
 #include "link_inputs.h"
+#include "lto_backend.h"
 #include "../native_worker.h"
 
 LLD_HAS_DRIVER(elf)
@@ -166,6 +167,8 @@ int execute(int fd, unsigned operation, int journal) {
     environ = command[2];
     argv[0] = directory[1];
     llvm::SmallVector<const char *> args;
+    if (operation == 'A' || operation == 'M')
+        return argv[1] && !argv[2] ? dcc_lto_local(argv[1], operation) : 1;
     if (operation == 'B') {
         if (!argv[1]) return 1;
         if (!llvm::sys::fs::equivalent(argv[1], DCC_LLD_PATH)) {

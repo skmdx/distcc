@@ -141,12 +141,18 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
         size_t length = offsetof(struct dcc_tcp_run, root) + strlen(run->root) + 1;
         int descriptors[3] = {fd, input, -1};
         unsigned count = input >= 0 ? 2 : 1;
-        if (description->kind == DCC_JOB_FRONTEND) {
-            descriptors[2] = dcc_clang_pool_get(description->argv[0]);
-            if (descriptors[2] < 0) return -1;
-            count = 3;
+        struct dcc_tcp_run dispatch = *run;
+        dispatch.compiler_channel = 0;
+        char helper[PATH_MAX];
+        int resident = dcc_lto_helper(description, helper);
+        if (resident < 0) return -1;
+        if (resident || description->kind == DCC_JOB_FRONTEND) {
+            int compiler = dcc_clang_pool_get(description->argv[0], resident ? helper : NULL);
+            if (compiler < 0) return -1;
+            descriptors[count++] = compiler;
+            dispatch.compiler_channel = count;
         }
-        if (dcc_send_fds(w->fd, run, length, descriptors, count)) {
+        if (dcc_send_fds(w->fd, &dispatch, length, descriptors, count)) {
             close_worker(w); w->busy = RETIRING;
             return -1;
         }
@@ -702,8 +708,10 @@ int dcc_run_worker(void)
         ssize_t request_size = dcc_recv_fds(worker_channel, &run, sizeof(run), descriptors, &descriptor_count);
         if (request_size < 0 || !descriptor_count) return 0;
         acc_fd = descriptors[0];
-        int input = descriptor_count >= 2 ? descriptors[1] : -1;
-        int frontend = descriptor_count == 3 ? descriptors[2] : -1;
+        if (run.operation == DCC_TCP_RUN && run.compiler_channel &&
+            (run.compiler_channel < 2 || run.compiler_channel != descriptor_count)) return EXIT_PROTOCOL_ERROR;
+        int frontend = run.operation == DCC_TCP_RUN && run.compiler_channel ? descriptors[descriptor_count-1] : -1;
+        int input = descriptor_count >= (frontend >= 0 ? 3u : 2u) ? descriptors[1] : -1;
         message = run.operation;
         if (request_size > (ssize_t)offsetof(struct dcc_tcp_run, root) &&
             request_size <= (ssize_t)sizeof(run) && message == DCC_TCP_RUN &&

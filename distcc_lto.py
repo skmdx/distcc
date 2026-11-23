@@ -5,7 +5,6 @@ from functools import cache, cached_property
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import socket
 import stat
@@ -16,10 +15,6 @@ import distcc_python
 import xxhash
 
 from distcc_job import JOB_THINLTO, LocalOnly, fingerprint, snapshot, write_metadata
-
-CONTROL = '/__distcc_lto'
-RUNTIME = ('/lib', '/lib64', '/usr/lib64', '/usr/lib/gcc', '/usr/lib/llvm',
-           '/etc/ld.so.cache')
 
 
 class InputSnapshot:
@@ -53,9 +48,7 @@ def llvm_tools(compiler):
     binary = shutil.which(compiler) or compiler
     bindir = Path(binary).resolve().parent
     plan = (bindir / 'distcc-lto').resolve()
-    paths = dict(plan=plan, prepare=plan.with_name('lto-prepare.so'),
-                 linker=bindir / 'ld.lld', objcopy=bindir / 'llvm-objcopy')
-    return paths if all(path.is_file() for path in paths.values()) else None
+    return dict(plan=plan, linker=bindir / 'ld.lld') if plan.is_file() else None
 
 
 def work_key(job, files):
@@ -149,7 +142,6 @@ def distribute(request, kind, link=None):
     import itertools
     import math
     import queue
-    import shlex
 
     common, jobs = request['common'], request['jobs']
     if not jobs:
@@ -245,11 +237,24 @@ def distribute(request, kind, link=None):
                 entries.append((name, size, digest))
             write_metadata(kind, job, entries, jobdir / 'job',
                            work_key=work_key(job, files), work_units=task['instructions'])
-            try:
-                lane = idle.get_nowait()
-            except queue.Empty:
-                lane = open_lane()
+            lane = acquire_lane()
             return lane, lane.submit([jobdir / 'job', inputs, *task['destinations']]), job
+
+        def acquire_lane():
+            try:
+                return idle.get_nowait()
+            except queue.Empty:
+                return open_lane()
+
+        def local(operation, directory, spec):
+            description = directory / 'request.json'
+            description.write_text(json.dumps(spec))
+            lane = acquire_lane()
+            args = [operation, common['args'][0], description]
+            status = lane.result(lane.submit(args))
+            idle.put(lane)
+            if status:
+                raise subprocess.CalledProcessError(status, args)
 
         def collect(started):
             lane, first, job = started
@@ -264,22 +269,11 @@ def distribute(request, kind, link=None):
             return 0
 
         def prepare(index, task):
-            assert tools is not None
             jobdir, job = describe(index, task)
-            root = jobdir / 'root'
-            root.mkdir()
-            for name in job['inputs']:
-                path = root / name.lstrip('/')
-                path.parent.mkdir(parents=True, exist_ok=True)
-                os.link(files[name].path, path)
-            manifest = str(jobdir / 'partitions.json')
-            job['outputs'] = [manifest]
-            job['partitions'] = task['partitions']
-            job['args'][len(common['args']) + task['args'].index('-o') + 1] = manifest + '.unused.o'
-            result = run_preparation(root, job, tools['prepare'])
-            if result:
-                raise subprocess.CalledProcessError(result, job['args'])
-            with os.fdopen(open_regular(root / manifest.lstrip('/')), 'rb') as source:
+            manifest = 'partitions.json'
+            local('--prepare', jobdir, dict(cwd=job['cwd'], args=job['args'],
+                  partitions=task['partitions'], files={n: str(files[n].path) for n in job['inputs']}))
+            with os.fdopen(open_regular(jobdir / manifest), 'rb') as source:
                 partition = json.load(source)
             if not 0 < len(partition['parts']) <= task['partitions']:
                 raise ValueError('unexpected LLVM partition count')
@@ -304,7 +298,7 @@ def distribute(request, kind, link=None):
                 expected = f'{manifest}.part-{i}.bc'
                 if part['path'] != expected:
                     raise ValueError('unexpected LLVM partition path')
-                path = str(root / expected.lstrip('/'))
+                path = str(jobdir / expected)
                 args = [path if absolute(arg) == primary else arg for arg in task['args']]
                 args[args.index('-o') + 1] = output
                 args.extend(['-mllvm', '-thinlto-assume-merged'])
@@ -317,20 +311,10 @@ def distribute(request, kind, link=None):
             return children
 
         def merge(group):
-            assert tools is not None
             directory = group['directory']
-            sandbox = llvm_sandbox(tools['linker'].parent)
-            sandbox.extend(['--bind', str(directory), CONTROL, '--remount-ro', '/',
-                            '--chdir', CONTROL, '--clearenv', '--'])
-            environment = dict(os.environ, SANDBOX_ON='0')
             parts = [Path(p).name for p in group['outputs']]
-            subprocess.run([*sandbox, tools['linker'], '-r', '-o', 'merged.o', *parts], env=environment, check=True)
-            output = 'merged.o'
-            if group['locals']:
-                output = 'localized.o'
-                (directory / 'localize.rsp').write_text(shlex.join(
-                    ['--localize-symbol=' + name for name in group['locals']] + ['merged.o', output]))
-                subprocess.run([*sandbox, tools['objcopy'], '@localize.rsp'], env=environment, check=True)
+            local('--merge', directory, dict(parts=parts, locals=group['locals']))
+            output = 'localized.o' if group['locals'] else 'merged.o'
             destination = group['destination']
             with os.fdopen(open_regular(directory / output), 'rb') as source, ExitStack() as stack:
                 os.replace(stage_output(source, destination, stack), destination)
@@ -374,85 +358,6 @@ def distribute(request, kind, link=None):
                             if not group['remaining']:
                                 enqueue('merge', group, float('inf'))
         return 0
-
-
-def llvm_sandbox(tool_dir, root=None):
-    namespaces = ['--unshare-all']
-    if os.geteuid() == 0:
-        # Portage installs as root below the build user's mode-0700 directory.
-        # A new user namespace loses host DAC override before bwrap opens the
-        # bind sources. Keep it for mount setup, then drop every capability
-        # before executing Clang in the isolated, read-only filesystem.
-        namespaces = ['--unshare-ipc', '--unshare-pid', '--unshare-net',
-                      '--unshare-uts', '--unshare-cgroup-try', '--cap-drop', 'ALL']
-    sandbox = [shutil.which('bwrap', path=os.defpath) or '/usr/bin/bwrap', *namespaces, '--die-with-parent']
-    if root is not None:
-        sandbox.extend(['--bind', str(root), '/'])
-    for runtime in RUNTIME:
-        if Path(runtime).exists():
-            sandbox.extend(['--ro-bind', runtime, runtime])
-    # Keep the installed tool directory and its symlinks intact: Clang locates
-    # LLD and resource files relative to its executable. Binding a symlink as
-    # an individual mount target is also rejected by bubblewrap.
-    sandbox.extend(['--ro-bind', str(tool_dir), str(tool_dir), '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp'])
-    return sandbox
-
-
-def run_preparation(root, job, prepare_library):
-    root = Path(root)
-
-    def rooted(name):
-        path = Path(name)
-        if not path.is_absolute() or '..' in path.parts:
-            raise ValueError('invalid LLVM job file path')
-        return root / name.lstrip('/')
-
-    requested, *args = job['args']
-    # Invoke administrator-installed LLVM tools; never an uploaded executable.
-    name = Path(requested).name
-    if not re.fullmatch(r'(?:[\w.+]+-)*(?:clang(?:\+\+)?|lld|ld\.lld)(?:-\d+(?:\.\d+)*)?', name):
-        raise ValueError('LLVM jobs must invoke an installed compiler or linker')
-    # LLVM backends may use either driver arguments or a compiler-generated
-    # cc1 invocation. Let Clang validate its action; cc1 uses -emit-obj, not -c.
-    compiler = None
-    path = Path(requested)
-    if (path.is_absolute() and path.parent.parent.parent == Path('/usr/lib/llvm')
-            and path.parent.name == 'bin' and path.is_file()):
-        compiler = str(path)
-    compiler = compiler or shutil.which(name, path=os.environ.get('DISTCCD_PATH', os.defpath))
-    if not compiler:
-        raise OSError('worker Clang is not installed')
-    # Keep embedded import paths in LLVM indexes unchanged. A private mount
-    # namespace gives Clang the client path layout and read-only cached inputs.
-    rooted(job['cwd']).mkdir(parents=True, exist_ok=True)
-    sandbox = llvm_sandbox(Path(compiler).parent, root)
-    sandbox.extend(['--dir', job['cwd']])
-    outputs = [rooted(name) for name in job['outputs']]
-    # LLD publishes with a temporary sibling and rename; a writable file mount
-    # alone is insufficient. The per-job tree owns these writable directories.
-    # Bind inputs last so cached files remain immutable even in the same directory.
-    for parent in sorted({Path(name).parent for name in job['outputs']}, key=lambda p: len(p.parts)):
-        directory = rooted(str(parent))
-        directory.mkdir(parents=True, exist_ok=True)
-        sandbox.extend(['--bind', str(directory), str(parent)])
-    for name in job['inputs']:
-        sandbox.extend(['--ro-bind', str(rooted(name)), name])
-    sandbox.extend(['--remount-ro', '/', '--chdir', job['cwd'], '--clearenv',
-                    '--setenv', 'PATH', os.defpath, '--setenv', 'TMPDIR', '/tmp'])
-    if prepare_library is not None:
-        sandbox.extend(['--setenv', 'LD_PRELOAD', str(prepare_library),
-                        '--setenv', 'DISTCC_LTO_PARTITION_FILE', job['outputs'][0],
-                        '--setenv', 'DISTCC_LTO_PARTITIONS', str(job['partitions'])])
-    # Portage's preload cannot follow bubblewrap's UID maps and pivot_root.
-    # Exempt only namespace setup; the compiler runs with a cleared environment
-    # inside the read-only mounts above. The parent's sandbox stays active.
-    result = subprocess.run([*sandbox, compiler, *args],
-                            env=dict(os.environ, SANDBOX_ON='0'))
-    if result.returncode:
-        return result.returncode if result.returncode > 0 else 128 - result.returncode
-    if not outputs or not outputs[0].stat().st_size:
-        raise ValueError('LLVM job produced no output')
-    return 0
 
 
 class LinkFiles:

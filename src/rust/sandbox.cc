@@ -4,7 +4,7 @@
 #include "rust/api.h"
 #include <seccomp.h>
 namespace rust {
-static Fd namespace_filter() {
+static Fd namespace_filter(bool inherit) {
     Fd filter(dcc_job_memfd("rust-probe-filter"));
     auto rules = seccomp_init(SCMP_ACT_ALLOW);
     if (!rules)
@@ -18,7 +18,7 @@ static Fd namespace_filter() {
     }
     rc |= seccomp_export_bpf(rules, filter.fd);
     seccomp_release(rules);
-    if (rc || lseek(filter.fd, 0, SEEK_SET) < 0 || fcntl(filter.fd, F_SETFD, 0) < 0)
+    if (rc || lseek(filter.fd, 0, SEEK_SET) < 0 || (inherit && fcntl(filter.fd, F_SETFD, 0) < 0))
         throw std::runtime_error("cannot prepare dependency probe filter");
     return filter;
 }
@@ -26,7 +26,7 @@ void Sandbox::mount(const fs::path &from, const fs::path &to, bool writable) {
     args.insert(args.end(), {writable ? "--bind" : "--ro-bind", from, to});
 }
 Sandbox::Sandbox(Root policy, const fs::path &tree)
-    : filter(namespace_filter()), args{"/usr/bin/bwrap", "--unshare-all", "--die-with-parent"} {
+    : filter(namespace_filter(policy != Root::ResidentLLVM)), args{"/usr/bin/bwrap", "--unshare-all", "--die-with-parent"} {
     if (env("SANDBOX_ON") == "1") {
         // Keep preloads out of namespace setup. bwrap prepares the payload
         // environment before writing uid_map. Host probes inherit Portage's
@@ -61,7 +61,14 @@ Sandbox::Sandbox(Root policy, const fs::path &tree)
             if (fs::exists(p))
                 mount(p, p);
     }
-    args.insert(args.end(), {"--proc", "/proc", "--dev", "/dev", "--seccomp", std::to_string(filter.fd)});
+    args.insert(args.end(), {"--proc", "/proc"});
+    if (policy == Root::ResidentLLVM) {
+        mount("/dev/null", "/dev/null");
+        args.insert(args.end(), {"--remount-ro", "/proc", "--cap-drop", "ALL", "--clearenv",
+                                  "--seccomp", "4"});
+        return;
+    }
+    args.insert(args.end(), {"--dev", "/dev", "--seccomp", std::to_string(filter.fd)});
     if (policy != Root::Host)
         args.insert(args.end(), {"--tmpfs", "/tmp"});
     if (policy == Root::Inputs || policy == Root::Backend || policy == Root::LLVM)

@@ -62,7 +62,7 @@ unsigned char *dcc_tcp_file_chunk(uint32_t, unsigned, int, off_t, size_t, int, e
                                   unsigned char *, unsigned char *, size_t *);
 
 #define DCC_TCP_RUN 128
-struct dcc_tcp_run { uint32_t operation; uint64_t id; char root[PATH_MAX]; };
+struct dcc_tcp_run { uint32_t operation, compiler_channel; uint64_t id; char root[PATH_MAX]; };
 struct dcc_tcp_finished {
     uint64_t id;
     uint64_t peak_bytes;

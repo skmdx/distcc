@@ -28,7 +28,7 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
     else if (!memchr(run->root, 0, sizeof(run->root)) || run->root[0] != '/' ||
         dcc_job_decode(metadata, 0, &job)) finished.error = EXIT_PROTOCOL_ERROR;
     else if ((dcc_job_frontend(job) && input < 0) ||
-        (job->kind == DCC_JOB_FRONTEND ? frontend < 0 : frontend >= 0))
+        (job->kind == DCC_JOB_FRONTEND ? frontend < 0 : frontend >= 0 && job->kind != DCC_JOB_THINLTO))
         finished.error = EXIT_PROTOCOL_ERROR;
     if (!finished.error && job->kind == DCC_JOB_GCC_FRONTEND) {
         pid_t child = fork();
@@ -47,10 +47,10 @@ int dcc_tcp_worker(int channel, const struct dcc_tcp_run *run, int metadata, int
     if (!finished.error && setenv("TMPDIR", run->root, 1)) finished.error = EXIT_OUT_OF_MEMORY;
     if (!finished.error) {
         changed_tmp = 1;
+        job->compiler_channel = frontend + 1;
         if (input >= 0) {
             if (dcc_job_frontend(job)) {
                 job->fs_channel = input + 1;
-                job->compiler_channel = frontend + 1;
             } else {
             char target[64], path[PATH_MAX];
             snprintf(target, sizeof(target), "/proc/self/fd/%d", input);

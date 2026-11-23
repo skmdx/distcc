@@ -251,8 +251,9 @@ static int request(char **argv, char operation, int output, int errors, int jour
 {
     int reuse = dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0);
     int planning = operation == 'P' || operation == 'I';
+    int lto = operation == 'A' || operation == 'M';
     const char *driver = argv[0];
-    if ((!reuse && !planning) || !dcc_clang_driver_mode(driver)) return -1;
+    if ((!reuse && !planning && !lto) || !dcc_clang_driver_mode(driver)) return -1;
     /* Internal tool entry points bypass Clang's driver in the native binary. */
     if (argv[1] && !strncmp(argv[1], "-cc1", 4)) return planning ? EXIT_LOCAL_COMPILE : -1;
     char *compiler = NULL, *cwd = NULL;
@@ -267,7 +268,7 @@ static int request(char **argv, char operation, int output, int errors, int jour
     }
     if (lookup == -ENOENT || lookup == -ENOTDIR) return planning ? EXIT_LOCAL_COMPILE : -1;
     if (!compiler) goto out;
-    ret = get_worker(compiler, planning, &worker);
+    ret = get_worker(compiler, planning || lto, &worker);
     if (ret) goto out;
     if (operation == 'P' && (ret = dcc_lock_local_cpp(&cpu))) goto out;
     ret = EXIT_IO_ERROR;
@@ -435,10 +436,10 @@ done:
     return ret;
 }
 
-int dcc_clang_run_link(char **argv, uint64_t *cpu_ns)
+int dcc_clang_local_tool(char **argv, char operation, uint64_t *cpu_ns)
 {
     int status;
-    int ret = request(argv, 'B', -1, 2, -1, 0, &status, cpu_ns);
+    int ret = request(argv, operation, -1, 2, -1, 0, &status, cpu_ns);
     return ret ? (ret < 0 ? EXIT_DISTCC_FAILED : ret) :
         WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }

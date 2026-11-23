@@ -55,15 +55,15 @@ void dcc_clang_pool_shutdown(void)
     }
 }
 
-int dcc_clang_pool_get(const char *compiler)
+int dcc_clang_pool_get(const char *compiler, const char *lto_helper)
 {
     char path[PATH_MAX];
-    const char *helper = dcc_helper_path("distcc-clang", path);
-    char *selected = strdup(compiler);
+    const char *helper = lto_helper ? lto_helper : dcc_helper_path("distcc-clang", path);
+    char *selected = strdup(lto_helper ? helper : compiler);
     if (!selected) return -1;
     /* cc1 already owns language/target options. C and C++ driver spellings
      * select the same loaded frontend. Different compilers remain independent. */
-    char *mode = strstr(selected, "clang++");
+    char *mode = lto_helper ? NULL : strstr(selected, "clang++");
     if (mode) memmove(mode + 5, mode + 7, strlen(mode + 7) + 1);
     for (struct frontend *f = frontends; f; f = f->next) {
         if (strcmp(f->compiler, selected) || strcmp(f->helper, helper)) continue;
@@ -85,8 +85,9 @@ int dcc_clang_pool_get(const char *compiler)
     /* The daemon has asynchronous IO threads: spawn only, never run Python
      * or compiler library code after a fork of the daemon's address space. */
     posix_spawn_file_actions_t actions;
-    int ret = posix_spawn_file_actions_init(&actions);
-    if (!ret) {
+    int ret = lto_helper ? dcc_spawn_lto(&f->pid, pair[1], helper, compiler) :
+                           posix_spawn_file_actions_init(&actions);
+    if (!ret && !lto_helper) {
         char option[] = "--worker", descriptor[] = "3";
         char *command[] = {f->helper, option, descriptor, selected, NULL};
         ret = posix_spawn_file_actions_adddup2(&actions, pair[1], 3);
@@ -105,7 +106,7 @@ int dcc_clang_pool_get(const char *compiler)
     f->next = frontends; frontends = f;
     /* Requests queue during startup. Results use private reply sockets, so
      * the helper's single readiness byte need not block the daemon loop. */
-    rs_trace("started reusable frontend pid=%ld", (long)f->pid);
+    rs_trace("started reusable %s pid=%ld", lto_helper ? "sandboxed ThinLTO worker" : "frontend", (long)f->pid);
     return f->channel;
 }
 
@@ -128,38 +129,48 @@ int dcc_clang_worker(int session, char **argv, int filesystem, int cancel,
     }
     for (unsigned i = 0; i < 5; ++i) if (i != 2 && fds[i] >= 0) close(fds[i]);
     if (ret) goto failed;
-    struct timespec started, now;
+    struct timespec started;
     clock_gettime(CLOCK_MONOTONIC, &started);
+    struct dcc_native_result result;
+    ret = dcc_compiler_result(reply[0], cancel, &started, &result);
+    if (!ret) {
+        *status = result.status; *peak = result.peak_bytes; *cpu_ns = result.cpu_ns;
+        close(reply[0]);
+        rs_trace("reused frontend status=%d peak=%llu", *status, *peak);
+        return 0;
+    }
+failed:
+    close(reply[0]);
+    if (dcc_worker_group) { killpg(getpgrp(), SIGKILL); _exit(ret); }
+    return ret;
+}
+
+int dcc_wait_compiler_fd(int fd, short events, int cancel, const struct timespec *started)
+{
     for (;;) {
-        struct pollfd polls[] = {{reply[0], POLLIN, 0}, {cancel, POLLIN, 0}};
+        struct pollfd polls[] = {{fd, events, 0}, {cancel, POLLIN, 0}};
         int timeout = -1;
         if (dcc_job_lifetime) {
+            struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
-            long long elapsed = (now.tv_sec - started.tv_sec) * 1000LL +
-                                (now.tv_nsec - started.tv_nsec) / 1000000;
+            long long elapsed = (now.tv_sec - started->tv_sec) * 1000LL +
+                                (now.tv_nsec - started->tv_nsec) / 1000000;
             long long remaining = dcc_job_lifetime * 1000LL - elapsed;
-            if (remaining <= 0) { ret = EXIT_TIMEOUT; break; }
+            if (remaining <= 0) return EXIT_TIMEOUT;
             timeout = remaining > 2147483647 ? 2147483647 : remaining;
         }
         int ready = poll(polls, 2, timeout);
         if (ready < 0 && errno == EINTR) continue;
-        if (ready < 0 || polls[1].revents) { ret = EXIT_IO_ERROR; break; }
-        if (!ready) { ret = EXIT_TIMEOUT; break; }
-        if (polls[0].revents) {
-            struct dcc_native_result result;
-            ssize_t length = recv(reply[0], &result, sizeof(result), MSG_TRUNC);
-            if (length != sizeof(result) || result.status > 65535) { ret = EXIT_IO_ERROR; break; }
-            *status = result.status; *peak = result.peak_bytes;
-            *cpu_ns = result.cpu_ns;
-            close(reply[0]);
-            rs_trace("reused frontend status=%d peak=%llu", *status, *peak);
-            return 0;
-        }
+        if (ready < 0 || polls[1].revents) return EXIT_IO_ERROR;
+        return ready ? 0 : EXIT_TIMEOUT;
     }
-failed:
-    close(reply[0]);
-    /* The compiler joined this worker's group. Never terminate the shared
-     * helper or another execution slot when cancelling this job. */
-    if (dcc_worker_group) { killpg(getpgrp(), SIGKILL); _exit(ret); }
-    return ret;
+}
+
+int dcc_compiler_result(int fd, int cancel, const struct timespec *started,
+                        struct dcc_native_result *result)
+{
+    int ret = dcc_wait_compiler_fd(fd, POLLIN, cancel, started);
+    if (ret) return ret;
+    return recv(fd, result, sizeof(*result), MSG_TRUNC) == sizeof(*result) &&
+           result->status <= 65535 ? 0 : EXIT_IO_ERROR;
 }
