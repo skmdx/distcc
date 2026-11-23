@@ -25,7 +25,6 @@
 #include <set>
 #include <sys/mman.h>
 #include <sys/resource.h>
-#include <sys/sendfile.h>
 
 extern "C" {
 #include "broker.h"
@@ -1332,7 +1331,7 @@ int distributed(char **original, const Words &args, const States &responses) {
     return status;
 }
 } // namespace
-static int submit_cgu(const char *version, const char *target, const char *phase, int input, int output) {
+static int submit_cgu(const dcc_cgu_request &request, int input, Result &result) {
     try {
         struct stat st = descriptor_state(input);
         if (!S_ISREG(st.st_mode) || !st.st_size)
@@ -1341,12 +1340,10 @@ static int submit_cgu(const char *version, const char *target, const char *phase
         in.path = const_cast<char *>("/cgu");
         in.fd = input;
         in.plain_size = st.st_size;
-        if (dcc_file_digest(in.fd, st.st_size, in.digest))
-            return EXIT_IO_ERROR;
         dcc_job job{};
         job.kind = DCC_JOB_RUST_CGU;
         job.cwd = const_cast<char *>("/");
-        char *args[] = {const_cast<char *>("distcc-rust-cgu"), const_cast<char *>(version), nullptr};
+        char *args[] = {const_cast<char *>("distcc-rust-cgu"), const_cast<char *>(request.version), nullptr};
         job.argv = args;
         job.inputs = &in;
         job.count = 1;
@@ -1354,13 +1351,12 @@ static int submit_cgu(const char *version, const char *target, const char *phase
         hint.kind = DCC_WORK_RUST_CGU;
         hint.bytes = st.st_size;
         hint.work_units = std::min<uint64_t>(st.st_size, UINT32_MAX);
-        hint.key = hash(string(reinterpret_cast<char *>(in.digest), sizeof(in.digest))) | 1;
         hint.memory_class = dcc_resource_class(&job);
-        string required = string(version) + " " + target;
+        string required = string(request.version) + " " + request.target;
+        hint.key = hash(request.phase, hash(required, request.identity)) | 1;
         if (required.size() >= sizeof(hint.cgu_backend))
             return EXIT_BAD_ARGUMENTS;
         strcpy(hint.cgu_backend, required.c_str());
-        Result result;
         int rc = dcc_transfer_prepared(&job, nullptr, nullptr, &hint, -1, &result);
         if (rc)
             return rc;
@@ -1374,25 +1370,17 @@ static int submit_cgu(const char *version, const char *target, const char *phase
             return EXIT_DISTCC_FAILED;
         }
         if (env("DISTCC_VERBOSE") == "1")
-            fprintf(stderr, "distcc-rust-cgu: finished %s\n", phase);
-        off_t offset = 0;
-        while (uint64_t(offset) < result.size[DCC_JOB_OBJECT]) {
-            ssize_t n = sendfile(output, result.fd[DCC_JOB_OBJECT], &offset, 1U << 30);
-            if (n < 0 && errno == EINTR)
-                continue;
-            if (n <= 0)
-                return EXIT_IO_ERROR;
-        }
-        return 0;
+            fprintf(stderr, "distcc-rust-cgu: finished %s\n", request.phase);
+        return result.fd[DCC_JOB_OBJECT] >= 0 && result.size[DCC_JOB_OBJECT] ? 0 : EXIT_PROTOCOL_ERROR;
     } catch (const std::exception &e) {
         fprintf(stderr, "distcc-rust-cgu: %s\n", e.what());
         return EXIT_DISTCC_FAILED;
     }
 }
-static void dispatch_cgu(dcc_cgu_request header, Fd input, Fd output, Fd reply) {
-    unsigned char status = submit_cgu(header.version, header.target, header.phase, input.fd, output.fd);
-    ssize_t sent;
-    do { sent = send(reply.fd, &status, 1, MSG_NOSIGNAL); } while (sent < 0 && errno == EINTR);
+static void dispatch_cgu(dcc_cgu_request header, Fd input, Fd reply) {
+    Result result;
+    unsigned char status = submit_cgu(header, input.fd, result);
+    dcc_send_fds(reply.fd, &status, 1, &result.fd[DCC_JOB_OBJECT], status ? 0 : 1);
 }
 
 extern "C" int dcc_rust_cgu_dispatcher(void) {
@@ -1405,23 +1393,23 @@ extern "C" int dcc_rust_cgu_dispatcher(void) {
         try {
             for (;;) {
                 dcc_cgu_request header;
-                int fds[3];
+                int fds[2];
                 unsigned count = std::size(fds);
                 ssize_t n = dcc_recv_fds(STDIN_FILENO, &header, sizeof(header), fds, &count);
                 if (!n && !count) break;
                 auto valid = [](const auto &field) { return field[0] && memchr(field, 0, sizeof(field)); };
-                if (n != sizeof(header) || count != 3 ||
+                if (n != sizeof(header) || count != std::size(fds) ||
                     !valid(header.version) || !valid(header.target) || !valid(header.phase)) {
                     for (unsigned i = 0; i < count; ++i) close(fds[i]);
                     rc = EXIT_PROTOCOL_ERROR;
                     break;
                 }
-                Fd in(fds[0]), out(fds[1]), reply(fds[2]);
+                Fd in(fds[0]), reply(fds[1]);
                 active.remove_if([](auto &task) {
                     return task.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
                 });
                 active.push_back(std::async(std::launch::async, dispatch_cgu, header,
-                                            std::move(in), std::move(out), std::move(reply)));
+                                            std::move(in), std::move(reply)));
             }
         } catch (const std::exception &e) {
             fprintf(stderr, "distcc-rust-cgu: %s\n", e.what());

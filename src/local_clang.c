@@ -351,14 +351,13 @@ out:
 int dcc_prepare_clang(char ***argv, char ***files)
 {
     int needed = 0;
-    if (dcc_offload_language(*argv)) return 0;
     if (!dcc_clang_driver_mode((*argv)[0])) return 0;
     for (char **p = *argv + 1; *p; ++p)
         if (str_endswith(".a", *p) ||
             (str_startswith("-fprofile", *p) && !str_startswith("-fprofile-generate", *p)) ||
             str_startswith("-fauto-profile", *p) ||
             str_startswith("-fmemory-profile-use", *p)) needed = 1;
-    if (!needed) return 0;
+    if (!needed || dcc_offload_language(*argv)) return 0;
     int output = dcc_job_memfd("distcc-clang-inputs"), status = 0;
     if (output < 0) return EXIT_IO_ERROR;
     char **groups[2];

@@ -3,11 +3,9 @@
  */
 #include <config.h>
 #include <ctype.h>
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #include "distcc.h"
 #include "helpers.h"
@@ -23,43 +21,6 @@ static int append(char ***list, const char *value)
     grown[n] = NULL;
     grown[n + 1] = NULL;
     return (grown[n] = strdup(value)) ? 0 : EXIT_OUT_OF_MEMORY;
-}
-
-/* ROCm's driver discovers a directory, including libraries not selected by
- * this particular GPU. Ship its bitcode files through the existing shared
- * input cache, so workers need neither the client's ROCm install nor headers. */
-static int device_libraries(const char *file, char **directory, char ***files)
-{
-    char *path = realpath(file, NULL), *slash;
-    DIR *dir;
-    struct dirent *entry;
-    int ret = EXIT_IO_ERROR;
-    if (!path) return ret;
-    slash = strrchr(path, '/');
-    if (!slash) { free(path); return ret; }
-    *slash = '\0';
-    if (*directory) {
-        ret = strcmp(*directory, path) ? EXIT_DISTCC_FAILED : 0;
-        free(path);
-        return ret;
-    }
-    *directory = path;
-    if (!(dir = opendir(path))) return ret;
-    ret = 0;
-    while ((entry = readdir(dir))) {
-        char *name;
-        struct stat st;
-        if (!str_endswith(".bc", entry->d_name)) continue;
-        if (asprintf(&name, "%s/%s", path, entry->d_name) < 0) {
-            ret = EXIT_OUT_OF_MEMORY;
-            break;
-        }
-        if (!stat(name, &st) && S_ISREG(st.st_mode)) ret = append(files, name);
-        free(name);
-        if (ret) break;
-    }
-    closedir(dir);
-    return ret;
 }
 
 static const char *option(char **args, const char *name)
@@ -98,15 +59,20 @@ static int host_native(char ***args, char **host)
     return 0;
 }
 
-int dcc_prepare_offload(char ***argvp, char ***files, int *targets)
+int dcc_prepare_offload(char ***argvp, char ***files, int brokered, int *use_graph)
 {
     char **argv = *argvp, **expanded = NULL, **inputs = NULL, **host = NULL, **gpus = NULL;
-    char *text = NULL, *directory = NULL, *compiler = NULL, *cuid = NULL, *line, *next;
+    char *text = NULL, *compiler = NULL, *cuid = NULL, *line, *next;
     int ret = EXIT_DISTCC_FAILED, native = dcc_native_requested(argv);
     int hip = !strcmp(dcc_offload_language(argv), "hip-cpp-output");
     int gpu_native = dcc_argv_search(argv, "--offload-arch=native");
-    int devices = 0;
-    *targets = 0;
+    /* The coordinator owns its driver's temporary paths and consumes the
+     * selected -mlink-builtin-bitcode operands directly from each cc1. */
+    if ((hip || (brokered && !dcc_argv_search(argv, "-nogpulib"))) &&
+        !dcc_argv_search(argv, "--cuda-host-only") && !dcc_argv_search(argv, "--offload-host-only")) {
+        *use_graph = 1;
+        return 0;
+    }
     if (dcc_read_driver(argv, &text)) goto out;
     for (line = text; line && *line; line = next) {
         char **words;
@@ -123,7 +89,12 @@ int dcc_prepare_offload(char ***argvp, char ***files, int *targets)
             }
         triple = option(words, "-triple");
         if (triple && !strncmp(triple, "amdgcn", 6)) {
-            ++devices;
+            if (hip || option(words, "-mlink-builtin-bitcode")) {
+                free(words);
+                *use_graph = brokered || hip;
+                ret = *use_graph ? 0 : EXIT_LOCAL_COMPILE;
+                goto out;
+            }
             if (gpu_native) {
                 const char *cpu = option(words, "-target-cpu");
                 char *flag = NULL;
@@ -131,14 +102,6 @@ int dcc_prepare_offload(char ***argvp, char ***files, int *targets)
                 int error = append(&gpus, flag);
                 free(flag);
                 if (error) { free(words); goto out; }
-            }
-            for (int i = 1; words[i] && words[i + 1]; ++i) {
-                if (!strcmp(words[i], "-mlink-builtin-bitcode")) {
-                    if (device_libraries(words[++i], &directory, &inputs)) {
-                        free(words);
-                        goto out;
-                    }
-                }
             }
             free(words);
         } else {
@@ -161,8 +124,6 @@ int dcc_prepare_offload(char ***argvp, char ***files, int *targets)
              !strcmp(argv[i + 1], "-mtune=native"))) { ++i; continue; }
         if (hip && (!strcmp(argv[i], "-march=native") || !strcmp(argv[i], "-mcpu=native") ||
                     !strcmp(argv[i], "-mtune=native"))) continue;
-        if (directory && !strncmp(argv[i], "--rocm-device-lib-path=", 23)) continue;
-        if (directory && !strcmp(argv[i], "--rocm-device-lib-path") && argv[i + 1]) { ++i; continue; }
         if (append(&expanded, argv[i])) goto out;
     }
     for (int i = 0; gpus && gpus[i]; ++i)
@@ -179,13 +140,6 @@ int dcc_prepare_offload(char ***argvp, char ***files, int *targets)
         free(flag);
         if (error || (native && host_native(&expanded, host))) goto out;
     }
-    if (directory) {
-        char *flag;
-        if (asprintf(&flag, "--rocm-device-lib-path=%s", directory) < 0) goto out;
-        int error = append(&expanded, flag);
-        free(flag);
-        if (error) goto out;
-    }
     if (!hip && native) {
         char *input = NULL, *output = NULL, **scanned = NULL;
         ret = dcc_scan_args(expanded, &input, &output, &scanned, 1);
@@ -197,7 +151,6 @@ int dcc_prepare_offload(char ***argvp, char ***files, int *targets)
     dcc_free_argv(argv);
     *argvp = expanded;
     *files = inputs;
-    if (hip) *targets = devices;
     expanded = inputs = NULL;
     ret = 0;
 out:
@@ -207,7 +160,6 @@ out:
     free(host);
     free(compiler);
     free(cuid);
-    free(directory);
     free(text);
     return ret;
 }

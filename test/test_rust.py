@@ -25,6 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from distcc_job import JOB_RUST_CGU
 
+CGU_REQUEST = struct.Struct('@96s96s14sQ')
+
 
 @unittest.skipUnless(shutil.which('rustc') and shutil.which('bwrap'), 'rustc and bubblewrap required')
 class RustTest(BrokerTestCase):
@@ -286,11 +288,14 @@ class RustTest(BrokerTestCase):
         result = self.rust(source, '-Ccodegen-units=8', '-Copt-level=2', '-o', 'resident',
                            remote=False, env=dict(self.env, LD_PRELOAD=str(self.build/'llvm-lto/distcc-rust-cgu.so'),
                                                  DISTCC_RUST_CGU_CLIENT=str(self.build/'distcc')),
-                           prefix=['strace', '-f', '-s', '256', '-e', 'execve', '-o', str(client_trace)])
+                           prefix=['strace', '-f', '-s', '256', '-e', 'execve,memfd_create', '-o', str(client_trace)])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertGreater(result.stderr.count('distcc-rust-cgu: compiled on'), 1, result.stderr)
         self.assertEqual(int(subprocess.check_output([self.work/'resident'])), 8*sum(range(64))+sum(range(8)))
-        pids = re.findall(r'^(\d+)\s+execve\(.*?"--rust-cgu-worker".*?= 0$', client_trace.read_text(), re.M)
+        trace = client_trace.read_text()
+        self.assertIn('memfd_create("rust-cgu-input"', trace)
+        self.assertNotIn('memfd_create("rust-cgu-result"', trace)
+        pids = re.findall(r'^(\d+)\s+execve\(.*?"--rust-cgu-worker"', trace, re.M)
         self.assertEqual(len(pids), 1)
         self.assertFalse((Path('/proc')/pids[0]).exists(), 'dispatcher still alive after rustc')
         self.assertEqual(len(re.findall(r'execve\("/usr/bin/bwrap"', server_trace.read_text())), 1)
@@ -308,22 +313,39 @@ class RustTest(BrokerTestCase):
             self.start_broker(f'127.0.0.1:{self.ports[0]}/1,tcp,stats={self.stats_ports[0]}', name='local-cgu')
         source = self.work/'answer.rs'
         steps = ''.join(f'x = std::hint::black_box(x) + {i};' for i in range(64))
-        source.write_text('fn main() { let mut x=0u64;' + steps + 'println!("{}", x); }')
-        result = self.rust(source, '-Ccodegen-units=1', '-Copt-level=2', '-o', 'answer', remote=False,
-                           env=dict(self.env, LD_PRELOAD=str(self.build/'llvm-lto/distcc-rust-cgu.so'),
-                                    DISTCC_RUST_CGU_CLIENT=str(self.build/'distcc'), DISTCC_VERBOSE='1'))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        count = result.stderr.count('distcc-rust-cgu: compiled on')
-        self.assertGreater(count, 0, result.stderr)
-        self.assertIn(f'dcc_local_input_jobs {count}\n', self.get_stats(self.stats_ports[0], '127.0.0.1'))
-        self.assertEqual(int(subprocess.check_output([self.work/'answer'])), sum(range(64)))
+        log = self.work/'local-cgu.log'
+        single_cgu_keys = []
+        count = 0
+        for units, initial in ((1, 0), (1, 42), (2, 42)):
+            offset = log.stat().st_size
+            source.write_text('mod calc { #[inline(never)] pub fn value(mut x:u64) -> u64 {'
+                              + steps + 'x} }\n' + f'fn main() {{ let mut x={initial}u64;'
+                              + steps + 'println!("{}", calc::value(x)); }')
+            result = self.rust(source, f'-Ccodegen-units={units}', '-Clto=off', '-Copt-level=2', '-o', 'answer', remote=False,
+                               env=dict(self.env, LD_PRELOAD=str(self.build/'llvm-lto/distcc-rust-cgu.so'),
+                                        DISTCC_RUST_CGU_CLIENT=str(self.build/'distcc'), DISTCC_VERBOSE='1'))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            jobs = result.stderr.count('distcc-rust-cgu: compiled on')
+            self.assertEqual(jobs, units, result.stderr)
+            phases = re.findall(r'distcc-rust-cgu: finished (\S+)', result.stderr)
+            self.assertEqual(len(phases), jobs)
+            self.assertEqual(len(set(phases)), 1)
+            count += jobs
+            self.assertIn(f'dcc_local_input_jobs {count}\n', self.get_stats(self.stats_ports[0], '127.0.0.1'))
+            self.assertEqual(int(subprocess.check_output([self.work/'answer'])), initial + 2 * sum(range(64)))
+            keys = re.findall(rb'job cost: key=([0-9a-f]+) kind=11 ', log.read_bytes()[offset:])
+            self.assertEqual(len(keys), jobs)
+            self.assertEqual(len(set(keys)), units)
+            if units == 1:
+                single_cgu_keys.append(keys[0])
+        self.assertEqual(single_cgu_keys[0], single_cgu_keys[1])
 
     def test_started_cgu_failure_reaches_the_compiler(self):
         version, target = self.cgu_toolchain()
         request = self.work/'invalid-module.bc'
         request.write_bytes(b'{"llvm":"'+version.encode()+b'"}\ninvalid bitcode')
         control, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        with request.open('rb') as ir, (self.work/'object').open('wb') as obj, control, child, subprocess.Popen(
+        with request.open('rb') as ir, control, child, subprocess.Popen(
                 [self.build/'distcc', '--rust-cgu-worker'], cwd=self.work, stdin=child.fileno(),
                 stderr=subprocess.PIPE, env=dict(self.env, DISTCC_FALLBACK='0'), text=True) as process:
             child.close()
@@ -342,20 +364,20 @@ class RustTest(BrokerTestCase):
                 self.fail('CGU dispatcher did not become idle')
             baseline = idle_fds()
             for abi, status in [(version, 100), ('absent', 121)] * 4:
-                packet = struct.pack('96s96s14s', abi.encode(), target.encode(), b'object')
+                packet = CGU_REQUEST.pack(abi.encode(), target.encode(), b'object', 1)
                 reply, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
                 with reply, peer:
                     reply.settimeout(10)
-                    socket.send_fds(control, [packet], [ir.fileno(), obj.fileno(), peer.fileno()])
+                    socket.send_fds(control, [packet], [ir.fileno(), peer.fileno()])
                     peer.close()
-                    self.assertEqual(reply.recv(1), bytes([status]))
+                    message, fds, _, _ = socket.recv_fds(reply, 1, 1)
+                    self.assertEqual((message, fds), (bytes([status]), []))
                     self.assertEqual(reply.recv(1), b'')
                 self.assertEqual(idle_fds(), baseline)
             control.close()
             _, diagnostics = process.communicate(timeout=5)
             self.assertEqual(process.returncode, 0, diagnostics)
             self.assertIn('missing CGU flags', diagnostics)
-        self.assertEqual((self.work/'object').stat().st_size, 0)
 
     def test_cgu_dispatcher_disconnect_cancels_pending_acquisition(self):
         version, target = self.cgu_toolchain()
@@ -369,9 +391,9 @@ class RustTest(BrokerTestCase):
             with subprocess.Popen([self.build/'distcc', '--rust-cgu-worker'], stdin=child.fileno(),
                                   stderr=subprocess.PIPE, env=dict(self.env, DISTCC_BROKER=path)) as process:
                 child.close()
-                with Path(__file__).open('rb') as source, (self.work/'unused').open('wb') as output:
-                    packet = struct.pack('96s96s14s', version.encode(), target.encode(), b'object')
-                    socket.send_fds(control, [packet], [source.fileno(), output.fileno(), peer.fileno()])
+                with Path(__file__).open('rb') as source:
+                    packet = CGU_REQUEST.pack(version.encode(), target.encode(), b'object', 1)
+                    socket.send_fds(control, [packet], [source.fileno(), peer.fileno()])
                 peer.close()
                 with broker.accept()[0] as pending:
                     pending.settimeout(5)

@@ -26,10 +26,10 @@ class OffloadTest(BrokerTestCase):
         self.env['DISTCC_VERBOSE'] = '1'
         self.env['PATH'] = str(self.build) + os.pathsep + self.env.get('PATH', os.defpath)
 
-    def distributed(self, flags, source):
+    def distributed(self, flags, source, prefix=()):
         obj = source.with_suffix('.o')
         args = [self.compiler, *flags, '-c', str(source), '-o', str(obj)]
-        result = subprocess.run([str(self.build / 'distcc'), *args], env=self.env,
+        result = subprocess.run([*prefix, str(self.build / 'distcc'), *args], env=self.env,
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(' on 127.0.0.1', result.stderr)
@@ -51,6 +51,30 @@ class OffloadTest(BrokerTestCase):
         obj = self.distributed(['--target=amdgcn-amd-amdhsa', '-mcpu=gfx900',
                                 '-nogpulib', '-O2', '-x', 'c'], source)
         self.assertIn('AMD GPU', subprocess.check_output(['readelf', '-h', obj], text=True))
+
+    @unittest.skipUnless(shutil.which('strace') and os.environ.get('ROCM_DEVICE_LIB_PATH'),
+                         'ROCm bitcode and strace required')
+    def test_driver_plan_transfers_only_selected_device_libraries(self):
+        libs = self.work / 'bitcode'
+        libs.mkdir()
+        for path in Path(os.environ['ROCM_DEVICE_LIB_PATH']).glob('*.bc'):
+            (libs / path.name).symlink_to(path)
+        (libs / 'unused-unit3.bc').write_bytes(b'unreferenced')
+        source = self.work / 'math.cl'
+        source.write_text('__kernel void k(__global float *v) { *v = sin(*v); }\n')
+        args = [self.compiler, '--target=amdgcn-amd-amdhsa', '-mcpu=gfx900',
+                '--rocm-device-lib-path=' + str(libs), '-c', str(source), '-o', str(self.work/'math.o')]
+        subprocess.run(args, check=True)
+        expected = (self.work/'math.o').read_bytes()
+        (self.work/'math.o').unlink()
+        trace = self.work / 'opens'
+        result = subprocess.run(['strace', '-f', '-s', '1024', '-e', 'trace=execve,openat', '-o', trace,
+                        self.build/'distcc', *args], env=self.env, check=True, capture_output=True)
+        self.assertIn(b' on 127.0.0.1', result.stderr)
+        calls = trace.read_text()
+        self.assertEqual(calls.count('"-###"'), 1)
+        self.assertNotIn('/unused-unit3.bc"', calls)
+        self.assertEqual((self.work/'math.o').read_bytes(), expected)
 
     def test_absolute_cmake_compiler_preserves_lto_version(self):
         source = self.work / 'configure.cpp'
@@ -185,8 +209,13 @@ int main(int argc, char **) {
     def test_multi_gpu_device_only(self):
         source = self.work / 'devices.hip'
         source.write_text('__attribute__((global)) void increment(int *p) { p[0] += 1; }\n')
+        trace = self.work/'multi.exec'
+        prefix = ['strace', '-f', '-e', 'execve', '-o', str(trace)] if shutil.which('strace') else []
         obj = self.distributed(['--offload-device-only', '--offload-arch=gfx900',
-                                '--offload-arch=gfx1030', '-nogpuinc', '-nogpulib', '-O2'], source)
+                                '--offload-arch=gfx1030', '-nogpuinc', '-nogpulib', '-O2'], source, prefix)
+        if prefix:
+            # Two device compilations and two device links, one distributor per stage.
+            self.assertEqual(trace.read_text().count('execve("' + str(self.build/'distcc-offload-link') + '"'), 2)
         bundler = str(Path(self.compiler).parent / 'clang-offload-bundler')
         targets = subprocess.check_output([bundler, '-list', '-type=o', '-input=' + str(obj)], text=True)
         self.assertIn('gfx900', targets)

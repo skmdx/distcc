@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute Clang's HIP action graph with distributed compilation and links."""
+"""Execute Clang's AMDGPU action graph with distributed compilation and links."""
 import asyncio
 import errno
 import json
@@ -12,6 +12,10 @@ import subprocess
 import sys
 import tempfile
 import distcc_python
+
+
+PREPROCESSED = {'hip': 'hip-cpp-output', 'cl': 'cl-cpp-output', 'clcpp': 'clcpp-cpp-output',
+                'c': 'cpp-output', 'c++': 'c++-cpp-output'}
 
 
 def option(args, name):
@@ -62,6 +66,21 @@ def publish(source, destination):
         Path(staging).unlink(missing_ok=True)
 
 
+def remote_job(node):
+    command = node['args']
+    inputs = []
+    linker = Path(command[0]).name in ('lld', 'ld.lld')
+    for i, arg in enumerate(command[1:], 1):
+        # GNU linker plugins belong to the worker's LLVM installation.
+        if linker and (command[i-1] in ('-plugin', '--plugin') or
+                       arg.partition('=')[0] in ('-plugin', '--plugin')):
+            continue
+        value = arg.partition('=')[2] if arg.startswith('-') and '=' in arg else arg
+        if value not in node['outputs'] and not value.startswith('-') and Path(value).is_file():
+            inputs.append(value)
+    return {'args': command, 'inputs': inputs, 'outputs': node['outputs']}
+
+
 def compile_images(source, output, args):
     helper = Path(__file__).resolve().with_name('distcc-offload-link')
     env = dict(os.environ)
@@ -72,8 +91,11 @@ def compile_images(source, output, args):
         plan = subprocess.run([*args, '-###'], capture_output=True, text=True, env=env, check=True)
         commands = [shlex.split(line) for line in plan.stderr.splitlines()
                     if line.lstrip().startswith('"')]
+        if env.get('DISTCC_VERBOSE') == '1':
+            print('prepared AMDGPU offload:', shlex.join(args), file=sys.stderr)
         result = work / 'result.o'
         nodes = []
+        groups = {}
 
         def add(command, remote, extra_outputs=()):
             artifact = option(command, '-o') or next(
@@ -84,8 +106,14 @@ def compile_images(source, output, args):
             # a preceding output, including --image=file=..., orders that edge.
             dependencies = [i for i, node in enumerate(nodes)
                             if any(name in arg for name in node['outputs'] for arg in command)]
-            nodes.append({'args': command, 'outputs': [artifact, *extra_outputs],
-                          'remote': remote, 'dependencies': dependencies})
+            depth = max((nodes[i]['depth'] + 1 for i in dependencies), default=0)
+            # Independent remote jobs in the same stage share one distributor's
+            # snapshots. Local tools keep their individual dependencies.
+            group = ('remote', depth) if remote else ('local', len(nodes))
+            node = {'args': command, 'outputs': [artifact, *extra_outputs], 'depth': depth,
+                    'group': group, 'dependencies': dependencies}
+            nodes.append(node)
+            groups.setdefault(group, []).append(node)
 
         for index, command in enumerate(commands):
             command = [str(result) if i and command[i - 1] == '-o' and arg == output else
@@ -93,7 +121,8 @@ def compile_images(source, output, args):
                        for i, arg in enumerate(command)]
             name = Path(command[0]).name
             frontend = '-cc1' in command
-            if frontend and option(command, '-x') == 'hip':
+            preprocessed = PREPROCESSED.get(option(command, '-x') or '')
+            if frontend and preprocessed:
                 # A bare driver -E in the new HIP driver produces only host
                 # text. Each cc1 action has its own target macros and includes.
                 # Keep Clang's resolved frontend options, changing only action,
@@ -113,48 +142,38 @@ def compile_images(source, output, args):
                                             '-imacros': 1, '-include-pch': 1,
                                             '-I': 1, '-isystem': 1, '-iquote': 1,
                                             '-internal-isystem': 1, '-internal-externc-isystem': 1,
-                                            '-idirafter': 1, '-F': 1, '-iframework': 1})
-                command[command.index('-x') + 1] = 'hip-cpp-output'
+                                            '-idirafter': 1, '-F': 1, '-iframework': 1,
+                                            '-finclude-default-header': 0})
+                command[command.index('-x') + 1] = preprocessed
                 command[-1] = prepared
             if name == 'clang-linker-wrapper':
                 wrapper = helper.with_name('distcc-linker-wrapper')
                 command = [str(wrapper), '--device-distributor=' + str(helper),
-                           '--device-compiler-path=' + str(Path(args[0]).absolute()),
+                           '--device-compiler-path=' + next(c[0] for c in commands if '-cc1' in c),
                            *command[1:]]
             add(command, frontend or name in ('lld', 'ld.lld'))
 
         async def execute():
-            async def action(index, node):
-                for predecessor in node['dependencies']:
-                    await tasks[predecessor]
-                command = node['args']
-                if node['remote']:
-                    # cc1 bitcode, profile and embedded GPU inputs are explicit
-                    # operands. Ship existing file operands through the shared
-                    # cache; include directories are irrelevant after -E.
-                    inputs = []
-                    linker = Path(command[0]).name in ('lld', 'ld.lld')
-                    for i, arg in enumerate(command[1:], 1):
-                        # GNU linker plugins belong to the worker's LLVM installation.
-                        if linker and (command[i-1] in ('-plugin', '--plugin') or
-                                       arg.partition('=')[0] in ('-plugin', '--plugin')):
-                            continue
-                        value = arg.partition('=')[2] if arg.startswith('-') and '=' in arg else arg
-                        if value not in node['outputs'] and not value.startswith('-') and Path(value).is_file():
-                            inputs.append(value)
-                    request = work / f'{index}.json'
+            async def action(group, jobs):
+                for node in jobs:
+                    for predecessor in node['dependencies']:
+                        await tasks[nodes[predecessor]['group']]
+                if group[0] == 'remote':
+                    request = work / f'stage-{group[1]}.json'
                     request.write_text(json.dumps({'common': {'args': [], 'inputs': []},
-                        'jobs': [{'args': command, 'inputs': inputs, 'outputs': node['outputs']}]}))
+                                                   'jobs': [remote_job(node) for node in jobs]}))
                     command = [str(helper), str(request)]
+                else:
+                    command = jobs[0]['args']
                 await child(command, env)
-            tasks = [asyncio.create_task(action(i, node)) for i, node in enumerate(nodes)]
+            tasks = {group: asyncio.create_task(action(group, jobs)) for group, jobs in groups.items()}
             try:
-                await asyncio.gather(*tasks)
+                await asyncio.gather(*tasks.values())
             finally:
-                for task in tasks:
+                for task in tasks.values():
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         asyncio.run(execute())
         publish(result, output)
@@ -166,7 +185,7 @@ if __name__ == '__main__':
         raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, interrupted)
     try:
-        sys.exit(compile_images(*sys.argv[1:3], sys.argv[3:]))
+        sys.exit(compile_images(sys.argv[1], sys.argv[2], sys.argv[3:]))
     except subprocess.CalledProcessError as error:
         if error.stdout:
             sys.stdout.buffer.write(error.stdout if isinstance(error.stdout, bytes) else error.stdout.encode())

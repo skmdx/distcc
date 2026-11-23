@@ -456,7 +456,7 @@ dcc_build_somewhere(char *argv[],
     struct dcc_job *prepared_job = NULL;
     char **localcpp_server_argv = NULL;
     struct dcc_buffer server_stderr = {0}, server_stdout = {0};
-    int preprocess_only, offload_targets = 0, remote_frontend = 0;
+    int preprocess_only, offload_graph = 0, remote_frontend = 0;
     int needs_dotd = 0;
     int sets_dotd_target = 0;
     pid_t cpp_pid = 0;
@@ -525,9 +525,10 @@ dcc_build_somewhere(char *argv[],
     preprocess_only = dcc_argv_search(argv, "-E");
     if (preprocess_only)
         ret = EXIT_LOCAL_CPP;
+    const char *offload = !ret ? dcc_offload_language(argv) : NULL;
     /* Local execution consumes the same broker capacity as a local worker,
      * but needs neither native expansion nor a duplicate header/input tree. */
-    if (!ret && !dcc_offload_language(argv) &&
+    if (!ret && !offload &&
         broker && *broker) {
         dcc_work_describe(&work, argv, input_fname, NULL, -1, 0, &source_features);
         direct_lease = dcc_broker_try_local(&work);
@@ -549,12 +550,12 @@ dcc_build_somewhere(char *argv[],
      * native frontend's filesystem carries those reads to the client. */
     if (!ret && !remote_frontend && dcc_cpp_assembly(argv, input_fname))
         ret = EXIT_LOCAL_CPP;
-    if (!ret && (dcc_offload_language(argv) ||
+    if (!ret && (offload ||
         ((!remote_frontend || !dcc_cpp_ir(argv, input_fname)) && dcc_native_requested(argv)))) {
-        if (dcc_offload_language(argv) ? dcc_prepare_offload(&argv, &auxiliary, &offload_targets) :
+        if (offload ? dcc_prepare_offload(&argv, &auxiliary, broker && *broker, &offload_graph) :
                                        dcc_expand_native(&argv, input_fname, output_fname)) {
             ret = EXIT_DISTCC_FAILED;
-        } else {
+        } else if (!offload_graph) {
             ret = dcc_scan_args(argv, &input_fname, &output_fname, &new_argv, 0);
             dcc_free_argv(argv);
             argv = new_argv;
@@ -572,7 +573,7 @@ dcc_build_somewhere(char *argv[],
         goto lock_local;
     }
 
-    if (offload_targets) {
+    if (offload_graph) {
         char **command = NULL;
         ret = dcc_offload_command(argv, input_fname, output_fname, &command);
         if (!ret) ret = dcc_compile_local(command, input_fname, NULL, NULL);

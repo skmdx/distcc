@@ -14,6 +14,7 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/VirtualFileSystem.h>
+#include <llvm/Support/xxhash.h>
 #include <llvm-c/TargetMachine.h>
 #include <atomic>
 #include <mutex>
@@ -64,7 +65,8 @@ bool rust_caller(void *pc) {
     return dladdr(pc, &info) && info.dli_fname && strstr(info.dli_fname, "librustc_driver");
 }
 struct File {
-    int fd;
+    int fd = -1;
+    File() = default;
     explicit File(const char *name) : fd(memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING)) {}
     ~File() {
         if (fd >= 0)
@@ -193,7 +195,7 @@ public:
         shutdown(control.fd[0], SHUT_WR);
         while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
     }
-    unsigned submit(int in, int out, StringRef target, StringRef phase) const {
+    unsigned submit(int in, int &out, StringRef target, StringRef phase, StringRef module) const {
         dcc_cgu_request header{};
         auto field = [](auto &slot, StringRef value) {
             if (value.empty() || value.size() >= sizeof(slot)) fatal("invalid CGU request field");
@@ -202,22 +204,24 @@ public:
         field(header.version, cgu::abi);
         field(header.target, target);
         field(header.phase, phase);
+        header.identity = xxh3_64bits(module);
         SocketPair reply;
-        const int fds[] = {in, out, reply.fd[1]};
-        if (dcc_send_fds(control.fd[0], &header, sizeof(header), fds, 3)) fatal(strerror(errno));
+        const int fds[] = {in, reply.fd[1]};
+        if (dcc_send_fds(control.fd[0], &header, sizeof(header), fds, 2)) fatal(strerror(errno));
         reply.sent();
         unsigned char status;
-        ssize_t n;
-        do { n = recv(reply.fd[0], &status, 1, MSG_TRUNC); } while (n < 0 && errno == EINTR);
-        if (n != 1) fatal("CGU dispatcher disconnected");
+        unsigned count = 1;
+        if (dcc_recv_fds(reply.fd[0], &status, 1, &out, &count) != 1)
+            fatal("CGU dispatcher disconnected");
+        if (count != (status ? 0U : 1U)) fatal("invalid CGU result descriptor count");
         return status;
     }
 };
 
 std::optional<Reply> dispatch(Module &m, cgu::Object spec) {
     const bool ir_only = spec.get("ir-only") != nullptr;
-    File in("rust-cgu-input"), out("rust-cgu-result");
-    if (in.fd < 0 || out.fd < 0)
+    File in("rust-cgu-input"), out;
+    if (in.fd < 0)
         fatal(strerror(errno));
     auto kind = cgu::string(spec, "kind").str();
     auto target = cgu::string(spec, "backend").str();
@@ -239,7 +243,7 @@ std::optional<Reply> dispatch(Module &m, cgu::Object spec) {
     if (fcntl(in.fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL))
         fatal(strerror(errno));
     static Dispatcher dispatcher;
-    unsigned status = dispatcher.submit(in.fd, out.fd, target, kind);
+    unsigned status = dispatcher.submit(in.fd, out.fd, target, kind, m.getModuleIdentifier());
     if (status == EXIT_LOCAL_COMPILE)
         return std::nullopt;
     if (status)

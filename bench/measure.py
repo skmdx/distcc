@@ -259,6 +259,23 @@ def prepare_runtime(runtime):
     return log
 
 
+def local_socket_prefix(config):
+    for settings, key in ((config, 'local_socket'), (os.environ, 'DISTCC_LOCAL_SOCKET')):
+        if key in settings:
+            return settings[key]
+    pid = execute(['systemctl', 'show', 'distccd.service', '-p', 'MainPID', '--value'])
+    if not pid or pid == '0':
+        return ''
+    environment = (Path('/proc') / pid / 'environ').read_bytes().split(b'\0')
+    return next((os.fsdecode(word.partition(b'=')[2]) for word in environment
+                 if word.startswith(b'DISTCC_LOCAL_SOCKET=')), '')
+
+
+def broker_environment(config, hosts, runtime):
+    return dict(DISTCC_VERBOSE='1', DISTCC_HOSTS=hosts, DISTCC_DIR=str(runtime / '.distcc'),
+                TMPDIR=str(runtime), DISTCC_LOCAL_SOCKET=local_socket_prefix(config))
+
+
 def measure(config, out, buildroot):
     group = cgroup()
     # Preserve Portage's short paths, while all
@@ -282,6 +299,8 @@ def measure(config, out, buildroot):
     conditions['incremental'] = bool(config.get('build_root'))
     conditions['repository'] = repository_revision(config['ebuild'])
     hosts = host_list(conditions['hosts'])
+    broker_env = broker_environment(config, hosts, runtime)
+    conditions['local_socket'] = broker_env['DISTCC_LOCAL_SOCKET']
     execute(['distcc', '--show-hosts'], env=dict(os.environ, DISTCC_HOSTS=hosts))
     mapping = private / 'package.env'
     if mapping.is_file():
@@ -336,9 +355,9 @@ def measure(config, out, buildroot):
         if any('error' in r or int(r['dcc_busy']) or int(r['dcc_queued']) for r in initial['hosts'].values()):
             raise RuntimeError('workers must be reachable and idle before measurement')
         with (out / 'broker.log').open('w') as log:
-            broker = subprocess.Popen(['runuser', '-u', 'portage', '--', 'env', 'DISTCC_VERBOSE=1',
-                'DISTCC_HOSTS=' + hosts, 'DISTCC_DIR=' + str(runtime / '.distcc'),
-                'TMPDIR=' + str(runtime), '/usr/bin/distccd', '--broker', socket_path], stdout=log, stderr=subprocess.STDOUT)
+            broker = subprocess.Popen(['runuser', '-u', 'portage', '--', 'env',
+                *(f'{key}={value}' for key, value in broker_env.items()),
+                '/usr/bin/distccd', '--broker', socket_path], stdout=log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 10
         while not Path(socket_path).exists():
             if broker.poll() is not None or time.monotonic() > deadline:

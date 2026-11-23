@@ -4,6 +4,7 @@ import importlib
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import os
 import shutil
 import subprocess
@@ -186,6 +187,19 @@ class StatisticsTest(unittest.TestCase):
 
 
 class ConfigurationTest(unittest.TestCase):
+    def test_broker_local_socket_prefix(self):
+        with subprocess.Popen(['cat'], stdin=subprocess.PIPE,
+                              env={'DISTCC_LOCAL_SOCKET': '/run/local worker/job'}) as daemon, \
+                patch.dict(os.environ, {}, clear=True), patch.object(measure, 'execute') as service:
+            service.return_value = str(daemon.pid)
+            environment = measure.broker_environment({}, 'localhost', Path('runtime'))
+            self.assertEqual(environment['DISTCC_LOCAL_SOCKET'], '/run/local worker/job')
+            service.return_value = '0'
+            self.assertEqual(measure.local_socket_prefix({}), '')
+            os.environ['DISTCC_LOCAL_SOCKET'] = '/run/from-env'
+            self.assertEqual(measure.local_socket_prefix({}), '/run/from-env')
+            self.assertEqual(measure.local_socket_prefix({'local_socket': '/run/config'}), '/run/config')
+
     @unittest.skipUnless(shutil.which('distcc'), 'distcc required')
     def test_commented_host_file_reaches_real_parser(self):
         hosts = measure.host_list('# worker capacity\nlocalhost/2 # local\nworker.invalid/4\n')
