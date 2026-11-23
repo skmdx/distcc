@@ -5,6 +5,8 @@
 #include "rust/common.hh"
 #include "rust/probe.h"
 #include "rust/response.hh"
+#include "rust/cgu_transport.h"
+#include "fd_io.h"
 #include "rust/runtime.hh"
 #include "rust/sandbox.hh"
 
@@ -12,6 +14,10 @@
 #include <chrono>
 #include <elf.h>
 #include <functional>
+#include <future>
+#include <list>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <iconv.h>
 #include <memory>
 #include <optional>
@@ -25,6 +31,7 @@ extern "C" {
 #include "broker.h"
 #include "exitcode.h"
 #include "file_cache.h"
+#include "hosts.h"
 #include "lock.h"
 #include "plan_memo.h"
 #include "resource.h"
@@ -1325,14 +1332,14 @@ int distributed(char **original, const Words &args, const States &responses) {
     return status;
 }
 } // namespace
-extern "C" int dcc_rust_submit_cgu(const char *version, const char *target, const char *phase) {
+static int submit_cgu(const char *version, const char *target, const char *phase, int input, int output) {
     try {
-        struct stat st = descriptor_state(STDIN_FILENO);
+        struct stat st = descriptor_state(input);
         if (!S_ISREG(st.st_mode) || !st.st_size)
             return EXIT_BAD_ARGUMENTS;
         dcc_job_input in{};
         in.path = const_cast<char *>("/cgu");
-        in.fd = STDIN_FILENO;
+        in.fd = input;
         in.plain_size = st.st_size;
         if (dcc_file_digest(in.fd, st.st_size, in.digest))
             return EXIT_IO_ERROR;
@@ -1357,8 +1364,10 @@ extern "C" int dcc_rust_submit_cgu(const char *version, const char *target, cons
         int rc = dcc_transfer_prepared(&job, nullptr, nullptr, &hint, -1, &result);
         if (rc)
             return rc;
-        if (result.fd[DCC_JOB_STDERR] >= 0)
-            put(STDERR_FILENO, contents(result.fd[DCC_JOB_STDERR]));
+        if (result.fd[DCC_JOB_STDERR] >= 0) {
+            auto log = contents(result.fd[DCC_JOB_STDERR]);
+            fwrite(log.data(), 1, log.size(), stderr);
+        }
         if (result.status) {
             if (WIFEXITED(result.status) && WEXITSTATUS(result.status) == EXIT_LOCAL_COMPILE)
                 return EXIT_LOCAL_COMPILE;
@@ -1368,7 +1377,7 @@ extern "C" int dcc_rust_submit_cgu(const char *version, const char *target, cons
             fprintf(stderr, "distcc-rust-cgu: finished %s\n", phase);
         off_t offset = 0;
         while (uint64_t(offset) < result.size[DCC_JOB_OBJECT]) {
-            ssize_t n = sendfile(STDOUT_FILENO, result.fd[DCC_JOB_OBJECT], &offset, 1U << 30);
+            ssize_t n = sendfile(output, result.fd[DCC_JOB_OBJECT], &offset, 1U << 30);
             if (n < 0 && errno == EINTR)
                 continue;
             if (n <= 0)
@@ -1380,6 +1389,55 @@ extern "C" int dcc_rust_submit_cgu(const char *version, const char *target, cons
         return EXIT_DISTCC_FAILED;
     }
 }
+static void dispatch_cgu(dcc_cgu_request header, Fd input, Fd output, Fd reply) {
+    unsigned char status = submit_cgu(header.version, header.target, header.phase, input.fd, output.fd);
+    ssize_t sent;
+    do { sent = send(reply.fd, &status, 1, MSG_NOSIGNAL); } while (sent < 0 && errno == EINTR);
+}
+
+extern "C" int dcc_rust_cgu_dispatcher(void) {
+    int rc = dcc_read_localslots_configuration();
+    if (rc) return rc;
+    try {
+        Fd cancel(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+        dcc_client_cancel_fd = cancel.fd;
+        std::list<std::future<void>> active;
+        try {
+            for (;;) {
+                dcc_cgu_request header;
+                int fds[3];
+                unsigned count = std::size(fds);
+                ssize_t n = dcc_recv_fds(STDIN_FILENO, &header, sizeof(header), fds, &count);
+                if (!n && !count) break;
+                auto valid = [](const auto &field) { return field[0] && memchr(field, 0, sizeof(field)); };
+                if (n != sizeof(header) || count != 3 ||
+                    !valid(header.version) || !valid(header.target) || !valid(header.phase)) {
+                    for (unsigned i = 0; i < count; ++i) close(fds[i]);
+                    rc = EXIT_PROTOCOL_ERROR;
+                    break;
+                }
+                Fd in(fds[0]), out(fds[1]), reply(fds[2]);
+                active.remove_if([](auto &task) {
+                    return task.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+                });
+                active.push_back(std::async(std::launch::async, dispatch_cgu, header,
+                                            std::move(in), std::move(out), std::move(reply)));
+            }
+        } catch (const std::exception &e) {
+            fprintf(stderr, "distcc-rust-cgu: %s\n", e.what());
+            rc = EXIT_DISTCC_FAILED;
+        }
+        // EOF also covers rustc being killed while transfers are queued or running.
+        while (eventfd_write(cancel.fd, 1) < 0 && errno == EINTR) {}
+        active.clear();
+        dcc_client_cancel_fd = -1;
+        return rc;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "distcc-rust-cgu: %s\n", e.what());
+        return EXIT_IO_ERROR;
+    }
+}
+
 extern "C" int dcc_rust_client(char **argv) {
     Words args;
     for (char **p = argv + 1; *p; ++p)

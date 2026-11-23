@@ -194,7 +194,7 @@ dist_extra =							\
 	distcc-link \
 	distcc-multi \
 	src/lto_distribute.cc src/lto_distribute.hh src/lto_link.cc \
-	src/lto_worker.cc \
+	src/lto_worker.cc src/sandbox_child.cc src/sandbox_child.h \
 	src/lto_partition.cc \
 	src/lto_partition.h \
 	src/llvm-split-module.patch \
@@ -202,7 +202,7 @@ dist_extra =							\
 	distcc-offload \
 	distcc_job.py \
 	distcc_python.py \
-	src/rust/native.cc src/rust/audit.cc src/rust/cgu.h src/rust/cgu_hook.cc src/rust/check_cgu_hooks.py src/rust/cgu_worker.cc \
+	src/rust/native.cc src/rust/audit.cc src/rust/cgu.h src/rust/cgu_hook.cc src/rust/cgu_transport.h src/rust/check_cgu_hooks.py src/rust/cgu_worker.cc \
 	src/rust/sandbox.cc src/rust/sandbox.hh src/rust/runtime.hh src/rust/client.cc src/rust/worker.cc src/rust/link.cc src/rust/response.hh src/rust/probe.cc src/rust/probe.h src/rust/common.hh src/rust/affinity.hh src/rust/api.h \
 	$(wildcard src/clang/*.cpp src/clang/*.h) src/clang/launcher.c \
 	src/argv_file.h \
@@ -550,11 +550,15 @@ $(CLANG_OBJECTS): $(LTO_BUILD)/%.o: $(srcdir)/src/clang/%.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -I$(LTO_BUILD) -DDCC_LLD_PATH='"$(LTO_BINDIR)/ld.lld"' -MMD -c $< -o $@
 
+$(LTO_BUILD)/sandbox_child.o: $(srcdir)/src/sandbox_child.cc $(srcdir)/src/sandbox_child.h
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -MMD -c $< -o $@
+
 $(LTO_BUILD)/clang_worker_loop.o: $(srcdir)/src/native_worker.cc
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -MMD -c $< -o $@
 
-$(LTO_BUILD)/distcc-clang: $(CLANG_OBJECTS) $(LTO_BUILD)/clang_worker_loop.o $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o src/argv_file.o src/file_cache.o src/fd_io.o
+$(LTO_BUILD)/distcc-clang: $(CLANG_OBJECTS) $(LTO_BUILD)/clang_worker_loop.o $(LTO_BUILD)/sandbox_child.o $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o src/argv_file.o src/file_cache.o src/fd_io.o
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $^ `$(LLVM_CONFIG) --ldflags` -Wl,-rpath,$(LLVM_TARGET_LIBDIR) '-Wl,--export-dynamic-symbol=_ZN4llvm3lto11thinBackend*' -lclang-cpp -llldELF -llldCommon -lLLVM -lxxhash -llz4 -ldl -lseccomp
 
 CLANG_MAJOR = $(firstword $(subst ., ,$(shell $(LLVM_CONFIG) --version)))
@@ -612,8 +616,8 @@ $(LTO_BUILD)/cgu_worker.o: $(srcdir)/src/rust/cgu_worker.cc $(srcdir)/src/rust/c
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) -std=c++17 $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fexceptions -MMD -c $< -o $@
 
-$(LTO_BUILD)/distcc-rust-cgu: $(LTO_BUILD)/cgu_worker.o
-	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -o $@ $< $(LDFLAGS) `$(LLVM_CONFIG) --ldflags` -lLLVM
+$(LTO_BUILD)/distcc-rust-cgu: $(LTO_BUILD)/cgu_worker.o $(LTO_BUILD)/clang_worker_loop.o $(LTO_BUILD)/sandbox_child.o
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -o $@ $^ $(LDFLAGS) `$(LLVM_CONFIG) --ldflags` -lLLVM -lseccomp
 
 # Encode libc++'s configured inline namespace as an Itanium source-name.
 # Preprocess with the target flags; cross builds never execute target code.
@@ -624,11 +628,15 @@ $(LTO_BUILD)/cgu-libcpp.h: Makefile
 	@awk '$$1=="DCC_NAMESPACE" {if (NF==2) print "#define DCC_LIBCPP_NAMESPACE \"" length($$2) $$2 "\""; found=1} END {exit !found}' $@.i >$@.tmp
 	@mv $@.tmp $@ && rm -f $@.i
 
-$(LTO_BUILD)/cgu_hook.o: $(srcdir)/src/rust/cgu_hook.cc $(srcdir)/src/rust/cgu.h $(srcdir)/src/exitcode.h $(LTO_BUILD)/cgu-libcpp.h
-	$(CXX) $(CPPFLAGS) -std=c++17 $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -I$(@D) -fexceptions -fPIC -c $< -o $@
+$(LTO_BUILD)/cgu_hook.o: $(srcdir)/src/rust/cgu_hook.cc $(srcdir)/src/rust/cgu.h $(srcdir)/src/rust/cgu_transport.h $(srcdir)/src/exitcode.h $(LTO_BUILD)/cgu-libcpp.h
+	$(CXX) $(CPPFLAGS) -std=c++17 $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -I$(@D) -fexceptions -MMD -fPIC -c $< -o $@
 
-$(LTO_BUILD)/distcc-rust-cgu.so: $(LTO_BUILD)/cgu_hook.o $(srcdir)/src/rust/check_cgu_hooks.py
-	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -shared -o $@.tmp $< $(LDFLAGS) `$(LLVM_CONFIG) --ldflags` -lLLVM -ldl
+$(LTO_BUILD)/cgu_fd_io.o: $(srcdir)/src/fd_io.c $(srcdir)/src/fd_io.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fvisibility=hidden -fPIC -c $< -o $@
+
+$(LTO_BUILD)/distcc-rust-cgu.so: $(LTO_BUILD)/cgu_hook.o $(LTO_BUILD)/cgu_fd_io.o $(srcdir)/src/rust/check_cgu_hooks.py
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -shared -o $@.tmp $(filter %.o,$^) $(LDFLAGS) `$(LLVM_CONFIG) --ldflags` -lLLVM -ldl
 	$(PYTHON) $(srcdir)/src/rust/check_cgu_hooks.py $@.tmp "`$(LLVM_CONFIG) --libdir`/libLLVM.so"
 	mv $@.tmp $@
 

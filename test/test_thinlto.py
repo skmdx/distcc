@@ -234,10 +234,11 @@ class ThinLTOTest(BrokerTestCase):
             self.assertEqual('distcc-thinlto: submitting' in result.stderr, distributed, result.stderr)
             self.assertNotIn('distcc-thinlto: partitioned', result.stderr)
             self.assertTrue((self.work/'libout.so').read_bytes().startswith(b'\x7fELF'))
+        # Check idle admission before backend completions publish real host load.
         for inputs, distributed in [
                 (['native.o'], False), (['part0.o'], False), (['part0.o','part1.o'], False),
-                (['part0.o','part1.o','part2.o'], True), (['large.o'], True),
                 (['part1.o','-L.', '-Wl,-Bstatic','-lelf','-l:libthinelf.a'], False),
+                (['part0.o','part1.o','part2.o'], True), (['large.o'], True),
                 (['-Wl,--whole-archive', 'libbits.a'], True),
                 (['-Wl,--whole-archive', '-L.', '-lbits'], True),
                 (['-Wl,--whole-archive', '-L.', '-l:libthinbits.a'], True)]:
@@ -386,21 +387,6 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
     def test_cc1_backend_without_driver_compile_flag(self):
         self.check_backend_cwd(True)
 
-    def trace_backend(self):
-        trace = self.work/'server.exec'
-        traced = self.work/'server'
-        binary = self.build/'distccd'
-        if shutil.which('strace'):
-            traced.write_text('#!/bin/sh\nexec ' + shlex.join(
-                ['strace', '-D', '-f', '-e', 'execve', '-o', str(trace), str(binary)]) + ' "$@"\n')
-            traced.chmod(0o755)
-            self.restart_server(traced)
-            self.addCleanup(self.restart_server, binary)
-        else:
-            self.restart_server(binary)
-        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='resident')
-        return trace
-
     def test_resident_backend_transfers_multiple_descriptor_batches(self):
         trace = self.trace_backend()
         log = Path(self.logs[0].name)
@@ -410,22 +396,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         self.assertEqual(len(started), 1)
         if trace.exists():
             self.assertEqual(len(re.findall(r'execve\("/usr/bin/bwrap"', trace.read_text())), 1)
-        # Inspect the live payload. The outer bwrap supervisor and PID 1
-        # can both appear between the distccd child and the resident compiler.
-        pending = [int(started[0])]
-        while pending:
-            pid = pending.pop()
-            process = Path('/proc')/str(pid)
-            if (process/'cmdline').read_bytes().split(b'\0')[:2] == [b'/distcc-clang', b'--lto-worker']:
-                values = dict(line.split(':', 1) for line in (process/'status').read_text().splitlines())
-                for field in ('CapEff', 'CapPrm', 'CapInh', 'CapBnd', 'CapAmb'):
-                    self.assertEqual(int(values[field], 16), 0, field)
-                self.assertEqual(int(values['NoNewPrivs']), 1)
-                self.assertEqual(int(values['Seccomp']), 2)
-                break
-            pending.extend(map(int, (process/'task'/str(pid)/'children').read_text().split()))
-        else:
-            self.fail('resident sandbox exited between backend requests')
+        self.assert_resident_sandbox(int(started[0]), [b'/distcc-clang', b'--lto-worker'])
 
     @unittest.skipUnless(shutil.which('strace'), 'daemon exec tracing required')
     def test_lld_object_and_partition_jobs_share_one_sandbox(self):

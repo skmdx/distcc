@@ -82,7 +82,6 @@
 #include "job.h"
 #include "rust/api.h"
 #include "clang_worker.h"
-#include "tcp_job.h"
 #ifdef HAVE_GSSAPI
 #include "auth.h"
 
@@ -850,18 +849,19 @@ static int retain_artifact(struct dcc_job_result *result, unsigned index, const 
     return 0;
 }
 
-/* Execute an isolated file-tree backend or a sysroot-aware whole link. */
-static int dcc_run_helper_job(int in_fd, int out_fd,
+/* Run a whole link against the configured worker sysroot. */
+static int dcc_run_link_job(int in_fd, int out_fd,
                             const char *out_fname, const char *err_fname, int *status,
                             enum dcc_protover protover, const char *input_archive,
-                            struct dcc_job_result *result, const char *helper, const struct dcc_job *job)
+                            struct dcc_job_result *result)
 {
+    const char *helper = "distcc-link";
     char *archive = NULL, *output = NULL;
     struct stat st;
     pid_t pid;
     int ret;
     enum dcc_compress compr = protover == DCC_VER_STREAM_LINK ? DCC_COMPRESS_LZ4_STREAM : DCC_COMPRESS_NONE;
-    if (!strcmp(helper, "distcc-link") && !getenv("DISTCCD_LINK_ROOT")) {
+    if (!getenv("DISTCCD_LINK_ROOT")) {
         rs_log_error("remote linking requires DISTCCD_LINK_ROOT");
         return EXIT_PROTOCOL_ERROR;
     }
@@ -872,13 +872,9 @@ static int dcc_run_helper_job(int in_fd, int out_fd,
         goto done;
     if ((ret = dcc_make_tmpnam("distcc-link", ".out", &output)))
         goto done;
-    if (!strcmp(helper, "distcc-rust-cgu")) {
-        ret = dcc_spawn_rust_cgu(&pid, job->argv[1], archive, output, out_fname, err_fname);
-    } else {
-        char path[PATH_MAX];
-        char *argv[] = {dcc_helper_path(helper, path), (char *)"--worker", archive, output, NULL};
-        ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname);
-    }
+    char path[PATH_MAX];
+    char *argv[] = {dcc_helper_path(helper, path), (char *)"--worker", archive, output, NULL};
+    ret = dcc_spawn_child(argv, &pid, "/dev/null", out_fname, err_fname);
     if (ret || (ret = dcc_collect_child(helper, pid, status, in_fd,
                                  result ? &result->peak_bytes : NULL,
                                  result ? &result->cpu_ns : NULL)))
@@ -980,10 +976,13 @@ static int dcc_run_job(int in_fd,
             ret = EXIT_OUT_OF_MEMORY;
             goto out_cleanup;
         }
-        if (job && (job->kind == DCC_JOB_RUST || dcc_job_llvm(job))) {
-            status = job->kind == DCC_JOB_RUST
-                ? dcc_rust_worker(job, root, in_fd, out_fname, err_fname, result)
-                : dcc_llvm_worker(job, root, in_fd, out_fname, err_fname, result);
+        if (tree) {
+            if (job->kind == DCC_JOB_RUST)
+                status = dcc_rust_worker(job, root, in_fd, out_fname, err_fname, result);
+            else if (job->kind == DCC_JOB_RUST_CGU)
+                status = dcc_rust_cgu_worker(job, root, in_fd, out_fname, err_fname, result);
+            else
+                status = dcc_llvm_worker(job, root, in_fd, out_fname, err_fname, result);
             result->status = status;
             ret = retain_artifact(result, DCC_JOB_STDERR, err_fname);
             if (!ret) ret = retain_artifact(result, DCC_JOB_STDOUT, out_fname);
@@ -991,17 +990,13 @@ static int dcc_run_job(int in_fd,
             goto out_cleanup;
         }
         char *input_archive = NULL;
-        if (tree && !(input_archive = strdup(root))) {
-            ret = EXIT_OUT_OF_MEMORY;
-            goto out_cleanup;
-        }
-        if (job && !tree && (job->count != 1 ||
+        if (job && (job->count != 1 ||
             asprintf(&input_archive, "%s%s", root, job->inputs[0].path) < 0)) {
             ret = EXIT_PROTOCOL_ERROR;
             goto out_cleanup;
         }
-        ret = dcc_run_helper_job(in_fd, out_fd, out_fname, err_fname, &status,
-                              protover, input_archive, result, helper, job);
+        ret = dcc_run_link_job(in_fd, out_fd, out_fname, err_fname, &status,
+                               protover, input_archive, result);
         free(input_archive);
         job_result = ret || status ? STATS_COMPILE_ERROR : STATS_COMPILE_OK;
         goto out_cleanup;

@@ -55,8 +55,6 @@ Sandbox::Sandbox(Root policy, const fs::path &tree)
     } else {
         if (policy == Root::Inputs)
             mount(tree, "/", true);
-        if (policy == Root::Backend)
-            mount("/usr", "/usr");
         for (auto p : runtime)
             if (fs::exists(p))
                 mount(p, p);
@@ -71,7 +69,7 @@ Sandbox::Sandbox(Root policy, const fs::path &tree)
     args.insert(args.end(), {"--dev", "/dev", "--seccomp", std::to_string(filter.fd)});
     if (policy != Root::Host)
         args.insert(args.end(), {"--tmpfs", "/tmp"});
-    if (policy == Root::Inputs || policy == Root::Backend || policy == Root::LLVM)
+    if (policy == Root::Inputs || policy == Root::LLVM)
         args.push_back("--clearenv");
 }
 void Sandbox::command(const Words &argv) {

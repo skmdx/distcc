@@ -189,9 +189,9 @@ class RustTest(BrokerTestCase):
     def cgu_executing(pid):
         proc = Path('/proc')/str(pid)
         try:
-            if (proc/'cmdline').read_bytes().startswith(b'/backend\0--execute\0'):
-                return True
             children = (proc/'task'/str(pid)/'children').read_text().split()
+            if (proc/'cmdline').read_bytes().split(b'\0')[:2] == [b'/backend', b'--worker']:
+                return bool(children)
         except (FileNotFoundError, ProcessLookupError):
             return False
         return any(RustTest.cgu_executing(child) for child in children)
@@ -270,17 +270,98 @@ class RustTest(BrokerTestCase):
                 self.assertEqual(load.returncode, 100, load.stderr)
                 self.assertIn('missing LLVM entry point ' + missing, load.stderr)
 
+    @unittest.skipUnless(shutil.which('strace'), 'CGU process tracing required')
+    def test_parallel_cgus_share_resident_sandbox_and_dispatcher(self):
+        self.cgu_toolchain()
+        server_trace = self.trace_backend()
+        offset = Path(self.logs[0].name).stat().st_size
+        source = self.work/'resident.rs'
+        steps = ''.join(f'x = std::hint::black_box(x).wrapping_add({i});' for i in range(64))
+        modules = [f'mod m{j} {{ #[inline(never)] pub fn f(mut x:u64)->u64 {{ {steps} x }} }}'
+                   for j in range(8)]
+        total = '+'.join(f'm{j}::f({j})' for j in range(8))
+        source.write_text('\n'.join(modules) + f'\nfn main() {{println!("{{}}", {total});}}')
+        client_trace = self.work/'client.exec'
+        result = self.rust(source, '-Ccodegen-units=8', '-Copt-level=2', '-o', 'resident',
+                           remote=False, env=dict(self.env, LD_PRELOAD=str(self.build/'llvm-lto/distcc-rust-cgu.so'),
+                                                 DISTCC_RUST_CGU_CLIENT=str(self.build/'distcc')),
+                           prefix=['strace', '-f', '-s', '256', '-e', 'execve', '-o', str(client_trace)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(result.stderr.count('distcc-rust-cgu: compiled on'), 1, result.stderr)
+        self.assertEqual(int(subprocess.check_output([self.work/'resident'])), 8*sum(range(64))+sum(range(8)))
+        pids = re.findall(r'^(\d+)\s+execve\(.*?"--rust-cgu-worker".*?= 0$', client_trace.read_text(), re.M)
+        self.assertEqual(len(pids), 1)
+        self.assertFalse((Path('/proc')/pids[0]).exists(), 'dispatcher still alive after rustc')
+        self.assertEqual(len(re.findall(r'execve\("/usr/bin/bwrap"', server_trace.read_text())), 1)
+        started = re.findall(rb'started reusable sandboxed Rust CGU worker pid=(\d+)',
+                             Path(self.logs[0].name).read_bytes()[offset:])
+        self.assertEqual(len(started), 1)
+        self.assert_resident_sandbox(int(started[0]), [b'/backend', b'--worker'])
+
     def test_started_cgu_failure_reaches_the_compiler(self):
         version, target = self.cgu_toolchain()
         request = self.work/'invalid-module.bc'
         request.write_bytes(b'{"llvm":"'+version.encode()+b'"}\ninvalid bitcode')
-        with request.open('rb') as ir, (self.work/'object').open('wb') as obj:
-            result = subprocess.run([self.build/'distcc', '--rust-cgu', version, target, 'object'],
-                                    cwd=self.work, stdin=ir, stdout=obj, stderr=subprocess.PIPE,
-                                    env=dict(self.env, DISTCC_FALLBACK='0'), text=True, timeout=15)
-        self.assertEqual(result.returncode, 100, result.stderr)
-        self.assertIn('missing CGU flags', result.stderr)
+        control, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        with request.open('rb') as ir, (self.work/'object').open('wb') as obj, control, child, subprocess.Popen(
+                [self.build/'distcc', '--rust-cgu-worker'], cwd=self.work, stdin=child.fileno(),
+                stderr=subprocess.PIPE, env=dict(self.env, DISTCC_FALLBACK='0'), text=True) as process:
+            child.close()
+            descriptors = Path('/proc')/str(process.pid)/'fd'
+            def idle_fds():
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if len(list((descriptors.parent/'task').iterdir())) == 1:
+                        try:
+                            opened = sorted(os.readlink(fd) for fd in descriptors.iterdir())
+                        except FileNotFoundError:
+                            continue
+                        if 'anon_inode:[eventfd]' in opened:
+                            return opened
+                    time.sleep(.005)
+                self.fail('CGU dispatcher did not become idle')
+            baseline = idle_fds()
+            for abi, status in [(version, 100), ('absent', 121)] * 4:
+                packet = struct.pack('96s96s14s', abi.encode(), target.encode(), b'object')
+                reply, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                with reply, peer:
+                    reply.settimeout(10)
+                    socket.send_fds(control, [packet], [ir.fileno(), obj.fileno(), peer.fileno()])
+                    peer.close()
+                    self.assertEqual(reply.recv(1), bytes([status]))
+                    self.assertEqual(reply.recv(1), b'')
+                self.assertEqual(idle_fds(), baseline)
+            control.close()
+            _, diagnostics = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, diagnostics)
+            self.assertIn('missing CGU flags', diagnostics)
         self.assertEqual((self.work/'object').stat().st_size, 0)
+
+    def test_cgu_dispatcher_disconnect_cancels_pending_acquisition(self):
+        version, target = self.cgu_toolchain()
+        path = str(self.work/'pending-broker')
+        control, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        reply, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as broker, control, child, reply, peer:
+            broker.bind(path)
+            broker.listen(1)
+            broker.settimeout(5)
+            with subprocess.Popen([self.build/'distcc', '--rust-cgu-worker'], stdin=child.fileno(),
+                                  stderr=subprocess.PIPE, env=dict(self.env, DISTCC_BROKER=path)) as process:
+                child.close()
+                with Path(__file__).open('rb') as source, (self.work/'unused').open('wb') as output:
+                    packet = struct.pack('96s96s14s', version.encode(), target.encode(), b'object')
+                    socket.send_fds(control, [packet], [source.fileno(), output.fileno(), peer.fileno()])
+                peer.close()
+                with broker.accept()[0] as pending:
+                    pending.settimeout(5)
+                    self.assertTrue(pending.recv(4096))
+                    control.close()
+                    _, errors = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 0, errors)
+                    self.assertEqual(pending.recv(1), b'')
+                self.assertNotIn(reply.recv(1), (b'', b'\x00'))
+                self.assertEqual(reply.recv(1), b'')
 
     def test_saturated_cgu_worker_waits_then_returns_object(self):
         import select
@@ -692,7 +773,7 @@ class RustTest(BrokerTestCase):
                         'void __real_LLVMGetVersion(unsigned*,unsigned*,unsigned*);\n'
                         'void __wrap_LLVMGetVersion(unsigned *a,unsigned *b,unsigned *c) { '
                         f'__real_LLVMGetVersion(a,b,c); *c={patch}; '
-                        'if (!access("/input", R_OK)) fprintf(stderr, "LLVM worker %u.%u.%u\\n", *a, *b, *c); }\n')
+                        'if (!access("/backend", X_OK)) fprintf(stderr, "LLVM worker %u.%u.%u\\n", *a, *b, *c); }\n')
         obj = shim.with_suffix('.o')
         subprocess.run(['cc', '-c', shim, '-o', obj], check=True)
         helper = folder/'distcc-rust-cgu'
@@ -761,8 +842,8 @@ class RustTest(BrokerTestCase):
                 self.assertIn('distcc-rust-cgu: completed', result.stderr)
                 self.assert_one_job_per_cgu(result.stderr, counts)
                 if host == foreign_host:
-                    self.assertEqual(result.stderr.count(f'LLVM worker {llvm}.{worker_patch}\n'),
-                                     result.stderr.count('distcc-rust-cgu: completed'))
+                    daemon_log = Path(self.logs[0].name).read_text()
+                    self.assertEqual(daemon_log.count(f'LLVM worker {llvm}.{worker_patch}\n'), 1)
                 self.assertEqual(writes.read_bytes(), b'x')
                 writes.unlink()
                 calls = trace.read_text()
@@ -1551,7 +1632,9 @@ class RustTest(BrokerTestCase):
         subprocess.run([executable], check=True)
 
     def test_profile_use_is_transferred_and_linkable(self):
-        profdata = shutil.which('llvm-profdata')
+        config = os.environ.get('LLVM_CONFIG')
+        bindir = subprocess.check_output([config, '--bindir'], text=True).strip() if config else None
+        profdata = shutil.which('llvm-profdata', path=bindir)
         if not profdata:
             self.skipTest('llvm-profdata required')
         source = self.work / 'pgo.rs'

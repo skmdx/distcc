@@ -1,6 +1,8 @@
 /* LLVM Rust CGU boundaries. rustc retains its local pass managers, ThinLTO
  * summary writer, object streams and archive writer throughout the job. */
 #include "rust/cgu.h"
+#include "rust/cgu_transport.h"
+#include "fd_io.h"
 #include "exitcode.h"
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Bitcode/BitcodeReader.h>
@@ -22,6 +24,7 @@
 #include <link.h>
 #include <spawn.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -160,6 +163,57 @@ bool eligible(Module &m) {
     return transport && StringRef(m.getModuleIdentifier()).contains("cgu.") &&
            m.getInstructionCount() >= min_remote_instructions;
 }
+struct SocketPair {
+    int fd[2];
+    SocketPair() {
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, fd))
+            fatal(strerror(errno));
+    }
+    void sent() { close(fd[1]); fd[1] = -1; }
+    ~SocketPair() { close(fd[0]); if (fd[1] >= 0) close(fd[1]); }
+};
+
+class Dispatcher {
+    SocketPair control;
+    pid_t pid;
+public:
+    Dispatcher() {
+        const char *args[] = {transport, "--rust-cgu-worker", nullptr};
+        posix_spawn_file_actions_t actions;
+        int rc = posix_spawn_file_actions_init(&actions);
+        if (rc) fatal(strerror(rc));
+        rc = posix_spawn_file_actions_adddup2(&actions, control.fd[1], STDIN_FILENO);
+        if (!rc) rc = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+        if (!rc) rc = posix_spawn(&pid, transport, &actions, nullptr, const_cast<char **>(args), environ);
+        posix_spawn_file_actions_destroy(&actions);
+        if (rc) fatal(strerror(rc));
+        control.sent();
+    }
+    ~Dispatcher() {
+        shutdown(control.fd[0], SHUT_WR);
+        while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+    }
+    unsigned submit(int in, int out, StringRef target, StringRef phase) const {
+        dcc_cgu_request header{};
+        auto field = [](auto &slot, StringRef value) {
+            if (value.empty() || value.size() >= sizeof(slot)) fatal("invalid CGU request field");
+            memcpy(slot, value.data(), value.size());
+        };
+        field(header.version, cgu::abi);
+        field(header.target, target);
+        field(header.phase, phase);
+        SocketPair reply;
+        const int fds[] = {in, out, reply.fd[1]};
+        if (dcc_send_fds(control.fd[0], &header, sizeof(header), fds, 3)) fatal(strerror(errno));
+        reply.sent();
+        unsigned char status;
+        ssize_t n;
+        do { n = recv(reply.fd[0], &status, 1, MSG_TRUNC); } while (n < 0 && errno == EINTR);
+        if (n != 1) fatal("CGU dispatcher disconnected");
+        return status;
+    }
+};
+
 std::optional<Reply> dispatch(Module &m, cgu::Object spec) {
     const bool ir_only = spec.get("ir-only") != nullptr;
     File in("rust-cgu-input"), out("rust-cgu-result");
@@ -184,25 +238,9 @@ std::optional<Reply> dispatch(Module &m, cgu::Object spec) {
     }
     if (fcntl(in.fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL))
         fatal(strerror(errno));
-    const char *args[] = {transport, "--rust-cgu", cgu::abi, target.c_str(), kind.c_str(), nullptr};
-    posix_spawn_file_actions_t actions;
-    int rc = posix_spawn_file_actions_init(&actions);
-    if (rc)
-        fatal(strerror(rc));
-    rc = posix_spawn_file_actions_adddup2(&actions, in.fd, STDIN_FILENO);
-    if (!rc)
-        rc = posix_spawn_file_actions_adddup2(&actions, out.fd, STDOUT_FILENO);
-    pid_t pid;
-    if (!rc)
-        rc = posix_spawn(&pid, transport, &actions, nullptr, const_cast<char **>(args), environ);
-    posix_spawn_file_actions_destroy(&actions);
-    if (rc)
-        fatal(strerror(rc));
-    int status;
-    while (waitpid(pid, &status, 0) < 0)
-        if (errno != EINTR)
-            fatal(strerror(errno));
-    if (WIFEXITED(status) && WEXITSTATUS(status) == EXIT_LOCAL_COMPILE)
+    static Dispatcher dispatcher;
+    unsigned status = dispatcher.submit(in.fd, out.fd, target, kind);
+    if (status == EXIT_LOCAL_COMPILE)
         return std::nullopt;
     if (status)
         fatal(Twine("backend failed for ") + m.getModuleIdentifier());

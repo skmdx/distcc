@@ -55,15 +55,15 @@ void dcc_clang_pool_shutdown(void)
     }
 }
 
-int dcc_clang_pool_get(const char *compiler, const char *lto_helper)
+int dcc_clang_pool_get(const struct dcc_job *job, const char *resident_helper)
 {
     char path[PATH_MAX];
-    const char *helper = lto_helper ? lto_helper : dcc_helper_path("distcc-clang", path);
-    char *selected = strdup(lto_helper ? helper : compiler);
+    const char *helper = resident_helper ? resident_helper : dcc_helper_path("distcc-clang", path);
+    char *selected = strdup(resident_helper ? helper : job->argv[0]);
     if (!selected) return -1;
     /* cc1 already owns language/target options. C and C++ driver spellings
      * select the same loaded frontend. Different compilers remain independent. */
-    char *mode = lto_helper ? NULL : strstr(selected, "clang++");
+    char *mode = resident_helper ? NULL : strstr(selected, "clang++");
     if (mode) memmove(mode + 5, mode + 7, strlen(mode + 7) + 1);
     for (struct frontend *f = frontends; f; f = f->next) {
         if (strcmp(f->compiler, selected) || strcmp(f->helper, helper)) continue;
@@ -85,9 +85,9 @@ int dcc_clang_pool_get(const char *compiler, const char *lto_helper)
     /* The daemon has asynchronous IO threads: spawn only, never run Python
      * or compiler library code after a fork of the daemon's address space. */
     posix_spawn_file_actions_t actions;
-    int ret = lto_helper ? dcc_spawn_lto(&f->pid, pair[1], helper, compiler) :
+    int ret = resident_helper ? dcc_spawn_backend(&f->pid, pair[1], helper, job) :
                            posix_spawn_file_actions_init(&actions);
-    if (!ret && !lto_helper) {
+    if (!ret && !resident_helper) {
         char option[] = "--worker", descriptor[] = "3";
         char *command[] = {f->helper, option, descriptor, selected, NULL};
         ret = posix_spawn_file_actions_adddup2(&actions, pair[1], 3);
@@ -106,7 +106,9 @@ int dcc_clang_pool_get(const char *compiler, const char *lto_helper)
     f->next = frontends; frontends = f;
     /* Requests queue during startup. Results use private reply sockets, so
      * the helper's single readiness byte need not block the daemon loop. */
-    rs_trace("started reusable %s pid=%ld", lto_helper ? "sandboxed ThinLTO worker" : "frontend", (long)f->pid);
+    const char *kind = job->kind == DCC_JOB_RUST_CGU ? "sandboxed Rust CGU worker" :
+                       resident_helper ? "sandboxed ThinLTO worker" : "frontend";
+    rs_trace("started reusable %s pid=%ld", kind, (long)f->pid);
     return f->channel;
 }
 

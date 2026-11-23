@@ -1,6 +1,10 @@
 /* Isolated LLVM backend for a single Rust codegen unit. */
 #include "rust/cgu.h"
 #include "exitcode.h"
+#include "native_worker.h"
+#include "sandbox_child.h"
+#include <sys/stat.h>
+#include <unistd.h>
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
@@ -19,8 +23,11 @@
 using namespace llvm;
 namespace {
 codegen::RegisterCodeGenFlags codegen_flags;
-void execute() {
-    auto buffer = MemoryBuffer::getFile("/input", false, false);
+int execute(int output, unsigned operation) {
+    if (operation != 'R' || !dcc_restrict_compiler_child()) return EXIT_DISTCC_FAILED;
+    struct stat st;
+    if (fstat(STDIN_FILENO, &st) || !S_ISREG(st.st_mode)) return EXIT_PROTOCOL_ERROR;
+    auto buffer = MemoryBuffer::getOpenFile(STDIN_FILENO, "rust-cgu", st.st_size, false);
     if (!buffer)
         throw std::system_error(buffer.getError());
     auto [header, bc] = (*buffer)->getBuffer().split('\n');
@@ -69,10 +76,7 @@ void execute() {
     auto &m = **module;
     if (m.getTargetTriple() != triple || m.getDataLayout() != tm->createDataLayout())
         throw std::runtime_error("incompatible module layout");
-    std::error_code ec;
-    raw_fd_ostream out("/output", ec);
-    if (ec)
-        throw std::system_error(ec);
+    raw_fd_ostream out(output, false);
     auto kind = cgu::string(*spec, "kind");
     TargetLibraryInfoImpl tli(triple);
     if (cgu::integer(*spec, "no-builtins"))
@@ -104,9 +108,10 @@ void execute() {
     out.write(header_bytes, sizeof(header_bytes));
     out.write(object.data(), object.size());
     out.write(optimized.data(), optimized.size());
-    out.close();
+    out.flush();
     if (out.has_error())
         throw std::system_error(out.error());
+    return 0;
 }
 } // namespace
 int main(int argc, char **argv) {
@@ -132,9 +137,17 @@ int main(int argc, char **argv) {
                 !target->hasMCAsmBackend())
                 return EXIT_LOCAL_COMPILE;
             outs() << target->getName();
-        } else if (argc == 2 && StringRef(argv[1]) == "--execute")
-            execute();
-        else
+        } else if (argc == 3 && StringRef(argv[1]) == "--worker" && StringRef(argv[2]) == "3") {
+            if (!dcc_init_compiler_sandbox(false)) return EXIT_DISTCC_FAILED;
+            return dcc_native_worker(3, [](int output, unsigned operation) {
+                try {
+                    return execute(output, operation);
+                } catch (const std::exception &e) {
+                    errs() << "distcc-rust-cgu: " << e.what() << '\n';
+                    return int(EXIT_DISTCC_FAILED);
+                }
+            });
+        } else
             return 1;
         return 0;
     } catch (const std::exception &e) {

@@ -25,9 +25,10 @@ int dcc_rust_catalog_fd(void);
 int dcc_rust_catalog_attach(int fd);
 const char *dcc_rust_compilers(const char **first_host, const char **features);
 const char *dcc_rust_cgu_capabilities(void);
-int dcc_spawn_rust_cgu(pid_t *, const char *abi, const char *tree, const char *output,
-                       const char *stdout_path, const char *stderr_path);
-int dcc_rust_submit_cgu(const char *version, const char *target, const char *phase);
+int dcc_rust_cgu_helper(const char *abi, char *path);
+int dcc_rust_cgu_worker(const struct dcc_job *, const char *root, int cancel,
+                        const char *out, const char *err, struct dcc_job_result *);
+int dcc_rust_cgu_dispatcher(void);
 int dcc_rust_capture(char **argv);
 struct dcc_rust_artifacts *dcc_rust_watch(const char *root, int *watchfd);
 int dcc_rust_next_metadata(struct dcc_rust_artifacts *, const char **name, const char **line, int *file);

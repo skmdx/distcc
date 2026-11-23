@@ -11,6 +11,7 @@ from pathlib import Path
 import socket
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -107,11 +108,51 @@ class BrokerTestCase(DistccTestCase):
                           self.host(1, f',tcp,stats={self.stats_ports[1]}'), name='memory-refusal')
         return peer
 
+    def trace_backend(self):
+        trace = self.work/'server.exec'
+        traced = self.work/'server'
+        binary = self.build/'distccd'
+        if shutil.which('strace'):
+            traced.write_text('#!/bin/sh\nexec ' + shlex.join(
+                ['strace', '-D', '-f', '-e', 'execve', '-o', str(trace), str(binary)]) + ' "$@"\n')
+            traced.chmod(0o755)
+            self.restart_server(traced)
+            self.addCleanup(self.restart_server, binary)
+        else:
+            self.restart_server(binary)
+        self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), name='resident')
+        return trace
+
+    def assert_resident_sandbox(self, pid, command):
+        # Inspect the live payload. The outer bwrap supervisor and PID 1
+        # can both appear between the distccd child and the resident compiler.
+        pending = [pid]
+        while pending:
+            pid = pending.pop()
+            process = Path('/proc')/str(pid)
+            if (process/'cmdline').read_bytes().split(b'\0')[:2] == command:
+                values = dict(line.split(':', 1) for line in (process/'status').read_text().splitlines())
+                for field in ('CapEff', 'CapPrm', 'CapInh', 'CapBnd', 'CapAmb'):
+                    self.assertEqual(int(values[field], 16), 0, field)
+                self.assertEqual(int(values['NoNewPrivs']), 1)
+                self.assertEqual(int(values['Seccomp']), 2)
+                if os.geteuid() == 0:
+                    for mount in (process/'mounts').read_text().splitlines():
+                        _, directory, _, options, *_ = mount.split()
+                        if 'rw' in options.split(','):
+                            entry = process/'root'/directory.lstrip('/')
+                            self.assertFalse(stat.S_ISDIR(entry.stat().st_mode), directory)
+                return process
+            pending.extend(map(int, (process/'task'/str(pid)/'children').read_text().split()))
+        else:
+            self.fail('resident sandbox exited between backend requests')
+
     def restart_server(self, binary, address=None, jobs=None, **settings):
         old = self.daemons[0]
         os.killpg(old.pid, signal.SIGTERM)
         old.wait(timeout=5)
-        env = dict(self.base_env, TMPDIR=str(self.root),
+        daemon_root = Path(old.args[old.args.index('--pid-file') + 1]).parent
+        env = dict(self.base_env, TMPDIR=str(daemon_root), DISTCCD_RUST_TMPDIR=str(daemon_root),
                    DISTCCD_PATH=str(self.root / 'bin') + os.pathsep + os.defpath)
         env.update(getattr(self, 'daemon_env', {}))
         env.update(settings)

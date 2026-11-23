@@ -85,14 +85,19 @@ extern "C" int dcc_lto_helper(const dcc_job *job, char *path) {
     } catch (const std::exception &) { return 0; }
 }
 
-extern "C" int dcc_spawn_lto(pid_t *pid, int channel, const char *helper, const char *compiler) {
+extern "C" int dcc_spawn_backend(pid_t *pid, int channel, const char *helper, const dcc_job *job) {
     try {
-        bool linker;
-        auto tool_dir = fs::canonical(installed_tool(compiler, linker)).parent_path();
         Sandbox box(Root::ResidentLLVM);
-        box.mount(tool_dir, tool_dir);
-        box.mount(helper, "/distcc-clang");
-        box.command({"/distcc-clang", "--lto-worker", "3"});
+        if (job->kind == DCC_JOB_RUST_CGU) {
+            box.mount(helper, "/backend");
+            box.command({"/backend", "--worker", "3"});
+        } else {
+            bool linker;
+            auto tool_dir = fs::canonical(installed_tool(job->argv[0], linker)).parent_path();
+            box.mount(tool_dir, tool_dir);
+            box.mount(helper, "/distcc-clang");
+            box.command({"/distcc-clang", "--lto-worker", "3"});
+        }
         auto argv = pointers(box.args);
         Fd filter(fcntl(box.filter.fd, F_DUPFD_CLOEXEC, 5));
         posix_spawn_file_actions_t actions;

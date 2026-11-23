@@ -3,7 +3,7 @@
 namespace rust {
 enum class CpuProfile { Target, HostUnion, HostIntersection };
 string capture_cpu_profile(const fs::path &compiler, const Work &work, CpuProfile mode);
-enum class Root { Host, HostWithOutputs, Inputs, Backend, LLVM, ResidentLLVM };
+enum class Root { Host, HostWithOutputs, Inputs, LLVM, ResidentLLVM };
 struct Sandbox {
     Fd filter;
     Words args;

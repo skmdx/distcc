@@ -14,9 +14,12 @@
 #include <set>
 #include <sys/inotify.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 
 extern "C" {
 #include "exec.h"
+#include "clang_worker.h"
+#include "fd_io.h"
 #include "exitcode.h"
 #include "workload.h"
 }
@@ -285,31 +288,56 @@ const Backends &backends() {
     return value;
 }
 } // namespace
-extern "C" int dcc_spawn_rust_cgu(pid_t *pid, const char *abi, const char *tree, const char *output,
-                                  const char *stdout_path, const char *stderr_path) {
+extern "C" int dcc_rust_cgu_helper(const char *abi, char *path) {
     try {
-        auto &slots = backends().paths;
+        const auto &slots = backends().paths;
         auto slot = slots.find(abi);
-        if (slot == slots.end())
-            return EXIT_LOCAL_COMPILE;
-        // Pin the prepared input before crossing the mount boundary. Only
-        // the result descriptor is writable, and LLVM starts inside bwrap.
-        Fd in(open((fs::path(tree) / "cgu").c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK));
-        Fd out(open(output, O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW, 0600));
-        struct stat st;
-        if (fstat(in.fd, &st) || !S_ISREG(st.st_mode))
-            return EXIT_PROTOCOL_ERROR;
-        auto descriptor = [](int fd) { return "/proc/self/fd/" + std::to_string(fd); };
-        Sandbox box(Root::Backend);
-        box.mount(slot->second, "/backend");
-        box.mount(descriptor(in.fd), "/input");
-        box.mount(descriptor(out.fd), "/output", true);
-        box.command({"/backend", "--execute"});
-        auto argv = pointers(box.args);
-        return dcc_spawn_child(argv.data(), pid, "/dev/null", stdout_path, stderr_path);
+        if (slot == slots.end()) return 0;
+        return realpath(slot->second.c_str(), path) ? 1 : -1;
     } catch (const std::exception &e) {
-        fprintf(stderr, "distccd: %s: %s\n", __func__, e.what());
-        return EXIT_IO_ERROR;
+        fprintf(stderr, "distccd: Rust CGU backend: %s\n", e.what());
+        return -1;
+    }
+}
+
+extern "C" int dcc_rust_cgu_worker(const dcc_job *job, const char *tree, int cancel,
+                                   const char *out, const char *err, dcc_job_result *result) {
+    if (!job->compiler_channel) return EXIT_LOCAL_COMPILE << 8;
+    try {
+        Fd input(open((fs::path(tree) / "cgu").c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+        struct stat st;
+        if (fstat(input.fd, &st) || !S_ISREG(st.st_mode)) return EXIT_PROTOCOL_ERROR << 8;
+        Fd object(dcc_job_memfd("rust-cgu-object"));
+        Fd log(open(out, O_WRONLY | O_TRUNC | O_CLOEXEC));
+        Fd diagnostics(open(err, O_WRONLY | O_APPEND | O_CLOEXEC));
+        int pair[2];
+        check(!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair), "CGU reply channel");
+        Fd reply(pair[0]);
+        timespec started;
+        clock_gettime(CLOCK_MONOTONIC, &started);
+        {
+            Fd completion(pair[1]);
+            int fds[] = {object.fd, completion.fd, input.fd, log.fd, diagnostics.fd};
+            dcc_native_request request{'R', 0};
+            check(!dcc_send_fds(job->compiler_channel - 1, &request, sizeof(request), fds, std::size(fds)),
+                  "submit Rust CGU");
+        }
+        dcc_native_result usage{};
+        int rc = dcc_compiler_result(reply.fd, cancel, &started, &usage);
+        if (rc) return rc << 8;
+        result->peak_bytes = usage.peak_bytes;
+        result->cpu_ns = usage.cpu_ns;
+        if (!usage.status) {
+            check(!fstat(object.fd, &st) && st.st_size > 8, "missing CGU result");
+            result->size[DCC_JOB_OBJECT] = st.st_size;
+            result->mode = 0600;
+            result->fd[DCC_JOB_OBJECT] = object.fd;
+            object.fd = -1;
+        }
+        return usage.status;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "distccd: Rust CGU: %s\n", e.what());
+        return EXIT_IO_ERROR << 8;
     }
 }
 extern "C" const char *dcc_rust_cgu_capabilities(void) {

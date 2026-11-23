@@ -2,7 +2,6 @@
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #include "../native_worker.h"
 #include <cstdlib>
-#include <sys/prctl.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/FrontendTool/Utils.h>
 #include <clang/Tooling/Tooling.h>
@@ -170,7 +169,7 @@ int main(int argc, char **argv) {
     dcc_clang_compile_init();
     dcc_clang_codegen_init();
     if (argc == 3 && !strcmp(argv[1], "--lto-worker")) {
-        if (prctl(PR_SET_DUMPABLE, 0) || !dcc_lto_init(false)) return 1;
+        if (!dcc_lto_init(false)) return 1;
         return dcc_native_worker(atoi(argv[2]), dcc_lto_remote);
     }
     if (argc == 4 && !strcmp(argv[1], "--native-worker")) {

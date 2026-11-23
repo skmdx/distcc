@@ -144,10 +144,11 @@ static int accept_tcp_job(struct dcc_tcp_server *job, const struct dcc_tcp_run *
         struct dcc_tcp_run dispatch = *run;
         dispatch.compiler_channel = 0;
         char helper[PATH_MAX];
-        int resident = dcc_lto_helper(description, helper);
+        int resident = description->kind == DCC_JOB_RUST_CGU
+            ? dcc_rust_cgu_helper(description->argv[1], helper) : dcc_lto_helper(description, helper);
         if (resident < 0) return -1;
         if (resident || description->kind == DCC_JOB_FRONTEND) {
-            int compiler = dcc_clang_pool_get(description->argv[0], resident ? helper : NULL);
+            int compiler = dcc_clang_pool_get(description, resident ? helper : NULL);
             if (compiler < 0) return -1;
             descriptors[count++] = compiler;
             dispatch.compiler_channel = count;

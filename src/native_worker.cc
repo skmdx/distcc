@@ -143,7 +143,7 @@ int dcc_native_worker(int control, int (*execute)(int, unsigned), int (*plan)(in
                     received != 5 + int(has_extra_fd(request.operation)) + int(request.operation == 'G' || request.operation == 'S') ||
                     (request.operation != 'C' && request.operation != 'P' && request.operation != 'L' && request.operation != 'B' && request.operation != 'D' &&
                      request.operation != 'G' && request.operation != 'S' && request.operation != 'I' &&
-                     request.operation != 'A' && request.operation != 'M' && request.operation != 'N' && request.operation != 'T') ||
+                     request.operation != 'A' && request.operation != 'M' && request.operation != 'N' && request.operation != 'T' && request.operation != 'R') ||
                     request.group > INT_MAX) return 1;
                 if (plan && (request.operation == 'P' || request.operation == 'I' ||
                              request.operation == 'L' || request.operation == 'N')) {
