@@ -14,6 +14,7 @@
 #include <array>
 #include <algorithm>
 #include <climits>
+#include <map>
 #include <set>
 #include <condition_variable>
 #include <deque>
@@ -351,7 +352,32 @@ public:
         if (!source_hit) previous = c.source_hints(this->scope);
     }
     const Buffer &snapshot() const { return previous; }
-    bool known_source() const { return source_hit; }
+    using Directories = std::map<std::string, std::set<std::string>>;
+    int load(Directories &directories) const {
+        if (!previous.owner) return 0;
+        std::string_view bytes(previous.data, previous.size);
+        while (!bytes.empty()) {
+            auto end = bytes.find('\0');
+            if (end == std::string_view::npos || bytes.front() != '/') return EPROTO;
+            auto [entry, inserted] = directories.try_emplace(std::string(bytes.substr(0, end)));
+            if (!inserted) return EPROTO;
+            bytes.remove_prefix(end+1);
+            for (;;) {
+                end = bytes.find('\0');
+                if (end == std::string_view::npos) return EPROTO;
+                auto name = bytes.substr(0, end);
+                bytes.remove_prefix(end+1);
+                if (name.empty()) break;
+                if (!valid_name(name) || !entry->second.emplace(name).second) return EPROTO;
+            }
+        }
+        return 0;
+    }
+    static void append(std::string &record, const std::string &directory, const std::set<std::string> &names) {
+        record += directory; record += '\0';
+        for (const auto &name : names) { record += name; record += '\0'; }
+        record += '\0';
+    }
     void save(Connection &c, std::string_view actual) const {
         bool changed = !previous.owner || actual != std::string_view(previous.data, previous.size);
         if (!source_hit || changed) c.save_source_hints(source, actual);
@@ -365,7 +391,8 @@ struct DirectoryQuery {
     Buffer previous;
     const std::string &payload() const { return bytes; }
 
-    int encode(const std::set<std::string> &hints, const std::set<std::string> &scheduled) {
+    template<class Scheduled = std::set<std::string>>
+    int encode(const std::set<std::string> &hints, const Scheduled &scheduled = {}) {
         if (previous.owner && previous.size < DCC_FS_METADATA) return EPROTO;
         bytes = path; bytes += '\0';
         if (previous.owner) bytes.append(previous.data, DCC_FS_METADATA);

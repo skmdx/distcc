@@ -59,31 +59,11 @@ static dccfs::SourceHints source_hints(dccfs::Connection &connection, const char
 class Files {
     dccfs::Connection connection;
     dccfs::SourceHints hints;
-    std::map<std::string, std::set<std::string>> predictions;
+    dccfs::SourceHints::Directories predictions;
     int hints_error = 0;
     bool learned = false;
     std::map<std::string, Entry> entries;
     std::map<std::pair<uint64_t, uint64_t>, ino_t> inodes;
-    int load_hints(const dccfs::Buffer &snapshot) {
-        if (!snapshot.owner) return 0;
-        std::string_view bytes(snapshot.data, snapshot.size);
-        while (!bytes.empty()) {
-            auto end = bytes.find('\0');
-            if (!end || end == std::string_view::npos || bytes.front() != '/') return EPROTO;
-            auto [entry, inserted] = predictions.try_emplace(std::string(bytes.substr(0, end)));
-            if (!inserted) return EPROTO;
-            bytes.remove_prefix(end+1);
-            for (;;) {
-                end = bytes.find('\0');
-                if (end == std::string_view::npos) return EPROTO;
-                auto name = bytes.substr(0, end);
-                bytes.remove_prefix(end+1);
-                if (name.empty()) break;
-                if (!valid_name(name) || !entry->second.emplace(name).second) return EPROTO;
-            }
-        }
-        return 0;
-    }
 public:
     std::string root;
     Files(int fd, std::string root, const char *identity, const char *cache_root,
@@ -91,7 +71,7 @@ public:
         : connection(fd, dcc_file_cache_records, identity, cache_root),
           hints(source_hints(connection, cwd, input)), root(std::move(root)) {
         learned = bool(hints.snapshot().owner);
-        hints_error = load_hints(hints.snapshot());
+        hints_error = hints.load(predictions);
     }
     ~Files() {
         if (hints_error) return;
@@ -103,9 +83,7 @@ public:
             // Retain only children the compiler actually requested this time.
             // An empty footprint still records a searched directory: its fresh
             // names can answer absent-header lookups without individual RPCs.
-            snapshot += path; snapshot += '\0';
-            for (const auto &name : entry.observed) { snapshot += name; snapshot += '\0'; }
-            snapshot += '\0';
+            hints.append(snapshot, path, entry.observed);
         }
         hints.save(connection, snapshot);
     }

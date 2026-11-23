@@ -143,7 +143,7 @@ int main() {
         auto view = (*a)->getBuffer("a", -1, true, false); require(bool(view), "first view");
         retained = std::move(*view);
         require(retained->getBuffer() == "fresh" && !retained->getBufferEnd()[0], "payload/terminator");
-        auto again = files.openFileForRead("/tree/a"); require(bool(again), "cached open");
+        auto again = files.openFileForRead("/tree//a"); require(bool(again), "cached open with repeated separator");
         auto second = (*again)->getBuffer("again", -1, true, false);
         require(second && (*second)->getBufferStart() == retained->getBufferStart(), "copied cached payload");
         require(files.status("/tree/a")->getUniqueID() == llvm::sys::fs::UniqueID(1, 2), "stale metadata");

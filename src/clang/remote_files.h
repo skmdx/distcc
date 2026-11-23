@@ -136,7 +136,7 @@ class RemoteFiles : public llvm::vfs::FileSystem {
     std::string cwd;
     llvm::StringMap<Entry> entries;
     std::optional<dccfs::SourceHints> hints;
-    std::set<std::string> reads;
+    dccfs::SourceHints::Directories reads;
     bool recording = false, stable = true;
     std::vector<std::string> observations;
     void observe(llvm::StringRef name, unsigned operation, std::error_code error = {}) {
@@ -199,6 +199,10 @@ class RemoteFiles : public llvm::vfs::FileSystem {
             name.insert(name.begin(), '/');
             name.insert(name.begin(), cwd.begin(), cwd.end());
         }
+        // Directory replies join parent and leaf with one separator. Keep
+        // trailing slashes and symlink/.. traversal significant.
+        name.erase(std::unique(name.begin(), name.end(),
+                               [](char a, char b) { return a == '/' && b == '/'; }), name.end());
         return name;
     }
     std::error_code cachedError(llvm::StringRef name) const {
@@ -262,40 +266,22 @@ public:
             llvm::StringRef(snapshot.bytes.data, snapshot.bytes.size), name.str(), std::move(snapshot.bytes.owner));
     }
     std::error_code prepare(const clang::CompilerInvocation &invocation) {
-        std::set<std::string> directories;
-        for (const auto &entry : invocation.getHeaderSearchOpts().UserEntries)
-            directories.insert(absolute(entry.Path).str().str());
+        dccfs::SourceHints::Directories directories;
         const auto &inputs = invocation.getFrontendOpts().Inputs;
-        std::map<std::string, std::set<std::string>> predicted;
         if (!inputs.empty() && inputs[0].isFile()) {
             auto source = absolute(inputs[0].getFile()).str().str();
-            directories.insert(llvm::sys::path::parent_path(source).str());
-            std::string scope = "clang-scope:" + cwd;
-            for (const auto &dir : directories) { scope += '\0'; scope += dir; }
-            hints.emplace(connection, "clang-source:" + source, std::move(scope));
-            const auto &saved = hints->snapshot();
-            if (saved.owner) {
-                llvm::StringRef paths(saved.data, saved.size);
-                while (!paths.empty()) {
-                    auto [path, rest] = paths.split('\0');
-                    auto leaf = llvm::sys::path::filename(path);
-                    if (path.starts_with("/") && dccfs::valid_name({leaf.data(), leaf.size()})) {
-                        auto parent = llvm::sys::path::parent_path(path).str();
-                        if (hints->known_source() || directories.count(parent)) {
-                            directories.insert(parent);
-                            predicted[parent].insert(leaf.str());
-                        }
-                    }
-                    paths = rest;
-                }
-            }
+            hints.emplace(connection, "clang-source-v2:" + source, "clang-scope-v2:" + cwd);
+            if (int error = hints->load(directories)) return {error, std::generic_category()};
+            directories.try_emplace(llvm::sys::path::parent_path(source).str());
         }
+        for (const auto &entry : invocation.getHeaderSearchOpts().UserEntries)
+            directories.try_emplace(absolute(entry.Path).str().str());
         std::vector<dccfs::DirectoryQuery> queries;
-        for (const auto &path : directories) {
+        for (const auto &[path, names] : directories) {
             auto &q = queries.emplace_back();
             q.operation = DCC_FS_STAT; q.path = path;
             q.previous = connection.directory_names(path);
-            if (int error = q.encode(predicted[path], directories)) return {error, std::generic_category()};
+            if (int error = q.encode(names, directories)) return {error, std::generic_category()};
         }
         return connection.batch(DCC_FS_DIRECTORIES, queries, [&](const auto &q, std::error_code error,
                                                                    const dccfs::Buffer &reply) {
@@ -310,10 +296,7 @@ public:
         connection.finish_writes();
         if (!hints) return;
         std::string actual;
-        for (const auto &path : reads) {
-            if (actual.size() + path.size() + 1 > DCC_FS_QUERY_MAX) break;
-            actual += path; actual += '\0';
-        }
+        for (const auto &[dir, names] : reads) hints->append(actual, dir, names);
         hints->save(connection, actual);
     }
     int claimResult(llvm::StringRef action) { return connection.claim_compilation({action.data(), action.size()}); }
@@ -404,7 +387,7 @@ public:
     }
     std::error_code fetch(dccfs::DirectoryQuery &query, const std::set<std::string> &children) {
         query.operation = DCC_FS_STAT;
-        if (int e = query.encode(children, {})) return {e, std::generic_category()};
+        if (int e = query.encode(children)) return {e, std::generic_category()};
         dccfs::Buffer response;
         if (auto e = connection.request(query.operation, query.bytes, response)) {
             remember(query.path, e);
@@ -433,7 +416,7 @@ public:
     llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>> openFileForRead(const llvm::Twine &path) override {
         auto name = absolute(path);
         auto result = openImpl(name);
-        if (result && reads.size() < DCC_JOB_INPUT_MAX) reads.insert(name.str().str());
+        if (result) reads[llvm::sys::path::parent_path(name).str()].insert(llvm::sys::path::filename(name).str());
         // A failed file open does not invalidate path metadata: an include
         // candidate may be a directory containing a later requested header.
         // Do not certify a failed read using a successful stat observation.

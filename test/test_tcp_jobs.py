@@ -1765,17 +1765,19 @@ class FrontendTest(BrokerTestCase):
         include.symlink_to(real, target_is_directory=True)
         nested = real/'nested'
         nested.mkdir()
-        (nested/'common.h').touch()
+        (nested/'common.h').write_text('#define COMMON 7\n')
         for name in ('a', 'b'):
+            (self.work/name).mkdir()
             (real/(name+'.inc')).write_text('42\n')
             (real/(name+'_only.h')).symlink_to(name+'.inc')
-            (self.work/(name+'.c')).write_text(
-                f'#include <nested/common.h>\n#if __has_include(<absent.h>)\n#error unexpected header\n#endif\n'
-                f'int value =\n#include <{name}_only.h>\n;\n')
+            (self.work/name/'source.c').write_text(
+                f'#include <nested//common.h>\n#if __has_include(<absent.h>)\n#error unexpected header\n#endif\n'
+                f'int value = COMMON +\n#include <{name}_only.h>\n;\n')
 
         def compile_source(name):
             trace, output = self.work/'trace', self.work/(name+'.o')
-            args = [clang, '-nostdinc', '-I'+str(include), '-c', str(self.work/(name+'.c')), '-o', str(output)]
+            args = [clang, '-nostdinc', '-I'+str(self.work/name), '-I'+str(include),
+                    '-c', str(self.work/name/'source.c'), '-o', str(output)]
             subprocess.run(args, env=self.env, check=True, capture_output=True)
             expected = output.read_bytes()
             output.unlink()
@@ -1785,18 +1787,22 @@ class FrontendTest(BrokerTestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('frontend filesystem:', result.stderr)
             self.assertEqual(output.read_bytes(), expected)
-            return trace.read_text()
+            reads = int(required_match(r'(\d+) reads, \d+ read batches', result.stderr)[1])
+            return trace.read_text(), reads
 
-        cold = compile_source('a')
+        cold, _ = compile_source('a')
+        self.assertRegex(cold, r'openat\([^\n]*common\.h", O_RDONLY')
         self.assertRegex(cold, r'getdents64\(\d+<'+re.escape(str(nested))+r'>')
         self.assertRegex(cold, r'getdents64\(\d+<'+re.escape(str(real))+r'>')
         self.assertNotRegex(cold, r'fstatat\([^\n]*"b_only\.h"')
         # A different size forces a miss if the cold TU speculatively reads A.
         (real/'a.inc').write_text('12345\n')
-        cold_b = compile_source('b')
+        cold_b, reads = compile_source('b')
+        self.assertLessEqual(reads, 2, 'only the new source and its private header need contents')
+        self.assertNotRegex(cold_b, r'openat\([^\n]*common\.h", O_RDONLY')
         self.assertNotRegex(cold_b, r'getdents64\(\d+<'+re.escape(str(nested))+r'>')
         self.assertNotRegex(cold_b, r'openat\([^\n]*"[^"]*/a_only\.h", O_RDONLY')
-        warm_a = compile_source('a')
+        warm_a, _ = compile_source('a')
         self.assertRegex(warm_a, r'(?:fstatat|statx)\([^\n]*"a_only\.h"')
         self.assertNotRegex(warm_a, r'(?:fstatat|statx|openat)\([^\n]*"[^"]*b_only\.h"')
         for events in (cold_b, warm_a):
@@ -1805,10 +1811,33 @@ class FrontendTest(BrokerTestCase):
         # The stale directory yields only A's hinted attributes. Looking up a
         # newly added header must refresh the names before answering negatively.
         (real/'late.h').write_text('73\n')
-        source = self.work/'a.c'
+        source = self.work/'a/source.c'
         source.write_text(source.read_text().replace('a_only.h', 'late.h'))
-        changed = compile_source('a')
+        changed, _ = compile_source('a')
         self.assertRegex(changed, r'getdents64\(\d+<'+re.escape(str(real))+r'>')
+
+    def test_clang_hint_record_spans_directory_query_batches(self):
+        clang = self.start_frontend()
+        includes = []
+        # Each directory fits a query. Together even the grouped names exceed 64 KiB.
+        for tree in ('left', 'right'):
+            directory = self.work/tree
+            directory.mkdir()
+            for i in range(200):
+                leaf = 'header_' + 'x'*160 + str(i) + '.h'
+                (directory/leaf).write_text(f'#define VALUE_{tree}_{i} {i}\n')
+                includes.append(f'#include <{tree}/{leaf}>\n')
+
+        def compile_source(source, directives):
+            path = self.work/source
+            path.write_text(''.join(directives)+'int value = VALUE_right_199;\n')
+            result = subprocess.run([self.build/'distcc', clang, '-nostdinc', '-I'+str(self.work),
+                                     '-c', path, '-o', self.work/'out.o'], env=self.env,
+                                    capture_output=True, text=True, check=True, timeout=30)
+            return int(required_match(r'(\d+) reads, \d+ read batches', result.stderr)[1])
+
+        self.assertGreaterEqual(compile_source('first.c', includes), len(includes))
+        self.assertLessEqual(compile_source('second.c', includes[-1:]), 1, 'only the new source needs contents')
 
     def test_header_directory_survives_failed_file_open(self):
         clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1')
