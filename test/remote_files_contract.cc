@@ -1,5 +1,6 @@
 /* Exercise VFS snapshot ownership and the actual local request stream. */
 #include "../src/clang/remote_files.h"
+#include <atomic>
 #include <thread>
 #include <future>
 #include <csignal>
@@ -65,7 +66,47 @@ static void store(dcc_record_cache *, const void *key, size_t size, const void *
 static volatile sig_atomic_t interrupted;
 static void interrupt(int) { interrupted = 1; }
 
+static void shared_hints(const char *root) {
+    using Hints = dccfs::SourceHints;
+    using Dirs = Hints::Directories;
+    auto api = dcc_file_cache_records;
+    static std::atomic<unsigned> writes;
+    api.write = [](auto cache, auto key, auto key_size, auto data, auto size) {
+        ++writes;
+        dcc_file_cache_records.write(cache, key, key_size, data, size);
+    };
+    dccfs::Connection first(-1, api, "contract", root), second(-1, api, "contract", root);
+    Hints a(first, "a", "scope"), b(second, "b", "scope");
+    Dirs left{{"/tree", {"a", "b"}}}, right{{"/branch", {"z"}}};
+    auto keep = [](const auto &, auto &) { return false; };
+    a.save_source(first, left);
+    auto job = std::async(std::launch::async, [&] { a.merge_scope(first, left, keep); });
+    b.merge_scope(second, right, keep);
+    job.get();
+    Hints known(first, "a", "scope"), cold(second, "c", "scope");
+    Dirs prediction;
+    require(known.known_source() && !known.load(prediction) && prediction == left, "exact source hints");
+    known.save_source(first, left);
+    b.merge_scope(second, right, keep);
+    require(writes == 3, "unchanged source or subset republished");
+    prediction.clear();
+    auto both = left;
+    both.insert(right.begin(), right.end());
+    require(!cold.known_source() && !cold.load(prediction) && prediction == both, "lost overlapping job");
+
+    // A directory and two names exhaust the shared budget.
+    Dirs wide{{"/tree", {"x", "y", "z"}}};
+    cold.save_source(second, wide);
+    Hints::merge(first, "scope", 3, wide, keep);
+    prediction.clear();
+    require(!Hints(second, "new", "scope").load(prediction) && prediction == Dirs{{"/tree", {"x", "y"}}},
+            "shared hint budget or actual priority");
+    prediction.clear();
+    require(!Hints(first, "c", "scope").load(prediction) && prediction == wide, "truncated exact source");
+}
+
 int main() {
+    shared_hints(".");
     auto directory = stamp(S_IFDIR | 0755, 0, 1);
     auto regular = stamp(S_IFREG | 0644, 5, 1);
     auto listing = directory;
@@ -81,11 +122,11 @@ int main() {
     std::string long_path = '/' + std::string(65536, 'x');
     struct Reply { unsigned operation; std::string path, bytes; unsigned error = 0, extra = 0; };
     std::vector<Reply> replies{
-        {DCC_FS_STAT, "/tree", listing},
+        {DCC_FS_LSTAT, "/tree", listing},
         {DCC_FS_READ, "/tree/a", stamp(S_IFREG | 0644, 5, 2) + "fresh"},
         {DCC_FS_READ, "/tree/c", regular + "third"},
         {DCC_FS_READ, "/tree/child", {}, EINVAL},
-        {DCC_FS_STAT, "/tree/child", empty_directory},
+        {DCC_FS_LSTAT, "/tree/child/", empty_directory},
         {DCC_FS_LIST, "/tree", types},
         {DCC_FS_LIST, "/tree/child", {}},
         {DCC_FS_LIST, "/short", "bad"},
@@ -93,14 +134,14 @@ int main() {
         {DCC_FS_REALPATH, long_path, "/tree/a"},
         {DCC_FS_READ, "/direct", stamp(S_IFREG | 0644, 0, 1)},
         {DCC_FS_READ, "/unseen-directory", {}, EINVAL},
-        {DCC_FS_STAT, "/unseen-directory", empty_directory},
-        {DCC_FS_STAT, "/unreadable", regular},
+        {DCC_FS_LSTAT, "/unseen-directory", empty_directory},
+        {DCC_FS_LSTAT, "/unreadable", regular},
         {DCC_FS_READ, "/unreadable", {}, EACCES},
-        {DCC_FS_STAT, "/denied", {}, EACCES},
+        {DCC_FS_LSTAT, "/denied", {}, EACCES},
         {DCC_FS_REALPATH, "/broken", "bad", 0, 10},
     };
     for (auto &r : replies)
-        if (r.operation == DCC_FS_STAT) r.path.append(1 + DCC_FS_METADATA, '\0');
+        if (r.operation == DCC_FS_LSTAT) r.path.append(1 + DCC_FS_METADATA, '\0');
     int sockets[2];
     require(!socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), "socketpair");
     int small = 1024;

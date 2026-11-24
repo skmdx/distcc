@@ -61,7 +61,6 @@ class Files {
     dccfs::SourceHints hints;
     dccfs::SourceHints::Directories predictions;
     int hints_error = 0;
-    bool learned = false;
     std::map<std::string, Entry> entries;
     std::map<std::pair<uint64_t, uint64_t>, ino_t> inodes;
 public:
@@ -70,22 +69,28 @@ public:
           const char *cwd, const char *input)
         : connection(fd, dcc_file_cache_records, identity, cache_root),
           hints(source_hints(connection, cwd, input)), root(std::move(root)) {
-        learned = bool(hints.snapshot().owner);
         hints_error = hints.load(predictions);
     }
     ~Files() {
         if (hints_error) return;
-        std::string snapshot;
-        snapshot.reserve(hints.snapshot().size);
-        for (const auto &[path, entry] : entries) {
+        dccfs::SourceHints::Directories actual;
+        for (auto &[path, entry] : entries) {
             if (!entry.searched) continue;
             // Speculative queries do not teach the next job to repeat them.
             // Retain only children the compiler actually requested this time.
             // An empty footprint still records a searched directory: its fresh
             // names can answer absent-header lookups without individual RPCs.
-            hints.append(snapshot, path, entry.observed);
+            actual.emplace(path, std::move(entry.observed));
         }
-        hints.save(connection, snapshot);
+        hints.save_source(connection, actual);
+        hints.merge_scope(connection, actual, [&](const auto &dir, auto &names) {
+            return dccfs::prune_missing(dir, names, [&](const std::string &path) -> dccfs::HintStatus {
+                auto found = entries.find(path);
+                if (found == entries.end() || !found->second.queried) return {};
+                auto &entry = found->second;
+                return {entry.mode(), entry.error, &entry};
+            });
+        });
     }
     ino_t inode(uint64_t device, uint64_t number) {
         // One FUSE mount represents several client devices. Preserve hardlink
@@ -98,7 +103,7 @@ public:
         if (hints_error) return entry.error = hints_error;
         query.path = path;
         auto predicted = predictions.find(path);
-        if (speculative && learned && predicted == predictions.end()) {
+        if (speculative && hints.learned() && predicted == predictions.end()) {
             query.operation = DCC_FS_ATTRIBUTES;
             query.bytes = path;
             return query.bytes.size() <= DCC_FS_QUERY_MAX-12 ? 0 : (entry.error = ENAMETOOLONG);

@@ -296,9 +296,11 @@ public:
     }
     void save_source_hints(std::string_view source, std::string_view hints) {
         auto key = cache_key("gcc-source-hints", source);
-        // Hints only batch fresh attribute queries. Concurrent publication can
-        // lose a prefetch opportunity, never a filesystem freshness check.
         cache.write(records, key.data(), key.size(), hints.data(), hints.size());
+    }
+    int claim_source_hints(std::string_view scope) {
+        auto key = cache_key("gcc-source-hints", scope);
+        return cache.claim(records, key.data(), key.size(), 1);
     }
     std::string file_key(std::string_view path, const char *version) const {
         std::string key(identity);
@@ -342,20 +344,36 @@ inline bool valid_name(std::string_view name) {
 
 // The source owns its lookup footprint. Only a cold source consults the scope.
 class SourceHints {
+public:
+    using Directories = std::map<std::string, std::set<std::string>>;
+private:
     std::string source, scope;
     Buffer previous;
     bool source_hit;
+    static std::string encode(const Directories &directories) {
+        std::string record;
+        for (const auto &[directory, names] : directories) {
+            record += directory; record += '\0';
+            for (const auto &name : names) { record += name; record += '\0'; }
+            record += '\0';
+        }
+        return record;
+    }
+    static bool equals(const Buffer &snapshot, std::string_view record) {
+        return snapshot.owner && record == std::string_view(snapshot.data, snapshot.size);
+    }
 public:
     SourceHints(Connection &c, std::string source, std::string scope)
         : source(std::move(source)), scope(std::move(scope)), previous(c.source_hints(this->source)),
           source_hit(bool(previous.owner)) {
         if (!source_hit) previous = c.source_hints(this->scope);
     }
-    const Buffer &snapshot() const { return previous; }
-    using Directories = std::map<std::string, std::set<std::string>>;
-    int load(Directories &directories) const {
-        if (!previous.owner) return 0;
-        std::string_view bytes(previous.data, previous.size);
+    bool known_source() const { return source_hit; }
+    bool learned() const { return bool(previous.owner); }
+    int load(Directories &directories) const { return decode(previous, directories); }
+    static int decode(const Buffer &snapshot, Directories &directories) {
+        if (!snapshot.owner) return 0;
+        std::string_view bytes(snapshot.data, snapshot.size);
         while (!bytes.empty()) {
             auto end = bytes.find('\0');
             if (end == std::string_view::npos || bytes.front() != '/') return EPROTO;
@@ -373,15 +391,47 @@ public:
         }
         return 0;
     }
-    static void append(std::string &record, const std::string &directory, const std::set<std::string> &names) {
-        record += directory; record += '\0';
-        for (const auto &name : names) { record += name; record += '\0'; }
-        record += '\0';
+    void save_source(Connection &c, const Directories &actual) const {
+        auto record = encode(actual);
+        if (!source_hit || !equals(previous, record)) c.save_source_hints(source, record);
     }
-    void save(Connection &c, std::string_view actual) const {
-        bool changed = !previous.owner || actual != std::string_view(previous.data, previous.size);
-        if (!source_hit || changed) c.save_source_hints(source, actual);
-        if (changed) c.save_source_hints(scope, actual);
+    // Count both directory queries and child stats, including empty GCC footprints.
+    // Take this job's observations first, then retain still-live prior hints.
+    template<class Prune>
+    static void merge(Connection &c, const std::string &key, size_t limit,
+                      const Directories &actual, Prune prune) {
+        struct Claim {
+            int fd;
+            ~Claim() { if (fd >= 0) close(fd); }
+        } claim{c.claim_source_hints(key)};
+        if (claim.fd < 0) return; // The optional cache cannot publish this update.
+        auto latest = c.source_hints(key);
+        if (actual.empty() && !latest.owner) return;
+        Directories prior, merged;
+        if (decode(latest, prior)) return;
+        auto add = [&](const Directories &from) {
+            for (const auto &[dir, names] : from) {
+                if (!limit) break;
+                auto [entry, inserted] = merged.try_emplace(dir);
+                limit -= inserted;
+                for (const auto &name : names) {
+                    if (!limit) break;
+                    limit -= entry->second.insert(name).second;
+                }
+            }
+        };
+        add(actual);
+        for (auto it = prior.begin(); it != prior.end(); ) {
+            if (prune(it->first, it->second)) it = prior.erase(it);
+            else ++it;
+        }
+        add(prior);
+        auto record = encode(merged);
+        if (!equals(latest, record)) c.save_source_hints(key, record);
+    }
+    template<class Prune>
+    void merge_scope(Connection &c, const Directories &actual, Prune prune) const {
+        merge(c, scope, 4096, actual, prune);
     }
 };
 
@@ -392,9 +442,11 @@ struct DirectoryQuery {
     const std::string &payload() const { return bytes; }
 
     template<class Scheduled = std::set<std::string>>
-    int encode(const std::set<std::string> &hints, const Scheduled &scheduled = {}) {
+    int encode(const std::set<std::string> &hints, const Scheduled &scheduled = {}, bool directory = false) {
         if (previous.owner && previous.size < DCC_FS_METADATA) return EPROTO;
-        bytes = path; bytes += '\0';
+        bytes = path;
+        if (directory && bytes.back() != '/') bytes += '/';
+        bytes += '\0';
         if (previous.owner) bytes.append(previous.data, DCC_FS_METADATA);
         else bytes.append(DCC_FS_METADATA, '\0');
         if (bytes.size() > DCC_FS_QUERY_MAX-12) return ENAMETOOLONG;
@@ -466,4 +518,26 @@ struct DirectoryListing {
         return 0;
     }
 };
+
+struct HintStatus {
+    unsigned mode = 0;
+    int error = 0;
+    const DirectoryListing *directory = nullptr;
+    bool absent() const { return error == ENOENT || error == ENOTDIR; }
+};
+
+template<class Lookup>
+bool prune_missing(const std::string &dir, std::set<std::string> &names, Lookup lookup) {
+    auto parent = lookup(dir);
+    if (parent.error) return parent.absent();
+    if (parent.mode && !S_ISDIR(parent.mode)) return true;
+    if (names.empty()) return false;
+    auto prefix = dir == "/" ? dir : dir + '/';
+    for (auto it = names.begin(); it != names.end(); ) {
+        if ((parent.directory && parent.directory->excludes(*it)) || lookup(prefix + *it).absent())
+            it = names.erase(it);
+        else ++it;
+    }
+    return names.empty();
+}
 }

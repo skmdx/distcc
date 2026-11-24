@@ -1816,6 +1816,81 @@ class FrontendTest(BrokerTestCase):
         changed, _ = compile_source('a')
         self.assertRegex(changed, r'getdents64\(\d+<'+re.escape(str(real))+r'>')
 
+    def trace_clang_hints(self, clang, cwd, source, headers=(), flags=()):
+        (cwd/source).write_text(''.join(f'#include <{h}>\n' for h in headers) + 'int value;\n')
+        command = [clang, '-nostdinc', *flags, '-c', source, '-o', 'out.o']
+        subprocess.run(command, cwd=cwd, check=True, capture_output=True)
+        output = cwd/'out.o'
+        expected = output.read_bytes()
+        output.unlink()
+        trace = self.work/'client.trace'
+        result = subprocess.run(['strace', '-yy', '-s', '512', '-e', 'trace=newfstatat,statx,openat',
+                                 '-o', trace, self.build/'distcc', *command], cwd=cwd, env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_bytes(), expected)
+        reads = int(required_match(r'frontend filesystem:[^\n]*?([0-9]+) reads,', result.stderr)[1])
+        return trace.read_text(), reads
+
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_clang_scope_survives_small_and_other_language_sources(self):
+        clang = self.start_frontend()
+        headers = ['left/first.h', 'right/second.h']
+        for header in headers:
+            path = self.work/header
+            path.parent.mkdir()
+            path.touch()
+        def compile_source(name, uses=()):
+            return self.trace_clang_hints(clang, self.work, name, uses, ['-I.'])
+        _, cold = compile_source('wide.cpp', headers)
+        self.assertGreaterEqual(cold, len(headers))
+        c_trace, _ = compile_source('interrupt.c')
+        compile_source('small.cpp')
+        trace, reads = compile_source('next.cpp', headers)
+        with self.subTest('language'):
+            self.assertNotRegex(c_trace, r'(?:fstatat|statx)\([^\n]*"(?:[^"]*/)?(?:first|second)\.h"')
+        self.assertLessEqual(reads, 1, 'only the new source needs contents')
+        self.assertNotRegex(trace, r'openat\([^\n]*(?:first|second)\.h", O_RDONLY')
+
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_clang_system_hints_follow_active_roots_across_working_directories(self):
+        clang = self.start_frontend()
+        shared = self.work/'sdk'
+        optional = shared/'optional'
+        project = shared/'project'
+        for root, leaf in [(shared, 'shared.h'), (optional, 'private.h'), (project, 'project.h')]:
+            (root/'detail').mkdir(parents=True)
+            (root/'detail'/leaf).touch()
+        first, second, control = self.work/'first', self.work/'second', self.work/'control'
+        first.mkdir()
+        second.mkdir()
+        control.mkdir()
+        flags = ['-isystem', str(shared)]
+        self.trace_clang_hints(clang, first, 'both.cpp', ['detail/shared.h', 'detail/private.h', 'detail/project.h'],
+                               [*flags, '-isystem', str(optional), '-I', str(project)])
+        trace, reads = self.trace_clang_hints(clang, second, 'fresh.cpp', ['detail/shared.h'], flags)
+        _, source_reads = self.trace_clang_hints(clang, control, 'fresh.cpp', flags=flags)
+        self.assertNotRegex(trace, r'openat\([^\n]*shared\.h", O_RDONLY')
+        self.assertNotRegex(trace, r'(?:fstatat|statx)\([^\n]*"(?:[^"]*/)?(?:private|project)\.h"')
+        self.assertEqual(reads, source_reads, 'the system header must add no READ')
+
+    @unittest.skipUnless(shutil.which('strace'), 'strace required')
+    def test_clang_scope_prunes_observed_missing_headers(self):
+        clang = self.start_frontend()
+        directory = self.work/'nested'
+        directory.mkdir()
+        for name in ('gone.h', 'kept.h'):
+            (directory/name).touch()
+        def compile_source(name, uses=()):
+            return self.trace_clang_hints(clang, self.work, name, uses, ['-I.'])
+        compile_source('wide.cpp', ['nested/gone.h', 'nested/kept.h'])
+        (directory/'gone.h').unlink()
+        trace, _ = compile_source('prune.cpp')
+        self.assertRegex(trace, r'(?:fstatat|statx)\([^\n]*"gone\.h"[^\n]*ENOENT')
+        trace, reads = compile_source('next.cpp', ['nested/kept.h'])
+        self.assertNotRegex(trace, r'(?:fstatat|statx)\([^\n]*"gone\.h"')
+        self.assertLessEqual(reads, 1, 'pruning must retain the other header')
+
     def test_clang_hint_record_spans_directory_query_batches(self):
         clang = self.start_frontend()
         includes = []
@@ -2881,11 +2956,14 @@ int main(int argc, char **argv) {
         includedir = subprocess.check_output([config, '--includedir'], text=True).strip()
         libdir = subprocess.check_output([config, '--libdir'], text=True).strip()
         executable = self.work/'remote-files'
+        subprocess.run(['make', 'h_codec.so'], check=True, capture_output=True, timeout=30)
         subprocess.run([clang, '--driver-mode=g++', '-std=c++17',
                         str(self.build/'test/remote_files_contract.cc'), '-I'+str(self.build),
-                        '-I'+includedir, '-L'+libdir, '-Wl,-rpath,'+libdir, '-lLLVM', '-pthread',
-                        '-o', str(executable)], check=True, capture_output=True, timeout=30)
-        subprocess.run([str(executable)], check=True, timeout=10)
+                        '-I'+includedir, '-L'+libdir, '-Wl,-rpath,'+libdir, '-lLLVM',
+                        self.build/'h_codec.so', '-pthread', '-o', executable],
+                       check=True, capture_output=True, timeout=30)
+        subprocess.run([executable], cwd=self.work, env=dict(os.environ, DISTCCD_FILE_CACHE=str(self.work/'records')),
+                       check=True, timeout=10)
 
     def test_frontend_directory_snapshots_keep_freshness_and_permissions(self):
         if os.geteuid() == 0:

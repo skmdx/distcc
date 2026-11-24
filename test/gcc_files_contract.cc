@@ -81,7 +81,8 @@ extern "C" const dcc_file_cache_api dcc_file_cache_records = {
         if (key_size >= sizeof("gcc-source-hints") &&
             !memcmp(key, "gcc-source-hints", sizeof("gcc-source-hints")))
             published_hints.emplace_back(static_cast<const char *>(data), size);
-    }
+    },
+    [](dcc_record_cache *, const void *, size_t, int) { return open("/dev/null", O_RDONLY | O_CLOEXEC); }
 };
 
 static void require(bool ok, const char *message)

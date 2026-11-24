@@ -137,6 +137,8 @@ class RemoteFiles : public llvm::vfs::FileSystem {
     llvm::StringMap<Entry> entries;
     std::optional<dccfs::SourceHints> hints;
     dccfs::SourceHints::Directories reads;
+    std::map<std::string, bool> include_roots; // true for a system search entry outside cwd
+    std::string system_key;
     bool recording = false, stable = true;
     std::vector<std::string> observations;
     void observe(llvm::StringRef name, unsigned operation, std::error_code error = {}) {
@@ -265,39 +267,109 @@ public:
         record.contents = std::make_shared<SnapshotBuffer>(
             llvm::StringRef(snapshot.bytes.data, snapshot.bytes.size), name.str(), std::move(snapshot.bytes.owner));
     }
+    // absolute() collapses repeated separators. In shared records a double
+    // slash separates the owning include root from the absolute directory.
+    // Remember the most specific root: a broad SDK root must not activate
+    // an optional -isystem subtree learned through a narrower entry.
+    std::string sharedDirectory(const std::string &dir) const {
+        for (llvm::StringRef path(dir); !path.empty(); path = llvm::sys::path::parent_path(path)) {
+            if (path == cwd) return dir;
+            auto root = include_roots.find(path.str());
+            if (root != include_roots.end())
+                return root->second ? path.rtrim('/').str() + '/' + dir : dir;
+            if (path == "/" || llvm::sys::path::filename(path) == "..") break;
+        }
+        return dir;
+    }
+    static std::pair<llvm::StringRef, llvm::StringRef> splitDirectory(llvm::StringRef key) {
+        auto split = key.find("//");
+        if (split == key.npos) return {{}, key};
+        return {split ? key.take_front(split) : "/", key.drop_front(split+1)};
+    }
     std::error_code prepare(const clang::CompilerInvocation &invocation) {
         dccfs::SourceHints::Directories directories;
+        const auto &search = invocation.getHeaderSearchOpts();
+        auto cwd_prefix = llvm::StringRef(cwd).rtrim('/').str() + '/';
+        bool has_system = false;
+        for (const auto &entry : search.UserEntries) {
+            auto path = absolute(!entry.IgnoreSysRoot && llvm::sys::path::is_absolute(entry.Path)
+                                     ? search.Sysroot + entry.Path : entry.Path).str().str();
+            directories.try_emplace(path);
+            auto root = llvm::StringRef(path).rtrim('/');
+            if (root.empty()) root = "/";
+            bool system = entry.Group >= clang::frontend::System && root != cwd && !root.starts_with(cwd_prefix);
+            include_roots[root.str()] |= system;
+            has_system |= system;
+        }
         const auto &inputs = invocation.getFrontendOpts().Inputs;
         if (!inputs.empty() && inputs[0].isFile()) {
             auto source = absolute(inputs[0].getFile()).str().str();
-            hints.emplace(connection, "clang-source-v2:" + source, "clang-scope-v2:" + cwd);
-            if (int error = hints->load(directories)) return {error, std::generic_category()};
+            auto lang = std::to_string(static_cast<unsigned>(inputs[0].getKind().getLanguage()));
+            hints.emplace(connection, "clang-source-v2:" + source, "clang-scope-v3:" + lang + ':' + cwd);
+            if (has_system) system_key = "clang-system-v1:" + lang;
+            dccfs::SourceHints::Directories predicted;
+            if (int error = hints->load(predicted)) return {error, std::generic_category()};
+            auto bootstrap = [&](const auto &record) {
+                for (const auto &[key, names] : record) {
+                    auto [root, dir] = splitDirectory(key);
+                    if (!root.empty()) {
+                        auto active = include_roots.find(root.str());
+                        if (active == include_roots.end() || !active->second) continue;
+                    }
+                    directories[dir.str()].insert(names.begin(), names.end());
+                }
+            };
+            bootstrap(predicted);
+            if (!hints->known_source() && !system_key.empty()) {
+                predicted.clear();
+                if (int error = hints->decode(connection.source_hints(system_key), predicted))
+                    return {error, std::generic_category()};
+                bootstrap(predicted);
+            }
             directories.try_emplace(llvm::sys::path::parent_path(source).str());
         }
-        for (const auto &entry : invocation.getHeaderSearchOpts().UserEntries)
-            directories.try_emplace(absolute(entry.Path).str().str());
         std::vector<dccfs::DirectoryQuery> queries;
         for (const auto &[path, names] : directories) {
             auto &q = queries.emplace_back();
-            q.operation = DCC_FS_STAT; q.path = path;
+            q.path = path;
             q.previous = connection.directory_names(path);
-            if (int error = q.encode(names, directories)) return {error, std::generic_category()};
+            if (int error = q.encode(names, directories, true)) return {error, std::generic_category()};
         }
-        return connection.batch(DCC_FS_DIRECTORIES, queries, [&](const auto &q, std::error_code error,
-                                                                   const dccfs::Buffer &reply) {
-            if (!error) return accept(q, reply);
+        std::vector<Query> follow;
+        auto error = connection.batch(DCC_FS_DIRECTORIES, queries, [&](const auto &q, std::error_code error,
+                                                                       const dccfs::Buffer &reply) {
+            if (!error) return accept(q, reply, follow);
+            // A search entry can itself be a file. ENOTDIR for path/ does
+            // not establish the status of path.
+            if (error == std::errc::not_a_directory) follow.push_back({DCC_FS_STATUS, q.path});
             // A speculative access denial is not a compiler observation.
-            if (error != std::errc::permission_denied && error != std::errc::file_too_large)
+            else if (error != std::errc::permission_denied && error != std::errc::file_too_large)
                 remember(q.path, error);
             return std::error_code{};
         });
+        return error ? error : prefetch(follow);
     }
     void finish() {
         connection.finish_writes();
         if (!hints) return;
-        std::string actual;
-        for (const auto &[dir, names] : reads) hints->append(actual, dir, names);
-        hints->save(connection, actual);
+        hints->save_source(connection, reads);
+        dccfs::SourceHints::Directories scope, system;
+        for (auto &[dir, names] : reads) {
+            auto key = sharedDirectory(dir);
+            if (key != dir) system.emplace(key, names);
+            scope.emplace(std::move(key), std::move(names));
+        }
+        auto prune = [&](const std::string &key, auto &names) {
+            auto dir = splitDirectory(key).second;
+            return dccfs::prune_missing(dir.str(), names, [&](const std::string &path) -> dccfs::HintStatus {
+                auto found = entries.find(path);
+                if (found == entries.end()) return {};
+                auto &entry = found->second;
+                return {entry.mode(), entry.error.value(), entry.directory.get()};
+            });
+        };
+        hints->merge_scope(connection, scope, prune);
+        if (!system_key.empty()) hints->merge(connection, system_key, 2048, system, prune);
     }
     int claimResult(llvm::StringRef action) { return connection.claim_compilation({action.data(), action.size()}); }
     dccfs::Buffer result(llvm::StringRef action) { return connection.compilation({action.data(), action.size()}); }
@@ -364,7 +436,7 @@ public:
         dccfs::DirectoryQuery query;
         query.path = name.str();
         query.previous = connection.directory_names(query.path);
-        if (auto e = fetch(query, {})) return e;
+        if (auto e = fetch(query, {}, entry != nullptr)) return e;
         return entries.find(name)->second.status(name);
     }
     std::error_code lookup(llvm::StringRef name, Entry *&entry) {
@@ -378,25 +450,35 @@ public:
                 // An unpredicted lookup upgrades a partial footprint once.
                 dccfs::DirectoryQuery query;
                 query.path = parent->getKey().str();
-                if (auto e = fetch(query, {leaf.str()})) return e;
+                if (auto e = fetch(query, {leaf.str()}, true)) return e;
                 found = entries.find(name);
             }
         }
         entry = found == entries.end() ? nullptr : &found->second;
         return entry ? entry->error : cachedError(name);
     }
-    std::error_code fetch(dccfs::DirectoryQuery &query, const std::set<std::string> &children) {
-        query.operation = DCC_FS_STAT;
-        if (int e = query.encode(children)) return {e, std::generic_category()};
+    std::error_code fetch(dccfs::DirectoryQuery &query, const std::set<std::string> &children, bool directory) {
+        if (int e = query.encode(children, {}, directory)) return {e, std::generic_category()};
         dccfs::Buffer response;
         if (auto e = connection.request(query.operation, query.bytes, response)) {
+            if (directory && e == std::errc::not_a_directory)
+                return prefetch({{DCC_FS_STATUS, query.path}});
             remember(query.path, e);
             return e;
         }
-        return accept(query, response);
+        std::vector<Query> follow;
+        if (auto error = accept(query, response, follow)) return error;
+        return prefetch(follow);
     }
-    std::error_code accept(const dccfs::DirectoryQuery &query, const dccfs::Buffer &reply) {
+    std::error_code accept(const dccfs::DirectoryQuery &query, const dccfs::Buffer &reply,
+                           std::vector<Query> &follow) {
         if (reply.size < DCC_FS_METADATA) return std::make_error_code(std::errc::protocol_error);
+        // Versioned LSTAT works with every peer. Clang observes stat
+        // semantics, so resolve just the links in one metadata-only batch.
+        if (S_ISLNK(number(reply.data+32, 4))) {
+            follow.push_back({DCC_FS_STATUS, query.path});
+            return {};
+        }
         auto &entry = remember(query.path, reply.data);
         entry.queried = true;
         entry.directory.reset();
@@ -407,6 +489,7 @@ public:
         int e = listing->decode(connection, query, reply, [&](std::string_view leaf, unsigned error, const char *version) {
             auto path = prefix + std::string(leaf);
             if (error) remember(path, {static_cast<int>(error), std::generic_category()});
+            else if (S_ISLNK(number(version+32, 4))) follow.push_back({DCC_FS_STATUS, std::move(path)});
             else remember(path, version);
         });
         if (e) return {e, std::generic_category()};
