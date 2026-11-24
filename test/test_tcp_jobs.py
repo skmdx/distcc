@@ -507,6 +507,40 @@ class GccFrontendTest(BrokerTestCase):
         subprocess.run([self.cc, 'out.o', '-o', 'program'], cwd=self.work, check=True)
         self.assertEqual(subprocess.check_output([str(self.work/'program')]), b'37 hello.c\n')
 
+    def test_include_parent_traversal_exports_only_the_destination(self):
+        self.start_frontend()
+        external = self.root/'walks'
+        outside = external/'lib'/'pkgconfig'
+        target = external/'real'/'deep'
+        for directory in (outside, target, external/'include', external/'real'/'include'):
+            directory.mkdir(parents=True)
+        link = external/'link'
+        link.symlink_to(target, target_is_directory=True)
+        (external/'include'/'plain.h').write_text('#define PLAIN 17\n')
+        (external/'real'/'include'/'linked.h').write_text('#define LINKED 25\n')
+        secret = outside/'private.h'
+        secret.write_text('/* readable on the client */\n')
+        self.source.write_text('#include <plain.h>\n#include <linked.h>\n'
+                               f'#ifdef READ_PRIVATE\n#include "{secret}"\n#endif\n'
+                               'int value(void) { return PLAIN + LINKED; }\n')
+        command = [self.cc, '-nostdinc', '-I'+str(outside/'../../include'),
+                   '-I'+str(link/'../include'), '-c', 'hello.c', '-o', 'out.o']
+        subprocess.run([*command, '-DREAD_PRIVATE'], cwd=self.work, check=True, capture_output=True)
+        output = self.work/'out.o'
+        expected = output.read_bytes()
+        for _ in range(2):
+            output.unlink()
+            self.compile_frontend(command)
+            self.assertEqual(output.read_bytes(), expected)
+        denied = subprocess.run([str(self.build/'distcc'), *command, '-H', '-DREAD_PRIVATE'],
+                                cwd=self.work, env=dict(self.env, LC_ALL='C'),
+                                capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn('pooled TCP job completed', denied.stderr)
+        for header in ('plain.h', 'linked.h'):
+            self.assertRegex(denied.stderr, rf'(?m)^\. .*/{re.escape(header)}$')
+        self.assertIn(f'{secret}: Permission denied', denied.stderr)
+
     def test_driver_resolves_subprograms_with_masquerade_path(self):
         self.start_frontend()
         aliases = self.work/'distcc-masquerade'

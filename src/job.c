@@ -157,10 +157,8 @@ void dcc_job_free(struct dcc_job *job)
         for (char **p = job->rust.environment; *p; ++p) free(*p);
         free(job->rust.environment);
     }
-    if (job->fs_roots) {
-        for (i = 0; job->fs_roots[i]; ++i) free(job->fs_roots[i]);
-        free(job->fs_roots);
-    }
+    if (job->fs_roots) dcc_free_argv(job->fs_roots);
+    if (job->fs_traversals) dcc_free_argv(job->fs_traversals);
     for (i = 0; i < job->count; ++i) {
         free(job->inputs[i].path);
         free(job->inputs[i].target);

@@ -15,11 +15,37 @@
 #include "tcp_job.h"
 #include "frontend_fs.h"
 
-/* Authorization normalizes the spelling, but the syscall keeps the original
- * path: collapsing symlink/.. would change the compiler's lookup semantics. */
-static int normalized(const char *path, char result[PATH_MAX])
+static int append_path(char ***paths, size_t count, char *owned)
+{
+    if (!owned) return -1;
+    char **list = realloc(*paths, (count + 2) * sizeof(*list));
+    if (!list) { free(owned); return -1; }
+    list[count] = owned;
+    list[count + 1] = NULL;
+    *paths = list;
+    return 0;
+}
+
+/* The prefix is normalized up to the directory being left. Keep the entire
+ * suffix from ".." onward: a symlink in the prefix can change its meaning. */
+static int remember_traversal(struct dcc_job *job, const char *prefix, const char *suffix)
+{
+    char *walk;
+    if (asprintf(&walk, "%s/%s", prefix, suffix) < 0) return -1;
+    size_t i = 0;
+    while (job->fs_traversals && job->fs_traversals[i]) {
+        if (!strcmp(job->fs_traversals[i], walk)) { free(walk); return 0; }
+        ++i;
+    }
+    return append_path(&job->fs_traversals, i, walk);
+}
+
+/* Only a client export may record traversal rights. Query normalization is
+ * read-only; the syscall keeps the compiler's original path spelling. */
+static int normalized(const char *path, char result[PATH_MAX], struct dcc_job *export)
 {
     size_t used = 0;
+    int descended = 0;
     while (*path) {
         if (*path == '/') { ++path; continue; }
         const char *part = path;
@@ -27,11 +53,17 @@ static int normalized(const char *path, char result[PATH_MAX])
         size_t size = path - part;
         if (size == 1 && part[0] == '.') continue;
         if (size == 2 && part[0] == '.' && part[1] == '.') {
+            if (export && descended) {
+                result[used] = 0;
+                if (remember_traversal(export, result, part)) return -1;
+            }
+            descended = 0;
             while (used && result[--used] != '/') {}
         } else {
             if (size >= PATH_MAX - used - 1) { errno = ENAMETOOLONG; return -1; }
             result[used++] = '/';
             memcpy(result + used, part, size); used += size;
+            descended = 1;
         }
     }
     if (!used) result[used++] = '/';
@@ -52,15 +84,12 @@ int dcc_frontend_fs_add_root(struct dcc_job *job, const char *path)
         if (n < 0 || n >= (int)sizeof(absolute)) { errno = ENAMETOOLONG; return -1; }
         path = absolute;
     }
-    if (normalized(path, root)) return -1;
+    if (normalized(path, root, job)) return -1;
     size_t count = job->fs_roots ? dcc_argv_len(job->fs_roots) : 0;
     for (size_t i = 0; i < count; ++i)
         if (within(root, job->fs_roots[i])) return 0;
-    char **roots = realloc(job->fs_roots, (count+2)*sizeof(*roots));
-    if (!roots) return -1;
-    job->fs_roots = roots;
-    char *copy = strdup(root);
-    if (!copy) return -1;
+    if (append_path(&job->fs_roots, count, strdup(root))) return -1;
+    char **roots = job->fs_roots;
     /* Keep the authorization frontier minimal. A broad export supersedes
      * its descendants, including roots learned through earlier symlinks. */
     size_t retained = 0;
@@ -68,7 +97,7 @@ int dcc_frontend_fs_add_root(struct dcc_job *job, const char *path)
         if (within(roots[i], root)) free(roots[i]);
         else roots[retained++] = roots[i];
     }
-    roots[retained++] = copy; roots[retained] = NULL;
+    roots[retained++] = roots[count]; roots[retained] = NULL;
     return 0;
 }
 int dcc_frontend_fs_add_roots(struct dcc_job *job, const char *paths)
@@ -88,13 +117,44 @@ failed:
 static int allowed(const struct dcc_job *job, const char *path)
 {
     char name[PATH_MAX];
-    if (normalized(path, name)) return 0;
+    if (normalized(path, name, NULL)) return 0;
     int result = 0;
     for (char **p = job->fs_roots; p && *p; ++p) {
-        if (within(name, *p)) { result = PATH_METADATA | PATH_CONTENTS; break; }
+        if (within(name, *p)) return PATH_METADATA | PATH_CONTENTS;
         if (within(*p, name)) result = PATH_METADATA;
     }
+    /* A normalized name can only match up to the first ".." in a walk. */
+    for (char **p = job->fs_traversals; !result && p && *p; ++p)
+        if (within(*p, name)) return PATH_METADATA;
     return result;
+}
+
+static int authorize_link(struct dcc_job *job, const char *path, int access)
+{
+    char *resolved = realpath(path, NULL);
+    if (!resolved) return 0; /* A dangling link still has a readable target. */
+    char **exports[] = {access & PATH_CONTENTS ? NULL : job->fs_roots, job->fs_traversals};
+    char **aliases = NULL;
+    size_t count = 0, length = strlen(path);
+    int error = 0;
+    /* Snapshot the remaining components before registration changes either
+     * list. Even a fully exported link may have a walk leaving its target. */
+    for (size_t i = 0; i < 2 && !error; ++i) {
+        for (char **p = exports[i]; p && *p; ++p) {
+            if (!within(*p, path)) continue;
+            char *alias;
+            if (asprintf(&alias, "%s%s", resolved, *p + length) < 0 ||
+                append_path(&aliases, count, alias)) { error = errno; break; }
+            ++count;
+        }
+    }
+    if (!error && (access & PATH_CONTENTS) && dcc_frontend_fs_add_root(job, resolved))
+        error = errno;
+    for (size_t i = 0; i < count && !error; ++i)
+        if (dcc_frontend_fs_add_root(job, aliases[i])) error = errno;
+    if (aliases) dcc_free_argv(aliases);
+    free(resolved);
+    return error;
 }
 /* Metadata stays in one owned allocation. File contents are read only when
  * the transport can send its next chunk, without a temporary-file round trip. */
@@ -411,39 +471,7 @@ static int append_query(struct dcc_job *job, const void *data, size_t size,
         ssize_t length = readlink(path, target, sizeof(target));
         if (length < 0 || (size_t)length == sizeof(target)) error = length < 0 ? errno : ENAMETOOLONG;
         else if (append(reply, target, length)) error = errno;
-        else {
-            /* The kernel follows the link before its next FUSE request.
-             * Authorize only targets reached through a client-authorized
-             * link, not arbitrary canonical paths proposed by the worker. */
-            if (access & PATH_CONTENTS) {
-                char *resolved = realpath(path, NULL);
-                if (resolved && dcc_frontend_fs_add_root(job, resolved)) error = ENOMEM;
-                free(resolved);
-            } else {
-                /* A symlink above an export grants only the exports below
-                 * it, rather than every file in the symlink's target. */
-                char *resolved = realpath(path, NULL);
-                if (resolved) {
-                    /* Resolve this hop once. Descendant symlinks remain in
-                     * their original spelling and authorize their own hop
-                     * when the compiler follows them. */
-                    size_t count = dcc_argv_len(job->fs_roots), used = 0;
-                    char **aliases = calloc(count + 1, sizeof(*aliases));
-                    if (!aliases) error = ENOMEM;
-                    for (char **root = job->fs_roots; *root && !error; ++root) {
-                        if (!within(*root, path)) continue;
-                        char alias[PATH_MAX];
-                        int alias_length = snprintf(alias, sizeof(alias), "%s%s", resolved, *root + path_length);
-                        if (alias_length < 0 || alias_length >= (int)sizeof(alias)) error = ENAMETOOLONG;
-                        else if (!(aliases[used++] = strdup(alias))) error = ENOMEM;
-                    }
-                    for (char **alias = aliases; alias && *alias && !error; ++alias)
-                        if (dcc_frontend_fs_add_root(job, *alias)) error = ENOMEM;
-                    if (aliases) dcc_free_argv(aliases);
-                    free(resolved);
-                }
-            }
-        }
+        else error = authorize_link(job, path, access);
     } else error = EINVAL;
 complete:
     if (error) {

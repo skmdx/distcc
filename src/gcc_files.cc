@@ -169,14 +169,15 @@ public:
     int prefetch(const char *cwd, char *const *directories) {
         std::set<std::string> paths, roots;
         auto add = [&](const char *name) {
-            auto path = (std::filesystem::path(cwd)/name).lexically_normal();
-            if (path != path.root_path() && !path.has_filename()) path = path.parent_path();
-            roots.insert(path.string());
-            for (;;) {
+            std::filesystem::path path = "/";
+            paths.insert(path.string());
+            for (const auto &part : (std::filesystem::path(cwd)/name).relative_path()) {
+                if (part.empty() || part == ".") continue;
+                if (part == "..") path = path.parent_path();
+                else path /= part;
                 paths.insert(path.string());
-                if (path == path.root_path()) break;
-                path = path.parent_path();
             }
+            roots.insert(path.string());
         };
         // Native GCC supplied these paths; no command-line option parsing is
         // duplicated here. Lexical spellings are only speculative cache keys:

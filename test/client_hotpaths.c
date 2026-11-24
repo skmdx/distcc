@@ -297,6 +297,8 @@ int main(int argc, char **argv)
     struct dcc_job job = {.cwd = (char *)"/source"};
     assert(!dcc_frontend_fs_add_root(&job, "inc/../include//."));
     assert(!strcmp(job.fs_roots[0], "/source/include"));
+    assert(allowed(&job, "/source/inc") == PATH_METADATA);
+    assert(!allowed(&job, "/source/inc/private"));
     assert(allowed(&job, "/source/./include/a/../b.h") == (PATH_CONTENTS|PATH_METADATA));
     assert(!allowed(&job, "/source/include/../../secret"));
     assert(!allowed(&job, "/source/include-more/header"));
@@ -363,5 +365,6 @@ int main(int argc, char **argv)
     for (int i = 0; i < (bench ? 2000 : 1); ++i) dcc_read_localslots_configuration();
     sample("localslots_four_hosts", &before);
     dcc_free_argv(job.fs_roots);
+    dcc_free_argv(job.fs_traversals);
     return 0;
 }

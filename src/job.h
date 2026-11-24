@@ -45,6 +45,9 @@ struct dcc_job {
     char **llvm_outputs; /* Ordered virtual paths in an LLVM backend job. */
     /* Client-only authorization roots; never accepted from a remote peer. */
     char **fs_roots;
+    /* Client-only spellings at a parent step: metadata up to "..", with
+     * the remaining components retained for symlink traversal. */
+    char **fs_traversals;
     /* Owned stdin snapshot, represented as fd + 1; client-only. */
     int stdin_fd;
     /* Borrowed worker filesystem IPC, represented as fd + 1. */

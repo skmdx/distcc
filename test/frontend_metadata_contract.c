@@ -56,8 +56,8 @@ static void contents(const char *path, const char *text)
     assert(!close(fd));
 }
 
-static struct dcc_frontend_reply query(struct dcc_job *job, const char *path,
-                                      unsigned operation, const unsigned char *previous)
+static struct dcc_frontend_reply query_status(struct dcc_job *job, const char *path,
+                          unsigned operation, const unsigned char *previous, unsigned error)
 {
     size_t length = strlen(path), size = 4 + length;
     int versioned = operation == DCC_FS_LSTAT || (operation == DCC_FS_STAT && previous);
@@ -73,9 +73,15 @@ static struct dcc_frontend_reply query(struct dcc_job *job, const char *path,
     struct dcc_frontend_reply reply = {.fd = -1};
     assert(!dcc_frontend_fs_reply(job, bytes, size, &reply));
     free(bytes);
-    assert(reply.size >= 8 && dcc_tcp_get32(reply.data) == 0);
+    assert(reply.size >= 8 && dcc_tcp_get32(reply.data) == error);
     assert(dcc_tcp_get32(reply.data + 4) == reply.size + reply.file_size - 8);
     return reply;
+}
+
+static struct dcc_frontend_reply query(struct dcc_job *job, const char *path,
+                                      unsigned operation, const unsigned char *previous)
+{
+    return query_status(job, path, operation, previous, 0);
 }
 
 static uint64_t header_size(const struct dcc_frontend_reply *reply)
@@ -216,6 +222,53 @@ static void authorization(const char *root)
     dcc_free_argv(job.fs_roots);
 }
 
+static void check_access(struct dcc_job *job, const char *name, int rights,
+                         unsigned operation, unsigned error)
+{
+    char path[PATH_MAX];
+    assert(snprintf(path, sizeof(path), "%s/%s", job->cwd, name) < (int)sizeof(path));
+    assert(allowed(job, path) == rights);
+    struct dcc_frontend_reply reply = query_status(job, path, operation, NULL, error);
+    if (error) assert(reply.size == 8 && reply.fd == -1);
+    if (!error && rights == PATH_METADATA && operation == DCC_FS_LSTAT)
+        assert(reply.size == 8 + DCC_FS_METADATA); /* No directory entries. */
+    dcc_frontend_fs_clear(&reply);
+}
+
+static void parent_traversal(const char *root)
+{
+    int cwd = open(".", O_DIRECTORY | O_CLOEXEC);
+    assert(cwd >= 0 && !chdir(root));
+    assert(!mkdir("outside", 0700) && !mkdir("outside/pkg", 0700));
+    assert(!mkdir("real", 0700) && !mkdir("real/deep", 0700));
+    assert(!mkdir("real/include", 0700) && !mkdir("real/private", 0700));
+    assert(!symlink("real/deep", "via"));
+    contents("outside/pkg/secret", "private");
+    contents("real/deep/secret", "private");
+    contents("real/include/header", "public");
+    assert(!fchdir(cwd) && !close(cwd));
+
+    struct dcc_job job = {.cwd = (char *)root};
+    assert(!dcc_frontend_fs_add_root(&job, "include"));
+    assert(!dcc_frontend_fs_add_root(&job, "outside/pkg/../../via/../include"));
+    assert(dcc_argv_len(job.fs_roots) == 1);
+    check_access(&job, "outside", PATH_METADATA, DCC_FS_LIST, EACCES);
+    check_access(&job, "outside/pkg", PATH_METADATA, DCC_FS_LSTAT, 0);
+    check_access(&job, "outside/pkg", PATH_METADATA, DCC_FS_LIST, EACCES);
+    check_access(&job, "outside/pkg/secret", 0, DCC_FS_READ, EACCES);
+    check_access(&job, "real/include/header", 0, DCC_FS_READ, EACCES);
+    check_access(&job, "via", PATH_METADATA, DCC_FS_READLINK, 0);
+    check_access(&job, "real", PATH_METADATA, DCC_FS_LIST, EACCES);
+    check_access(&job, "real/deep", PATH_METADATA, DCC_FS_LSTAT, 0);
+    check_access(&job, "real/deep", PATH_METADATA, DCC_FS_LIST, EACCES);
+    check_access(&job, "real/deep/secret", 0, DCC_FS_READ, EACCES);
+    check_access(&job, "real/private", 0, DCC_FS_LIST, EACCES);
+    check_access(&job, "real/include", PATH_METADATA | PATH_CONTENTS, DCC_FS_LIST, 0);
+    check_access(&job, "real/include/header", PATH_METADATA | PATH_CONTENTS, DCC_FS_READ, 0);
+    dcc_free_argv(job.fs_roots);
+    dcc_free_argv(job.fs_traversals);
+}
+
 static void empty_footprint(struct dcc_job *job, const char *path)
 {
     unsigned char request[PATH_MAX + 5 + DCC_FS_METADATA] = {0};
@@ -289,6 +342,7 @@ int main(int argc, char **argv)
     assert(!mkdir(directory_path, 0755));
     contents(header, "one");
     authorization(argv[1]);
+    parent_traversal(argv[1]);
     char *roots[] = {argv[1], NULL};
     struct dcc_job job = {.fs_roots = roots};
     clang_directory(&job, argv[1]);
