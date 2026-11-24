@@ -538,30 +538,73 @@ class RustTest(BrokerTestCase):
         self.assertEqual(subprocess.check_output([output], text=True), 'patch\n')
 
     def test_host_feature_capture_respects_the_allowed_cores(self):
-        cpus = sorted(os.sched_getaffinity(0))[:2]
-        if len(cpus) != 2:
+        cpus = sorted(os.sched_getaffinity(0))[:3]
+        if len(cpus) < 2:
             self.skipTest('requires two allowed CPUs')
-        # Exercise the real preload's pinning and LLVM ABI on a homogeneous
-        # test machine. Only the per-core answer from LLVM is substituted.
+        flags = ['-Ctarget-cpu=native', '--print=cfg']
+        native = str(self.build/'distcc-rust-native.so')
+        capture = dict(self.env, LD_PRELOAD=native, DISTCC_RUST_NATIVE=str(self.work),
+                       DISTCC_RUST_NATIVE_CAPTURE='1', RUSTC_BOOTSTRAP='')
+        def cfg(env, cpu):
+            result = self.rust(*flags, remote=False, env=env, prefix=['taskset', '-c', str(cpu)])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return set(re.findall(r'^target_feature="([^"]+)"$', result.stdout, re.M))
+
+        stable = cfg(capture, cpus[0])
+        raw = (self.work/'features').read_text().split(',')
+        enabled = {f[1:] for f in raw if f.startswith('+')}
+        toggles = sorted(stable & enabled)
+        llvm_names = {f[1:] for f in raw}
+        hidden = 'sgx' if 'sgx' in llvm_names else min(enabled - stable, default=None)
+        if len(toggles) < 2 or not hidden:
+            self.skipTest('requires two native cfg features and an LLVM-only feature')
+        left, right = toggles[:2]
+        extra = '+' + hidden
+        if 'ermsb' in llvm_names:
+            extra += ',+ermsb'
+        # Only LLVM's per-core answer changes. rustc itself determines which
+        # cfg features each profile enables, including CPU defaults and implications.
         source = self.work/'features.c'
-        source.write_text('#define _GNU_SOURCE\n#include <unistd.h>\n#include <sys/syscall.h>\n#include <string.h>\n'
-                          'char *LLVMGetHostCPUFeatures(void) { unsigned cpu; syscall(SYS_getcpu, &cpu, 0, 0); '
-                          'return strdup(cpu == '
-                          f'{cpus[0]} ? "+left,+common,-right" : "-left,+right,+common"); }}')
+        source.write_text('#define _GNU_SOURCE\n#include <sched.h>\n#include <string.h>\n'
+                          'char *LLVMGetHostCPUFeatures(void) { return strdup(sched_getcpu() == '
+                          f'{cpus[0]} ? "+{left},-{right},{extra}" : "-{left},+{right},{extra}"); }}')
         shim = self.work/'features.so'
         subprocess.run(['cc','-fPIC','-shared',source,'-o',shim], check=True)
-        output = self.work/'features'
-        preload = str(self.build/'distcc-rust-native.so') + ':' + str(shim)
-        for mask, union, expected in [(cpus, False, 'common'), (cpus, True, 'common,left,right'),
-                                      (cpus[:1], True, 'common,left')]:
-            with self.subTest(mask=mask, union=union):
-                env = dict(self.env, LD_PRELOAD=preload, DISTCC_RUST_HOST_PROFILE=str(output),
-                           DISTCC_RUST_HOST_UNION=str(int(union)))
-                result = self.rust('-Ctarget-cpu=native', '--print=cfg', remote=False, env=env,
-                                   prefix=['taskset', '-c', ','.join(map(str,mask))])
+        sets, profiles = {}, {}
+        for cpu in cpus:
+            sets[cpu] = cfg(dict(capture, LD_PRELOAD=native+':'+str(shim)), cpu)
+            profiles[cpu] = tuple((self.work/name).read_text() for name in ('cpu', 'features'))
+        if sets[cpus[0]] == sets[cpus[1]]:
+            self.skipTest('rustc does not distinguish the two native profiles on this target')
+        self.assertNotIn(hidden, set.union(*sets.values()))
+
+        library = self.build_pure_macro()
+        consumer = self.work/'consumer.rs'
+        consumer.write_text('extern crate macros; pub const N: u32 = macros::answer!();')
+        self.start_broker(self.host(1, f',tcp,stats={self.stats_ports[1]}'), name='cfg-union')
+        daemon = self.work/'pinned-worker'
+        has_strace = shutil.which('strace')
+        trace = self.work/'cfg.trace'
+        trace_args = [has_strace, '-f', '-e', 'execve', '-o', str(trace)] if has_strace else []
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        for mask in (cpus, cpus[:1], cpus[1:]):
+            with self.subTest(mask=mask):
+                pin = ['taskset', '-c', ','.join(map(str, mask))]
+                daemon.write_text('#!/bin/sh\nexec ' + shlex.join([*pin, str(self.build/'distccd')]) + ' "$@"\n')
+                daemon.chmod(0o755)
+                self.restart_server(daemon, LD_PRELOAD=str(shim), DISTCCD_RUSTC=self.rustc, RUSTC_BOOTSTRAP='1')
+                stats = self.get_stats(self.stats_ports[0])
+                common = set.intersection(*(sets[cpu] for cpu in mask))
+                self.assertRegex(stats, r'(?m)^dcc_rust_host_features ' +
+                                 re.escape(','.join(sorted(common)) or '-') + r' [0-9a-f]+$')
+                result = self.rust('--crate-type=rlib', consumer, '--extern', 'macros='+str(library),
+                                   env=dict(self.env, LD_PRELOAD=str(shim), RUSTC_BOOTSTRAP='1'),
+                                   prefix=[*pin, *trace_args])
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(output.read_text(), expected)
-                output.unlink()
+                required = set.union(*(sets[cpu] for cpu in mask))
+                self.assertIn(' requires ' + (','.join(sorted(required)) or '-') + '\n', result.stderr)
+                if has_strace:
+                    self.assertEqual(trace.read_text().count('"--print=cfg"'), len({profiles[cpu] for cpu in mask}))
 
     def test_proc_macro_requires_host_features_only_for_whole_crates(self):
         self.cgu_toolchain()
@@ -574,8 +617,9 @@ class RustTest(BrokerTestCase):
         for group in record[1].split(';'):
             names, *keys = group.split()
             self.assertTrue(keys)
-            groups.append(' '.join([','.join(names.split(',')[1:]) or '-', *keys]))
-        narrow = self.peer(actual.replace(record[0], 'dcc_rust_host_features '+';'.join(groups)).encode())
+            if names != '-':
+                groups.append(' '.join([','.join(names.split(',')[1:]) or '-', *keys]))
+        narrow = self.peer(actual.replace(record[0], 'dcc_rust_host_features '+(';'.join(groups) or '-')).encode())
         a = self.host(0, f',tcp,stats={narrow.port},speed=100', slots=1)
         b = self.host(1, f',tcp,stats={self.stats_ports[1]},speed=0.1', slots=1)
         macro = self.work/'maker.rs'
@@ -583,12 +627,16 @@ class RustTest(BrokerTestCase):
                          'pub fn number(_: proc_macro::TokenStream) -> proc_macro::TokenStream '
                          '{ "42".parse().unwrap() }')
         plugin = self.work/'libmaker.so'
-        built = self.rust(macro, '--crate-type=proc-macro', '-Ctarget-cpu=native', '-o', plugin, remote=False)
-        self.assertEqual(built.returncode, 0, built.stderr)
         main = self.work/'main.rs'
         program = self.work/'program'
         args = ['-Copt-level=2','-Ccodegen-units=1',main,'-o',program]
         self.start_broker(a+' '+b, name='host-features')
+        before = self.completed_jobs()
+        built = self.rust(macro, '--crate-type=proc-macro', '-Ctarget-cpu=native', '-o', plugin)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        self.assertNotIn('proc-macro host ABI', built.stderr)
+        self.assertIn('distcc-rust: compiled on', built.stderr)
+        self.assertEqual(self.completed_jobs(), [before[0]+1,before[1]])
         main.write_text('fn main() { assert_eq!(std::hint::black_box(42), 42); }')
         before = self.completed_jobs()
         plain = self.rust(*args)
@@ -1848,7 +1896,7 @@ class RustTest(BrokerTestCase):
         library = self.work / 'libmacros.so'
         result = self.rust('--crate-type=proc-macro', source, '-o', library)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('proc-macro host ABI', result.stderr)
+        self.assertNotIn('proc-macro host ABI', result.stderr)
         self.assertIn('compiled on', result.stderr)
         return library
 

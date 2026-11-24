@@ -260,7 +260,7 @@ struct Invocation {
     std::set<fs::path> inputs, search, native_search, dirs;
     std::map<fs::path, fs::path> observed;
     std::set<string> libraries;
-    bool trace_macro = false, needs_host = false, static_archive = false, pipeline = false;
+    bool trace_macro = false, loads_host_code = false, static_archive = false, pipeline = false;
     bool multi_cgu = true, incremental = false, linker_plugin_lto = false, explicit_linker = false;
     Words compiler_flags;
     string metadata_name;
@@ -333,7 +333,6 @@ struct Invocation {
             if (k == "--crate-type") {
                 for (auto &type : split(v, ',')) {
                     types.push_back(type);
-                    needs_host |= type == "proc-macro";
                     native_link |= type == "bin" || type == "cdylib" || type == "dylib" || type == "proc-macro";
                     static_archive |= type == "staticlib";
                 }
@@ -477,7 +476,7 @@ struct Invocation {
         {
             ProbeSlot slot;
             envs["DISTCC_RUST_SYSROOT"] = root;
-            if (run_probe(cmd, envs, staging, trace_macro, quiet.fd, {loads.fd}))
+            if (run_probe(cmd, envs, staging, trace_macro, quiet.fd, quiet.fd, {loads.fd}))
                 throw Local(trace_macro ? "isolated dependency expansion failed" : "dependency expansion failed");
         }
         for (const auto &dir : native_search) {
@@ -532,8 +531,8 @@ struct Invocation {
         }
         if (!any)
             throw Local("empty dependency records");
-        needs_host |= audit(depfile, loads.fd, root, search, inputs, dirs, observed, env_keys);
-        if (needs_host) {
+        loads_host_code = audit(depfile, loads.fd, root, search, inputs, dirs, observed, env_keys);
+        if (loads_host_code || std::find(types.begin(), types.end(), "proc-macro") != types.end()) {
             // Cargo's crate context may also be enumerated directly, without getenv.
             env_keys.insert("OUT_DIR");
             for (char **p = environ; *p; ++p)
@@ -679,7 +678,7 @@ string profile(const fs::path &compiler, const Work &work, const States &tool,
     auto library = native_library();
     auto watched = tool;
     watched.emplace(library, metadata(library));
-    auto prefix = mode == CpuProfile::HostUnion ? "host-union:" : "native:";
+    auto prefix = mode == CpuProfile::HostUnion ? "host-cfg-union:" : "native:";
     auto context = prefix + profile_context(compiler) + '\0' + library.string() + '\0' +
                    read("/proc/sys/kernel/random/boot_id") + affinity_key();
     return memo(context, watched, [&] {
@@ -1203,7 +1202,7 @@ int distributed(char **original, const Words &args, const States &responses) {
     clock_gettime(CLOCK_REALTIME, &start);
     try {
         inv.discover(exe, root, work);
-        if (inv.needs_host) {
+        if (inv.loads_host_code) {
             auto required = profile(exe, work, tool, CpuProfile::HostUnion);
             if (required.empty() || required.size() >= sizeof(hint.rust_host_features))
                 throw Local("cannot represent required Rust host instruction set");
@@ -1213,8 +1212,8 @@ int distributed(char **original, const Words &args, const States &responses) {
         return refused(reason);
     }
     string host = field(version, "host: ");
-    if (inv.needs_host && env("DISTCC_VERBOSE") == "1")
-        fprintf(stderr, "distcc-rust: proc-macro host ABI %s\n", host.c_str());
+    if (inv.loads_host_code && env("DISTCC_VERBOSE") == "1")
+        fprintf(stderr, "distcc-rust: proc-macro host ABI %s requires %s\n", host.c_str(), hint.rust_host_features);
     job.rust.host = host.data();
     job.rust.cpu = cpu.data();
     job.rust.features = features.data();

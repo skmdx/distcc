@@ -12,14 +12,14 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <link.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <set>
-#include <algorithm>
-#include <sstream>
+#include <utility>
 #include "affinity.hh"
 
 namespace {
@@ -40,16 +40,6 @@ template<typename T> T original(const char *name)
 struct Profile {
     std::string directory;
     bool capture;
-
-    Profile()
-    {
-        const char *path = std::getenv("DISTCC_RUST_NATIVE");
-        if (!path)
-            fail("missing profile directory");
-        directory = path;
-        const char *mode = std::getenv("DISTCC_RUST_NATIVE_CAPTURE");
-        capture = mode && std::strcmp(mode, "1") == 0;
-    }
 
     void write(const char *name, const std::string &value) const
     {
@@ -72,26 +62,32 @@ struct Profile {
     }
 };
 
-const Profile &profile()
+llvm::StringRef host_cpu_name()
 {
-    static const Profile value;
+    return original<llvm::StringRef (*)()>("_ZN4llvm3sys14getHostCPUNameEv")();
+}
+
+std::string host_features()
+{
+    char *raw = original<char *(*)()>("LLVMGetHostCPUFeatures")();
+    if (!raw)
+        fail("LLVMGetHostCPUFeatures returned null");
+    std::string value(raw);
+    original<void (*)(char *)>("LLVMDisposeMessage")(raw);
     return value;
 }
 
-// rustc's own native query selects this slot's LLVM and runs after startup.
-void capture_host_features(const char *path)
+// Both hooks replay profile 0 in this rustc, even if its thread migrates
+// after we restore the allowed mask.
+Profile capture_host_profiles(const std::string &directory)
 {
-    auto get = original<char *(*)()>("LLVMGetHostCPUFeatures");
-    auto dispose = original<void (*)(char *)>("LLVMDisposeMessage");
     auto mask = rust::affinity();
     if (mask.empty()) fail("cannot determine CPU affinity");
     auto size = mask.size() * sizeof(mask[0]);
     auto allowed = reinterpret_cast<cpu_set_t *>(mask.data());
     rust::CpuMask one(mask.size());
     auto pin = reinterpret_cast<cpu_set_t *>(one.data());
-    const char *mode = std::getenv("DISTCC_RUST_HOST_UNION");
-    bool first = true, intersection = !mode || std::strcmp(mode, "1") != 0;
-    std::set<std::string> result;
+    std::set<std::pair<std::string, std::string>> profiles;
     for (size_t cpu = 0; cpu < size * 8; ++cpu) {
         if (!CPU_ISSET_S(cpu, size, allowed))
             continue;
@@ -99,33 +95,30 @@ void capture_host_features(const char *path)
         CPU_SET_S(cpu, size, pin);
         if (sched_setaffinity(0, size, pin))
             fail("cannot pin host feature probe");
-        char *raw = get();
-        if (!raw || !*raw)
-            fail("LLVM host feature list unavailable");
-        std::istringstream stream(raw);
-        dispose(raw);
-        std::set<std::string> current;
-        for (std::string token; std::getline(stream, token, ',');)
-            if (token.size() > 1 && token.front() == '+')
-                current.insert(token.substr(1));
-        if (first || !intersection)
-            result.insert(current.begin(), current.end());
-        else {
-            std::set<std::string> common;
-            std::set_intersection(result.begin(), result.end(), current.begin(), current.end(),
-                                  std::inserter(common, common.end()));
-            result.swap(common);
+        auto [entry, inserted] = profiles.emplace(host_cpu_name().str(), host_features());
+        if (inserted) {
+            Profile p{directory + '/' + std::to_string(profiles.size() - 1), false};
+            if (mkdir(p.directory.c_str(), 0700))
+                fail("cannot create host profile directory");
+            p.write("cpu", entry->first);
+            p.write("features", entry->second);
         }
-        first = false;
     }
-    if (first || sched_setaffinity(0, size, allowed))
+    if (profiles.empty() || sched_setaffinity(0, size, allowed))
         fail("cannot restore host feature probe affinity");
-    std::ofstream file(path);
-    if (result.empty()) file << '-';
-    for (auto it = result.begin(); it != result.end(); ++it)
-        file << (it == result.begin() ? "" : ",") << *it;
-    file.close();
-    if (!file) fail("cannot write host features");
+    return {directory + "/0", false};
+}
+
+const Profile &profile()
+{
+    static const Profile value = [] {
+        std::string path = std::getenv("DISTCC_RUST_NATIVE");
+        const char *mode = std::getenv("DISTCC_RUST_NATIVE_CAPTURE");
+        if (mode && std::strcmp(mode, "host") == 0)
+            return capture_host_profiles(path);
+        return Profile{path, mode && std::strcmp(mode, "1") == 0};
+    }();
+    return value;
 }
 }
 
@@ -133,11 +126,11 @@ namespace llvm::sys {
 StringRef getHostCPUName()
 {
     if (!std::getenv("DISTCC_RUST_NATIVE"))
-        return original<StringRef (*)()>("_ZN4llvm3sys14getHostCPUNameEv")();
+        return host_cpu_name();
     static const std::string cpu = [] {
         const auto &p = profile();
         if (p.capture) {
-            auto value = original<StringRef (*)()>("_ZN4llvm3sys14getHostCPUNameEv")().str();
+            auto value = host_cpu_name().str();
             p.write("cpu", value);
             return value;
         }
@@ -151,20 +144,12 @@ StringRef getHostCPUName()
 
 extern "C" char *LLVMGetHostCPUFeatures()
 {
-    if (const char *path = std::getenv("DISTCC_RUST_HOST_PROFILE")) {
-        static const bool captured = (capture_host_features(path), true);
-        (void)captured;
-    }
     if (!std::getenv("DISTCC_RUST_NATIVE"))
         return original<char *(*)()>("LLVMGetHostCPUFeatures")();
     static const std::string features = [] {
         const auto &p = profile();
         if (p.capture) {
-            char *raw = original<char *(*)()>("LLVMGetHostCPUFeatures")();
-            if (!raw)
-                fail("LLVMGetHostCPUFeatures returned null");
-            std::string value(raw);
-            original<void (*)(char *)>("LLVMDisposeMessage")(raw);
+            auto value = host_features();
             p.write("features", value);
             return value;
         }

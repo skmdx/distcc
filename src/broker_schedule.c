@@ -295,9 +295,8 @@ static int pipeline_slots(const struct dcc_hostdef *host, int lanes)
     return staging < DCC_TCP_PIPELINE ? staging : DCC_TCP_PIPELINE;
 }
 
-/* Both lists use sorted LLVM names. Match complete tokens, including x86
- * families whose names are prefixes of other features. An absent offer
- * cannot authorize loading client code. */
+/* Match complete, sorted rustc target_feature names. Loading client code
+ * requires a verified offer even when the required feature set is empty. */
 static int compatible_rust_host(const char *required, const char *offered)
 {
     if (!*required) return 1;

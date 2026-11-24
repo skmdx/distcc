@@ -76,42 +76,72 @@ void Sandbox::command(const Words &argv) {
     args.insert(args.end(), {"--remount-ro", "/", "--"});
     args.insert(args.end(), argv.begin(), argv.end());
 }
-int run_probe(const Words &cmd, Env envs, const fs::path &outputs, bool isolate, int diagnostics,
+int run_probe(const Words &cmd, Env envs, const fs::path &outputs, bool isolate, int out, int err,
               std::vector<int> inherited) {
     envs["LD_PRELOAD"] = native_library().string() + " " + env("LD_PRELOAD");
     // Portage can trace rustc without forwarding LD_PRELOAD. Install the
     // instrumentation and caller's preload together at the confined exec.
     if (!isolate && env("SANDBOX_ON") != "1")
-        return run(cmd, envs, diagnostics, diagnostics, &inherited);
+        return run(cmd, envs, out, err, &inherited);
     Sandbox box(Root::Host);
     box.mount(outputs, outputs, true);
     for (auto &[k,v] : envs) box.args.insert(box.args.end(), {"--setenv", k, v});
     box.command(cmd);
     inherited.push_back(box.filter.fd);
-    return run(box.args, {}, diagnostics, diagnostics, &inherited);
+    return run(box.args, {}, out, err, &inherited);
 }
 string capture_cpu_profile(const fs::path &compiler, const Work &work, CpuProfile mode) {
-    auto path = work.dir / "host-features";
-    Env settings;
-    if (mode == CpuProfile::Target)
-        settings = {{"DISTCC_RUST_NATIVE", work.dir}, {"DISTCC_RUST_NATIVE_CAPTURE", "1"}};
-    else
-        settings = {{"DISTCC_RUST_HOST_PROFILE", path},
-                    {"DISTCC_RUST_HOST_UNION", mode == CpuProfile::HostUnion ? "1" : "0"}};
     auto cmd = compiler_command(compiler);
     cmd.insert(cmd.end(), {"-Ctarget-cpu=native", "--print=cfg"});
-    Fd quiet(dcc_job_memfd("rust-native-diagnostics"));
-    int status = run_probe(cmd, settings, work.dir, false, quiet.fd);
-    if (mode != CpuProfile::Target) {
-        if (status || !fs::is_regular_file(path))
-            throw Local("cannot determine rustc host instruction set: " + contents(quiet.fd));
-        return read(path);
+    auto probe = [&](const fs::path &dir, const char *capture) {
+        Env settings{{"DISTCC_RUST_NATIVE", dir}, {"DISTCC_RUST_NATIVE_CAPTURE", capture}};
+        if (mode != CpuProfile::Target)
+            settings["RUSTC_BOOTSTRAP"] = ""; // Use rustc's normal target_feature vocabulary.
+        Fd out(dcc_job_memfd("rust-native-cfg")), err(dcc_job_memfd("rust-native-diagnostics"));
+        int status = run_probe(cmd, settings, work.dir, false, out.fd, err.fd);
+        if (status) {
+            if (mode != CpuProfile::Target)
+                throw Local("cannot determine rustc host instruction set: " + contents(err.fd));
+            throw std::runtime_error("native CPU discovery failed (" + std::to_string(status) + "): " +
+                                     contents(err.fd));
+        }
+        return contents(out.fd);
+    };
+    if (mode == CpuProfile::Target) {
+        probe(work.dir, "1");
+        if (!fs::is_regular_file(work.dir / "cpu") || !fs::is_regular_file(work.dir / "features"))
+            throw std::runtime_error("rustc did not report its native CPU and features");
+        return read(work.dir / "cpu") + '\0' + read(work.dir / "features");
     }
-    if (status)
-        throw std::runtime_error("native CPU discovery failed (" + std::to_string(status) + "): " +
-                                 contents(quiet.fd));
-    if (!fs::is_regular_file(work.dir / "cpu") || !fs::is_regular_file(work.dir / "features"))
-        throw std::runtime_error("rustc did not report its native CPU and features");
-    return read(work.dir / "cpu") + '\0' + read(work.dir / "features");
+
+    Work profiles(work.dir);
+    auto cfg = probe(profiles.dir, "host");
+    std::set<string> result;
+    for (size_t i = 0; ; ++i) {
+        auto dir = profiles.dir / std::to_string(i);
+        if (i) {
+            if (!fs::exists(dir)) break;
+            cfg = probe(dir, "0");
+        }
+        if (!fs::is_regular_file(dir / "cpu-used") || !fs::is_regular_file(dir / "features-used"))
+            throw Local("rustc did not consume the native host profile");
+        std::set<string> current;
+        const string prefix = "target_feature=\"";
+        for (const auto &line : split(cfg, '\n'))
+            if (line.size() > prefix.size() + 1 && line.compare(0, prefix.size(), prefix) == 0 &&
+                line.back() == '"')
+                current.insert(line.substr(prefix.size(), line.size() - prefix.size() - 1));
+        if (i == 0 || mode == CpuProfile::HostUnion) {
+            result.insert(current.begin(), current.end());
+        } else {
+            std::set<string> common;
+            std::set_intersection(result.begin(), result.end(), current.begin(), current.end(),
+                                  std::inserter(common, common.end()));
+            result.swap(common);
+        }
+    }
+    string list;
+    for (const auto &name : result) list += (list.empty() ? "" : ",") + name;
+    return list.empty() ? "-" : list;
 }
 } // namespace rust

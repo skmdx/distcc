@@ -199,12 +199,13 @@ The worker receives defined environment variables read through `getenv` or
 `CARGO_*` crate context and `OUT_DIR` for environment enumeration. The worker
 owns loader, sandbox, jobserver and compiler-wrapper settings. Crates with an
 explicit rustc environment dependency on one of these settings compile on the client.
-A whole-crate job that produces or loads a procedural macro also requires the
-worker's compiler to advertise every LLVM host CPU feature available on any
-allowed client core. Each compiler advertises the intersection across its
-allowed worker cores. If no worker qualifies, the client expands the macro and
-uses compatible CGU workers when available. Ordinary crates require only the
-matching compiler.
+When the dependency pass observes a client library being loaded, whole-crate
+execution also requires every `target_feature` reported by
+`rustc -Ctarget-cpu=native --print=cfg` across the allowed client cores.
+Each worker compiler advertises the features common to all its allowed cores.
+If no worker qualifies, the client expands the macro and uses compatible CGU
+workers when available. A job that only produces a procedural macro can use
+any worker with a matching compiler.
 The journal also discovers regular files in the Cargo package directory, Cargo's
 registry source cache and the Portage work directory. A symlink in the path to
 one of these directories preserves access to the same source tree.
