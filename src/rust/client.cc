@@ -3,6 +3,7 @@
 #include "rust/api.h"
 #include "helpers.h"
 #include "rust/common.hh"
+#include "rust/driver_elf.hh"
 #include "rust/probe.h"
 #include "rust/response.hh"
 #include "rust/cgu_transport.h"
@@ -975,63 +976,114 @@ std::optional<int> try_local_frontend(const Invocation &inv, char **original, co
     lease.id = -1;
     return status;
 }
+struct CguBackend {
+    string target;
+    fs::path host;
+    Env environment;
+};
 struct CguRoute {
-    fs::path shim;
+    CguBackend backend;
     int cgu_peers = 0;
     int native_peers = 0;
 };
-fs::path linked_llvm(const fs::path &binary, const Words &command) {
+struct Libraries {
+    fs::path llvm, driver;
+    string entry, tls;
+};
+Libraries linked_libraries(const fs::path &binary, bool compiler) {
     States dependencies{{binary, metadata(binary)}};
-    return memo("linked-llvm:" + profile_context(binary) + '\0' + env("SANDBOX_ON"), dependencies, [&] {
-        Fd output(dcc_job_memfd("rust-llvm-library"));
-        if (run(command, {{"LD_TRACE_LOADED_OBJECTS", "1"}}, output.fd, 2))
-            throw std::runtime_error("LLVM loader query failed: " + binary.string());
-        for (const auto &line : split(contents(output.fd), '\n')) {
-            auto start = line.find(" => /"), end = line.rfind(" (");
-            if (line.compare(0, 8, "\tlibLLVM") == 0 && start != string::npos && end != string::npos) {
-                auto library = line.substr(start + 4, end - start - 4);
-                dependencies.emplace(library, metadata(library));
-                return library;
+    auto record = memo("driver-libraries:" + profile_context(binary) + '\0' + env("SANDBOX_ON") + '\0' +
+                       env("SANDBOX_METHOD"), dependencies, [&]() -> string {
+        string needed, entry;
+        if (compiler) {
+            // A copied toolchain can require its bundled dynamic loader. Leave
+            // it on the ordinary compiler path, as with opaque compiler proxies.
+            if (compiler_command(binary).size() != 1)
+                return {};
+            try {
+                std::tie(needed, entry) = DriverElf(binary).driver_import();
+            } catch (const UnsupportedElf &) {
+                return {};
             }
         }
-        return string{};
+        Fd output(dcc_job_memfd("rust-llvm-library"));
+        if (run({binary}, {{"LD_TRACE_LOADED_OBJECTS", "1"}}, output.fd, output.fd))
+            return {};
+        string llvm, driver;
+        for (const auto &line : split(contents(output.fd), '\n')) {
+            auto start = line.find(" => /"), end = line.rfind(" (");
+            if (start == string::npos || end == string::npos || end <= start + 4)
+                continue;
+            auto library = line.substr(start + 4, end - start - 4);
+            if (line.compare(0, 8, "\tlibLLVM") == 0)
+                llvm = library;
+            else if (compiler && line.substr(0, start) == '\t' + needed)
+                driver = library;
+            else
+                continue;
+            dependencies.emplace(library, metadata(library));
+        }
+        if (!compiler)
+            return llvm;
+        if (driver.empty() || llvm.empty())
+            return {};
+        try {
+            auto a = DriverElf(driver).tls_size(), b = DriverElf(llvm).tls_size();
+            constexpr uint64_t padding = 32768 + 4095;
+            if (a > UINT64_MAX - padding || b > UINT64_MAX - padding - a)
+                return {};
+            auto tls = std::max<uint64_t>(65536, (a + b + padding) & ~uint64_t(4095));
+            return llvm + '\0' + driver + '\0' + entry + '\0' + std::to_string(tls);
+        } catch (const UnsupportedElf &) {
+            return {};
+        }
     });
+    auto fields = split(record, '\0');
+    if (!compiler && fields.size() == 1)
+        return {fields[0], {}, {}, {}};
+    if (compiler && fields.size() == 4)
+        return {fields[0], fields[1], fields[2], fields[3]};
+    return {};
 }
-string probe_cgu(const fs::path &compiler, const fs::path &shim) {
-    Fd reply(dcc_job_memfd("rust-cgu-probe")), quiet(dcc_job_memfd("rust-cgu-version"));
-    auto cmd = compiler_command(compiler);
-    cmd.push_back("--version");
-    const std::vector<int> inherited{reply.fd};
-    int rc = run(cmd, {{"DISTCC_RUST_CGU_PROBE", std::to_string(reply.fd)},
-                       {"LD_PRELOAD", shim.string() + " " + env("LD_PRELOAD")}}, quiet.fd, quiet.fd, &inherited);
-    if (rc) {
-        auto reason = "compiler probe exited " + std::to_string(rc);
+Env driver_environment(const Libraries &libs) {
+    auto previous = env("GLIBC_TUNABLES");
+    string setting = "glibc.rtld.optional_static_tls=";
+    string tunables;
+    for (const auto &item : split(previous, ':'))
+        if (!item.empty() && item.rfind(setting, 0) != 0)
+            tunables += item + ':';
+    return {{"DISTCC_RUST_CGU_DRIVER", libs.driver}, {"DISTCC_RUST_CGU_ENTRY", libs.entry},
+            {"GLIBC_TUNABLES", tunables + setting + libs.tls}, {"DISTCC_RUST_CGU_PREV_TUNABLES", previous}};
+}
+string probe_cgu(const fs::path &compiler, const CguBackend &backend) {
+    auto vars = backend.environment;
+    for (bool version : {true, false}) {
+        Fd reply(dcc_job_memfd("rust-cgu-probe")), quiet(dcc_job_memfd("rust-cgu-output"));
+        const std::vector<int> inherited{reply.fd};
+        vars["DISTCC_RUST_CGU_PROBE"] = std::to_string(reply.fd);
+        int rc = run({compiler, version ? "--version" : "--distcc-cgu-probe-invalid"}, vars,
+                     quiet.fd, quiet.fd, &inherited, backend.host);
+        auto result = contents(reply.fd);
+        if (result.rfind("err:", 0) == 0 && result.back() == '\n')
+            return "incompatible LLVM ABI: " + result.substr(4, result.size() - 5);
         auto output = contents(quiet.fd);
-        constexpr char whitespace[] = " \t\r\n\f\v";
-        auto first = output.find_first_not_of(whitespace);
-        if (first != string::npos)
-            reason += ": " + output.substr(first, output.find_last_not_of(whitespace) - first + 1);
-        return reason;
+        bool banner = output.rfind("rustc ", 0) == 0 || output.find("\nrustc ") != string::npos;
+        if (rc != (version ? 0 : 1) || result != "ok\n" || (version && !banner)) {
+            while (!output.empty() && isspace(static_cast<unsigned char>(output.back())))
+                output.pop_back();
+            return "rustc driver probe exited " + std::to_string(rc) + ": " + output;
+        }
     }
-    auto result = contents(reply.fd);
-    if (result.empty())
-        return "CGU preload did not reach rustc (LD_PRELOAD stripped)";
-    if (result == "ok\n")
-        return string{};
-    if (result.rfind("err:", 0) == 0 && result.back() == '\n')
-        return "incompatible LLVM ABI: " + result.substr(4, result.size() - 5);
-    return "invalid CGU preload probe reply";
+    return {};
 }
-struct CguBackend {
-    string target;
-    fs::path shim;
-};
 CguBackend select_cgu(const fs::path &compiler, const fs::path &sysroot, const string &llvm, const string &triple) {
-    auto binary = sysroot / "bin/rustc";
+    auto frontend = linked_libraries(compiler, true);
+    if (frontend.driver.empty())
+        return {};
     for (const auto &helper : backend_helpers(sysroot, llvm)) {
-        auto shim = helper.parent_path() / "distcc-rust-cgu.so";
+        auto host = helper.parent_path() / "distcc-rust-cgu-driver";
         auto impl = helper.parent_path() / "distcc-rust-cgu-llvm.so";
-        if (!fs::is_regular_file(shim) || !fs::is_regular_file(impl))
+        if (access(host.c_str(), X_OK) || !fs::is_regular_file(impl))
             continue;
         auto target = memo("cgu-target:" + profile_context(helper) + '\0' + llvm + '\0' + triple,
                            {{helper, metadata(helper)}}, [&] {
@@ -1045,27 +1097,22 @@ CguBackend select_cgu(const fs::path &compiler, const fs::path &sysroot, const s
         });
         if (target.empty())
             continue;
-        auto frontend = linked_llvm(binary, compiler_command(binary));
-        auto backend = linked_llvm(helper, {helper});
-        if (frontend.empty() || backend.empty())
+        auto backend = linked_libraries(helper, false);
+        if (backend.llvm.empty())
             continue;
-        if (!fs::equivalent(frontend, backend) || env("SANDBOX_ON") == "1") {
-            States watched;
-            auto key = "cgu-probe:" + profile_context(compiler) + '\0' + env("SANDBOX_ON") +
-                       '\0' + env("SANDBOX_METHOD") + '\0' +
-                       (env("LD_PRELOAD").find("libsandbox") != string::npos ? "1" : "0");
-            for (const auto &path : {compiler, binary, helper, shim, impl, frontend, backend}) {
-                key += '\0' + path.string();
-                watched.emplace(path, metadata(path));
-            }
-            auto reason = memo(key, watched, [&] { return probe_cgu(compiler, shim); });
-            if (!reason.empty()) {
-                if (env("DISTCC_VERBOSE") == "1")
-                    fprintf(stderr, "distcc-rust: %s: %s\n", shim.c_str(), reason.c_str());
-                continue;
-            }
+        CguBackend candidate{target, host, driver_environment(frontend)};
+        States watched;
+        auto key = "cgu-driver-probe:" + profile_context(compiler) + '\0' + env("SANDBOX_ON") +
+                   '\0' + env("SANDBOX_METHOD") + '\0' + env("GLIBC_TUNABLES");
+        for (const auto &path : {compiler, frontend.driver, helper, host, impl, frontend.llvm, backend.llvm}) {
+            key += '\0' + path.string();
+            watched.emplace(path, metadata(path));
         }
-        return {target, shim};
+        auto reason = memo(key, watched, [&] { return probe_cgu(compiler, candidate); });
+        if (reason.empty())
+            return candidate;
+        if (env("DISTCC_VERBOSE") == "1")
+            fprintf(stderr, "distcc-rust: %s: %s\n", host.c_str(), reason.c_str());
     }
     return {};
 }
@@ -1080,7 +1127,7 @@ CguRoute cgu_route(const Invocation &inv, const fs::path &compiler, const string
             if (requirement.size() >= sizeof(hint.cgu_backend))
                 throw Local("CGU target record too long");
             strcpy(hint.cgu_backend, requirement.c_str());
-            route.shim = backend.shim;
+            route.backend = std::move(backend);
         }
     }
     hint.kind = DCC_WORK_RUST_CGU;
@@ -1093,7 +1140,7 @@ int cgu_frontend(const CguRoute &route, const Invocation &inv, const fs::path &e
                  const States &responses) {
     for (auto &[p, st] : responses)
         verify(p, st);
-    auto local = compiler_command(exe);
+    Words local{exe};
     std::optional<Work> argfile;
     if (!inv.incremental) {
         for (auto p = original + 1; *p; ++p)
@@ -1127,11 +1174,10 @@ int cgu_frontend(const CguRoute &route, const Invocation &inv, const fs::path &e
         auto emit = action.substr(0, action.find('='));
         return emit == "metadata" || emit == "link" || emit == "dep-info" || emit == "obj";
     });
-    Env vars = {{"DISTCC_RUST_CGU_OBJECT_ONLY", machine_outputs ? "1" : "0"},
-                {"DISTCC_RUST_CGU_PLUGIN_LTO", inv.linker_plugin_lto ? "1" : "0"},
-                {"LD_PRELOAD", route.shim.string() + " " + env("LD_PRELOAD")},
-                {"DISTCC_RUST_CGU_CLIENT", fs::canonical("/proc/self/exe")},
-                {"DISTCC_RUST_CGU_PREVIOUS", env("LD_PRELOAD")}};
+    Env vars = route.backend.environment;
+    vars["DISTCC_RUST_CGU_OBJECT_ONLY"] = machine_outputs ? "1" : "0";
+    vars["DISTCC_RUST_CGU_PLUGIN_LTO"] = inv.linker_plugin_lto ? "1" : "0";
+    vars["DISTCC_RUST_CGU_CLIENT"] = fs::canonical("/proc/self/exe");
     pid_t pid;
     {
         ProbeSlot frontend;
@@ -1142,7 +1188,7 @@ int cgu_frontend(const CguRoute &route, const Invocation &inv, const fs::path &e
             Fd writer(pipefd[1]);
             check(!fcntl(writer.fd, F_SETFD, 0), "inherit frontend completion pipe");
             vars["DISTCC_RUST_CGU_STARTED"] = std::to_string(writer.fd);
-            pid = spawn(local, vars, 1, 2);
+            pid = spawn(local, vars, 1, 2, nullptr, false, route.backend.host);
         }
         // EOF releases the frontend slot when LLVM starts, or on early
         // compiler exit. Cargo can now schedule a metadata-dependent crate.

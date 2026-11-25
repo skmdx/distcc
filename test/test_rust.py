@@ -18,10 +18,12 @@ import unittest
 from contextlib import ExitStack
 from unittest.mock import patch
 import test_tcp_jobs as tcp
+from cgu_driver import driver_command
 
 from test_broker import BrokerTestCase
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+SOURCE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SOURCE))
 
 
 from distcc_job import JOB_RUST_CGU
@@ -89,7 +91,7 @@ class RustTest(BrokerTestCase):
         return manifest(JOB_RUST, self.work, args, entries, rust=command), paths
 
     def wire_result(self, net, identity, first=None):
-        codec = runpy.run_path(str(self.build/'distcc-link'))['Lz4Chunks']()
+        codec = runpy.run_path(str(SOURCE/'distcc-link'))['Lz4Chunks']()
         kind, data = first or self.frame(net)
         while kind == 0x54000408:
             kind, data = self.frame(net)
@@ -179,7 +181,7 @@ class RustTest(BrokerTestCase):
 
     def cgu_toolchain(self):
         tool = self.build/'llvm-lto/distcc-rust-cgu'
-        if not tool.is_file() or not (tool.parent/'distcc-rust-cgu.so').is_file():
+        if not tool.is_file() or not (tool.parent/'distcc-rust-cgu-driver').is_file():
             self.skipTest('build does not include the LLVM CGU backend')
         fields = dict(line.split(': ', 1) for line in subprocess.check_output([self.rustc, '-vV'],
                       text=True).splitlines() if ': ' in line)
@@ -188,6 +190,12 @@ class RustTest(BrokerTestCase):
             self.skipTest('rustc uses another LLVM version')
         target = subprocess.check_output([tool, '--target-name', offered[0], fields['host']], text=True)
         return offered[0], target
+
+    def direct_cgu(self, *args, binary=None, prefix=(), **environment):
+        host = binary or self.build/'llvm-lto/distcc-rust-cgu-driver'
+        env = dict(self.env, DISTCC_RUST_CGU_CLIENT=str(self.build/'distcc'))
+        env.update(environment)
+        return dict(**driver_command(self.rustc, host, *args, env=env, prefix=prefix), cwd=self.work)
 
     @staticmethod
     def cgu_executing(pid):
@@ -247,12 +255,12 @@ class RustTest(BrokerTestCase):
 
     def test_cgu_constructor_exports_are_checked_before_compilation(self):
         self.cgu_toolchain()
-        shim = self.build/'llvm-lto/distcc-rust-cgu.so'
+        host = self.build/'llvm-lto/distcc-rust-cgu-driver'
         # objcopy needs an ELF object even when the normal build uses linker-plugin LTO.
         native = self.work/'native-hook'
         subprocess.run(['make', '-s', f'LTO_BUILD={native}', 'CXXFLAGS=-O1 -fno-lto', native/'cgu_hook.o'],
                        cwd=self.build, check=True)
-        exports = subprocess.check_output(['nm', '-DP', '--defined-only', shim], text=True).splitlines()
+        exports = subprocess.check_output(['nm', '-DP', '--defined-only', host], text=True).splitlines()
         for ctor in ('_ZN4llvm11PassBuilderC1', '_ZN4llvm14raw_fd_ostreamC1'):
             with self.subTest(ctor=ctor):
                 # Re-link so that the broken export has a valid ELF hash and relocations.
@@ -262,36 +270,111 @@ class RustTest(BrokerTestCase):
                 folder.mkdir()
                 shutil.copy2(native/'cgu-libcpp.h', folder)
                 impl = folder/'distcc-rust-cgu-llvm.so'
-                impl.symlink_to(shim.with_name(impl.name))
+                impl.symlink_to(host.with_name(impl.name))
                 subprocess.run(['objcopy', '--redefine-sym', f'{name}={missing}',
                                 native/'cgu_hook.o', folder/'cgu_hook.o'], check=True)
-                target = folder/shim.name
+                target = folder/host.name
                 check = subprocess.run(['make', '-s', '-o', impl, f'LTO_BUILD={folder}', target], cwd=self.build,
                                        capture_output=True, text=True)
                 self.assertNotEqual(check.returncode, 0)
                 self.assertIn(missing, check.stderr)
                 self.assertFalse(target.exists())
-                env = dict(self.env, LD_PRELOAD=str(target)+'.tmp', DISTCC_RUST_CGU_CLIENT=str(self.build/'distcc'))
-                load = self.rust('-vV', remote=False, env=env)
+                load = subprocess.run(**self.direct_cgu('-vV', binary=str(target)+'.tmp'),
+                                      capture_output=True, text=True)
                 self.assertEqual(load.returncode, 100, load.stderr)
                 self.assertIn('missing LLVM entry point ' + missing, load.stderr)
 
-    def test_hardened_preload_in_wrapper_and_incompatible_llvm_probe(self):
+    def test_driver_rejects_incompatible_llvm_probe(self):
         self.cgu_toolchain()
-        shim = self.work/'distcc-rust-cgu.so'
-        shutil.copy2(self.build/'llvm-lto'/shim.name, shim)
-        env = dict(self.env, LD_BIND_NOW='1', LD_PRELOAD=str(shim), DISTCC_RUST_CGU_CLIENT='unused')
-        subprocess.run(['/bin/sh', '-c', 'exit 0'], env=env, check=True)
+        host = self.work/'distcc-rust-cgu-driver'
+        shutil.copy2(self.build/'llvm-lto'/host.name, host)
         # The real loader must resolve every reference in the sibling.
         subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', self.work/'distcc-rust-cgu-llvm.so'],
                        input='extern void LLVMAbsent(void); void *dcc_cgu_initialize(void) { LLVMAbsent(); return 0; }',
                        text=True, check=True)
         with (self.work/'probe').open('w+') as reply:
-            result = subprocess.run([self.rustc, '--version'], pass_fds=[reply.fileno()],
-                                    env=dict(env, DISTCC_RUST_CGU_PROBE=str(reply.fileno())), capture_output=True)
+            result = subprocess.run(**self.direct_cgu('--version', binary=host, LD_BIND_NOW='1',
+                                    DISTCC_RUST_CGU_PROBE=str(reply.fileno())), pass_fds=[reply.fileno()],
+                                    capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             reply.seek(0)
             self.assertRegex(reply.read(), r'^err:.*LLVMAbsent\n$')
+
+    def test_driver_exit_proc_macro_and_linker_environment(self):
+        self.cgu_toolchain()
+        self.restart_server(self.build/'distccd', DISTCCD_RUSTC='/bin/false')
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        src = self.work/'answer.rs'
+        src.write_text('compile_error!("driver exit status");')
+        error = self.rust(src)
+        self.assertEqual(error.returncode, 1, error.stderr)
+        self.assertIn('driver exit status', error.stderr)
+
+        src.write_text('extern crate proc_macro; #[proc_macro] '
+                       'pub fn number(_:proc_macro::TokenStream)->proc_macro::TokenStream '
+                       '{ "42".parse().unwrap() }')
+        plugin = self.work/'libanswer.so'
+        built = self.rust(src, '--crate-type=proc-macro', '-Cembed-bitcode=no', '-o', plugin)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        self.assertIn('distcc-rust-cgu: compiled on', built.stderr)
+
+        linker = self.work/'linker'
+        child_env = self.work/'linker-env'
+        linker.write_text('#!/bin/sh\nenv -0 > ' + shlex.quote(str(child_env)) + '\nexec /usr/bin/cc "$@"\n')
+        linker.chmod(0o755)
+        main = self.work/'main.rs'
+        main.write_text('extern crate answer; fn main() { let mut n: u64 = answer::number!();' +
+                        'n = std::hint::black_box(n) + 1;' * 160 + 'assert_eq!(n, 202); }')
+        for tunables in ('', 'glibc.rtld.optional_static_tls=2048:glibc.malloc.perturb=37'):
+            with self.subTest(tunables=tunables):
+                env = dict(self.env, GLIBC_TUNABLES=tunables, LD_PRELOAD='libm.so.6')
+                result = self.rust(main, '--extern', 'answer='+str(plugin), '-Clinker='+str(linker),
+                                   '-Cembed-bitcode=no', '-o', 'main', env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('distcc-rust-cgu: compiled on', result.stderr)
+                child = dict(item.split('=', 1) for item in child_env.read_text().split('\0') if item)
+                self.assertEqual([k for k in child if k.startswith('DISTCC_RUST_CGU_')], [])
+                self.assertEqual(child.get('GLIBC_TUNABLES'), tunables or None)
+                self.assertEqual(child.get('LD_PRELOAD'), 'libm.so.6')
+                subprocess.run([self.work/'main'], check=True, timeout=5)
+
+    def test_driver_does_not_bypass_opaque_compiler(self):
+        abi, _ = self.cgu_toolchain()
+        self.restart_server(self.build/'distccd', DISTCCD_RUSTC='/bin/false')
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        wrapper = self.work/'rustc'
+        wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(self.rustc) + ' --cfg wrapped "$@"\n')
+        wrapper.chmod(0o755)
+        self.rustc = str(wrapper)
+        triple = re.search(r'^host: (.+)$', self.rust('-vV', remote=False).stdout, re.M)[1]
+        query = subprocess.run([self.build/'distcc', '--rust-cgu-target', wrapper, abi, triple],
+                               cwd=self.work, env=self.env, capture_output=True, text=True, check=True)
+        self.assertEqual(query.stdout, '')
+        source = self.work/'wrapped.rs'
+        source.write_text('#[cfg(not(wrapped))] compile_error!("compiler wrapper was bypassed"); fn main() {}')
+        counts = self.completed_jobs()
+        result = self.rust(source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('distcc-rust: local: worker has no matching Rust toolchain', result.stderr)
+        self.assertEqual(self.completed_jobs(), counts)
+
+    def test_driver_declines_truncated_elf_section_table(self):
+        abi, _ = self.cgu_toolchain()
+        real = Path(self.rustc).resolve()
+        (self.work/'bin').mkdir()
+        (self.work/'lib').symlink_to(real.parents[1]/'lib', target_is_directory=True)
+        compiler = self.work/'bin/rustc'
+        shutil.copy2(real, compiler)
+        # The loader can still run this rustc through its program headers.
+        with compiler.open('r+b') as f:
+            f.seek(40)  # ELF64 e_shoff
+            f.write(struct.pack('=Q', compiler.stat().st_size - 1))
+        report = subprocess.check_output([compiler, '-vV'], text=True)
+        triple = re.search(r'^host: (.+)$', report, re.M)[1]
+        result = subprocess.run([self.build/'distcc', '--rust-cgu-target', compiler, abi, triple],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
 
     def test_aarch64_optimized_cgu_object(self):
         self.cgu_toolchain()
@@ -318,13 +401,14 @@ extern "C" { fn step(x: u64) -> u64; }
         self.assertEqual(header[:6], b'\x7fELF\x02\x01')
         self.assertEqual(struct.unpack_from('<HH', header, 16), (1, 183))  # ET_REL, EM_AARCH64
 
-    def test_private_llvm_remote_cgus_and_sandbox_fallback(self):
+    def test_private_llvm_remote_cgus_inside_and_outside_sandbox(self):
         self.cgu_toolchain()
         report = subprocess.check_output([self.rustc, '-vV'], text=True)
         slot = re.search(r'^release: (.+)$', report, re.M)[1]
         compiler = Path('/opt')/('rust-bin-'+slot)/'bin/rustc'
         if not compiler.is_file():
             self.skipTest('matching Gentoo rust-bin slot required')
+        system = self.rustc
         self.restart_server(self.build/'distccd', DISTCCD_RUSTC='/bin/false')
         self.addCleanup(self.restart_server, self.build/'distccd')
         self.rustc = str(compiler)
@@ -339,10 +423,10 @@ extern "C" { fn step(x: u64) -> u64; }
         counts = self.completed_jobs()
         result = self.rust(*args)
         self.assertEqual(result.returncode, 0, result.stderr)
-        shim = self.build/'llvm-lto/distcc-rust-cgu.so'
+        host = self.build/'llvm-lto/distcc-rust-cgu-driver'
         library, = (compiler.parents[1]/'lib').glob('libLLVM.so.*')
         check = subprocess.run([sys.executable, Path(__file__).resolve().parents[1]/'src/rust/check_cgu_hooks.py',
-                                shim, shim.with_name('distcc-rust-cgu-llvm.so'), library],
+                                host, host.with_name('distcc-rust-cgu-llvm.so'), library],
                                capture_output=True, text=True)
         if check.returncode:
             self.assertIn('missing LLVM entry points', check.stderr)
@@ -353,17 +437,23 @@ extern "C" { fn step(x: u64) -> u64; }
             self.assert_one_job_per_cgu(result.stderr, counts)
         subprocess.run([exe], check=True)
         if shutil.which('sandbox'):
-            counts = self.completed_jobs()
-            exe.unlink()
-            log = self.work/'sandbox.log'
-            result = self.rust(*args, prefix=['sandbox', 'env', 'SANDBOX_WRITE='+str(self.work)],
-                               env=dict(self.env, SANDBOX_LOG=str(log), SANDBOX_DEBUG_LOG=str(self.work/'sandbox.debug')))
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('LD_PRELOAD stripped', result.stderr)
-            self.assertIn('distcc-rust: local: worker has no matching Rust toolchain', result.stderr)
-            self.assertEqual(counts, self.completed_jobs())
-            self.assertFalse(log.exists(), result.stderr)
-            subprocess.run([exe], check=True)
+            for rustc in (str(compiler), system):
+                with self.subTest(sandbox_compiler=rustc):
+                    self.rustc = rustc
+                    counts = self.completed_jobs()
+                    exe.unlink()
+                    log = self.work/'sandbox.log'
+                    result = self.rust(*args, prefix=['sandbox', 'env', 'SANDBOX_WRITE='+str(self.work)],
+                                       env=dict(self.env, SANDBOX_LOG=str(log),
+                                                SANDBOX_DEBUG_LOG=str(self.work/'sandbox.debug')))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    if rustc == str(compiler) and check.returncode:
+                        self.assertIn('incompatible LLVM ABI', result.stderr)
+                        self.assertEqual(counts, self.completed_jobs())
+                    else:
+                        self.assert_one_job_per_cgu(result.stderr, counts)
+                    self.assertFalse(log.exists(), result.stderr)
+                    subprocess.run([exe], check=True)
 
     @unittest.skipUnless(shutil.which('strace'), 'CGU process tracing required')
     def test_parallel_cgus_share_resident_sandbox_and_dispatcher(self):
@@ -377,10 +467,9 @@ extern "C" { fn step(x: u64) -> u64; }
         total = '+'.join(f'm{j}::f({j})' for j in range(8))
         source.write_text('\n'.join(modules) + f'\nfn main() {{println!("{{}}", {total});}}')
         client_trace = self.work/'client.exec'
-        result = self.rust(source, '-Ccodegen-units=8', '-Copt-level=2', '-o', 'resident',
-                           remote=False, env=dict(self.env, LD_PRELOAD=str(self.build/'llvm-lto/distcc-rust-cgu.so'),
-                                                 DISTCC_RUST_CGU_CLIENT=str(self.build/'distcc')),
-                           prefix=['strace', '-f', '-s', '256', '-e', 'execve,memfd_create', '-o', str(client_trace)])
+        trace_cmd = ['strace', '-f', '-s', '256', '-e', 'execve,memfd_create', '-o', client_trace]
+        result = subprocess.run(**self.direct_cgu(source, '-Ccodegen-units=8', '-Copt-level=2',
+                                '-o', 'resident', prefix=trace_cmd), capture_output=True, text=True, timeout=90)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertGreater(result.stderr.count('distcc-rust-cgu: compiled on'), 1, result.stderr)
         self.assertEqual(int(subprocess.check_output([self.work/'resident'])), 8*sum(range(64))+sum(range(8)))
@@ -413,9 +502,8 @@ extern "C" { fn step(x: u64) -> u64; }
             source.write_text('mod calc { #[inline(never)] pub fn value(mut x:u64) -> u64 {'
                               + steps + 'x} }\n' + f'fn main() {{ let mut x={initial}u64;'
                               + steps + 'println!("{}", calc::value(x)); }')
-            result = self.rust(source, f'-Ccodegen-units={units}', '-Clto=off', '-Copt-level=2', '-o', 'answer', remote=False,
-                               env=dict(self.env, LD_PRELOAD=str(self.build/'llvm-lto/distcc-rust-cgu.so'),
-                                        DISTCC_RUST_CGU_CLIENT=str(self.build/'distcc'), DISTCC_VERBOSE='1'))
+            result = subprocess.run(**self.direct_cgu(source, f'-Ccodegen-units={units}', '-Clto=off',
+                                    '-Copt-level=2', '-o', 'answer'), capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 0, result.stderr)
             jobs = result.stderr.count('distcc-rust-cgu: compiled on')
             self.assertEqual(jobs, units, result.stderr)
@@ -540,11 +628,10 @@ extern "C" { fn step(x: u64) -> u64; }
                           shlex.quote(str(self.build/'distcc')) + ' "$@"\n')
         submit.chmod(0o755)
         executable = self.work / 'queued'
-        env = dict(self.env, LD_PRELOAD=str(self.build/'llvm-lto/distcc-rust-cgu.so'),
-                   DISTCC_RUST_CGU_CLIENT=str(submit), DISTCC_RUST_CGU_OBJECT_ONLY='1')
+        cmd = self.direct_cgu('-Copt-level=2', '-Ccodegen-units=1', source, '-o', executable,
+                              DISTCC_RUST_CGU_CLIENT=str(submit), DISTCC_RUST_CGU_OBJECT_ONLY='1')
         before = self.completed_jobs()
-        with subprocess.Popen([self.rustc, '-Copt-level=2', '-Ccodegen-units=1', source, '-o', executable],
-                              env=env, cwd=self.work, stderr=subprocess.PIPE, text=True) as compiler:
+        with subprocess.Popen(**cmd, stderr=subprocess.PIPE, text=True) as compiler:
             try:
                 deadline = time.monotonic() + 10
                 while not started.exists() and compiler.poll() is None and time.monotonic() < deadline:
@@ -767,7 +854,7 @@ extern "C" { fn step(x: u64) -> u64; }
         subprocess.run([program],check=True)
 
     def test_same_triple_mixed_compilers_route_whole_crates_and_cgus(self):
-        deploy = runpy.run_path(str(self.build/'packaging/gentoo/deploy.py'))
+        deploy = runpy.run_path(str(SOURCE/'packaging/gentoo/deploy.py'))
         abi, backend = self.cgu_toolchain()
         report = subprocess.check_output([self.rustc, '-vV'], text=True)
         host = next(line[6:] for line in report.splitlines() if line.startswith('host: '))
@@ -1034,7 +1121,7 @@ extern "C" { fn step(x: u64) -> u64; }
                 writes.unlink()
                 calls = trace.read_text()
                 self.assertEqual('-Zbinary-dep-depinfo' in calls, host == native)
-                frontend = 'execve("' + str(Path(self.rustc).resolve()) + '",'
+                frontend = 'execve("' + str(self.build/'llvm-lto/distcc-rust-cgu-driver') + '",'
                 full = [line for line in calls.splitlines() if frontend in line and
                         re.search(r'"--crate-type(?:=rlib"|", "rlib")', line) and '-Zbinary-dep-depinfo' not in line]
                 self.assertEqual(len(full), 1, calls)
@@ -1241,8 +1328,6 @@ extern "C" { fn step(x: u64) -> u64; }
                     self.assertTrue(output.stat().st_size)
 
     def test_local_fallback_rereads_changed_linker_response(self):
-        self.restart_server(self.build/'distccd', DISTCCD_RUSTC='/bin/false')
-        self.addCleanup(self.restart_server, self.build/'distccd')
         compiler = self.work/'rustc'
         compiler.write_text('#!/bin/sh\nif test "$1" = -vV; then mv next.rsp link.rsp; fi\n'
                             'exec '+shlex.quote(self.rustc)+' "$@"\n')

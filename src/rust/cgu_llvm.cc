@@ -79,13 +79,6 @@ void configure_environment(const char *client) {
     unsetenv("DISTCC_RUST_CGU_OBJECT_ONLY");
     plugin_lto = getenv("DISTCC_RUST_CGU_PLUGIN_LTO") && !strcmp(getenv("DISTCC_RUST_CGU_PLUGIN_LTO"), "1");
     unsetenv("DISTCC_RUST_CGU_PLUGIN_LTO");
-    const char *previous = getenv("DISTCC_RUST_CGU_PREVIOUS");
-    if (previous && *previous)
-        setenv("LD_PRELOAD", previous, 1);
-    else
-        unsetenv("LD_PRELOAD");
-    unsetenv("DISTCC_RUST_CGU_PREVIOUS");
-    unsetenv("DISTCC_RUST_CGU_CLIENT");
 }
 bool supported(const TargetMachine &tm) {
     return tm.Options.MCOptions.SplitDwarfFile.empty() && !tm.getPGOOption() &&

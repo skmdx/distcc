@@ -1,5 +1,4 @@
-/* Keep this preload safe in wrappers with immediate ELF binding. Only the
- * sibling module calls LLVM, after rustc has loaded its own LLVM runtime. */
+/* Host the selected rustc driver. Only the sibling module imports LLVM. */
 #define LLVM_DISABLE_ABI_BREAKING_CHECKS_ENFORCING 1
 #include "rust/cgu_hooks.h"
 #include "exitcode.h"
@@ -8,12 +7,17 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm-c/TargetMachine.h>
 #include <dlfcn.h>
+#include <filesystem>
 #include <link.h>
+#include <signal.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 using namespace llvm;
 namespace {
 const cgu::Hooks *hooks;
+void *llvm_handle;
+const void *driver_base;
 int probe_fd = -1;
 
 [[noreturn]] void fatal(const std::string &reason) {
@@ -29,18 +33,18 @@ int probe_fd = -1;
 // The same sections identify the hooks to the cross-build symbol check.
 #define CGU_HOOK(id)                                                                                         \
     extern "C" [[gnu::visibility("hidden")]] const char __start_dcc_hook_##id[];                             \
-    [[gnu::used, gnu::retain, gnu::section("dcc_hook_entries")]] static const void *const id##_entry =       \
+    [[gnu::used, gnu::retain, gnu::section("dcc_cgu_entries")]] static const void *const id##_entry =        \
         __start_dcc_hook_##id;                                                                               \
-    [[gnu::section("dcc_hook_" #id)]]
-extern "C" [[gnu::visibility("hidden")]] const void *const __start_dcc_hook_entries[], *const __stop_dcc_hook_entries[];
+    [[gnu::visibility("default"), gnu::section("dcc_hook_" #id)]]
+extern "C" [[gnu::visibility("hidden")]] const void *const __start_dcc_cgu_entries[], *const __stop_dcc_cgu_entries[];
 void *original(const void *hook) {
     Dl_info info{};
     // GNU ld may also expose a zero-size __start symbol at the first byte.
     // Query inside the function so dladdr selects the interposed ELF symbol.
     if (!dladdr(static_cast<const char *>(hook) + 1, &info) || !info.dli_sname)
         fatal("cannot resolve LLVM hook symbol");
-    auto fn = dlsym(RTLD_NEXT, info.dli_sname);
-    if (!fn)
+    auto fn = dlsym(llvm_handle, info.dli_sname);
+    if (!fn || fn == hook)
         fatal(std::string("missing LLVM entry point ") + info.dli_sname);
     return fn;
 }
@@ -53,56 +57,100 @@ auto next_method(const void *hook, R (C::*)(A...)) {
 }
 bool rust_caller(void *pc) {
     Dl_info info{};
-    return dladdr(pc, &info) && info.dli_fname && strstr(info.dli_fname, "librustc_driver");
+    return dladdr(pc, &info) && info.dli_fbase == driver_base;
 }
 
-__attribute__((constructor)) void compiler_environment() {
-    const char *probe = getenv("DISTCC_RUST_CGU_PROBE");
-    const char *client = getenv("DISTCC_RUST_CGU_CLIENT");
-    if (!probe && !client)
-        return;
-    if (!dl_iterate_phdr([](dl_phdr_info *info, size_t, void *) {
-            return int(strstr(info->dlpi_name, "librustc_driver") != nullptr);
-        }, nullptr))
-        return;
-    if (probe) {
+std::string take_env(const char *key) {
+    const char *value = getenv(key);
+    std::string saved = value ? value : "";
+    unsetenv(key);
+    return saved;
+}
+void *load_library(const char *path, int flags) {
+    auto handle = dlopen(path, flags);
+    if (!handle) {
+        const char *error = dlerror();
+        fatal(error ? error : std::string("cannot load ") + path);
+    }
+    return handle;
+}
+void *symbol(void *handle, const char *name) {
+    auto fn = dlsym(handle, name);
+    if (!fn)
+        fatal(std::string("missing entry point ") + name);
+    return fn;
+}
+} // namespace
+
+int main(int, char **) try {
+    auto driver = take_env("DISTCC_RUST_CGU_DRIVER");
+    auto entry_name = take_env("DISTCC_RUST_CGU_ENTRY");
+    auto probe = take_env("DISTCC_RUST_CGU_PROBE");
+    auto client = take_env("DISTCC_RUST_CGU_CLIENT");
+    auto previous = take_env("DISTCC_RUST_CGU_PREV_TUNABLES");
+    if (!probe.empty()) {
         char *end;
-        long fd = strtol(probe, &end, 10);
-        if (!*probe || *end || fd < 3 || fd > INT_MAX)
+        long fd = strtol(probe.c_str(), &end, 10);
+        if (*end || fd < 3 || fd > INT_MAX)
             fatal("invalid probe descriptor");
         probe_fd = fd;
     }
-    Dl_info info{};
-    if (!dladdr(reinterpret_cast<void *>(&compiler_environment), &info) || !info.dli_fname)
-        fatal("cannot locate CGU interposer");
-    std::string path = info.dli_fname;
-    auto slash = path.rfind('/');
-    auto directory = slash == std::string::npos ? "./" : path.substr(0, slash + 1);
-    auto module = dlopen((directory + "distcc-rust-cgu-llvm.so").c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!module) {
-        const char *err = dlerror();
-        fatal(err ? err : "cannot load CGU LLVM module");
-    }
-    auto initialize = reinterpret_cast<decltype(&cgu::dcc_cgu_initialize)>(dlsym(module, "dcc_cgu_initialize"));
-    if (!initialize) {
-        const char *err = dlerror();
-        fatal(err ? err : "cannot resolve dcc_cgu_initialize");
-    }
-    for (auto entry = __start_dcc_hook_entries; entry != __stop_dcc_hook_entries; ++entry)
-        original(*entry);
-    auto api = initialize(probe ? nullptr : client);
+    if (previous.empty() ? unsetenv("GLIBC_TUNABLES") : setenv("GLIBC_TUNABLES", previous.c_str(), 1))
+        fatal("cannot restore GLIBC_TUNABLES");
+    if (driver.empty() || entry_name.empty() || (probe_fd < 0 && client.empty()))
+        fatal("missing rustc driver configuration");
+    stack_t stack{};
+    long min_stack = SIGSTKSZ;
+    stack.ss_size = min_stack > 65536 ? size_t(min_stack) : 65536;
+    stack.ss_sp = mmap(nullptr, stack.ss_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack.ss_sp == MAP_FAILED || sigaltstack(&stack, nullptr) || signal(SIGPIPE, SIG_DFL) == SIG_ERR)
+        fatal("cannot initialize rustc signal handling");
+
+    auto drv = load_library(driver.c_str(), RTLD_LAZY | RTLD_GLOBAL);
+    auto entry = reinterpret_cast<uint8_t (*)()>(symbol(drv, entry_name.c_str()));
+    Dl_info owner{};
+    if (!dladdr(reinterpret_cast<void *>(entry), &owner))
+        fatal("cannot locate rustc driver entry");
+    driver_base = owner.dli_fbase;
+    const char *llvm_path = nullptr;
+    int multiple = dl_iterate_phdr([](dl_phdr_info *info, size_t, void *result) {
+        if (!info->dlpi_name || !*info->dlpi_name)
+            return 0;
+        const char *base = strrchr(info->dlpi_name, '/');
+        if (strncmp(base ? base + 1 : info->dlpi_name, "libLLVM", 7))
+            return 0;
+        auto &found = *static_cast<const char **>(result);
+        if (found)
+            return 1;
+        found = info->dlpi_name;
+        return 0;
+    }, &llvm_path);
+    if (multiple)
+        fatal("multiple LLVM libraries in rustc driver process");
+    if (!llvm_path)
+        fatal("rustc driver did not load LLVM");
+    llvm_handle = load_library(llvm_path, RTLD_LAZY | RTLD_NOLOAD);
+    auto sibling = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "distcc-rust-cgu-llvm.so";
+    auto module = load_library(sibling.c_str(), RTLD_NOW | RTLD_LOCAL);
+    auto initialize = reinterpret_cast<decltype(&cgu::dcc_cgu_initialize)>(symbol(module, "dcc_cgu_initialize"));
+    for (auto hook = __start_dcc_cgu_entries; hook != __stop_dcc_cgu_entries; ++hook)
+        original(*hook);
+    auto api = initialize(probe_fd >= 0 ? nullptr : client.c_str());
     if (!api)
         fatal("incompatible linked LLVM ABI");
-    if (probe) {
+    if (probe_fd >= 0) {
         dprintf(probe_fd, "ok\n");
         close(probe_fd);
         probe_fd = -1;
-        unsetenv("DISTCC_RUST_CGU_PROBE");
     } else {
         hooks = api;
     }
+    return entry();
+} catch (const std::exception &e) {
+    fatal(e.what());
+} catch (...) {
+    fatal("rustc driver unwound across its entry point");
 }
-} // namespace
 // The header declares extern template class PassManager<Module>, precluding
 // a specialization of run() here. The exported signature has no std types.
 PreservedAnalyses module_passes(ModulePassManager *, Module &, ModuleAnalysisManager &) asm(
@@ -126,6 +174,7 @@ Error PassBuilder::parsePassPipeline(ModulePassManager &pm, StringRef pipeline) 
 extern "C" void destroy_module(Module *) asm("_ZN4llvm6ModuleD1Ev");
 CGU_HOOK(destroy_module)
 void destroy_module(Module *m) {
+    // LLVMDisposeModule can destroy a tracked module from inside libLLVM.
     if (hooks)
         hooks->destroy(*m);
     static auto next = next_function(destroy_module_entry, &destroy_module);
@@ -140,7 +189,7 @@ void destroy_module(Module *m) {
 #define STD_TYPE(name) "St" name
 #endif
 // The Itanium C++ ABI passes this non-trivial value by invisible reference.
-// Forward its original storage so the preload never needs PGOOptions' LLVM
+// Forward its original storage so the driver host never needs PGOOptions' LLVM
 // copy constructor or destructor. The caller owns destruction.
 static_assert(!std::is_trivially_destructible_v<std::optional<PGOOptions>>);
 extern "C" void pb_ctor(PassBuilder *, TargetMachine *, PipelineTuningOptions, std::optional<PGOOptions> &,

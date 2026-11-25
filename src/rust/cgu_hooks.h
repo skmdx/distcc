@@ -1,4 +1,4 @@
-/* Private interface between the ELF interposer and its sibling LLVM module. */
+/* Private interface between the rustc driver host and its sibling LLVM module. */
 #pragma once
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Passes/PassBuilder.h>

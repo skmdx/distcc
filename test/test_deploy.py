@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 from unittest import mock
+from cgu_driver import driver_command
 
 spec = importlib.util.spec_from_file_location('deploy', Path(__file__).resolve().parents[1] /
                                             'packaging/gentoo/deploy.py')
@@ -39,10 +40,9 @@ class RustDistributionTest(unittest.TestCase):
                     # Request this build's backend for every compiler, including
                     # other LLVM slots. Ask the actual loader for the expectation.
                     with tempfile.TemporaryFile() as reply:
-                        shim = helper.with_suffix('.so')
-                        subprocess.run([compiler, '--version'], stdout=subprocess.DEVNULL, check=True,
-                                       pass_fds=[reply.fileno()], env=dict(os.environ, LD_PRELOAD=str(shim),
-                                       DISTCC_RUST_CGU_PROBE=str(reply.fileno())))
+                        cmd = driver_command(compiler, helper.with_name('distcc-rust-cgu-driver'), '--version',
+                                             env=dict(os.environ, DISTCC_RUST_CGU_PROBE=str(reply.fileno())))
+                        subprocess.run(**cmd, stdout=subprocess.DEVNULL, check=True, pass_fds=[reply.fileno()])
                         reply.seek(0)
                         response = reply.read()
                     target = subprocess.check_output([helper, '--target-name', abi, fields['host']], text=True)
