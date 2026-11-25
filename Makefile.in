@@ -33,7 +33,9 @@ LLVM_TARGET_LIBDIR = $(patsubst $(LLVM_SYSROOT)/%,/%,$(shell $(LLVM_CONFIG) --li
 LLVM_TARGET_BINDIR = $(patsubst $(LLVM_SYSROOT)/%,/%,$(shell $(LLVM_CONFIG) --bindir))
 LTO_LIBDIR ?= $(LLVM_TARGET_LIBDIR)/distcc
 LTO_BINDIR ?= $(LLVM_TARGET_BINDIR)
-LTO_TARGETS = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),$(LTO_BUILD)/distcc-rust-cgu $(LTO_BUILD)/distcc-rust-cgu.so $(LTO_BUILD)/distcc-clang)
+RUST_CGU_PROGRAMS = distcc-rust-cgu distcc-rust-cgu.so distcc-rust-cgu-llvm.so
+RUST_CGU_LIBEXECDIR = $(pkglibexecdir)/llvm-$(CLANG_MAJOR)
+LTO_TARGETS = $(if $(shell command -v $(LLVM_CONFIG) 2>/dev/null),$(addprefix $(LTO_BUILD)/,$(RUST_CGU_PROGRAMS) distcc-clang))
 # Upstream Clang owns extraction, device grouping and image registration.
 # Point at its clang/tools/clang-linker-wrapper source directory to build it.
 LLVM_WRAPPER_SOURCE ?=
@@ -202,7 +204,7 @@ dist_extra =							\
 	distcc-offload \
 	distcc_job.py \
 	distcc_python.py \
-	src/rust/native.cc src/rust/audit.cc src/rust/cgu.h src/rust/cgu_hook.cc src/rust/cgu_transport.h src/rust/check_cgu_hooks.py src/rust/cgu_worker.cc \
+	src/rust/native.cc src/rust/audit.cc src/rust/cgu.h src/rust/cgu_hook.cc src/rust/cgu_hooks.h src/rust/cgu_llvm.cc src/rust/cgu_transport.h src/rust/check_cgu_hooks.py src/rust/cgu_worker.cc \
 	src/rust/sandbox.cc src/rust/sandbox.hh src/rust/runtime.hh src/rust/client.cc src/rust/worker.cc src/rust/link.cc src/rust/response.hh src/rust/probe.cc src/rust/probe.h src/rust/common.hh src/rust/affinity.hh src/rust/api.h \
 	$(wildcard src/clang/*.cpp src/clang/*.h) src/clang/launcher.c \
 	src/argv_file.h \
@@ -599,8 +601,12 @@ lto: $(LTO_TARGETS) $(if $(LTO_TARGETS),clang-slot)
 
 install-lto: $(LTO_TARGETS)
 	if test -n "$(LTO_TARGETS)"; then \
-	  $(mkinstalldirs) "$(DESTDIR)$(LTO_LIBDIR)" "$(DESTDIR)$(pkglibexecdir)" && \
-	  $(INSTALL_PROGRAM) $(LTO_TARGETS) "$(DESTDIR)$(LTO_LIBDIR)/" && \
+	  $(mkinstalldirs) "$(DESTDIR)$(LTO_LIBDIR)" "$(DESTDIR)$(RUST_CGU_LIBEXECDIR)" && \
+	  $(INSTALL_PROGRAM) $(addprefix $(LTO_BUILD)/,$(RUST_CGU_PROGRAMS)) "$(DESTDIR)$(RUST_CGU_LIBEXECDIR)/" && \
+	  for p in $(RUST_CGU_PROGRAMS); do \
+	    ln -srf "$(DESTDIR)$(RUST_CGU_LIBEXECDIR)/$$p" "$(DESTDIR)$(LTO_LIBDIR)/$$p" || exit 1; \
+	  done && \
+	  $(INSTALL_PROGRAM) $(LTO_BUILD)/distcc-clang "$(DESTDIR)$(LTO_LIBDIR)/" && \
 	  ln -srf "$(DESTDIR)$(LTO_LIBDIR)/distcc-clang" "$(DESTDIR)$(pkglibexecdir)/distcc-clang-$(CLANG_MAJOR)"; \
 	fi
 
@@ -628,16 +634,23 @@ $(LTO_BUILD)/cgu-libcpp.h: Makefile
 	@awk '$$1=="DCC_NAMESPACE" {if (NF==2) print "#define DCC_LIBCPP_NAMESPACE \"" length($$2) $$2 "\""; found=1} END {exit !found}' $@.i >$@.tmp
 	@mv $@.tmp $@ && rm -f $@.i
 
-$(LTO_BUILD)/cgu_hook.o: $(srcdir)/src/rust/cgu_hook.cc $(srcdir)/src/rust/cgu.h $(srcdir)/src/rust/cgu_transport.h $(srcdir)/src/exitcode.h $(LTO_BUILD)/cgu-libcpp.h
+$(LTO_BUILD)/cgu_hook.o: $(srcdir)/src/rust/cgu_hook.cc $(srcdir)/src/rust/cgu_hooks.h $(srcdir)/src/exitcode.h $(LTO_BUILD)/cgu-libcpp.h
 	$(CXX) $(CPPFLAGS) -std=c++17 $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -I$(@D) -fexceptions -MMD -fPIC -c $< -o $@
+
+$(LTO_BUILD)/cgu_llvm.o: $(srcdir)/src/rust/cgu_llvm.cc $(srcdir)/src/rust/cgu.h $(srcdir)/src/rust/cgu_hooks.h $(srcdir)/src/rust/cgu_transport.h $(srcdir)/src/exitcode.h
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) -std=c++17 $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -fexceptions -MMD -fPIC -c $< -o $@
 
 $(LTO_BUILD)/cgu_fd_io.o: $(srcdir)/src/fd_io.c $(srcdir)/src/fd_io.h
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fvisibility=hidden -fPIC -c $< -o $@
 
-$(LTO_BUILD)/distcc-rust-cgu.so: $(LTO_BUILD)/cgu_hook.o $(LTO_BUILD)/cgu_fd_io.o $(srcdir)/src/rust/check_cgu_hooks.py
-	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -shared -o $@.tmp $(filter %.o,$^) $(LDFLAGS) `$(LLVM_CONFIG) --ldflags` -lLLVM -ldl
-	$(PYTHON) $(srcdir)/src/rust/check_cgu_hooks.py $@.tmp "`$(LLVM_CONFIG) --libdir`/libLLVM.so"
+$(LTO_BUILD)/distcc-rust-cgu-llvm.so: $(LTO_BUILD)/cgu_llvm.o $(LTO_BUILD)/cgu_fd_io.o
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -shared -o $@ $^ $(LDFLAGS)
+
+$(LTO_BUILD)/distcc-rust-cgu.so: $(LTO_BUILD)/cgu_hook.o $(LTO_BUILD)/distcc-rust-cgu-llvm.so $(srcdir)/src/rust/check_cgu_hooks.py
+	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -shared -o $@.tmp $< $(LDFLAGS) -ldl -Wl,-z,defs
+	$(PYTHON) $(srcdir)/src/rust/check_cgu_hooks.py $@.tmp $(LTO_BUILD)/distcc-rust-cgu-llvm.so "`$(LLVM_CONFIG) --libdir`/libLLVM.so"
 	mv $@.tmp $@
 
 distcc-rust-native.so: src/rust/native.o src/rust/audit.o
@@ -1262,7 +1275,7 @@ uninstall-programs:
 	rm -f "$(DESTDIR)$(libdir)/distcc/cpp_lookup.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/gcc_plan.so"
 	rm -f "$(DESTDIR)$(libdir)/distcc/distcc-rust-native.so"
-	rm -f "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu" "$(DESTDIR)$(LTO_LIBDIR)/distcc-rust-cgu.so"
+	for p in $(RUST_CGU_PROGRAMS); do rm -f "$(DESTDIR)$(LTO_LIBDIR)/$$p" "$(DESTDIR)$(RUST_CGU_LIBEXECDIR)/$$p"; done
 	for p in $(private_scripts) $(private_modules) $(private_distributors) distcc-linker-wrapper distcc; do rm -f "$(DESTDIR)$(pkglibexecdir)/$$p"; done
 	rm -f "$(DESTDIR)$(bindir)/distcc-rust"
 	for p in $(bin_PROGRAMS); do			\

@@ -350,15 +350,7 @@ def llvm_abi(version):
 
 def rust_cgu_requirement(client, compiler):
     abi = llvm_abi(compiler['identity']['llvm'])
-    library = next((lib['path'] for lib in compiler['runtime']
-                    if lib['name'].partition('+')[0] == 'libLLVM.so.' + abi), None)
-    if not library:
-        return None
-    target = run(['sh', '-ec', '''
-directory=$(dirname "$(realpath -e -- "$1")")/distcc
-test -f "$directory/distcc-rust-cgu.so" && test -x "$directory/distcc-rust-cgu" || exit 0
-"$directory/distcc-rust-cgu" --target-name "$2" "$3" || { rc=$?; test "$rc" = 121 || exit "$rc"; }
-''', 'sh', library, abi, compiler['host']], client)
+    target = run(['distcc', '--rust-cgu-target', compiler['root'] + '/bin/rustc', abi, compiler['host']], client)
     return (abi, target) if target else None
 
 

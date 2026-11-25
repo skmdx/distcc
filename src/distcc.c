@@ -269,6 +269,9 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--rust-cgu-worker"))
         dcc_exit(dcc_rust_cgu_dispatcher());
 
+    if (argc == 5 && !strcmp(argv[1], "--rust-cgu-target"))
+        dcc_exit(dcc_rust_cgu_target(argv[2], argv[3], argv[4]));
+
     if (!strcmp(compiler_name, "distcc-thinlto") || !strcmp(compiler_name, "distcc-offload-link"))
         dcc_exit(dcc_lto_distribute(argc, argv));
 

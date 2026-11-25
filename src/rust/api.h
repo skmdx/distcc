@@ -29,6 +29,7 @@ int dcc_rust_cgu_helper(const char *abi, char *path);
 int dcc_rust_cgu_worker(const struct dcc_job *, const char *root, int cancel,
                         const char *out, const char *err, struct dcc_job_result *);
 int dcc_rust_cgu_dispatcher(void);
+int dcc_rust_cgu_target(const char *compiler, const char *abi, const char *triple);
 int dcc_rust_capture(char **argv);
 struct dcc_rust_artifacts *dcc_rust_watch(const char *root, int *watchfd);
 int dcc_rust_next_metadata(struct dcc_rust_artifacts *, const char **name, const char **line, int *file);

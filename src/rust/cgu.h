@@ -48,7 +48,7 @@ inline int integer(const Object &data, StringRef key) {
     X(MCOptions.AsmVerbose) X(MCOptions.PreserveAsmComments) X(MCOptions.CompressDebugSections) \
     X(MCOptions.X86RelaxRelocations) X(UseInitArray) X(EmulatedTLS) X(TrapUnreachable) \
     X(NoTrapAfterNoreturn) X(ThreadModel) X(ExceptionModel) X(EmitStackSizeSection) \
-    X(EnableFastISel) X(EnableGlobalISel)
+    X(EnableFastISel) X(EnableGlobalISel) X(GlobalISelAbort)
 #define DCC_CGU_TUNING_FIELDS(X) \
     X(LoopInterleaving) X(LoopVectorization) X(SLPVectorization) X(LoopUnrolling) \
     X(LoopInterchange) X(LoopFusion) X(ForgetAllSCEVInLoopUnroll) X(LicmMssaOptCap) \

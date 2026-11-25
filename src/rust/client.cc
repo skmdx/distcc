@@ -708,9 +708,14 @@ string relocate_runpath(string arg, const fs::path &destination, const fs::path 
 bool wrapper(const fs::path &binary) {
     return binary.filename() == "distcc" || binary.filename() == "ccache";
 }
-fs::path link_driver(const fs::path &name) {
-    if (name.has_parent_path() && !wrapper(executable(name)))
-        return fs::absolute(name);
+fs::path find_link_driver(const fs::path &name) {
+    if (name.has_parent_path()) {
+        auto driver = find_program(name);
+        if (driver.empty())
+            return {};
+        if (!wrapper(driver))
+            return fs::absolute(name);
+    }
     // The sandbox needs the driver itself. Keep its invocation name for
     // multicall drivers such as clang++ and ld.lld.
     for (const auto &dir : split(env("PATH"), ':')) {
@@ -719,7 +724,13 @@ fs::path link_driver(const fs::path &name) {
         if (!binary.empty() && !wrapper(binary))
             return candidate;
     }
-    throw std::runtime_error("link driver unavailable: " + name.string());
+    return {};
+}
+fs::path link_driver(const fs::path &name) {
+    auto driver = find_link_driver(name);
+    if (driver.empty())
+        throw Local("link driver unavailable: " + name.string());
+    return driver;
 }
 string link_path(const fs::path &tools, const fs::path &name) {
     string path = tools;
@@ -914,6 +925,34 @@ void publish(Result &result, const Invocation &inv) {
         f.temporary = nullptr;
     }
 }
+struct LocalCompiler {
+    Words cmd;
+    Env environment;
+    bool opaque_linker = false;
+
+    LocalCompiler(char **original, const Invocation *inv) {
+        for (auto p = original; *p; ++p)
+            cmd.emplace_back(*p);
+        if (!inv || inv->linker.empty())
+            return;
+        environment["PATH"] = link_path({}, inv->linker);
+        if (inv->explicit_linker) {
+            auto driver = find_link_driver(inv->linker);
+            int fd = driver.empty() ? -1 : open(driver.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0) {
+                opaque_linker = true; // Let rustc diagnose its linker.
+                return;
+            }
+            Fd file(fd);
+            char magic[SELFMAG];
+            opaque_linker = ::read(file.fd, magic, sizeof(magic)) != sizeof(magic) ||
+                            memcmp(magic, ELFMAG, SELFMAG);
+            if (!opaque_linker)
+                cmd.insert(std::find(cmd.begin() + 1, cmd.end(), "--"), "-Clinker=" + driver.string());
+        }
+    }
+    int execute() const { return run(cmd, environment, 1, 2); }
+};
 std::optional<int> try_local_frontend(const Invocation &inv, char **original, const States &responses,
                                       const dcc_work_hint &hint) {
     Lease lease{dcc_broker_try_local(&hint)};
@@ -921,27 +960,11 @@ std::optional<int> try_local_frontend(const Invocation &inv, char **original, co
         return {};
     for (auto &[p, st] : responses)
         verify(p, st);
-    Words cmd;
-    for (auto p = original; *p; ++p)
-        cmd.emplace_back(*p);
-    Env environment;
-    if (!inv.linker.empty()) {
-        // The lease covers rustc and its linker. Resolve the same native driver
-        // as finish_links so a Portage masquerade cannot start a second scheduler.
-        if (inv.explicit_linker) {
-            auto driver = link_driver(inv.linker);
-            // An opaque linker script can invoke distcc by absolute path.
-            // Preserve its behavior on the ordinary captured-link path.
-            Fd file(open(driver.c_str(), O_RDONLY | O_CLOEXEC));
-            char magic[SELFMAG];
-            if (::read(file.fd, magic, sizeof(magic)) != sizeof(magic) || memcmp(magic, ELFMAG, SELFMAG))
-                return {};
-            cmd.emplace_back("-Clinker=" + driver.string());
-        }
-        environment["PATH"] = link_path({}, inv.linker);
-    }
+    LocalCompiler local(original, &inv);
+    if (local.opaque_linker)
+        return {}; // Preserve script behavior through captured linking when available.
     auto start = std::chrono::steady_clock::now();
-    int status = run(cmd, environment, 1, 2);
+    int status = local.execute();
     struct rusage usage{};
     getrusage(RUSAGE_CHILDREN, &usage);
     uint64_t cpu = (usage.ru_stime.tv_sec + usage.ru_utime.tv_sec) * 1000000000ULL +
@@ -957,53 +980,108 @@ struct CguRoute {
     int cgu_peers = 0;
     int native_peers = 0;
 };
-// A rustc-private LLVM and a system LLVM can report the same version but
-// cannot exchange C++ objects inside rustc. Trace the loader without running
-// constructors before selecting the slot's in-process hook.
-fs::path linked_llvm(const Words &command) {
-    Fd output(dcc_job_memfd("rust-llvm-library"));
-    if (run(command, {{"LD_TRACE_LOADED_OBJECTS", "1"}}, output.fd, 2))
-        throw std::runtime_error("LLVM loader query failed: " + command.front());
-    for (const auto &line : split(contents(output.fd), '\n')) {
-        auto start = line.find(" => /"), end = line.rfind(" (");
-        if (line.compare(0, 8, "\tlibLLVM") == 0 && start != string::npos && end != string::npos)
-            return line.substr(start + 4, end - start - 4);
-    }
-    return {};
+fs::path linked_llvm(const fs::path &binary, const Words &command) {
+    States dependencies{{binary, metadata(binary)}};
+    return memo("linked-llvm:" + profile_context(binary) + '\0' + env("SANDBOX_ON"), dependencies, [&] {
+        Fd output(dcc_job_memfd("rust-llvm-library"));
+        if (run(command, {{"LD_TRACE_LOADED_OBJECTS", "1"}}, output.fd, 2))
+            throw std::runtime_error("LLVM loader query failed: " + binary.string());
+        for (const auto &line : split(contents(output.fd), '\n')) {
+            auto start = line.find(" => /"), end = line.rfind(" (");
+            if (line.compare(0, 8, "\tlibLLVM") == 0 && start != string::npos && end != string::npos) {
+                auto library = line.substr(start + 4, end - start - 4);
+                dependencies.emplace(library, metadata(library));
+                return library;
+            }
+        }
+        return string{};
+    });
 }
-CguRoute cgu_route(const Invocation &inv, const string &version, const fs::path &sysroot,
-                   dcc_work_hint hint, bool metadata_only) {
-    CguRoute route;
-    auto llvm = llvm_abi(field(version, "LLVM version: "));
-    auto host = field(version, "host: ");
-    auto triple = inv.target.empty() ? host : inv.target;
-    auto compiler = sysroot / "bin/rustc";
-    for (auto &helper : metadata_only ? std::vector<fs::path>{} : backend_helpers(sysroot, llvm)) {
+string probe_cgu(const fs::path &compiler, const fs::path &shim) {
+    Fd reply(dcc_job_memfd("rust-cgu-probe")), quiet(dcc_job_memfd("rust-cgu-version"));
+    auto cmd = compiler_command(compiler);
+    cmd.push_back("--version");
+    const std::vector<int> inherited{reply.fd};
+    int rc = run(cmd, {{"DISTCC_RUST_CGU_PROBE", std::to_string(reply.fd)},
+                       {"LD_PRELOAD", shim.string() + " " + env("LD_PRELOAD")}}, quiet.fd, quiet.fd, &inherited);
+    if (rc) {
+        auto reason = "compiler probe exited " + std::to_string(rc);
+        auto output = contents(quiet.fd);
+        constexpr char whitespace[] = " \t\r\n\f\v";
+        auto first = output.find_first_not_of(whitespace);
+        if (first != string::npos)
+            reason += ": " + output.substr(first, output.find_last_not_of(whitespace) - first + 1);
+        return reason;
+    }
+    auto result = contents(reply.fd);
+    if (result.empty())
+        return "CGU preload did not reach rustc (LD_PRELOAD stripped)";
+    if (result == "ok\n")
+        return string{};
+    if (result.rfind("err:", 0) == 0 && result.back() == '\n')
+        return "incompatible LLVM ABI: " + result.substr(4, result.size() - 5);
+    return "invalid CGU preload probe reply";
+}
+struct CguBackend {
+    string target;
+    fs::path shim;
+};
+CguBackend select_cgu(const fs::path &compiler, const fs::path &sysroot, const string &llvm, const string &triple) {
+    auto binary = sysroot / "bin/rustc";
+    for (const auto &helper : backend_helpers(sysroot, llvm)) {
         auto shim = helper.parent_path() / "distcc-rust-cgu.so";
-        if (!fs::is_regular_file(shim))
+        auto impl = helper.parent_path() / "distcc-rust-cgu-llvm.so";
+        if (!fs::is_regular_file(shim) || !fs::is_regular_file(impl))
             continue;
-        auto key = "cgu-target:" + helper.string() + '\0' + profile_context(compiler) + '\0' + llvm + '\0' + triple;
-        auto target = memo(key, {{helper, metadata(helper)}, {compiler, metadata(compiler)}}, [&] {
+        auto target = memo("cgu-target:" + profile_context(helper) + '\0' + llvm + '\0' + triple,
+                           {{helper, metadata(helper)}}, [&] {
             Fd output(dcc_job_memfd("rust-target"));
             int rc = run({helper, "--target-name", llvm, triple}, {}, output.fd, 2);
             if (rc == EXIT_LOCAL_COMPILE)
                 return string{};
             if (rc)
                 throw std::runtime_error("LLVM target query failed: " + helper.string());
-            auto frontend = linked_llvm(compiler_command(compiler));
-            auto backend = linked_llvm({helper});
-            if (frontend.empty() || backend.empty() || !fs::equivalent(frontend, backend))
-                return string{};
             return contents(output.fd);
         });
         if (target.empty())
             continue;
-        string requirement = llvm + " " + target;
-        if (requirement.size() >= sizeof(hint.cgu_backend))
-            throw Local("CGU target record too long");
-        strcpy(hint.cgu_backend, requirement.c_str());
-        route.shim = shim;
-        break;
+        auto frontend = linked_llvm(binary, compiler_command(binary));
+        auto backend = linked_llvm(helper, {helper});
+        if (frontend.empty() || backend.empty())
+            continue;
+        if (!fs::equivalent(frontend, backend) || env("SANDBOX_ON") == "1") {
+            States watched;
+            auto key = "cgu-probe:" + profile_context(compiler) + '\0' + env("SANDBOX_ON") +
+                       '\0' + env("SANDBOX_METHOD") + '\0' +
+                       (env("LD_PRELOAD").find("libsandbox") != string::npos ? "1" : "0");
+            for (const auto &path : {compiler, binary, helper, shim, impl, frontend, backend}) {
+                key += '\0' + path.string();
+                watched.emplace(path, metadata(path));
+            }
+            auto reason = memo(key, watched, [&] { return probe_cgu(compiler, shim); });
+            if (!reason.empty()) {
+                if (env("DISTCC_VERBOSE") == "1")
+                    fprintf(stderr, "distcc-rust: %s: %s\n", shim.c_str(), reason.c_str());
+                continue;
+            }
+        }
+        return {target, shim};
+    }
+    return {};
+}
+CguRoute cgu_route(const Invocation &inv, const fs::path &compiler, const string &version, const fs::path &sysroot,
+                   dcc_work_hint hint, bool metadata_only) {
+    CguRoute route;
+    if (!metadata_only) {
+        auto llvm = llvm_abi(field(version, "LLVM version: "));
+        auto backend = select_cgu(compiler, sysroot, llvm, inv.target.empty() ? field(version, "host: ") : inv.target);
+        if (!backend.target.empty()) {
+            string requirement = llvm + " " + backend.target;
+            if (requirement.size() >= sizeof(hint.cgu_backend))
+                throw Local("CGU target record too long");
+            strcpy(hint.cgu_backend, requirement.c_str());
+            route.shim = backend.shim;
+        }
     }
     hint.kind = DCC_WORK_RUST_CGU;
     hint.memory_class = 1 + DCC_JOB_RUST_CGU * DCC_MEMORY_BUCKETS + dcc_resource_bucket(hint.bytes);
@@ -1109,11 +1187,10 @@ bool small_crate(const fs::path &source, uintmax_t bytes) {
     }
     return !ec;
 }
-int distributed(char **original, const Words &args, const States &responses) {
+int distributed(Invocation &inv, char **original, const Words &args, const States &responses) {
     const string compiler = *original;
     if (env("DISTCC_BROKER").empty())
         throw Local("Rust distribution requires DISTCC_BROKER");
-    auto inv = read_user_input([&] { return Invocation(args); });
     auto exe = executable(compiler);
     struct stat source;
     if (stat(inv.source.c_str(), &source)) {
@@ -1161,7 +1238,7 @@ int distributed(char **original, const Words &args, const States &responses) {
     string id = identity(version), cpu, features;
     auto root = info.substr(separator + 1);
     hint.rust_compiler = compiler_key(version);
-    auto route = cgu_route(inv, version, root, hint, metadata_only);
+    auto route = cgu_route(inv, exe, version, root, hint, metadata_only);
     bool mixed = route.cgu_peers > route.native_peers;
     if (!route.native_peers && !route.cgu_peers)
         throw Local("worker has no matching Rust toolchain");
@@ -1382,6 +1459,19 @@ static void dispatch_cgu(dcc_cgu_request header, Fd input, Fd reply) {
     dcc_send_fds(reply.fd, &status, 1, &result.fd[DCC_JOB_OBJECT], status ? 0 : 1);
 }
 
+extern "C" int dcc_rust_cgu_target(const char *compiler, const char *abi, const char *triple) {
+    try {
+        auto exe = executable(compiler);
+        auto backend = select_cgu(exe, query(exe, "--print=sysroot"), abi, triple);
+        if (!backend.target.empty())
+            puts(backend.target.c_str());
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "distcc-rust: %s\n", e.what());
+        return EXIT_DISTCC_FAILED;
+    }
+}
+
 extern "C" int dcc_rust_cgu_dispatcher(void) {
     int rc = dcc_read_localslots_configuration();
     if (rc) return rc;
@@ -1431,16 +1521,46 @@ extern "C" int dcc_rust_client(char **argv) {
         args.emplace_back(*p);
     try {
         ResponseFiles response;
-        read_user_input([&] { response.expand(args); });
-        return distributed(argv, response.flat, response.files);
-    } catch (const Local &e) {
-        if (env("DISTCC_VERBOSE") == "1")
-            fprintf(stderr, "distcc-rust: local: %s\n", e.what());
+        std::optional<Invocation> inv;
+        auto parse = [&](ResponseFiles &input) {
+            read_user_input([&] {
+                input.expand(args);
+                inv.emplace(input.flat);
+            });
+        };
+        try {
+            parse(response);
+            return distributed(*inv, argv, response.flat, response.files);
+        } catch (const Local &e) {
+            if (env("DISTCC_VERBOSE") == "1")
+                fprintf(stderr, "distcc-rust: local: %s\n", e.what());
+        }
+        if (!inv) {
+            dcc_restore_fd_limit();
+            execvp(*argv, argv);
+            return EXIT_COMPILER_MISSING;
+        }
+        // As for --local-command, absent host configuration leaves the local
+        // defaults in force. A lock failure is an error, never an unleased run.
+        dcc_read_localslots_configuration();
+        int fd;
+        if (int rc = dcc_lock_local(&fd))
+            return rc;
+        Fd slot(fd);
+        check(!fcntl(fd, F_SETFD, FD_CLOEXEC), "local Rust slot");
+        if (!response.files.empty()) {
+            // Waiting for a slot can outlive an @file generation. Choose the
+            // linker from the current arguments and pass the original @file to rustc.
+            ResponseFiles current;
+            try {
+                parse(current);
+            } catch (const Local &) {
+                inv.reset(); // rustc owns diagnostics for the current @file.
+            }
+        }
+        return LocalCompiler(argv, inv ? &*inv : nullptr).execute();
     } catch (const std::exception &e) {
         fprintf(stderr, "distcc-rust: %s\n", e.what());
         return EXIT_DISTCC_FAILED;
     }
-    dcc_restore_fd_limit();
-    execvp(*argv, argv);
-    return EXIT_COMPILER_MISSING;
 }

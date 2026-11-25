@@ -23,6 +23,37 @@ spec.loader.exec_module(deploy)
 rust_slots = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'packaging/gentoo/rust-slots.py'))
 
 class RustDistributionTest(unittest.TestCase):
+    def test_cgu_requirement_probes_system_and_private_rustc(self):
+        build = Path.cwd()
+        helper = build/'llvm-lto/distcc-rust-cgu'
+        if not (build/'distcc').is_file() or not helper.is_file():
+            self.skipTest('requires a distcc build with an LLVM CGU backend')
+        abi = subprocess.check_output([helper, '--capabilities'], text=True).split()[0]
+        installed = [*Path('/usr/lib/rust').glob('*/bin/rustc'), *Path('/opt').glob('rust-bin-*/bin/rustc')]
+        with mock.patch.dict(os.environ, PATH=str(build)+os.pathsep+os.environ['PATH']):
+            for compiler in installed:
+                with self.subTest(compiler=compiler):
+                    report = subprocess.check_output([compiler, '-vV'], text=True)
+                    fields = dict(line.split(': ', 1) for line in report.splitlines() if ': ' in line)
+                    slot = dict(root=str(compiler.parents[1]), host=fields['host'], identity=dict(llvm=abi))
+                    # Request this build's backend for every compiler, including
+                    # other LLVM slots. Ask the actual loader for the expectation.
+                    with tempfile.TemporaryFile() as reply:
+                        shim = helper.with_suffix('.so')
+                        subprocess.run([compiler, '--version'], stdout=subprocess.DEVNULL, check=True,
+                                       pass_fds=[reply.fileno()], env=dict(os.environ, LD_PRELOAD=str(shim),
+                                       DISTCC_RUST_CGU_PROBE=str(reply.fileno())))
+                        reply.seek(0)
+                        response = reply.read()
+                    target = subprocess.check_output([helper, '--target-name', abi, fields['host']], text=True)
+                    if response == b'ok\n':
+                        self.assertEqual(deploy.llvm_abi(fields['LLVM version']), abi)
+                        expected = (abi, target)
+                    else:
+                        self.assertTrue(response.startswith(b'err:'), response)
+                        expected = None
+                    self.assertEqual(deploy.rust_cgu_requirement(None, slot), expected)
+
     def test_inventory_collects_slots_once_and_never_redistributes_copies(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
