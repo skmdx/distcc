@@ -737,7 +737,7 @@ class MemoryEstimateTest(unittest.TestCase):
 #define M (1024ULL*1024)
 int main(void) {
     setenv("DISTCC_JOB_MEMORY", "512", 1);
-    setenv("DISTCC_MEMORY_LEARNING", "1", 1);
+    unsetenv("DISTCC_MEMORY_LEARNING");
     assert(dcc_resource_job_bytes() == 512*M);
     struct dcc_job_input input = {.path = "/src/main.rs", .plain_size = 1024};
     struct dcc_job job = {.kind = DCC_JOB_COMPILE, .count = 1, .inputs = &input};
@@ -859,7 +859,7 @@ int main(void) {
     assert(dcc_resource_class_slots(16, large, 0) == 0);
     assert(!dcc_resource_admit(large, 0));
     assert(dcc_resource_estimate(small) == 256*M);
-    unsetenv("DISTCC_MEMORY_LEARNING");
+    setenv("DISTCC_MEMORY_LEARNING", "0", 1);
     assert(dcc_resource_job_bytes() == 512*M);
     assert(dcc_resource_spare_bytes() == 128*M);
     assert(dcc_resource_estimate(large) == 512*M);

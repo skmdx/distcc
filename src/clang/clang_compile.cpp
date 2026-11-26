@@ -135,11 +135,15 @@ static int remote(llvm::ArrayRef<const char *> argv, int fd) {
                *dependencies = argv[6], *client_identity = argv[9];
     if (setenv("TMPDIR", root, 1)) { llvm::errs() << "distcc: " << strerror(errno) << '\n'; return 1; }
     auto args = llvm::ArrayRef(argv).drop_front(10);
+    auto flush = llvm::scope_exit([] { llvm::outs().flush(); llvm::errs().flush(); });
     // Arguments borrow the decoded command file, owned until compilation ends.
     bool ok = false;
     auto invocation = std::make_shared<clang::CompilerInvocation>();
     DccChildCompiler compiler(new clang::CompilerInstance(invocation, std::make_shared<clang::PCHContainerOperations>()));
     if (dcc_parse_compiler_invocation(*compiler, args)) {
+        const auto &options = invocation->getFrontendOpts();
+        if (options.ShowVersion || options.ShowHelp)
+            return clang::ExecuteCompilerInvocation(compiler.get()) ? 0 : 1;
         invocation->getFrontendOpts().OutputFile = output;
         auto &deps = invocation->getDependencyOutputOpts();
         if (!deps.OutputFile.empty()) deps.OutputFile = dependencies;
@@ -164,7 +168,6 @@ static int remote(llvm::ArrayRef<const char *> argv, int fd) {
                                            &result);
         ok = generated ? *generated : clang::ExecuteCompilerInvocation(compiler.get());
     }
-    llvm::outs().flush(); llvm::errs().flush();
     return ok ? 0 : 1;
 }
 

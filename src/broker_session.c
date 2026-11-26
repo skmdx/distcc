@@ -70,8 +70,8 @@ static int reconnect_wait(struct reconnect *retry, int error, int allow_unreacha
 
 static int dcc_session_begin(unsigned *tag, double deadline, int io_timeout)
 {
-    const char *path = getenv("DISTCC_BROKER");
-    if (!path || !*path || strlen(path) >= sizeof(session.address.sun_path)) { errno = EINVAL; return -1; }
+    const char *path = dcc_broker_path();
+    if (!path || strlen(path) >= sizeof(session.address.sun_path)) { errno = EINVAL; return -1; }
     if (session.pid != getpid() || strcmp(path, session.address.sun_path)) {
         dcc_session_lost();
         session.pid = getpid();
@@ -120,7 +120,7 @@ void dcc_session_finish(int lease)
     if (i < DCC_BROKER_CLIENT_MAX) session.tags[i] = FREE;
 }
 
-static ssize_t receive_reply(int fd, void *buffer, size_t size, int *net)
+static ssize_t receive_reply(int fd, void *buffer, size_t size, int *net, uid_t *sender)
 {
     union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct ucred))]; } control;
     struct iovec part = {buffer, size};
@@ -141,6 +141,7 @@ static ssize_t receive_reply(int fd, void *buffer, size_t size, int *net)
             cmsg->cmsg_len == CMSG_LEN(sizeof(struct ucred))) {
             struct ucred credentials;
             memcpy(&credentials, CMSG_DATA(cmsg), sizeof(credentials));
+            *sender = credentials.uid;
             authenticated = geteuid() == 0 || credentials.uid == geteuid() || credentials.uid == 0;
         } else if (cmsg->cmsg_type == SCM_RIGHTS) {
             size_t offset, bytes = cmsg->cmsg_len - CMSG_LEN(0);
@@ -203,9 +204,10 @@ int dcc_session_call(struct broker_request_hdr *header, struct iovec *parts, siz
             read_reply = ready > 0;
         }
         if (read_reply) {
-            ssize_t n = receive_reply(fd, reply.iov_base, reply.iov_len, descriptor);
+            uid_t sender;
+            ssize_t n = receive_reply(fd, reply.iov_base, reply.iov_len, descriptor, &sender);
             if (n >= 0) {
-                int error = decode(header->command, header->flags, reply.iov_base, n, *descriptor);
+                int error = decode(header->command, header->flags, reply.iov_base, n, *descriptor, sender);
                 if (!error) {
                     if (received) *received = n;
                     return lease;

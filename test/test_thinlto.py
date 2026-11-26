@@ -107,6 +107,15 @@ class ThinLTOTest(BrokerTestCase):
     def partition_probe(self, compiler):
         return self.clang_slot(compiler).with_name('h_lto_split')
 
+    def remote_link_worker(self, name='remote-link'):
+        # A local worker can grant a small link directly to the caller.
+        # These cases require actual remote backend submission.
+        address = '127.0.0.2'
+        self.restart_server(self.build/'distccd', address=address)
+        self.addCleanup(self.restart_server, self.build/'distccd')
+        self.start_broker(f'{address}:{self.ports[0]}/4,tcp,stats={self.stats_ports[0]}', name=name)
+        self.env.update(DISTCC_VERBOSE='1', PATH=str(self.build) + os.pathsep + os.environ['PATH'])
+
     def run_command(self, command, **kwargs):
         try:
             return subprocess.run(list(map(str, command)), cwd=self.work, env=self.env,
@@ -398,6 +407,7 @@ class ThinLTOTest(BrokerTestCase):
     def test_meson_install_preserves_origin_rpath(self):
         import ctypes
 
+        self.remote_link_worker()
         prefix = self.work / 'installed'
         libdir = prefix / 'lib/plugins/long-install-directory'
         (self.work / 'dep.c').write_text('int dep(void) { return 42; }\n')
@@ -417,7 +427,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         for name in ('CFLAGS', 'CPPFLAGS', 'LDFLAGS'):
             self.env.pop(name, None)
         self.env['CC'] = shlex.join([str(self.build / 'distcc'), compiler])
-        before = [self.get_stats(port) for port in self.stats_ports]
+        before = self.get_stats(self.stats_ports[0], '127.0.0.2')
         for args in (['setup', 'build', '--prefix=' + str(prefix)],
                      ['compile', '-C', 'build'], ['install', '-C', 'build', '--no-rebuild']):
             result = self.run_command(['meson', *args])
@@ -434,8 +444,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
             match = re.search(r'^dcc_compile_ok (\d+)$', stats, re.M)
             assert match is not None, stats
             return int(match[1])
-        self.assertGreater(sum(completed(self.get_stats(port)) - completed(old)
-                               for port, old in zip(self.stats_ports, before)), 0)
+        self.assertGreater(completed(self.get_stats(self.stats_ports[0], '127.0.0.2')), completed(before))
 
     def test_backend_cwd_survives_private_tmp_mount(self):
         self.check_backend_cwd(False)
@@ -544,9 +553,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     def test_backend_cost_identity_survives_temporary_paths(self):
         self.base_env = dict(self.base_env, DISTCC_VERBOSE='1')
-        self.start_broker(self.env['DISTCC_HOSTS'], name='cost-broker')
-        self.env['PATH'] = str(self.build) + os.pathsep + os.environ['PATH']
-        self.env.pop('DISTCC_LINK_SYSROOT', None)
+        self.remote_link_worker('cost-broker')
         compiler = shutil.which('clang')
         source = self.work / 'cost.c'
         source.write_text('#include <stdio.h>\n'
@@ -624,6 +631,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
         self.assertAlmostEqual(updated['min_rate'], .25)
 
     def test_dominant_function_skips_unproductive_partitioning(self):
+        self.remote_link_worker()
         compiler = shutil.which('clang')
         self.clang_slot(compiler)
         source = self.work / 'dominant.c'
@@ -867,6 +875,7 @@ shared_library('plugin', 'plugin.c', link_with: dep, install: true,
 
     @unittest.skipUnless(os.uname().machine == 'x86_64', 'x86 ELF assembly')
     def test_versioned_definition_and_section_comdat_survive_partitioned_link(self):
+        self.remote_link_worker()
         compiler = 'clang'
         self.clang_slot(compiler)
         module = self.work / 'definitions.ll'
@@ -1361,6 +1370,7 @@ for _ in range(3):
 
     @unittest.skipUnless(shutil.which('cmake') and shutil.which('ninja'), 'CMake and Ninja required')
     def test_cmake_link_launcher(self):
+        self.remote_link_worker()
         for language, suffix, driver in (('C', 'c', 'clang'), ('HIP', 'hip', 'clang++')):
             with self.subTest(language=language):
                 source = self.work / language
@@ -1442,6 +1452,7 @@ for _ in range(3):
         self.assertNotIn('retrying backend locally', result.stderr)
 
     def test_lld_cache_avoids_backend_reexecution(self):
+        self.remote_link_worker()
         source = self.work / 'main.c'
         source.write_text('int main(void) { return 0; }')
         obj = source.with_suffix('.o')

@@ -846,7 +846,7 @@ int finish_links(Result &result, const Invocation &inv, const fs::path &work, co
             throw std::runtime_error("missing linker destination");
         // Only the local driver's identity selects the remote compiler.
         fs::path binary;
-        if (thin && !distributed && !env("DISTCC_BROKER").empty())
+        if (thin && !distributed && dcc_broker_path())
             binary = thinlto_compiler(driver, box);
         Words launcher;
         std::optional<Work> temporary;
@@ -956,7 +956,7 @@ struct LocalCompiler {
 };
 std::optional<int> try_local_frontend(const Invocation &inv, char **original, const States &responses,
                                       const dcc_work_hint &hint) {
-    Lease lease{dcc_broker_try_local(&hint)};
+    Lease lease{dcc_broker_try_local(&hint, NULL)};
     if (lease.id < 0)
         return {};
     for (auto &[p, st] : responses)
@@ -1235,7 +1235,7 @@ bool small_crate(const fs::path &source, uintmax_t bytes) {
 }
 int distributed(Invocation &inv, char **original, const Words &args, const States &responses) {
     const string compiler = *original;
-    if (env("DISTCC_BROKER").empty())
+    if (!dcc_broker_path())
         throw Local("Rust distribution requires DISTCC_BROKER");
     auto exe = executable(compiler);
     struct stat source;

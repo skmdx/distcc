@@ -721,58 +721,16 @@ done:
     return ret;
 }
 
-/* The -MT command line flag does not work as advertised for distcc:
- * it augments, rather than replace, the list of targets in the dotd file.
- * The behavior we want though, is the replacing behavior.
- * So here we delete the "-MT target" arguments, and we return the target,
- * for use in the .d rewriting in dotd.c.
- */
-static int dcc_convert_mt_to_dotd_target(char **argv, char **dotd_target)
-{
-    int i;
-    *dotd_target = NULL;
-
-    for (i = 0; argv[i]; ++i) {
-        if (strcmp(argv[i], "-MT") == 0) {
-            break;
-        }
-    }
-
-    /* if we reached the end without finding -MT, fine. */
-    if (argv[i] == NULL)
-        return 0;
-
-    /* if we find -MT but only at the very end, that's an error. */
-    if (argv[i+1] == NULL) {
-        rs_trace("found -MT at the end of the command line");
-        return 1;
-    }
-
-    /* the dotd_target is the argument of -MT */
-    *dotd_target = argv[i+1];
-
-    /* copy the next-next argument on top of this. */
-    for (; argv[i+2]; ++i) {
-        argv[i] = argv[i+2];
-    }
-
-    /* and then put the terminal null in. */
-    argv[i] = argv[i+2];
-
-    return 0;
-}
-
-
 /**
  * Add -MMD and -MF to get a .d file.
- * Find what the dotd target should be (if any).
+ * Preserve the client's dependency targets when redirecting output.
  * Prepend @p root_dir to every command
  * line argument that refers to a file/dir by an absolute name.
  **/
 static int tweak_arguments_for_server(char **argv,
                                       const char *root_dir,
                                       const char *deps_fname,
-                                      char **dotd_target,
+                                      const char *client_output,
                                       char ***tweaked_argv, int *include_fd)
 {
     int ret;
@@ -783,7 +741,7 @@ static int tweak_arguments_for_server(char **argv,
             str_startswith("-fmacro-prefix-map=/", argv[i]) ||
             str_startswith("-ffile-prefix-map=/", argv[i]))
             client_maps++;
-    if ((ret = dcc_copy_argv(argv, tweaked_argv, 5 + client_maps)))
+    if ((ret = dcc_copy_argv(argv, tweaked_argv, 7 + client_maps)))
       return 1;
 
     /* Remap absolute input names and DWARF in the compiler, preserving relative
@@ -818,11 +776,13 @@ static int tweak_arguments_for_server(char **argv,
         }
     }
 
-    if (!dcc_argv_search(argv, "-E") &&
-        (ret = dcc_convert_mt_to_dotd_target(*tweaked_argv, dotd_target)))
-      return 1;
-
     if (deps_fname) {
+        /* GCC owns Make quoting and the order of explicit dependency targets.
+         * Supply its original default when -o was redirected to a worker file. */
+        if (client_output && !dcc_argv_startswith(argv, "-MT") && !dcc_argv_startswith(argv, "-MQ")) {
+            dcc_argv_append(*tweaked_argv, strdup("-MQ"));
+            dcc_argv_append(*tweaked_argv, strdup(client_output));
+        }
         if (!dcc_argv_search(argv, "-MD") && !dcc_argv_search(argv, "-MMD"))
             dcc_argv_append(*tweaked_argv, strdup("-MMD"));
         dcc_argv_append(*tweaked_argv, strdup("-MF"));
@@ -966,7 +926,6 @@ static int dcc_run_job(int in_fd,
     int ret = 0, compile_ret = 0;
     char *orig_input = NULL, *orig_output = NULL;
     char *orig_input_tmp, *orig_output_tmp;
-    char *dotd_target = NULL;
     pid_t cc_pid;
     enum dcc_compress compr;
     struct timeval start, end;
@@ -1175,7 +1134,7 @@ static int dcc_run_job(int in_fd,
             (ret = dcc_make_tmpnam("distcc", ".deps", &deps_fname))) goto out_cleanup;
         if ((!stdout_output && (ret = dcc_set_output(argv, temp_o)))
             || (ret = tweak_arguments_for_server(argv, temp_dir, deps_fname,
-                                                &dotd_target, &tweaked_argv, &include_fd)))
+                                                preprocess_only ? NULL : orig_output, &tweaked_argv, &include_fd)))
             goto out_cleanup;
         /* Repeat the switcharoo trick a few lines above. */
         dcc_free_argv(argv);
@@ -1314,8 +1273,7 @@ report_result:
             if (!stdout_output && (ret = retain_artifact(result, DCC_JOB_OBJECT, temp_o))) goto out_cleanup;
             if (deps_fname) {
                 char *cleaned = NULL;
-                ret = dcc_cleanup_dotd(deps_fname, &cleaned, temp_dir,
-                                      dotd_target ? dotd_target : orig_output, preprocess_only ? NULL : temp_o);
+                ret = dcc_cleanup_dotd(deps_fname, &cleaned, temp_dir);
                 if (!ret) ret = retain_artifact(result, DCC_JOB_DEPS, cleaned);
                 free(cleaned);
                 if (ret) goto out_cleanup;

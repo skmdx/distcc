@@ -31,7 +31,7 @@ class PreparedCompilerTest(BrokerTestCase):
     def setUp(self):
         super().setUp()
         self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}') + ' --localslots_cpp=1')
-        self.env.update(DISTCC_VERBOSE='1', DISTCC_LOG=str(self.work/'client.log'),
+        self.env.update(DISTCC_FRONTEND_REMOTE='0', DISTCC_VERBOSE='1', DISTCC_LOG=str(self.work/'client.log'),
                         DISTCC_SKIP_LOCAL_RETRY='1', DISTCC_CPP_LOOKUP_LIBRARY=str(self.build/'cpp_lookup.so'))
         self.source = self.work/'source.c'
         self.source.write_text('int value;\n')
@@ -425,7 +425,8 @@ class PreparedLocalClangTest(BrokerTestCase):
                 self.start_broker(self.host(0, f',tcp,stats={peer.port}') +
                                   ' --localslots_cpp=1', name=name)
                 log = self.work / f'client-{index}.log'
-                self.env.update(DISTCC_LOG=str(log), DISTCC_SAVE_TEMPS=str(int(save)),
+                self.env.update(DISTCC_FRONTEND_REMOTE='0', DISTCC_CLANG_LOCAL='0',
+                                DISTCC_LOG=str(log), DISTCC_SAVE_TEMPS=str(int(save)),
                                 DISTCC_CLANG_DRIVER=str(self.build / 'distcc-clang'))
                 args = ['clang++', '-O3', '-g', *options, '-c', str(source),
                         '-o', 'prepared.o', '-MD', '-MF', 'prepared.d']

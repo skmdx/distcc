@@ -198,7 +198,7 @@ char *dcc_native_cache_key(char *argv[], const char *input, const char *output)
     FILE *file;
     cpu_set_t affinity;
     int i, clang;
-    if (!getenv("DISTCC_BROKER") || !*getenv("DISTCC_BROKER")) return NULL;
+    if (!dcc_broker_path()) return NULL;
     if (strchr(argv[0], '/')) snprintf(path, sizeof(path), "%s", argv[0]);
     else {
         if (!(search = strdup(getenv("PATH") ? getenv("PATH") : ""))) return NULL;

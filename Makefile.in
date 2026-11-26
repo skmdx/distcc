@@ -303,7 +303,7 @@ common_obj = src/arg.o src/argutil.o					\
 	src/cleanup.o src/compress.o src/compress_stream.o					\
 	src/trace.o src/util.o src/io.o src/fd_io.o src/exec.o			\
 	$(rpc_obj) src/tempfile.o src/bulk.o src/help.o src/filename.o	\
-	src/lock.o src/broker_session.o src/resource.o					\
+	src/lock.o src/broker_path.o src/broker_session.o src/resource.o					\
 	src/netutil.o							\
 	src/pump.o							\
 	src/sendfile.o							\
@@ -388,7 +388,7 @@ distccd_obj += src/rust/sandbox.o src/rust/worker.o src/rust/link.o src/lto_work
 h_compile_obj += src/remote_job.o src/file_cache.o
 
 # All source files, for the purposes of building the distribution
-SRC =	src/stats.c src/adaptive.c src/broker.c src/broker_client.c src/broker_schedule.c src/broker_memo.c src/broker_session.c src/workload.c src/clang_worker.c src/local_clang.c	\
+SRC =	src/stats.c src/adaptive.c src/broker.c src/broker_client.c src/broker_schedule.c src/broker_memo.c src/broker_session.c src/broker_path.c src/workload.c src/clang_worker.c src/local_clang.c	\
 	src/access.c src/arg.c src/argutil.c				\
 	src/auth_common.c src/auth_distcc.c src/auth_distccd.c		\
 	src/backoff.c src/bulk.c src/compress_stream.c src/file_cache.c	\
@@ -423,7 +423,7 @@ SRC =	src/stats.c src/adaptive.c src/broker.c src/broker_client.c src/broker_sch
 	src/gcc_scan.cc src/gcc_scan_inputs.cc src/build_gcc_scan.py
 
 
-HEADERS = src/stats.h src/adaptive.h src/broker.h src/broker_memo.h src/broker_schedule.h src/broker_protocol.h src/broker_session.h src/epoll_set.h src/lane_schedule.h src/cpuperf.h src/workload.h src/file_cache.h	\
+HEADERS = src/stats.h src/adaptive.h src/broker.h src/broker_memo.h src/broker_schedule.h src/broker_protocol.h src/broker_session.h src/broker_path.h src/env.h src/epoll_set.h src/lane_schedule.h src/cpuperf.h src/workload.h src/file_cache.h	\
 	src/access.h src/source_scan.h					\
 	src/auth.h							\
 	src/bulk.h							\
@@ -561,7 +561,7 @@ $(LTO_BUILD)/clang_worker_loop.o: $(srcdir)/src/native_worker.cc
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` -MMD -c $< -o $@
 
-$(LTO_BUILD)/distcc-clang: $(CLANG_OBJECTS) $(LTO_BUILD)/clang_worker_loop.o $(LTO_BUILD)/sandbox_child.o $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o src/argv_file.o src/file_cache.o src/fd_io.o
+$(LTO_BUILD)/distcc-clang: $(CLANG_OBJECTS) $(LTO_BUILD)/clang_worker_loop.o $(LTO_BUILD)/sandbox_child.o $(LTO_BUILD)/lto_partition.o $(LTO_BUILD)/lto_split.o src/argv_file.o src/file_cache.o src/fd_io.o src/broker_path.o
 	$(CXX) $(CXXFLAGS) `$(LLVM_CONFIG) --cxxflags` $(LDFLAGS) -o $@ $^ `$(LLVM_CONFIG) --ldflags` -Wl,-rpath,$(LLVM_TARGET_LIBDIR) '-Wl,--export-dynamic-symbol=_ZN4llvm3lto11thinBackend*' -lclang-cpp -llldELF -llldCommon -lLLVM -lxxhash -llz4 -ldl -lseccomp
 
 CLANG_MAJOR = $(firstword $(subst ., ,$(shell $(LLVM_CONFIG) --version)))
@@ -674,8 +674,8 @@ gcc_plan.so: $(GCC_PLAN_OBJECTS) src/argv_file.pic.o
 CLIENT_CONTRACT_SOURCES = src/hosts.c src/hostfile.c src/loadfile.c src/lock.c src/io.c src/fd_io.c src/tempfile.c \
 	src/trace.c src/util.c src/argutil.c src/rpc.c src/filename.c src/snprintf.c src/cleanup.c @ZEROCONF_COMMON_OBJS@
 # Host configuration must link without the client-only scheduler, as in distccd.
-h_client_hotpaths: test/client_hotpaths.c src/tcp_client.c src/tcp_job.c src/tcp_job.h src/local_clang.c src/exec.c src/broker_client.o src/broker_session.o src/broker_protocol.h src/broker_session.h src/workload.h src/argv_file.c src/frontend_fs.c src/frontend_identity.h $(CLIENT_CONTRACT_SOURCES)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/tcp_job.c src/local_clang.c src/exec.c src/broker_client.o src/broker_session.o src/argv_file.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
+h_client_hotpaths: test/client_hotpaths.c src/tcp_client.c src/tcp_job.c src/tcp_job.h src/local_clang.c src/exec.c src/broker_client.o src/broker_session.o src/broker_path.o src/broker_protocol.h src/broker_session.h src/workload.h src/argv_file.c src/frontend_fs.c src/frontend_identity.h $(CLIENT_CONTRACT_SOURCES)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -ffunction-sections -fdata-sections $(LDFLAGS) -Wl,--gc-sections -o $@ $< src/tcp_job.c src/local_clang.c src/exec.c src/broker_client.o src/broker_session.o src/broker_path.o src/argv_file.c $(CLIENT_CONTRACT_SOURCES) $(LIBS)
 h_resource: test/resource.c src/resource.c src/resource.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 h_file_cache: test/file_cache.c src/file_cache.c src/file_cache.h src/remote_job.c src/job.h $(CLIENT_CONTRACT_SOURCES)

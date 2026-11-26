@@ -178,8 +178,8 @@ static void dcc_show_hosts(void) {
 }
 
 int dcc_lto_capacity(char **capacity) {
-    const char *broker = getenv("DISTCC_BROKER");
-    if (!broker || !*broker) {
+    const char *broker = dcc_broker_path();
+    if (!broker) {
         rs_log_error("LTO capacity requires DISTCC_BROKER");
         return EXIT_BAD_ARGUMENTS;
     }
@@ -190,9 +190,9 @@ static void dcc_concurrency_level(void) {
     struct dcc_hostdef *list, *l;
     int nhosts;
     int nslots = 0;
-    const char *broker_path = getenv("DISTCC_BROKER");
+    const char *broker_path = dcc_broker_path();
 
-    if (broker_path && *broker_path) {
+    if (broker_path) {
         nslots = dcc_broker_jobs(NULL);
         if (nslots < 0)
             dcc_exit(EXIT_CONNECT_FAILED);

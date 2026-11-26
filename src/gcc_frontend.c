@@ -34,7 +34,7 @@ char *dcc_plan_key(char **argv, const char *input)
     const char *library = getenv("DISTCC_GCC_PLAN_LIBRARY");
     char context[80], *compiler = NULL, cwd[PATH_MAX];
     const char *extension = dcc_find_extension_const(input), *parent = strrchr(input, '/');
-    if (!getenv("DISTCC_BROKER") || !extension || !strcmp(input, "-") ||
+    if (!dcc_broker_path() || !extension || !strcmp(input, "-") ||
         !getcwd(cwd, sizeof(cwd))) return NULL;
     if (!library) library = GCC_PLAN_LIBRARY;
     if (strchr(argv[0], '/')) compiler = strdup(argv[0]);

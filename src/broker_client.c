@@ -20,8 +20,9 @@
 #include "workload.h"
 #include "plan_memo.h"
 
-static int decode_memo(unsigned command, unsigned flags, void *data, size_t size, int descriptor)
+static int decode_memo(unsigned command, unsigned flags, void *data, size_t size, int descriptor, uid_t sender)
 {
+    (void)sender;
     (void)flags;
     const char *value = data;
     if (descriptor >= 0)
@@ -105,7 +106,7 @@ static void free_hosts(struct dcc_hostdef *host)
     }
 }
 
-static int decode_schedule(unsigned command, unsigned flags, void *data, size_t size, int descriptor)
+static int decode_schedule(unsigned command, unsigned flags, void *data, size_t size, int descriptor, uid_t sender)
 {
     const struct reply *reply = data;
     int acquire = command == ACQUIRE || command == ACQUIRE_POOL || command == ACQUIRE_LINK ||
@@ -117,9 +118,13 @@ static int decode_schedule(unsigned command, unsigned flags, void *data, size_t 
                reply->status == EXIT_CONNECT_FAILED ? EHOSTUNREACH :
                reply->status == EXIT_LOCAL_COMPILE ? EXDEV : EPROTO;
     int direct = reply->flags & DCC_BROKER_DIRECT;
-    if (direct && (!(flags & CLIENT_COMPILE) || (command != ACQUIRE_CPP && command != ACQUIRE_READY)))
+    int ssh = reply->flags & DCC_BROKER_SSH;
+    /* SSH executes a broker-selected command using the caller's credentials. */
+    if (ssh && sender != geteuid() && sender != 0) return EACCES;
+    if (ssh && (direct || (reply->flags & DCC_BROKER_POOLED))) return EPROTO;
+    if ((direct || ssh) && (!(flags & CLIENT_COMPILE) || (command != ACQUIRE_CPP && command != ACQUIRE_READY)))
         return EPROTO;
-    return (acquire && !direct) == (descriptor >= 0) ? 0 : EPROTO;
+    return (acquire && !direct && !ssh) == (descriptor >= 0) ? 0 : EPROTO;
 }
 
 static int broker_request(uint8_t command, uint8_t flags, struct reply *reply, int *net,
@@ -146,10 +151,11 @@ int dcc_broker_local_cpp(int *lease, int *occupied, unsigned limit)
     return *lease < 0 ? EXIT_CONNECT_FAILED : 0;
 }
 
-int dcc_broker_try_local(const struct dcc_work_hint *hint)
+int dcc_broker_try_local(const struct dcc_work_hint *hint, int *tcp_jobs)
 {
     struct reply reply;
     int net, lease = broker_request(TRY_LOCAL, 0, &reply, &net, hint, NULL, 0);
+    if (tcp_jobs) *tcp_jobs = lease < 0 ? -1 : !!(reply.flags & DCC_BROKER_TCP_JOBS);
     if (lease >= 0 && !reply.slots) { dcc_session_finish(lease); lease = -1; }
     return lease;
 }
@@ -165,7 +171,7 @@ void dcc_broker_local_done(int lease, double elapsed, uint64_t cpu_ns, int statu
     dcc_session_send_lease(lease, RETURN, &part, 1, -1, FINISH_LEASE);
 }
 
-int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int can_compile_locally,
+int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, unsigned client_flags,
                        const struct dcc_work_hint *hint, int *queued_fd)
 {
     struct reply reply;
@@ -173,15 +179,16 @@ int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int
     /* Preserve the client's --localslots and --localslots_cpp settings. */
     if (dcc_read_localslots_configuration())
         return EXIT_BAD_HOSTSPEC;
-    fd = broker_request(cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL,
-                        can_compile_locally ? CLIENT_COMPILE : 0,
+    fd = broker_request(cpp_ready ? ACQUIRE_READY : ACQUIRE_POOL, client_flags,
                         &reply, &net, hint, queued_fd, 0);
     if (fd < 0)
         return errno == EXDEV ? EXIT_LOCAL_COMPILE : EXIT_CONNECT_FAILED;
     *host = NULL;
     count = 0;
     if (dcc_parse_hosts(reply.host, "broker", host, &count, NULL) ||
-        count != 1 || (*host)->mode != DCC_MODE_TCP) {
+        count != 1 || (((*host)->mode == DCC_MODE_SSH) != !!(reply.flags & DCC_BROKER_SSH)) ||
+        ((*host)->mode == DCC_MODE_LOCAL && !(reply.flags & DCC_BROKER_DIRECT)) ||
+        ((client_flags & CLIENT_FRONTEND) && !(*host)->tcp_jobs)) {
         free_hosts(*host);
         *host = NULL;
         if (net >= 0) close(net);
@@ -297,16 +304,21 @@ void dcc_broker_memo_put(int lease, const char *value, size_t length)
     (void)length;
     (void)value;
 }
-int dcc_broker_try_local(const struct dcc_work_hint *hint) { (void)hint; return -1; }
+int dcc_broker_try_local(const struct dcc_work_hint *hint, int *tcp_jobs)
+{
+    (void)hint;
+    if (tcp_jobs) *tcp_jobs = -1;
+    return -1;
+}
 void dcc_broker_local_done(int lease, double elapsed, uint64_t cpu_ns, int status)
 {
     (void)lease; (void)elapsed; (void)cpu_ns; (void)status;
 }
-int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int can_compile_locally,
+int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, unsigned client_flags,
                        const struct dcc_work_hint *hint, int *queued_fd)
 {
     (void)queued_fd;
-    (void)can_compile_locally;
+    (void)client_flags;
     (void)hint;
     (void)cpp_ready;
     (void)host;

@@ -370,7 +370,7 @@ static int dcc_link_candidate(char **argv, const char *broker)
     int i, input = 0;
     const char *profile = getenv("DISTCC_LINK_SYSROOT");
     enum dcc_clang_mode clang = dcc_clang_driver_mode(argv[0]);
-    if (!broker || !*broker || clang == DCC_CLANG_CPP || ((!profile || !*profile) && !clang))
+    if (!broker || clang == DCC_CLANG_CPP || ((!profile || !*profile) && !clang))
         return 0;
     for (i = 1; argv[i]; i++) {
         if (!strcmp(argv[i], "-o")) { if (argv[i + 1]) i++; continue; }
@@ -448,7 +448,7 @@ dcc_build_somewhere(char *argv[],
                     int sg_level,
                     int *status)
 {
-    const char *broker = getenv("DISTCC_BROKER");
+    const char *broker = dcc_broker_path();
     int rewrite_cross = !getenv("DISTCC_NO_REWRITE_CROSS");
     char *input_fname = NULL, *output_fname, *cpp_fname = NULL, *deps_fname = NULL;
     int cpp_fd = -1;
@@ -526,19 +526,29 @@ dcc_build_somewhere(char *argv[],
     /* GCC appends environment-requested dependencies to a client file. */
     if (preprocess_only && (getenv("DEPENDENCIES_OUTPUT") || getenv("SUNPRO_DEPENDENCIES")))
         ret = EXIT_LOCAL_CPP;
-    remote_frontend = !ret && broker && *broker &&
-        dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) &&
+    remote_frontend = !ret && broker &&
+        dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 1) &&
         (dcc_cpp_gcc(argv, input_fname) || (!preprocess_only && dcc_cpp_ir(argv, input_fname)));
     if (preprocess_only && !remote_frontend)
         ret = EXIT_LOCAL_CPP;
     const char *offload = !ret ? dcc_offload_language(argv) : NULL;
     /* Local execution consumes the same broker capacity as a local worker,
      * but needs neither native expansion nor a duplicate header/input tree. */
-    if (!ret && !offload &&
-        broker && *broker) {
+    if (!ret && broker) {
+        int tcp_jobs;
         dcc_work_describe(&work, argv, input_fname, NULL, -1, 0, &source_features);
-        direct_lease = dcc_broker_try_local(&work);
-        if (direct_lease >= 0) goto run_local;
+        direct_lease = dcc_broker_try_local(&work, &tcp_jobs);
+        if (direct_lease >= 0) {
+            if (!offload) goto run_local;
+            /* The offload coordinator acquires capacity for each action. */
+            dcc_unlock(direct_lease);
+            direct_lease = -1;
+        }
+        if (remote_frontend && tcp_jobs == 0) {
+            remote_frontend = 0;
+            if (preprocess_only) ret = EXIT_LOCAL_CPP;
+        }
+        if (offload && tcp_jobs == 0) ret = EXIT_LOCAL_COMPILE;
     }
     /* Driver config files belong to the client. Only a captured Clang
      * frontend command has already expanded them before transport. */
@@ -555,7 +565,7 @@ dcc_build_somewhere(char *argv[],
         ret = EXIT_LOCAL_CPP;
     if (!ret && (offload ||
         ((!remote_frontend || !dcc_cpp_ir(argv, input_fname)) && dcc_native_requested(argv)))) {
-        if (offload ? dcc_prepare_offload(&argv, &auxiliary, broker && *broker, &offload_graph) :
+        if (offload ? dcc_prepare_offload(&argv, &auxiliary, broker != NULL, &offload_graph) :
                                        dcc_expand_native(&argv, input_fname, output_fname)) {
             ret = EXIT_DISTCC_FAILED;
         } else if (!offload_graph) {
@@ -603,7 +613,7 @@ dcc_build_somewhere(char *argv[],
     /* With a broker, finish local preprocessing before reserving a worker.
      * Release the local lock before requesting the remote lease; never wait
      * for a remote slot while holding a local slot. Reuse this input on retry. */
-    if (broker && *broker && !prepared_job) {
+    if (broker && !prepared_job) {
         dcc_read_localslots_configuration();
         if (local_cpu_lock_fd == -1 && !dcc_is_preprocessed(input_fname) &&
             (ret = dcc_lock_local_cpp(&local_cpu_lock_fd))) goto fallback;
@@ -643,9 +653,8 @@ dcc_build_somewhere(char *argv[],
     dcc_free_buffer(&server_stdout);
     remote_completed = 0;
     if ((ret = dcc_pick_host_from_list_and_lock_it(&host, &cpu_lock_fd,
-            cpp_ready || (prepared_job && dcc_job_frontend(prepared_job)), &work)) != 0) {
-        /* Doesn't happen at the moment: all failures are masked by
-           returning localhost. */
+            cpp_ready, prepared_job && dcc_job_frontend(prepared_job), &work)) != 0) {
+        if (ret == EXIT_LOCAL_COMPILE) goto lock_local;
         goto fallback;
     }
     if (host->mode == DCC_MODE_LOCAL) {
@@ -659,7 +668,6 @@ dcc_build_somewhere(char *argv[],
     }
 
     if (prepared_job && dcc_job_frontend(prepared_job)) {
-        if (!host->broker_managed || host->compr != DCC_COMPRESS_LZ4_STREAM) goto fallback;
         char *target = NULL;
         if ((ret = dcc_get_dotd_info(argv, &deps_fname, &needs_dotd,
                                      &sets_dotd_target, &target)))

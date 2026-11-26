@@ -797,13 +797,13 @@ def tcp_link(net, archive, output):
     return status, timing, load
 
 
-def remote_link(job, inputs, output):
+def remote_link(job, inputs, output, broker):
     from distcc_job import BROKER_VERSION, BROKER_POOLED
 
     archive = LinkArchive(job, inputs)
     with ExitStack() as stack:
         lease = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
-        lease.connect(os.environ['DISTCC_BROKER'])
+        lease.connect(broker)
         lease.sendall(struct.pack('=HBBI', BROKER_VERSION, 8, 0, 0))
         layout = struct.Struct('=iiI1024s')
         reply, ancillary, flags, _ = lease.recvmsg(layout.size, socket.CMSG_SPACE(4), socket.MSG_CMSG_CLOEXEC)
@@ -1303,8 +1303,12 @@ def main():
     if '-###' in command[1:]:
         os.execvp(command[0], command)
     local = [distcc_python.client_executable(), '--local-command']
+    from distcc_job import broker_path
     try:
-        if os.environ.get('DISTCC_BROKER') and compiler_family(command[0]) == 'clang':
+        broker = broker_path()
+        if not broker:
+            raise LocalOnly('no broker configured')
+        if compiler_family(command[0]) == 'clang':
             invocation, diagnostics = clang_link_command(command, offload=True, plan=link_plan)
             args = invocation[1:]
             offload = Path(invocation[0]).name == 'clang-linker-wrapper'
@@ -1342,7 +1346,7 @@ def main():
         check_source(profile)
         sys.stderr.write(diagnostics)
         sys.stderr.flush()
-        result = remote_link(job, inputs, output)
+        result = remote_link(job, inputs, output, broker)
         if not result or os.environ.get('DISTCC_FALLBACK') == '0':
             return result
         print('distcc-link: remote linker failed; retrying locally', file=sys.stderr)

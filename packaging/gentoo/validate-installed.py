@@ -49,6 +49,9 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
     # listener while the remote command itself is still within its deadline.
     env['DISTCC_BROKER_IDLE'] = str(REMOTE_TIMEOUT)
     env['DISTCC_BROKER'] = str(root/'broker.sock')
+    for option in ('DISTCC_FRONTEND_REMOTE', 'DISTCC_CLANG_LOCAL', 'DISTCC_CLANG_CODEGEN',
+                   'DISTCC_MEMORY_LEARNING'):
+        env.pop(option, None)
     def report_failure(error_type, error, traceback):
         if error_type is not None:
             if isinstance(error, subprocess.TimeoutExpired):
@@ -85,7 +88,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
         return run_observed(args, observe=(broker.pid,), **kwargs)
     env.pop('DISTCC_GCC_SCAN_LIBRARY', None)
     if ',tcp' in env['DISTCC_HOSTS']:
-        env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_FRONTEND_ROOTS=str(root))
+        env['DISTCC_FRONTEND_ROOTS'] = str(root)
     results = {}
     compilers = ['/usr/bin/gcc', '/usr/bin/g++'] + json.loads(os.environ.get('VALIDATE_DISTCC_COMPILERS', '[]'))
     # Test the names Portage actually invokes, not only target-prefixed aliases
@@ -171,11 +174,10 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             # Reach the daemon's GCC filesystem frontend, including when this
             # validator and the selected daemon run on the same machine.
             before = (root/'client.log').stat().st_size
-            frontend_env = dict(env, DISTCC_FRONTEND_REMOTE='1')
             obj.unlink()
             result = remote(['distcc', compiler, '-I'+str(root), '-O2', '-fPIC',
                                      '-c', str(source), '-o', str(obj)],
-                                    env=frontend_env, timeout=REMOTE_TIMEOUT)
+                                    env=env, timeout=REMOTE_TIMEOUT)
             assert result.returncode == 0, (compiler, result.stderr.decode(errors='replace'))
             log = (root/'client.log').read_text()[before:]
             assert 'frontend filesystem:' in log and 'pooled TCP job completed' in log, log[-6000:]
@@ -196,7 +198,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             before = (root/'client.log').stat().st_size
             result = remote(['distcc', compiler, '-x', 'c++' if suffix == 'cc' else 'c',
                                      '-I'+str(root), '-O2', '-fPIC', '-c', '-', '-o', str(obj)],
-                                    input=source.read_bytes(), env=frontend_env,
+                                    input=source.read_bytes(), env=env,
                                     timeout=REMOTE_TIMEOUT)
             assert result.returncode == 0, (compiler, result.stderr.decode(errors='replace'))
             log = (root/'client.log').read_text()[before:]
@@ -219,7 +221,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
                              'assembly_values[1]!=7 || assembly_values[2]!=9; }\n')
             before = (root/'client.log').stat().st_size
             result = remote(['distcc', compiler, '-c', str(assembly), '-o', str(obj)],
-                                    cwd=root, env=frontend_env, timeout=REMOTE_TIMEOUT)
+                                    cwd=root, env=env, timeout=REMOTE_TIMEOUT)
             assert result.returncode == 0, (compiler, result.stderr.decode(errors='replace'))
             log = (root/'client.log').read_text()[before:]
             assert 'frontend filesystem:' in log and 'pooled TCP job completed' in log, log[-6000:]
@@ -276,8 +278,7 @@ with tempfile.TemporaryDirectory(prefix='distcc-native-', dir=os.environ['TMPDIR
             wrappers.mkdir()
             for name in ('clang', 'clang++', 'distcc-clang'):
                 (wrappers/name).symlink_to('/usr/bin/distcc')
-            launcher_env = dict(env, PATH=str(wrappers) + os.pathsep + env['PATH'],
-                                DISTCC_CLANG_LOCAL='1', DISTCC_FRONTEND_REMOTE='1')
+            launcher_env = dict(env, PATH=str(wrappers) + os.pathsep + env['PATH'])
             launcher_env.pop('DISTCC_CLANG_DRIVER', None)
             driver = Path(clang).with_name('clang++')
             source = root/'compiler-probe.hip'

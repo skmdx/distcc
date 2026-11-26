@@ -169,6 +169,11 @@ static void id_contract(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "--broker-path")) {
+        const char *path = dcc_broker_path_in(argv[2]);
+        if (path) puts(path);
+        return 0;
+    }
     assert(argc == 2);
     if (!strcmp(argv[1], "--memo") || !strcmp(argv[1], "--worker")) {
         char *value = NULL;
@@ -191,7 +196,7 @@ int main(int argc, char **argv)
         int worker, cpu, queued = -1;
         int memo = dcc_broker_memo_get("old-plan", &value, NULL, NULL);
         int helper = dcc_broker_worker_get("old-helper", &worker);
-        int local = dcc_broker_try_local(&hint);
+        int local = dcc_broker_try_local(&hint, NULL);
         assert(memo >= 0 && helper >= 0 && local >= 0);
         assert(!dcc_broker_acquire(&host, &cpu, 0, 0, &hint, &queued));
         assert(write(1, "A", 1) == 1 && getchar() != EOF);

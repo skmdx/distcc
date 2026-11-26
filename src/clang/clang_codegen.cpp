@@ -2,6 +2,7 @@
  * independent machine-code generation. SPDX-License-Identifier: GPL-2.0-or-later */
 #include "clang_codegen.h"
 #include "../broker_protocol.h"
+#include "../broker_path.h"
 #include "../workload.h"
 #include "../lto_partition.h"
 #include <clang/Basic/TargetInfo.h>
@@ -127,10 +128,9 @@ public:
 };
 // This is an optional extra CPU, never a queued request. The enclosing
 // compilation already owns one lane and can always finish without another.
-int try_lane() {
-    const char *path = getenv("DISTCC_BROKER");
+int try_lane(const char *path) {
     sockaddr_un address{};
-    if (!path || strlen(path) >= sizeof(address.sun_path)) return -1;
+    if (strlen(path) >= sizeof(address.sun_path)) return -1;
     address.sun_family = AF_UNIX;
     strcpy(address.sun_path, path);
     int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
@@ -184,12 +184,13 @@ void dcc_clang_codegen_init() {
 
 std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler,
     const std::function<unsigned(unsigned)> &reserve, dcc_result::Result *result) {
-    const char *enabled = getenv("DISTCC_CLANG_CODEGEN");
+    if (!dcc_clang_codegen_enabled()) return std::nullopt;
+    const char *broker = reserve ? nullptr : dcc_broker_path();
     auto &frontend = compiler.getFrontendOpts();
     const auto &codegen = compiler.getCodeGenOpts();
     // These actions produce other artifacts, or have wrappers around the
     // frontend action; their original Clang path owns those contracts.
-    if (!enabled || strcmp(enabled, "1") || (!reserve && !getenv("DISTCC_BROKER")) ||
+    if ((!reserve && !broker) ||
         frontend.ProgramAction != clang::frontend::EmitObj || frontend.ShowHelp || frontend.ShowVersion ||
         frontend.OutputFile.empty() || frontend.OutputFile == "-" ||
         frontend.FixAndRecompile || frontend.EmitSymbolGraph || !frontend.ASTMergeFiles.empty() ||
@@ -262,7 +263,7 @@ std::optional<bool> dcc_clang_codegen(clang::CompilerInstance &compiler,
         if (selected > 1) extra = reserve(selected-1);
     } else {
         while (lanes.size()+1 < selected) {
-            int fd = try_lane();
+            int fd = try_lane(broker);
             if (fd < 0) break;
             lanes.push_back(fd);
         }

@@ -2,7 +2,9 @@
 import fcntl
 import mmap
 import os
+import pwd
 import shutil
+import stat
 import struct
 from typing import NamedTuple
 
@@ -12,12 +14,35 @@ import xxhash
 
 (JOB_COMPILE, JOB_LINK, JOB_RUST, JOB_THINLTO, JOB_OFFLOAD_LINK,
  JOB_FRONTEND, JOB_GCC_FRONTEND, JOB_RUST_CGU) = range(8)
-BROKER_VERSION = 10
+BROKER_VERSION = 11
 BROKER_POOLED = 1
 TCP_BEGIN = 0x54000400
 TCP_RESULT_FD = TCP_BEGIN + 6
 TCP_PROGRESS = TCP_BEGIN + 8
 TCP_COMPLETE_SIZE = 8 + 5 * 8 + 12 * 4
+
+
+def broker_path(run_dir='/run'):
+    configured = os.environ.get('DISTCC_BROKER')
+    if configured is not None:
+        return configured or None
+    if 'DISTCC_HOSTS' in os.environ or 'DISTCC_DIR' in os.environ:
+        return None
+    home = os.environ.get('HOME')
+    if home is not None and os.access(home + '/.distcc/hosts', os.R_OK):
+        return None
+    uid = os.geteuid()
+    try:
+        name = pwd.getpwuid(uid).pw_name
+        if not name or '/' in name:
+            return None
+        path = os.path.join(run_dir, f'distcc-broker-{name}.socket')
+        info = os.lstat(path)
+    except (OSError, KeyError):
+        return None
+    if stat.S_ISSOCK(info.st_mode) and info.st_uid == uid and not info.st_mode & 0o077:
+        return path
+    return None
 
 
 def read_argv(fd):

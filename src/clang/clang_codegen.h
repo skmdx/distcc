@@ -3,8 +3,13 @@
 #define DCC_CLANG_CODEGEN_H
 #include <optional>
 #include <functional>
+#include "../env.h"
 namespace clang { class CompilerInstance; }
 namespace dcc_result { class Result; }
+
+inline bool dcc_clang_codegen_enabled() {
+    return dcc_getenv_bool("DISTCC_CLANG_CODEGEN", 1);
+}
 
 // Serial execution has no split/merge cost. Beyond two parts the model is
 // convex, so stop as soon as another part no longer reduces completion time.

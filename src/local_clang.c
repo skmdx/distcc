@@ -264,8 +264,8 @@ static int start_worker(const char *compiler, int *worker)
 
 static int get_worker(const char *compiler, int planning, int *worker)
 {
-    const char *broker = getenv("DISTCC_BROKER");
-    if (!broker || !*broker)
+    const char *broker = dcc_broker_path();
+    if (!broker)
         return planning ? start_worker(compiler, worker) : -1;
 
     char key[80], path[PATH_MAX];
@@ -290,7 +290,7 @@ static int get_worker(const char *compiler, int planning, int *worker)
 /* -1 means no request was accepted: ordinary execution is still safe. */
 static int request(char **argv, char operation, int output, int errors, int journal, int templated, int *status, uint64_t *cpu_ns)
 {
-    int reuse = dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0);
+    int reuse = dcc_getenv_bool("DISTCC_CLANG_LOCAL", 1);
     int planning = operation == 'P' || operation == 'I';
     int lto = operation == 'A' || operation == 'M' || operation == 'N';
     const char *driver = argv[0];
@@ -383,7 +383,8 @@ int dcc_clang_local(char **argv, int *status, uint64_t *cpu_ns)
 {
     /* Recursive compiler probes are already admitted by their caller. They
      * must execute the compiler directly, without another broker/helper wait. */
-    if (dcc_recursion_safeguard()) return -1;
+    /* Let the driver diagnose a response file that could not be expanded. */
+    if (dcc_recursion_safeguard() || dcc_argv_startswith(argv + 1, "@")) return -1;
     int ret = request(argv, 'C', -1, 2, -1, 0, status, cpu_ns);
     return ret == EXIT_LOCAL_COMPILE ? -1 : ret;
 }
@@ -402,7 +403,7 @@ static int dcc_clang_local_prepare(char **argv, const char *input, char ***comma
     char key[96], context[80], path[PATH_MAX];
     if (strchr(argv[0], '/')) compiler = strdup(argv[0]);
     else dcc_which(argv[0], &compiler);
-    if (compiler && cwd && getenv("DISTCC_BROKER") &&
+    if (compiler && cwd && dcc_broker_path() &&
         !dcc_local_worker_key(compiler, dcc_helper_path("distcc-clang", path),
                               DCC_PLAN_ENVIRONMENT, context, sizeof(context))) {
         dcc_clang_plan_template(&plan, argv, input);
@@ -489,7 +490,7 @@ int dcc_clang_link_prepare(char **argv, int *plan, int *errors, char ***invocati
 {
     *plan = *errors = -1;
     *invocation = NULL;
-    if (!dcc_getenv_bool("DISTCC_CLANG_LOCAL", 0) ||
+    if (!dcc_getenv_bool("DISTCC_CLANG_LOCAL", 1) ||
         !dcc_clang_driver_mode(argv[0])) return -1;
     *plan = dcc_job_memfd("distcc-link-plan");
     *errors = dcc_job_memfd("distcc-link-diagnostics");

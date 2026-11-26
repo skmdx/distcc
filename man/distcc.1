@@ -467,9 +467,11 @@ duplicate lock endpoints use the first entry. Without stats or speed options,
 host selection is unchanged. Per-client slot locks are held until job completion;
 the server's --jobs limit still bounds work from multiple clients.
 .PP
-On Linux, setting DISTCC_BROKER to an absolute UNIX socket path delegates
-selection and TCP connection establishment to a local distccd --broker
-process. An empty value disables the broker. The broker's startup host list
+On Linux, clients discover /run/distcc-broker-<user>.socket when the socket
+is owned by the effective user and has no group or other permissions.
+Setting DISTCC_HOSTS or DISTCC_DIR, or providing a readable ~/.distcc/hosts,
+disables discovery. Set DISTCC_BROKER to select an explicit socket path or
+to an empty value to disable the broker. The broker's startup host list
 is authoritative; the client's host
 list still supplies --localslots and --localslots_cpp. distcc -j queries the
 broker. Statistics and slot reservations are held in memory, avoiding
@@ -512,7 +514,7 @@ Bulk data is sent in bounded chunks instead of buffering its complete compressed
 representation. Both endpoints must support the selected protocol.
 .TP
 .B ,tcp
-Uses prepared jobs over pooled TCP connections. Requires DISTCC_BROKER and
+Uses prepared jobs over pooled TCP connections. Requires an active broker and
 upgraded clients and workers. Inputs are prepared and results returned outside
 compiler execution slots. Shared inputs use a bounded verified cache.
 SSH and GSSAPI cannot be combined with this option.
@@ -559,7 +561,7 @@ ignore that host for about one minute.
 .SH "REMOTE OBJECT LINKING"
 On Linux, GCC and Clang/LLD object/archive links can use the local broker and a synchronized
 client sysroot. This is opt-in: set DISTCC_LINK_SYSROOT to a profile produced
-by the private distcc-link helper with --sync, and DISTCC_BROKER to the broker socket. The distcc-link
+by the private distcc-link helper with --sync and run a local broker. The distcc-link
 helper requires Python 3.11 or later. Each worker must have a compatible
 toolchain and DISTCCD_LINK_ROOT pointing at its sysroot cache. GCC links apply
 the cached client GCC specs, preserving its default linker flags.

@@ -58,13 +58,10 @@
 
 #include <config.h>
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <time.h>
 
 #include <sys/stat.h>
 #include <sys/file.h>
@@ -78,6 +75,7 @@
 #include "exitcode.h"
 #include "adaptive.h"
 #include "broker.h"
+#include "broker_protocol.h"
 #include "resource.h"
 
 
@@ -88,16 +86,16 @@ static void dcc_lock_pause(void);
 
 
 int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **buildhost,
-                            int *cpu_lock_fd, int cpp_ready, const struct dcc_work_hint *work)
+                            int *cpu_lock_fd, int cpp_ready, int frontend, const struct dcc_work_hint *work)
 {
     struct dcc_hostdef *hostlist;
     struct dcc_hostdef *h;
     int ret;
     int n_hosts;
-    const char *broker_path = getenv("DISTCC_BROKER");
-
-    if (broker_path && *broker_path)
-        return dcc_broker_acquire(buildhost, cpu_lock_fd, cpp_ready, 1, work, NULL);
+    if (dcc_broker_path())
+        return dcc_broker_acquire(buildhost, cpu_lock_fd, cpp_ready || frontend,
+                                  CLIENT_COMPILE | (frontend ? CLIENT_FRONTEND : 0), work, NULL);
+    if (frontend) return EXIT_LOCAL_COMPILE;
 
     if ((ret = dcc_get_hostlist(&hostlist, &n_hosts)) != 0) {
         return EXIT_NO_HOSTS;
@@ -216,10 +214,10 @@ int dcc_lock_local_cpp(int *cpu_lock_fd)
     int ret = dcc_read_localslots_configuration();
     if (ret) return ret;
     struct dcc_hostdef *chosen = dcc_hostdef_local_cpp;
-    const char *broker = getenv("DISTCC_BROKER");
+    const char *broker = dcc_broker_path();
     /* A socket lease wakes on release instead of polling all local locks.
      * It is closed by the same unlock path, including cancellation. */
-    if (broker && *broker) {
+    if (broker) {
         int occupied;
         for (;;) {
             int maximum = chosen->slots_specified ? chosen->n_slots : dcc_resource_cpus();

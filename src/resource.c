@@ -15,6 +15,7 @@
 #include <sys/inotify.h>
 #endif
 #include "resource.h"
+#include "env.h"
 #include "job.h"
 
 static double pressure = -1;
@@ -223,8 +224,11 @@ static void observe_memory(struct memory_history *history,
 
 static int memory_learning(void)
 {
-    const char *setting = getenv("DISTCC_MEMORY_LEARNING");
-    return setting && !strcmp(setting, "1");
+#ifdef __linux__
+    return dcc_getenv_bool("DISTCC_MEMORY_LEARNING", 1);
+#else
+    return 0;
+#endif
 }
 
 unsigned dcc_resource_bucket(unsigned long long bytes)
@@ -397,8 +401,7 @@ static int resource_slots(int maximum, unsigned long long job,
     sample_resources();
     if (pressure >= 10) pressure_blocked = 1;
     else if (pressure < 5) pressure_blocked = 0;
-    const char *learn = getenv("DISTCC_MEMORY_LEARNING");
-    if (!pressure_blocked && learning && learn && !strcmp(learn, "1") && samples &&
+    if (!pressure_blocked && learning && memory_learning() && samples &&
         (budget < job || budget - job < spare)) {
         /* The estimate already includes measurement headroom. A separate
          * host reserve must not strand one otherwise fitting measured job. */

@@ -4,6 +4,7 @@ import array
 import fcntl
 import concurrent.futures
 import os
+import pwd
 import re
 import select
 import shlex
@@ -18,11 +19,56 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from distcc_job import BROKER_VERSION, JOB_COMPILE, JOB_RUST, JOB_THINLTO, JOB_OFFLOAD_LINK
+from distcc_job import BROKER_VERSION, JOB_COMPILE, JOB_RUST, JOB_THINLTO, JOB_OFFLOAD_LINK, broker_path
 from test_adaptive import DistccTestCase, free_port, stats_response
+
+
+class BrokerDiscoveryTest(unittest.TestCase):
+    def check_path(self, root, expected, **overrides):
+        env = {k: v for k, v in os.environ.items() if k not in
+               ('DISTCC_BROKER', 'DISTCC_HOSTS', 'DISTCC_DIR')}
+        env.update(HOME=str(root), **overrides)
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(broker_path(root), expected)
+            result = subprocess.check_output([Path.cwd()/'h_client_hotpaths', '--broker-path', root],
+                                             text=True).rstrip('\n')
+            self.assertEqual(result or None, expected)
+
+    def test_only_private_owned_socket_without_host_overrides(self):
+        with tempfile.TemporaryDirectory() as directory, socket.socket(socket.AF_UNIX) as sock:
+            root = Path(directory)
+            name = pwd.getpwuid(os.geteuid()).pw_name
+            path = root/f'distcc-broker-{name}.socket'
+            self.check_path(root, None)
+            path.touch(mode=0o600)
+            self.check_path(root, None)
+            path.unlink()
+            sock.bind(str(path))
+            path.chmod(0o600)
+            self.check_path(root, str(path))
+            for option in ('DISTCC_HOSTS', 'DISTCC_DIR', 'DISTCC_BROKER'):
+                with self.subTest(option=option):
+                    self.check_path(root, None, **{option: ''})
+            (root/'.distcc').mkdir()
+            hosts = root/'.distcc/hosts'
+            hosts.touch()
+            self.check_path(root, None)
+            self.check_path(root, '/explicit', DISTCC_BROKER='/explicit', DISTCC_HOSTS='localhost')
+            hosts.unlink()
+            path.chmod(0o660)
+            self.check_path(root, None)
+            path.chmod(0o600)
+            if os.geteuid() == 0:
+                os.chown(path, pwd.getpwnam('nobody').pw_uid, -1)
+                self.check_path(root, None)
+                os.chown(path, 0, -1)
+            target = path.rename(root/'socket')
+            path.symlink_to(target)
+            self.check_path(root, None)
 
 
 class MemoReconnectTest(unittest.TestCase):
@@ -71,6 +117,22 @@ class MemoReconnectTest(unittest.TestCase):
 
 class BrokerTestCase(DistccTestCase):
     protocol_version = BROKER_VERSION
+
+    def discovered_command(self, *command):
+        if not shutil.which('bwrap'):
+            self.skipTest('private /run requires bubblewrap')
+        env = dict(self.env, HOME=str(self.work))
+        path = env.pop('DISTCC_BROKER')
+        env.pop('DISTCC_DIR', None)
+        env.pop('DISTCC_HOSTS', None)
+        name = pwd.getpwuid(os.geteuid()).pw_name
+        mounts = ['--dev-bind', '/', '/', '--tmpfs', '/run', '--bind', path,
+                  f'/run/distcc-broker-{name}.socket']
+        for directory in ('/etc/distcc', '/usr/etc/distcc'):
+            if Path(directory).is_dir():
+                mounts.extend(['--tmpfs', directory])
+        return subprocess.run(['bwrap', *mounts, *command], cwd=self.work, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
 
     def clang_slot(self, compiler):
         major = subprocess.check_output([compiler, '-dumpversion'], text=True).strip().split('.')[0]
@@ -199,11 +261,13 @@ class BrokerTestCase(DistccTestCase):
         return proc
 
     def request(self, command=1, work=(0, 0, 0), work_units=0, family=0, memory_class=None,
-                cpp_limit=2147483647, scope_key=0, rust_compiler=0, cgu_backend=b'', client_compile=False):
+                cpp_limit=2147483647, scope_key=0, rust_compiler=0, cgu_backend=b'', client_compile=False,
+                frontend=False):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         sock.settimeout(5)
         sock.connect(self.env["DISTCC_BROKER"])
-        payload = struct.pack("=HBBI", self.protocol_version, command, client_compile, 0)
+        flags = int(client_compile) | (2 if frontend else 0)
+        payload = struct.pack("=HBBI", self.protocol_version, command, flags, 0)
         if command == 12:
             payload += struct.pack('=I', cpp_limit)
         if command in (6, 9, 10, 15, 20):
@@ -774,6 +838,24 @@ class BrokerPlacementTest(BrokerTestCase):
 
 
 class BrokerTest(BrokerTestCase):
+    def test_classic_pools_compile_without_fallback(self):
+        ssh = self.work/'ssh'
+        ssh.write_text('#!/bin/sh\nshift\nexec "$@"\n')
+        ssh.chmod(0o755)
+        for name, hosts in [('classic', self.host(0, ',lz4')), ('local', 'localhost/4'),
+                            ('ssh', '@localhost/4:' + str(self.build/'distccd'))]:
+            with self.subTest(transport=name):
+                self.start_broker(hosts, name=name)
+                self.env.update(DISTCC_SSH=str(ssh), DISTCC_VERBOSE='1')
+                self.assertEqual(self.receive(self.request(15), capabilities=True), (0, 0, []))
+                self.assertEqual(self.receive(self.request(10, frontend=True)), (121, 0, []))
+                self.job(name)
+                command = [self.cc, '-E', str(self.source)]
+                actual = subprocess.run([self.build/'distcc', *command], env=self.env,
+                                        capture_output=True, check=True, timeout=10)
+                self.assertEqual(actual.stdout, subprocess.check_output(command))
+                self.assertNotIn(b'frontend filesystem:', actual.stderr)
+
     def test_untagged_connection_returns_one_reply_and_eof(self):
         broker = self.start_broker()
         # Queue both JOBS queries before the broker can answer the first.

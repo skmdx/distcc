@@ -56,7 +56,7 @@ static int local_lease(int bytes)
 {
     struct dcc_work_hint hint = {.kind = DCC_WORK_THINLTO, .bytes = bytes,
         .memory_class = 1 + DCC_JOB_THINLTO * DCC_MEMORY_BUCKETS + dcc_resource_bucket(bytes)};
-    return dcc_broker_try_local(&hint);
+    return dcc_broker_try_local(&hint, NULL);
 }
 
 static int run_link(char **argv, char **args, int errors, int bytes, int offload, int supplied)
@@ -108,7 +108,7 @@ out:
         dcc_broker_local_done(lease, finish.tv_sec-start.tv_sec +
                               (finish.tv_nsec-start.tv_nsec)/1e9, cpu, ret);
     }
-    dcc_close(lock);
+    if (lock >= 0) dcc_close(lock);
     free(resolved); free(device); free(driver); free(transport); free(compiler); free(cmd);
     return ret;
 }

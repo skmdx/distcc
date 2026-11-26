@@ -62,8 +62,7 @@ class LocalClangTest(BrokerTestCase):
             self.skipTest('Clang unavailable')
         self.compiler = compiler
         self.broker = self.start_broker(hosts=hosts)
-        self.env.update(DISTCC_HOSTS='localhost/4', DISTCC_CLANG_LOCAL='1', DISTCC_VERBOSE='1',
-                        DISTCC_CLANG_CODEGEN='1',
+        self.env.update(DISTCC_HOSTS='localhost/4', DISTCC_VERBOSE='1',
                         DISTCC_LOG=str(self.work/'client.log'),
                         PATH=str(self.build)+os.pathsep+self.env['PATH'])
 
@@ -90,6 +89,25 @@ class LocalClangTest(BrokerTestCase):
                 'started local compiler libraries'), 1)
         finally:
             os.close(reader)
+
+    def test_local_reuse_opt_out(self):
+        self.start_local()
+        self.env['DISTCC_CLANG_LOCAL'] = '0'
+        result = self.command(['-dumpversion'], check=True)
+        self.assertEqual(result.stdout, self.command(['-dumpversion'], reused=False, check=True).stdout)
+        self.assertNotIn('local compiler libraries', (self.work/'client.log').read_text())
+
+    def test_compiler_helper_discovers_broker_in_request_environment(self):
+        capacity = self.peer(stats_response(cpus=4, jobs=4, cores=4))
+        self.start_local(self.host(0, f',tcp,stats={capacity.port}'))
+        self.source.write_text('\n'.join(f'unsigned f{i}(unsigned n) {{for (int j=0;j<100;j++) '
+                                         f'n=n*33+j+{i}; return n;}}' for i in range(8)))
+        result = self.discovered_command('sh', '-c', '"$@" && exec "$@"', 'sh',
+                                         self.build/'distcc', self.compiler, '-O2', '-c', self.source,
+                                         '-o', self.work/'out.o')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(b'distcc codegen: 2 parts', result.stdout)
+        self.assertIn('reused local compiler libraries', (self.work/'client.log').read_text())
 
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
     def test_prepared_local_cc1_reuses_frontend(self):
@@ -1016,7 +1034,7 @@ int main() {
         capacity = self.peer(stats_response(cpus=4, jobs=4, cores=4))
         self.start_broker(self.host(0, f',tcp,stats={capacity.port}'), name='codegen')
         saved.update({key: self.env[key] for key in ('DISTCC_HOSTS', 'DISTCC_BROKER')})
-        self.env = dict(saved, DISTCC_CLANG_CODEGEN='1')
+        self.env = saved
         if not verbose:
             self.env.pop('DISTCC_VERBOSE', None)
         if occupied:

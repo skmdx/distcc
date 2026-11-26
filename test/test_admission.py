@@ -15,7 +15,7 @@ from test_broker import BrokerTestCase
 
 
 class MemoryAdmissionTest(BrokerTestCase):
-    daemon_env = {'DISTCC_JOB_MEMORY': '128'}
+    daemon_env = {'DISTCC_JOB_MEMORY': '128', 'DISTCC_MEMORY_LEARNING': '0'}
     transport = 'lz4'
 
     def test_budget_and_headroom_recover(self):

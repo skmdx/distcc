@@ -1,6 +1,7 @@
 /* Validated reuse of frontend IR, within one resident compiler.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
+#include "clang_codegen.h"
 #include "remote_files.h"
 #include <clang/Frontend/Utils.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
@@ -151,8 +152,7 @@ class Result {
 public:
     Result(RemoteFiles &files, clang::CompilerInstance &compiler, llvm::StringRef cwd)
         : files(files), compiler(compiler) {
-        const char *enabled = getenv("DISTCC_CLANG_CODEGEN");
-        if (!enabled || strcmp(enabled, "1")) return;
+        if (!dcc_clang_codegen_enabled()) return;
         const char *verbosity = getenv("DISTCC_VERBOSE");
         verbose = verbosity && !strcmp(verbosity, "1");
         if (!eligible(compiler.getInvocation())) {

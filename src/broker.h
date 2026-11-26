@@ -1,19 +1,21 @@
 /* Local distccd scheduling and connected-socket leases. */
 #include <stdint.h>
 #include <stddef.h>
+#include "broker_path.h" // IWYU pragma: export
 struct dcc_hostdef;
 #define DCC_BROKER_LEASE_BASE (1 << 28)
 void dcc_broker_release(int lease);
 struct dcc_work_hint;
 struct dcc_job_result;
 int dcc_broker_serve(const char *path);
-int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, int can_compile_locally,
+int dcc_broker_acquire(struct dcc_hostdef **host, int *lease, int cpp_ready, unsigned client_flags,
                        const struct dcc_work_hint *, int *queued_fd);
 int dcc_broker_local_cpp(int *lease, int *occupied, unsigned limit);
 /* Try the ordinary placement policy before preparing remote inputs. A declined
  * request holds no reservation; a granted lease covers client-side execution.
  * An empty hint borrows an extra local codegen lane; there is no movable job. */
-int dcc_broker_try_local(const struct dcc_work_hint *);
+/* Optional tcp_jobs output: 1/0 describes the hostlist, -1 means no reply. */
+int dcc_broker_try_local(const struct dcc_work_hint *, int *tcp_jobs);
 void dcc_broker_local_done(int lease, double elapsed, uint64_t cpu_ns, int status);
 void dcc_broker_failed(const struct dcc_hostdef *host);
 void dcc_broker_defer(const struct dcc_hostdef *host);

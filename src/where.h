@@ -25,7 +25,7 @@
 struct dcc_work_hint;
 struct dcc_hostdef;
 int dcc_pick_host_from_list_and_lock_it(struct dcc_hostdef **,
-                                        int *cpu_lock_fd, int cpp_ready, const struct dcc_work_hint *);
+                                        int *cpu_lock_fd, int cpp_ready, int frontend, const struct dcc_work_hint *);
 
 int dcc_lock_local(int *cpu_lock_fd);
 

@@ -41,7 +41,8 @@ struct client {
     struct client *session_next;
     unsigned tag;
     int session;
-    int fd, net, peer, cpp_reserved, direct, can_compile_locally;
+    int fd, net, peer, cpp_reserved, direct;
+    unsigned flags;
     uint64_t serial;
     enum client_state state;
     uint32_t command, local_limit;
@@ -57,7 +58,7 @@ struct client {
 struct broker_schedule {
     struct peer peers[MAX_HOSTS];
     struct client clients[MAX_CLIENTS];
-    int count, cpp_busy, cpp_limit;
+    int count, tcp_jobs, cpp_busy, cpp_limit;
     uint64_t direct_completed, direct_prepared_completed;
     double local_prepare[DCC_WORK_CLASSES];
     struct dcc_work_model model;

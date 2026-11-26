@@ -116,6 +116,7 @@ const int dcc_default_port = DISTCC_DEFAULT_PORT;
 /* Configuration is shared by broker client code linked into both binaries.
  * Keep it with host parsing, not the client-only scheduling object. */
 static int tcp_jobs_only;
+static int read_hostlist(struct dcc_hostdef **list, int *count, int required);
 
 int dcc_read_localslots_configuration(void)
 {
@@ -140,7 +141,7 @@ int dcc_read_localslots_configuration(void)
     dcc_hostdef_local->slots_specified = dcc_hostdef_local_cpp->slots_specified = 0;
     dcc_hostdef_local->n_slots = 4;
     dcc_hostdef_local_cpp->n_slots = 0;
-    result = dcc_get_hostlist(&hostlist, &n_hosts);
+    result = read_hostlist(&hostlist, &n_hosts, 0);
     tcp_jobs_only = 1; /* A broker-only client has an empty local list. */
     while (hostlist) {
         struct dcc_hostdef *next = hostlist->next;
@@ -198,10 +199,10 @@ char *strndup(const char *src, size_t size)
  *
  * Hosts are taken from DISTCC_HOSTS, if that exists.  Otherwise, they are
  * taken from $DISTCC_DIR/hosts, if that exists.  Otherwise, they are taken
- * from ${sysconfdir}/distcc/hosts, if that exists.  Otherwise, we fail.
+ * from ${sysconfdir}/distcc/hosts. A caller reading only local slot settings
+ * can use the built-in defaults when none of these sources exists.
  **/
-int dcc_get_hostlist(struct dcc_hostdef **ret_list,
-                     int *ret_nhosts)
+static int read_hostlist(struct dcc_hostdef **ret_list, int *ret_nhosts, int required)
 {
     char *env;
     char *path = NULL;
@@ -239,10 +240,15 @@ int dcc_get_hostlist(struct dcc_hostdef **ret_list,
         free(path);
     }
 
-    /* FIXME: Clearer message? */
+    if (!required) return 0; /* Local slot settings are optional. */
     rs_log_warning("no hostlist is set; can't distribute work");
 
     return EXIT_BAD_HOSTSPEC;
+}
+
+int dcc_get_hostlist(struct dcc_hostdef **list, int *count)
+{
+    return read_hostlist(list, count, 1);
 }
 
 

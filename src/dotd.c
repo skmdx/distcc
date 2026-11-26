@@ -44,14 +44,10 @@ static size_t make_word_length(const char *word)
 /* Given the name of a dotd file, and the name of the directory
  * masquerading as root, write a @p new_dotd file that
  * contains everything in dotd, but with the "root" directory removed.
- * It will also substitute client_out_name for server_out_name,
- * rewriting the dependency target.
  */
 int dcc_cleanup_dotd(const char *dotd_fname,
                      char **new_dotd_fname,
-                     const char *root_dir,
-                     const char *client_out_name,
-                     const char *server_out_name)
+                     const char *root_dir)
 {
     FILE *dotd, *tmp_dotd;
     int ret;
@@ -76,7 +72,6 @@ int dcc_cleanup_dotd(const char *dotd_fname,
 
     char *line = NULL;
     size_t capacity = 0, column = 0, root_len = strlen(root_dir);
-    size_t target_len = server_out_name ? strlen(server_out_name) : 0;
     int continued = 0, relocated = 0;
     ssize_t length;
     while ((length = getline(&line, &capacity, dotd)) >= 0) {
@@ -88,17 +83,9 @@ int dcc_cleanup_dotd(const char *dotd_fname,
             const char *word = next + space;
             size_t size = make_word_length(word);
             next = word + size;
-            int colon = 0;
             if (size > root_len && word[root_len] == '/' && !memcmp(word, root_dir, root_len)) {
                 word += root_len;
                 size -= root_len;
-                relocated = 1;
-            } else if (target_len && (size == target_len ||
-                       (size == target_len + 1 && word[target_len] == ':')) &&
-                       !memcmp(word, server_out_name, target_len)) {
-                colon = size != target_len;
-                word = client_out_name;
-                size = strlen(word);
                 relocated = 1;
             }
             if (space) {
@@ -112,8 +99,7 @@ int dcc_cleanup_dotd(const char *dotd_fname,
                 ++column;
             }
             fwrite(word, 1, size, tmp_dotd);
-            if (colon) fputc(':', tmp_dotd);
-            column += size + colon;
+            column += size;
             continued = 0;
         }
         continued = wrap;

@@ -403,7 +403,8 @@ static enum decision answer_cluster_jobs(const struct broker_schedule *broker, c
         const struct peer *p = &broker->peers[i];
         struct dcc_capacity observed = observed_capacity(p, broker->cpp_busy);
         const struct dcc_capacity *cap = p->valid_until > now ? &observed : NULL;
-        if (!p->address_len || p->retry_at > now || dcc_capacity_slots(p->host, cap) <= 0) continue;
+        if ((!p->address_len && p->host->mode == DCC_MODE_TCP) ||
+            p->retry_at > now || dcc_capacity_slots(p->host, cap) <= 0) continue;
         if (capacity_pending(p, client, now)) return HOLD_JOB;
         ++available;
         int jobs = dcc_capacity_parallelism(p->host, cap);
@@ -469,9 +470,9 @@ static struct peer_view project_peer(const struct peer *p, const struct occupanc
     }
     view.slots = dcc_capacity_slots(p->host, cap);
     int staged = p->host->tcp_jobs;
-    view.local_exec = p->local && staged && (client->command == TRY_LOCAL ||
-        (client->can_compile_locally && cap && cap->busy >= 0 &&
-         (client->command == ACQUIRE_CPP || client->command == ACQUIRE_READY)));
+    view.local_exec = p->host->mode == DCC_MODE_LOCAL || (p->local && staged &&
+        (client->command == TRY_LOCAL || ((client->flags & CLIENT_COMPILE) && cap && cap->busy >= 0 &&
+         (client->command == ACQUIRE_CPP || client->command == ACQUIRE_READY))));
     view.capacity = cap && cap->capacity >= 0 && cap->capacity < view.slots ? cap->capacity : view.slots;
     view.lanes = cap ? effective_lanes(cap) : view.slots;
     view.pipeline = link_backend || view.local_exec ? 0 : pipeline_slots(p->host, view.capacity);
@@ -534,7 +535,12 @@ static enum decision place_job(struct broker_schedule *broker, struct client *cl
         struct prediction forecast;
     } best = {.peer = -1}, ready = {.peer = -1}, affinity = {.peer = -1};
     int direct = client->command == TRY_LOCAL;
+    if ((client->flags & CLIENT_FRONTEND) && !broker->tcp_jobs) {
+        reply->status = EXIT_LOCAL_COMPILE;
+        return ANSWER;
+    }
     if (direct) {
+        if (broker->tcp_jobs) reply->flags |= DCC_BROKER_TCP_JOBS;
         for (i = 0; i < broker->count; ++i)
             if (broker->peers[i].local && broker->peers[i].host->tcp_jobs) break;
         if (i == broker->count) return ANSWER;
@@ -561,6 +567,9 @@ static enum decision place_job(struct broker_schedule *broker, struct client *cl
         /* An empty preflight describes an extra local codegen lane, not a
          * movable compiler invocation. It has no remote execution method. */
         if (direct && !client->hint.key && !p->local) continue;
+        if ((client->flags & CLIENT_FRONTEND) && !p->host->tcp_jobs) continue;
+        if (p->host->mode != DCC_MODE_TCP && (!(client->flags & CLIENT_COMPILE) ||
+            (client->command != ACQUIRE_CPP && client->command != ACQUIRE_READY))) continue;
         if (client->hint.kind == DCC_WORK_RUST || client->hint.kind == DCC_WORK_RUST_CGU) {
             struct rust_routes routes = rust_routes(p, client, now);
             if (!(client->hint.kind == DCC_WORK_RUST ? routes.native : routes.cgu)) {
@@ -575,7 +584,7 @@ static enum decision place_job(struct broker_schedule *broker, struct client *cl
         int local_exec = view.local_exec, inflight = view.inflight, pipeline = view.pipeline;
         if (direct && p->local && !broker->cpp_limit &&
             broker->cpp_busy >= cpp_limit(broker)) continue;
-        if (!p->address_len || p->retry_at > now || slots <= 0)
+        if ((!p->address_len && p->host->mode == DCC_MODE_TCP) || p->retry_at > now || slots <= 0)
             continue;
         available++;
         if (view.memory_full || p->valid_until < 0) continue; /* Admission was refused: refresh first. */
@@ -851,7 +860,8 @@ int schedule_batch(struct broker_schedule *broker, struct dispatch_batch *batch,
     for (i = 0; i < MAX_CLIENTS; ++i) {
         struct client *c = &broker->clients[i];
         if (c->fd >= 0 && c->state == WAITING &&
-            (c->command == LOCAL_CPP || !probes_pending))
+            (c->command == LOCAL_CPP || !probes_pending ||
+             (!broker->tcp_jobs && (c->command == TRY_LOCAL || (c->flags & CLIENT_FRONTEND)))))
             waiting[count_waiting++] = (struct waiting_job){c,
                 dcc_work_predict(&broker->model, &c->hint), now - c->waiting_since};
     }

@@ -22,6 +22,7 @@
  */
 
 #include "distcc.h"
+#include "env.h" // IWYU pragma: export
 #include <stdio.h>
 #include <time.h>
 #include <stdint.h>
@@ -35,7 +36,6 @@ int dcc_redirect_fd(int, const char *fname, int);
 int str_startswith(const char *head, const char *worm);
 char *dcc_gethostname(void);
 void dcc_exit(int exitcode) NORETURN;
-int dcc_getenv_bool(const char *name, int def_value);
 int set_cloexec_flag (int desc, int value);
 int dcc_ignore_sigpipe(int val);
 int dcc_remove_if_exists(const char *fname);

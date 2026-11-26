@@ -52,6 +52,21 @@ class OffloadTest(BrokerTestCase):
                                 '-nogpulib', '-O2', '-x', 'c'], source)
         self.assertIn('AMD GPU', subprocess.check_output(['readelf', '-h', obj], text=True))
 
+    def test_classic_broker_runs_device_compile_locally(self):
+        self.start_broker(self.host(0, ',lz4'), name='classic')
+        self.env['DISTCC_VERBOSE'] = '1'
+        source, obj = self.work/'device.c', self.work/'device.o'
+        source.write_text('int device_add(int a, int b) { return a + b; }\n')
+        args = [self.compiler, '--target=amdgcn-amd-amdhsa', '-mcpu=gfx900', '-nogpulib',
+                '-O2', '-x', 'c', '-c', source, '-o', obj]
+        subprocess.run(args, capture_output=True, check=True)
+        expected = obj.read_bytes()
+        obj.unlink()
+        result = subprocess.run([self.build/'distcc', *args], env=self.env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b'exec on localhost', result.stderr)
+        self.assertEqual(obj.read_bytes(), expected)
+
     @unittest.skipUnless(shutil.which('strace') and os.environ.get('ROCM_DEVICE_LIB_PATH'),
                          'ROCm bitcode and strace required')
     def test_driver_plan_transfers_only_selected_device_libraries(self):

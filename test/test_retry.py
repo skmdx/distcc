@@ -104,6 +104,7 @@ class RetryTest(BrokerTestCase):
                                'strcmp(__BASE_FILE__, EXPECTED_FILE) || __INCLUDE_LEVEL__; } return 1; }\n')
         for codec in ('lz4', 'tcp'):
             self.start_broker(self.host(0, ',' + codec), name='clang-cpp-' + codec)
+            self.env['DISTCC_FRONTEND_REMOTE'] = '0'
             obj, dep = self.work / 'macro.o', self.work / 'macro.d'
             args = [clang, '-Werror=unreachable-code-loop-increment',
                     '-DVALUE=17', '-D', 'REMOVED', '-U', 'REMOVED',
@@ -124,6 +125,7 @@ class RetryTest(BrokerTestCase):
 
     def test_local_cpp_preserves_dependency_outputs(self):
         self.start_broker(self.host(0, ',tcp'))
+        self.env['DISTCC_FRONTEND_REMOTE'] = '0'
         for compiler in ('gcc', shutil.which('clang')):
             if not compiler:
                 continue
@@ -144,6 +146,7 @@ class RetryTest(BrokerTestCase):
         self.source.write_text('#include "missing-distcc-test-header.h"\n')
         for codec in ('lz4', 'tcp'):
             self.start_broker(self.host(0, ',' + codec), name='cpp-error-' + codec)
+            self.env['DISTCC_FRONTEND_REMOTE'] = '0'
             before = re.search(r'dcc_tcp_accept (\d+)', self.get_stats(self.stats_ports[0]))
             assert before is not None
             for fallback in ('0', '1'):

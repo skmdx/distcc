@@ -17,10 +17,12 @@ the same libraries or header files installed. Machines can be running
 different operating systems, as long as they have compatible binary
 formats or cross-compilers.
 
-By default, distcc sends source code with its headers expanded across
-the network for each job, so all it requires of the volunteer machines
-is that they be running the distccd daemon, and that they have an
-appropriate compiler installed.
+The client automatically uses `/run/distcc-broker-<user>.socket` when it is a
+socket owned by the effective user with group and other permissions cleared.
+Setting `DISTCC_HOSTS` or `DISTCC_DIR`, or providing a readable
+`$HOME/.distcc/hosts`, selects that host configuration and disables discovery.
+An explicit `DISTCC_BROKER` path takes precedence. Set `DISTCC_BROKER=""` to
+disable the broker.
 
 HIP compilation uses the client's Clang driver and the existing TCP input cache.
 `distcc-offload` executes the driver's action graph: each target is preprocessed
@@ -41,7 +43,7 @@ ThinLTO links distribute individual optimization/code-generation backends:
 distcc clang++ -flto=thin -fuse-ld=lld main.o library.a -o application
 ```
 
-This requires `DISTCC_BROKER`, `,tcp` workers, Clang/LLD with the integrated
+This requires a broker, `,tcp` workers, Clang/LLD with the integrated
 DTLTO interface, Python xxhash and bubblewrap with unprivileged user namespaces.
 LLD performs the thin link, discovers imported modules and archive members, and
 invokes `distcc-thinlto` with its JSON job description. Each backend uses the
@@ -145,7 +147,7 @@ RUSTC_WRAPPER=distcc cargo build --release
 distcc rustc --crate-type=rlib library.rs
 ```
 
-Rust requires the local `DISTCC_BROKER` socket and TCP workers with a configured
+Rust requires the local broker and TCP workers with a configured
 statistics port (for example `,tcp,stats=3633`), bubblewrap and unprivileged
 user namespaces. Each worker advertises its executable compilers in
 `dcc_rust_compilers`. Whole-crate jobs require the client's release string
@@ -625,8 +627,9 @@ prevents application/startup.
 This policy requires a writable system systemd manager and cgroup v2 memory
 accounting. It does not remove the uncertainty of an unseen job's memory demand.
 
-On Linux, `DISTCC_MEMORY_LEARNING=1` on the daemon uses compiler peak RSS
-reported by `wait4` for prepared jobs. `DISTCC_JOB_MEMORY` is the cold-start
+On Linux, the daemon learns from compiler peak RSS reported by `wait4` for
+prepared jobs by default. Set `DISTCC_MEMORY_LEARNING=0` for fixed estimates.
+`DISTCC_JOB_MEMORY` is the cold-start
 estimate. Prepared jobs are classified by operation and the binary size interval
 of their uncompressed inputs. C/C++ classes omit shared code-generation inputs
 such as PGO profiles so a common large profile does not hide source complexity;
@@ -729,10 +732,11 @@ compression independently for each host. Upgrade both endpoints before enabling 
 
 ## Prepared TCP jobs
 
-Use `,tcp` to select the prepared-job protocol:
+Give the broker a `,tcp` host such as `builder-a/8,tcp,stats=3633`.
+With the packaged systemd socket, clients discover the broker automatically.
 
 ```sh
-export DISTCC_HOSTS='builder-a/8,tcp,stats=3633'
+sudo systemctl start "distcc-broker@$(id -un).socket"
 make -j"$(distcc -j)" CC='distcc gcc' CXX='distcc g++'
 ```
 
@@ -741,8 +745,9 @@ This path requires the Linux broker and the
 daemon's prefork mode. It uses the existing TCP listener and IP access rules;
 SSH and GSSAPI are unsupported with `,tcp`.
 
-For evaluation, `DISTCC_FRONTEND_REMOTE=1` moves ordinary GCC and Clang C/C++
-frontend execution to the selected worker. The selected compiler supplies its
+By default a broker with `,tcp` peers can send ordinary GCC and Clang C/C++
+frontends to those workers. Classic-only pools preprocess locally. Set
+`DISTCC_FRONTEND_REMOTE=0` to choose local preprocessing. The selected compiler supplies its
 search paths and native CPU options; the worker reads source files and headers
 on demand through the existing job connection and shared snapshot cache. This
 avoids local preprocessing and IR generation. Clang uses
@@ -862,8 +867,9 @@ when its version also matches after enumeration. Child attributes are always
 fresh, batched for previously used names and fetched on demand for other names.
 Execute-only directories use individual lookups without exposing a listing.
 
-`DISTCC_CLANG_LOCAL=1` also reuses Clang and LLD libraries for local driver
-commands, including configure probes. The broker caches a worker for each
+With a broker, local driver commands reuse installed Clang and LLD helpers by
+default, including for configure probes. Set `DISTCC_CLANG_LOCAL=0` to use the
+ordinary driver for local execution. The broker caches a worker for each
 compiler and startup context. The worker handles frontend, link and ThinLTO
 index planning serially, with each request's directory, environment and
 diagnostic streams. Compilation runs in an isolated child. A prepared local
@@ -871,9 +877,10 @@ diagnostic streams. Compilation runs in an isolated child. A prepared local
 generation when enabled. Specialized tools such as `-cc1as` use the original
 compiler. Closing the broker cache releases idle helpers.
 
-`DISTCC_CLANG_CODEGEN=1` evaluates parallel code generation in the local and
-remote frontend paths; set it in the process that owns the compiler helper
-(the client broker or worker daemon). Clang first optimizes the complete
+Local and remote Clang frontends enable parallel code generation and eligible
+remote frontend IR reuse by default. Set `DISTCC_CLANG_CODEGEN=0` in the
+client environment for local codegen or on the daemon for remote jobs to
+disable both optimizations there. Clang first optimizes the complete
 translation unit, then the
 existing LLVM splitter and relocatable linker preserve ownership and local
 symbols across machine-code partitions. Additional CPUs require an immediate

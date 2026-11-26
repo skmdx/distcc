@@ -423,7 +423,7 @@ class GccFrontendTest(BrokerTestCase):
         self.assertTrue(Path(self.module).is_file(), 'GCC native module must be built before testing')
         self.restart_server(self.build/'distccd', DISTCC_GCC_SCAN_LIBRARY=self.module, **settings)
         self.start_broker(self.host(0, f',tcp,stats={self.stats_ports[0]}'), backoff=backoff)
-        self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
+        self.env.update(DISTCC_VERBOSE='1',
                         DISTCC_GCC_PLAN_LIBRARY=str(self.build/'gcc_plan.so'),
                         DISTCC_GCC_SCAN_LIBRARY=self.module, DISTCC_SKIP_LOCAL_RETRY='1')
 
@@ -436,6 +436,40 @@ class GccFrontendTest(BrokerTestCase):
         self.assertEqual(result.returncode, 0, trace + '\n' + Path(self.logs[0].name).read_text())
         self.assertIn('pooled TCP job completed', trace)
         return result
+
+    def test_mixed_pool_sends_frontends_only_to_tcp_peer(self):
+        self.start_frontend()
+        self.start_broker(self.host(1, ',lz4,speed=100') + ' ' + self.host(0, ',tcp'), name='mixed')
+        self.env.update(DISTCC_VERBOSE='1', DISTCC_GCC_PLAN_LIBRARY=str(self.build/'gcc_plan.so'),
+                        DISTCC_GCC_SCAN_LIBRARY=self.module)
+        self.assertEqual(self.receive(self.request(15), capabilities=True), (0, 4, []))
+        for action in ('-c', '-E'):
+            result = self.compile_frontend([self.cc, action, 'hello.c', '-o', 'result'])
+            self.assertIn('frontend filesystem:', result.stderr)
+        self.env['DISTCC_FRONTEND_REMOTE'] = '0'
+        result = subprocess.run([self.build/'distcc', self.cc, '-E', self.source], env=self.env,
+                                capture_output=True, check=True, timeout=10)
+        self.assertEqual(result.stdout, subprocess.check_output([self.cc, '-E', self.source]))
+        self.assertNotIn(b'frontend filesystem:', result.stderr)
+
+    def test_discovered_broker_supplies_entire_remote_hostlist(self):
+        self.start_frontend()
+        result = self.discovered_command(self.build/'distcc', self.cc, '-c', self.source, '-o', 'hello.o')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(b'frontend filesystem:', result.stdout)
+        self.assertIn(b'pooled TCP job completed', result.stdout)
+        self.assertGreater((self.work/'hello.o').stat().st_size, 0)
+
+    def test_dependency_targets_preserve_make_quoting(self):
+        self.start_frontend()
+        for targets in ([], ['-MT', 'raw target', '-MQ', 'quoted $ target']):
+            args = [self.cc, '-c', 'hello.c', '-MMD', '-MF', 'deps.d', *targets, '-o', 'object $ name.o']
+            subprocess.run(args, cwd=self.work, check=True, capture_output=True)
+            deps = self.work/'deps.d'
+            expected = deps.read_bytes()
+            deps.unlink()
+            self.compile_frontend(args)
+            self.assertEqual(deps.read_bytes(), expected)
 
     def compare_preprocessing(self, flags, *, stdin=None, files=(), success=True):
         log = self.work/'client.log'
@@ -1865,14 +1899,14 @@ class FrontendTest(BrokerTestCase):
         self.restart_server(self.build / 'distccd', DISTCC_CLANG_DRIVER=str(self.build / 'distcc-clang'),
                             DISTCCD_FILE_CACHE=str(self.work/'cache'), jobs=jobs, **settings)
         self.start_tcp()
-        self.env.update(DISTCC_FRONTEND_REMOTE='1', DISTCC_VERBOSE='1',
-                        DISTCC_CLANG_LOCAL='1', PATH=str(self.build)+os.pathsep+self.env['PATH'],
+        self.env.update(DISTCC_VERBOSE='1', PATH=str(self.build)+os.pathsep+self.env['PATH'],
                         DISTCC_SKIP_LOCAL_RETRY='1')
         return clang
 
     @unittest.skipUnless(shutil.which('strace'), 'strace required')
     def test_clang_hints_follow_each_source_and_only_open_used_headers(self):
-        clang = self.start_frontend()
+        # Measure include lookup hints without IR replay revalidating the inputs.
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='0')
         real = self.work/'headers'
         real.mkdir()
         include = self.work/'include'
@@ -2090,7 +2124,7 @@ class FrontendTest(BrokerTestCase):
         self.assertEqual(units[inactive.stat().st_size], 10002)
 
     def test_remote_result_reuse_preserves_artifacts_and_revalidates_inputs(self):
-        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        clang = self.start_frontend(DISTCC_VERBOSE='1')
         source, header = self.work/'source.c', self.work/'value.h'
         source.write_text('#include "value.h"\n#if __has_include("optional.h")\n'
                           '#include "optional.h"\n#endif\n'
@@ -2126,6 +2160,16 @@ class FrontendTest(BrokerTestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn(b"'value.h' file not found", failed.stderr)
         self.assertNotIn(b'distcc compiler result: hit', failed.stderr)
+
+    def test_codegen_opt_out_disables_partitioning_and_ir_reuse(self):
+        clang = self.start_frontend(DISTCC_CLANG_CODEGEN='0', DISTCC_VERBOSE='1')
+        for _ in range(2):
+            result = subprocess.run([self.build/'distcc', clang, '-O2', '-c', self.source,
+                                     '-o', self.work/'out.o'], env=self.env,
+                                    capture_output=True, check=True, timeout=30)
+            self.assertIn(b'frontend filesystem:', result.stderr)
+            self.assertNotIn(b'distcc codegen plan:', result.stderr)
+            self.assertNotIn(b'distcc compiler result:', result.stderr)
 
     def test_remote_result_reuse_quiet_diagnostics(self):
         clang = self.start_frontend(DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='0')
@@ -2479,7 +2523,7 @@ class FrontendTest(BrokerTestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
 
     def check_remote_codegen(self, jobs, compiler=None, shared=False, assembler_input=False):
-        clang = self.start_frontend(jobs=jobs, DISTCC_CLANG_CODEGEN='1', DISTCC_VERBOSE='1')
+        clang = self.start_frontend(jobs=jobs, DISTCC_VERBOSE='1')
         if compiler: clang = compiler
         source = self.work/'partition.cpp'
         payload = self.work/'backend.bin'
@@ -3324,7 +3368,9 @@ class TcpJobTestCase(BrokerTestCase):
     def start_tcp(self):
         # Fixed transport slots keep the client on the RPC path. Live local
         # statistics deliberately enable direct compilation, tested separately.
-        return self.start_broker(self.host(0, ',tcp'))
+        broker = self.start_broker(self.host(0, ',tcp'))
+        self.env['DISTCC_FRONTEND_REMOTE'] = '0'  # Exercise DCC_JOB_COMPILE.
+        return broker
 
 
 class TcpJobsTest(TcpJobTestCase):
@@ -3757,7 +3803,7 @@ int unlinkat(int fd, const char *path, int flags) {
         self.job('after-invalid-local-fd')
 
     def test_memory_estimate_uses_completed_compiler_rss(self):
-        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='512', DISTCC_MEMORY_LEARNING='1')
+        self.restart_server(self.build / 'distccd', DISTCC_JOB_MEMORY='512')
         self.addCleanup(self.restart_server, self.build / 'distccd')
         self.start_tcp()
         before = self.get_stats(self.stats_ports[0])
@@ -4386,7 +4432,7 @@ with open(args[args.index('-o') + 1], 'ab') as output:
         thread = threading.Thread(target=server)
         thread.start()
         self.start_broker(f'127.0.0.1:{listener.getsockname()[1]}/1,tcp')
-        self.env.update(DISTCC_MAX_RETRIES='1', DISTCC_SKIP_LOCAL_RETRY='1',
+        self.env.update(DISTCC_FRONTEND_REMOTE='0', DISTCC_MAX_RETRIES='1', DISTCC_SKIP_LOCAL_RETRY='1',
                         DISTCC_RECONNECT_TIMEOUT='0')
         output = self.work/'coalesced.o'
         output.write_bytes(b'previous object')
@@ -4436,7 +4482,7 @@ with open(args[args.index('-o') + 1], 'ab') as output:
         thread = threading.Thread(target=server)
         thread.start()
         self.start_broker(f'127.0.0.1:{listener.getsockname()[1]}/1,tcp')
-        self.env.update(DISTCC_MAX_RETRIES='1', DISTCC_SKIP_LOCAL_RETRY='1',
+        self.env.update(DISTCC_FRONTEND_REMOTE='0', DISTCC_MAX_RETRIES='1', DISTCC_SKIP_LOCAL_RETRY='1',
                         DISTCC_RECONNECT_TIMEOUT='0')
         output = self.work / 'previous.o'
         output.write_bytes(b'original artifact')
@@ -4477,6 +4523,7 @@ class RemoteTcpJobsTest(TcpJobTestCase):
 
     def test_memory_refusal_reschedules_without_fallback(self):
         self.start_memory_refusal()
+        self.env['DISTCC_FRONTEND_REMOTE'] = '0'
         before = self.get_stats(self.stats_ports[1])
         self.job('memory-rescheduled')
         log = (self.work / 'memory-refusal.log').read_text()
@@ -4633,7 +4680,7 @@ class LocalCrossUidTest(unittest.TestCase):
             env.update(DISTCC_JOB_MEMORY='64', DISTCC_LOCAL_SOCKET=str(root/'jobs'),
                        DISTCC_HOSTS=f'127.0.0.1:{port}/1,tcp',
                        DISTCC_DIR=str(client), DISTCC_BROKER=str(client/'broker.sock'),
-                       DISTCC_FALLBACK='0', DISTCC_SKIP_LOCAL_RETRY='1', TMPDIR=str(client))
+                       DISTCC_FRONTEND_REMOTE='0', DISTCC_FALLBACK='0', DISTCC_SKIP_LOCAL_RETRY='1', TMPDIR=str(client))
             compiler = shutil.which('gcc')
             assert compiler is not None
             server_env = dict(env, TMPDIR=str(root), DISTCCD_PATH=os.path.dirname(compiler)+os.pathsep+os.defpath)

@@ -109,7 +109,8 @@ retains a quarter-job margin, and defers admission under memory pressure.
 This estimate does not impose a hard per-job memory limit. DISTCC_IO_TIMEOUT
 (default 300 seconds) also bounds protocol reads from silent clients.
 .PP
-Set DISTCC_BROKER in clients to the absolute socket path. The broker exits
+Clients discover the packaged per-user socket as described in distcc(1).
+For a custom socket, set DISTCC_BROKER to its absolute path. The broker exits
 after DISTCC_BROKER_IDLE seconds without a request and with no connected
 clients (default 60, range 1 to 86400). Active leases prevent idle exit even
 when the compiler is silent. Client disconnects release their reservations.

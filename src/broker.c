@@ -330,6 +330,8 @@ static void deliver_connection(struct broker *broker, struct client *client)
                                    client->pooled ? DCC_BROKER_POOLED : 0};
     struct peer *peer = &broker->schedule.peers[client->peer];
     strcpy(reply.host, peer->host->hostdef_string);
+    if (client->command == TRY_LOCAL) reply.flags |= DCC_BROKER_TCP_JOBS;
+    if (peer->host->mode == DCC_MODE_SSH) reply.flags |= DCC_BROKER_SSH;
     dcc_watch_drop(broker->ep, &broker->watches[NETWORK + (client - broker->schedule.clients)]);
     if (send_reply(client->fd, &reply, client->net)) {
         release_client(broker, client);
@@ -476,17 +478,25 @@ static int initialize(struct broker *broker, struct dcc_hostdef *hosts)
     for (host = hosts; host; host = host->next) {
         struct addrinfo hints = {0}, *addresses = NULL;
         struct peer *peer;
+        if (strlen(host->hostdef_string) >= sizeof(((struct reply *)0)->host))
+            return -1;
         for (i = 0; i < broker->schedule.count; i++)
-            if (host->port == broker->schedule.peers[i].host->port &&
+            if (host->mode == broker->schedule.peers[i].host->mode &&
+                host->port == broker->schedule.peers[i].host->port &&
                 !strcmp(host->hostname, broker->schedule.peers[i].host->hostname))
                 break;
-        if (i < broker->schedule.count)
+        if (i < broker->schedule.count) {
+            if (host->tcp_jobs && !broker->schedule.peers[i].host->tcp_jobs) {
+                broker->schedule.peers[i].host = host;
+                broker->schedule.tcp_jobs = 1;
+            }
             continue;
-        if (broker->schedule.count == MAX_HOSTS || host->mode != DCC_MODE_TCP ||
-            strlen(host->hostdef_string) >= sizeof(((struct reply *)0)->host))
+        }
+        if (broker->schedule.count == MAX_HOSTS)
             return -1;
         peer = &broker->schedule.peers[broker->schedule.count++];
         peer->host = host;
+        broker->schedule.tcp_jobs |= host->tcp_jobs;
         peer->stats_fd = -1;
 #ifdef HAVE_GSSAPI
         if (host->authenticate) peer->pool_supported = -1;
@@ -592,7 +602,8 @@ static int decode_request(const struct packet *packet, size_t size, int fd,
 {
     const struct broker_request_hdr *hdr = &packet->header;
     unsigned op = hdr->command;
-    if (hdr->version != BROKER_VERSION || (hdr->flags & ~CLIENT_COMPILE)) return 0;
+    if (hdr->version != BROKER_VERSION || (hdr->flags & ~(CLIENT_COMPILE | CLIENT_FRONTEND))) return 0;
+    if ((hdr->flags & CLIENT_FRONTEND) && op != ACQUIRE_READY) return 0;
     if (hdr->flags && op != ACQUIRE_CPP && op != ACQUIRE_READY && op != ACQUIRE_POOL) return 0;
     const uint8_t *data = packet->data;
     if (op == RELEASE) return !size && fd < 0;
@@ -729,7 +740,7 @@ static void handle_request(struct broker *broker, int id, double now, int backof
             session->preflight = 0;
         }
         c->command = op;
-        c->can_compile_locally = !!(packet.header.flags & CLIENT_COMPILE);
+        c->flags = packet.header.flags;
         broker->dirty = 1;
         c->waiting_since = now;
         return;
@@ -757,7 +768,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     case ASSIGN_JOB: break;
     }
     struct peer *p = &broker->schedule.peers[choice.peer];
-    if (!choice.direct) {
+    if (!choice.direct && p->host->mode == DCC_MODE_TCP) {
         client->admission = !p->host->tcp_jobs && client->command != ACQUIRE &&
                             p->admission_supported && p->pool_supported >= 0;
         client->net = client->command != ACQUIRE ? pool_take(broker, choice.peer) : -1;
@@ -773,7 +784,7 @@ static int dispatch(struct broker *broker, struct client *client, double now, st
     }
     schedule_assign(&broker->schedule, client, batch, &choice, now);
     client->used = 0;
-    if (choice.direct || client->reused) {
+    if (choice.direct || client->reused || p->host->mode == DCC_MODE_SSH) {
         if (client->admission) client->state = RESERVE_SEND;
         else deliver_connection(broker, client);
     }
