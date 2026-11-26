@@ -29,43 +29,16 @@
 #include "dotd.h"
 #include "snprintf.h"
 
-/* The dotd file is compiler generated,
- * so it should not have lines with more than
- * twice the length of the maximum path length.
- */
-#define MAX_DOTD_LINE_LEN (MAXPATHLEN * 2)
-
-/* Replaces the first occurrence of needle in haystack with
-   new_needle. haystack must be of at least hay_size,
-   and hay_size must be large enough to hold the string
-   after the replacement.
-   new_needle should not overlap with the haystack.
-   Returns 0 if all goes well, 1 otherwise.
-*/
-static int dcc_strgraft(char *haystack, size_t hay_size,
-                        const char *needle, const char *new_needle)
+/* GCC separates Make names with spaces and quotes embedded whitespace
+ * with an odd number of backslashes. Keep the original quoted bytes. */
+static size_t make_word_length(const char *word)
 {
-    char *found;
-    size_t needle_len = 0;
-    size_t new_needle_len = 0;
-
-    found = strstr(haystack, needle);
-    if (found == NULL)
-        return 0;
-
-    needle_len = strlen(needle);
-    new_needle_len = strlen(new_needle);
-
-    if (strlen(haystack) - needle_len + new_needle_len + 1 > hay_size)
-        return 1;
-
-    /* make some room in the haystack for the new needle */
-    memmove(found + new_needle_len,
-            found + needle_len,
-            strlen(found + needle_len) + 1);
-    memcpy(found, new_needle, new_needle_len);
-
-    return 0;
+    const char *end = word;
+    while (*end && *end != ' ') {
+        if (*end == '\\' && end[1]) ++end;
+        ++end;
+    }
+    return end - word;
 }
 
 /* Given the name of a dotd file, and the name of the directory
@@ -80,14 +53,7 @@ int dcc_cleanup_dotd(const char *dotd_fname,
                      const char *client_out_name,
                      const char *server_out_name)
 {
-    /* When we do the substitution of server-side output name to
-     * client-side output name, we may end up with a line that
-     * longer than the longest line we expect from the compiler.
-     */
-    char buf[2 * MAX_DOTD_LINE_LEN];
-
     FILE *dotd, *tmp_dotd;
-    char *found;
     int ret;
 
     dotd = fopen(dotd_fname, "r");
@@ -108,43 +74,59 @@ int dcc_cleanup_dotd(const char *dotd_fname,
         return 1;
     }
 
-    while (fgets(buf, MAX_DOTD_LINE_LEN, dotd)) {
-        if ((strchr(buf, '\n') == NULL) && !feof(dotd)) {
-            /* Line length must have exceeded MAX_DOTD_LINE_LEN: bail out. */
-            fclose(dotd);
-            fclose(tmp_dotd);
-            return 1;
+    char *line = NULL;
+    size_t capacity = 0, column = 0, root_len = strlen(root_dir);
+    size_t target_len = server_out_name ? strlen(server_out_name) : 0;
+    int continued = 0, relocated = 0;
+    ssize_t length;
+    while ((length = getline(&line, &capacity, dotd)) >= 0) {
+        int wrap = length >= 3 && !memcmp(line + length - 3, " \\\n", 3);
+        if (wrap) line[length - 3] = '\0';
+        else if (length && line[length - 1] == '\n') line[length - 1] = '\0';
+        for (const char *next = line; *next;) {
+            int space = *next == ' ';
+            const char *word = next + space;
+            size_t size = make_word_length(word);
+            next = word + size;
+            int colon = 0;
+            if (size > root_len && word[root_len] == '/' && !memcmp(word, root_dir, root_len)) {
+                word += root_len;
+                size -= root_len;
+                relocated = 1;
+            } else if (target_len && (size == target_len ||
+                       (size == target_len + 1 && word[target_len] == ':')) &&
+                       !memcmp(word, server_out_name, target_len)) {
+                colon = size != target_len;
+                word = client_out_name;
+                size = strlen(word);
+                relocated = 1;
+            }
+            if (space) {
+                /* libcpp wraps before a name when column + quoted length
+                 * exceeds 72. Its original breaks used worker path lengths. */
+                if (relocated ? column + size > 72 : continued) {
+                    fputs(" \\\n", tmp_dotd);
+                    column = 0;
+                }
+                fputc(' ', tmp_dotd);
+                ++column;
+            }
+            fwrite(word, 1, size, tmp_dotd);
+            if (colon) fputc(':', tmp_dotd);
+            column += size + colon;
+            continued = 0;
         }
-
-        /* First, the dependency target substitution */
-        if (dcc_strgraft(buf, sizeof(buf),
-                         server_out_name, client_out_name)) {
-            fclose(dotd);
-            fclose(tmp_dotd);
-            return 1;
-        }
-
-        /* Second, the trimming of the "root" directory" */
-        found = strstr(buf, root_dir);
-        while (found) {
-            char *rest_of_buf = found + strlen(root_dir);
-            memmove(found, rest_of_buf, strlen(rest_of_buf) + 1);
-            found = strstr(found, root_dir);
-        }
-        if (fprintf(tmp_dotd, "%s", buf) < 0) {
-            fclose(dotd);
-            fclose(tmp_dotd);
-            return 1;
+        continued = wrap;
+        if (!wrap) {
+            fputc('\n', tmp_dotd);
+            column = 0;
+            relocated = 0;
         }
     }
-    if (ferror(dotd) || ferror(tmp_dotd)) {
-       return 1;
-    }
+    ret = !feof(dotd) || ferror(dotd) || ferror(tmp_dotd);
+    free(line);
     fclose(dotd);
-    if (fclose(tmp_dotd) < 0) {
-        return 1;
-    }
-    return 0;
+    return fclose(tmp_dotd) || ret;
 }
 
 /* Go through arguments (in @p argv), and relevant environment variables, and

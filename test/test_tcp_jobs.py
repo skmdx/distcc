@@ -437,6 +437,86 @@ class GccFrontendTest(BrokerTestCase):
         self.assertIn('pooled TCP job completed', trace)
         return result
 
+    def compare_preprocessing(self, flags, *, stdin=None, files=(), success=True):
+        log = self.work/'client.log'
+        self.env['DISTCC_LOG'] = str(log)
+        offset = log.stat().st_size if log.exists() else 0
+        worker = Path(self.logs[0].name)
+        worker_offset = worker.stat().st_size
+        command = [self.cc, '-E', *flags]
+        def run(argv):
+            return subprocess.run(argv, cwd=self.work, env=self.env, input=stdin,
+                                  capture_output=True, timeout=30)
+        native = run(command)
+        self.assertEqual(native.returncode == 0, success, native.stderr)
+        expected = {}
+        for name in files:
+            path = self.work/name
+            expected[name] = path.read_bytes() if path.exists() else None
+            path.write_bytes(b'stale artifact\n')
+            (self.work/(name+'.old')).hardlink_to(path)
+        remote = run([self.build/'distcc', *command])
+        trace = log.read_bytes()[offset:].decode()
+        self.assertIn('pooled TCP job completed', trace, trace)
+        self.assertIn(b'input_view:gcc', worker.read_bytes()[worker_offset:])
+        self.assertEqual(remote.returncode, native.returncode, trace)
+        self.assertEqual(remote.stderr, native.stderr)
+        self.assertEqual(remote.stdout, native.stdout)
+        for name, contents in expected.items():
+            path = self.work/name
+            self.assertEqual(path.read_bytes() if path.exists() else None, contents)
+            old = self.work/(name+'.old')
+            self.assertEqual(old.read_bytes(), b'stale artifact\n')
+            old.unlink()
+        return remote, trace
+
+    def test_preprocess_linemarkers_and_output_files(self):
+        self.start_frontend()
+        include = self.work/'include with spaces'
+        include.mkdir()
+        (include/'where.h').write_text('const char *header = __FILE__;\n')
+        self.source.write_text('#include <stddef.h>\n#include <where.h>\n'
+                               'const char *source = __FILE__;\n'
+                               'const char *literal = "# 42 \\"/path/files/test\\"";\n')
+        flags = ['-I'+str(include), str(self.source)]
+        sentinel = self.work/'-'
+        sentinel.write_bytes(b'untouched')
+        for output in ([], ['-o', '-'], ['-o', 'out.i']):
+            with self.subTest(output=output):
+                self.compare_preprocessing([*flags, *output], files=['out.i'] if 'out.i' in output else [])
+                self.assertEqual(sentinel.read_bytes(), b'untouched')
+        self.compare_preprocessing([*flags, '-MD', '-MP', '-MQ', 'target with spaces', '-MF', 'absolute.d'],
+                                   files=['absolute.d'])
+        self.source.write_text('#error failing preprocessor\n')
+        self.compare_preprocessing([str(self.source)], success=False)
+        self.compare_preprocessing([str(self.source), '-o', 'out.i'], files=['out.i'], success=False)
+
+    def test_preprocess_genksyms_dependencies_and_memo(self):
+        self.start_frontend()
+        (self.work/'export.h').write_text('#define EXPORT(name) name\n')
+        self.source.write_text('#include "export.h"\n#ifdef __GENKSYMS__\nEXPORT(symbol)\n#endif\n')
+        flags = ['-D__GENKSYMS__', '-Wp,-MMD,hello.o.d', self.source.name]
+        for action in ('publish', 'hit'):
+            result, trace = self.compare_preprocessing(flags, files=['hello.o.d'])
+            self.assertIn(b'symbol\n', result.stdout)
+            self.assertIn('GCC plan memo ' + action, trace)
+
+    def test_preprocess_stdin(self):
+        self.start_frontend()
+        source = b'#ifdef __GENKSYMS__\nint symbol;\n#endif\nconst char *name = __FILE__;\n'
+        (self.work/'-').write_bytes(b'#error this is not stdin\n')
+        for options in ([], ['-D__GENKSYMS__'], ['-D__GENKSYMS__', '-MMD', '-MF', 'stdin.d'],
+                        ['-MD', '-MF', 'stdin.d', '-MT', 'entry.o']):
+            with self.subTest(options=options):
+                self.compare_preprocessing([*options, '-x', 'c', '-'], stdin=source,
+                                           files=['stdin.d'] if '-MF' in options else [])
+
+    def test_preprocess_large_stdout(self):
+        self.start_frontend()
+        self.source.write_text('#define ROW "' + 'x'*256 + '"\n' + 'ROW\n'*8192)
+        result, _ = self.compare_preprocessing([self.source.name])
+        self.assertGreater(len(result.stdout), 2 * 1024 * 1024)
+
     def test_native_gcc_stdin_preserves_names_headers_and_dependencies(self):
         self.start_frontend()
         (self.work/'value.h').write_text('#define VALUE 42\n')

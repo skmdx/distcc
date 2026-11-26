@@ -49,17 +49,19 @@ char *dcc_plan_key(char **argv, const char *input)
     ADD("gcc-plan-1"); ADD(context); ADD(cwd); ADD(extension);
     if (parent) XXH3_128bits_update(&hash, input, parent-input+1);
     else ADD(".");
-    unsigned inputs = 0, compile = 0;
+    unsigned inputs = 0, compile = 0, preprocess = 0, assembly = 0;
     size_t bytes = 0;
     for (unsigned i=0; argv[i]; ++i) {
         const char *s = argv[i];
         bytes += strlen(s)+1;
         if (bytes > DCC_MEMO_LIMIT || *s=='@' || !strcmp(s,"-") ||
-            !strcmp(s,"-E") || !strcmp(s,"-v") || !strcmp(s,"-###") ||
+            !strcmp(s,"-v") || !strcmp(s,"-###") ||
             !strncmp(s,"-specs",6) || !strncmp(s,"--specs",7) ||
             !strncmp(s,"-wrapper",8) || !strncmp(s,"-fplugin",8) ||
             !strncmp(s,"--config",8)) return NULL;
         if (!strcmp(s,"-c")) compile = 1;
+        if (!strcmp(s,"-E")) preprocess = 1;
+        if (!strcmp(s,"-S")) assembly = 1;
         if (!strcmp(s,"-o") || !strcmp(s,"-MF") || !strcmp(s,"-MT") || !strcmp(s,"-MQ")) {
             ADD(s);
             if (!argv[++i]) return NULL;
@@ -74,7 +76,8 @@ char *dcc_plan_key(char **argv, const char *input)
             ADD(s);
         }
     }
-    if (!compile || inputs!=1 || bytes>DCC_MEMO_LIMIT) return NULL;
+    if ((!compile && !preprocess) || (preprocess && (compile || assembly)) ||
+        inputs!=1 || bytes>DCC_MEMO_LIMIT) return NULL;
     XXH128_hash_t value=XXH3_128bits_digest(&hash);
     char *key=NULL;
     if (asprintf(&key,"gcc-plan:%016llx%016llx",(unsigned long long)value.high64,
@@ -329,14 +332,14 @@ int dcc_gcc_frontend_prepare(char **argv, const char *input, struct dcc_job **re
     char **command = NULL, **groups[2] = {NULL, NULL};
     struct dcc_job *job = NULL;
     if (descriptor < 0 || fcntl(descriptor, F_SETFD, 0) ||
-        dcc_copy_argv(argv, &command, 5) || dcc_set_output(command, "/dev/null")) goto done;
+        dcc_copy_argv(argv, &command, 7) || dcc_set_output(command, "/dev/null")) goto done;
     const char *module = getenv("DISTCC_GCC_SCAN_LIBRARY");
     char *plugin = NULL, *option = NULL;
     if (asprintf(&plugin, "-fplugin=%s", module ? module : "distcc_gcc_scan") < 0 ||
         asprintf(&option, "-fplugin-arg-distcc_gcc_scan-plan-fd=%d", descriptor) < 0) {
         free(plugin); free(option); goto done;
     }
-    dcc_argv_append(command, strdup("-E"));
+    if (!dcc_argv_search(command, "-E")) dcc_argv_append(command, strdup("-E"));
     dcc_argv_append(command, plugin);
     dcc_argv_append(command, option);
     int wrapped = 0;

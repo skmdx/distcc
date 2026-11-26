@@ -239,7 +239,7 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
                   char ***ret_newargv, int allow_native)
 {
     int seen_opt_c = 0, seen_opt_s = 0, seen_opt_e = 0;
-    int seen_md = 0, seen_mf = 0;
+    int seen_md = 0, seen_mf = 0, trace_headers = 0;
     int i;
     char *a;
     int ret;
@@ -270,6 +270,8 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
         } else if (a[0] == '-') {
             if (!strcmp(a, "-E")) {
                 seen_opt_e = 1;
+            } else if (!strcmp(a, "-H")) {
+                trace_headers = 1;
             } else if (!strcmp(a, "-MD") || !strcmp(a, "-MMD")) {
                 seen_md = 1;
                 /* These two generate dependencies as a side effect.  They
@@ -399,8 +401,13 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
      * extant files when looking for the input file; that's possibly
      * worthwhile.  Of course we can't do that on the server. */
 
-    /* With -E -MD, -o names the dependency file unless -MF is explicit. */
-    if (seen_opt_e && seen_md && !seen_mf)
+    /* A literal -E operand (e.g. -MT -E) cannot select the worker's
+     * preprocessed-text result contract for an object compilation. */
+    if (!seen_opt_e && dcc_argv_search(argv, "-E"))
+        return EXIT_LOCAL_CPP;
+    /* With -E -MD, -o names the dependency file unless -MF is explicit.
+     * -H reports header paths on stderr, including the worker's mount point. */
+    if (seen_opt_e && ((seen_md && !seen_mf) || trace_headers))
         return EXIT_LOCAL_CPP;
 
     if (!seen_opt_c && !seen_opt_s && !seen_opt_e) {
@@ -502,8 +509,8 @@ int dcc_set_action_opt(char **a, const char *new_c)
 
 
 /**
- * Change object file or suffix of -o to @p ofname
- * Frees the old value, if it exists.
+ * Set -o to @p ofname. Callers reserve two extra argv slots if the
+ * command can have implicit stdout.
  *
  * It's crucially important that in every case where an output file is
  * detected by dcc_scan_args(), it's also correctly identified here.
@@ -539,8 +546,11 @@ int dcc_set_output(char **a, const char *ofname)
             return 0;
         }
 
-    rs_log_error("failed to find \"-o\"");
-    return EXIT_DISTCC_FAILED;
+    a[i] = strdup("-o");
+    if (!a[i]) return EXIT_OUT_OF_MEMORY;
+    a[i+1] = strdup(ofname);
+    a[i+2] = NULL;
+    return a[i+1] ? 0 : EXIT_OUT_OF_MEMORY;
 }
 
 /**

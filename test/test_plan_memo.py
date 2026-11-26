@@ -150,13 +150,15 @@ class PlanMemoTest(BrokerTestCase):
     def test_key_bypass_boundaries(self):
         self.prepare()
         source=str(self.sources/'a.c')
-        def key(flags,output='object.o'):
+        def key(flags,output='object.o',action='-c'):
             p=subprocess.run([str(self.build/'h_compile'),'plan_key',source,self.cc,
-                              '-c',source,'-o',output,*flags],env=self.env,capture_output=True,text=True)
+                              action,source,'-o',output,*flags],env=self.env,capture_output=True,text=True)
             self.assertEqual(p.returncode,0,p.stderr)
             return p.stdout.strip()
         original=key([])
         self.assertNotEqual(original,'bypass')
+        self.assertNotIn(key([],action='-E'), ('bypass', original))
+        self.assertEqual(key(['-S'],action='-E'), 'bypass')
         self.assertEqual(original,key([],output='other.o'))
         for flags in (['@args'],['-specs=custom'],['-wrapper','x'],['-E'],['-v'],['-###'],
                       ['-'],[str(self.sources/'b.c')],['-DVALUE='+'0'*65536]):

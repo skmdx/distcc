@@ -350,6 +350,42 @@ class PreparedCompilerTest(BrokerTestCase):
         finally:
             lease.close()
 
+    def test_local_preprocessing_modes(self):
+        self.env['DISTCC_FRONTEND_REMOTE'] = '1'
+        self.source.write_text('#include <stddef.h>\nsize_t size;\n')
+        for compiler, flags in (('gcc', ['-E', '-H']), ('gcc', ['-E', '-MD']),
+                                ('gcc', ['-M']), ('gcc', ['-MM']), ('clang', ['-E']),
+                                ('gcc', ['-c', '-MMD', '-MF', 'literal.d', '-MT', '-E'])):
+            with self.subTest(compiler=compiler, flags=flags):
+                args = [*flags, self.source]
+                native = self.run_cc(compiler, args, remote=False)
+                result = self.run_cc(compiler, args)
+                self.assertEqual(native.returncode, 0, native.stderr)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (0, native.stdout, native.stderr))
+        trace = (self.work/'client.log').read_text()
+        self.assertNotIn('pooled TCP job completed', trace)
+        self.assertNotIn('GCC plan memo', trace)
+
+    def test_preprocessing_appends_environment_dependencies_locally(self):
+        self.env['DISTCC_FRONTEND_REMOTE'] = '1'
+        (self.work/'value.h').write_text('#define VALUE 1\n')
+        self.source.write_text('#include "value.h"\nint n = VALUE;\n')
+        deps = self.work/'environment.d'
+        for variable in ('DEPENDENCIES_OUTPUT', 'SUNPRO_DEPENDENCIES'):
+            with self.subTest(variable=variable):
+                self.env[variable] = str(deps)
+                deps.write_bytes(b'previous.o: previous.c\n')
+                native = self.run_cc('gcc', ['-E', self.source], remote=False)
+                expected = deps.read_bytes()
+                deps.write_bytes(b'previous.o: previous.c\n')
+                result = self.run_cc('gcc', ['-E', self.source])
+                self.assertEqual(native.returncode, 0, native.stderr)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (0, native.stdout, native.stderr))
+                self.assertEqual(deps.read_bytes(), expected)
+                del self.env[variable]
+
     def test_gcc_frontend_packs_large_include_search(self):
         first = self.work / 'first search'
         second = self.work / 'second search'

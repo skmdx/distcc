@@ -822,15 +822,59 @@ static int tweak_arguments_for_server(char **argv,
         (ret = dcc_convert_mt_to_dotd_target(*tweaked_argv, dotd_target)))
       return 1;
 
-    if (!dcc_argv_search(*tweaked_argv, "-MD") && !dcc_argv_search(*tweaked_argv, "-MMD")) {
-        dcc_argv_append(*tweaked_argv, strdup("-MMD"));
+    if (deps_fname) {
+        if (!dcc_argv_search(argv, "-MD") && !dcc_argv_search(argv, "-MMD"))
+            dcc_argv_append(*tweaked_argv, strdup("-MMD"));
+        dcc_argv_append(*tweaked_argv, strdup("-MF"));
+        dcc_argv_append(*tweaked_argv, strdup(deps_fname));
     }
-    dcc_argv_append(*tweaked_argv, strdup("-MF"));
-    dcc_argv_append(*tweaked_argv, strdup(deps_fname));
 
     if ((ret = tweak_include_arguments_for_server(*tweaked_argv, root_dir, include_fd)))
         return ret;
     return tweak_input_argument_for_server(*tweaked_argv, root_dir);
+}
+
+static char *linemarker_filename(char *line)
+{
+    char *number;
+    if (!strncmp(line, "# ", 2)) number = line + 2;
+    else if (!strncmp(line, "#line ", 6)) number = line + 6;
+    else return NULL;
+    char *end = number + strspn(number, "0123456789");
+    return end != number && !strncmp(end, " \"", 2) ? end + 2 : NULL;
+}
+
+/* GCC's macro prefix map covers __FILE__, but not linemarkers or diagnostics.
+ * Only a marker's filename may be relocated in preprocessed source. */
+static int relocate_cpp_paths(const char *path, const char *root, int diagnostics)
+{
+    char *cleaned = NULL, *line = NULL;
+    size_t capacity = 0, prefix = strlen(root);
+    ssize_t size;
+    int ret = dcc_make_tmpnam("distccd", ".i", &cleaned);
+    if (ret) return ret;
+    FILE *input = fopen(path, "rb"), *output = fopen(cleaned, "wb");
+    ret = EXIT_IO_ERROR;
+    if (input && output) {
+        while ((size = getline(&line, &capacity, input)) >= 0) {
+            char *name = diagnostics ? strstr(line, root) : linemarker_filename(line);
+            while (name) {
+                if (!strncmp(name, root, prefix) && name[prefix] == '/') {
+                    size -= prefix;
+                    memmove(name, name + prefix, size - (name - line) + 1);
+                }
+                name = diagnostics ? strstr(name + 1, root) : NULL;
+            }
+            if (fwrite(line, 1, size, output) != (size_t)size) break;
+        }
+        if (size < 0 && feof(input) && !ferror(input)) ret = 0;
+    }
+    if (input) fclose(input);
+    if (output && fclose(output)) ret = EXIT_IO_ERROR;
+    if (!ret && rename(cleaned, path)) ret = EXIT_IO_ERROR;
+    free(line);
+    free(cleaned);
+    return ret;
 }
 
 
@@ -941,8 +985,6 @@ static int dcc_run_job(int in_fd,
 
     gettimeofday(&start, NULL);
 
-    if ((ret = dcc_make_tmpnam("distcc", ".deps", &deps_fname)))
-        goto out_cleanup;
     if (job && job->rust.pipeline) {
         if (asprintf(&err_fname, "%s%s", root, DCC_RUST_STDERR) < 0) return EXIT_OUT_OF_MEMORY;
     } else if ((ret = dcc_make_tmpnam("distcc", ".stderr", &err_fname)))
@@ -1006,7 +1048,8 @@ static int dcc_run_job(int in_fd,
         if (!job->fs_channel || !job->compiler_channel || !job->argv[1]) { ret = EXIT_PROTOCOL_ERROR; goto out_cleanup; }
         orig_input = strdup(job->argv[1]);
         if (!orig_input) { ret = EXIT_OUT_OF_MEMORY; goto out_cleanup; }
-        if ((ret = dcc_make_tmpnam("distccd", ".o", &temp_o))) goto out_cleanup;
+        if ((ret = dcc_make_tmpnam("distccd", ".o", &temp_o)) ||
+            (ret = dcc_make_tmpnam("distcc", ".deps", &deps_fname))) goto out_cleanup;
         unsigned argc = dcc_argv_len(job->argv);
         argv = calloc(argc + 8, sizeof(*argv));
         char helper[PATH_MAX];
@@ -1111,7 +1154,7 @@ static int dcc_run_job(int in_fd,
     orig_input = strdup(orig_input_tmp);
     orig_output = strdup(orig_output_tmp);
     preprocess_only = dcc_argv_search(argv, "-E");
-    stdout_output = preprocess_only && !strcmp(orig_output_tmp, "-");
+    stdout_output = gcc_frontend && preprocess_only && !strcmp(orig_output_tmp, "-");
     if (orig_input == NULL || orig_output == NULL) {
       ret = EXIT_OUT_OF_MEMORY;
       goto out_cleanup;
@@ -1124,10 +1167,12 @@ static int dcc_run_job(int in_fd,
     tweaked_argv = NULL;
 
     rs_trace("output file %s", orig_output);
-    if ((ret = dcc_make_tmpnam("distccd", ".o", &temp_o)))
+    if (!stdout_output && (ret = dcc_make_tmpnam("distccd", ".o", &temp_o)))
         goto out_cleanup;
 
     if (gcc_frontend) {
+        if ((!preprocess_only || dcc_argv_search(argv, "-MD") || dcc_argv_search(argv, "-MMD")) &&
+            (ret = dcc_make_tmpnam("distcc", ".deps", &deps_fname))) goto out_cleanup;
         if ((!stdout_output && (ret = dcc_set_output(argv, temp_o)))
             || (ret = tweak_arguments_for_server(argv, temp_dir, deps_fname,
                                                 &dotd_target, &tweaked_argv, &include_fd)))
@@ -1256,16 +1301,21 @@ static int dcc_run_job(int in_fd,
 report_result:
     if (result) {
         result->status = status;
+        if (gcc_frontend && preprocess_only &&
+            ((ret = relocate_cpp_paths(err_fname, temp_dir, 1)) ||
+             ((stdout_output || !status) &&
+              (ret = relocate_cpp_paths(stdout_output ? out_fname : temp_o, temp_dir, 0)))))
+            goto out_cleanup;
         if ((ret = retain_artifact(result, DCC_JOB_STDERR, err_fname)) ||
             (ret = retain_artifact(result, DCC_JOB_STDOUT, out_fname))) goto out_cleanup;
         if (!status) {
             if (gcc_frontend && !preprocess_only &&
                 (ret = dcc_fix_debug_info(temp_o, "/", temp_dir))) goto out_cleanup;
-            if ((ret = retain_artifact(result, DCC_JOB_OBJECT, temp_o))) goto out_cleanup;
-            if (gcc_frontend) {
+            if (!stdout_output && (ret = retain_artifact(result, DCC_JOB_OBJECT, temp_o))) goto out_cleanup;
+            if (deps_fname) {
                 char *cleaned = NULL;
                 ret = dcc_cleanup_dotd(deps_fname, &cleaned, temp_dir,
-                                      dotd_target ? dotd_target : orig_output, temp_o);
+                                      dotd_target ? dotd_target : orig_output, preprocess_only ? NULL : temp_o);
                 if (!ret) ret = retain_artifact(result, DCC_JOB_DEPS, cleaned);
                 free(cleaned);
                 if (ret) goto out_cleanup;

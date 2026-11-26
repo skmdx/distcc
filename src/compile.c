@@ -523,7 +523,13 @@ dcc_build_somewhere(char *argv[],
     dcc_free_argv(argv);
     argv = new_argv;
     preprocess_only = dcc_argv_search(argv, "-E");
-    if (preprocess_only)
+    /* GCC appends environment-requested dependencies to a client file. */
+    if (preprocess_only && (getenv("DEPENDENCIES_OUTPUT") || getenv("SUNPRO_DEPENDENCIES")))
+        ret = EXIT_LOCAL_CPP;
+    remote_frontend = !ret && broker && *broker &&
+        dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) &&
+        (dcc_cpp_gcc(argv, input_fname) || (!preprocess_only && dcc_cpp_ir(argv, input_fname)));
+    if (preprocess_only && !remote_frontend)
         ret = EXIT_LOCAL_CPP;
     const char *offload = !ret ? dcc_offload_language(argv) : NULL;
     /* Local execution consumes the same broker capacity as a local worker,
@@ -534,9 +540,6 @@ dcc_build_somewhere(char *argv[],
         direct_lease = dcc_broker_try_local(&work);
         if (direct_lease >= 0) goto run_local;
     }
-    remote_frontend = !ret && !preprocess_only &&
-        dcc_getenv_bool("DISTCC_FRONTEND_REMOTE", 0) && broker &&
-        (dcc_cpp_ir(argv, input_fname) || dcc_cpp_gcc(argv, input_fname));
     /* Driver config files belong to the client. Only a captured Clang
      * frontend command has already expanded them before transport. */
     if (!ret && !(remote_frontend && dcc_cpp_ir(argv, input_fname)) &&

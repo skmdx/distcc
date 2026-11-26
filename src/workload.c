@@ -110,7 +110,7 @@ void dcc_work_describe(struct dcc_work_hint *hint, char **argv, const char *inpu
     *hint = (struct dcc_work_hint){0};
     struct stat st;
     const char *path = ready && prepared ? prepared : input;
-    if (!input || (ready && fd >= 0 ? fstat(fd, &st) : stat(path, &st)) ||
+    if (!input || !strcmp(input, "-") || (ready && fd >= 0 ? fstat(fd, &st) : stat(path, &st)) ||
         !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > SOURCE_LIMIT) return;
     unsigned kind = 1;
     const char *extension = strrchr(input, '.');
